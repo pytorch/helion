@@ -25,6 +25,7 @@ from helion._compiler.tile_dependency import TaskAxis
 from helion._compiler.tile_dependency import TaskFamily
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
+from helion._compiler.tile_dependency import TileDependencyGraph
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _coalesce_adjacent_target_boxes
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
@@ -8866,6 +8867,130 @@ class TestTileDependency(TestCase):
                 for consumer_task in range(consumer_domain.size)
             ),
         )
+
+    def test_dense_reshape_ignores_common_symbolic_storage_origin(self) -> None:
+        storage_origin = sympy.Symbol(
+            "input_storage_offset",
+            integer=True,
+            nonnegative=True,
+        )
+        common_offset = storage_origin + 7
+
+        def make_plan(offset: int | sympy.Expr) -> TileDependencyGraph:
+            return build_tile_dependency_graph(
+                (
+                    _access(
+                        0,
+                        root=0,
+                        kind="store",
+                        shape=(1, 32, 128),
+                        strides=(4096, 128, 1),
+                        block_ids=(10, 11, 12),
+                        scales=(1, 1, 1),
+                        offsets=(0, 0, 0),
+                        storage_offset=offset,
+                    ),
+                    _access(
+                        1,
+                        root=1,
+                        kind="load",
+                        shape=(1, 4096),
+                        strides=(4096, 1),
+                        block_ids=(20, 21),
+                        scales=(1, 1),
+                        offsets=(0, 0),
+                        storage_offset=offset,
+                    ),
+                ),
+                [[10, 11, 12], [20, 21]],
+            )
+
+        root_domains = (
+            CoordinateDomain(
+                (10, 11, 12),
+                ((10, 1), (11, 32), (12, 1)),
+                ((10, 1), (11, 1), (12, 128)),
+            ),
+            CoordinateDomain(
+                (20, 21),
+                ((20, 1), (21, 32)),
+                ((20, 1), (21, 128)),
+            ),
+        )
+        zero_offset = make_plan(0)
+        symbolic_offset = make_plan(common_offset)
+
+        self.assertEqual(
+            tuple(access.storage_offset for access in symbolic_offset.accesses),
+            (common_offset, common_offset),
+        )
+        configured_roots, site_domains = _configured_domains(
+            symbolic_offset,
+            _axis_geometry(root_domains),
+        )
+        (symbolic_relation,) = tuple(
+            dependency.producers_by_consumer
+            for dependency in instantiate_symbolic_dependencies(
+                symbolic_offset,
+                root_domains=configured_roots,
+                site_domains=site_domains,
+            )
+        )
+        self.assertIsNotNone(symbolic_relation)
+        assert symbolic_relation is not None
+        self.assertNotIn(storage_origin, symbolic_relation.parameter_symbols)
+        self.assertEqual(
+            _root_producers_by_consumer(symbolic_offset, root_domains),
+            _root_producers_by_consumer(zero_offset, root_domains),
+        )
+
+    def test_dense_reshape_does_not_cancel_unequal_symbolic_offsets(self) -> None:
+        storage_origin = sympy.Symbol(
+            "input_storage_offset",
+            integer=True,
+            nonnegative=True,
+        )
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(1, 32, 128),
+                    strides=(4096, 128, 1),
+                    block_ids=(10, 11, 12),
+                    scales=(1, 1, 1),
+                    offsets=(0, 0, 0),
+                    storage_offset=storage_origin,
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(1, 4096),
+                    strides=(4096, 1),
+                    block_ids=(20, 21),
+                    scales=(1, 1),
+                    offsets=(0, 0),
+                    storage_offset=storage_origin + 1,
+                ),
+            ),
+            [[10, 11, 12], [20, 21]],
+        )
+        root_domains = (
+            CoordinateDomain(
+                (10, 11, 12),
+                ((10, 1), (11, 32), (12, 1)),
+                ((10, 1), (11, 1), (12, 128)),
+            ),
+            CoordinateDomain(
+                (20, 21),
+                ((20, 1), (21, 32)),
+                ((20, 1), (21, 128)),
+            ),
+        )
+
+        self.assertIsNone(_root_producers_by_consumer(plan, root_domains))
 
     def test_unequal_tiles_map_to_every_overlapping_producer(self) -> None:
         plan = build_tile_dependency_graph(

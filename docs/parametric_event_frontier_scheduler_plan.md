@@ -37,16 +37,18 @@ The following remain ordinary runtime tensor values:
 
 Runtime values may select read addresses, bound loops *inside* an already
 scheduled task, or suppress useful arithmetic. They may not change task
-existence, task ownership, readiness keys, waits, publications, continuation
-ownership, participant count, or schedule order. They also may not remap a
-compiler-managed intermediate write through an unproved indirect index. If
-runtime metadata would change any schedule-affecting fact, the source must use
-a fixed-capacity masked representation or a matching specialization. With
-fixed physical slots but an unproved fine producer/consumer mapping, the
-compiler may retain canonical static order and a whole-root barrier. If task
-existence, task identity, ownership, readiness keys, or fan-in itself varies at
-runtime, a barrier is insufficient: `static_pipeline` must use a fixed-capacity
-rewrite or decline.
+existence, task ownership, emitted readiness keys, waits, publications,
+continuation ownership, participant count, or schedule order. They also may
+not remap a compiler-managed intermediate write through an unproved indirect
+index. If runtime metadata would change a physical task or ownership fact, the
+source must use a fixed-capacity masked representation or a matching
+specialization. With fixed physical slots but an unproved or parameterized
+fine producer/consumer mapping, the compiler may retain canonical static order
+and cover the complete source-ordered inter-root obligation with a whole-root
+barrier. The unlowered fine key/fan-in relation is then not part of the emitted
+schedule. If task existence, task identity, configured task order, or physical
+ownership varies at runtime, a barrier is insufficient: `static_pipeline`
+must use a fixed-capacity rewrite or decline.
 
 Runtime KV page/block metadata is directly safe for read-only cache addressing.
 A fused KV-cache update followed by attention through runtime page/slot
@@ -307,13 +309,21 @@ sections are not active work.
 
 ### Phase S1: make fixed schedule capacity explicit
 
-- [ ] Gate the optimized scheduler on concrete schedule-affecting facts after
-  ordinary specialization: root/task/tile/split extents and orders,
-  readiness-key sizes, fan-ins, source-ticket count, worker geometry, and
-  ownership. With fixed slots but an unproved fine mapping, retain canonical
-  static order and a whole-root barrier. Runtime-varying task/key/fan-in/
-  ownership cardinality requires a matching specialization or fixed-capacity
-  rewrite; otherwise decline `static_pipeline`.
+- [x] Gate the optimized scheduler on a concrete physical task universe after
+  ordinary specialization: every configured root task-order relation, and
+  therefore every root/task/tile/split extent, task identity, and configured
+  PID order, must be parameter-free. Worker geometry is already concrete.
+  Source-ticket count and final ownership must also be concrete before commit.
+  A parameterized or unlowerable *fine* readiness mapping does not create a
+  second scheduling policy: exclude that obligation from continuation/source
+  transfer and fine-grained placement, and cover its complete source-ordered
+  inter-root obligation with a root barrier. Other fixed exact obligations may
+  still use counters and the ordinary list placement; the deterministic all-
+  resident canonical schedule remains the one transactional retry.
+  Decline only when the physical task/order/ownership universe is dynamic or
+  the canonical barrier plan cannot prove coverage, progress, or publication.
+  No parameterized counter, segment ownership, or publication fact may survive
+  in `StaticPipelinePlan`.
 - [ ] Treat `B_capacity` and uniform `Q` like ordinary specialized Helion
   dimensions. Compile B1/B2/B4/B9 or the serving capture buckets separately;
   cross-`B` cubin reuse is future work rather than an exit gate.
@@ -443,6 +453,55 @@ codegen/config/oracle passes 141 tests and 130 subtests. Short cold-L2 guards
 retain canonical ragged FlashMLA B4 at 63.47 us versus 67.58 us standalone,
 Gemma B1 m3 at 51.20 us versus 55.28 us standalone, and Qwen B1 list/local
 parity at 96.35/96.19 us. This checkpoint contains no workload recognizer.
+
+Fixed-capacity dynamic-input checkpoint (2026-09-11): the deployment contract
+has now been exercised with `static_shapes=False`, rather than inferred from a
+`static_shapes=True` control. Gemma B1/B2 explicitly specializes its physical
+batch capacity while route IDs remain runtime tensor contents; changing routes
+on the same cubin remains exact. Its latest B1 latency is 53.14 us versus
+53.09 us for the identical static-shape body and 57.18 us standalone; B2 is
+71.52/71.39/69.47 us respectively. Qwen B1/Q1 explicitly
+specializes tensor extents, strides, and fixed model/tile geometry while
+`context_lens`, positions, block-table entries, slot mappings, and KV/data
+contents remain device loads. One cubin replayed S8192, S2048 with permuted
+pages, and S8192 with a different permutation bit-exactly. After the common-
+offset fix, fixed-capacity versus identical static-shape latency was
+96.42/98.22 us, 92.10/94.08 us, and 96.13/96.22 us respectively; resources
+were identical. The Qwen plans enter the same concrete
+`build_worker_schedule` path, contain no parameter symbols, and now have
+identical schedules, barriers, and all seven counters, including the nested
+8->9 fan-in-32 counter.
+
+For contrast, fully runtime batch cardinality remains a historical stress
+control, not the immediate contract. A one-cubin Qwen B1/B2 build is 6--12%
+slower and follows the obsolete parameterized root-major policy. A one-cubin
+FlashMLA fan-out probe remains numerically exact and faster than its matched
+standalone boundary across B1/B2/B4/B9, demonstrating that the retained
+symbolic relation algebra is useful, but it does not justify keeping a second
+production ownership policy.
+
+Implementation checkpoint (2026-09-11, fixed task universe):
+`build_static_pipeline_plan` now rejects a parameterized authoritative root
+task order before choosing ownership. Every admissible configuration uses the
+same concrete scheduler transaction; the separate parameterized root-major
+ownership branch and its sink/fan-in policy are gone. One shared emitted-
+counter capability requires exact lowering and parameter-free state. A
+parameterized or unsupported fine relation remains dependency evidence but is
+left uncovered for the existing strict source-ordered root-barrier fallback.
+Final `StaticPipelinePlan` construction rejects parameterized root orders,
+placement relations, counters, and publication ownership. The former dynamic-
+cardinality integration tests were removed; replacements cover explicit
+fixed-capacity rejection, fixed-capacity quotient behavior, symbolic-counter
+non-emission, conservative barrier fallback, and `static_shapes=False` replay
+with specialized tensor capacity but changing runtime metadata values.
+
+The same checkpoint fixes the Qwen 8->9 proof gap generically in
+`tile_dependency`: equal producer and consumer storage offsets are factored as
+one common translation before the dense linear overlap proof. A runtime,
+nonzero common offset now derives exactly the zero-origin relation without
+specializing that offset; unequal offsets remain conservative. This restores
+Qwen's fan-in-32 nested counter under `static_shapes=False` and makes its
+lowered Triton match the static control after nonsemantic normalization.
 
 ### Phase S3: post-placement synchronization validation and cleanup
 

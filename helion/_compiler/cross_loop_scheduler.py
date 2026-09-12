@@ -6532,6 +6532,15 @@ class StaticPipelinePlan:
 
     def __post_init__(self) -> None:
         _validate_root_task_orders(self.root_task_orders)
+        if any(task_order.parameter_symbols for task_order in self.root_task_orders):
+            raise ValueError("pipeline plan root task capacity is parameterized")
+        if self.worker_schedule.placement_domain.parameter_symbols or any(
+            segment.task_order.parameter_symbols
+            for segment in self.worker_schedule.segments
+        ):
+            raise ValueError("pipeline plan schedule ownership is parameterized")
+        if any(counter.parameter_symbols for counter in self.readiness_counters):
+            raise ValueError("pipeline plan readiness state is parameterized")
         root_count = len(self.root_task_orders)
         root_domains = tuple(
             task_order.target_domain for task_order in self.root_task_orders
@@ -6550,6 +6559,10 @@ class StaticPipelinePlan:
                 0 <= producer_root < root_count and 0 <= consumer_root < root_count
             ):
                 raise ValueError("root-barrier edge references an unknown root")
+            if producer_root >= consumer_root:
+                raise ValueError(
+                    "root-barrier edge must be a strict source-ordered dependency"
+                )
 
         continuation_roots: set[int] = set()
         for counter in self.readiness_counters:
@@ -6563,7 +6576,7 @@ class StaticPipelinePlan:
                     continuation_roots.add(consumer.consumer_root)
 
         if (
-            _current_renderer_lowerable_counters(
+            _emittable_readiness_counters(
                 self.readiness_counters,
                 root_domains,
             )
@@ -6597,7 +6610,12 @@ class StaticPipelinePlan:
         # Freeze the sole root-publication derivation with the selected plan.
         # Code generation consumes this cache and must not reconstruct owner
         # support or arrival counts from schedule geometry.
-        _ = self.root_barrier_publication_plans
+        publication_plans = self.root_barrier_publication_plans
+        if any(
+            publication_plan is not None and publication_plan.parameter_symbols
+            for publication_plan in publication_plans
+        ):
+            raise ValueError("pipeline plan publication ownership is parameterized")
 
     @cached_property
     def root_barrier_publication_plans(
@@ -6995,7 +7013,7 @@ def choose_readiness_counters(
             consumers=tuple(retained_consumers),
             continuation_consumer_index=continuation_consumer_index,
         )
-        if _supports_exact_counter_plan_lowering(
+        if _supports_emitted_counter_plan_lowering(
             candidate,
             readiness_graph.root_domains,
         ):
@@ -7517,7 +7535,7 @@ def derive_final_arrival_continuations(
             consumers=(readiness_consumer,),
             continuation_consumer_index=consumer_index,
         )
-        if not _supports_exact_counter_plan_lowering(
+        if not _supports_emitted_counter_plan_lowering(
             candidate_plan,
             readiness_graph.root_domains,
         ):
@@ -13082,66 +13100,6 @@ def _has_valid_transient_source_schedule(
     )
 
 
-def _parameterized_counter_fan_in_bounds(
-    plan: ReadinessCounterPlan,
-) -> tuple[int, int] | None:
-    """Return the proved static fan-in bounds accepted by parametric schedules.
-
-    Ordinary resident waits may fan out from one key to multiple consumer
-    tasks and may have different exact arrival counts by key. Final-arrival
-    continuations retain their stricter uniform one-task-per-key contract.
-    """
-    fan_in_bounds = plan.arrival_count_bounds()
-    if (
-        len(plan.producers) != 1
-        or not plan.consumers
-        or fan_in_bounds is None
-        or not 0 < fan_in_bounds[0] <= fan_in_bounds[1] < 2**32
-    ):
-        return None
-    (producer,) = plan.producers
-    publication = producer.keys_by_producer
-    if (
-        producer.producer_site_id is not None
-        or publication is None
-        or publication.canonical_single_valued() is None
-    ):
-        return None
-    if not all(
-        consumer.consumer_site_id is None
-        and producer.producer_root < consumer.consumer_root
-        and consumer.keys_by_consumer.canonical_single_valued() is not None
-        for consumer in plan.consumers
-    ):
-        return None
-    if plan.continuation_consumer_index is not None:
-        if (
-            fan_in_bounds[0] != fan_in_bounds[1]
-            or fan_in_bounds[0] == 1
-            or len(plan.consumers) != 1
-        ):
-            return None
-        (consumer,) = plan.consumers
-        converse = consumer.keys_by_consumer.converse()
-        if (
-            not consumer.keys_by_consumer.is_positional_bijection()
-            or converse is None
-            or not converse.is_positional_bijection()
-        ):
-            return None
-    return fan_in_bounds
-
-
-def _parameterized_uniform_counter_fan_in(
-    plan: ReadinessCounterPlan,
-) -> int | None:
-    """Return a parameterized counter's uniform fan-in, when it has one."""
-    bounds = _parameterized_counter_fan_in_bounds(plan)
-    if bounds is None or bounds[0] != bounds[1]:
-        return None
-    return bounds[0]
-
-
 def _supports_exact_counter_plan_lowering(
     plan: ReadinessCounterPlan,
     root_domains: tuple[CoordinateDomain, ...],
@@ -13222,44 +13180,32 @@ def _supports_exact_counter_plan_lowering(
     )
 
 
-def _supports_current_parameterized_renderer(
+def _supports_emitted_counter_plan_lowering(
     plan: ReadinessCounterPlan,
     root_domains: tuple[CoordinateDomain, ...],
 ) -> bool:
-    """Return whether today's parameterized renderer supports this exact plan."""
-    return (
-        _supports_exact_counter_plan_lowering(plan, root_domains)
-        and _parameterized_counter_fan_in_bounds(plan) is not None
+    """Return whether one exact counter has fixed emitted semantics.
+
+    A relation may remain useful dependency evidence even when it carries
+    runtime parameters. Such an obligation is conservatively covered by a
+    whole-root barrier, however: schedule ownership, readiness keys, and
+    publication state are fixed-capacity facts in a StaticPipelinePlan.
+    """
+    return not plan.parameter_symbols and _supports_exact_counter_plan_lowering(
+        plan,
+        root_domains,
     )
 
 
-def _current_renderer_lowerable_counters(
+def _emittable_readiness_counters(
     plans: tuple[ReadinessCounterPlan, ...],
     root_domains: tuple[CoordinateDomain, ...],
 ) -> tuple[ReadinessCounterPlan, ...]:
-    """Filter exact plans through today's parameterized/epoch renderer contract."""
-    common = tuple(
-        plan
-        for plan in plans
-        if _supports_exact_counter_plan_lowering(plan, root_domains)
-    )
-    parameterized_roots = any(domain.parameter_symbols for domain in root_domains)
-    renderable = tuple(
-        plan
-        for plan in common
-        if not (parameterized_roots or plan.parameter_symbols)
-        or _supports_current_parameterized_renderer(plan, root_domains)
-    )
-    uses_epoch_framing = parameterized_roots or any(
-        plan.parameter_symbols for plan in renderable
-    )
-    if not uses_epoch_framing:
-        return renderable
+    """Keep only exact counters with fixed emitted state and ownership."""
     return tuple(
         plan
-        for plan in renderable
-        if (bounds := plan.arrival_count_bounds()) is not None
-        and 0 < bounds[0] <= bounds[1] < 2**32
+        for plan in plans
+        if _supports_emitted_counter_plan_lowering(plan, root_domains)
     )
 
 
@@ -13270,11 +13216,10 @@ def _finalize_emitted_synchronization(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
 ) -> tuple[tuple[ReadinessCounterPlan, ...], frozenset[tuple[int, int]]]:
     """Select fallback barriers and remove counter consumers they subsume."""
-    # Dropping an unsupported plan lets coverage select the ordinary
-    # root-barrier fallback from the same obligations. The two-pass renderer
-    # filter first rejects unsupported parameterized plans, then enforces the
-    # shared epoch bound across every retained sibling.
-    readiness_counters = _current_renderer_lowerable_counters(
+    # Dropping an unsupported or parameterized fine plan leaves its original
+    # obligations uncovered, so the same coverage pass selects the ordinary
+    # strict source-ordered root-barrier fallback.
+    readiness_counters = _emittable_readiness_counters(
         readiness_counters,
         root_domains,
     )
@@ -13361,7 +13306,7 @@ def _try_finalize_pipeline_proposal(
     root_domains = readiness_graph.root_domains
     if (
         not allow_counter_fallback
-        and _current_renderer_lowerable_counters(
+        and _emittable_readiness_counters(
             candidate_readiness_counters,
             root_domains,
         )
@@ -13395,13 +13340,11 @@ def _try_finalize_pipeline_proposal(
         for continuation in continuations
     )
 
-    parameterized_roots = any(domain.parameter_symbols for domain in root_domains)
     ownership_bases: list[tuple[WorkerSchedule, int | None]] = []
     if (
         allow_global_schedule
         and allow_transient_source
         and not continuations
-        and not parameterized_roots
     ):
         transient_candidate = _transient_source_candidate(
             readiness_graph,
@@ -13430,7 +13373,7 @@ def _try_finalize_pipeline_proposal(
         external_source_frontiers: (
             tuple[tuple[int, CoordinateRelation], ...] | None
         ) = ()
-        if allow_global_schedule and not parameterized_roots:
+        if allow_global_schedule:
             external_source_frontiers = (
                 ()
                 if transient_source_root is None
@@ -13483,7 +13426,6 @@ def _try_finalize_pipeline_proposal(
                 external_source_frontiers=external_source_frontiers,
             )
             if allow_global_schedule
-            and not parameterized_roots
             and external_source_frontiers is not None
             else prepared_schedule
         )
@@ -13557,7 +13499,19 @@ def build_static_pipeline_plan(
     ):
         raise ValueError("cross-loop pipeline depth must be an integer between 1 and 4")
     root_domains = tuple(task_order.target_domain for task_order in root_task_orders)
-    parameterized_roots = any(domain.parameter_symbols for domain in root_domains)
+    schedule_capacity_parameters = frozenset(
+        symbol
+        for task_order in root_task_orders
+        for symbol in task_order.parameter_symbols
+    )
+    if schedule_capacity_parameters:
+        raise exc.InvalidConfig(
+            "cross_loop_schedule='static_pipeline' requires a fixed task "
+            "capacity and task order; specialize the schedule-affecting "
+            "capacity (for example B_capacity and Q) while keeping runtime "
+            "metadata values unspecialized; unresolved parameters: "
+            f"{', '.join(sorted(map(str, schedule_capacity_parameters)))}"
+        )
     readiness_graph = build_readiness_graph(
         dependency_graph=dependency_graph,
         root_task_orders=root_task_orders,
@@ -13566,111 +13520,6 @@ def build_static_pipeline_plan(
         prove_nonnegative=prove_nonnegative,
     )
     continuation_candidates = derive_final_arrival_continuations(readiness_graph)
-
-    if parameterized_roots:
-        try:
-            baseline_schedule = _build_root_major_worker_schedule(
-                root_domains,
-                root_task_orders,
-                worker_count,
-            )
-        except ValueError as error:
-            raise exc.InvalidConfig(
-                "cross_loop_schedule='static_pipeline' cannot represent this "
-                "parameterized root schedule"
-            ) from error
-        continuation_candidates = choose_final_arrival_continuations(
-            readiness_graph,
-            continuation_candidates,
-            baseline_schedule,
-            excluded_roots=continuation_ineligible_roots
-            | frozenset(
-                readiness_consumer.consumer_root
-                for event in readiness_graph.events
-                for readiness_consumer in event.consumers
-                if readiness_consumer.consumer_site_id is not None
-            ),
-        )
-        # Preserve the current ownership policy until post-placement local
-        # dominance is available. Candidate derivation above is common
-        # legality; this raw-event renderer/sink/fan-in gate is deliberately
-        # only a migration policy and must be deleted with the policy split.
-        sink_roots = frozenset(range(len(root_domains))) - frozenset(
-            edge.producer_root for edge in dependency_graph.edges
-        )
-        selected_continuations: list[FinalArrivalContinuation] = []
-        for continuation in continuation_candidates:
-            event = readiness_graph.event(continuation.event_id)
-            readiness_consumer = event.consumers[continuation.consumer_index]
-            provisional_plan = ReadinessCounterPlan(
-                producers=event.producers,
-                consumers=(readiness_consumer,),
-                continuation_consumer_index=0,
-            )
-            fan_in = _parameterized_uniform_counter_fan_in(provisional_plan)
-            if (
-                readiness_consumer.consumer_root in sink_roots
-                and fan_in is not None
-                and fan_in > 1
-            ):
-                selected_continuations.append(continuation)
-        continuations = tuple(selected_continuations)
-        continuation_roots = frozenset(
-            readiness_graph.event(continuation.event_id)
-            .consumers[continuation.consumer_index]
-            .consumer_root
-            for continuation in continuations
-        )
-        try:
-            worker_schedule = (
-                baseline_schedule
-                if not continuation_roots
-                else _build_root_major_worker_schedule(
-                    root_domains,
-                    root_task_orders,
-                    worker_count,
-                    excluded_roots=continuation_roots,
-                )
-            )
-        except ValueError:
-            worker_schedule = baseline_schedule
-            continuations = ()
-        proposal = _try_finalize_pipeline_proposal(
-            dependency_graph=dependency_graph,
-            readiness_graph=readiness_graph,
-            worker_schedule=worker_schedule,
-            continuations=continuations,
-            candidate_readiness_counters=choose_readiness_counters(
-                readiness_graph,
-                continuations,
-            ),
-            allow_counter_fallback=False,
-            allow_global_schedule=False,
-            allow_transient_source=False,
-            pipeline_depth=cross_loop_pipeline_depth,
-        )
-        if proposal is not None:
-            return proposal
-        fallback = _try_finalize_pipeline_proposal(
-            dependency_graph=dependency_graph,
-            readiness_graph=readiness_graph,
-            worker_schedule=baseline_schedule,
-            continuations=(),
-            candidate_readiness_counters=choose_readiness_counters(
-                readiness_graph,
-                (),
-            ),
-            allow_counter_fallback=True,
-            allow_global_schedule=False,
-            allow_transient_source=False,
-            pipeline_depth=cross_loop_pipeline_depth,
-        )
-        if fallback is None:
-            raise exc.InvalidConfig(
-                "cross_loop_schedule='static_pipeline' cannot prove a "
-                "progress-safe parameterized plan"
-            )
-        return fallback
 
     try:
         (
@@ -13791,6 +13640,11 @@ def _select_root_barrier_edges(
             for access_dependency in dependency.access_dependencies
         ):
             continue
+        if dependency.producer_root >= dependency.consumer_root:
+            raise exc.CrossLoopSchedulingError(
+                "a whole-root barrier can cover only a strict source-ordered "
+                f"dependency, got {dependency.producer_root}->{dependency.consumer_root}"
+            )
         if _is_ordered_by_root_barrier(*pair, ordered_root_edges):
             continue
         selected_edges.add(pair)
@@ -13804,6 +13658,8 @@ def _is_ordered_by_root_barrier(
     edges: set[tuple[int, int]],
 ) -> bool:
     """Return whether whole-root ordering transitively covers one pair."""
+    if producer == consumer:
+        return False
     pending = [producer]
     visited: set[int] = set()
     while pending:

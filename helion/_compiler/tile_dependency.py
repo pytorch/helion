@@ -13640,12 +13640,32 @@ def _symbolic_producers_by_consumer(
             if relation is not None:
                 return relation
 
+    # The allocation's absolute storage origin is irrelevant when both views
+    # begin at the same exact offset.  Normalize that common translation before
+    # the linear fallback: otherwise a host-backed runtime offset appears as a
+    # second free symbol beside the task coordinate and prevents the affine
+    # interval recognizer from seeing an ordinary dense reshape.  Unequal view
+    # offsets retain their original coordinates and conservative behavior.
+    linear_producer_access = producer_access
+    linear_consumer_access = consumer_access
+    if _integer_partition_expressions_equal(
+        producer_access.storage_offset,
+        consumer_access.storage_offset,
+    ):
+        linear_producer_access = dataclasses.replace(
+            producer_access,
+            storage_offset=sympy.Integer(0),
+        )
+        linear_consumer_access = dataclasses.replace(
+            consumer_access,
+            storage_offset=sympy.Integer(0),
+        )
     producer_storage_size = _allocation_storage_size(
-        producer_access,
+        linear_producer_access,
         prove_nonnegative=prove_nonnegative,
     )
     consumer_storage_size = _allocation_storage_size(
-        consumer_access,
+        linear_consumer_access,
         prove_nonnegative=prove_nonnegative,
     )
     if producer_storage_size is None or consumer_storage_size is None:
@@ -13673,13 +13693,13 @@ def _symbolic_producers_by_consumer(
         identity=producer_access.allocation_id,
     )
     producer_relation = _symbolic_linear_access_relation(
-        producer_access,
+        linear_producer_access,
         source_domain=producer_domain,
         allocation_domain=linear_domain,
         prove_nonnegative=prove_nonnegative,
     )
     consumer_relation = _symbolic_linear_access_relation(
-        consumer_access,
+        linear_consumer_access,
         source_domain=consumer_domain,
         allocation_domain=linear_domain,
         prove_nonnegative=prove_nonnegative,
