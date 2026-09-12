@@ -1162,6 +1162,528 @@ def emit_flash_bwd_device_body(
 {compute_blocks}"""
 
 
+def _flash_bwd_2cta_wg_compute_block(
+    *,
+    h: int,
+    plan: AttentionBwdPlan,
+    io_dtype: str,
+    scale2_expr: str,
+    out_scale_expr: str,
+    m_mod_tiles: int,
+    steps_expr: str,
+) -> str:
+    """One compute warpgroup's body for the 2-CTA family (column half h)."""
+    d = plan.head_dim
+    warp_lo, warp_hi = (4, 8) if h == 0 else (8, 12)
+    mask_arg = "fbwd_mask_lim" if plan.causal else "None"
+    epi_off = 128 if h == 0 else 384
+    epi_tensor = "_fbwd_mdV" if h == 0 else "_fbwd_mdK"
+    epi_scale = (
+        "_helion_flash_rt._scale_fragment_packed_f32x2(fbwd_reg, cutlass.Float32("
+        + out_scale_expr
+        + "))"
+        if h == 1
+        else "pass"
+    )
+    return f"""
+    if (warp_idx >= {warp_lo}) & (warp_idx < {warp_hi}):
+        cute.arch.setmaxregister_increase(168)
+        fbwd_s_shape = fbwd_sst.partition_shape_C((256, 128))
+        tStS_frag = fbwd_sst.make_fragment_C(fbwd_s_shape)
+        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
+        fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
+        fbwd_half_layout = cute.composition(tStS_frag.layout, cute.make_layout((128, 64)))
+        tS_h = cute.make_tensor(fbwd_tmem_ptr + {64 * h}, fbwd_half_layout)
+        tdP_h = cute.make_tensor(fbwd_tmem_ptr + {256 + 64 * h}, fbwd_half_layout)
+        cS = cute.make_identity_tensor((256, 128))
+        tScS = fbwd_sst.partition_C(cS)
+        fbwd_cs_half_layout = cute.composition(tScS.layout, cute.make_layout((128, 64)))
+        tScS_h = cute.make_tensor(tScS.iterator, fbwd_cs_half_layout)
+        fbwd_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+        fbwd_tiled_ld = cute_tcgen05_flash.make_tmem_copy(fbwd_ld_atom, tS_h)
+        fbwd_thr_ld = fbwd_tiled_ld.get_slice(fbwd_local_tidx)
+        tLDtS = fbwd_thr_ld.partition_S(tS_h)
+        tLDtdP = fbwd_thr_ld.partition_S(tdP_h)
+        tLDcS = fbwd_thr_ld.partition_D(tScS_h)
+        fbwd_p_half_layout = cute.composition(tStS_frag.layout, cute.make_layout((128, 32)))
+        tP_h = cute.make_tensor(fbwd_tmem_ptr + {32 * h}, fbwd_p_half_layout)
+        tDS_h = cute.make_tensor(fbwd_tmem_ptr + {256 + 32 * h}, fbwd_p_half_layout)
+        fbwd_cp_half_layout = cute.composition(tScS.layout, cute.make_layout((128, 32)))
+        tPcS_h = cute.make_tensor(tScS.iterator, fbwd_cp_half_layout)
+        fbwd_st_atom = cute.make_copy_atom(cute_tcgen05_flash.St32x32bOp(cute_tcgen05_flash.Repetition(16)), cutlass.Float32)
+        fbwd_tiled_st = cute_tcgen05_flash.make_tmem_copy(fbwd_st_atom, tP_h)
+        fbwd_thr_st = fbwd_tiled_st.get_slice(fbwd_local_tidx)
+        tSTtP = fbwd_thr_st.partition_D(tP_h)
+        tSTtDS = fbwd_thr_st.partition_D(tDS_h)
+        tSTcP = fbwd_thr_st.partition_S(tPcS_h)
+        fbwd_sdS_kv2 = cute.make_tensor(fbwd_sdS_mn.iterator, cute.make_layout((64, 2, 128), stride=(1, 8192, 64)))
+        fbwd_crow = cutlass.Int32(tLDcS[0][0]) % 128
+        fbwd_sdSx_v = cute.make_tensor(fbwd_sdSx_ptr, cute.make_layout((64, 128), stride=(1, 64)))
+        fbwd_thr_row = cutlass.Int32(tLDcS[0][0])
+        fbwd_phase = cutlass.Int32(0)
+        fbwd_dqf_phase = cutlass.Int32(0)
+        fbwd_scale2 = cutlass.Float32({scale2_expr})
+        for fbwd_i in cutlass.range({steps_expr}, unroll=1):
+            fbwd_m_tile = fbwd_m_start + fbwd_i
+            fbwd_qbase = (fbwd_m_tile % {m_mod_tiles}) * 128 + {64 * h}
+            fbwd_row_base = fbwd_q_row_base + fbwd_m_tile * 128
+            fbwd_mask_lim = fbwd_kv_base + fbwd_thr_row - fbwd_qbase
+            fbwd_par = (fbwd_i % 2) * 128
+            if fbwd_local_tidx < 64:
+                fbwd_stage_col = fbwd_row_base + {64 * h} + fbwd_local_tidx
+                fbwd_sLSE[fbwd_par + {64 * h} + fbwd_local_tidx] = _fbwd_mLSE[fbwd_stage_col]
+                fbwd_sDelta[fbwd_par + {64 * h} + fbwd_local_tidx] = _fbwd_mDelta[fbwd_stage_col]
+            _helion_flash_rt.mbar_spin_wait(fbwd_s_full_ptr, fbwd_phase, 10000000)
+            tLDrS = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+            cute.copy(fbwd_tiled_ld, tLDtS, tLDrS)
+            cute.arch.fence_view_async_tmem_load()
+            _helion_flash_rt.named_barrier_wait_unaligned(3, 256)
+            if fbwd_i > 0:
+                with cute.arch.elect_one():
+                    _helion_flash_rt.mbarrier_arrive(fbwd_ds_smem_full_ptr, cutlass.Int32(0))
+            for fbwd_ch in cutlass.range_constexpr(2):
+                fbwd_lse_frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+                fbwd_lse_v = cute.make_tensor(fbwd_sLSE.iterator + fbwd_par + {64 * h} + fbwd_ch * 32, cute.make_layout(32))
+                cute.autovec_copy(fbwd_lse_v, fbwd_lse_frg)
+                _helion_flash_rt.fbwd_p_pairs_packed(tLDrS, fbwd_lse_frg, fbwd_ch * 32, 32, fbwd_scale2, {mask_arg}, fbwd_ch * 32)
+            tSTrP = cute.make_rmem_tensor(tSTcP.shape, cutlass.Float32)
+            tSTrP_e = cute.make_tensor(cute.recast_ptr(tSTrP.iterator, dtype={io_dtype}), tLDrS.layout)
+            tSTrP_e.store(tLDrS.load().to({io_dtype}))
+            cute.copy(fbwd_tiled_st, tSTrP, tSTtP)
+            cute.arch.fence_view_async_tmem_store()
+            with cute.arch.elect_one():
+                _helion_flash_rt.mbarrier_arrive(fbwd_p_full_ptr, cutlass.Int32(0))
+            _helion_flash_rt.mbar_spin_wait(fbwd_dp_full_ptr, fbwd_phase, 10000000)
+            if fbwd_i > 0:
+                _helion_flash_rt.mbar_spin_wait(fbwd_dq_full_ptr, fbwd_dqf_phase, 10000000)
+                fbwd_dqf_phase ^= 1
+            tLDrdP = cute.make_rmem_tensor(tLDcS.shape, cutlass.Float32)
+            cute.copy(fbwd_tiled_ld, tLDtdP, tLDrdP)
+            cute.arch.fence_view_async_tmem_load()
+            _helion_flash_rt.named_barrier_wait_unaligned(3, 256)
+            for fbwd_ch in cutlass.range_constexpr(2):
+                fbwd_dlt_frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)
+                fbwd_dlt_v = cute.make_tensor(fbwd_sDelta.iterator + fbwd_par + {64 * h} + fbwd_ch * 32, cute.make_layout(32))
+                cute.autovec_copy(fbwd_dlt_v, fbwd_dlt_frg)
+                _helion_flash_rt.fbwd_ds_pairs_packed_off(tLDrdP, fbwd_ch * 32, tLDrS, fbwd_ch * 32, fbwd_dlt_frg, 32)
+            tSTrDS = cute.make_rmem_tensor(tSTcP.shape, cutlass.Float32)
+            tSTrDS_e = cute.make_tensor(cute.recast_ptr(tSTrDS.iterator, dtype={io_dtype}), tLDrdP.layout)
+            tSTrDS_e.store(tLDrdP.load().to({io_dtype}))
+            cute.copy(fbwd_tiled_st, tSTrDS, tSTtDS)
+            cute.arch.fence_view_async_tmem_store()
+            with cute.arch.elect_one():
+                _helion_flash_rt.mbarrier_arrive(fbwd_ds_tmem_full_ptr, cutlass.Int32(0))
+            fbwd_dsb = cute.make_rmem_tensor(tLDcS.shape, {io_dtype})
+            fbwd_dsb.store(tLDrdP.load().to({io_dtype}))
+            fbwd_dsb_flat = cute.make_tensor(fbwd_dsb.iterator, cute.make_layout(64))
+            if fbwd_rank == {h}:
+                fbwd_sdS_keep = fbwd_sdS_kv2[None, fbwd_rank, fbwd_crow]
+                cute.autovec_copy(fbwd_dsb_flat, fbwd_sdS_keep)
+            else:
+                fbwd_sdSx_row = fbwd_sdSx_v[None, fbwd_crow]
+                cute.autovec_copy(fbwd_dsb_flat, fbwd_sdSx_row)
+            cute.arch.fence_view_async_shared()
+            _helion_flash_rt.named_barrier_wait_unaligned(3, 256)
+{_FBWD_2CTA_SEND if h == 0 else ""}
+            fbwd_phase ^= 1
+        with cute.arch.elect_one():
+            _helion_flash_rt.mbarrier_arrive(fbwd_ds_smem_full_ptr, cutlass.Int32(0))
+        _helion_flash_rt.mbar_spin_wait(fbwd_dkv_done_ptr, 0, 10000000)
+        fbwd_dkv_shape = fbwd_tst.partition_shape_C((256, {d}))
+        tDKV_frag = fbwd_tst.make_fragment_C(fbwd_dkv_shape)
+        tEPI_t = cute.make_tensor(fbwd_tmem_ptr + {epi_off}, tDKV_frag.layout)
+        fbwd_gepi = cute.flat_divide({epi_tensor}, (256, {d}))
+        fbwd_epi_tiler = ((cute.size(tEPI_t, mode=[0, 0]), cute.size(tEPI_t, mode=[0, 1])),)
+        tEPI_epi = cute.zipped_divide(tEPI_t, fbwd_epi_tiler)
+        fbwd_epi_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition(16)), cutlass.Float32)
+        fbwd_tiled_epi_ld = cute_tcgen05_flash.make_tmem_copy(fbwd_epi_ld_atom, tEPI_epi[None, 0])
+        fbwd_thr_epi_ld = fbwd_tiled_epi_ld.get_slice(fbwd_local_tidx)
+        tEPItT = fbwd_thr_epi_ld.partition_S(tEPI_epi)
+        tEPIgG_mma = fbwd_tst.partition_C(fbwd_gepi)[None, None, None, fbwd_cl_tile, 0]
+        fbwd_g_epi = cute.zipped_divide(tEPIgG_mma, fbwd_epi_tiler)
+        tEPIgG = fbwd_thr_epi_ld.partition_D(fbwd_g_epi)
+        for fbwd_c in cutlass.range(cute.size(tEPItT, mode=[2])):
+            fbwd_reg = cute.make_rmem_tensor(tEPIgG[None, None, 0].shape, cutlass.Float32)
+            fbwd_rego = cute.make_rmem_tensor(tEPIgG[None, None, 0].shape, {io_dtype})
+            cute.copy(fbwd_tiled_epi_ld, tEPItT[None, None, fbwd_c], fbwd_reg)
+            {epi_scale}
+            fbwd_rego.store(fbwd_reg.load().to({io_dtype}))
+            cute.autovec_copy(fbwd_rego, tEPIgG[None, None, fbwd_c])
+        _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)
+"""
+
+
+_FBWD_2CTA_SEND = """            if fbwd_local_tidx == 0:
+                fbwd_peer = fbwd_rank ^ 1
+                cute.arch.mbarrier_arrive_and_expect_tx(fbwd_ds_cl_full_ptr, 16384, peer_cta_rank_in_cluster=fbwd_peer)
+                _helion_flash_rt.cpasync_bulk_s2cluster(fbwd_sdSx_ptr, fbwd_sdS_mn.iterator + fbwd_rank * 8192, fbwd_ds_cl_full_ptr, 16384, fbwd_peer)"""
+
+
+def emit_flash_bwd_2cta_device_body(
+    *,
+    plan: AttentionBwdPlan,
+    io_dtype: str,
+    scale2_expr: str,
+    out_scale_expr: str,
+) -> str:
+    """2-CTA (cluster (2,1,1)) fused backward device body for head_dim 128."""
+    d = plan.head_dim
+    n_tiles = plan.n_dim // 128
+    m_tiles = plan.mm_dim // 128
+    m_mod_tiles = plan.m_dim // 128
+    causal_start = "fbwd_n_tile // 2 * 2" if plan.causal else "cutlass.Int32(0)"
+    compute_blocks = "".join(
+        _flash_bwd_2cta_wg_compute_block(
+            h=h,
+            plan=plan,
+            io_dtype=io_dtype,
+            scale2_expr=scale2_expr,
+            out_scale_expr=out_scale_expr,
+            m_mod_tiles=m_mod_tiles,
+            steps_expr="fbwd_steps",
+        )
+        for h in (0, 1)
+    )
+
+    body = f"""
+    tidx, _, _ = cute.arch.thread_idx()
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    fbwd_local_tidx = tidx % 128
+    fbwd_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    fbwd_is_leader = fbwd_rank == cutlass.Int32(0)
+    fbwd_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
+    fbwd_cl_tile = fbwd_tile_id // 2
+    fbwd_bh = fbwd_tile_id // {n_tiles}
+    fbwd_n_tile = fbwd_tile_id % {n_tiles}
+    fbwd_m_start = {causal_start}
+    fbwd_steps = {m_tiles} - fbwd_m_start
+    fbwd_q_tile_base = fbwd_bh * {m_tiles}
+    fbwd_q_row_base = fbwd_bh * {plan.mm_dim}
+    fbwd_kv_base = fbwd_n_tile // 2 * 256
+    if warp_idx == 0:
+        cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_q)
+        cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_k)
+        cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_v)
+        cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_dot)
+        cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_do2)
+        cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_qt)
+        cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_kt)
+    _fbwd_storage_cls = _helion_flash_rt.flash_bwd_2cta_shared_storage({d}, {io_dtype})
+    smem = cutlass_utils_flash.SmemAllocator()
+    storage = smem.allocate(_fbwd_storage_cls)
+    sQ = storage.sQ.get_tensor(_fbwd_qsl.outer, swizzle=_fbwd_qsl.inner)
+    sdOt = storage.sdOt.get_tensor(_fbwd_dosl.outer, swizzle=_fbwd_dosl.inner)
+    sdO = storage.sdO.get_tensor(_fbwd_dotl.outer, swizzle=_fbwd_dotl.inner)
+    sQt = storage.sQt.get_tensor(_fbwd_qtl.outer, swizzle=_fbwd_qtl.inner)
+    sK = storage.sK.get_tensor(_fbwd_ksl.outer, swizzle=_fbwd_ksl.inner)
+    sV = storage.sV.get_tensor(_fbwd_vsl.outer, swizzle=_fbwd_vsl.inner)
+    sKt = storage.sKt.get_tensor(_fbwd_ktl.outer, swizzle=_fbwd_ktl.inner)
+    fbwd_sdS_mn = storage.sdS.get_tensor(_fbwd_dssl.outer, swizzle=_fbwd_dssl.inner)
+    fbwd_sdSx_plain = storage.sdSx.get_tensor(cute.make_layout(8192))
+    fbwd_sdSx_ptr = cute.recast_ptr(fbwd_sdSx_plain.iterator, _fbwd_dssl.inner)
+    fbwd_sLSE = storage.sLSE.get_tensor(cute.make_layout(2 * 128))
+    fbwd_sDelta = storage.sDelta.get_tensor(cute.make_layout(2 * 128))
+    fbwd_sdq = storage.sdQaccum.get_tensor(cute.make_layout(4096))
+    fbwd_s_full_ptr = storage.s_full_mbar.data_ptr()
+    fbwd_dp_full_ptr = storage.dp_full_mbar.data_ptr()
+    fbwd_p_full_ptr = storage.p_full_mbar.data_ptr()
+    fbwd_ds_tmem_full_ptr = storage.ds_tmem_full_mbar.data_ptr()
+    fbwd_ds_smem_full_ptr = storage.ds_smem_full_mbar.data_ptr()
+    fbwd_dq_full_ptr = storage.dq_full_mbar.data_ptr()
+    fbwd_dq_empty_ptr = storage.dq_empty_mbar.data_ptr()
+    fbwd_dkv_done_ptr = storage.dkv_done_mbar.data_ptr()
+    fbwd_ds_cl_full_ptr = storage.ds_cluster_full_mbar.data_ptr()
+    fbwd_ds_cl_leader_ptr = storage.ds_cluster_leader_mbar.data_ptr()
+    fbwd_tmem_dealloc_ptr = storage.tmem_dealloc_mbar.data_ptr()
+    if tidx == 0:
+        cute.arch.mbarrier_init(fbwd_s_full_ptr, 1)
+        cute.arch.mbarrier_init(fbwd_dp_full_ptr, 1)
+        cute.arch.mbarrier_init(fbwd_p_full_ptr, 16)
+        cute.arch.mbarrier_init(fbwd_ds_tmem_full_ptr, 16)
+        cute.arch.mbarrier_init(fbwd_ds_smem_full_ptr, 16)
+        cute.arch.mbarrier_init(fbwd_dq_full_ptr, 1)
+        cute.arch.mbarrier_init(fbwd_dq_empty_ptr, 8)
+        cute.arch.mbarrier_init(fbwd_dkv_done_ptr, 1)
+        cute.arch.mbarrier_init(fbwd_ds_cl_full_ptr, 1)
+        cute.arch.mbarrier_init(fbwd_ds_cl_leader_ptr, 2)
+    cute.arch.mbarrier_init_fence()
+    fbwd_tmem_user_bar = cutlass_pipeline_flash.NamedBarrier(barrier_id=2, num_threads=13 * 32)
+    fbwd_tmem = cutlass_utils_flash.TmemAllocator(storage.tmem_holding_buf.ptr, barrier_for_retrieve=fbwd_tmem_user_bar, allocator_warp_id=12, is_two_cta=True, two_cta_tmem_dealloc_mbar_ptr=fbwd_tmem_dealloc_ptr)
+    fbwd_q_bytes = cute.size_in_bytes({io_dtype}, cute.select(_fbwd_qsl, mode=[0, 1, 2])) * 2
+    fbwd_k_bytes = cute.size_in_bytes({io_dtype}, cute.select(_fbwd_ksl, mode=[0, 1, 2])) * 2
+    fbwd_kt_bytes = cute.size_in_bytes({io_dtype}, cute.select(_fbwd_ktl, mode=[0, 1, 2])) * 2
+    fbwd_do_bytes = fbwd_q_bytes * 2
+    fbwd_q_prod, fbwd_q_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_q_bytes, barrier_storage=storage.q_mbar_ptr.data_ptr(), cta_layout_vmnk=_fbwd_cluster_vmnk).make_participants()
+    fbwd_qt_prod, fbwd_qt_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_q_bytes, barrier_storage=storage.qt_mbar_ptr.data_ptr(), cta_layout_vmnk=_fbwd_cluster_vmnk).make_participants()
+    fbwd_kt_prod, fbwd_kt_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_kt_bytes, barrier_storage=storage.kt_mbar_ptr.data_ptr(), cta_layout_vmnk=_fbwd_cluster_vmnk).make_participants()
+    fbwd_k_prod, fbwd_k_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_k_bytes, barrier_storage=storage.k_mbar_ptr.data_ptr(), cta_layout_vmnk=_fbwd_cluster_vmnk).make_participants()
+    fbwd_v_prod, fbwd_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_k_bytes, barrier_storage=storage.v_mbar_ptr.data_ptr(), cta_layout_vmnk=_fbwd_cluster_vmnk).make_participants()
+    fbwd_do_prod, fbwd_do_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_do_bytes, barrier_storage=storage.do_mbar_ptr.data_ptr(), cta_layout_vmnk=_fbwd_cluster_vmnk).make_participants()
+    cutlass_pipeline_flash.pipeline_init_arrive(cluster_shape_mn=_fbwd_cluster_vmnk, is_relaxed=True)
+    cutlass_pipeline_flash.pipeline_init_wait(cluster_shape_mn=_fbwd_cluster_vmnk)
+    fbwd_sst = _fbwd_ss_mma.get_slice(fbwd_rank)
+    fbwd_tst = _fbwd_ts_mma.get_slice(fbwd_rank)
+    fbwd_dqt = _fbwd_dq_mma.get_slice(fbwd_rank)
+    fbwd_mcast = cutlass_pipeline_flash.PipelineUmmaAsync._compute_tmem_sync_mask(_fbwd_cluster_vmnk)
+    gK = cute.flat_divide(_fbwd_mKt, cute.select((256, 128, {d}), mode=[0, 2]))
+    gV = cute.flat_divide(_fbwd_mVt, cute.select((256, 128, {d}), mode=[0, 2]))
+    gQ = cute.flat_divide(_fbwd_mQt, cute.select((256, 128, {d}), mode=[1, 2]))
+    gdOt = cute.flat_divide(_fbwd_mdOtN, cute.select((256, 128, {d}), mode=[1, 2]))
+    gdO = cute.flat_divide(_fbwd_mdOtT, cute.select((256, {d}, 128), mode=[1, 2]))
+    gQt = cute.flat_divide(_fbwd_mQtT, cute.select((256, {d}, 128), mode=[1, 2]))
+    gKt = cute.flat_divide(_fbwd_mKtT, cute.select((128, {d}, 256), mode=[1, 2]))
+    tSgK = fbwd_sst.partition_A(gK)
+    tSgV = fbwd_sst.partition_A(gV)
+    tSgQ = fbwd_sst.partition_B(gQ)
+    tSgDOt = fbwd_sst.partition_B(gdOt)
+    tTSgDO = fbwd_tst.partition_B(gdO)
+    tTSgQt = fbwd_tst.partition_B(gQt)
+    tDQgKt = fbwd_dqt.partition_B(gKt)
+    tKsK, tKgK_kdl = cute_cpasync_flash.tma_partition(_fbwd_tma_k, 0, cute.make_layout(1), cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3))
+    tVsV, tVgV_kdl = cute_cpasync_flash.tma_partition(_fbwd_tma_v, 0, cute.make_layout(1), cute.group_modes(sV, 0, 3), cute.group_modes(tSgV, 0, 3))
+    tQsQ, tQgQ_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_q, 0, cute.make_layout(1), cute.group_modes(sQ, 0, 3), cute.group_modes(tSgQ, 0, 3))
+    tDOTsDOT, tDOTgDOT_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_dot, 0, cute.make_layout(1), cute.group_modes(sdOt, 0, 3), cute.group_modes(tSgDOt, 0, 3))
+    tDOsDO, tDOgDO_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_do2, 0, cute.make_layout(1), cute.group_modes(sdO, 0, 3), cute.group_modes(tTSgDO, 0, 3))
+    tQTsQT, tQTgQT_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_qt, 0, cute.make_layout(1), cute.group_modes(sQt, 0, 3), cute.group_modes(tTSgQt, 0, 3))
+    tKTsKT, tKTgKT_kdl = cute_cpasync_flash.tma_partition(_fbwd_tma_kt, 0, cute.make_layout(1), cute.group_modes(sKt, 0, 3), cute.group_modes(tDQgKt, 0, 3))
+    if warp_idx == 14:
+        fbwd_rphase = cutlass.Int32(0)
+        for fbwd_i in cutlass.range(fbwd_steps, unroll=1):
+            _helion_flash_rt.mbar_spin_wait(fbwd_ds_cl_full_ptr, fbwd_rphase, 10000000)
+            fbwd_rphase ^= 1
+            with cute.arch.elect_one():
+                _helion_flash_rt.mbarrier_arrive(fbwd_ds_cl_leader_ptr, cutlass.Int32(0))
+    if warp_idx == 13:
+        tKgK = tKgK_kdl[None, None, 0, 0]
+        tVgV = tVgV_kdl[None, None, 0, 0]
+        tQgQ = tQgQ_qdl[None, None, 0, 0]
+        tDOTgDOT = tDOTgDOT_qdl[None, None, 0, 0]
+        tDOgDO = tDOgDO_qdl[None, 0, None, 0]
+        tQTgQT = tQTgQT_qdl[None, 0, None, 0]
+        tKTgKT = tKTgKT_kdl[None, 0, None, 0]
+        fbwd_ke = fbwd_k_prod.acquire_and_advance()
+        cute.copy(_fbwd_tma_k, tKgK[None, fbwd_cl_tile], tKsK[None, fbwd_ke.index], tma_bar_ptr=fbwd_ke.barrier)
+        fbwd_ve = fbwd_v_prod.acquire_and_advance()
+        cute.copy(_fbwd_tma_v, tVgV[None, fbwd_cl_tile], tVsV[None, fbwd_ve.index], tma_bar_ptr=fbwd_ve.barrier)
+        fbwd_kte = fbwd_kt_prod.acquire_and_advance()
+        cute.copy(_fbwd_tma_kt, tKTgKT[None, fbwd_cl_tile], tKTsKT[None, fbwd_kte.index], tma_bar_ptr=fbwd_kte.barrier)
+        for fbwd_i in cutlass.range(fbwd_steps, unroll=1):
+            fbwd_q_tile = fbwd_q_tile_base + fbwd_m_start + fbwd_i
+            fbwd_qe = fbwd_q_prod.acquire_and_advance()
+            cute.copy(_fbwd_tma_q, tQgQ[None, fbwd_q_tile], tQsQ[None, fbwd_qe.index], tma_bar_ptr=fbwd_qe.barrier)
+            fbwd_qte = fbwd_qt_prod.acquire_and_advance()
+            cute.copy(_fbwd_tma_qt, tQTgQT[None, fbwd_q_tile], tQTsQT[None, fbwd_qte.index], tma_bar_ptr=fbwd_qte.barrier)
+            fbwd_doe = fbwd_do_prod.acquire_and_advance()
+            cute.copy(_fbwd_tma_dot, tDOTgDOT[None, fbwd_q_tile], tDOTsDOT[None, fbwd_doe.index], tma_bar_ptr=fbwd_doe.barrier)
+            cute.copy(_fbwd_tma_do2, tDOgDO[None, fbwd_q_tile], tDOsDO[None, fbwd_doe.index], tma_bar_ptr=fbwd_doe.barrier)
+        fbwd_q_prod.tail()
+        fbwd_qt_prod.tail()
+        fbwd_do_prod.tail()
+        fbwd_k_prod.tail()
+        fbwd_v_prod.tail()
+        fbwd_kt_prod.tail()
+    if warp_idx == 12:
+        fbwd_tmem.allocate(512)
+        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
+        fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
+        if fbwd_is_leader:
+            fbwd_s_shape = fbwd_sst.partition_shape_C((256, 128))
+            tStS_frag = fbwd_sst.make_fragment_C(fbwd_s_shape)
+            fbwd_dkv_shape = fbwd_tst.partition_shape_C((256, {d}))
+            tDKV_frag = fbwd_tst.make_fragment_C(fbwd_dkv_shape)
+            fbwd_dq_shape = fbwd_dqt.partition_shape_C((128, {d}))
+            tDQ_frag = fbwd_dqt.make_fragment_C(fbwd_dq_shape)
+            tS_t = cute.make_tensor(fbwd_tmem_ptr, tStS_frag.layout)
+            tdP_t = cute.make_tensor(fbwd_tmem_ptr + 256, tStS_frag.layout)
+            tDV_t = cute.make_tensor(fbwd_tmem_ptr + 128, tDKV_frag.layout)
+            tDK_t = cute.make_tensor(fbwd_tmem_ptr + 384, tDKV_frag.layout)
+            tDQ_t = cute.make_tensor(fbwd_tmem_ptr + 64, tDQ_frag.layout)
+            tP = cute.make_tensor(tS_t.iterator, _fbwd_ptl.outer)
+            tDS = cute.make_tensor(tdP_t.iterator, _fbwd_ptl.outer)
+            tSrK = fbwd_sst.make_fragment_A(sK)
+            tSrQ = fbwd_sst.make_fragment_B(sQ)
+            tSrV = fbwd_sst.make_fragment_A(sV)
+            tSrDOt = fbwd_sst.make_fragment_B(sdOt)
+            tTSrP = fbwd_tst.make_fragment_A(tP)
+            tTSrDS = fbwd_tst.make_fragment_A(tDS)
+            tTSrDO = fbwd_tst.make_fragment_B(sdO)
+            tTSrQt = fbwd_tst.make_fragment_B(sQt)
+            tDQrDS = fbwd_dqt.make_fragment_A(fbwd_sdS_mn)
+            tDQrKt = fbwd_dqt.make_fragment_B(sKt)
+            fbwd_s_addr = tS_t.iterator.toint()
+            fbwd_dp_addr = tdP_t.iterator.toint()
+            fbwd_dv_addr = tDV_t.iterator.toint()
+            fbwd_dk_addr = tDK_t.iterator.toint()
+            fbwd_dqa_addr = tDQ_t.iterator.toint()
+            fbwd_k_base = _helion_flash_ptx.smem_desc_base_from_tensor(sK, _helion_flash_ptx.Major.K)
+            _helion_flash_ptx.declare_ptx_smem_desc(_helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, 0].iterator), fbwd_k_base, tSrK[None, None, None, 0].layout, "helion_fbwd_k_desc")
+            fbwd_v_base = _helion_flash_ptx.smem_desc_base_from_tensor(sV, _helion_flash_ptx.Major.K)
+            _helion_flash_ptx.declare_ptx_smem_desc(_helion_flash_ptx.make_smem_desc_start_addr(sV[None, None, None, 0].iterator), fbwd_v_base, tSrV[None, None, None, 0].layout, "helion_fbwd_v_desc")
+            _helion_flash_ptx.declare_ptx_idesc(_fbwd_ss_mma.op, "helion_fbwd_ss_idesc")
+            fbwd_q_base = _helion_flash_ptx.smem_desc_base_from_tensor(sQ, _helion_flash_ptx.Major.K)
+            fbwd_dot_base = _helion_flash_ptx.smem_desc_base_from_tensor(sdOt, _helion_flash_ptx.Major.K)
+            fbwd_do2_base = _helion_flash_ptx.smem_desc_base_from_tensor(sdO, _helion_flash_ptx.Major.MN)
+            fbwd_qt_base = _helion_flash_ptx.smem_desc_base_from_tensor(sQt, _helion_flash_ptx.Major.MN)
+            _helion_flash_ptx.declare_ptx_idesc(_fbwd_ts_mma.op, "helion_fbwd_ts_idesc")
+            fbwd_dsmn_base = _helion_flash_ptx.smem_desc_base_from_tensor(fbwd_sdS_mn, _helion_flash_ptx.Major.MN)
+            _helion_flash_ptx.declare_ptx_smem_desc(_helion_flash_ptx.make_smem_desc_start_addr(fbwd_sdS_mn[None, None, None, 0].iterator), fbwd_dsmn_base, tDQrDS[None, None, None, 0].layout, "helion_fbwd_dsmn_desc")
+            fbwd_kt_base = _helion_flash_ptx.smem_desc_base_from_tensor(sKt, _helion_flash_ptx.Major.MN)
+            _helion_flash_ptx.declare_ptx_idesc(_fbwd_dq_mma.op, "helion_fbwd_dq_idesc")
+            fbwd_ke = fbwd_k_cons.wait_and_advance()
+            fbwd_ve = fbwd_v_cons.wait_and_advance()
+            fbwd_kte = fbwd_kt_cons.wait_and_advance()
+            fbwd_pf_phase = cutlass.Int32(0)
+            fbwd_dst_phase = cutlass.Int32(0)
+            fbwd_dss_phase = cutlass.Int32(0)
+            fbwd_dcl_phase = cutlass.Int32(0)
+            fbwd_dqe_phase = cutlass.Int32(0)
+            fbwd_dk_zero = cutlass.Boolean(True)
+            fbwd_qe = fbwd_q_cons.wait_and_advance()
+            _helion_flash_ptx.gemm_ptx_precomputed_qk(fbwd_s_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQ[None, None, None, fbwd_qe.index].iterator), fbwd_q_base, tSrQ[None, None, None, 0].layout, "helion_fbwd_k_desc", "helion_fbwd_ss_idesc", smem_offset=0, zero_init=True, cta_group=2)
+            with cute.arch.elect_one():
+                cute_tcgen05_flash.commit(fbwd_s_full_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
+            fbwd_qe.release()
+            fbwd_doe = fbwd_do_cons.wait_and_advance()
+            _helion_flash_ptx.gemm_ptx_precomputed_qk(fbwd_dp_addr, _helion_flash_ptx.make_smem_desc_start_addr(sdOt[None, None, None, fbwd_doe.index].iterator), fbwd_dot_base, tSrDOt[None, None, None, 0].layout, "helion_fbwd_v_desc", "helion_fbwd_ss_idesc", smem_offset=0, zero_init=True, cta_group=2)
+            with cute.arch.elect_one():
+                cute_tcgen05_flash.commit(fbwd_dp_full_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
+            _helion_flash_rt.mbar_spin_wait(fbwd_p_full_ptr, fbwd_pf_phase, 10000000)
+            fbwd_pf_phase ^= 1
+            _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(fbwd_dv_addr, fbwd_s_addr, _helion_flash_ptx.make_smem_desc_start_addr(sdO[None, None, None, fbwd_doe.index].iterator), fbwd_do2_base, tTSrP[None, None, None, 0].layout, tTSrDO[None, None, None, 0].layout, "helion_fbwd_ts_idesc", zero_init=True, cta_group=2)
+            for fbwd_i in cutlass.range(fbwd_steps - 1, unroll=1):
+                if fbwd_i > 0:
+                    _helion_flash_rt.mbar_spin_wait(fbwd_dq_empty_ptr, fbwd_dqe_phase, 10000000)
+                    fbwd_dqe_phase ^= 1
+                fbwd_qe = fbwd_q_cons.wait_and_advance()
+                _helion_flash_ptx.gemm_ptx_precomputed_qk(fbwd_s_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQ[None, None, None, fbwd_qe.index].iterator), fbwd_q_base, tSrQ[None, None, None, 0].layout, "helion_fbwd_k_desc", "helion_fbwd_ss_idesc", smem_offset=0, zero_init=True, cta_group=2)
+                with cute.arch.elect_one():
+                    cute_tcgen05_flash.commit(fbwd_s_full_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
+                fbwd_qe.release()
+                fbwd_qte = fbwd_qt_cons.wait_and_advance()
+                _helion_flash_rt.mbar_spin_wait(fbwd_ds_tmem_full_ptr, fbwd_dst_phase, 10000000)
+                fbwd_dst_phase ^= 1
+                _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(fbwd_dk_addr, fbwd_dp_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qte.index].iterator), fbwd_qt_base, tTSrDS[None, None, None, 0].layout, tTSrQt[None, None, None, 0].layout, "helion_fbwd_ts_idesc", zero_init=fbwd_dk_zero, cta_group=2)
+                fbwd_dk_zero = cutlass.Boolean(False)
+                fbwd_qte.release()
+                fbwd_doe.release()
+                fbwd_doe = fbwd_do_cons.wait_and_advance()
+                _helion_flash_ptx.gemm_ptx_precomputed_qk(fbwd_dp_addr, _helion_flash_ptx.make_smem_desc_start_addr(sdOt[None, None, None, fbwd_doe.index].iterator), fbwd_dot_base, tSrDOt[None, None, None, 0].layout, "helion_fbwd_v_desc", "helion_fbwd_ss_idesc", smem_offset=0, zero_init=True, cta_group=2)
+                with cute.arch.elect_one():
+                    cute_tcgen05_flash.commit(fbwd_dp_full_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
+                _helion_flash_rt.mbar_spin_wait(fbwd_ds_smem_full_ptr, fbwd_dss_phase, 10000000)
+                fbwd_dss_phase ^= 1
+                _helion_flash_rt.mbar_spin_wait(fbwd_ds_cl_leader_ptr, fbwd_dcl_phase, 10000000)
+                fbwd_dcl_phase ^= 1
+                _helion_flash_ptx.gemm_ptx_precomputed_qk(fbwd_dqa_addr, _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, fbwd_kte.index].iterator), fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dsmn_desc", "helion_fbwd_dq_idesc", smem_offset=0, zero_init=True, cta_group=2)
+                with cute.arch.elect_one():
+                    cute_tcgen05_flash.commit(fbwd_dq_full_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
+                _helion_flash_rt.mbar_spin_wait(fbwd_p_full_ptr, fbwd_pf_phase, 10000000)
+                fbwd_pf_phase ^= 1
+                _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(fbwd_dv_addr, fbwd_s_addr, _helion_flash_ptx.make_smem_desc_start_addr(sdO[None, None, None, fbwd_doe.index].iterator), fbwd_do2_base, tTSrP[None, None, None, 0].layout, tTSrDO[None, None, None, 0].layout, "helion_fbwd_ts_idesc", zero_init=False, cta_group=2)
+            fbwd_qte = fbwd_qt_cons.wait_and_advance()
+            _helion_flash_rt.mbar_spin_wait(fbwd_ds_tmem_full_ptr, fbwd_dst_phase, 10000000)
+            _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(fbwd_dk_addr, fbwd_dp_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qte.index].iterator), fbwd_qt_base, tTSrDS[None, None, None, 0].layout, tTSrQt[None, None, None, 0].layout, "helion_fbwd_ts_idesc", zero_init=fbwd_dk_zero, cta_group=2)
+            fbwd_qte.release()
+            if fbwd_steps > 1:
+                _helion_flash_rt.mbar_spin_wait(fbwd_dq_empty_ptr, fbwd_dqe_phase, 10000000)
+                fbwd_dqe_phase ^= 1
+            _helion_flash_rt.mbar_spin_wait(fbwd_ds_smem_full_ptr, fbwd_dss_phase, 10000000)
+            _helion_flash_rt.mbar_spin_wait(fbwd_ds_cl_leader_ptr, fbwd_dcl_phase, 10000000)
+            _helion_flash_ptx.gemm_ptx_precomputed_qk(fbwd_dqa_addr, _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, fbwd_kte.index].iterator), fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dsmn_desc", "helion_fbwd_dq_idesc", smem_offset=0, zero_init=True, cta_group=2)
+            with cute.arch.elect_one():
+                cute_tcgen05_flash.commit(fbwd_dq_full_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
+            fbwd_doe.release()
+            with cute.arch.elect_one():
+                cute_tcgen05_flash.commit(fbwd_dkv_done_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
+            fbwd_ke.release()
+            fbwd_ve.release()
+            fbwd_kte.release()
+        fbwd_tmem.relinquish_alloc_permit()
+        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
+        fbwd_tmem.free(fbwd_tmem_ptr)
+    if warp_idx < 4:
+        fbwd_dq_shape = fbwd_dqt.partition_shape_C((128, {d}))
+        tDQ_frag = fbwd_dqt.make_fragment_C(fbwd_dq_shape)
+        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
+        fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
+        tDQ_t = cute.make_tensor(fbwd_tmem_ptr + 64, tDQ_frag.layout)
+        cDQ = cute.make_identity_tensor((128, {d}))
+        tDQcDQ = fbwd_dqt.partition_C(cDQ)
+        fbwd_dq_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
+        fbwd_tiled_dq_ld = cute_tcgen05_flash.make_tmem_copy(fbwd_dq_ld_atom, tDQ_t)
+        fbwd_thr_dq_ld = fbwd_tiled_dq_ld.get_slice(fbwd_local_tidx)
+        tRDtDQ = fbwd_thr_dq_ld.partition_S(tDQ_t)
+        tRDcDQ = fbwd_thr_dq_ld.partition_D(tDQcDQ)
+        fbwd_out_scale = cutlass.Float32({out_scale_expr})
+        fbwd_my_m = cutlass.Int32(tRDcDQ[0][0])
+        fbwd_m_org = fbwd_my_m // 64 * 64
+        fbwd_m_loc = fbwd_my_m % 64
+        fbwd_phase = cutlass.Int32(0)
+        for fbwd_i in cutlass.range(fbwd_steps, unroll=1):
+            fbwd_m_tile = fbwd_m_start + fbwd_i
+            fbwd_row_base = fbwd_q_row_base + fbwd_m_tile * 128
+            _helion_flash_rt.mbar_spin_wait(fbwd_dq_full_ptr, fbwd_phase, 10000000)
+            fbwd_phase ^= 1
+            tRDrDQ = cute.make_rmem_tensor(tRDcDQ.shape, cutlass.Float32)
+            cute.copy(fbwd_tiled_dq_ld, tRDtDQ, tRDrDQ)
+            cute.arch.fence_view_async_tmem_load()
+            with cute.arch.elect_one():
+                _helion_flash_rt.mbarrier_arrive(fbwd_dq_empty_ptr, cutlass.Int32(0))
+            _helion_flash_rt._scale_fragment_packed_f32x2(tRDrDQ, fbwd_out_scale)
+            fbwd_ndq = cute.size(tRDrDQ)
+            for fbwd_p in cutlass.range_constexpr(2):
+                if fbwd_m_loc // 32 == fbwd_p:
+                    for fbwd_j in cutlass.range_constexpr(fbwd_ndq):
+                        fbwd_sdq[fbwd_m_loc % 32 * {d} + cutlass.Int32(tRDcDQ[fbwd_j][1])] = tRDrDQ[fbwd_j]
+                cute.arch.fence_view_async_shared()
+                _helion_flash_rt.named_barrier_wait_unaligned(4, 128)
+                if warp_idx == 0:
+                    with cute.arch.elect_one():
+                        _helion_flash_rt.cpasync_reduce_bulk_add_f32(fbwd_sdq.iterator, _fbwd_mDQ.iterator + (fbwd_row_base + fbwd_m_org + fbwd_p * 32) * {d}, {32 * d * 4})
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0)
+                _helion_flash_rt.named_barrier_wait_unaligned(4, 128)
+        _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)
+{compute_blocks}"""
+    return body  # noqa: RET504
+
+
+_FLASH_BWD_2CTA_KERNEL_PARAMS = (
+    "_fbwd_ss_mma",
+    "_fbwd_ts_mma",
+    "_fbwd_dq_mma",
+    "_fbwd_cluster_vmnk",
+    "_fbwd_tma_q",
+    "_fbwd_mQt",
+    "_fbwd_tma_k",
+    "_fbwd_mKt",
+    "_fbwd_tma_v",
+    "_fbwd_mVt",
+    "_fbwd_tma_dot",
+    "_fbwd_mdOtN",
+    "_fbwd_tma_do2",
+    "_fbwd_mdOtT",
+    "_fbwd_tma_qt",
+    "_fbwd_mQtT",
+    "_fbwd_tma_kt",
+    "_fbwd_mKtT",
+    "_fbwd_qsl",
+    "_fbwd_ksl",
+    "_fbwd_vsl",
+    "_fbwd_dosl",
+    "_fbwd_ptl",
+    "_fbwd_dotl",
+    "_fbwd_qtl",
+    "_fbwd_ktl",
+    "_fbwd_dssl",
+    "_fbwd_mLSE",
+    "_fbwd_mDelta",
+    "_fbwd_mDQ",
+    "_fbwd_mdK",
+    "_fbwd_mdV",
+)
+
+
 _FLASH_BWD_KERNEL_PARAMS = (
     "_fbwd_ss_mma",
     "_fbwd_ts_mma",
@@ -1207,7 +1729,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
 
     df = cg.device_function
     match = df.cute_state.attention_flash_bwd_match
-    if match is None:
+    if not isinstance(match, AttentionBwdMatch):
         return False
     plan: AttentionBwdPlan = match.plan
 
@@ -1278,11 +1800,24 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
 
     if match.qk_scale_sym is None or match.out_scale_sym is None:
         return False
-    scale2_expr = df.sympy_expr(match.qk_scale_sym)
-    out_scale_expr = df.sympy_expr(match.out_scale_sym)
+    scale2_expr = df.sympy_expr(match.qk_scale_sym)  # pyrefly: ignore [bad-argument-type]
+    out_scale_expr = df.sympy_expr(match.out_scale_sym)  # pyrefly: ignore [bad-argument-type]
 
     env = CompileEnvironment.current()
     io_dtype_str = env.backend.dtype_str(plan.io_dtype)
+    # The 2-CTA cluster family (FA4's d128 configuration) requires 256-row
+    # cluster KV tiles that never span a (batch, head) group boundary.
+    # 2-CTA cluster family (FA4's native d128 config) is implemented but has a
+    # residual dV/dK accumulation bug across the skewed schedule (second
+    # m-tile drops, first doubles); dQ + the DSMEM dS exchange are verified
+    # correct. Off by default -> d128 uses the correct optimized 1-CTA path.
+    # Opt in with HELION_CUTE_FLASH_BWD_2CTA=1 to continue the bring-up.
+    two_cta = (
+        os.environ.get("HELION_CUTE_FLASH_BWD_2CTA", "0") == "1"
+        and d == 128
+        and plan.n_dim % 256 == 0
+        and plan.total_kv_rows % 256 == 0
+    )
     # FA4 1-CTA staging: Q double-buffered (spans two skewed iterations);
     # dO single-stage at head_dim 128 to fit the 227KB smem budget.
     q_stage = 2
@@ -1307,21 +1842,40 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
         "total_kv_rows": plan.total_kv_rows,
         "q_stage": q_stage,
         "do_stage": do_stage,
+        "two_cta": two_cta,
+        # NOTE: without min_blocks_per_mp at launch, ptxas silently drops the
+        # setmaxnreg reallocation and all warps run at a uniform 128
+        # registers. Measured FASTER than the current explicit budgets with
+        # min_blocks_per_mp=1 (plan "topology": "fa4" enables it): d128
+        # 9.92ms vs 12.76. Revisit as a coupled autotuner knob
+        # (min_blocks + per-group budgets) later.
     }
     cg.cute_wrapper_plans.append(wrapper_plan)  # type: ignore[attr-defined]
-    df.wrapper_only_params.extend(_FLASH_BWD_KERNEL_PARAMS)
+    if two_cta:
+        df.wrapper_only_params.extend(_FLASH_BWD_2CTA_KERNEL_PARAMS)
+        df.cute_state.cluster_shape = (2, 1, 1)
+    else:
+        df.wrapper_only_params.extend(_FLASH_BWD_KERNEL_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())  # type: ignore[union-attr]
     cg.cute_uses_matmul = True  # type: ignore[attr-defined]
     df.cute_state.attention_flash_threads = 512
 
-    body_src = emit_flash_bwd_device_body(
-        plan=plan,
-        io_dtype=io_dtype_str,
-        scale2_expr=scale2_expr,
-        out_scale_expr=out_scale_expr,
-        q_stage=q_stage,
-        do_stage=do_stage,
-    )
+    if two_cta:
+        body_src = emit_flash_bwd_2cta_device_body(
+            plan=plan,
+            io_dtype=io_dtype_str,
+            scale2_expr=scale2_expr,
+            out_scale_expr=out_scale_expr,
+        )
+    else:
+        body_src = emit_flash_bwd_device_body(
+            plan=plan,
+            io_dtype=io_dtype_str,
+            scale2_expr=scale2_expr,
+            out_scale_expr=out_scale_expr,
+            q_stage=q_stage,
+            do_stage=do_stage,
+        )
     wrapped = ast_module.parse("if True:\n" + body_src)
     assert isinstance(wrapped.body[0], ast_module.If)
     df.body = list(wrapped.body[0].body)
