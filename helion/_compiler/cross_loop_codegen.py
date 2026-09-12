@@ -18,7 +18,6 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cross_loop_scheduler import _RESIDENT_LAUNCH_STAGE
-from .cross_loop_scheduler import _SOURCE_LAUNCH_STAGE
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
 from .cross_loop_scheduler import ReadinessProducer
@@ -773,18 +772,6 @@ def emit_cross_loop_schedule(
     source_stage_root = (
         None if source_ticket_segment is None else source_ticket_segment.root
     )
-    launch_stage_zero_segments = tuple(
-        segment
-        for segment in static_pipeline_plan.worker_schedule.segments
-        if segment.launch_stage == _SOURCE_LAUNCH_STAGE
-    )
-    if bool(launch_stage_zero_segments) != (source_ticket_segment is not None) or (
-        source_ticket_segment is not None
-        and launch_stage_zero_segments != (source_ticket_segment,)
-    ):
-        raise AssertionError(
-            "source dispatch requires one exact launch-stage-zero segment"
-        )
     source_ticket_task_count = (
         source_ticket_segment.task_count if source_ticket_segment is not None else 0
     )
@@ -2472,13 +2459,6 @@ def emit_cross_loop_schedule(
         )
     else:
         assert dispatch_ticket is not None
-        if (
-            source_stage_root in readiness_consumers_by_root
-            or source_stage_root in root_barrier_incoming
-        ):
-            raise AssertionError(
-                "a source-ticket root may not have incoming dependencies"
-            )
         source_ticket_body = scheduled_root_task_body(
             source_stage_root,
             dispatch_ticket,

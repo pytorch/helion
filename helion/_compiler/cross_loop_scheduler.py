@@ -10783,9 +10783,8 @@ def _global_unit_list_schedule(
         return None
     if pipeline_depth == 1:
         return worker_schedule
-    if _source_ticket_schedule_segment(
-        worker_schedule
-    ) is None and not _emitted_prerequisites(
+    source_ticket_segment = _source_ticket_schedule_segment(worker_schedule)
+    if source_ticket_segment is None and not _emitted_prerequisites(
         readiness_counters,
         root_barrier_edges,
     ):
@@ -10799,7 +10798,7 @@ def _global_unit_list_schedule(
     )
     if candidate is None:
         return worker_schedule
-    if _source_ticket_schedule_segment(worker_schedule) is not None:
+    if source_ticket_segment is not None:
         return candidate
 
     # Unit-task list scheduling must not lengthen an otherwise equivalent

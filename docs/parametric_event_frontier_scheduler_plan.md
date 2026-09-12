@@ -1110,6 +1110,9 @@ and the deferred internal ticketed-phase generalization are stated explicitly.
 A follow-up removes test-only schedule materialization methods and stores only
 the three primitive root-publication owner counts; real arrivals and replay
 stride are now derived from those facts rather than duplicated in the plan.
+Codegen consumes the validated source-stage segment directly instead of
+rechecking ownership and incoming-dependency invariants already frozen by
+`StaticPipelinePlan`.
 
 ### Explicitly deferred
 
