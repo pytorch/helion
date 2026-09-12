@@ -28,7 +28,7 @@ from .cross_loop_scheduler import WorkerScheduleSegment
 from .cross_loop_scheduler import _normalize_intervals
 from .cross_loop_scheduler import _packed_root_major_task_order_relation
 from .cross_loop_scheduler import _packed_schedule_segment_geometry
-from .cross_loop_scheduler import _parametric_root_major_schedule_geometry
+from .cross_loop_scheduler import _root_major_schedule_geometry
 from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import _source_ticket_schedule_segment
 from .cross_loop_scheduler import build_static_pipeline_plan
@@ -716,7 +716,7 @@ def emit_cross_loop_schedule(
         running_offset += domain.size
     case_offset_strings = [str(offset) for offset in case_offsets]
     all_readiness_counter_plans = static_pipeline_plan.readiness_counters
-    root_major_schedule_geometry = _parametric_root_major_schedule_geometry(
+    root_major_schedule_geometry = _root_major_schedule_geometry(
         static_pipeline_plan.worker_schedule
     )
     schedule_segment_geometry = (

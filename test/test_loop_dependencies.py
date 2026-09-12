@@ -462,7 +462,6 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertEqual(first_hashes, second_hashes)
         self.assertEqual(len(first_hashes), 1)
         self.assertIn("runtime_metadata", code)
-        self.assertNotIn("tile_dependency_parameterized_state", code)
 
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)

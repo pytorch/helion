@@ -88,7 +88,6 @@ def _compile(
     *,
     multiplier: int,
     request_major: bool,
-    supported_intermediate_continuations: bool = False,
     active_participant_barriers: bool = False,
     bounded_unit_barriers: bool = False,
 ) -> tuple[CompiledConfig, dict[str, object], str, dict[str, object]]:
@@ -105,10 +104,8 @@ def _compile(
     bound.config_spec.normalize(config.config)
 
     path_records: dict[str, object] = {}
-    original_root_major = cross_loop_scheduler._build_root_major_worker_schedule
-    original_event_frontier = (
-        cross_loop_scheduler._build_parametric_event_frontier_worker_schedule
-    )
+    original_baseline = cross_loop_scheduler.build_baseline_worker_schedule
+    original_event_frontier = cross_loop_scheduler._event_frontier_list_schedule
     original_global = cross_loop_scheduler._global_unit_list_schedule
     original_pipeline_plan = cross_loop_codegen.build_static_pipeline_plan
     original_build_readiness_graph = cross_loop_scheduler.build_readiness_graph
@@ -145,12 +142,13 @@ def _compile(
                             consumer.keys_by_consumer.is_positional_bijection()
                         ),
                         "continuation_counter_supported": (
-                            cross_loop_scheduler._supports_parameterized_counter(
+                            cross_loop_scheduler._supports_exact_counter_plan_lowering(
                                 cross_loop_scheduler.ReadinessCounterPlan(
                                     producers=event.producers,
                                     consumers=(consumer,),
                                     continuation_consumer_index=0,
-                                )
+                                ),
+                                result.root_domains,
                             )
                         ),
                     }
@@ -221,9 +219,9 @@ def _compile(
         ]
         return result
 
-    def root_major(*call_args: object, **call_kwargs: object):  # noqa: ANN202
-        result = original_root_major(*call_args, **call_kwargs)
-        path_records["parametric_root_major"] = {
+    def baseline(*call_args: object, **call_kwargs: object):  # noqa: ANN202
+        result = original_baseline(*call_args, **call_kwargs)
+        path_records["baseline_worker_schedule"] = {
             "called": True,
             "segments": len(result.segments),
             "roots": [segment.root for segment in result.segments],
@@ -232,9 +230,10 @@ def _compile(
 
     def event_frontier(*call_args: object, **call_kwargs: object):  # noqa: ANN202
         result = original_event_frontier(*call_args, **call_kwargs)
-        path_records["parametric_event_frontier"] = {
+        path_records["event_frontier_proposal"] = {
             "called": True,
-            "accepted": result is not None,
+            "returned_schedule": result is not None,
+            "changed": result is not None and result != call_args[1],
             "segments": None if result is None else len(result.segments),
             "roots": (
                 None
@@ -246,113 +245,16 @@ def _compile(
 
     def global_list(*call_args: object, **call_kwargs: object):  # noqa: ANN202
         result = original_global(*call_args, **call_kwargs)
-        path_records["static_global_list"] = {
+        path_records["global_list_schedule"] = {
             "called": True,
-            "accepted": result is not None,
+            "returned_schedule": result is not None,
+            "changed": result is not None and result != call_args[1],
             "segments": None if result is None else len(result.segments),
         }
         return result
 
     def pipeline_plan(*call_args: object, **call_kwargs: object):  # noqa: ANN202
-        root_task_orders = call_kwargs["root_task_orders"]
-        root_domains = tuple(
-            task_order.target_domain for task_order in root_task_orders
-        )
-        if supported_intermediate_continuations and any(
-            domain.parameter_symbols for domain in root_domains
-        ):
-            # Diagnostic-only ablation: use the production proof machinery and
-            # change only admission of the two intermediate continuations that
-            # already carry complete parameterized counter certificates.
-            # The root IDs deliberately make this a Qwen attribution probe,
-            # not a proposed compiler policy.
-            worker_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
-                root_domains,
-                root_task_orders,
-                call_kwargs["worker_count"],
-            )
-            graph = cross_loop_scheduler.build_readiness_graph(
-                dependency_graph=call_kwargs["dependency_graph"],
-                root_task_orders=root_task_orders,
-                site_domains=call_kwargs["site_domains"],
-                publishable_site_ids=call_kwargs.get("publishable_site_ids"),
-                prove_nonnegative=call_kwargs.get("prove_nonnegative"),
-            )
-            candidates = cross_loop_scheduler.choose_final_arrival_continuations(
-                graph,
-                worker_schedule,
-            )
-            selected = tuple(
-                continuation
-                for continuation in candidates
-                if (
-                    tuple(
-                        producer.producer_root
-                        for producer in graph.event(continuation.event_id).producers
-                    ),
-                    graph.event(continuation.event_id)
-                    .consumers[continuation.consumer_index]
-                    .consumer_root,
-                )
-                in {((6,), 7), ((12,), 13)}
-            )
-            counters = tuple(
-                plan
-                for plan in cross_loop_scheduler.choose_readiness_counters(
-                    graph,
-                    selected,
-                )
-                if cross_loop_scheduler._supports_parameterized_counter(plan)
-            )
-            if sum(
-                plan.continuation_consumer_index is not None for plan in counters
-            ) != len(selected):
-                raise AssertionError(
-                    "supported continuation ablation lost a selected continuation"
-                )
-            counters, barriers = cross_loop_scheduler._finalize_emitted_synchronization(
-                readiness_graph=graph,
-                readiness_counters=counters,
-            )
-            if not cross_loop_scheduler._parameterized_prerequisites_follow_root_order(
-                counters,
-                barriers,
-            ):
-                raise AssertionError("continuation ablation broke root progress")
-            continuation_roots = frozenset(
-                consumer.consumer_root
-                for plan in counters
-                if (consumer := plan.continuation_consumer) is not None
-            )
-            worker_schedule = cross_loop_scheduler._build_root_major_worker_schedule(
-                root_domains,
-                root_task_orders,
-                call_kwargs["worker_count"],
-                excluded_roots=continuation_roots,
-            )
-            result = cross_loop_scheduler.StaticPipelinePlan(
-                worker_schedule=worker_schedule,
-                root_task_orders=root_task_orders,
-                readiness_counters=counters,
-                root_barrier_edges=barriers,
-            )
-            path_records["diagnostic_continuation_ablation"] = {
-                "selected": [
-                    {
-                        "producer_roots": [
-                            producer.producer_root
-                            for producer in graph.event(continuation.event_id).producers
-                        ],
-                        "consumer_root": graph.event(continuation.event_id)
-                        .consumers[continuation.consumer_index]
-                        .consumer_root,
-                    }
-                    for continuation in selected
-                ],
-                "excluded_roots": sorted(continuation_roots),
-            }
-        else:
-            result = original_pipeline_plan(*call_args, **call_kwargs)
+        result = original_pipeline_plan(*call_args, **call_kwargs)
         path_records["static_pipeline_plan"] = {
             "readiness_counters": [
                 {
@@ -400,7 +302,7 @@ def _compile(
         if len(captured_plan) != 1:
             raise AssertionError("active-barrier ablation did not capture one plan")
         (plan,) = captured_plan
-        geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
+        geometry = cross_loop_scheduler._root_major_schedule_geometry(
             plan.worker_schedule
         )
         if geometry is None:
@@ -592,10 +494,8 @@ def _compile(
         }
         return result
 
-    cross_loop_scheduler._build_root_major_worker_schedule = root_major
-    cross_loop_scheduler._build_parametric_event_frontier_worker_schedule = (
-        event_frontier
-    )
+    cross_loop_scheduler.build_baseline_worker_schedule = baseline
+    cross_loop_scheduler._event_frontier_list_schedule = event_frontier
     cross_loop_scheduler._global_unit_list_schedule = global_list
     cross_loop_scheduler.build_readiness_graph = readiness_graph
     cross_loop_scheduler.choose_final_arrival_continuations = choose_continuations
@@ -612,10 +512,8 @@ def _compile(
             raise RuntimeError("compiled Qwen kernel has no generated source path")
         code = Path(cache_path).read_text()
     finally:
-        cross_loop_scheduler._build_root_major_worker_schedule = original_root_major
-        cross_loop_scheduler._build_parametric_event_frontier_worker_schedule = (
-            original_event_frontier
-        )
+        cross_loop_scheduler.build_baseline_worker_schedule = original_baseline
+        cross_loop_scheduler._event_frontier_list_schedule = original_event_frontier
         cross_loop_scheduler._global_unit_list_schedule = original_global
         cross_loop_scheduler.build_readiness_graph = original_build_readiness_graph
         cross_loop_scheduler.choose_final_arrival_continuations = (
@@ -732,9 +630,6 @@ def benchmark(args: argparse.Namespace) -> dict[str, object]:
         exemplar_args,
         multiplier=args.multiplier,
         request_major=args.request_major,
-        supported_intermediate_continuations=(
-            args.supported_intermediate_continuations
-        ),
         active_participant_barriers=args.active_participant_barriers,
         bounded_unit_barriers=args.bounded_unit_barriers,
     )
@@ -879,11 +774,6 @@ def main() -> None:
     parser.add_argument("--multiplier", type=int, default=8)
     parser.add_argument("--request-major", action="store_true")
     parser.add_argument(
-        "--supported-intermediate-continuations",
-        action="store_true",
-        help="diagnostic Qwen-only ablation for already-certified 6->7 and 12->13",
-    )
-    parser.add_argument(
         "--active-participant-barriers",
         action="store_true",
         help="diagnostic weighted active-worker root-barrier lowering",
@@ -917,8 +807,9 @@ def main() -> None:
             "dynamic_scheduler_path": {
                 key: result["dynamic_scheduler_path"].get(key)
                 for key in (
-                    "parametric_root_major",
-                    "diagnostic_continuation_ablation",
+                    "baseline_worker_schedule",
+                    "event_frontier_proposal",
+                    "global_list_schedule",
                     "diagnostic_active_participant_barriers",
                     "focused_events",
                     "static_pipeline_plan",

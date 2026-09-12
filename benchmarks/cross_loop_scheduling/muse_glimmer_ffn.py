@@ -504,8 +504,6 @@ def _compile_persistent(
     gate_block_k: int,
     down_block_k: int,
     maxnreg: int | None,
-    max_list_nodes: int,
-    max_list_segments: int,
 ) -> tuple[CompiledConfig, tuple[dict[str, object], ...], dict[str, object]]:
     bound = MUSE_GLIMMER_FFN_KEYED.bind(args)
     values = dict(bound.config_spec.default_config())
@@ -536,224 +534,22 @@ def _compile_persistent(
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     original = cross_loop_scheduler._global_unit_list_schedule
-    original_overlap = cross_loop_scheduler._segment_dependency_support_overlaps
-    original_progress = cross_loop_scheduler._schedule_is_progress_safe
-    original_ordered = cross_loop_scheduler._ordered_root_tasks
-    original_successors = cross_loop_scheduler._semantic_task_successors
-    original_topological = cross_loop_scheduler._topological_order
-    original_slice = cross_loop_scheduler._task_order_slice
-    original_validate = cross_loop_scheduler._validate_worker_schedule_tasks
-    original_traversal = cross_loop_scheduler._root_schedule_traversal
-    original_max_list_nodes = cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES
-    original_max_list_segments = cross_loop_scheduler._MAX_GLOBAL_LIST_SEGMENTS
     records: list[dict[str, object]] = []
 
     def traced(*call_args: object, **call_kwargs: object):  # noqa: ANN202
-        unsupported_overlaps: list[dict[str, object]] = []
-        proposed_segments: list[dict[str, int]] = []
-        rejected_helpers: list[str] = []
-        rejected_traversals: list[dict[str, object]] = []
-        progress_diagnostics: list[dict[str, object]] = []
-
-        def traced_overlap(*overlap_args: object, **overlap_kwargs: object):  # noqa: ANN202
-            overlap = original_overlap(*overlap_args, **overlap_kwargs)
-            if overlap is None and len(unsupported_overlaps) < 8:
-                producer_segment = overlap_args[0]
-                keys_by_producer = overlap_args[1]
-                consumer_segment = overlap_args[2]
-                keys_by_consumer = overlap_args[3]
-                consumer_segment_keys = consumer_segment.task_order.then(
-                    keys_by_consumer
-                )
-                consumers_by_key = (
-                    None
-                    if consumer_segment_keys is None
-                    else consumer_segment_keys.converse()
-                )
-                producers_reaching_consumer = (
-                    None
-                    if consumers_by_key is None
-                    else keys_by_producer.then(consumers_by_key)
-                )
-                unsupported_overlaps.append(
-                    {
-                        "producer_root": producer_segment.root,
-                        "producer_tasks": producer_segment.task_count,
-                        "consumer_root": consumer_segment.root,
-                        "consumer_tasks": consumer_segment.task_count,
-                        "consumer_segment_keys": consumer_segment_keys is not None,
-                        "consumer_segment_keys_repr": repr(consumer_segment_keys),
-                        "consumers_by_key": consumers_by_key is not None,
-                        "producers_reaching_consumer": (
-                            producers_reaching_consumer is not None
-                        ),
-                        "producer_order_pieces": len(
-                            producer_segment.task_order.pieces
-                        ),
-                        "producer_order_converse": (
-                            producer_segment.task_order.converse() is not None
-                        ),
-                        "consumer_order_pieces": len(
-                            consumer_segment.task_order.pieces
-                        ),
-                    }
-                )
-            return overlap
-
-        def traced_progress(*progress_args: object, **progress_kwargs: object):  # noqa: ANN202
-            schedule = progress_args[0]
-            proposed_segments.extend(
-                {
-                    "root": segment.root,
-                    "tasks": segment.task_count,
-                    "worker_begin": segment.worker_begin,
-                    "worker_count": segment.worker_count,
-                    "dispatch_offset": segment.dispatch_offset,
-                }
-                for segment in schedule.segments
-            )
-            safe = original_progress(*progress_args, **progress_kwargs)
-            if not safe:
-                readiness_graph = progress_args[1]
-                readiness_counters = progress_args[2]
-                root_barrier_edges = progress_args[3]
-                source_segment = (
-                    cross_loop_scheduler._transient_source_schedule_segment(schedule)
-                )
-                source_root = None if source_segment is None else source_segment.root
-                continuations = (
-                    cross_loop_scheduler._emitted_final_arrival_continuations(
-                        readiness_graph,
-                        readiness_counters,
-                    )
-                )
-                continuation_by_root = (
-                    {}
-                    if continuations is None
-                    else cross_loop_scheduler._continuations_by_consumer_root(
-                        readiness_graph,
-                        continuations,
-                    )
-                )
-                excluded_roots = frozenset(continuation_by_root) | (
-                    frozenset()
-                    if source_root is None
-                    else frozenset((source_root,))
-                )
-                progress_diagnostics.append(
-                    {
-                        "continuations_supported": continuations is not None,
-                        "continuation_roots": sorted(continuation_by_root),
-                        "excluded_roots_have_segments": any(
-                            schedule.segments_for_root(root)
-                            for root in excluded_roots
-                        ),
-                        "symbolic_worker_rank": (
-                            cross_loop_scheduler._has_symbolic_worker_rank(schedule)
-                        ),
-                        "task_steps_supported": (
-                            cross_loop_scheduler._task_step_relations(
-                                schedule,
-                                readiness_graph,
-                                excluded_roots=excluded_roots,
-                            )
-                            is not None
-                        ),
-                        "acyclic_segment_precedence": (
-                            False
-                            if continuations is None
-                            else cross_loop_scheduler._has_acyclic_symbolic_segment_precedence(
-                                schedule,
-                                readiness_graph,
-                                readiness_counters,
-                                root_barrier_edges,
-                                continuation_by_root=continuation_by_root,
-                                excluded_roots=excluded_roots,
-                            )
-                        ),
-                    }
-                )
-            return safe
-
-        def trace_optional(name: str, function: Callable[..., object]):  # noqa: ANN202
-            def wrapper(*helper_args: object, **helper_kwargs: object):  # noqa: ANN202
-                value = function(*helper_args, **helper_kwargs)
-                if value is None or value is False:
-                    rejected_helpers.append(name)
-                return value
-
-            return wrapper
-
-        def traced_traversal(*traversal_args: object, **traversal_kwargs: object):  # noqa: ANN202
-            traversal = original_traversal(*traversal_args, **traversal_kwargs)
-            if (
-                traversal is None
-                or traversal.logical_task_to_scheduled_ordinal is None
-            ):
-                segments = traversal_args[0]
-                reference = traversal_args[1]
-                rejected_traversals.append(
-                    {
-                        "root": None if not segments else segments[0].root,
-                        "segment_count": len(segments),
-                        "task_counts": [segment.task_count for segment in segments],
-                        "has_traversal": traversal is not None,
-                        "has_inverse": (
-                            traversal is not None
-                            and traversal.logical_task_to_scheduled_ordinal is not None
-                        ),
-                        "task_order": (
-                            None if not segments else repr(segments[0].task_order)
-                        ),
-                        "reference_order": repr(reference),
-                    }
-                )
-            return traversal
-
-        cross_loop_scheduler._segment_dependency_support_overlaps = traced_overlap
-        cross_loop_scheduler._schedule_is_progress_safe = traced_progress
-        cross_loop_scheduler._ordered_root_tasks = trace_optional(
-            "ordered_root_tasks", original_ordered
-        )
-        cross_loop_scheduler._semantic_task_successors = trace_optional(
-            "semantic_task_successors", original_successors
-        )
-        cross_loop_scheduler._topological_order = trace_optional(
-            "topological_order", original_topological
-        )
-        cross_loop_scheduler._task_order_slice = trace_optional(
-            "task_order_slice", original_slice
-        )
-        cross_loop_scheduler._validate_worker_schedule_tasks = trace_optional(
-            "validate_worker_schedule_tasks", original_validate
-        )
-        cross_loop_scheduler._root_schedule_traversal = traced_traversal
-        try:
-            result = original(*call_args, **call_kwargs)
-        finally:
-            cross_loop_scheduler._segment_dependency_support_overlaps = original_overlap
-            cross_loop_scheduler._schedule_is_progress_safe = original_progress
-            cross_loop_scheduler._ordered_root_tasks = original_ordered
-            cross_loop_scheduler._semantic_task_successors = original_successors
-            cross_loop_scheduler._topological_order = original_topological
-            cross_loop_scheduler._task_order_slice = original_slice
-            cross_loop_scheduler._validate_worker_schedule_tasks = original_validate
-            cross_loop_scheduler._root_schedule_traversal = original_traversal
+        result = original(*call_args, **call_kwargs)
         readiness_graph = call_args[0]
         source_schedule = call_args[1]
         records.append(
             {
-                "accepted": result is not None,
-                "unsupported_segment_overlaps": unsupported_overlaps,
-                "proposed_segments": proposed_segments,
-                "rejected_helpers": rejected_helpers,
-                "rejected_traversals": rejected_traversals,
-                "progress_diagnostics": progress_diagnostics,
+                "returned_schedule": result is not None,
+                "changed": result is not None and result != source_schedule,
                 "root_sizes": [domain.size for domain in readiness_graph.root_domains],
                 "source_stage_root": (
                     None
                     if (
-                        source_segment := cross_loop_scheduler._transient_source_schedule_segment(
+                        source_segment
+                        := cross_loop_scheduler._source_ticket_schedule_segment(
                             source_schedule
                         )
                     )
@@ -780,8 +576,6 @@ def _compile_persistent(
         return result
 
     try:
-        cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES = max_list_nodes
-        cross_loop_scheduler._MAX_GLOBAL_LIST_SEGMENTS = max_list_segments
         cross_loop_scheduler._global_unit_list_schedule = (
             traced if global_list else lambda *unused_args, **unused_kwargs: None
         )
@@ -789,8 +583,6 @@ def _compile_persistent(
         compiled = bound.compile_config(config)
     finally:
         cross_loop_scheduler._global_unit_list_schedule = original
-        cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES = original_max_list_nodes
-        cross_loop_scheduler._MAX_GLOBAL_LIST_SEGMENTS = original_max_list_segments
     return compiled, tuple(records), dict(config)
 
 
@@ -903,8 +695,6 @@ def benchmark(
     gate_block_ks: tuple[int, ...],
     down_block_ks: tuple[int, ...],
     maxnregs: tuple[int, ...],
-    max_list_nodes: int,
-    max_list_segments: int,
     repetitions: int,
     warmup_ms: int,
     seed: int,
@@ -962,8 +752,6 @@ def benchmark(
                                 gate_block_k=gate_block_k,
                                 down_block_k=down_block_k,
                                 maxnreg=maxnreg,
-                                max_list_nodes=max_list_nodes,
-                                max_list_segments=max_list_segments,
                             )
                             actual = _canonical_outputs(compiled(*args))
                             torch.cuda.synchronize()
@@ -1039,16 +827,6 @@ def main() -> None:
     parser.add_argument("--gate-block-k", type=int, nargs="+", default=(128,))
     parser.add_argument("--down-block-k", type=int, nargs="+", default=(128,))
     parser.add_argument("--maxnreg", type=int, nargs="+", default=(0,))
-    parser.add_argument(
-        "--max-list-nodes",
-        type=int,
-        default=cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES,
-    )
-    parser.add_argument(
-        "--max-list-segments",
-        type=int,
-        default=cross_loop_scheduler._MAX_GLOBAL_LIST_SEGMENTS,
-    )
     parser.add_argument("--repetitions", type=int, default=50)
     parser.add_argument("--warmup-ms", type=int, default=10_000)
     parser.add_argument("--seed", type=int, default=0)
@@ -1060,8 +838,6 @@ def main() -> None:
         gate_block_ks=tuple(args.gate_block_k),
         down_block_ks=tuple(args.down_block_k),
         maxnregs=tuple(args.maxnreg),
-        max_list_nodes=args.max_list_nodes,
-        max_list_segments=args.max_list_segments,
         repetitions=args.repetitions,
         warmup_ms=args.warmup_ms,
         seed=args.seed,

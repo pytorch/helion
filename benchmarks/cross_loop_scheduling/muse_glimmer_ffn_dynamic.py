@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import hashlib
 import inspect
+from itertools import starmap
 import json
 import linecache
 from pathlib import Path
@@ -463,18 +464,14 @@ def _compile(
     config = helion.Config.from_dict(values)
     bound.config_spec.normalize(config.config)
     path_records: dict[str, object] = {}
-    original_root_major = (
-        cross_loop_scheduler._build_root_major_worker_schedule
-    )
-    original_event_frontier = (
-        cross_loop_scheduler._build_parametric_event_frontier_worker_schedule
-    )
+    original_baseline = cross_loop_scheduler.build_baseline_worker_schedule
+    original_event_frontier = cross_loop_scheduler._event_frontier_list_schedule
     original_global = cross_loop_scheduler._global_unit_list_schedule
     original_pipeline_plan = cross_loop_codegen.build_static_pipeline_plan
 
-    def root_major(*call_args: object, **call_kwargs: object):  # noqa: ANN202
-        result = original_root_major(*call_args, **call_kwargs)
-        path_records["parametric_root_major"] = {
+    def baseline(*call_args: object, **call_kwargs: object):  # noqa: ANN202
+        result = original_baseline(*call_args, **call_kwargs)
+        path_records["baseline_worker_schedule"] = {
             "called": True,
             "segments": len(result.segments),
         }
@@ -482,18 +479,20 @@ def _compile(
 
     def event_frontier(*call_args: object, **call_kwargs: object):  # noqa: ANN202
         result = original_event_frontier(*call_args, **call_kwargs)
-        path_records["parametric_event_frontier"] = {
+        path_records["event_frontier_proposal"] = {
             "called": True,
-            "accepted": result is not None,
+            "returned_schedule": result is not None,
+            "changed": result is not None and result != call_args[1],
             "segments": None if result is None else len(result.segments),
         }
         return result
 
     def global_list(*call_args: object, **call_kwargs: object):  # noqa: ANN202
         result = original_global(*call_args, **call_kwargs)
-        path_records["static_global_list"] = {
+        path_records["global_list_schedule"] = {
             "called": True,
-            "accepted": result is not None,
+            "returned_schedule": result is not None,
+            "changed": result is not None and result != call_args[1],
             "segments": None if result is None else len(result.segments),
         }
         return result
@@ -505,6 +504,9 @@ def _compile(
         site_domains = call_kwargs["site_domains"]
         publishable_site_ids = call_kwargs.get("publishable_site_ids")
         prove_nonnegative = call_kwargs.get("prove_nonnegative")
+        root_domains = tuple(
+            task_order.target_domain for task_order in root_task_orders
+        )
 
         def relation_summary(relation: object) -> dict[str, object]:
             source_domain = relation.source_domain
@@ -578,8 +580,8 @@ def _compile(
                         )
                         for producer in event.producers
                     ],
-                    "parameterized_counter_supported": (
-                        cross_loop_scheduler._supports_parameterized_counter(
+                    "exact_counter_supported": (
+                        cross_loop_scheduler._supports_exact_counter_plan_lowering(
                             cross_loop_scheduler.ReadinessCounterPlan(
                                 producers=event.producers,
                                 consumers=tuple(
@@ -587,7 +589,8 @@ def _compile(
                                     for consumer in event.consumers
                                     if consumer.consumer_site_id is None
                                 ),
-                            )
+                            ),
+                            root_domains,
                         )
                         if any(
                             consumer.consumer_site_id is None
@@ -612,9 +615,6 @@ def _compile(
                 }
             )
 
-        root_domains = tuple(
-            task_order.target_domain for task_order in root_task_orders
-        )
         site_by_id = {
             site.site_id: site for site in dependency_graph.execution_sites
         }
@@ -817,10 +817,8 @@ def _compile(
         }
         return result
 
-    cross_loop_scheduler._build_root_major_worker_schedule = root_major
-    cross_loop_scheduler._build_parametric_event_frontier_worker_schedule = (
-        event_frontier
-    )
+    cross_loop_scheduler.build_baseline_worker_schedule = baseline
+    cross_loop_scheduler._event_frontier_list_schedule = event_frontier
     cross_loop_scheduler._global_unit_list_schedule = (
         global_list
         if enable_global_list
@@ -836,12 +834,8 @@ def _compile(
         path_records["compile_config_seconds"] = time.perf_counter() - binary_start
         path_records["total_compile_seconds"] = time.perf_counter() - compile_start
     finally:
-        cross_loop_scheduler._build_root_major_worker_schedule = (
-            original_root_major
-        )
-        cross_loop_scheduler._build_parametric_event_frontier_worker_schedule = (
-            original_event_frontier
-        )
+        cross_loop_scheduler.build_baseline_worker_schedule = original_baseline
+        cross_loop_scheduler._event_frontier_list_schedule = original_event_frontier
         cross_loop_scheduler._global_unit_list_schedule = original_global
         cross_loop_codegen.build_static_pipeline_plan = original_pipeline_plan
     return compiled, values, code, path_records
@@ -1125,8 +1119,7 @@ def benchmark(args: argparse.Namespace) -> dict[str, object]:
         correctness[batch_size] = {
             "dynamic_vs_standalone_max_abs": max_abs_dynamic,
             "dynamic_vs_standalone_bit_exact": all(
-                torch.equal(actual, expected_value)
-                for actual, expected_value in zip(dynamic, expected, strict=True)
+                starmap(torch.equal, zip(dynamic, expected, strict=True))
             ),
         }
         if static is not None:
@@ -1134,10 +1127,7 @@ def benchmark(args: argparse.Namespace) -> dict[str, object]:
                 {
                     "static_vs_standalone_max_abs": max_abs_static,
                     "static_vs_standalone_bit_exact": all(
-                        torch.equal(actual, expected_value)
-                        for actual, expected_value in zip(
-                            static, expected, strict=True
-                        )
+                        starmap(torch.equal, zip(static, expected, strict=True))
                     ),
                 }
             )

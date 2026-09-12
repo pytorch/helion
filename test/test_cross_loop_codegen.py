@@ -1001,10 +1001,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 self.assertNotIn("tile_dependency_root_barrier", code)
                 if producer_width < consumer_width:
                     self.assertIn("tile_dependency_continuation_previous", code)
-                    self.assertNotIn("tile_dependency_task_wait", code)
                 else:
                     self.assertIn("tile_dependency_readiness_wait", code)
-                    self.assertNotIn("tile_dependency_task_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1029,7 +1027,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, expected)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("* tl.cast(3, tl.uint32) - 1", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1060,12 +1057,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
             continuation_lines[1],
         )
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertIn("tile_dependency_root_barrier_wait", code)
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("ld.acquire.gpu.global.u64", code)
         self.assertNotIn("tl.atomic_max", code)
-        self.assertNotIn("tile_dependency_parameterized_state", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1083,7 +1078,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_readiness_wait", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertIn(
             "@triton.jit\ndef tile_dependency_root_1_scheduled_task",
@@ -1112,7 +1106,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, (x[:64] + launch + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("< 4", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1157,7 +1150,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, expected)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tile_dependency_readiness_wait", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1178,7 +1170,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             torch.testing.assert_close(out, x + launch + 1 + (y + launch) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tl.cast(2, tl.uint32) - 1", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1215,7 +1206,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}]", line)
         for line in publication_lines:
             self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}, 1", line)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1235,7 +1225,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, expected)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertIn("tl.cast(4, tl.uint32)", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1254,7 +1243,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x + 1).reshape(4, 2).sum(dim=-1) * 2)
         self.assertIn("tl.cast(2, tl.uint32) - 1", code)
         self.assertNotIn("tl.cast(1, tl.uint32) - 1", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1292,7 +1280,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 )
 
                 torch.testing.assert_close(out, (x + 1) * 2)
-                self.assertNotIn("tile_dependency_task_wait", code)
                 self.assertIn("tile_dependency_continuation_previous", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
 
@@ -1312,7 +1299,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, ((x + 1) * 2).unsqueeze(0))
         self.assertIn("tile_dependency_readiness_wait", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1335,7 +1321,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x[32:] + 1) * 2)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1353,7 +1338,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_continuation_task", code)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1394,7 +1378,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, x * 2)
-        self.assertNotIn("tile_dependency_task_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tl.cast(4, tl.uint32) - 1", code)
@@ -1507,9 +1490,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 worker_count=plan.worker_schedule.worker_count,
                 segments=tuple(segments),
             )
-            geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
-                permuted
-            )
+            geometry = cross_loop_scheduler._root_major_schedule_geometry(permuted)
             assert geometry is not None
             selected_roots = tuple(segment.root for segment, _first, _count in geometry)
             return dataclasses.replace(plan, worker_schedule=permuted)
@@ -1783,9 +1764,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     ),
                 ),
             )
-            self.assertIsNone(
-                cross_loop_scheduler._parametric_root_major_schedule_geometry(split)
-            )
+            self.assertIsNone(cross_loop_scheduler._root_major_schedule_geometry(split))
             self.assertIsNotNone(
                 cross_loop_scheduler._packed_schedule_segment_geometry(split)
             )
@@ -1832,7 +1811,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("ld.acquire.gpu.global.u64", code)
         self.assertNotIn("tl.atomic_max", code)
-        self.assertNotIn("tile_dependency_parameterized_state", code)
         self.assertEqual(
             code.count("tl.atomic_add(tile_dependency_state"),
             2,
@@ -1987,7 +1965,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 )
 
                 torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
-                self.assertNotIn("tile_dependency_ordered_group", code)
                 self.assertIn("tile_dependency_nested_loop_wait", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
                 self.assertIn("tile_dependency_dispatch_ticket", code)
@@ -2196,22 +2173,16 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
 
                 if reverse_groups:
-                    self.assertNotIn("tile_dependency_group_arrivals", code)
                     self.assertIn("tile_dependency_root_barrier", code)
                 elif group_size != 32:
-                    self.assertNotIn("tile_dependency_group_arrivals", code)
-                    self.assertNotIn("tile_dependency_cohort_wait", code)
                     self.assertIn("tile_dependency_continuation_previous", code)
                     self.assertIn("tile_dependency_nested_loop_wait", code)
                 else:
-                    self.assertNotIn("tile_dependency_group_arrivals", code)
                     self.assertNotIn("tile_dependency_root_barrier", code)
-                    self.assertNotIn("tile_dependency_task_wait", code)
                     self.assertTrue(
                         "tile_dependency_continuation_previous" in code
                         or "tile_dependency_readiness_wait" in code
                     )
-                    self.assertNotIn("tile_dependency_cohort_wait", code)
                     self.assertIn("tile_dependency_nested_loop_wait", code)
 
     @skipIfNotCUDA()
@@ -2254,4 +2225,3 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tile_dependency_nested_loop_wait", code)
-        self.assertNotIn("tile_dependency_cohort_wait", code)

@@ -377,7 +377,7 @@ class TestExactConverseSemantics(TestCase):
             self.assertIsNotNone(_memoized_exact_converse(normalized.task_order))
             WorkerSchedule(4, (normalized,))
 
-    def test_transient_source_widening_retains_resident_converse(self) -> None:
+    def test_source_ticket_widening_retains_resident_converse(self) -> None:
         _old_domain, widened_domain, resident_order = self._partial_worker_task_order(
             target_identity=1
         )
@@ -427,11 +427,11 @@ class TestExactConverseSemantics(TestCase):
                 "_factored_source_support_converse",
                 new_callable=mock.PropertyMock,
                 side_effect=AssertionError(
-                    "transient widening must retain resident converses"
+                    "source-ticket widening must retain resident converses"
                 ),
             ),
         ):
-            result = cross_loop_scheduler._with_transient_source_schedule_segment(
+            result = cross_loop_scheduler._with_source_ticket_schedule_segment(
                 resident_schedule,
                 (source_order, resident_reference),
                 0,
@@ -735,7 +735,7 @@ class TestExactConverseSemantics(TestCase):
 
         with mock.patch.object(
             cross_loop_scheduler,
-            "_parametric_root_major_schedule_geometry_from_parts",
+            "_root_major_schedule_geometry_from_parts",
             side_effect=AssertionError(
                 "derived geometry must not replace relation validation"
             ),

@@ -2004,7 +2004,7 @@ def _ceildiv_nonnegative_expression(
     return cast("sympy.Expr", CeilDiv(sympy.sympify(numerator), denominator))
 
 
-def _parametric_root_major_relation(
+def _packed_root_major_relation(
     schedule_domain: CoordinateDomain,
     target_domain: CoordinateDomain,
     first_slot: sympy.Expr,
@@ -2250,7 +2250,7 @@ def _packed_ordinal_slice_relation(
         kind="task_order",
         identity=ordinal_domain.identity,
     )
-    local = _parametric_root_major_relation(
+    local = _packed_root_major_relation(
         schedule_domain,
         interval_domain,
         sympy.simplify(first_slot + ordinal_begin),
@@ -2359,7 +2359,7 @@ def _packed_root_major_task_order_relation(
         sliced_order = _task_order_slice(task_order, ordinal_begin, task_count)
         if sliced_order is None:
             return None
-        packed_local = _parametric_root_major_relation(
+        packed_local = _packed_root_major_relation(
             schedule_domain,
             sliced_order.source_domain,
             first_slot,
@@ -2388,7 +2388,7 @@ def _packed_root_major_task_order_relation(
         ):
             return None
         return composed
-    packed_source = _parametric_root_major_relation(
+    packed_source = _packed_root_major_relation(
         schedule_domain,
         task_order.source_domain,
         first_slot,
@@ -2551,11 +2551,11 @@ def _packed_schedule_segment_geometry(
     )
 
 
-def _parametric_root_major_schedule_geometry_from_parts(
+def _root_major_schedule_geometry_from_parts(
     worker_count: int,
     segments: tuple[WorkerScheduleSegment, ...],
 ) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
-    """Recognize and prove the compiler's exact parametric root-major relation.
+    """Recognize and prove the compiler's exact packed root-major relation.
 
     Each result item is ``(segment, first_slot, task_count)``. This structural
     proof is shared by schedule validation, barrier ownership, and codegen, so
@@ -2593,7 +2593,7 @@ def _parametric_root_major_schedule_geometry_from_parts(
         task_count = target_domain.size_expr
         statically_empty = task_count.is_zero is True and not relation.pieces
         if statically_empty:
-            expected = _parametric_root_major_relation(
+            expected = _packed_root_major_relation(
                 schedule_domain,
                 target_domain,
                 first_slot,
@@ -2604,7 +2604,7 @@ def _parametric_root_major_schedule_geometry_from_parts(
                 return None
         else:
             if not relation.has_same_source_support(
-                _parametric_root_major_relation(
+                _packed_root_major_relation(
                     schedule_domain,
                     target_domain,
                     first_slot,
@@ -2986,24 +2986,6 @@ class WorkerSchedule:
             ),
         )
 
-    def replacing_root(
-        self,
-        root: int,
-        segments: tuple[WorkerScheduleSegment, ...],
-    ) -> WorkerSchedule:
-        """Return a schedule with one task family's placement replaced."""
-        result: list[WorkerScheduleSegment] = []
-        inserted = False
-        for segment in self.segments:
-            if segment.root != root:
-                result.append(segment)
-            elif not inserted:
-                result.extend(segments)
-                inserted = True
-        if not inserted:
-            result.extend(segments)
-        return WorkerSchedule(worker_count=self.worker_count, segments=tuple(result))
-
 
 _DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE = "_derived_root_major_geometry"
 
@@ -3028,17 +3010,17 @@ def _remember_root_major_schedule_geometry(
     worker_schedule.__dict__[_DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE] = geometry
 
 
-def _parametric_root_major_schedule_geometry(
+def _root_major_schedule_geometry(
     worker_schedule: WorkerSchedule,
 ) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
-    """Return the proved parameterized schedule geometry, when supported."""
+    """Return the proved packed root-major geometry, when supported."""
     memoized = worker_schedule.__dict__.get(_DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE)
     if memoized is not None:
         return cast(
             "tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...]",
             memoized,
         )
-    geometry = _parametric_root_major_schedule_geometry_from_parts(
+    geometry = _root_major_schedule_geometry_from_parts(
         worker_schedule.worker_count,
         worker_schedule.segments,
     )
@@ -3491,7 +3473,7 @@ def root_barrier_publication_plan(
         source_segments[0].task_order.target_domain.size if source_segments else 0
     )
 
-    root_major_geometry = _parametric_root_major_schedule_geometry(worker_schedule)
+    root_major_geometry = _root_major_schedule_geometry(worker_schedule)
     packed_geometry = (
         None
         if root_major_geometry is not None
@@ -3522,7 +3504,7 @@ def root_barrier_publication_plan(
             participant_order, real_arrival_count, effective_arrival_count = participant
             if continuation_arrival_count != 0 or source_stage_arrival_count:
                 raise ValueError(
-                    "parameterized resident ownership overlaps another execution role"
+                    "relation-derived resident ownership overlaps another execution role"
                 )
             return RootBarrierPublicationPlan(
                 root=root,
@@ -3647,28 +3629,6 @@ def build_baseline_worker_schedule(
         )
         worker_step_begin += (task_count + worker_count - 1) // worker_count
     return WorkerSchedule(worker_count=worker_count, segments=tuple(segments))
-
-
-def _select_final_arrival_ownership(
-    readiness_graph: ReadinessGraph,
-    continuation_candidates: tuple[FinalArrivalContinuation, ...],
-    resident_schedule: WorkerSchedule,
-    *,
-    continuation_ineligible_roots: frozenset[int] = frozenset(),
-) -> tuple[FinalArrivalContinuation, ...]:
-    """Freeze continuations by comparing with one accepted resident schedule."""
-    nested_wait_roots = frozenset(
-        readiness_consumer.consumer_root
-        for event in readiness_graph.events
-        for readiness_consumer in event.consumers
-        if readiness_consumer.consumer_site_id is not None
-    )
-    return choose_final_arrival_continuations(
-        readiness_graph,
-        continuation_candidates,
-        resident_schedule,
-        excluded_roots=nested_wait_roots | continuation_ineligible_roots,
-    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4229,7 +4189,7 @@ def _root_major_prerequisites_follow_root_order(
     continuation_by_root: dict[int, FinalArrivalContinuation],
 ) -> bool:
     """Prove packed-root progress after contracting continuation ownership."""
-    geometry = _parametric_root_major_schedule_geometry(worker_schedule)
+    geometry = _root_major_schedule_geometry(worker_schedule)
     if geometry is None:
         return False
     root_position = {
@@ -5736,7 +5696,7 @@ class StaticPipelinePlan:
         root_count = len(self.root_task_orders)
         producer_roots = {producer for producer, _consumer in self.root_barrier_edges}
         uses_relation_segment_renderer = (
-            _parametric_root_major_schedule_geometry(self.worker_schedule) is None
+            _root_major_schedule_geometry(self.worker_schedule) is None
             and _packed_schedule_segment_geometry(self.worker_schedule) is not None
         )
         publication_roots = producer_roots | (
@@ -6334,7 +6294,14 @@ def choose_final_arrival_continuations(
     *,
     excluded_roots: frozenset[int] = frozenset(),
 ) -> tuple[FinalArrivalContinuation, ...]:
-    """Select non-displacing continuations over one accepted resident schedule."""
+    """Select eligible non-displacing continuations over one resident schedule."""
+    nested_wait_roots = frozenset(
+        readiness_consumer.consumer_root
+        for event in readiness_graph.events
+        for readiness_consumer in event.consumers
+        if readiness_consumer.consumer_site_id is not None
+    )
+    excluded_roots |= nested_wait_roots
     placement_domain = worker_schedule.placement_domain
     _launch_stage_axis, _worker_axis, wave_axis = placement_domain.axis_order
     placement_counts = placement_domain.axis_count_expressions
@@ -7249,25 +7216,6 @@ def _build_readiness_events_and_obligations(
     return events, obligations_by_root_pair
 
 
-def build_readiness_events(
-    dependency_graph: TileDependencyGraph,
-    *,
-    root_domains: tuple[CoordinateDomain, ...],
-    site_domains: tuple[CoordinateDomain | None, ...],
-    publishable_site_ids: frozenset[int] | None = None,
-    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-) -> tuple[ReadinessEvent, ...]:
-    """Build canonical symbolic readiness events from memory dependencies."""
-    events, _obligations_by_root_pair = _build_readiness_events_and_obligations(
-        dependency_graph,
-        root_domains=root_domains,
-        site_domains=site_domains,
-        publishable_site_ids=publishable_site_ids,
-        prove_nonnegative=prove_nonnegative,
-    )
-    return events
-
-
 def build_readiness_graph(
     dependency_graph: TileDependencyGraph,
     *,
@@ -7469,8 +7417,8 @@ def _validate_worker_schedule_tasks(
         if placement is not None:
             continue
         # The traversal compatibility path uses concrete ordinal domains.
-        # A parameterized schedule is valid only when its authoritative
-        # placement relation itself proves exact ownership.
+        # A symbolic schedule is valid only when its authoritative placement
+        # relation itself proves exact ownership.
         if root_domain.parameter_symbols or any(
             segment.task_order.parameter_symbols for segment in segments
         ):
@@ -8583,7 +8531,7 @@ def _has_symbolic_worker_rank(
     worker_schedule: WorkerSchedule,
 ) -> bool:
     """Prove every resident strand edge strictly increases worker step."""
-    if _parametric_root_major_schedule_geometry(worker_schedule) is not None:
+    if _root_major_schedule_geometry(worker_schedule) is not None:
         # The remembered geometry is created only by the exact globally packed
         # slot construction.  Distinct occupied slots on one worker have
         # distinct, increasing waves even when a root count is symbolic.
@@ -8979,7 +8927,7 @@ def _schedule_is_progress_safe(
         prerequisite.consumer_root in excluded_roots for prerequisite in prerequisites
     ):
         return False
-    if _parametric_root_major_schedule_geometry(worker_schedule) is not None:
+    if _root_major_schedule_geometry(worker_schedule) is not None:
         return _root_major_prerequisites_follow_root_order(
             worker_schedule,
             readiness_graph,
@@ -9101,7 +9049,8 @@ def _root_schema_criticality(
         successors[producer].add(consumer)
     order = _deterministic_topological_order(successors)
     if order is None:
-        # A cyclic quotient needs the affine SCC-rank proof from Phase 4.
+        # The fixed-capacity event-frontier policy handles only acyclic
+        # quotients; a cyclic graph conservatively retains canonical order.
         return None
 
     predecessors = [set() for _ in range(root_count)]
@@ -9578,7 +9527,7 @@ def _event_frontier_list_schedule(
         # cross-root placement refinement, not that ownership decision.
         return worker_schedule
 
-    external_frontiers: dict[int, CoordinateRelation] = {}
+    source_ticket_frontiers_by_root: dict[int, CoordinateRelation] = {}
     cohort_relations_by_root: dict[int, list[CoordinateRelation]] = {
         root: [] for root in scheduled_roots
     }
@@ -9637,7 +9586,7 @@ def _event_frontier_list_schedule(
             canonical_frontier
         ):
             return None
-        external_frontiers[root] = canonical_frontier
+        source_ticket_frontiers_by_root[root] = canonical_frontier
         ordinal_identity = CoordinateRelation.identity(
             order.source_domain,
             order.source_domain,
@@ -9895,7 +9844,10 @@ def _event_frontier_list_schedule(
         ):
             return worker_schedule
     if not account_relation_piece_work(
-        sum(max(1, len(frontier.pieces)) for frontier in external_frontiers.values())
+        sum(
+            max(1, len(frontier.pieces))
+            for frontier in source_ticket_frontiers_by_root.values()
+        )
     ):
         return worker_schedule
 
@@ -10152,24 +10104,24 @@ def _event_frontier_list_schedule(
         )
         if continues_active is None:
             return None
-        external_release = -1
-        if external_frontier := external_frontiers.get(root):
-            external_maximum = _scalar_relation_maximum_on_interval(
-                external_frontier,
+        source_ticket_release = -1
+        if source_ticket_frontier := source_ticket_frontiers_by_root.get(root):
+            source_ticket_maximum = _scalar_relation_maximum_on_interval(
+                source_ticket_frontier,
                 cursor,
                 candidate_end,
             )
-            if external_maximum is None or not external_maximum[0]:
+            if source_ticket_maximum is None or not source_ticket_maximum[0]:
                 return None
-            external_release = external_maximum[1]
+            source_ticket_release = source_ticket_maximum[1]
         priority = (
             effective[0],
-            0 if root in external_frontiers else 1,
+            0 if root in source_ticket_frontiers_by_root else 1,
             effective[1],
             0 if effective == base else 1,
             0 if closes_effective_event else 1,
             0 if continues_active else 1,
-            external_release,
+            source_ticket_release,
             canonical_rank[root],
             cursor,
         )
@@ -11215,7 +11167,7 @@ def _has_valid_source_ticket_schedule(
             segment.launch_stage == _RESIDENT_LAUNCH_STAGE
             for segment in worker_schedule.segments
         )
-    if source_segment is None or _source_segment_ticket_order(source_segment) is None:
+    if source_segment is None:
         return False
     source_root = source_segment.root
     if not 0 <= source_root < len(root_task_orders):
@@ -11245,8 +11197,8 @@ def _supports_exact_counter_plan_lowering(
 ) -> bool:
     """Return whether the selected counter has one exact supported lowering.
 
-    These are immutable plan facts shared by static and parameterized
-    schedules.  Renderer-specific restrictions do not belong here.
+    These are immutable plan facts shared by every exact schedule rendering.
+    Renderer-specific restrictions do not belong here.
     """
 
     def endpoint_has_supported_domain(
@@ -11667,11 +11619,11 @@ def build_static_pipeline_plan(
             "admit a progress-safe all-resident cross-loop schedule"
         )
 
-    continuations = _select_final_arrival_ownership(
+    continuations = choose_final_arrival_continuations(
         readiness_graph,
         continuation_candidates,
         all_resident_plan.worker_schedule,
-        continuation_ineligible_roots=continuation_ineligible_roots,
+        excluded_roots=continuation_ineligible_roots,
     )
     scheduling_counters = _assign_final_arrival_continuations(
         readiness_graph,
@@ -11680,7 +11632,6 @@ def build_static_pipeline_plan(
     )
     if scheduling_counters is None:
         return all_resident_plan
-    root_barrier_edges = all_resident_barriers
     emitted_continuations = _emitted_final_arrival_continuations(
         readiness_graph,
         scheduling_counters,
@@ -11695,7 +11646,7 @@ def build_static_pipeline_plan(
         _source_ticket_candidate(
             readiness_graph,
             scheduling_counters,
-            root_barrier_edges,
+            all_resident_barriers,
             worker_count=worker_count,
         )
         if supports_source_ticket_launch and not continuations
@@ -11708,7 +11659,7 @@ def build_static_pipeline_plan(
             readiness_graph=readiness_graph,
             worker_count=worker_count,
             readiness_counters=scheduling_counters,
-            root_barrier_edges=root_barrier_edges,
+            root_barrier_edges=all_resident_barriers,
             source_ticket_root=source_ticket_root,
             pipeline_depth=cross_loop_pipeline_depth,
         )

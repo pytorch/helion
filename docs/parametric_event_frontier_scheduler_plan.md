@@ -118,9 +118,8 @@ proposal and retain the configured traversals. The
 accepted traversals are represented only by `WorkerScheduleSegment.task_order`
 when `C` is built; they are not copied into `ReadinessGraph` or a new order
 object. `C` is not the output of `place_nested_loop_consumers`,
-`place_ready_families`, or another readiness-driven placement policy. During
-migration the old local path may supply `C` once as explicit technical debt,
-but the end state removes that dependency.
+`place_ready_families`, or another readiness-driven placement policy; those
+discarded placement paths have been removed.
 
 The deterministic root-local derivation consumes the frozen prerequisite
 view. Incoming exact-counter admission orders are considered first, and every
@@ -185,11 +184,9 @@ same final schedule passes the stronger progress proof. Any failure in physical
 publication derivation rejects the optimized proposal and returns to `C`; it
 never changes continuation or launch-stage source ownership.
 
-The existing concrete `_event_frontier_list_schedule` is the starting point
-for the sole cross-root placement policy, not something to enable unchanged.
-Its current surrounding pipeline still contains competing placement decisions,
-and its current candidate loop can fragment an unfinished producer at every
-frontier. The unified static scheduler must enforce:
+The finite `_event_frontier_list_schedule` is the sole cross-root placement
+policy. Its transactional preparation and finalization stages do not make
+independent placement decisions. It enforces:
 
 1. depth one returns `C`'s resident placement exactly, preserving any already-
    frozen continuation or launch-stage source ownership;
@@ -243,10 +240,10 @@ model-name, or profiled cost model enters scheduling.
 Root-local readiness ordering is setup for this one scheduler, not a second
 cross-root policy. Nested waits/publications, final-arrival continuation, and a
 launch-stage source remain synchronization/ownership capabilities. Their
-identities are chosen at most once before the final placement invocation (or,
-during migration, by one all-resident analysis followed by one rebuild), then
-frozen. There is no iterative ownership/schedule fixed point and no reselection
-in codegen.
+identities are chosen at most once before the final placement invocation, with
+one all-resident analysis seed followed by at most one rebuild, then frozen.
+There is no iterative ownership/schedule fixed point and no reselection in
+codegen.
 
 ### Nested-loop scope
 
@@ -340,7 +337,9 @@ sections are not active work.
   plans, resource reports, cold-L2 timings, and aligned Gantts for FlashMLA,
   Qwen, Gemma, Muse, Nemotron, and DeepSeek controls before changing policy.
 - [x] Discard the interrupted uncommitted symbolic chooser/apply rewrite. Do
-  not stage, rewrite, or remove user-owned benchmark/probe changes.
+  not stage, rewrite, or remove user-owned benchmark/probe changes. Obsolete
+  branch-local diagnostic monkeypatches may be removed once their measurements
+  are preserved and they no longer describe production compiler paths.
 - [x] Remove affine-repetition, translated-state, dynamic-`B` one-cubin, and
   parameterized-renderer work from the active implementation path. Retain
   generic relation primitives only when an independent dependency, ownership,
@@ -380,10 +379,9 @@ sections are not active work.
   continuation ownership once, then freeze ordinary exact-counter/root-barrier
   prerequisites while retaining exact semantic per-iteration prerequisites
   for nested consumers. Select and freeze launch-stage source ownership from
-  that immutable exact view before final placement. During migration allow at
-  most one all-resident analysis followed by one rebuild. A private scratch
-  placement may temporarily help decide continuation ownership, but neither
-  its placement nor a counter partition derived from it may be emitted.
+  that immutable exact view before final placement. Allow at most one
+  all-resident analysis followed by one rebuild; no private scratch placement
+  or counter partition may be emitted.
 - [x] Before scheduling, lower every retained multi-producer event through one
   common conservative key quotient when its original key space is not
   renderable. The selected quotient covers every retained consumer and
@@ -649,7 +647,7 @@ pipelined K loop, carrying its FP32 accumulator across an acquire loop and
 causing a register cliff. Post-placement compaction now emits a root-entry
 quotient only when every correlated resident-producer frontier is proved
 strictly earlier than its consumer CTA's worker rank, or the arm is the
-certified wait-free transient source whose complete source-ticket set is
+certified wait-free source-ticket root whose complete ticket set is
 issued before any resident ticket. The latter proves launch progress, not
 completion; the emitted counter still gates completion and visibility, and
 the final whole-schedule progress proof validates the stronger wait. On
@@ -892,7 +890,7 @@ The same post-quotient tree preserves canonical ragged FlashMLA B4/Q4/H16 on
 physical GPU 4: 63.360 us persistent versus 69.472 us matched standalone over
 500 balanced cold-L2 samples, bit-exact across canonical lengths, changed
 ragged lengths, and semantic page permutation with one cubin. Its 22-key,
-fan-in-16 nested quotient, four barriers, transient source, and R80/42-spill/
+fan-in-16 nested quotient, four barriers, source-ticket launch, and R80/42-spill/
 49,160-byte-shared/W8/S1 resource shape are unchanged.
 
 The fixed-capacity `static_shapes=False` Gemma4 A4B control also remains
@@ -907,12 +905,12 @@ B1 and 9 to 4 at B2. The checked-in Gemma entry point still declares
 is separate from scheduler correctness.
 
 For contrast, fully runtime batch cardinality remains a historical stress
-control, not the immediate contract. A one-cubin Qwen B1/B2 build is 6--12%
-slower and follows the obsolete parameterized root-major policy. A one-cubin
-FlashMLA fan-out probe remains numerically exact and faster than its matched
-standalone boundary across B1/B2/B4/B9, demonstrating that the retained
-symbolic relation algebra is useful, but it does not justify keeping a second
-production ownership policy.
+control, not the immediate contract. The measured one-cubin Qwen B1/B2 build
+was 6--12% slower and followed the now-removed parameterized root-major policy.
+The measured one-cubin FlashMLA fan-out probe was numerically exact and faster
+than its matched standalone boundary across B1/B2/B4/B9, demonstrating that
+the retained symbolic relation algebra is useful, but it does not justify
+keeping a second production ownership policy.
 
 Implementation checkpoint (2026-09-11, fixed task universe):
 `build_static_pipeline_plan` now rejects a parameterized authoritative root
@@ -943,10 +941,11 @@ test-only root-major schedule builder have no production caller and are
 removed. The concrete max-plus implementation remains only as an independent
 test oracle. Codegen likewise removes the unreachable uint64 epoch-framed
 readiness/root-barrier state and now has one aligned uint32 replay protocol for
-fixed-capacity counters and barriers. The uint64 transient dispatch ticket is
-unrelated and remains. Concrete packed/root-major and relation-segment
-rendering are retained even where legacy helper names still say
-"parametric," because list-scheduled split segments actively consume them.
+fixed-capacity counters and barriers. The uint64 source-ticket dispatch counter
+is unrelated and remains. Concrete packed/root-major and relation-segment
+rendering remain because list-scheduled split segments actively consume them;
+their active helper names now describe that role rather than a separate
+parametric schedule policy.
 
 ### Phase S3: post-placement synchronization validation and cleanup
 
@@ -968,7 +967,7 @@ rendering are retained even where legacy helper names still say
 - [x] Hoist a nested wait to root entry only when the accepted schedule proves
   progress precedence for every contracted producer arm: an ordinary resident
   producer must strictly precede its correlated consumer CTA in worker rank,
-  while a certified wait-free transient source may rely on every source ticket
+  while a certified wait-free source-ticket root may rely on every source ticket
   being issued before any resident ticket. Ticket order is not completion; the
   counter still gates completion and visibility. If this compositional proof
   fails, retain a genuine multi-segment frontier such as Qwen 74/22 or the
@@ -1011,7 +1010,7 @@ rendering are retained even where legacy helper names still say
   one constant readiness key; segmented lowering is reserved for total source
   support.  These are general fail-closed correctness/coverage fixes and do
   not change placement policy.
-- [ ] After parity, remove obsolete local placement passes and the
+- [x] After parity, remove obsolete local placement passes and the
   constant/parameterized policy split. Keep only synchronization derivation
   that still has a final-plan consumer.
 
@@ -1052,7 +1051,7 @@ rendering are retained even where legacy helper names still say
   time, exact schedule/counter dump, and standalone-over-persistent Gantt. A
   generalized schedule may be slightly slower than a historical specialized
   result, but it must beat matched standalone before becoming the default.
-- [ ] Treat DeepSeek-V3 and Nemotron MoE as inherited resource-envelope
+- [x] Treat DeepSeek-V3 and Nemotron MoE as inherited resource-envelope
   negative controls: their Helion-main persistent kernels were already slower
   than matched standalone before this scheduler work.  Require the redesign to
   match the identical-source, closest-identical-config current-main persistent
@@ -1068,28 +1067,46 @@ rendering are retained even where legacy helper names still say
   because FlashMLA needs source-ticket execution; the unique source root,
   ticket order, progress exemption, publication count, and codegen dispatch are
   derived from that segment. `StaticPipelinePlan.transient_source_root` and
-  its helper parameters are gone.
+  all downstream threaded identity parameters are gone; the frozen root is
+  carried once across the selector-to-segment-constructor boundary.
+  This milestone deliberately admits only one wait-free, oversubscribed source
+  with a strict partial-fan-out signal. For a topology such as preparation ->
+  ragged split work -> merge, the preparation root may receive tickets and the
+  downstream roots remain correct under ordinary event-frontier placement,
+  but the internal ragged split does not gain dynamic ticket stealing. Treat a
+  later generalized "ticketed ready phase" as a separate evidence-driven
+  extension, not as another model-specific exception during this cleanup.
 - [x] Replace `_select_final_arrival_ownership`'s discarded legacy scratch
   placement with direct continuation-dominance selection over the accepted
   all-resident schedule. Delete `place_nested_loop_consumers`,
   `place_ready_families`, `_family_placements_at_worker_step`, and the tests
   that specified only those discarded placement policies.
-- [ ] Finish source-ticket terminology/policy cleanup without deleting the
+- [x] Finish source-ticket terminology/policy cleanup without deleting the
   execution capability: derive priority-only source frontiers inside the
   common chooser, remove threaded `external_source_frontiers`, rename the
   backend capability and launch-stage helpers, and remove redundant validation
   calls. Preserve the source/resident dispatch, exact ticket bijection,
   counters, progress rule, and publication accounting required by FlashMLA.
-- [ ] Remove the production parametric cohort stack, symbolic cursor/repeat
+- [x] Remove the production parametric cohort stack, symbolic cursor/repeat
   state, and affine-lifting hooks after confirming they have no independent
   consumer. Audit `_packed_schedule_segment_geometry` and its relation renderer
   separately: retain their generic concrete packed-schedule use and remove only
   runtime-bound/schedule-classifying branches. Preserve tested relation support
   used by dependency or static-schedule correctness.
-- [ ] Finish with an independent architecture audit: one dependency graph, one
+- [x] Finish with an independent architecture audit: one dependency graph, one
   readiness graph, one cross-root placement policy, one authoritative worker
   schedule, one synchronization/ownership finalization, and no model/root/
   shape literals in compiler policy.
+
+Cleanup checkpoint (2026-09-12): the independent review found no correctness
+or single-source blocker. Obsolete readiness wrappers, scratch-schedule
+replacement helpers, duplicated ownership selection, stale generated-name
+assertions, and private probe ablations are removed; active root-major helpers
+are renamed for their packed-relation role. The final cleanup gate passes 228
+CPU tests plus 272 subtests and 62 CUDA/codegen tests plus 16 subtests, with one
+expected skip. Source tickets remain one topology-selected execution
+capability, not a workload path; their intentionally source-stage-only scope
+and the deferred internal ticketed-phase generalization are stated explicitly.
 
 ### Explicitly deferred
 
@@ -1099,6 +1116,8 @@ rendering are retained even where legacy helper names still say
 - runtime FlashMLA split generation;
 - runtime expert compaction, histogram-driven task counts, or route-aware
   priority;
+- ticket dispatch for an internal phase after its prerequisite event becomes
+  ready (the current capability is intentionally source-stage only);
 - mixed prefill/decode and adaptive per-request speculative width; and
 - schedule adaptation or load balancing based on actual `seq_lens` or routes.
 

@@ -41,9 +41,6 @@ from helion._compiler.cross_loop_scheduler import (
     build_baseline_worker_schedule as _build_baseline_worker_schedule,
 )
 from helion._compiler.cross_loop_scheduler import (
-    build_readiness_events as _build_readiness_events,
-)
-from helion._compiler.cross_loop_scheduler import (
     build_readiness_graph as _build_readiness_graph,
 )
 from helion._compiler.cross_loop_scheduler import (
@@ -1716,12 +1713,12 @@ def _configured_readiness_events(
     publishable_site_ids: frozenset[int] | None = None,
 ):
     root_domains, site_domains = _configured_domains(graph, axis_geometry)
-    return _build_readiness_events(
+    return _build_readiness_graph(
         graph,
-        root_domains=root_domains,
+        root_task_orders=_default_root_task_orders(root_domains),
         site_domains=site_domains,
         publishable_site_ids=publishable_site_ids,
-    )
+    ).events
 
 
 def _baseline_worker_schedule(
@@ -7054,7 +7051,7 @@ class TestCrossLoopScheduler(TestCase):
             (-3, -2, -1),
         )
         with self.assertRaisesRegex(ValueError, "disagrees with its worker domain"):
-            cross_loop_scheduler._parametric_root_major_relation(
+            cross_loop_scheduler._packed_root_major_relation(
                 mismatched_worker_domain,
                 left_domain,
                 sympy.Integer(0),
@@ -7086,7 +7083,7 @@ class TestCrossLoopScheduler(TestCase):
 
         two_axis_domain = _domain((50, 2, 1), (51, 2, 1))
         with self.assertRaisesRegex(ValueError, "must permute"):
-            cross_loop_scheduler._parametric_root_major_relation(
+            cross_loop_scheduler._packed_root_major_relation(
                 cross_loop_scheduler._worker_schedule_domain(
                     4,
                     1,
@@ -7658,9 +7655,7 @@ class TestCrossLoopScheduler(TestCase):
                 dispatch_offset=4,
             ),
         )
-        self.assertIsNone(
-            cross_loop_scheduler._parametric_root_major_schedule_geometry(schedule)
-        )
+        self.assertIsNone(cross_loop_scheduler._root_major_schedule_geometry(schedule))
         self.assertIsNotNone(
             cross_loop_scheduler._packed_schedule_segment_geometry(schedule)
         )
@@ -7913,9 +7908,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
         self.assertIsNotNone(
-            cross_loop_scheduler._parametric_root_major_schedule_geometry(
-                plan.worker_schedule
-            )
+            cross_loop_scheduler._root_major_schedule_geometry(plan.worker_schedule)
         )
 
     def test_symbolic_multi_consumer_counter_is_not_emitted(self) -> None:
