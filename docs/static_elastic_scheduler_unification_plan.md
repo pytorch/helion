@@ -120,8 +120,11 @@ static run still requires its `W` worker packets to fit concurrently.
 
 ## Scope and non-goals
 
-This redesign supports a fixed compiled task capacity with runtime data inside
-that capacity.  In particular, the following remain runtime values:
+This redesign supports a fixed, positive compiled task capacity per root with
+runtime data inside that capacity.  A statically zero-capacity root is rejected
+before scheduling; runtime masks may still turn every capacity task into a
+no-op, and those packets retain their normal publications.  In particular, the
+following remain runtime values:
 
 - `seq_lens[B]` and active-request masks;
 - KV page/block metadata;
@@ -179,12 +182,12 @@ by the retained root segment, not copied into another plan field.
 The final invariant is deliberately narrower than the current list-scheduler
 representation:
 
-- every non-continuation, nonempty root has exactly one segment;
+- every non-continuation root has exactly one segment;
 - continuation roots have no segment;
 - segments occur in increasing source-root order;
 - each segment's target is an exact, bijective cover of that root's tasks;
-- the segment's dense logical ordinal is the only task traversal used by both
-  static and elastic rendering; and
+- the segment's normalized relation plus its exact dense support define the
+  only task traversal used by both static and elastic rendering; and
 - one scalar field on the existing segment says whether that traversal is
   statically owned or elastically claimed.
 
@@ -199,8 +202,11 @@ later mechanical cleanup; it must not be repurposed as dispatch mode.
 Cross-root chronology is now the source-root order, not an ordering induced by
 dispatch mode or by splitting a root into several segment occurrences.  The
 worker/wave coordinates retain their exact role within a static segment and
-provide the dense ordinal certificate used to decode an elastic ticket.  The
-compiler must reject a segment that cannot expose that one exact traversal.
+provide the dense ordinal certificate used to decode an elastic ticket.  A
+representable flattened relation is an optional strength reduction; otherwise
+codegen substitutes the proved dense slot directly into the authoritative
+normalized relation.  The compiler rejects a segment whose exact support is
+not dense or bijective.
 
 This is the single-source-of-truth rule:
 
@@ -303,8 +309,8 @@ topology-pruned search space or a custom candidate generator.
 
 The field is indexed by source root, not by schedule segment.  That makes its
 meaning stable when continuation selection removes a root.  The entry for a
-continuation or statically empty root is ignored; duplicate autotuner
-candidates are acceptable and preferable to topology-specific knob shapes.
+continuation root is ignored; duplicate autotuner candidates are acceptable
+and preferable to topology-specific knob shapes.
 
 Expected useful settings are evidence, not compiler heuristics:
 
@@ -348,11 +354,9 @@ global list machinery is removed.
 
 ### Derived packet stream
 
-Codegen walks source roots, intersperses any mode-independent empty-root
-control required by the frozen `RootBarrierPublicationPlan`, and coalesces
-adjacent nonempty roots with the same mode.  The segments remain the only task
-schedule; empty controls, maximal runs, and prefix sums are local rendering
-facts, not stored schedule state and not a new abstraction.
+Codegen walks source roots and coalesces adjacent roots with the same mode.  The
+segments remain the only task schedule; maximal runs and prefix sums are local
+rendering facts, not stored schedule state and not a new abstraction.
 
 For each run:
 
@@ -361,14 +365,13 @@ For each run:
 - an elastic run with root task counts `T0, T1, ...` contributes
   `T = sum(Ti)` packets.  Its local packet ordinal is decoded by prefix sums
   into one root and one root-local ordinal, then mapped through that segment's
-  existing `logical_task_order`.
+  normalized relation and exact dense-support certificate.
 
 Concatenating the run ranges gives one fixed packet count
 
 ```text
 P = sum(W for each static run)
-    + sum(Ti for every nonempty elastic root)
-    + required synthetic empty-root control packets.
+    + sum(Ti for every elastic root).
 ```
 
 No packet table or run object is stored in `StaticPipelinePlan`.  The emitted
@@ -408,8 +411,7 @@ omit the cursor state and atomic.  This is an optimization of the identical
 packet semantics, not a second scheduler.  It is the strict Qwen/Gemma
 compatibility path.  Test the semantic all-static predicate directly; never
 fold merely because an unrelated elastic/mixed packet count happens to equal
-`W`.  Ignored continuation and empty-root config entries do not prevent the
-fold.
+`W`.  Ignored continuation config entries do not prevent the fold.
 
 For any mixed schedule containing a static run, prove that the compiled kernel
 can simultaneously residently support all `W` static worker packets.  The grid
@@ -433,14 +435,9 @@ Rename `source_stage_arrival_count` to `elastic_task_arrival_count`.  Codegen
 consumes the frozen `RootBarrierPublicationPlan`; it does not recompute mode or
 arrival mass.  Per-task publication is used only for root-barrier fallback;
 ordinary exact readiness events retain their existing publication sites.
-For an empty root, retain the existing vacuous/synthetic single arrival.  Its
-root dispatch config entry is ignored and it has no task segment.  In the
-semantic all-static fold, resident worker 0 publishes at that root's canonical
-control position.  In any non-folded packet stream, each required empty-root
-publication contributes one mode-independent control packet at that root's
-source-order position and that packet is included in `P`.  The frozen
-`RootBarrierPublicationPlan` is the sole authority for this control packet;
-empty-root handling does not invent a logical task segment.
+Every accepted root has positive compiled capacity, so every root-barrier
+publisher is an ordinary static owner, continuation, or elastic task.  Runtime
+masked/no-op tasks still publish exactly like active tasks.
 
 ## Progress and correctness proof
 
@@ -448,7 +445,7 @@ Correctness and liveness are separate obligations.
 
 ### Exact-once correctness
 
-For every nonempty, non-continuation root:
+For every non-continuation root:
 
 1. the segment traversal is a total function from dense ordinals to logical
    tasks;
@@ -459,8 +456,8 @@ For every nonempty, non-continuation root:
 4. all waits/publications are derived from the unchanged `ReadinessGraph`.
 
 Continuation contraction must cover its complete consumer root exactly once.
-The union of ordinary, continuation-owned, and explicitly represented empty
-control roots must equal the configured root set.
+The union of ordinary and continuation-owned roots must equal the configured
+root set.
 
 ### Progress invariant
 
@@ -571,7 +568,7 @@ dispatch overhead.  They never change this root-level meaning.
 - Therefore delete the fixed-loop/T+W design from the roadmap rather than
   retaining it beside the fast path.
 
-### Phase 0b: validate the one-shot packet executor
+### Phase 0b: validate the one-shot packet executor — in progress
 
 - Treat the archived FlashMLA B4/B9 and Muse m8 one-shot results as the positive
   all-elastic controls, then reproduce them through production packet lowering.
@@ -591,9 +588,9 @@ dispatch overhead.  They never change this root-level meaning.
   110.880--112.480 us atomic).  Mixed dispatch is therefore mechanically sound
   but must recover more than that generic admission tax to be profitable; the
   ordinary autotuner makes that decision.
-- Compare exact root-local traversals with and without the current
-  source-ticket-frontier branch before deleting that branch; Qwen is already a
-  no-op because it has no source segment, while MLA is the meaningful gate.
+- The source-ticket-frontier branch has been deleted.  Qwen's all-static
+  traversal remains byte-identical, while production MLA and Muse retain their
+  elastic wins with root-local order derived only from ordinary readiness.
 - For FlashMLA, retain and report compact K22/fan-in16.  The exact K352/F1
   fallback previously measured about 71.52 us versus about 63.33 us compact
   and 67.49 us standalone; production is not accepted without the generic
@@ -603,8 +600,14 @@ dispatch overhead.  They never change this root-level meaning.
 - Run one-shot and mixed-mode ablations for DeepSeek and Nemotron, whose
   archived dynamic evidence used fixed resident loops.  Tune only the generic
   root dispatch vector and existing resource knobs.
+  The all-elastic one-shot controls are now complete: DeepSeek measured
+  165.920 us versus 165.888 us fixed-loop and 155.648 us standalone; Nemotron
+  measured 79.904 us versus 77.824 us fixed-loop and 61.440 us standalone.
+  Both were bit-exact to the fixed-loop outputs and reference-valid.  DeepSeek
+  is exact performance parity; Nemotron's 2.080-us/2.7% one-shot cost is a
+  bounded performance gate for production tuning, not a second executor.
 
-### Phase 1: install the root dispatch surface
+### Phase 1: install the root dispatch surface — complete
 
 - Change `ConfigSpec.enable_cross_loop_schedule()` to accept root count.
 - Add `cross_loop_root_dispatch` with the existing `ListOf(EnumFragment)`.
@@ -614,7 +617,7 @@ dispatch overhead.  They never change this root-level meaning.
   configs/tests that intentionally exercise the new scheduler.
 - Default to all static.
 
-### Phase 2: collapse schedule construction
+### Phase 2: collapse schedule construction — complete
 
 - Make baseline construction produce one segment per non-continuation root.
 - Retain transactional `_consumer_major_producer_order` only as a
@@ -634,7 +637,7 @@ dispatch overhead.  They never change this root-level meaning.
   exception to the same contracted-root static/elastic proof.  Keep finer
   static segmented quotients on their existing rank proof.
 
-### Phase 3: lower the ordered packet stream
+### Phase 3: lower the ordered packet stream — complete
 
 - Reuse `scheduled_logical_task_expression` and
   `scheduled_root_task_body`; do not clone root bodies or decode PIDs again.
@@ -650,7 +653,7 @@ dispatch overhead.  They never change this root-level meaning.
 - Strength-reduce the semantic all-static case to the exact current
   `program_id`/per-worker-epoch path with no cursor or atomic.
 
-### Phase 4: replace the progress proof
+### Phase 4: replace the progress proof — complete
 
 - Prove exact segment traversal and coverage once.
 - Prove strict source-root dependency order after recursive continuation
@@ -665,7 +668,7 @@ dispatch overhead.  They never change this root-level meaning.
 - Cover nested waits and root barriers from the same emitted prerequisite view.
 - Delete wave/list-priority proofs that are no longer semantic.
 
-### Phase 5: delete superseded machinery
+### Phase 5: delete superseded machinery — complete
 
 Delete, rather than leave dormant:
 
@@ -685,7 +688,7 @@ Retain only generally required relation utilities.  Before deleting a helper,
 verify whether exact readiness, continuation contraction, root-local ordering,
 or nested-counter compaction still calls it.
 
-### Phase 6: replace obsolete tests
+### Phase 6: replace obsolete tests — complete
 
 Remove tests whose contract is list priority, multi-segment root placement,
 pipeline depth, or one special source root.  Preserve relation algebra tests
@@ -697,7 +700,7 @@ Add focused tests for:
 - root-indexed config defaulting/normalization;
 - exact static and elastic traversal equivalence;
 - adjacent same-mode run derivation without stored run state;
-- replay frames with fixed `P`, empty roots, and multiple runs;
+- replay frames with fixed `P` and multiple runs;
 - all four static/elastic transitions;
 - nested waits and continuations in both modes;
 - elastic producer -> continuation -> downstream execution (use DeepSeek root
@@ -707,7 +710,7 @@ Add focused tests for:
 - all-static lowered-code compatibility; and
 - absence of the deleted config keys and special-source symbols.
 
-### Phase 7: performance and observability validation
+### Phase 7: performance and observability validation — in progress
 
 Run every case with same-source standalone, correctness, resources, compile
 time, and cold-L2 medians.  Generate standalone-on-top/persistent-on-bottom
@@ -750,7 +753,8 @@ The redesign is complete only when all of the following hold:
 9. DeepSeek/Nemotron retain at least the dynamic-root-major signal; remaining
    gaps to standalone are reported as body/resource work, not hidden.
 10. Correctness, replay, root barriers, nested waits, and continuations pass
-    in static, elastic, and mixed synthetic tests.
+    in static, elastic, and mixed synthetic tests; statically zero-capacity
+    roots are rejected explicitly.
 
 The all-static golden additionally requires: omitted dispatch field defaults to
 all static; no cursor allocation or atomic claim appears; plan/counter/barrier

@@ -814,7 +814,6 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_schedule",
-        "cross_loop_pipeline_depth",
         "cross_loop_root_dispatch",
         "num_threads",
         "cute_vector_widths",
@@ -846,7 +845,6 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_flattens",
         "static_ranges",
         "cross_loop_schedule",
-        "cross_loop_pipeline_depth",
         "cross_loop_root_dispatch",
         "num_warps",
         "num_stages",
@@ -889,9 +887,6 @@ VALID_PID_TYPES = (
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
-MIN_CROSS_LOOP_PIPELINE_DEPTH = 1
-MAX_CROSS_LOOP_PIPELINE_DEPTH = 4
-DEFAULT_CROSS_LOOP_PIPELINE_DEPTH = 1
 EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
 EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
 EPILOGUE_SUBTILE_MIN_K_HINT = 1024
@@ -1102,7 +1097,6 @@ class ConfigSpec:
         # Populated only after DeviceIR proves that this kernel contains an
         # implicit cross-root dependency supported by the CUDA Triton backend.
         self.cross_loop_schedule: EnumFragment | None = None
-        self.cross_loop_pipeline_depth: IntegerFragment | None = None
         self.cross_loop_root_dispatch: ListOf | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
@@ -2215,7 +2209,6 @@ class ConfigSpec:
             key
             in (
                 "cross_loop_schedule",
-                "cross_loop_pipeline_depth",
                 "cross_loop_root_dispatch",
             )
             and self.device is not None
@@ -2235,11 +2228,6 @@ class ConfigSpec:
                 f"root_count must be a nonnegative integer, got {root_count!r}"
             )
         self.cross_loop_schedule = EnumFragment(VALID_CROSS_LOOP_SCHEDULES)
-        self.cross_loop_pipeline_depth = IntegerFragment(
-            MIN_CROSS_LOOP_PIPELINE_DEPTH,
-            MAX_CROSS_LOOP_PIPELINE_DEPTH,
-            DEFAULT_CROSS_LOOP_PIPELINE_DEPTH,
-        )
         self.cross_loop_root_dispatch = ListOf(
             EnumFragment(VALID_CROSS_LOOP_DISPATCH_MODES),
             length=root_count,
@@ -2375,7 +2363,6 @@ class ConfigSpec:
                 key in config
                 for key in (
                     "cross_loop_schedule",
-                    "cross_loop_pipeline_depth",
                     "cross_loop_root_dispatch",
                 )
             )
@@ -2384,7 +2371,6 @@ class ConfigSpec:
         ):
             if _fix_invalid:
                 config.pop("cross_loop_schedule", None)
-                config.pop("cross_loop_pipeline_depth", None)
                 config.pop("cross_loop_root_dispatch", None)
             else:
                 raise InvalidConfig(
@@ -2721,28 +2707,6 @@ class ConfigSpec:
                         "cross_loop_schedule must be one of "
                         f"{cross_loop_schedule_fragment.choices!r}, got "
                         f"{cross_loop_schedule!r}"
-                    )
-            pipeline_depth_fragment = self.cross_loop_pipeline_depth
-            assert pipeline_depth_fragment is not None
-            pipeline_depth = config.setdefault(
-                "cross_loop_pipeline_depth",
-                pipeline_depth_fragment.default(),
-            )
-            if (
-                type(pipeline_depth) is not int
-                or not pipeline_depth_fragment.low
-                <= pipeline_depth
-                <= pipeline_depth_fragment.high
-            ):
-                if _fix_invalid:
-                    config["cross_loop_pipeline_depth"] = (
-                        pipeline_depth_fragment.default()
-                    )
-                else:
-                    raise InvalidConfig(
-                        "cross_loop_pipeline_depth must be an integer between "
-                        f"{pipeline_depth_fragment.low} and "
-                        f"{pipeline_depth_fragment.high}, got {pipeline_depth!r}"
                     )
             root_dispatch_fragment = self.cross_loop_root_dispatch
             assert root_dispatch_fragment is not None
@@ -3561,8 +3525,6 @@ class ConfigSpec:
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.cross_loop_schedule is not None:
             fields["cross_loop_schedule"] = self.cross_loop_schedule
-            assert self.cross_loop_pipeline_depth is not None
-            fields["cross_loop_pipeline_depth"] = self.cross_loop_pipeline_depth
             assert self.cross_loop_root_dispatch is not None
             fields["cross_loop_root_dispatch"] = self.cross_loop_root_dispatch
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:

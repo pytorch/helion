@@ -377,72 +377,6 @@ class TestExactConverseSemantics(TestCase):
             self.assertIsNotNone(_memoized_exact_converse(normalized.task_order))
             WorkerSchedule(4, (normalized,))
 
-    def test_source_ticket_widening_retains_resident_converse(self) -> None:
-        _old_domain, widened_domain, resident_order = self._partial_worker_task_order(
-            target_identity=1
-        )
-        resident_target = resident_order.target_domain
-        resident_schedule = WorkerSchedule(
-            4,
-            (WorkerScheduleSegment(1, resident_order, 0, 4, 0),),
-        )
-
-        source_domain = CoordinateDomain((20,), ((20, 9),), identity=0)
-        source_order = pid_task_order(source_domain, source_domain.axis_order)
-        resident_reference = pid_task_order(
-            resident_target,
-            resident_target.axis_order,
-        )
-        source_segment = cross_loop_scheduler._normalize_dense_schedule_segment(
-            WorkerScheduleSegment(0, source_order, 0, 4, 0),
-            widened_domain,
-            launch_stage=0,
-        )
-        self.assertIsNotNone(source_segment.task_order.converse())
-        normalize = cross_loop_scheduler._normalize_dense_schedule_segment
-
-        def use_prepared_source_segment(
-            segment: WorkerScheduleSegment,
-            schedule_domain: CoordinateDomain,
-            *,
-            launch_stage: int = 1,
-        ) -> WorkerScheduleSegment:
-            if not segment.is_normalized and segment.root == 0 and launch_stage == 0:
-                self.assertEqual(schedule_domain, widened_domain)
-                return source_segment
-            return normalize(
-                segment,
-                schedule_domain,
-                launch_stage=launch_stage,
-            )
-
-        with (
-            mock.patch.object(
-                cross_loop_scheduler,
-                "_normalize_dense_schedule_segment",
-                side_effect=use_prepared_source_segment,
-            ),
-            mock.patch.object(
-                CoordinateRelation,
-                "_factored_source_support_converse",
-                new_callable=mock.PropertyMock,
-                side_effect=AssertionError(
-                    "source-ticket widening must retain resident converses"
-                ),
-            ),
-        ):
-            result = cross_loop_scheduler._with_source_ticket_schedule_segment(
-                resident_schedule,
-                (source_order, resident_reference),
-                0,
-            )
-            self.assertIsNotNone(result)
-            assert result is not None
-            widened_resident = result.segments_for_root(1)[0].task_order
-            self.assertEqual(widened_resident.source_domain, widened_domain)
-            self.assertIsNotNone(_memoized_exact_converse(widened_resident))
-            self.assertTrue(widened_resident.is_bijection_from_source_support())
-
     def test_static_quotient_bounds_are_valid_for_signed_integer_base(self) -> None:
         value = sympy.Symbol("value", integer=True)
 
@@ -849,7 +783,7 @@ class TestExactConverseSemantics(TestCase):
             publications=(RootBarrierPublication(0, ()),),
             resident_arrival_count=2,
             continuation_arrival_count=0,
-            source_stage_arrival_count=0,
+            elastic_task_arrival_count=0,
         )
 
         invalid_orders = {

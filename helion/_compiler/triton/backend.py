@@ -80,7 +80,6 @@ class TritonBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         if key in (
             "cross_loop_schedule",
-            "cross_loop_pipeline_depth",
             "cross_loop_root_dispatch",
         ):
             from ..._compat import is_hip
