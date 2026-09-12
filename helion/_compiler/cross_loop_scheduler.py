@@ -5840,8 +5840,6 @@ def _compact_nested_loop_counters_for_schedule(
     readiness_graph: ReadinessGraph,
     worker_schedule: WorkerSchedule,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
-    *,
-    transient_source_root: int | None = None,
 ) -> tuple[ReadinessCounterPlan, ...]:
     """Derive optional nested counter quotients from one accepted schedule.
 
@@ -5858,6 +5856,8 @@ def _compact_nested_loop_counters_for_schedule(
     proof still rejects any unsafe stronger wait. Unsupported frontiers retain
     the exact plan on the same placement.
     """
+    source_segment = _transient_source_schedule_segment(worker_schedule)
+    source_stage_root = None if source_segment is None else source_segment.root
     continuations = _emitted_final_arrival_continuations(
         readiness_graph,
         readiness_counters,
@@ -5870,8 +5870,8 @@ def _compact_nested_loop_counters_for_schedule(
     )
     excluded_roots = frozenset(continuation_by_root) | (
         frozenset()
-        if transient_source_root is None
-        else frozenset((transient_source_root,))
+        if source_stage_root is None
+        else frozenset((source_stage_root,))
     )
     task_steps: tuple[CoordinateRelation | None, ...] | None = None
     task_steps_computed = False
@@ -5931,7 +5931,6 @@ def _compact_nested_loop_counters_for_schedule(
                 consumer_keys=entry_consumer_keys,
                 task_steps=task_steps,
                 continuation_by_root=continuation_by_root,
-                transient_source_root=transient_source_root,
             )
         )
         if entry_has_progress_precedence:
@@ -5983,7 +5982,6 @@ class StaticPipelinePlan:
     root_task_orders: tuple[CoordinateRelation, ...]
     readiness_counters: tuple[ReadinessCounterPlan, ...]
     root_barrier_edges: frozenset[tuple[int, int]]
-    transient_source_root: int | None = None
 
     def __post_init__(self) -> None:
         _validate_root_task_orders(self.root_task_orders)
@@ -6045,22 +6043,13 @@ class StaticPipelinePlan:
         if scheduled_roots | continuation_roots != set(range(root_count)):
             raise ValueError("pipeline plan does not own every configured root")
 
-        source_segments = tuple(
-            segment
-            for segment in self.worker_schedule.segments
-            if segment.launch_stage == _SOURCE_LAUNCH_STAGE
-        )
-        if self.transient_source_root is None:
-            if source_segments:
-                raise ValueError("a source-stage segment requires source ownership")
-        elif (
-            not 0 <= self.transient_source_root < root_count
-            or len(source_segments) != 1
-            or source_segments[0].root != self.transient_source_root
+        if not _has_valid_transient_source_schedule(
+            self.worker_schedule,
+            self.root_task_orders,
+            self.readiness_counters,
+            self.root_barrier_edges,
         ):
-            raise ValueError(
-                "source ownership requires one matching stage-zero segment"
-            )
+            raise ValueError("pipeline plan has invalid launch-stage ownership")
 
         # Freeze the sole root-publication derivation with the selected plan.
         # Code generation consumes this cache and must not reconstruct owner
@@ -7533,7 +7522,6 @@ def _external_source_frontiers(
     worker_schedule: WorkerSchedule,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
-    source_root: int,
 ) -> tuple[tuple[int, CoordinateRelation], ...] | None:
     """Map resident tasks to their latest required source ticket.
 
@@ -7541,10 +7529,8 @@ def _external_source_frontiers(
     before resident tickets, which proves progress, but only runtime counters
     establish that the corresponding source work has completed.
     """
-    source_segment = _transient_source_schedule_segment(
-        worker_schedule,
-        source_root,
-    )
+    source_segment = _transient_source_schedule_segment(worker_schedule)
+    source_root = None if source_segment is None else source_segment.root
     ticket_to_logical = (
         None if source_segment is None else source_segment.logical_task_order
     )
@@ -7552,7 +7538,7 @@ def _external_source_frontiers(
         readiness_graph,
         readiness_counters,
     )
-    if ticket_to_logical is None or continuations is None:
+    if source_root is None or ticket_to_logical is None or continuations is None:
         return None
     ticket_domain = ticket_to_logical.source_domain
     ticket_identity = CoordinateRelation.identity(ticket_domain, ticket_domain)
@@ -8195,7 +8181,6 @@ def _counter_prerequisite_has_progress_precedence(
     consumer_keys: CoordinateRelation,
     task_steps: tuple[CoordinateRelation | None, ...],
     continuation_by_root: dict[int, FinalArrivalContinuation],
-    transient_source_root: int | None,
 ) -> bool:
     """Prove every required producer can make progress before its consumer.
 
@@ -8206,6 +8191,8 @@ def _counter_prerequisite_has_progress_precedence(
     visibility.  This is the shared proof for final progress and optional
     nested-counter strength reduction.
     """
+    source_segment = _transient_source_schedule_segment(worker_schedule)
+    source_stage_root = None if source_segment is None else source_segment.root
     static_relations = _readiness_static_producers(
         readiness_graph,
         producers,
@@ -8215,7 +8202,7 @@ def _counter_prerequisite_has_progress_precedence(
     if static_relations is None or consumer_steps is None:
         return False
     for producer_root, keys_by_producer in static_relations:
-        if producer_root == transient_source_root:
+        if producer_root == source_stage_root:
             continue
         if task_steps[producer_root] is None:
             return False
@@ -8606,8 +8593,6 @@ def _schedule_is_progress_safe(
     readiness_graph: ReadinessGraph,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
-    *,
-    transient_source_root: int | None = None,
 ) -> bool:
     """Prove progress symbolically, without constructing a CTA DAG.
 
@@ -8645,24 +8630,23 @@ def _schedule_is_progress_safe(
             # exact counter ownership alone does not rule out a continuation
             # cycle with no resident initiator.
             return False
+    if not _has_valid_transient_source_schedule(
+        worker_schedule,
+        readiness_graph.root_task_orders,
+        readiness_counters,
+        root_barrier_edges,
+    ):
+        return False
+    source_segment = _transient_source_schedule_segment(worker_schedule)
+    source_stage_root = None if source_segment is None else source_segment.root
     continuation_roots = frozenset(continuation_by_root)
     excluded_roots = continuation_roots | (
         frozenset()
-        if transient_source_root is None
-        else frozenset((transient_source_root,))
+        if source_stage_root is None
+        else frozenset((source_stage_root,))
     )
     if (
-        (
-            transient_source_root is not None
-            and not _has_valid_transient_source_schedule(
-                worker_schedule,
-                readiness_graph,
-                transient_source_root,
-                readiness_counters,
-                root_barrier_edges,
-            )
-        )
-        or any(worker_schedule.segments_for_root(root) for root in continuation_roots)
+        any(worker_schedule.segments_for_root(root) for root in continuation_roots)
         or not _has_symbolic_worker_rank(worker_schedule)
     ):
         return False
@@ -8713,7 +8697,7 @@ def _schedule_is_progress_safe(
                 return False
             has_progress_precedence = True
             for static_root, _relation in static_relations:
-                if static_root == transient_source_root:
+                if static_root == source_stage_root:
                     # Every source ticket is issued before any resident ticket.
                     # The barrier still gates completion and visibility at
                     # runtime, but launch-stage order proves progress.
@@ -8755,7 +8739,6 @@ def _schedule_is_progress_safe(
             consumer_keys=consumer_keys,
             task_steps=task_steps,
             continuation_by_root=continuation_by_root,
-            transient_source_root=transient_source_root,
         )
         covers_every_checkpoint = all_consumer_keys is not None
         if not covers_every_checkpoint or not has_progress_precedence:
@@ -9089,7 +9072,6 @@ def _event_frontier_list_schedule(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
     *,
-    transient_source_root: int | None = None,
     pipeline_depth: int = 2,
     external_source_frontiers: tuple[tuple[int, CoordinateRelation], ...] | None = None,
 ) -> WorkerSchedule | None:
@@ -9106,10 +9088,12 @@ def _event_frontier_list_schedule(
         readiness_graph,
         continuations,
     )
+    source_segment = _transient_source_schedule_segment(worker_schedule)
+    source_stage_root = None if source_segment is None else source_segment.root
     excluded_roots = frozenset(continuation_by_root) | (
         frozenset()
-        if transient_source_root is None
-        else frozenset((transient_source_root,))
+        if source_stage_root is None
+        else frozenset((source_stage_root,))
     )
     prepared_schedule = worker_schedule
     expected_scheduled_roots = frozenset(
@@ -9232,7 +9216,7 @@ def _event_frontier_list_schedule(
 
     if any(not account_contraction(queries) for queries in main_queries):
         return worker_schedule
-    if external_source_frontiers is None and transient_source_root is not None:
+    if external_source_frontiers is None and source_stage_root is not None:
         for prerequisite in _emitted_prerequisites(
             readiness_counters,
             root_barrier_edges,
@@ -9263,13 +9247,12 @@ def _event_frontier_list_schedule(
     if external_source_frontiers is None:
         external_source_frontiers = (
             ()
-            if transient_source_root is None
+            if source_stage_root is None
             else _external_source_frontiers(
                 readiness_graph,
                 worker_schedule,
                 readiness_counters,
                 root_barrier_edges,
-                transient_source_root,
             )
         )
     if external_source_frontiers is None:
@@ -10117,7 +10100,7 @@ def _event_frontier_list_schedule(
                 candidate_admission_end = candidate_end
                 if (
                     retirement_end_slot is None
-                    and transient_source_root is None
+                    and source_stage_root is None
                     and suffix_is_admissible
                     and action_end == root_ends[root]
                     and successors[root]
@@ -10313,11 +10296,11 @@ def _event_frontier_list_schedule(
         merged_runs.append(run)
     retained_source_segments = (
         ()
-        if transient_source_root is None
-        else prepared_schedule.segments_for_root(transient_source_root)
+        if source_stage_root is None
+        else prepared_schedule.segments_for_root(source_stage_root)
     )
     segments: list[WorkerScheduleSegment] = list(retained_source_segments)
-    if transient_source_root is None:
+    if source_stage_root is None:
         schedule_domain = _worker_schedule_domain(
             worker_schedule.worker_count,
             worker_step,
@@ -10509,7 +10492,6 @@ def _event_frontier_list_schedule(
         readiness_graph,
         readiness_counters,
         root_barrier_edges,
-        transient_source_root=transient_source_root,
     ):
         return None
     return result
@@ -10625,25 +10607,24 @@ def _global_unit_list_schedule(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
     *,
-    transient_source_root: int | None = None,
     pipeline_depth: int = 2,
     external_source_frontiers: tuple[tuple[int, CoordinateRelation], ...] | None = None,
 ) -> WorkerSchedule | None:
     """Place a prepared frozen-ownership schedule without materializing CTAs."""
     if type(pipeline_depth) is not int or not 1 <= pipeline_depth <= 4:
         raise ValueError("pipeline depth must be an integer between 1 and 4")
-    if (
-        transient_source_root is not None
-        and _transient_source_schedule_segment(
-            worker_schedule,
-            transient_source_root,
-        )
-        is None
+    if not _has_valid_transient_source_schedule(
+        worker_schedule,
+        readiness_graph.root_task_orders,
+        readiness_counters,
+        root_barrier_edges,
     ):
         return None
+    source_segment = _transient_source_schedule_segment(worker_schedule)
+    source_stage_root = None if source_segment is None else source_segment.root
     if pipeline_depth == 1:
         return worker_schedule
-    if transient_source_root is None and not _emitted_prerequisites(
+    if source_stage_root is None and not _emitted_prerequisites(
         readiness_counters,
         root_barrier_edges,
     ):
@@ -10651,13 +10632,12 @@ def _global_unit_list_schedule(
     if external_source_frontiers is None:
         external_source_frontiers = (
             ()
-            if transient_source_root is None
+            if source_stage_root is None
             else _external_source_frontiers(
                 readiness_graph,
                 worker_schedule,
                 readiness_counters,
                 root_barrier_edges,
-                transient_source_root,
             )
         )
     if external_source_frontiers is None:
@@ -10667,13 +10647,12 @@ def _global_unit_list_schedule(
         worker_schedule,
         readiness_counters,
         root_barrier_edges,
-        transient_source_root=transient_source_root,
         pipeline_depth=pipeline_depth,
         external_source_frontiers=external_source_frontiers,
     )
     if candidate is None:
         return worker_schedule
-    if transient_source_root is not None:
+    if source_stage_root is not None:
         return candidate
 
     # Unit-task list scheduling must not lengthen an otherwise equivalent
@@ -10775,17 +10754,18 @@ def _source_segment_ticket_order(
 
 def _transient_source_schedule_segment(
     worker_schedule: WorkerSchedule,
-    source_root: int,
 ) -> WorkerScheduleSegment | None:
-    """Recognize one exact dense launch-stage-zero source-ticket relation."""
-    if source_root < 0:
+    """Return the unique exact launch-stage-zero source-ticket relation."""
+    source_segments = tuple(
+        segment
+        for segment in worker_schedule.segments
+        if segment.launch_stage == _SOURCE_LAUNCH_STAGE
+    )
+    if len(source_segments) != 1:
         return None
-    segments = worker_schedule.segments_for_root(source_root)
-    if len(segments) != 1:
-        return None
-    (segment,) = segments
+    (segment,) = source_segments
     if (
-        segment.launch_stage != _SOURCE_LAUNCH_STAGE
+        len(worker_schedule.segments_for_root(segment.root)) != 1
         or segment.worker_begin != 0
         or segment.worker_count != worker_schedule.worker_count
         or segment.dispatch_offset != 0
@@ -10804,11 +10784,9 @@ def _with_transient_source_schedule_segment(
     if not 0 <= source_root < len(root_task_orders):
         return None
     if (
-        _transient_source_schedule_segment(
-            worker_schedule,
-            source_root,
-        )
+        (existing_source := _transient_source_schedule_segment(worker_schedule))
         is not None
+        and existing_source.root == source_root
         and worker_schedule.segments_for_root(source_root)[0].task_order.target_domain
         == root_task_orders[source_root].target_domain
     ):
@@ -10857,25 +10835,16 @@ def _with_transient_source_schedule_segment(
         )
     except ValueError:
         return None
-    return (
-        result
-        if _transient_source_schedule_segment(
-            result,
-            source_root,
-        )
-        is not None
-        else None
-    )
+    source_segment = _transient_source_schedule_segment(result)
+    return result if source_segment is not None and source_segment.root == source_root else None
 
 
 def _source_ticket_order(
     worker_schedule: WorkerSchedule,
-    source_root: int,
 ) -> CoordinateRelation | None:
     """Derive the logical-task-to-ticket map from the source segment."""
     source_segment = _transient_source_schedule_segment(
         worker_schedule,
-        source_root,
     )
     if source_segment is None:
         return None
@@ -10936,15 +10905,26 @@ def _has_strict_partial_source_signal(
 
 def _has_valid_transient_source_schedule(
     worker_schedule: WorkerSchedule,
-    readiness_graph: ReadinessGraph,
-    source_root: int,
+    root_task_orders: tuple[CoordinateRelation, ...],
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
 ) -> bool:
-    """Check source-ticket invariants after exact schedule ownership is proved."""
-    if not 0 <= source_root < len(readiness_graph.root_task_orders):
+    """Check launch-stage ownership after exact schedule ownership is proved."""
+    source_stage_segments = tuple(
+        segment
+        for segment in worker_schedule.segments
+        if segment.launch_stage == _SOURCE_LAUNCH_STAGE
+    )
+    source_segment = _transient_source_schedule_segment(worker_schedule)
+    if not source_stage_segments:
+        return all(
+            segment.launch_stage == _RESIDENT_LAUNCH_STAGE
+            for segment in worker_schedule.segments
+        )
+    if source_segment is None or _source_ticket_order(worker_schedule) is None:
         return False
-    if _source_ticket_order(worker_schedule, source_root) is None:
+    source_root = source_segment.root
+    if not 0 <= source_root < len(root_task_orders):
         return False
     if any(
         segment.launch_stage
@@ -11168,9 +11148,9 @@ def _try_finalize_pipeline_proposal(
         for continuation in emitted_continuations
     )
 
-    transient_source_root: int | None = None
+    source_candidate_root: int | None = None
     if allow_transient_source and not emitted_continuations:
-        transient_source_root = _transient_source_candidate(
+        source_candidate_root = _transient_source_candidate(
             readiness_graph,
             readiness_counters,
             root_barrier_edges,
@@ -11183,26 +11163,19 @@ def _try_finalize_pipeline_proposal(
         excluded_roots=continuation_roots
         | (
             frozenset()
-            if transient_source_root is None
-            else frozenset((transient_source_root,))
+            if source_candidate_root is None
+            else frozenset((source_candidate_root,))
         ),
     )
     ownership_base = resident_base
-    if transient_source_root is not None:
+    if source_candidate_root is not None:
         transient_schedule = _with_transient_source_schedule_segment(
             resident_base,
             readiness_graph.root_task_orders,
-            transient_source_root,
+            source_candidate_root,
         )
         if (
             transient_schedule is None
-            or not _has_valid_transient_source_schedule(
-                transient_schedule,
-                readiness_graph,
-                transient_source_root,
-                readiness_counters,
-                root_barrier_edges,
-            )
             or not _validate_worker_schedule_tasks(
                 transient_schedule,
                 readiness_graph.root_task_orders,
@@ -11213,14 +11186,13 @@ def _try_finalize_pipeline_proposal(
                 readiness_graph,
                 readiness_counters,
                 root_barrier_edges,
-                transient_source_root=transient_source_root,
             )
         ):
             # Source ownership is selected only after its complete static
             # ownership/progress certificate succeeds.  A declined candidate
             # remains an ordinary resident root; an accepted candidate is never
             # reversed by a later placement fallback.
-            transient_source_root = None
+            source_candidate_root = None
             ownership_base = build_baseline_worker_schedule(
                 readiness_graph.root_domains,
                 readiness_graph.root_task_orders,
@@ -11230,15 +11202,17 @@ def _try_finalize_pipeline_proposal(
         else:
             ownership_base = transient_schedule
 
+    source_segment = _transient_source_schedule_segment(ownership_base)
+    source_root = None if source_segment is None else source_segment.root
+
     external_source_frontiers = (
         ()
-        if transient_source_root is None
+        if source_root is None
         else _external_source_frontiers(
             readiness_graph,
             ownership_base,
             readiness_counters,
             root_barrier_edges,
-            transient_source_root,
         )
     )
     prepared_schedule = ownership_base
@@ -11251,8 +11225,8 @@ def _try_finalize_pipeline_proposal(
             excluded_roots=continuation_roots
             | (
                 frozenset()
-                if transient_source_root is None
-                else frozenset((transient_source_root,))
+                if source_root is None
+                else frozenset((source_root,))
             ),
             external_source_frontiers=external_source_frontiers,
         )
@@ -11265,7 +11239,6 @@ def _try_finalize_pipeline_proposal(
             readiness_graph,
             readiness_counters,
             root_barrier_edges,
-            transient_source_root=transient_source_root,
         ):
             prepared_schedule = prepared_candidate
 
@@ -11275,7 +11248,6 @@ def _try_finalize_pipeline_proposal(
             prepared_schedule,
             readiness_counters,
             root_barrier_edges,
-            transient_source_root=transient_source_root,
             pipeline_depth=pipeline_depth,
             external_source_frontiers=external_source_frontiers,
         )
@@ -11294,17 +11266,7 @@ def _try_finalize_pipeline_proposal(
             continue
         attempted.add(id(candidate))
         if (
-            (
-                transient_source_root is not None
-                and not _has_valid_transient_source_schedule(
-                    candidate,
-                    readiness_graph,
-                    transient_source_root,
-                    readiness_counters,
-                    root_barrier_edges,
-                )
-            )
-            or not _validate_worker_schedule_tasks(
+            not _validate_worker_schedule_tasks(
                 candidate,
                 readiness_graph.root_task_orders,
                 excluded_roots=continuation_roots,
@@ -11314,7 +11276,6 @@ def _try_finalize_pipeline_proposal(
                 readiness_graph,
                 readiness_counters,
                 root_barrier_edges,
-                transient_source_root=transient_source_root,
             )
         ):
             continue
@@ -11322,7 +11283,6 @@ def _try_finalize_pipeline_proposal(
             readiness_graph,
             candidate,
             readiness_counters,
-            transient_source_root=transient_source_root,
         )
         exact_covered_obligations = frozenset(
             obligation
@@ -11359,22 +11319,11 @@ def _try_finalize_pipeline_proposal(
                     emitted_counters,
                 )
                 != emitted_continuations
-                or (
-                    transient_source_root is not None
-                    and not _has_valid_transient_source_schedule(
-                        candidate,
-                        readiness_graph,
-                        transient_source_root,
-                        emitted_counters,
-                        root_barrier_edges,
-                    )
-                )
                 or not _schedule_is_progress_safe(
                     candidate,
                     readiness_graph,
                     emitted_counters,
                     root_barrier_edges,
-                    transient_source_root=transient_source_root,
                 )
             ):
                 continue
@@ -11384,7 +11333,6 @@ def _try_finalize_pipeline_proposal(
                     root_task_orders=readiness_graph.root_task_orders,
                     readiness_counters=emitted_counters,
                     root_barrier_edges=root_barrier_edges,
-                    transient_source_root=transient_source_root,
                 )
             except (ValueError, exc.CrossLoopSchedulingError):
                 # Physical publication rejection first retries the exact keys

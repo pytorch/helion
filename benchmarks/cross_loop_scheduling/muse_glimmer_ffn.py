@@ -617,7 +617,10 @@ def _compile_persistent(
                 readiness_graph = progress_args[1]
                 readiness_counters = progress_args[2]
                 root_barrier_edges = progress_args[3]
-                transient_source_root = progress_kwargs.get("transient_source_root")
+                source_segment = (
+                    cross_loop_scheduler._transient_source_schedule_segment(schedule)
+                )
+                source_root = None if source_segment is None else source_segment.root
                 continuations = (
                     cross_loop_scheduler._emitted_final_arrival_continuations(
                         readiness_graph,
@@ -634,8 +637,8 @@ def _compile_persistent(
                 )
                 excluded_roots = frozenset(continuation_by_root) | (
                     frozenset()
-                    if transient_source_root is None
-                    else frozenset((transient_source_root,))
+                    if source_root is None
+                    else frozenset((source_root,))
                 )
                 progress_diagnostics.append(
                     {
@@ -747,7 +750,16 @@ def _compile_persistent(
                 "rejected_traversals": rejected_traversals,
                 "progress_diagnostics": progress_diagnostics,
                 "root_sizes": [domain.size for domain in readiness_graph.root_domains],
-                "transient_source_root": call_kwargs.get("transient_source_root"),
+                "source_stage_root": (
+                    None
+                    if (
+                        source_segment := cross_loop_scheduler._transient_source_schedule_segment(
+                            source_schedule
+                        )
+                    )
+                    is None
+                    else source_segment.root
+                ),
                 "readiness_counters": [repr(plan) for plan in call_args[2]],
                 "root_barrier_edges": sorted(call_args[3]),
                 "input_segments": len(source_schedule.segments),

@@ -5322,16 +5322,19 @@ performance gates.
 Exit gate: FlashMLA B4/B9 retain their gains without an MLA matcher or an
 admission-width knob.
 
-Implementation checkpoint (2026-09-09): the existing transient source is now
-an exact launch-stage-zero `WorkerScheduleSegment`; there is no parallel source
-task-order mapping. Ticket order, count, external source frontiers, source-body
-mapping, and root-barrier arrival targets are derived from that relation.
-`transient_source_root` currently remains a cached role identity and codegen
-rejects disagreement with the unique stage-zero segment. Priority 2A supersedes
-that migration state: callers must derive the role from the segment and delete
-the duplicate field. The resident stage is unchanged. This checkpoint covers
-the proved static source-first behavior; parameterized wider fan-in and ragged
-source extents remain outside the accepted subset.
+Implementation checkpoint (2026-09-12): source-stage identity now has one
+source of truth. It is derived from the unique exact launch-stage-zero
+`WorkerScheduleSegment`; `StaticPipelinePlan.transient_source_root` and every
+threaded source-root argument have been deleted. Ticket order, count, external
+source frontiers, source-body mapping, progress exemptions, and root-barrier
+arrival targets all consume that relation. On canonical FlashMLA B4/Q4/H16,
+the resulting schedule, counters, barriers, publications, generated Triton,
+executable SASS, resources, and output are identical to the pre-cleanup golden.
+The next cleanup is continuation ownership: replace its discarded legacy
+scratch placement with a proof over the actual resident `WorkerSchedule`, then
+delete the old placement helpers after Qwen, Gemma, and FlashMLA gates pass.
+Parameterized wider fan-in and ragged source extents remain outside the
+accepted subset.
 
 ### Phase 6: cross-workload rollout
 

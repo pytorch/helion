@@ -335,7 +335,6 @@ def _compile(
                 root_task_orders=root_task_orders,
                 readiness_counters=counters,
                 root_barrier_edges=barriers,
-                transient_source_root=None,
             )
             path_records["diagnostic_continuation_ablation"] = {
                 "selected": [

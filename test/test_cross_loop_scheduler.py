@@ -1949,7 +1949,6 @@ class TestCrossLoopScheduler(TestCase):
             source_schedule,
             readiness_counters,
             frozenset(),
-            transient_source_root=0,
         )
 
         self.assertIsNotNone(scheduled)
@@ -1967,14 +1966,12 @@ class TestCrossLoopScheduler(TestCase):
                     readiness_graph,
                     readiness_counters,
                     frozenset(),
-                    transient_source_root=0,
                 )
             )
             self.assertTrue(
                 _has_valid_transient_source_schedule(
                     scheduled,
-                    readiness_graph,
-                    0,
+                    readiness_graph.root_task_orders,
                     readiness_counters,
                     frozenset(),
                 )
@@ -2052,7 +2049,6 @@ class TestCrossLoopScheduler(TestCase):
                 source_schedule,
                 counters,
                 frozenset(),
-                transient_source_root=0,
             )
 
         self.assertIsNotNone(scheduled)
@@ -2104,8 +2100,7 @@ class TestCrossLoopScheduler(TestCase):
             self.assertFalse(
                 _has_valid_transient_source_schedule(
                     invalid,
-                    graph,
-                    0,
+                    graph.root_task_orders,
                     counters,
                     frozenset(),
                 )
@@ -2116,7 +2111,6 @@ class TestCrossLoopScheduler(TestCase):
                     graph,
                     counters,
                     frozenset(),
-                    transient_source_root=0,
                 )
             )
 
@@ -2157,7 +2151,6 @@ class TestCrossLoopScheduler(TestCase):
                 source_schedule,
                 counters,
                 frozenset(),
-                transient_source_root=0,
                 pipeline_depth=2,
             )
 
@@ -2176,14 +2169,12 @@ class TestCrossLoopScheduler(TestCase):
                     graph,
                     counters,
                     frozenset(),
-                    transient_source_root=0,
                 )
             )
             self.assertTrue(
                 _has_valid_transient_source_schedule(
                     scheduled,
-                    graph,
-                    0,
+                    graph.root_task_orders,
                     counters,
                     frozenset(),
                 )
@@ -2247,7 +2238,6 @@ class TestCrossLoopScheduler(TestCase):
                         source_schedule,
                         readiness_counters,
                         frozenset(),
-                        transient_source_root=0,
                     )
 
                     self.assertIsNotNone(scheduled)
@@ -2255,7 +2245,6 @@ class TestCrossLoopScheduler(TestCase):
                     self.assertIsNotNone(
                         cross_loop_scheduler._source_ticket_order(
                             scheduled,
-                            0,
                         )
                     )
                     self.assertTrue(
@@ -2270,7 +2259,6 @@ class TestCrossLoopScheduler(TestCase):
                             readiness_graph,
                             readiness_counters,
                             frozenset(),
-                            transient_source_root=0,
                         )
                     )
                 self.assertEqual(len(scheduled.segments_for_root(0)), 1)
@@ -2345,11 +2333,16 @@ class TestCrossLoopScheduler(TestCase):
         baseline = _baseline_worker_schedule(root_domains, worker_count=2)
 
         def progress_safe(
+            worker_schedule: WorkerSchedule,
             *_args: object,
-            transient_source_root: int | None = None,
             **_kwargs: object,
         ) -> bool:
-            return transient_source_root is None
+            return (
+                cross_loop_scheduler._transient_source_schedule_segment(
+                    worker_schedule
+                )
+                is None
+            )
 
         with (
             mock.patch.object(
@@ -2379,7 +2372,11 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(plan)
         assert plan is not None
-        self.assertIsNone(plan.transient_source_root)
+        self.assertIsNone(
+            cross_loop_scheduler._transient_source_schedule_segment(
+                plan.worker_schedule
+            )
+        )
         self.assertEqual(
             tuple(segment.root for segment in plan.worker_schedule.segments),
             (0, 1),
@@ -2439,7 +2436,12 @@ class TestCrossLoopScheduler(TestCase):
         assert plan is not None
         prepare.assert_not_called()
         place.assert_not_called()
-        self.assertEqual(plan.transient_source_root, 0)
+        source_segment = cross_loop_scheduler._transient_source_schedule_segment(
+            plan.worker_schedule
+        )
+        self.assertIsNotNone(source_segment)
+        assert source_segment is not None
+        self.assertEqual(source_segment.root, 0)
         (resident_segment,) = plan.worker_schedule.segments_for_root(1)
         resident_order = resident_segment.logical_task_order
         self.assertIsNotNone(resident_order)
@@ -2519,8 +2521,7 @@ class TestCrossLoopScheduler(TestCase):
             self.assertTrue(
                 _has_valid_transient_source_schedule(
                     schedule,
-                    readiness_graph,
-                    0,
+                    readiness_graph.root_task_orders,
                     (full_plan,),
                     frozenset(),
                 )
@@ -2528,8 +2529,7 @@ class TestCrossLoopScheduler(TestCase):
             self.assertTrue(
                 _has_valid_transient_source_schedule(
                     schedule,
-                    readiness_graph,
-                    0,
+                    readiness_graph.root_task_orders,
                     (),
                     frozenset(((0, 1),)),
                 )
@@ -2567,8 +2567,7 @@ class TestCrossLoopScheduler(TestCase):
             self.assertTrue(
                 _has_valid_transient_source_schedule(
                     schedule,
-                    readiness_graph,
-                    0,
+                    readiness_graph.root_task_orders,
                     (partial_plan,),
                     frozenset(((0, 1),)),
                 )
@@ -8516,7 +8515,6 @@ class TestCrossLoopScheduler(TestCase):
         with _forbid_schedule_enumeration():
             logical_to_ticket = cross_loop_scheduler._source_ticket_order(
                 schedule,
-                0,
             )
         self.assertIsNotNone(logical_to_ticket)
         assert logical_to_ticket is not None
@@ -8547,7 +8545,6 @@ class TestCrossLoopScheduler(TestCase):
         with _forbid_schedule_enumeration():
             logical_to_ticket = cross_loop_scheduler._source_ticket_order(
                 schedule,
-                0,
             )
         self.assertIsNotNone(logical_to_ticket)
         assert logical_to_ticket is not None
@@ -8579,11 +8576,9 @@ class TestCrossLoopScheduler(TestCase):
         with _forbid_schedule_enumeration():
             source_segment = cross_loop_scheduler._transient_source_schedule_segment(
                 schedule,
-                0,
             )
             logical_to_ticket = cross_loop_scheduler._source_ticket_order(
                 schedule,
-                0,
             )
 
         self.assertIsNotNone(source_segment)
@@ -8625,7 +8620,6 @@ class TestCrossLoopScheduler(TestCase):
             self.assertTrue(_validate_worker_schedule_tasks(retained, (reference,)))
             logical_to_ticket = cross_loop_scheduler._source_ticket_order(
                 retained,
-                0,
             )
         self.assertIsNotNone(logical_to_ticket)
         assert logical_to_ticket is not None
@@ -8762,7 +8756,6 @@ class TestCrossLoopScheduler(TestCase):
                     readiness_graph,
                     (plan,),
                     frozenset(),
-                    transient_source_root=0,
                 )
             )
             self.assertFalse(
@@ -8771,7 +8764,6 @@ class TestCrossLoopScheduler(TestCase):
                     readiness_graph,
                     (plan,),
                     frozenset(),
-                    transient_source_root=0,
                 )
             )
 
@@ -9809,8 +9801,6 @@ class TestCrossLoopScheduler(TestCase):
             readiness_graph: ReadinessGraph,
             readiness_counters: tuple[ReadinessCounterPlan, ...],
             root_barrier_edges: frozenset[tuple[int, int]],
-            *,
-            transient_source_root: int | None = None,
         ) -> bool:
             # Model the final progress proof finding that the stronger entry
             # wait has introduced a same-strand cycle.  It was not an input to
@@ -9823,7 +9813,6 @@ class TestCrossLoopScheduler(TestCase):
                 readiness_graph,
                 readiness_counters,
                 root_barrier_edges,
-                transient_source_root=transient_source_root,
             )
 
         with (
@@ -9942,7 +9931,6 @@ class TestCrossLoopScheduler(TestCase):
                     graph,
                     transient_source,
                     exact,
-                    transient_source_root=0,
                 )
             )
 
@@ -9973,7 +9961,6 @@ class TestCrossLoopScheduler(TestCase):
                 graph,
                 transient_source_compact,
                 frozenset(),
-                transient_source_root=0,
             )
         )
 
@@ -13929,6 +13916,5 @@ class TestCrossLoopScheduler(TestCase):
                 readiness_graph,
                 overlapped.readiness_counters,
                 overlapped.root_barrier_edges,
-                transient_source_root=overlapped.transient_source_root,
             )
         )

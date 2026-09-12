@@ -10,7 +10,6 @@ from unittest import mock
 import torch
 
 import helion
-from helion import exc
 from helion._compiler import cross_loop_codegen
 from helion._compiler import cross_loop_scheduler
 from helion._compiler.compile_environment import CompileEnvironment
@@ -1875,7 +1874,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             return dataclasses.replace(
                 plan,
                 worker_schedule=staged_schedule,
-                transient_source_root=0,
             )
 
         with mock.patch.object(
@@ -1906,56 +1904,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_plan_rejects_transient_source_ownership_drift(self) -> None:
-        x = torch.arange(128, device=DEVICE, dtype=torch.float32)
-        original_build = cross_loop_codegen.build_static_pipeline_plan
-
-        for claimed_source, error in (
-            (None, "a source-stage segment requires source ownership"),
-            (1, "source ownership requires one matching stage-zero segment"),
-        ):
-            with self.subTest(claimed_source=claimed_source):
-
-                def build_with_ownership_drift(
-                    *, claimed_source: int | None = claimed_source, **kwargs: Any
-                ):
-                    kwargs["allow_transient_source"] = False
-                    plan = original_build(**kwargs)
-                    staged = _with_transient_source_schedule_segment(
-                        plan.worker_schedule,
-                        kwargs["root_task_orders"],
-                        0,
-                    )
-                    assert staged is not None
-                    return dataclasses.replace(
-                        plan,
-                        worker_schedule=staged,
-                        transient_source_root=claimed_source,
-                    )
-
-                with (
-                    mock.patch.object(
-                        cross_loop_codegen,
-                        "build_static_pipeline_plan",
-                        side_effect=build_with_ownership_drift,
-                    ),
-                    self.assertRaisesRegex(
-                        exc.InternalError,
-                        error,
-                    ),
-                ):
-                    code_and_output(
-                        offset_affine_chain,
-                        (x,),
-                        block_sizes=[16, 16],
-                        pid_type="persistent_blocked",
-                        cross_loop_schedule="static_pipeline",
-                        num_sm_multiplier=1,
-                        num_warps=1,
-                    )
-
-    @skipIfNotCUDA()
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_transient_source_lowers_its_authoritative_permutation(self) -> None:
         x = torch.arange(128, device=DEVICE, dtype=torch.float32).reshape(2, 64)
         original_build = cross_loop_codegen.build_static_pipeline_plan
@@ -1978,7 +1926,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             return dataclasses.replace(
                 plan,
                 worker_schedule=staged,
-                transient_source_root=0,
             )
 
         with mock.patch.object(

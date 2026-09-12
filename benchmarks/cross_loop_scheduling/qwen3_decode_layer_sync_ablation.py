@@ -13,15 +13,10 @@ import dataclasses
 import hashlib
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 
-import torch
-
-import helion
-import helion._compiler.cross_loop_codegen as cross_loop_codegen
-import helion._compiler.cross_loop_scheduler as cross_loop_scheduler
-from helion.runtime.kernel import CompiledConfig
 from pretuned_kernels._bench import bench_pre_captured_cudagraphs
 from pretuned_kernels._bench import capture_cuda_graph
 from pretuned_kernels._bench import thermal_warmup
@@ -29,6 +24,14 @@ from pretuned_kernels.megakernels.qwen3_decode_layer import qwen3_decode_layer a
 from pretuned_kernels.megakernels.qwen3_decode_layer._helion_aot_qwen3_decode_layer_cuda_sm100 import (
     CONFIG,
 )
+import torch
+
+import helion
+import helion._compiler.cross_loop_codegen as cross_loop_codegen
+import helion._compiler.cross_loop_scheduler as cross_loop_scheduler
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import CompiledConfig
 
 
 VARIANTS = {
@@ -141,7 +144,6 @@ def _compile_variant(
             graph,
             result.readiness_counters,
             result.root_barrier_edges,
-            transient_source_root=result.transient_source_root,
         )
         records.append(
             {

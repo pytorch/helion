@@ -767,30 +767,23 @@ def emit_cross_loop_schedule(
         if (continuation_consumer := plan.continuation_consumer) is not None
     }
     launch_worker_count = static_pipeline_plan.worker_schedule.worker_count
-    transient_source_root = static_pipeline_plan.transient_source_root
-    transient_source_segment = (
-        None
-        if transient_source_root is None
-        else _transient_source_schedule_segment(
-            static_pipeline_plan.worker_schedule,
-            transient_source_root,
-        )
+    transient_source_segment = _transient_source_schedule_segment(
+        static_pipeline_plan.worker_schedule
+    )
+    source_stage_root = (
+        None if transient_source_segment is None else transient_source_segment.root
     )
     launch_stage_zero_segments = tuple(
         segment
         for segment in static_pipeline_plan.worker_schedule.segments
         if segment.launch_stage == _SOURCE_LAUNCH_STAGE
     )
-    if transient_source_root is None and launch_stage_zero_segments:
-        raise AssertionError(
-            "a launch-stage-zero segment requires a transient source role"
-        )
-    if transient_source_root is not None and (
-        transient_source_segment is None
-        or launch_stage_zero_segments != (transient_source_segment,)
+    if bool(launch_stage_zero_segments) != (transient_source_segment is not None) or (
+        transient_source_segment is not None
+        and launch_stage_zero_segments != (transient_source_segment,)
     ):
         raise AssertionError(
-            "a transient source must have one exact launch-stage-zero segment"
+            "source dispatch requires one exact launch-stage-zero segment"
         )
     transient_source_task_count = (
         transient_source_segment.task_count
@@ -799,7 +792,7 @@ def emit_cross_loop_schedule(
     )
     launch_program_count = launch_worker_count + transient_source_task_count
     resident_grid_size_expr = strategy.grid_size_expr
-    if transient_source_root is not None:
+    if source_stage_root is not None:
         worker = device_function.new_var("tile_dependency_resident_worker", dce=True)
 
     root_barrier_producer_roots = sorted(
@@ -820,7 +813,7 @@ def emit_cross_loop_schedule(
     # contract for this non-cooperative static lowering.
     device_function.triton_minimum_resident_programs = resident_grid_size_expr
     device_function.preamble.extend(strategy._persistent_setup_statements(total_expr))
-    if transient_source_root is not None:
+    if source_stage_root is not None:
         strategy.grid_size_expr = (
             f"({resident_grid_size_expr} + {transient_source_task_count})"
         )
@@ -853,7 +846,7 @@ def emit_cross_loop_schedule(
     )
     readiness_counter_state_offset = reserve_state(readiness_counter_count)
     root_barrier_state_offset = reserve_state(root_barrier_count)
-    epoch_state_count = launch_program_count if transient_source_root is None else 0
+    epoch_state_count = launch_program_count if source_stage_root is None else 0
     static_state_base = str(
         (epoch_state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
         // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
@@ -876,7 +869,7 @@ def emit_cross_loop_schedule(
             numel="1",
             dtype=torch.uint64,
         )
-        if transient_source_root is not None
+        if source_stage_root is not None
         else None
     )
 
@@ -892,7 +885,7 @@ def emit_cross_loop_schedule(
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
     dispatch_ticket: str | None = None
-    if transient_source_root is None:
+    if source_stage_root is None:
         if epoch_arg is None:
             raise AssertionError("cross-loop epoch state was not allocated")
         result: list[ast.stmt] = [
@@ -2429,7 +2422,7 @@ def emit_cross_loop_schedule(
         static_pipeline_plan.worker_schedule.segments
     ):
         root = segment.root
-        if root == transient_source_root:
+        if root == source_stage_root:
             continue
         if schedule_segment_geometry is not None:
             segment_geometry = segment_geometry_by_identity.get(id(segment))
@@ -2468,13 +2461,13 @@ def emit_cross_loop_schedule(
             )
         )
     if any(
-        root != transient_source_root
+        root != source_stage_root
         and next_segment_range_by_root.get(root, 0)
         != len(traversal.segment_ordinal_ranges)
         for root, traversal in root_schedule_traversals.items()
     ):
         raise AssertionError("proved root traversal has unconsumed segments")
-    if transient_source_root is None:
+    if source_stage_root is None:
         result.extend(resident_body)
         result.append(
             statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
@@ -2482,20 +2475,20 @@ def emit_cross_loop_schedule(
     else:
         assert dispatch_ticket is not None
         if (
-            transient_source_root in readiness_consumers_by_root
-            or transient_source_root in root_barrier_incoming
+            source_stage_root in readiness_consumers_by_root
+            or source_stage_root in root_barrier_incoming
         ):
             raise AssertionError(
                 "a transient source may not have incoming dependencies"
             )
         transient_body = scheduled_root_task_body(
-            transient_source_root,
+            source_stage_root,
             dispatch_ticket,
-            f"{case_offsets[transient_source_root]} + {dispatch_ticket}",
+            f"{case_offsets[source_stage_root]} + {dispatch_ticket}",
             (dispatch_ticket,),
         )
-        transient_body.extend(root_barrier_publication(transient_source_root))
-        if kernel_scope_roots - {transient_source_root}:
+        transient_body.extend(root_barrier_publication(source_stage_root))
+        if kernel_scope_roots - {source_stage_root}:
             resident_branch = resident_body
         else:
             resident_branch = [

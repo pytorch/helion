@@ -485,23 +485,23 @@ Each segment iterates its own dense slice and composes through `task_order`.
 Codegen must not assume that the second root segment begins at the next
 root-local PID after the first.
 
-### 10. Add the proven transient-source launch mode
+### 10. Retain the proven source-stage launch mode
 
 FlashMLA B4 needs one-task attention CTAs to retire while a fixed resident
-cohort executes the downstream schedule. Add only one field to the existing
-plan:
+cohort executes the downstream schedule. The source is represented by the
+existing schedule, not by another plan field:
 
 ```python
 @dataclasses.dataclass(frozen=True)
 class StaticPipelinePlan:
     worker_schedule: WorkerSchedule
+    root_task_orders: tuple[CoordinateRelation, ...]
     readiness_counters: tuple[ReadinessCounterPlan, ...]
     root_barrier_edges: frozenset[tuple[int, int]]
-    transient_source_root: int | None
 ```
 
-No separate launch-plan IR is needed while only one inferred source is
-supported.
+The unique exact launch-stage-zero `WorkerScheduleSegment` is the sole source
+identity. No separate launch-plan IR or cached source-root identity exists.
 
 #### Eligibility
 
@@ -565,8 +565,8 @@ invocations.
 #### Two ticket roles, one executable schedule
 
 The source is a launch-stage-zero `WorkerScheduleSegment`. Its relation is the
-sole executable mapping from source tickets `[0, P)` to logical source tasks;
-`transient_source_root` only caches that segment's role. The resident list
+sole executable mapping from source tickets `[0, P)` to logical source tasks.
+Every consumer derives the source role from that segment. The resident list
 scheduler sees only stage-one tasks and assigns them local steps beginning at
 zero.
 
