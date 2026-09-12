@@ -5,6 +5,7 @@ backend DSL only, or ``jax`` alone for ``jax_fn=True``)."""
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 import subprocess
 import sys
@@ -12,8 +13,12 @@ import tempfile
 import textwrap
 from typing import Any
 import unittest
+from unittest.mock import Mock
+from unittest.mock import call
+from unittest.mock import patch
 
 import torch
+from torch._inductor.runtime.triton_compat import OutOfResources
 
 import helion
 from helion._testing import DEVICE
@@ -22,6 +27,9 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessPallas
 import helion.language as hl
+from helion.runtime.kernel import BoundKernel
+
+kernel_module = importlib.import_module("helion.runtime.kernel")
 
 _FREE = helion.OutputCodeOptions(allow_helion_deps=False)
 _JAX = helion.OutputCodeOptions(allow_helion_deps=False, jax_fn=True)
@@ -616,6 +624,134 @@ class TestToCodePallas(TestCase):
         y = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
         with self.assertRaises(NotImplementedError):
             _pallas_to_code(pallas_matmul, (x, y), _JAX)
+
+
+class TestOutOfResourcesFallback(TestCase):
+    def test_retries_once_with_default_config(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        fallback = Mock(return_value="ok")
+        bound = Mock(compile_config=Mock(return_value=fallback))
+        fallback_config = Mock()
+        wrapped = BoundKernel._run_with_fallback(bound, run, [fallback_config])
+
+        result = wrapped("arg")
+
+        self.assertEqual(result, "ok")
+        run.assert_called_once_with("arg")
+        bound.compile_config.assert_called_once_with(fallback_config)
+        fallback.assert_called_once_with("arg")
+
+    def test_no_retry_when_run_succeeds(self) -> None:
+        run = Mock(return_value="ok")
+        bound = Mock(compile_config=Mock())
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
+
+        result = wrapped("arg")
+
+        self.assertEqual(result, "ok")
+        bound.compile_config.assert_not_called()
+
+    def test_other_exceptions_are_not_caught(self) -> None:
+        run = Mock(side_effect=RuntimeError("unrelated failure"))
+        bound = Mock(compile_config=Mock())
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
+
+        with self.assertRaises(RuntimeError):
+            wrapped("arg")
+
+        bound.compile_config.assert_not_called()
+
+    def test_tries_each_config_until_one_launches(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        bad = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        good = Mock(return_value="ok")
+        bound = Mock(compile_config=Mock(side_effect=[bad, good]))
+        first, second = Mock(), Mock()
+        wrapped = BoundKernel._run_with_fallback(bound, run, [first, second])
+
+        self.assertEqual(wrapped("arg"), "ok")
+        self.assertEqual(
+            bound.compile_config.call_args_list, [call(first), call(second)]
+        )
+
+    def test_reraises_when_all_configs_fail(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        bad = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        bound = Mock(compile_config=Mock(return_value=bad))
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock(), Mock()])
+
+        with self.assertRaises(OutOfResources):
+            wrapped("arg")
+
+        self.assertEqual(bound.compile_config.call_count, 2)
+
+    def test_caches_working_config_for_static_shapes(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        good = Mock(return_value="ok")
+        bound = Mock(
+            compile_config=Mock(return_value=good),
+            settings=Mock(static_shapes=True),
+        )
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
+
+        self.assertEqual(wrapped("arg"), "ok")
+        # Static shapes: one BoundKernel per shape, so keep the bare callable.
+        self.assertIs(bound._run, good)
+
+    def test_keeps_retrying_for_dynamic_shapes(self) -> None:
+        run = Mock(side_effect=OutOfResources(1, 2, "shared memory"))
+        good = Mock(return_value="ok")
+        bound = Mock(
+            compile_config=Mock(return_value=good),
+            settings=Mock(static_shapes=False),
+            _run_with_fallback=BoundKernel._run_with_fallback,
+        )
+        bound._run_with_fallback = lambda *a: BoundKernel._run_with_fallback(bound, *a)
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
+
+        self.assertEqual(wrapped("arg"), "ok")
+        # Dynamic shapes share a BoundKernel, so the retry must stay installed.
+        self.assertIsNot(bound._run, good)
+        self.assertEqual(bound._run("arg"), "ok")
+
+    def test_retries_on_other_launch_resource_errors(self) -> None:
+        run = Mock(side_effect=RuntimeError("too many resources requested for launch"))
+        fallback = Mock(return_value="ok")
+        bound = Mock(compile_config=Mock(return_value=fallback))
+        wrapped = BoundKernel._run_with_fallback(bound, run, [Mock()])
+
+        result = wrapped("arg")
+
+        self.assertEqual(result, "ok")
+        fallback.assert_called_once_with("arg")
+
+    @skipIfRefEager("needs a compiled kernel")
+    def test_set_config_installs_fallback_only_when_enabled(self) -> None:
+        @helion.kernel(config=helion.Config(block_sizes=[32]))
+        def add1(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn(64, device=DEVICE)
+        config = helion.Config(block_sizes=[32])
+
+        with patch.object(kernel_module, "_RETRY_WITH_FALLBACK", False):
+            bound = add1.bind((x,))
+            bound.set_config(config)
+            self.assertNotEqual(bound._run.__name__, "run_with_fallback")
+            plain_run = bound._run
+
+        with patch.object(kernel_module, "_RETRY_WITH_FALLBACK", True):
+            bound = add1.bind((x,))
+            bound.set_config(config)
+            self.assertEqual(bound._run.__name__, "run_with_fallback")
+            # The default config is always available as a last resort.
+            self.assertTrue(bound.fallback_configs)
+
+        torch.testing.assert_close(plain_run(x), x + 1)
+        torch.testing.assert_close(bound._run(x), x + 1)
 
 
 if __name__ == "__main__":

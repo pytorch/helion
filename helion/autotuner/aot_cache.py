@@ -42,6 +42,7 @@ import torch
 
 from .._hardware import get_hardware_info
 from ..runtime.config import Config
+from ..runtime.kernel import _RETRY_WITH_FALLBACK
 from .aot_kernel import _flatten_key_value
 from .aot_kernel import extract_key_features
 from .aot_kernel import extract_shape_features
@@ -301,6 +302,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
     # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
     # Using source file ensures kernels with same name in different modules don't collide
     _heuristic_results: ClassVar[dict[tuple[str, str, str], Config]] = {}
+    # Maps (heuristic file, kernel_name) -> launch-failure fallback configs.
+    # Parsed once per file; pushed onto each BoundKernel at cache construction.
+    _fallback_configs: ClassVar[dict[tuple[Path, str], list[Config]]] = {}
     # Tracks which kernels have shown the "no heuristic" warning (to avoid spam)
     _no_heuristic_warned: ClassVar[set[str]] = set()
     # Tracks which kernels have already been compiled in compile mode
@@ -320,6 +324,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         """Clear all class-level caches (heuristic modules and results)."""
         cls._heuristic_modules.clear()
         cls._heuristic_results.clear()
+        cls._fallback_configs.clear()
         cls._no_heuristic_warned.clear()
         cls._compiled_kernels.clear()
         with cls._compiled_kernel_variants_lock:
@@ -344,6 +349,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self._tuned_configs: dict[str, list[TunedConfig]] = self._load_tuned_configs()
         self.shape_key = self._create_shape_key()
         self._verbose = is_aot_verbose()
+        if _RETRY_WITH_FALLBACK:
+            self._set_fallback_configs()
 
         # Look up optional collect_fn/measure_fn from the Kernel object
         # These are set by @aot_kernel() decorator
@@ -749,6 +756,39 @@ class AOTAutotuneCache(AutotuneCacheBase):
             data_dir=self.data_dir,
         )
 
+    def _load_heuristic_module(self, heuristic_file: Path) -> object | None:
+        """Load heuristic module from cache or import fresh."""
+        if (module := AOTAutotuneCache._heuristic_modules.get(heuristic_file)) is None:
+            spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
+            if spec is None or spec.loader is None:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            AOTAutotuneCache._heuristic_modules[heuristic_file] = module
+            log.debug(f"Loaded heuristic module: {heuristic_file}")
+        return module
+
+    def _set_fallback_configs(self) -> None:
+        """Prepend the heuristic's configs to the kernel's launch-failure fallbacks."""
+        heuristic_file = self._find_heuristic_file()
+        if heuristic_file is None:
+            return
+        kernel_name = self.kernel.kernel.name
+        key = (heuristic_file, kernel_name)
+        if (fallbacks := AOTAutotuneCache._fallback_configs.get(key)) is None:
+            module = self._load_heuristic_module(heuristic_file)
+            configs = (
+                self._parse_configs_from_autotune(module, kernel_name)
+                if module is not None
+                else None
+            )
+            fallbacks = [Config.from_dict(c) for c in configs or ()]
+            AOTAutotuneCache._fallback_configs[key] = fallbacks
+        if not fallbacks:
+            return
+        rest = [c for c in self.kernel.fallback_configs if c not in fallbacks]
+        self.kernel.fallback_configs = fallbacks + rest
+
     def _get_heuristic_config(
         self, args: Sequence[object] | None = None
     ) -> Config | None:
@@ -788,19 +828,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
             return AOTAutotuneCache._heuristic_results[cache_key]
 
         try:
-            # Load heuristic module from cache or import fresh
-            if heuristic_file in AOTAutotuneCache._heuristic_modules:
-                module = AOTAutotuneCache._heuristic_modules[heuristic_file]
-            else:
-                spec = importlib.util.spec_from_file_location(
-                    "heuristic", heuristic_file
-                )
-                if spec is None or spec.loader is None:
-                    return None
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                AOTAutotuneCache._heuristic_modules[heuristic_file] = module
-                log.debug(f"Loaded heuristic module: {heuristic_file}")
+            module = self._load_heuristic_module(heuristic_file)
+            if module is None:
+                return None
 
             # Call autotune_<kernel>(*args) to get the config
             # If there's a user key, we need to pass flattened key values, not raw args
