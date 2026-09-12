@@ -770,6 +770,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_raw_dispatch_ticket", code)
         self.assertIn("tile_dependency_root_barrier_wait", code)
         self.assertNotIn("_minimum_resident_programs=", code)
+        self.assertNotIn("tile_dependency_packet_dispatch", code)
+        self.assertNotIn("tile_dependency_scheduled_logical_task", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -833,6 +835,104 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_dispatch_ticket", code)
         self.assertIn("tile_dependency_scheduled_logical_task", code)
+        scheduled_pid = next(
+            line
+            for line in code.splitlines()
+            if "tile_dependency_scheduled_pid_task =" in line
+        )
+        self.assertIn("tl.minimum", scheduled_pid)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_kernel_scope_prefix_outlines_elastic_packet_suffix(self) -> None:
+        x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
+        kernel_scope_call = 0
+
+        def first_root_requires_kernel_scope(*_args: object) -> bool:
+            nonlocal kernel_scope_call
+            result = kernel_scope_call % 2 == 0
+            kernel_scope_call += 1
+            return result
+
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "choose_final_arrival_continuations",
+                return_value=(),
+            ),
+            mock.patch.object(
+                cross_loop_codegen,
+                "_triton_root_requires_kernel_scope",
+                side_effect=first_root_requires_kernel_scope,
+            ),
+        ):
+            for launch in range(2):
+                code, out = code_and_output(
+                    cartesian_affine_chain,
+                    (x + launch,),
+                    block_sizes=[1, 16, 1, 32],
+                    pid_type="persistent_blocked",
+                    cross_loop_schedule="static_pipeline",
+                    cross_loop_root_dispatch=["elastic", "elastic"],
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                torch.testing.assert_close(out, ((x + launch) + 1) * 2)
+
+        marker = "@triton.jit(noinline=True)\ndef tile_dependency_packet_dispatch"
+        self.assertIn(marker, code)
+        helper_begin = code.index(marker)
+        helper_end = code.index("\n@triton.jit", helper_begin + len(marker))
+        helper = code[helper_begin:helper_end]
+        self.assertIn("tile_dependency_root_1_scheduled_task", helper)
+        self.assertNotIn("tile_dependency_root_0_scheduled_task", helper)
+        kernel_begin = code.index("def _helion_cartesian_affine_chain")
+        kernel = code[kernel_begin:]
+        self.assertIn("if tile_dependency_dispatch_ticket_1 >= 0", kernel)
+        self.assertIn("tile_dependency_packet_dispatch(", kernel)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_kernel_scope_prefix_outlines_static_packet_suffix(self) -> None:
+        x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
+        kernel_scope_call = 0
+
+        def first_root_requires_kernel_scope(*_args: object) -> bool:
+            nonlocal kernel_scope_call
+            result = kernel_scope_call % 2 == 0
+            kernel_scope_call += 1
+            return result
+
+        with (
+            mock.patch.object(
+                cross_loop_scheduler,
+                "choose_final_arrival_continuations",
+                return_value=(),
+            ),
+            mock.patch.object(
+                cross_loop_codegen,
+                "_triton_root_requires_kernel_scope",
+                side_effect=first_root_requires_kernel_scope,
+            ),
+        ):
+            code, out = code_and_output(
+                cartesian_affine_chain,
+                (x,),
+                block_sizes=[1, 16, 1, 32],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                cross_loop_root_dispatch=["elastic", "static"],
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        marker = "@triton.jit(noinline=True)\ndef tile_dependency_packet_dispatch"
+        helper_begin = code.index(marker)
+        helper_end = code.index("\n@triton.jit", helper_begin + len(marker))
+        helper = code[helper_begin:helper_end]
+        self.assertIn("tile_dependency_logical_worker =", helper)
+        self.assertIn("tile_dependency_root_1_scheduled_task", helper)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

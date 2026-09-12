@@ -1025,7 +1025,8 @@ def emit_cross_loop_schedule(
         traversal = _root_schedule_traversal(segments, root_task_orders[root])
         if traversal is not None:
             root_schedule_traversals[root] = traversal
-            scheduled_task_roots.add(root)
+            if not traversal.matches_reference:
+                scheduled_task_roots.add(root)
             return
         if len(segments) == 1:
             (segment,) = segments
@@ -1081,9 +1082,7 @@ def emit_cross_loop_schedule(
                 remember_authoritative_traversal(root, segments)
             else:
                 root_schedule_traversals[root] = traversal
-            if segments[0].dispatch_mode == "elastic" or (
-                traversal is not None and not traversal.matches_reference
-            ):
+            if traversal is not None and not traversal.matches_reference:
                 scheduled_task_roots.add(root)
     readiness_consumers_by_root: dict[
         int,
@@ -2551,6 +2550,7 @@ def emit_cross_loop_schedule(
     else:
         assert dispatch_ticket is not None
         packet_begin = 0
+        packet_branches: list[tuple[int, bool, ast.stmt]] = []
         for _root, mode, segments in dispatch_entries:
             if mode == "static":
                 packet_end = packet_begin + launch_worker_count
@@ -2560,15 +2560,19 @@ def emit_cross_loop_schedule(
                     ),
                     *static_run_body(segments),
                 ]
-                result.append(
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{dispatch_ticket} >= {packet_begin} and "
-                            f"{dispatch_ticket} < {packet_end}"
+                packet_branches.append(
+                    (
+                        packet_begin,
+                        any(segment.root in kernel_scope_roots for segment in segments),
+                        create(
+                            ast.If,
+                            test=expr_from_string(
+                                f"{dispatch_ticket} >= {packet_begin} and "
+                                f"{dispatch_ticket} < {packet_end}"
+                            ),
+                            body=packet_body,
+                            orelse=[],
                         ),
-                        body=packet_body,
-                        orelse=[],
                     )
                 )
                 packet_begin = packet_end
@@ -2591,20 +2595,71 @@ def emit_cross_loop_schedule(
                     )
                 )
                 task_body.extend(root_barrier_publication(segment_root))
-                result.append(
-                    create(
-                        ast.If,
-                        test=expr_from_string(
-                            f"{dispatch_ticket} >= {packet_begin} and "
-                            f"{dispatch_ticket} < {packet_end}"
+                packet_branches.append(
+                    (
+                        packet_begin,
+                        segment_root in kernel_scope_roots,
+                        create(
+                            ast.If,
+                            test=expr_from_string(
+                                f"{dispatch_ticket} >= {packet_begin} and "
+                                f"{dispatch_ticket} < {packet_end}"
+                            ),
+                            body=task_body,
+                            orelse=[],
                         ),
-                        body=task_body,
-                        orelse=[],
                     )
                 )
                 packet_begin = packet_end
         if packet_begin != packet_count:
             raise AssertionError("packet stream does not cover its launch grid")
+        # TMEM and similar kernel-scoped operations cannot cross a Triton
+        # helper boundary.  Keep the prefix through the final such packet in
+        # the entry kernel, then isolate one contiguous helper-safe suffix so
+        # its live ranges do not couple to the kernel-scoped body.  An entirely
+        # helper-safe stream stays inline and avoids an unnecessary call.
+        last_kernel_scope_branch = next(
+            (
+                index
+                for index in reversed(range(len(packet_branches)))
+                if packet_branches[index][1]
+            ),
+            None,
+        )
+        if last_kernel_scope_branch is not None and last_kernel_scope_branch + 1 < len(
+            packet_branches
+        ):
+            result.extend(
+                branch
+                for _begin, _requires_kernel_scope, branch in packet_branches[
+                    : last_kernel_scope_branch + 1
+                ]
+            )
+            suffix = packet_branches[last_kernel_scope_branch + 1 :]
+            suffix_begin = suffix[0][0]
+            if any(
+                requires_kernel_scope for _begin, requires_kernel_scope, _ in suffix
+            ):
+                raise AssertionError("packet helper suffix requires kernel scope")
+            helper_call = _outline_cross_loop_region(
+                device_function,
+                name_hint="tile_dependency_packet_dispatch",
+                body=[branch for _begin, _requires_kernel_scope, branch in suffix],
+                extra_argument_names=(dispatch_ticket, epoch_var),
+                noinline=True,
+            )
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"{dispatch_ticket} >= {suffix_begin}"),
+                    body=[helper_call],
+                    orelse=[],
+                )
+            )
+        else:
+            result.extend(
+                branch for _begin, _requires_kernel_scope, branch in packet_branches
+            )
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)
         != opaque_case_fingerprints

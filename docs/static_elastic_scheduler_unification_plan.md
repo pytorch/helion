@@ -59,6 +59,37 @@ acceptance.
 | DeepSeek-V3 MoE | 167.872 us | 167.872 us | 157.728 us standalone |
 | Nemotron MoE | 77.856 us | 77.856 us | 61.504 us standalone |
 
+Current production validation after the unified lowering uses 500 cold-L2
+samples after a 10-second warmup on GPU4 (GPU1 for the static controls):
+
+| workload | unified persistent | same-run control | preserved facts |
+| --- | ---: | ---: | --- |
+| FlashMLA B4/Q4/H16 | **61.280 us** | 67.552 us standalone | bit-exact replay, K22/F16, R80/spill6/49,160B |
+| FlashMLA B9 ragged | **91.936 us** | 106.224 us standalone | bit-exact replay, all 18 counters, R80/spill6/49,160B |
+| Muse FFN m8 | **161.632 us** | 173.840 us standalone | five outputs bit-exact, R160/spill0/16,640B |
+| Qwen3 pretuned B1/S8192 | **102.400 us** | 102.400 us pre-refactor golden | byte-identical Triton/SASS, R255/spill22/17,408B |
+| Gemma4 A4B pretuned B1 | **49.056 us** | 55.168 us standalone | byte-identical Triton/SASS, R128/spill0/34,816B |
+| DeepSeek-V3 MoE, all elastic | 170.016 us | 159.552 us standalone | 11 outputs/replay correct, R150/spill0/52,224B |
+| Nemotron MoE, all elastic | 79.680 us | 63.216 us standalone | output/replay correct, R96/spill0/34,816B |
+
+The B4/B9 kernels keep their TMEM attention root inline and outline one
+helper-safe packet suffix.  B4 has one 786-packet stream; B9 has one
+1,448-packet stream.  Both execute one ticket claim per CTA and no dispatch
+loop.  Muse applies the same capability rule: its GEMM roots remain inline and
+only the final reduction suffix is outlined.  Same-run absolute latency drifts
+between measurements, so paired persistent-minus-standalone margins are the
+primary regression check.  Recorded ThunderKittens timings (71.456 us B4 and
+88.128 us B9) produced nonfinite/invalid outputs under the required numerics;
+B4 nevertheless beats the raw timing, while B9 is compared primarily against
+the valid matched standalone and the prior Helion result.
+DeepSeek's relative gap is unchanged from its archived one-shot control
+(approximately 6.6%), and Nemotron reproduces its archived dynamic latency.
+The same current source measured DeepSeek all-static at 182.112 us and
+Nemotron all-static at 104.320 us, so elastic improves those canonical static
+endpoints by 12.096 us and 24.640 us respectively.  Their remaining gaps to
+standalone are constituent-body/resource work; the scheduler does not hide
+them by changing numerics or fusion.
+
 In all six comparisons, elastic execution erased the list order's benefit.
 Canonical order tied it at B4/DeepSeek/Nemotron and beat it at B9/Muse.  The
 negative control is Qwen full decode: same-source static depth-one ownership
@@ -378,6 +409,20 @@ No packet table or run object is stored in `StaticPipelinePlan`.  The emitted
 decoder directly uses segment-derived constant prefix ranges and the existing
 `scheduled_root_task_body`.  Kernel-scoped/TMEM roots stay in the kernel body;
 legal root helpers retain their current inlining/outlining decisions.
+When the proved segment traversal matches the configured canonical PID order,
+the elastic local ordinal is that PID directly; codegen omits the otherwise
+redundant logical-coordinate round trip.  Permuted or nonrepresentable
+traversals still query the authoritative normalized relation.
+
+There is one generic code-shape boundary for heterogeneous Blackwell kernels.
+If a packet stream contains a kernel-scoped/TMEM branch, keep all branches
+through the final such branch inline and place the remaining contiguous,
+helper-safe packet suffix behind one guarded noinline helper.  This preserves
+TMEM legality while isolating the suffix's live ranges from the kernel-scoped
+body.  If every branch is helper-safe, leave the selector inline; if the final
+branch requires kernel scope, there is no suffix to outline.  This is derived
+solely from the existing kernel-scope legality classification, not a workload,
+root-count, or task-count heuristic, and it does not change packet order.
 
 In a non-folded packet stream, a static packet's decoded logical worker `w` is
 the sole worker identity used for task slicing, epoch/state indexing, waits,
@@ -648,6 +693,8 @@ dispatch overhead.  They never change this root-level meaning.
   cursor, launch `P` CTAs, and emit one claim/one complete role per CTA.
 - Decode elastic ticket ranges through each authoritative segment traversal;
   render a static packet with the unchanged worker-strand code over its run.
+- Isolate a helper-safe packet suffix after the final kernel-scoped/TMEM branch
+  with one guarded noinline helper; leave all-helper-safe streams inline.
 - Generalize frozen root-barrier publication from source tickets to elastic
   tasks.
 - Strength-reduce the semantic all-static case to the exact current
