@@ -263,6 +263,35 @@ The `Tile` class represents a portion of an iteration space with the following k
 
 ## View Operations
 
+### PyTorch splitting operations
+
+The Triton backend supports `torch.chunk(x, 2, dim)` for two equal chunks and
+`torch.unbind(x, dim)` when the selected dimension has size two. The Tensor
+method forms (`x.chunk(...)` and `x.unbind(...)`) are also supported. Both
+operations accept positive and negative axes and return a tuple of two tensors.
+`chunk` keeps the input rank. `unbind` removes the selected axis.
+Lowerings that require a permutation of rank-compacted tile tensors are
+currently rejected. Unbinding an already trailing dimension of size two
+remains supported with flattened tiles.
+
+The axis and the size being split must be known at compile time. Use
+`hl.specialize` before the device loop when the split size needs specialization.
+Other tile dimensions can remain symbolic. Because Triton pads
+tensor dimensions to powers of two, `chunk` requires a power-of-two split size
+of at least two. Other chunk counts, uneven chunks,
+and unbinding dimensions of other sizes raise an unsupported-configuration
+error. Other backends currently reject these device operations. These
+restrictions apply only inside device loops. Host-side calls use PyTorch
+normally.
+
+For example, for an accumulator of shape `[tile_m, 128]`:
+
+```python
+left, right = torch.chunk(acc, 2, dim=-1)  # each has shape [tile_m, 64]
+grouped = acc.reshape(tile_m, 2, 64).permute(0, 2, 1)
+left, right = grouped.unbind(dim=-1)      # same two contiguous halves
+```
+
 ### subscript()
 
 ```{eval-rst}
