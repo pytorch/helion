@@ -26,7 +26,14 @@ import helion.language as hl
 
 
 # %%
-@helion.kernel(ignore_warnings=[helion.exc.TensorOperationInWrapper])
+def baseline_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.cross_entropy(logits, labels.long())
+
+
+@helion.kernel(
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    autotune_baseline_fn=baseline_ce,
+)
 def cross_entropy(
     logits: torch.Tensor,  # [N, V] input logits
     labels: torch.Tensor,  # [N] target labels
@@ -48,30 +55,34 @@ def cross_entropy(
     n, v = logits.shape
     losses = torch.zeros([n], dtype=logits.dtype, device=logits.device)
 
-    # Flatten logits once at the beginning
-    logits_flat = logits.view(-1)
-
     for tile_n in hl.tile(n):
         # Get data for this tile
         labels_tile = labels[tile_n]  # [tile_size]
-        base_indices_tile = tile_n.index * v  # [tile_size]
 
-        # Compute the actual flat indices by adding the label offset
-        flat_indices = base_indices_tile + labels_tile
+        logits_at_target = hl.zeros([tile_n], dtype=logits.dtype)
+        max_logits_acc = hl.full([tile_n], float("-inf"), dtype=logits.dtype)
 
-        # Load the logits at the target indices
-        logits_at_target = hl.load(logits_flat, [flat_indices])
+        # First pass: find max and target logits
+        for v_chunk in hl.tile(v):
+            chunk_logits = logits[tile_n, v_chunk]
 
-        # Compute log_softmax for numerical stability
-        # Load the full rows for this tile
-        logits_rows = logits[tile_n, :]  # [tile_size, V]
+            # Extract target using a chunked mask
+            mask = (v_chunk.index[None, :] == labels_tile[:, None]).to(logits.dtype)
+            logits_at_target += torch.sum(chunk_logits * mask, dim=-1)
 
-        # Compute log-sum-exp
-        max_logits = torch.amax(logits_rows, dim=-1, keepdim=True)
-        shifted = logits_rows - max_logits
-        exp_shifted = torch.exp(shifted)
-        sum_exp = torch.sum(exp_shifted, dim=-1, keepdim=True)
-        log_sum_exp = max_logits.squeeze(-1) + torch.log(sum_exp.squeeze(-1))
+            # Update max
+            max_logits_acc = torch.maximum(
+                max_logits_acc, torch.amax(chunk_logits, dim=-1)
+            )
+
+        # Second pass: sum exp
+        sum_exp_acc = hl.zeros([tile_n], dtype=logits.dtype)
+        for v_chunk in hl.tile(v):
+            chunk_logits = logits[tile_n, v_chunk]
+            shifted = chunk_logits - max_logits_acc[:, None]
+            sum_exp_acc += torch.sum(torch.exp(shifted), dim=-1)
+
+        log_sum_exp = max_logits_acc + torch.log(sum_exp_acc)
 
         # Cross entropy loss: log_sum_exp - logit_at_target
         losses[tile_n] = log_sum_exp - logits_at_target
@@ -96,7 +107,7 @@ def main() -> None:
 
     run_example(
         cross_entropy,
-        torch.nn.functional.cross_entropy,
+        baseline_ce,
         (logits, labels),
         kernel_name="helion",
         baseline_name="torch",
