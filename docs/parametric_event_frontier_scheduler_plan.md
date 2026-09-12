@@ -1063,23 +1063,23 @@ rendering are retained even where legacy helper names still say
 - [ ] Tune ordinary resource knobs independently: worker count,
   `num_sm_multiplier`, warps, range stages, register limits, and tile choices.
   None enters list priority.
-- [ ] Once the cross-workload parity gate passes, remove transient-source
-  identity as separately threaded state.  Launch-stage-zero ownership remains
-  an ordinary `WorkerSchedule.task_order` relation because FlashMLA needs that
-  execution capability; derive its unique source root, ticket order, external
-  frontiers, progress exemption, and codegen dispatch directly from the
-  schedule instead of carrying `transient_source_root` through
-  `StaticPipelinePlan` and helper parameters.  Reject zero or multiple source
-  roots wherever the selected lowering requires exactly one.  Add no new IR
-  or abstraction.
-- [ ] Replace `_select_final_arrival_ownership`'s discarded legacy scratch
-  placement with direct continuation-dominance selection inside the one frozen
-  scheduling transaction.  Then delete `place_nested_loop_consumers`,
-  `place_ready_families`, redundant transient-source validation calls, and any
-  compatibility helper with no remaining correctness/codegen consumer.  Each
-  deletion must preserve the accepted Qwen, Gemma, FlashMLA, and Muse plans or
-  be justified by the same final-plan invariants rather than exact segment
-  spelling.
+- [x] Remove source identity as separately threaded state. Launch-stage-zero
+  ownership remains an ordinary `WorkerScheduleSegment.task_order` relation
+  because FlashMLA needs source-ticket execution; the unique source root,
+  ticket order, progress exemption, publication count, and codegen dispatch are
+  derived from that segment. `StaticPipelinePlan.transient_source_root` and
+  its helper parameters are gone.
+- [x] Replace `_select_final_arrival_ownership`'s discarded legacy scratch
+  placement with direct continuation-dominance selection over the accepted
+  all-resident schedule. Delete `place_nested_loop_consumers`,
+  `place_ready_families`, `_family_placements_at_worker_step`, and the tests
+  that specified only those discarded placement policies.
+- [ ] Finish source-ticket terminology/policy cleanup without deleting the
+  execution capability: derive priority-only source frontiers inside the
+  common chooser, remove threaded `external_source_frontiers`, rename the
+  backend capability and launch-stage helpers, and remove redundant validation
+  calls. Preserve the source/resident dispatch, exact ticket bijection,
+  counters, progress rule, and publication accounting required by FlashMLA.
 - [ ] Remove the production parametric cohort stack, symbolic cursor/repeat
   state, and affine-lifting hooks after confirming they have no independent
   consumer. Audit `_packed_schedule_segment_geometry` and its relation renderer
@@ -5330,11 +5330,34 @@ source frontiers, source-body mapping, progress exemptions, and root-barrier
 arrival targets all consume that relation. On canonical FlashMLA B4/Q4/H16,
 the resulting schedule, counters, barriers, publications, generated Triton,
 executable SASS, resources, and output are identical to the pre-cleanup golden.
-The next cleanup is continuation ownership: replace its discarded legacy
-scratch placement with a proof over the actual resident `WorkerSchedule`, then
-delete the old placement helpers after Qwen, Gemma, and FlashMLA gates pass.
+Continuation ownership is the next completed cleanup recorded below.
 Parameterized wider fan-in and ragged source extents remain outside the
 accepted subset.
+
+Implementation checkpoint (2026-09-12, continuation ownership): continuation
+selection is now a counterfactual proof over the one accepted all-resident
+schedule `A`. It removes producer arms only when exact readiness closure proves
+that another arm causally follows them, then requires each worker strand to
+publish at most one live key and places the consumer one slot after every
+strand-local possible final publisher. Ownership is frozen once; the compiler
+rebuilds one schedule `S` and accepts it only through ordinary exact coverage,
+publication, and progress validation, otherwise it atomically returns `A`.
+There is no second selection pass and no raw-wave reproof against compacted
+`S`. Owner relations stay in the natural `slot -> task` orientation, including
+partial publisher support, so many-workers-per-key events require neither a
+lossy factorization nor model-specific quotient normalization.
+
+Fresh unprimed production compiles select Qwen roots 7, 8, and 10 while keeping
+root 13 resident; the exact cross-key strand proof—not a 74/22 literal—causes
+that rejection. The untouched Gemma B1 probe selects its root-6 continuation
+and measures 51.14 us cold-L2. The fixed-capacity Gemma B2 control keeps root 6
+resident and selects root 7, as predicted by the same proof. The obsolete
+scratch placement functions and seven direct policy tests have been removed;
+exact nested-readiness and nested-counter lowering remain independently tested.
+The source-ticket capability is deliberately retained: FlashMLA needs its
+wait-free oversubscribed source launch. The next cleanup removes only its
+separate naming and argument plumbing, then gates the change on the canonical
+B4/B9 FlashMLA artifacts.
 
 ### Phase 6: cross-workload rollout
 

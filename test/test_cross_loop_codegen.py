@@ -1120,7 +1120,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_mixed_radix_dependency_uses_counter_continuation(self) -> None:
-        x = torch.randn((8, 4096), device=DEVICE, dtype=torch.float32)
+        # Keep the producer within one resident wave. Oversubscribed roots use
+        # source-ticket ownership instead, which is covered independently.
+        x = torch.randn((2, 512), device=DEVICE, dtype=torch.float32)
         for launch in range(2):
             code, out = code_and_output(
                 mixed_radix_continuation,
@@ -1359,8 +1361,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_continuation_follows_each_roots_pid_order(self) -> None:
-        x = torch.arange(64 * 1024, device=DEVICE, dtype=torch.float32).reshape(
-            64, 1024
+        # Keep this a continuation test rather than selecting the independent
+        # oversubscribed source-ticket capability.
+        x = torch.arange(4 * 256, device=DEVICE, dtype=torch.float32).reshape(
+            4, 256
         )
         code, out = code_and_output(
             cartesian_affine_chain,
@@ -1375,7 +1379,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tile_dependency_scheduled_pid_task", code)
+        self.assertIn("tile_dependency_continuation_task", code)
+        self.assertIn("tile_dependency_schedule_slot", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1962,10 +1967,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x * 2, dim=-1))
-        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tl.cast(8, tl.uint32)", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
-        self.assertIn("if tl.program_id(0) == 0:", code)
+        self.assertNotIn("tile_dependency_readiness_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
