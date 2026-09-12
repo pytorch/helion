@@ -1557,6 +1557,8 @@ def emit_flash_bwd_2cta_device_body(
     tDOsDO, tDOgDO_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_do2, 0, cute.make_layout(1), cute.group_modes(sdO, 0, 3), cute.group_modes(tTSgDO, 0, 3))
     tQTsQT, tQTgQT_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_qt, 0, cute.make_layout(1), cute.group_modes(sQt, 0, 3), cute.group_modes(tTSgQt, 0, 3))
     tKTsKT, tKTgKT_kdl = cute_cpasync_flash.tma_partition(_fbwd_tma_kt, 0, cute.make_layout(1), cute.group_modes(sKt, 0, 3), cute.group_modes(tDQgKt, 0, 3))
+    if (warp_idx >= 12) & (warp_idx < 16):
+        cute.arch.setmaxregister_decrease(88)
     if warp_idx == 14:
         fbwd_rphase = cutlass.Int32(0)
         for fbwd_i in cutlass.range(fbwd_steps, unroll=1):
@@ -1713,6 +1715,7 @@ def emit_flash_bwd_2cta_device_body(
         _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
         fbwd_tmem.free(fbwd_tmem_ptr)
     if warp_idx < 4:
+        cute.arch.setmaxregister_decrease(80)
         fbwd_dq_shape = fbwd_dqt.partition_shape_C((128, {d}))
         tDQ_frag = fbwd_dqt.make_fragment_C(fbwd_dq_shape)
         _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
