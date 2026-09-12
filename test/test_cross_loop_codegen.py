@@ -733,6 +733,65 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
+        lines = code.splitlines()
+        wait_index = next(
+            index
+            for index, line in enumerate(lines)
+            if "tile_dependency_nested_loop_wait =" in line
+        )
+        loop_index = next(
+            index
+            for index, line in enumerate(lines[wait_index + 1 :], wait_index + 1)
+            if line.startswith("    for ") and " in tl.range(" in line
+        )
+        # Every launch-stage source ticket is issued before a resident ticket.
+        # The compact entry wait therefore cannot starve an unlaunched source;
+        # its counter still gates source completion and visibility.
+        self.assertLess(wait_index, loop_index)
+        self.assertTrue(lines[wait_index].startswith("    "))
+        self.assertFalse(lines[wait_index].startswith("        "))
+        self.assertIn("tl.cast(256, tl.uint32)", lines[wait_index + 1])
+        # The source has 256 tasks and the resident pool has 148 workers. The
+        # one ticket stream therefore proves all source tickets were claimed
+        # before any of the 148 resident tickets can enter the compact wait.
+        self.assertIn("% tl.cast(404, tl.uint64)", code)
+        self.assertIn("tile_dependency_dispatch_ticket_1 < 256", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_exact_nested_keys_wait_inside_each_loop_iteration(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_compact_nested_loop_counters_for_schedule",
+            side_effect=lambda _graph, _schedule, exact, **_kwargs: exact,
+        ):
+            code, out = code_and_output(
+                nested_load_store_chain,
+                (x,),
+                block_sizes=[1, 16],
+                pid_type="persistent_blocked",
+                cross_loop_schedule="static_pipeline",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        lines = code.splitlines()
+        wait_index = next(
+            index
+            for index, line in enumerate(lines)
+            if "tile_dependency_nested_loop_wait =" in line
+        )
+        loop_index = max(
+            index
+            for index, line in enumerate(lines[:wait_index])
+            if line.startswith("    for ") and " in tl.range(" in line
+        )
+        loop_target = lines[loop_index].strip().split()[1]
+        self.assertTrue(lines[wait_index].startswith("        "))
+        self.assertIn(loop_target, lines[wait_index])
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1439,7 +1498,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             )
 
         torch.testing.assert_close(out, x * 2)
-        self.assertIn("tile_dependency_scheduled_logical_task", code)
+        self.assertIn("tile_dependency_schedule_slot", code)
+        self.assertNotIn("tile_dependency_scheduled_logical_task", code)
         self.assertEqual(code.count("def tile_dependency_root_0("), 1)
         self.assertEqual(code.count("def tile_dependency_root_0_scheduled_task"), 1)
         root_zero_calls = [

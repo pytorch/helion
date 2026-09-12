@@ -5,8 +5,10 @@
 The single Helion function's top-level tile loops implement residual RMSNorm
 and FP8 quantization, QKV projection, Q/K norm and RoPE, KV-cache update, split
 paged attention and merge, output projection, and the complete gated FFN.  The
-benchmark fixes the production decode shape and checks it against the
-corresponding compiled vLLM decoder layer with its default backend selection.
+benchmark fixes the production tensor capacity while sequence length, position,
+page-table entries, and slot mapping remain runtime metadata.  It checks the
+result against the corresponding compiled vLLM decoder layer with its default
+backend selection.
 """
 
 from __future__ import annotations
@@ -76,7 +78,11 @@ QWEN3_8B_FP8_CONFIG = {
 }
 
 
-@helion.aot_kernel(static_shapes=True, backend="triton")
+@helion.aot_kernel(
+    static_shapes=False,
+    backend="triton",
+    triton_do_not_specialize=False,
+)
 def qwen3_decode_layer(
     hidden_states,
     residual,
@@ -103,6 +109,7 @@ def qwen3_decode_layer(
     w13_scale,
     w2_q,
     w2_scale,
+    context_lens,
     hidden,
     intermediate,
     q_heads,
@@ -114,6 +121,131 @@ def qwen3_decode_layer(
     group,
     eps,
 ):
+    # This kernel has one specialized physical-capacity bucket (B1/Q1 on
+    # Qwen3-8B), but runtime attention metadata.  Keep that contract explicit:
+    # ``static_shapes=False`` prevents accidental blanket specialization, while
+    # these declarations preserve the model geometry and contiguous layouts
+    # used by the pretuned body.  Tensor contents -- notably context_lens,
+    # positions, block-table entries, slot mappings, and KV data -- remain
+    # ordinary runtime loads.
+    batch_capacity = hidden_states.size(0)
+    hl.specialize(batch_capacity)
+    hl.specialize(hidden_states.size(0))
+    torch._check(hidden_states.size(0) == batch_capacity)
+    hl.specialize(residual.size(0))
+    torch._check(residual.size(0) == batch_capacity)
+    hl.specialize(pre_q.size(0))
+    torch._check(pre_q.size(0) == batch_capacity)
+    hl.specialize(pre_scale.size(0))
+    torch._check(pre_scale.size(0) == batch_capacity)
+    hl.specialize(position.size(0))
+    torch._check(position.size(0) == batch_capacity)
+    hl.specialize(block_table.size(0))
+    torch._check(block_table.size(0) == batch_capacity)
+    hl.specialize(slot_mapping.size(0))
+    torch._check(slot_mapping.size(0) == batch_capacity)
+    hl.specialize(attention_q.size(0))
+    torch._check(attention_q.size(0) == batch_capacity)
+    hl.specialize(attention_scale.size(0))
+    torch._check(attention_scale.size(0) == batch_capacity)
+    hl.specialize(ffn_q.size(0))
+    torch._check(ffn_q.size(0) == batch_capacity)
+    hl.specialize(ffn_scale.size(0))
+    torch._check(ffn_scale.size(0) == batch_capacity)
+    hl.specialize(context_lens.size(0))
+    torch._check(context_lens.size(0) == batch_capacity)
+    torch._check(batch_capacity >= 1)
+
+    # Fixed model/capacity extents.  The first dimensions above are repeated
+    # deliberately: independent input tensors can otherwise receive distinct
+    # fake-shape symbols before their equality checks are evaluated.
+    hl.specialize(hidden_states.size(1))
+    hl.specialize(residual.size(1))
+    hl.specialize(pre_weight.size(0))
+    hl.specialize(pre_q.size(1))
+    hl.specialize(pre_scale.size(1))
+    hl.specialize(qkv_weight_q.size(0))
+    hl.specialize(qkv_weight_q.size(1))
+    hl.specialize(qkv_weight_scale.size(0))
+    hl.specialize(qkv_weight_scale.size(1))
+    hl.specialize(q_weight.size(0))
+    hl.specialize(k_weight.size(0))
+    hl.specialize(cos_sin.size(0))
+    hl.specialize(cos_sin.size(1))
+    hl.specialize(kv_cache.size(0))
+    hl.specialize(kv_cache.size(1))
+    hl.specialize(kv_cache.size(2))
+    hl.specialize(kv_cache.size(3))
+    hl.specialize(block_table.size(1))
+    hl.specialize(o_weight_q.size(0))
+    hl.specialize(o_weight_q.size(1))
+    hl.specialize(o_weight_scale.size(0))
+    hl.specialize(o_weight_scale.size(1))
+    hl.specialize(attention_q.size(1))
+    hl.specialize(attention_scale.size(1))
+    hl.specialize(post_weight.size(0))
+    hl.specialize(ffn_q.size(1))
+    hl.specialize(ffn_scale.size(1))
+    hl.specialize(w13_q.size(0))
+    hl.specialize(w13_q.size(1))
+    hl.specialize(w13_scale.size(0))
+    hl.specialize(w13_scale.size(1))
+    hl.specialize(w2_q.size(0))
+    hl.specialize(w2_q.size(1))
+    hl.specialize(w2_scale.size(0))
+    hl.specialize(w2_scale.size(1))
+
+    # User tensors are required to keep the layouts used during tuning.  This
+    # avoids making their address arithmetic generic merely because runtime
+    # attention metadata is enabled.
+    hl.specialize(hidden_states.stride(0))
+    hl.specialize(hidden_states.stride(1))
+    hl.specialize(residual.stride(0))
+    hl.specialize(residual.stride(1))
+    hl.specialize(pre_weight.stride(0))
+    hl.specialize(pre_q.stride(0))
+    hl.specialize(pre_q.stride(1))
+    hl.specialize(pre_scale.stride(0))
+    hl.specialize(pre_scale.stride(1))
+    hl.specialize(qkv_weight_q.stride(0))
+    hl.specialize(qkv_weight_q.stride(1))
+    hl.specialize(qkv_weight_scale.stride(0))
+    hl.specialize(qkv_weight_scale.stride(1))
+    hl.specialize(q_weight.stride(0))
+    hl.specialize(k_weight.stride(0))
+    hl.specialize(cos_sin.stride(0))
+    hl.specialize(cos_sin.stride(1))
+    hl.specialize(position.stride(0))
+    hl.specialize(kv_cache.stride(0))
+    hl.specialize(kv_cache.stride(1))
+    hl.specialize(kv_cache.stride(2))
+    hl.specialize(kv_cache.stride(3))
+    hl.specialize(block_table.stride(0))
+    hl.specialize(block_table.stride(1))
+    hl.specialize(slot_mapping.stride(0))
+    hl.specialize(o_weight_q.stride(0))
+    hl.specialize(o_weight_q.stride(1))
+    hl.specialize(o_weight_scale.stride(0))
+    hl.specialize(o_weight_scale.stride(1))
+    hl.specialize(attention_q.stride(0))
+    hl.specialize(attention_q.stride(1))
+    hl.specialize(attention_scale.stride(0))
+    hl.specialize(attention_scale.stride(1))
+    hl.specialize(post_weight.stride(0))
+    hl.specialize(ffn_q.stride(0))
+    hl.specialize(ffn_q.stride(1))
+    hl.specialize(ffn_scale.stride(0))
+    hl.specialize(ffn_scale.stride(1))
+    hl.specialize(w13_q.stride(0))
+    hl.specialize(w13_q.stride(1))
+    hl.specialize(w13_scale.stride(0))
+    hl.specialize(w13_scale.stride(1))
+    hl.specialize(w2_q.stride(0))
+    hl.specialize(w2_q.stride(1))
+    hl.specialize(w2_scale.stride(0))
+    hl.specialize(w2_scale.stride(1))
+    hl.specialize(context_lens.stride(0))
+
     pre_result = pre_q
     pre_input = hidden_states
     pre_norm_weight = pre_weight
@@ -123,7 +255,8 @@ def qwen3_decode_layer(
     pre_residual = residual
     pre_group_size = group
     assert pre_input.ndim == 2
-    pre_num_tokens, pre_hidden_size = pre_input.shape
+    _, pre_hidden_size = pre_input.shape
+    pre_num_tokens = batch_capacity
     hl.specialize(pre_hidden_size)
     hl.specialize(pre_group_size)
     pre_groups_per_row = pre_scale_output.shape[1]
@@ -142,7 +275,8 @@ def qwen3_decode_layer(
     qkv_mm_weight_q = qkv_weight_q
     qkv_mm_weight_scale = qkv_weight_scale
     qkv_mm_group_size = group
-    qkv_mm_m, qkv_mm_k = qkv_mm_activation_q.size()
+    _, qkv_mm_k = qkv_mm_activation_q.size()
+    qkv_mm_m = batch_capacity
     qkv_mm_n, qkv_mm_weight_k = qkv_mm_weight_q.size()
     assert qkv_mm_weight_k == qkv_mm_k
     assert qkv_mm_group_size == 128
@@ -152,7 +286,7 @@ def qwen3_decode_layer(
         dtype=torch.bfloat16,
         device=qkv_mm_activation_q.device,
     )
-    batch = hidden_states.shape[0]
+    batch = batch_capacity
     query = qkv[:, : q_heads * head_dim].view(batch, q_heads, head_dim)
     key_begin = q_heads * head_dim
     key = qkv[:, key_begin : key_begin + kv_heads * head_dim].view(
@@ -172,7 +306,7 @@ def qwen3_decode_layer(
     qk_cos_sin_cache = cos_sin
     qk_is_neox = True
     qk_position_ids = position
-    qk_num_tokens = qk_qkv.shape[0]
+    qk_num_tokens = batch_capacity
     qk_total_heads = qk_num_heads_q + qk_num_heads_k + qk_num_heads_v
     hl.specialize(qk_qkv.shape[1])
     qk_rotary_dim = qk_cos_sin_cache.shape[1]
@@ -189,7 +323,8 @@ def qwen3_decode_layer(
     cache_kv_cache = kv_cache
     cache_slot_mapping = slot_mapping
     cache_block_size = cache_block
-    cache_num_tokens, cache_num_kv_heads, cache_head_dim = cache_key.shape
+    _, cache_num_kv_heads, cache_head_dim = cache_key.shape
+    cache_num_tokens = batch_capacity
     hl.specialize(cache_num_kv_heads)
     hl.specialize(cache_head_dim)
     hl.specialize(cache_block_size)
@@ -201,10 +336,11 @@ def qwen3_decode_layer(
     attention_split_q_per_kv = q_heads // kv_heads
     attention_split_splits = attention_splits
     (
-        attention_split_num_tokens,
+        _,
         attention_split_num_q_heads,
         attention_split_head_dim,
     ) = attention_split_query.shape
+    attention_split_num_tokens = batch_capacity
     attention_split_num_kv_heads = attention_split_kv_cache.shape[2]
     assert (
         attention_split_num_q_heads
@@ -304,9 +440,8 @@ def qwen3_decode_layer(
     attention_quant_fp8_min = FP8_MIN
     attention_quant_fp8_max = FP8_MAX
     attention_quant_scale_ue8m0 = False
-    attention_quant_num_tokens, attention_quant_hidden_size = (
-        attention_quant_input.shape
-    )
+    _, attention_quant_hidden_size = attention_quant_input.shape
+    attention_quant_num_tokens = batch_capacity
     hl.specialize(attention_quant_hidden_size)
     hl.specialize(attention_quant_group_size)
     attention_quant_groups_per_row = attention_quant_output_s.shape[1]
@@ -326,7 +461,8 @@ def qwen3_decode_layer(
     o_mm_weight_q = o_weight_q
     o_mm_weight_scale = o_weight_scale
     o_mm_group_size = group
-    o_mm_m, o_mm_k = o_mm_activation_q.size()
+    _, o_mm_k = o_mm_activation_q.size()
+    o_mm_m = batch_capacity
     o_mm_n, o_mm_weight_k = o_mm_weight_q.size()
     assert o_mm_weight_k == o_mm_k
     assert o_mm_group_size == 128
@@ -345,7 +481,8 @@ def qwen3_decode_layer(
     post_residual = residual
     post_group_size = group
     assert post_input.ndim == 2
-    post_num_tokens, post_hidden_size = post_input.shape
+    _, post_hidden_size = post_input.shape
+    post_num_tokens = batch_capacity
     hl.specialize(post_hidden_size)
     hl.specialize(post_group_size)
     post_groups_per_row = post_scale.shape[1]
@@ -364,7 +501,8 @@ def qwen3_decode_layer(
     w13_weight_q = w13_q
     w13_weight_scale = w13_scale
     w13_group_size = group
-    w13_m, w13_k = w13_activation_q.size()
+    _, w13_k = w13_activation_q.size()
+    w13_m = batch_capacity
     w13_n, w13_weight_k = w13_weight_q.size()
     assert w13_weight_k == w13_k
     assert w13_group_size == 128
@@ -376,7 +514,8 @@ def qwen3_decode_layer(
     )
     activation_gate_up = gate_up
     activation_group_size = group
-    activation_m, activation_twice_intermediate = activation_gate_up.size()
+    _, activation_twice_intermediate = activation_gate_up.size()
+    activation_m = batch_capacity
     activation_intermediate = activation_twice_intermediate // 2
     hl.specialize(activation_group_size)
     activation_groups = activation_intermediate // activation_group_size
@@ -395,7 +534,8 @@ def qwen3_decode_layer(
     w2_weight_q = w2_q
     w2_weight_scale = w2_scale
     w2_group_size = group
-    w2_m, w2_k = w2_activation_q.size()
+    _, w2_k = w2_activation_q.size()
+    w2_m = batch_capacity
     w2_n, w2_weight_k = w2_weight_q.size()
     assert w2_weight_k == w2_k
     assert w2_group_size == 128
@@ -557,7 +697,7 @@ def qwen3_decode_layer(
     ):
         attention_split_m_i = hl.full(
             [attention_split_tile_bg, attention_split_tile_q],
-            float("-inf"),
+            -3.4028234663852886e38,
             dtype=torch.float32,
         )
         attention_split_l_i = hl.full(
@@ -580,76 +720,95 @@ def qwen3_decode_layer(
         attention_split_kv_head = (
             attention_split_tile_bg.index % attention_split_num_kv_heads
         )
-        attention_split_query_head = (
-            attention_split_kv_head[:, None] * attention_split_q_per_kv
-            + attention_split_tile_q.index[None, :]
-        )
-        attention_split_q_blk = attention_split_query[
-            attention_split_token[:, None],
-            attention_split_query_head,
-            :,
-        ]
-        attention_split_q_blk = (attention_split_q_blk * attention_split_qk_scale).to(
-            attention_split_query.dtype
-        )
-        for attention_split_tile_local_n in hl.tile(attention_split_split_context):
-            attention_split_n = (
-                attention_split_split_idx * attention_split_split_context
-                + attention_split_tile_local_n.index
+        attention_split_context_len = hl.load(context_lens, [attention_split_token])
+        if (
+            attention_split_split_idx * attention_split_split_context
+            < attention_split_context_len
+        ):
+            attention_split_query_head = (
+                attention_split_kv_head[:, None] * attention_split_q_per_kv
+                + attention_split_tile_q.index[None, :]
             )
-            attention_split_physical_block = attention_split_block_table[
+            attention_split_q_blk = attention_split_query[
                 attention_split_token[:, None],
-                (attention_split_n // attention_split_block_size)[None, :],
+                attention_split_query_head,
+                :,
             ]
-            attention_split_block_offset = (
-                attention_split_n % attention_split_block_size
-            )
-            attention_split_d = hl.arange(attention_split_head_dim)
-            attention_split_k = hl.load(
-                attention_split_kv_cache,
-                [
-                    attention_split_physical_block[:, :, None],
-                    attention_split_block_offset[None, :, None],
-                    attention_split_kv_head[:, None, None],
-                    attention_split_d[None, None, :],
-                ],
-            )
-            attention_split_scores = torch.bmm(
-                attention_split_q_blk,
-                attention_split_k.transpose(1, 2),
-                torch.float32,
-            )
-            attention_split_m_ij = torch.maximum(
-                attention_split_m_i, torch.amax(attention_split_scores, -1)
-            )
-            attention_split_p = torch.exp2(
-                attention_split_scores - attention_split_m_ij[:, :, None]
-            )
-            attention_split_alpha = torch.exp2(
-                attention_split_m_i - attention_split_m_ij
-            )
-            attention_split_l_i = (
-                attention_split_l_i * attention_split_alpha
-                + torch.sum(attention_split_p, -1)
-            )
-            attention_split_acc = (
-                attention_split_acc * attention_split_alpha[:, :, None]
-            )
-            attention_split_v = hl.load(
-                attention_split_kv_cache,
-                [
-                    attention_split_physical_block[:, :, None],
-                    attention_split_block_offset[None, :, None],
-                    attention_split_kv_head[:, None, None],
-                    (attention_split_d + attention_split_head_dim)[None, None, :],
-                ],
-            )
-            attention_split_acc = torch.baddbmm(
-                attention_split_acc,
-                attention_split_p.to(attention_split_v.dtype),
-                attention_split_v,
-            )
-            attention_split_m_i = attention_split_m_ij
+            attention_split_q_blk = (
+                attention_split_q_blk * attention_split_qk_scale
+            ).to(attention_split_query.dtype)
+            for attention_split_tile_local_n in hl.tile(attention_split_split_context):
+                attention_split_n = (
+                    attention_split_split_idx * attention_split_split_context
+                    + attention_split_tile_local_n.index
+                )
+                attention_split_valid_n = (
+                    attention_split_n < attention_split_context_len
+                )
+                attention_split_physical_block = hl.load(
+                    attention_split_block_table,
+                    [
+                        attention_split_token[:, None],
+                        (attention_split_n // attention_split_block_size)[None, :],
+                    ],
+                    extra_mask=attention_split_valid_n[None, :],
+                )
+                attention_split_block_offset = (
+                    attention_split_n % attention_split_block_size
+                )
+                attention_split_d = hl.arange(attention_split_head_dim)
+                attention_split_k = hl.load(
+                    attention_split_kv_cache,
+                    [
+                        attention_split_physical_block[:, :, None],
+                        attention_split_block_offset[None, :, None],
+                        attention_split_kv_head[:, None, None],
+                        attention_split_d[None, None, :],
+                    ],
+                    extra_mask=attention_split_valid_n[None, :, None],
+                )
+                attention_split_scores = torch.bmm(
+                    attention_split_q_blk,
+                    attention_split_k.transpose(1, 2),
+                    torch.float32,
+                )
+                attention_split_scores = torch.where(
+                    attention_split_valid_n[None, None, :],
+                    attention_split_scores,
+                    -3.4028234663852886e38,
+                )
+                attention_split_m_ij = torch.maximum(
+                    attention_split_m_i, torch.amax(attention_split_scores, -1)
+                )
+                attention_split_p = torch.exp2(
+                    attention_split_scores - attention_split_m_ij[:, :, None]
+                )
+                attention_split_alpha = torch.exp2(
+                    attention_split_m_i - attention_split_m_ij
+                )
+                attention_split_l_i = (
+                    attention_split_l_i * attention_split_alpha
+                    + torch.sum(attention_split_p, -1)
+                )
+                attention_split_acc = (
+                    attention_split_acc * attention_split_alpha[:, :, None]
+                )
+                attention_split_v = hl.load(
+                    attention_split_kv_cache,
+                    [
+                        attention_split_physical_block[:, :, None],
+                        attention_split_block_offset[None, :, None],
+                        attention_split_kv_head[:, None, None],
+                        (attention_split_d + attention_split_head_dim)[None, None, :],
+                    ],
+                    extra_mask=attention_split_valid_n[None, :, None],
+                )
+                attention_split_acc = torch.baddbmm(
+                    attention_split_acc,
+                    attention_split_p.to(attention_split_v.dtype),
+                    attention_split_v,
+                )
+                attention_split_m_i = attention_split_m_ij
         partial_out[
             attention_split_tile_split,
             attention_split_tile_bg,
@@ -1006,6 +1165,7 @@ def _make_inputs(seed: int = 0) -> dict[str, torch.Tensor]:
             device="cuda",
             dtype=torch.bfloat16,
         ),
+        "context_lens": torch.full((BATCH,), CONTEXT, device="cuda", dtype=torch.int64),
         "position": torch.full((BATCH,), CONTEXT - 1, device="cuda", dtype=torch.int64),
         "kv_cache": torch.randn(
             (
@@ -1120,6 +1280,7 @@ def _kernel_args(tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
         tensors["w13_scale"],
         tensors["w2_q"],
         tensors["w2_scale"],
+        tensors["context_lens"],
         HIDDEN,
         INTERMEDIATE,
         Q_HEADS,

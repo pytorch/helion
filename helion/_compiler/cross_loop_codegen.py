@@ -1502,6 +1502,73 @@ def emit_cross_loop_schedule(
                 "nested loop lowering currently requires one loop axis"
             )
         (nested_axis,) = nested_axes
+        nested_symbol = coordinate_axis_symbol(nested_axis)
+        key_varies_within_piece = any(
+            nested_symbol in sympy.sympify(expression).free_symbols
+            for piece in readiness_consumer.keys_by_consumer.pieces
+            for _axis, begin, end, _step in piece.target_ranges
+            for expression in (begin, end)
+        )
+        if key_varies_within_piece:
+            scheduled = False
+
+            def rewrite(loop: ast.For) -> list[ast.stmt] | None:
+                nonlocal scheduled
+                if tile_dependency_site_id(loop) != readiness_consumer.consumer_site_id:
+                    return None
+                if scheduled:
+                    raise AssertionError(
+                        "one dependency site must identify one lowered loop"
+                    )
+                if (
+                    not isinstance(loop.target, ast.Name)
+                    or not isinstance(loop.iter, ast.Call)
+                    or len(loop.iter.args) < 2
+                ):
+                    raise AssertionError(
+                        "nested loop wait requires one range-like loop axis"
+                    )
+                begin = ast.unparse(loop.iter.args[0])
+                step = (
+                    ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
+                )
+                site_coordinates = {
+                    **consumer_coordinates,
+                    nested_axis: f"(({loop.target.id}) - ({begin})) // ({step})",
+                }
+                readiness_key, membership = relation_flat_target(
+                    readiness_consumer.keys_by_consumer,
+                    site_coordinates,
+                )
+                waits = _wait_for_counter(
+                    device_function=device_function,
+                    counter=readiness_counter(plan, readiness_key),
+                    target=readiness_target(plan, readiness_key),
+                    prefix="tile_dependency_nested_loop_wait",
+                )
+                cloned = cast("ast.For", _clone_ast_value(loop))
+                if membership == "True":
+                    cloned.body = [*waits, *cloned.body]
+                elif membership != "False":
+                    cloned.body = [
+                        create(
+                            ast.If,
+                            test=expr_from_string(membership),
+                            body=waits,
+                            orelse=[],
+                        ),
+                        *cloned.body,
+                    ]
+                scheduled = True
+                return [cloned]
+
+            rewritten = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
+            if not scheduled:
+                raise AssertionError(
+                    f"missing dependency site {readiness_consumer.consumer_site_id}"
+                )
+            return rewritten
+
         boundaries = tuple(
             sorted(
                 {

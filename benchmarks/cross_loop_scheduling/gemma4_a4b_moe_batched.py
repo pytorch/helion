@@ -298,13 +298,61 @@ def post_norm(x, weight, eps):
     return output
 
 
-def _make_persistent_kernel() -> Kernel:
+def _make_persistent_kernel(
+    *,
+    dynamic_batch: bool = False,
+    triton_do_not_specialize: bool | None = None,
+) -> Kernel:
+    if triton_do_not_specialize is None:
+        triton_do_not_specialize = dynamic_batch
     source = textwrap.dedent(inspect.getsource(gemma.gemma4_a4b_moe.fn))
     source = source.replace(
         '@helion.aot_kernel(static_shapes=True, backend="triton")',
-        '@helion.kernel(static_shapes=True, autotune_effort="none", backend="triton")',
+        "@helion.kernel("
+        f"static_shapes={not dynamic_batch!r}, autotune_effort=\"none\", "
+        "backend=\"triton\", "
+        f"triton_do_not_specialize={triton_do_not_specialize!r})",
         1,
     )
+    if dynamic_batch:
+        invariant_size_dimensions = {
+            "residual": (1,),
+            "pre_ff_norm_weight": (0,),
+            "router_scale": (0,),
+            "router_weight": (0, 1),
+            "per_expert_scale": (0,),
+            "expert_gate_up_weight": (0, 1, 2),
+            "expert_down_weight": (0, 1, 2),
+            "post_ff_norm_weight": (0,),
+        }
+        tensor_ranks = {
+            "residual": 2,
+            "pre_ff_norm_weight": 1,
+            "router_scale": 1,
+            "root_size": 0,
+            "router_weight": 2,
+            "per_expert_scale": 1,
+            "expert_gate_up_weight": 3,
+            "expert_down_weight": 3,
+            "post_ff_norm_weight": 1,
+        }
+        invariant_specializations = "".join(
+            f"    hl.specialize({name}.size({dimension}))\n"
+            for name, dimensions in invariant_size_dimensions.items()
+            for dimension in dimensions
+        ) + "".join(
+            f"    hl.specialize({name}.stride({dimension}))\n"
+            for name, rank in tensor_ranks.items()
+            for dimension in range(rank)
+        )
+        marker = "):\n    router_project_hidden = residual"
+        if source.count(marker) != 1:
+            raise RuntimeError("unexpected Gemma source signature/body boundary")
+        source = source.replace(
+            marker,
+            "):\n" + invariant_specializations + "    router_project_hidden = residual",
+            1,
+        )
     module_name = "_helion_gemma4_batched_scheduler_probe"
     filename = f"<{module_name}>"
     linecache.cache[filename] = (

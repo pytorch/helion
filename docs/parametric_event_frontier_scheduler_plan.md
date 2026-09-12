@@ -86,12 +86,14 @@ TileDependencyGraph
     -> ReadinessGraph
     -> optional one-shot all-resident ownership analysis seed A
     -> freeze continuation ownership
-    -> freeze exact counter/root-barrier prerequisite semantics and nested entry waits
-    -> select and freeze launch-stage source ownership from that view
+    -> freeze ordinary exact-counter/root-barrier prerequisite semantics
+    -> retain exact semantic per-iteration prerequisites for nested consumers
+    -> select and freeze launch-stage source ownership from that exact view
     -> transactionally select exact root-local traversals
     -> build canonical frozen-ownership schedule C
-    -> one finite event-frontier placement
-    -> WorkerSchedule
+    -> one finite event-frontier placement from exact semantic prerequisites
+    -> accepted WorkerSchedule S
+    -> derive a compact nested-counter quotient Q from ReadinessGraph + S
     -> derive physical publication participants/sites and epoch layout; validate once
     -> existing static codegen
 ```
@@ -135,8 +137,10 @@ proof. If that frontier is not representable, retain the source-owned canonical
 schedule with configured resident traversals and decline deeper source-aware
 placement. Do not silently turn the source back into resident work. Final
 commit tries, in order, the placed candidate, prepared `C`, and the unprepared
-frozen-ownership base; every fallback within one proposal retains identical
-continuation/source ownership and prerequisite semantics.
+frozen-ownership base. Every fallback within one proposal retains identical
+continuation/source ownership and exact semantic prerequisites. Compact nested
+counter keys may differ because they are a one-way lowering of each candidate,
+but they never feed back into candidate selection.
 
 `_event_frontier_list_schedule` consumes the prepared `C` and never invokes a
 second root-ordering transform. Depth one returns that `C` exactly. If list
@@ -156,7 +160,8 @@ preparation, placement, and validation. It contains:
   producer-to-key publication and per-key cardinality are derived;
 - for every consumer task/site, the exact consumer-to-required-key relation;
 - nested site identity and nonuniform tail pieces; and
-- the covered original `TileDependencyGraph` obligations.
+- one canonical root-pair-to-obligations manifest whose union exactly equals
+  the obligations covered by the events.
 
 When a fine relation is unsupported, construction preserves the obligation as
 a conservative one-key whole-root event; it never drops it. Runtime masks,
@@ -168,13 +173,17 @@ views of this graph, not another DAG or source of truth.
 
 `ReadinessGraph` contains no worker/wave placement, continuation owner,
 counter-versus-barrier choice, or physical publication plan. Before placement,
-the compiler freezes only the executable prerequisite semantics: exact event
-keys and fan-ins represented by counters, conservative root-barrier edges,
-and nested entry waits. After final placement it derives the physical owners,
-last publication occurrences, contributions, participant counts, and epoch
-layout from the accepted `WorkerSchedule`. A failure in that post-placement
-derivation rejects the optimized proposal and returns to `C`; it never changes
-the frozen prerequisite mechanism underneath an accepted placement.
+the compiler freezes ordinary executable prerequisites and retains nested
+consumers at their exact semantic per-iteration keys. After placement it may
+replace only those nested keys with a proved compact quotient derived from the
+accepted `WorkerSchedule`. It then derives physical owners, last publication
+occurrences, contributions, participant counts, and epoch layout. A failure in
+the compact quotient keeps the exact per-iteration lowering for that same
+schedule; it does not reschedule. A root-entry wait is not an unconditional
+fallback because moving a wait earlier can deadlock. It is legal only when the
+same final schedule passes the stronger progress proof. Any failure in physical
+publication derivation rejects the optimized proposal and returns to `C`; it
+never changes continuation or launch-stage source ownership.
 
 The existing concrete `_event_frontier_list_schedule` is the starting point
 for the sole cross-root placement policy, not something to enable unchanged.
@@ -186,10 +195,14 @@ frontier. The unified static scheduler must enforce:
    frozen continuation or launch-stage source ownership;
 2. depth greater than one moves dependent work only as complete readiness-
    equivalent cohorts;
-3. dependent work may fill genuine unused lanes in a committed run's terminal
-   wave, but may not postpone the unfinished ancestor that created that hole;
-4. once all blocking ancestors are complete, a selected cohort may span waves
-   and remains atomic until placed;
+3. selecting a producer suffix reserves every producer task and its exact
+   worker/rank occurrence, but the committed-run transition may use each
+   low-count producer lane once after that lane's final occurrence without
+   postponing the producer;
+4. each retired lane contributes at most one early slot until the active
+   producer reservation completes. A selected cohort must fit entirely in the
+   currently exposed support; otherwise it waits rather than splitting or
+   recycling a narrow lane set;
 5. independent roots may backfill more broadly;
 6. exact readiness, unit-weight criticality, event release/closure, active
    event continuation, and canonical order provide the one deterministic
@@ -198,17 +211,34 @@ frontier. The unified static scheduler must enforce:
    autotune knob and changes eligibility, never correctness or priority.
 
 Operationally, a fully admissible selected root's remaining canonical suffix
-is one committed run. An incrementally admitted root's next complete
-readiness-equivalent cohort is one committed run. Closing an outgoing event
-never truncates either run. Only the committed run's true terminal partial wave
-creates holes for dependent work. This explicitly replaces the current
-concrete scheduler's producer clipping at every consumer frontier.
+is one committed **ownership reservation**. Its task relation is never clipped,
+shifted, or displaced. For `N=qW+r` reserved tasks placed in `[F,E)`, the
+ordinary committed-run transition exposes `[E,E+W-r)` as a one-use scheduling
+window while holding that root's admission cursor at its first `qW` tasks.
+This is the exact next slot of every lane with only `q` producer occurrences;
+it remains correct for a rotated `F` and can cross an absolute wave. An
+incrementally admitted cohort remains atomic. Closing an outgoing event never
+truncates the producer reservation and cannot recycle one retired lane before
+the producer tail is revealed. This replaces both arbitrary per-key producer
+clipping and the overly strong interpretation that a committed producer
+monopolizes every lane until its final global slot.
 
-The non-displacement and complete-cohort rules are the general protection
-against the harmful Muse-style many-segment schedule. A segment cap and a
-non-regressing unit-wave horizon are retained as guards, but neither substitutes
-for those rules. No latency, register, bandwidth, model-name, or profiled cost
-model enters scheduling.
+The retirement transaction keeps two ephemeral cursor views, both derived
+from the same reserved schedule rather than stored as new IR. The ownership
+cursor advances through the whole reserved suffix. The admission cursor is
+temporarily held at `qW`; complete downstream cohorts assigned to disjoint
+one-use slots advance their own admission cursors. Root-entry consumers see
+the held producer cursor, never the merely assigned `r`-task tail. A nested
+consumer may see same-window claimed producer cohorts for its first checkpoint,
+because it can execute an already-ready prefix and wait later, but the final
+all-checkpoint segment-DAG proof must still show that no wait blocks a future
+producer on the same strand.
+
+The non-displacement, one-use retirement, and complete-cohort rules are the
+general protection against the harmful Muse-style many-segment schedule. A
+segment cap and a non-regressing unit-wave horizon are retained as guards, but
+neither substitutes for those rules. No latency, register, bandwidth,
+model-name, or profiled cost model enters scheduling.
 
 Root-local readiness ordering is setup for this one scheduler, not a second
 cross-root policy. Nested waits/publications, final-arrival continuation, and a
@@ -221,18 +251,37 @@ in codegen.
 ### Nested-loop scope
 
 Nested iterations are not scheduler actions; their owning CTA is atomic. The
-first implementation should coarsen each nested consumer to one exact root-entry
-prerequisite derived from `ReadinessGraph`, emit one entry wait, and preserve
-producer publications at their true nested sites. If exact coarsening or
-lowering fails, retain the ordinary root-barrier fallback.
+placement policy consumes their exact semantic readiness relation. Compact
+waits are a downstream lowering optimization, not scheduler input:
 
-Qwen's historical 74/22 frontier is diagnostic evidence that nested readiness
-and placement can matter, not an ABI or an acceptance invariant. First measure
-the simpler root-entry form. If it remains numerically correct and the
-persistent kernel beats matched standalone, delete/defer schedule-derived
-nested splitting. Only if that performance gate fails may the common scheduler
-derive a finer static checkpoint; any such frontier must come from the final
-schedule and semantic relations, with no literals or Qwen-specific policy.
+```text
+Q = derive_nested_counter_quotient(
+        ReadinessGraph,
+        frozen execution ownership,
+        accepted WorkerSchedule,
+    )
+```
+
+`Q` must be a total, disjoint, ordered partition of the original nested
+iteration domain. Every iteration maps to exactly one emitted key; that key's
+publisher set contains every semantic producer required by the iteration;
+each physical publication occurs exactly once at its true site; fan-in is the
+exact distinct publication cardinality, including tails and all producer arms;
+and covered dependency obligations and event provenance are unchanged. The
+final schedule is revalidated against `Q` without changing placement. If this
+proof or lowering fails, retain the exact per-iteration counter for the same
+schedule. A stronger root-entry prerequisite is used only when exact lowering
+can be proved from the accepted schedule's progress precedence. It may be
+introduced afterward only as an emitted strength reduction, is revalidated on
+that identical placement, and is never fed back into scheduling.
+
+Qwen's historical 74/22 frontier remains diagnostic rather than ABI. The
+current 52/44 result exposed the ordering rule above: it was derived from a
+tentative-continuation, pre-reordered analysis schedule, then emitted with a
+different final continuation set and traversal. Both partitions are safe, but
+the stale one violates the single-source-of-truth design and loses overlap.
+The compiler must derive whichever partition follows from the accepted
+schedule and exact relation, with no literal or model-specific policy.
 
 ### Mandatory functional MoE support
 
@@ -327,12 +376,14 @@ sections are not active work.
 - [ ] Treat `B_capacity` and uniform `Q` like ordinary specialized Helion
   dimensions. Compile B1/B2/B4/B9 or the serving capture buckets separately;
   cross-`B` cubin reuse is future work rather than an exit gate.
-- [ ] Build one all-resident analysis seed `A`, select final-arrival
-  continuation ownership once, then freeze exact
-  counter/root-barrier prerequisites, including the initial root-entry form of
-  nested consumers. Select and freeze launch-stage source ownership from that
-  immutable prerequisite view before final placement. During migration allow
-  at most one all-resident analysis followed by one rebuild.
+- [x] Build one all-resident analysis seed `A`, select final-arrival
+  continuation ownership once, then freeze ordinary exact-counter/root-barrier
+  prerequisites while retaining exact semantic per-iteration prerequisites
+  for nested consumers. Select and freeze launch-stage source ownership from
+  that immutable exact view before final placement. During migration allow at
+  most one all-resident analysis followed by one rebuild. A private scratch
+  placement may temporarily help decide continuation ownership, but neither
+  its placement nor a counter partition derived from it may be emitted.
 - [x] Before scheduling, lower every retained multi-producer event through one
   common conservative key quotient when its original key space is not
   renderable. The selected quotient covers every retained consumer and
@@ -342,7 +393,7 @@ sections are not active work.
   final ownership. Otherwise retain the consumer and use the conservative
   barrier fallback. Scheduling consumes this executable quotient while event
   identity still comes from the one semantic `ReadinessEvent`.
-- [ ] Transactionally select root-local traversals from the frozen
+- [x] Transactionally select root-local traversals from the frozen
   `ReadinessGraph` and prerequisite view, then construct deterministic
   canonical schedule `C` for that frozen ownership plan. Root-local setup may
   change only an exact bijective traversal within already-owned slots. A
@@ -360,6 +411,26 @@ sections are not active work.
   combination through an exact neutral write or matching read mask. Exercise
   all-inactive input and repeated epoch replay.
 
+Single-source checkpoint (2026-09-12): readiness construction now retains its
+already-computed canonical root-pair obligation manifest directly in
+`ReadinessGraph`. Event construction asserts that the event-covered obligation
+union equals that manifest, and one obligation cannot belong to two root
+pairs. Barrier selection, counter finalization, and final coverage validation
+consume only `ReadinessGraph`; they no longer rescan `TileDependencyGraph`.
+Synthetic relation tests may explicitly omit provenance, but such graphs are
+rejected by synchronization finalization. An unrepresentable launch-source
+frontier now transactionally skips both root-local traversal preparation and
+global placement, preserving the configured resident traversals and frozen
+source ownership. This closes the last architecture mismatch found by the
+independent single-source review without changing scheduling policy.
+The private all-resident analysis now returns only frozen continuation
+ownership; its scratch `WorkerSchedule` and nested-counter partition cannot be
+passed into final placement accidentally. Final proposal construction receives
+only the configured worker count and rebuilds ownership from the frozen graph.
+The post-cleanup CPU gate passes 194 scheduler tests plus 76 subtests and 45
+codegen tests plus 18 subtests; the fixed-shape AOT/runtime-metadata contract
+tests for Qwen and Gemma also pass with CUDA hidden.
+
 ### Phase S2: one finite event-frontier placement
 
 - [x] Refactor the existing concrete path so `_event_frontier_list_schedule`
@@ -369,8 +440,10 @@ sections are not active work.
   transactional root-local preparation. The selector consumes prepared `C`
   without changing root traversal.
 - [x] Preserve one immutable executable-prerequisite view derived from
-  `ReadinessGraph` after ownership is frozen. The scheduler consumes that view;
-  final counters/barriers and codegen do not repartition it.
+  `ReadinessGraph` after ownership is frozen. The scheduler consumes that exact
+  view. Ordinary counters and barriers are not repartitioned; only nested
+  per-iteration keys may be lowered afterward through the proved one-way
+  schedule quotient described in S3.
 - [x] Make depth one return `C` exactly for the frozen ownership plan. At
   greater depths, allow a consumer released by producer assignments earlier
   in the same wave to fill remaining lanes only after the ordinary exact
@@ -393,10 +466,27 @@ sections are not active work.
   `C`, never from root numbering. A multi-wave noncanonical commit may cross
   unfinished roots only when the frozen root/event quotient proves them
   incomparable; complete terminal-hole actions remain eligible.
+- [x] Reinterpret a fully admissible committed suffix as an immutable ownership
+  reservation rather than global exclusion. For `N=qW+r` tasks already placed
+  in `[F,E)`, preserve the producer relation byte-for-byte, hold its admission
+  cursor at `qW`, and expose only `[E,E+W-r)` to the ordinary ready-cohort
+  chooser. Fold this into the existing committed-root transition; delete the
+  rejected hole-filling pre-pass rather than retaining a second policy.
+- [x] Permit each retired worker to host at most one early task until the active
+  producer reservation completes. Place only complete common readiness
+  cohorts, require disjoint exact support and unchanged task coverage, and
+  retain the existing final segment-precedence/progress proof. An unsupported
+  retirement relation keeps the committed suffix and canonical schedule.
+- [x] Add generic retirement tests for `N < W`, `N = W`, `N = kW`, and
+  `N = kW + r`; rotated producer starts; multiple outgoing cohort relations;
+  multi-arm joins; insufficient complement; and a large-key case whose action
+  and segment count scales with relation pieces/retirement strata rather than
+  key count. Include a Qwen-shaped small motif and a Muse-shaped no-recycling
+  motif without model names or production dimensions in scheduler policy.
 - [x] Wire `cross_loop_pipeline_depth` through the public config fragment,
   autotuner, plan builder, and lowering. Offer `{1,2,3,4}` without topology-
   dependent pruning; duplicate schedules are acceptable.
-- [ ] Carry the existing event-aware structural priority into this one finite
+- [x] Carry the existing event-aware structural priority into this one finite
   selector. Priority ablations are later compiler experiments, not production
   paths or knobs.
 - [x] Fast-forward the interior full waves of a committed run arithmetically.
@@ -424,10 +514,202 @@ sections are not active work.
   Keep this as a shared-function cleanup rather than threading a new
   proposal-global cache/IR through every pass. Muse's former long compile is a
   required negative control.
-- [ ] Coalesce adjacent same-root runs after selection, keep the structural
+- [x] Coalesce adjacent same-root runs after selection, keep the structural
   occupied-wave non-regression check, and validate exact coverage, chronology,
   resident progress, and publication ownership once from the final
-  `WorkerSchedule`.
+  `WorkerSchedule`. Consecutive source ordinals placed in consecutive global
+  slots are materialized as one packed existing `CoordinateRelation`; if
+  direct reconstruction declines, batch-union the fragments' already-proved
+  partial bijections and accept only an exact dense-support converse. This
+  fixed Qwen's wrapped woven-root proof and DeepSeek's cross-wave body
+  duplication without weakening support checks or introducing another
+  schedule representation.
+- [x] Add only the generic retirement-window eligibility relaxation justified
+  by DeepSeek and Nemotron: when no depth-eligible descendant is placeable or
+  rank-deferred, an incomparable ready root may fill the one-use window only
+  if its complete remaining suffix fits. A deferred descendant still blocks
+  unrelated work (preserving Qwen), and `cross_loop_pipeline_depth` bounds
+  descendants released by that suffix. The existing priority tuple is
+  unchanged; there is no branch heuristic or new knob.
+
+Implementation checkpoint (2026-09-11, retirement frontier): the rejected
+literal-hole pre-pass was deleted. Retirement is one transition inside the
+existing event-frontier selector and keeps one ownership cursor plus one
+temporarily held admission cursor derived from the same reserved
+`WorkerSchedule`. For Qwen's woven producer traversal, the generic forward
+composition cannot express the inverse preimage, so the selector uses the
+already-certified exact inverse traversal as a fallback proof. It derives
+`key k -> 16*k + 15`; no Qwen dimension or split literal appears in compiler
+policy. The resulting root tail is `P[2930,4466) / R74[4466,4540) /
+C512[4736,5248) / R22[5298,5320)`, and the post-schedule quotient emits the
+corresponding 74/22 waits.
+
+The existing relation renderer now accepts ordered, non-overlapping gaps only
+when a nonempty root repeats, which is the structural capability needed for a
+split root to resume. Dense streams retain their old lowering. One-shot
+root-major wave-alignment gaps intentionally remain on the simpler renderer,
+avoiding gratuitous outlining and singleton loops. This is a renderer
+capability boundary, not scheduling policy.
+
+On physical GPU 2, a paired 500-sample, 10-second-warmup cold-L2 run in both
+measurement orders gave packed 1x96 at 104.32 us and retirement 74/22 at
+104.38--104.45 us after the first order-sensitive sample: effective parity,
+bit-exact, and still below the matched 110.40-us standalone boundary. A
+three-way ablation measured packed 1x96 104.384 us, gapped 1x96 108.512 us,
+and gapped 74/22 104.416 us. Thus the frontier itself recovers 4.096 us; the
+remaining net result is placement/codegen parity rather than a hidden
+profitable special case. On GPU 4, fixed-capacity ragged FlashMLA B4/Q4/H16
+remains bit-exact at 63.360 us versus 69.472 us standalone. On GPU 6, Gemma
+A4B fixed-capacity depth two remains bit-exact across varied routes at 51.040
+versus 55.168 us for B1 and 69.504 versus 69.504 us for B2. The final combined
+scheduler/codegen suite passes 233 tests plus 94 subtests.
+Muse/Glimmer fixed B1 independently confirms that this is not an MLA-shaped
+policy: the event-frontier schedule saves 8.38 us over canonical placement at
+W1184, and ordinary `num_sm_multiplier=12` tuning reaches 161.728 us versus
+169.888 us for the best standalone while preserving the five-stage boundary,
+numerics, exact counters, R126/zero-spill resources, and one compiler policy.
+For Qwen B1/S8192, a same-plan source ablation also isolates 3.984 us of the
+historical regression to the required runtime ragged-attention masks: 106.432
+us masked versus 102.448 us with only the full-context attention body restored.
+The masked body introduces 22 spills where the unmasked control has none.
+This is a body/resource effect and remains separate from scheduler policy;
+the production masked persistent kernel is still faster than its matched
+masked standalone boundary.
+Nemotron fixed B1 provides a second branch-shaped scheduler check. At W592,
+depth one measures 120.640 us while depths two through four produce the same
+lowered code and measure 96.16--98.08 us. This recovers the historical
+approximately 98-us scheduling result through the unified selector, without
+the old shared-first special order. It remains far from the 59.232-us matched
+overlapped standalone, so Nemotron is not yet a rollout pass: the next work is
+an ordinary worker/resource sweep and constituent-resource comparison, not a
+new priority rule.
+
+A follow-up Nemotron worker sweep found the best current point at multiplier
+five (740 workers): 92.160 us versus 59.392 us matched standalone. Multiplier
+six regressed to 94.144 us and multiplier eight exceeded the 888-program
+residency limit. The remaining gap is chiefly a shared resource envelope, not
+missing readiness: standalone phases use 1--8 warps, 1--8 stages, 10--199
+registers, and up to 118,272 bytes of shared memory, while the persistent
+kernel uses W2/S2/R128 with 12 spill bytes. The schedule already emits six
+exact counters and four routed-chain barriers with no relation fallback.
+
+A targeted persistent-aware constituent sweep recovers a further large part
+without touching scheduler policy. Changing only routed expert-up from its
+standalone-optimal 16x128 tile to 32x512 halves that root from 928 to 464 CTAs;
+removing the global R128 cap then eliminates spills while retaining m5
+residency. A clean 500-sample/10-second run measures 77.824 us persistent
+versus 94.336 us for the prior anchor and 59.520 us standalone. All twelve
+materialized intermediates pass, the lowering retains five dot bodies, and the
+topology remains six exact counters plus four barriers. This 17.5% recovery is
+ordinary block/register tuning; the remaining 18.304-us gap still requires a
+profile-guided shared-up/down resource study, not another list priority.
+
+That wait-excluded profile shows routed-down finishing the critical path at
+32.864 us versus 16.800 us standalone, while early shared-up is stretched to
+41.728 versus 6.976 us by legal overlap with expert-up. The overlap comes from
+ordinary dense root-major worker progress, not event-frontier priority or the
+independent backfill rule. Doubling shared-up N from 32 to 64 halves its CTAs
+and improves the current kernel again: a 500-sample confirmation is 75.616 us
+versus 59.296 us standalone at m5/depth2, R162/zero spill. m4 is 5.6% slower
+despite the same two-wave count, so inserting an artificial dependency or
+reducing width is not justified without a generic resource model. Routed-down
+tile candidates confirm the same limit: at their maximum legal m3 residency,
+N32 is 90.192 us and K256/stage1 is 173.904 us versus the m3 base at 81.760 us;
+the former raises shared memory to 67.6 KB and the latter reaches R255/186
+spills. The best validated point therefore remains 75.616 us. The residual
+gap is a concrete limitation of one Triton kernel's shared warp/register/
+shared-memory envelope, not evidence for another scheduling rule.
+
+DeepSeek-V3 exposed two independent lowering defects before any priority
+change. First, adjacent pieces of one routed-W2 run were emitted as two bodies
+when packed reconstruction declined. Unioning their already-proved exact
+relations coalesces root 4 from `[2177,2368)+[2368,3969)` to
+`[2177,3969)`, while the genuinely gapped root 5 remains split. This reduces
+the depth-two lowering from 846 to 796 lines, seven to six dots, and 126 to 80
+spill words, recovering about 4 us in the initial paired run.
+
+Second, the exact K32/fan-in-two readiness acquire lived inside routed-W2's
+pipelined K loop, carrying its FP32 accumulator across an acquire loop and
+causing a register cliff. Post-placement compaction now emits a root-entry
+quotient only when every correlated resident-producer frontier is proved
+strictly earlier than its consumer CTA's worker rank, or the arm is the
+certified wait-free transient source whose complete source-ticket set is
+issued before any resident ticket. The latter proves launch progress, not
+completion; the emitted counter still gates completion and visibility, and
+the final whole-schedule progress proof validates the stronger wait. On
+DeepSeek depth one this derives K8/fan-in-eight, moves the wait before the
+unchanged K loop, and restores R117/zero spills. A clean paired GPU7 run
+measured 184.112 us versus 156.032 us standalone. Depth two has real same-wave
+resident overlap, so it conservatively retains K32/fan-in-two and measures
+261.920 us at R255/80 spills. This same rule preserves Qwen's useful 74/22
+same-wave split: general acyclic progress is sufficient for correctness, but
+not sufficient to erase resident overlap by hoisting a wait.
+
+Finally, the retirement window previously admitted only descendants of its
+anchor, leaving 549 proved one-use slots idle even though DeepSeek's complete
+independent shared-W13 suffix fit. The generic dead-window rule now considers
+an incomparable, fully admissible complete suffix only after no depth-eligible
+anchor descendant can run or is waiting for the next rank. At depth two this
+moves shared-W13 from `[4546,4802)` to `[3996,4252)` and improves the clean
+GPU3 result from 261.024 to 237.440 us with identical 796-line/R255/80-spill
+code resources. At depth three, shared-W2 also moves into `[4252,4476)` and
+the nominal horizon falls from nine waves to eight, but latency remains
+237.440 us because those CTAs wait for shared-W13 publication and the final
+join still waits on the late routed reduction. This is why pipeline depth is
+autotuned and wave count is not a latency cost model. Qwen's rank-deferred
+consumer continues to block unrelated backfill and its 74/22 schedule is
+unchanged. CPU coverage includes complete-suffix backfill, depth-bounded child
+release, and rank-deferred descendant precedence.
+
+A clean DeepSeek resource-port ablation then separated schedule quality from
+the shared compilation envelope. Keeping the unified depth-two schedule but
+restoring the historically tuned per-range tile sizes and stages removes the
+R255/80-spill cliff and reaches 168.832 us at R116/zero spill/34,816 bytes
+shared, versus 154.064 us standalone. The incumbent depth-two configuration
+was 231.440 us at R255/80 spill/52,224 bytes shared. A second uncontaminated
+sweep found m4 to be the worker knee (173.920 us versus 158.176 us standalone
+in that run); m5 was identical within 0.032 us, and raising global stages
+increased shared memory and lost occupancy. Thus no additional priority rule
+is justified: ordinary range configuration recovers most of the loss, while
+the remaining roughly 10% is a body/resource follow-up.
+
+A probe-only synchronization ablation isolates one part of that follow-up.
+With the incumbent resource geometry and identical depth-two
+`WorkerSchedule`, forcing the existing root-entry quotient changes routed-W2
+from exact K32/fan-in-two waits inside its reduction loop to K8/fan-in-eight at
+CTA entry. The ordinary final segment-DAG progress/lowerability proof accepts
+it; resources improve from R255/80 spills to R164/zero spills and latency from
+231.440 to 180.064 us. Under the historical resource geometry the same hook is
+a no-op because 3->4 already uses a root barrier; that path remains faster at
+174.016 versus 158.208 us standalone. This proves that an exact nested wait
+can create a general loop-carried-liveness cliff, but does not yet justify
+always coarsening: Qwen's fine 74/22 frontier has a measured overlap benefit.
+Any production choice must therefore be cross-workload and structural, not a
+DeepSeek root/site exception.
+
+Post-backfill source-ticket checkpoint (2026-09-12): an over-conservative
+entry-compaction guard briefly left canonical FlashMLA's exact source
+dependencies as K352/fan-in-one (and analogous exact plans), regressing the
+otherwise unchanged 13-segment placement from 63.36 to 71.52 us. The generic
+launch-progress rule above restores the established K22/fan-in-16 quotient and
+the other compact source counters without admitting arbitrary same-wave
+resident arms. On stable current source, fixed-capacity ragged B4/Q4/H16 is
+63.328 us persistent versus 67.488 us matched three-launch Helion and 71.616
+us for the performance-only ThunderKittens control. Canonical, shorter-ragged,
+and page-permuted inputs are bit-exact against standalone; the same cubin is
+reused. Muse B1 m12/depth2 remains 161.632 us versus 169.920 us for its best
+matched standalone boundary, also bit-exact. CPU coverage includes an
+oversubscribed 32-source-task/eight-resident-worker case and proves both the
+compact quotient and final progress without CTA enumeration.
+
+The same stable-source rollout closes the apparent Gemma fixed-capacity B2
+gap through ordinary tuning rather than scheduler policy. At m3/depth2, a
+balanced 500-sample cold-L2 run is 69.664 us persistent versus 69.536 us
+standalone (0.18%, practical parity), while B1 is 51.008 versus 55.200 us
+(7.59% faster). Depths two through four are exact schedule/cubin aliases;
+depth one is slower, multipliers two and four regress, and multiplier five is
+correctly rejected by resident capacity. Runtime route changes remain
+bit-exact and do not alter the schedule or counters.
 
 Current fixed-capacity guards after the canonical-tie/transitive-
 non-displacement change: canonical ragged FlashMLA B4 remains faster than its
@@ -467,8 +749,8 @@ contents remain device loads. One cubin replayed S8192, S2048 with permuted
 pages, and S8192 with a different permutation bit-exactly. After the common-
 offset fix, fixed-capacity versus identical static-shape latency was
 96.42/98.22 us, 92.10/94.08 us, and 96.13/96.22 us respectively; resources
-were identical. The Qwen plans enter the same concrete
-`build_worker_schedule` path, contain no parameter symbols, and now have
+were identical. The Qwen plans enter the same concrete fixed-capacity
+pipeline, contain no parameter symbols, and now have
 identical schedules, barriers, and all seven counters, including the nested
 8->9 fan-in-32 counter.
 
@@ -477,7 +759,7 @@ contract. Its temporary fixed-capacity source uses `static_shapes=False` and
 explicitly specializes `num_heads` in addition to the already fixed B, Q,
 block-N, split/task capacity, query/cache dimensions, and block-table column
 capacity. The resulting plan has no parameter symbols and uses one canonical
-`build_worker_schedule` plus one global-list proposal. One cubin replayed the
+ownership analysis plus one global-list proposal. One cubin replayed the
 canonical sequence lengths, different lengths within the same fixed
 14/14/37/353 task buckets, and a semantic page permutation while retaining
 runtime `seq_lens` and block-table loads. Persistent and matched standalone
@@ -488,6 +770,97 @@ known nonfinite-output defect, so it is not a numerical reference. Crossing a
 specialized task-count bucket remains outside this milestone; both current
 Helion source boundaries expose a pre-existing all-empty-tail numerical issue
 in that case.
+
+Qwen production-source checkpoint (2026-09-11): the checked-in pretuned B1/Q1
+entry point now uses `static_shapes=False` directly. It explicitly specializes
+all 26 input tensor extents and strides plus fixed model/tile/capacity geometry;
+`context_lens`, positions, page-table entries, slot mappings, and tensor data
+remain runtime loads. S8192, S2048, non-64-aligned S2051 with poisoned unused
+page entries, and page permutations reuse one BoundKernel and cubin and match
+an independently compiled same-source `static_shapes=True` control bit for bit
+across all 16 outputs and the full KV cache. The active attention path uses one
+body with masked page-table/K/V loads, so invalid tail metadata is never
+dereferenced. At S8192, same-source dynamic/static performance is identical
+within 0.032 us. An isolated root-5 comparison is likewise 16.320 us for the
+runtime-safe body versus 16.352 us for the fixed unmasked body; masking
+arithmetic is not the full-layer regression.
+
+The generic contiguous-run materialization fix now lets Qwen's depth-two list
+proposal survive exact `WorkerSchedule` construction. With the runtime-safe
+body, depth one is 106.46--107.09 us and depth two is 100.19--100.29 us over
+three fresh-cache cold-L2 trials; the old unmasked control is 95.98--96.14 us.
+Depth two therefore recovers about 6.4 us without a model branch. The remaining
+counter is still the stale 52/44 quotient derived from the discarded analysis
+schedule; moving nested quotient derivation after accepted placement is the
+next correctness-of-architecture task before attributing the remaining gap.
+
+Post-schedule quotient checkpoint (2026-09-11): scheduling now consumes the
+exact per-iteration nested events and derives any compact counter only from the
+accepted `WorkerSchedule`; compact failure retries exact keys on that identical
+schedule and never re-enters ownership, ordering, source selection, or list
+placement. A generic stale-order test observes 4/4 from its discarded scratch
+order and 6/2 from its accepted order, while spies prove both scheduling passes
+receive only exact keys. Multi-producer arms, nonuniform tails, exact-once
+publication, and a real multi-wave consumer are covered independently. The
+combined scheduler/codegen suite passes 223 tests and 94 subtests.
+
+The first Qwen run exposed two distinct facts. Exact 96-key nested waits are
+correct but cost 210.80 us. Taking the earliest admission wave as the uniform
+frontier is safe for a consumer root spanning waves 3--4; final progress proves
+the resulting stronger wait, and a one-key fan-in-96 quotient restores 106.34
+us. This beats the freshly measured matched standalone boundary at 110.40 us,
+but remains behind the 96.10-us old persistent control because the accepted
+schedule places all 96 producer tasks at one rank. A compact quotient cannot
+invent the missing overlap after placement.
+
+The next scheduler step is therefore a retirement-frontier placement, not a
+Qwen counter special case. The first implementation tried to backfill literal
+holes in the prepared schedule while leaving every other root fixed. Its proof
+and CPU tests were sound, but the real Qwen run stayed at 106.336 us with the
+unchanged packed schedule: roots 12/13/14 occupied global intervals
+`[2930,4466)`, `[4466,4562)`, and `[4562,5074)`, so the producer's terminal
+absolute-wave tail was already occupied. This is the wrong abstraction and
+must not remain as a second proposal policy.
+
+Retirement instead belongs inside the existing committed-run transition. Keep
+separate local cursors for ownership already assigned and producer work that
+may safely satisfy admission. If a full-width dense committed run with source
+interval `[a,b)` is placed in global slots `[F,E)` and
+`b-a = q*W + r`, preserve `[F,E)` byte for byte, advance ownership to `b`, but
+hold its admission cursor at `a + q*W`. The one-use interval
+`[E, E + (W-r))` is exactly the next slot of every lane that owns `q` rather
+than `q+1` producer tasks, even when `F` is rotated and the interval crosses an
+absolute wave. Run the same complete-cohort chooser and priority within that
+bounded interval, never reuse a lane or split a cohort, then reveal the final
+`r` producer tasks and resume the same selector. If no cohort fits, skip the
+unused interval; do not invent work merely to fill it.
+
+For Qwen, `1536 = 1*1184 + 352`, so the interval has 832 one-use slots. Holding
+root 12 at its first 1,184 assigned tasks makes exactly 74 complete fan-in-16
+root-13 tasks admissible; their same-window claims admit the complete 512-task
+nested root-14 family, and the final 22 root-13 tasks remain after the window.
+The expected 74/22 quotient then follows from the accepted relation. For
+Muse's 19,968-task producer, the same rule exposes only the genuine terminal
+retirement interval and never recycles lanes through all event keys. No model
+constant, operation kind, or measured latency enters the policy.
+
+The same post-quotient tree preserves canonical ragged FlashMLA B4/Q4/H16 on
+physical GPU 4: 63.360 us persistent versus 69.472 us matched standalone over
+500 balanced cold-L2 samples, bit-exact across canonical lengths, changed
+ragged lengths, and semantic page permutation with one cubin. Its 22-key,
+fan-in-16 nested quotient, four barriers, transient source, and R80/42-spill/
+49,160-byte-shared/W8/S1 resource shape are unchanged.
+
+The fixed-capacity `static_shapes=False` Gemma4 A4B control also remains
+healthy on physical GPU 6 at multiplier three/depth two. Over 500 balanced
+cold-L2 samples it measures 50.976 versus 55.104 us standalone at B1 (7.49%
+lower latency) and 69.440 versus 69.408 us at B2 (0.05% difference). Three
+runtime route patterns per capacity are bit-exact across all seven outputs;
+B2 exercises 15 distinct experts across 16 assignments, and each capacity
+retains one cubin. Depth two genuinely reduces occupied waves from 7 to 2 at
+B1 and 9 to 4 at B2. The checked-in Gemma entry point still declares
+`static_shapes=True`; promoting the validated fixed-capacity source contract
+is separate from scheduler correctness.
 
 For contrast, fully runtime batch cardinality remains a historical stress
 control, not the immediate contract. A one-cubin Qwen B1/B2 build is 6--12%
@@ -543,27 +916,50 @@ rendering are retained even where legacy helper names still say
   conservative symbolic segment-precedence graph. Missing dependency
   semantics still decline; inability to invert an optional proof projection
   does not.
-- [ ] Start with the frozen root-entry coarsening for nested consumers.
-  Preserve true nested producer publications, use the ordinary root-barrier
-  fallback on an unproved coarsening, and benchmark Qwen before retaining any
-  finer nested placement machinery.
-- [ ] Treat Qwen 74/22, its collapsed-frontier ablation, and its relocated
-  placement as diagnostics only. Accept any generic exact schedule that is
-  numerically correct and beats matched standalone; a small regression from
-  the historical best is acceptable.
-- [ ] After placement, derive only schedule-dependent physical publication
-  participants/sites and epoch layout. Counter keys/fan-ins, root-barrier
-  edges, continuation identity, and source ownership are already frozen and
-  may not be repartitioned.
-- [ ] Preserve the already-frozen multi-producer common quotient through
+- [x] Schedule nested consumers from their exact semantic per-iteration
+  prerequisites. After accepting a schedule, derive a compact nested-counter
+  quotient from that schedule and the same `ReadinessGraph`; never feed the
+  quotient back into root ordering, placement, continuation choice, or source
+  ownership. Keep exact per-iteration lowering as the no-reschedule fallback.
+- [x] Hoist a nested wait to root entry only when the accepted schedule proves
+  progress precedence for every contracted producer arm: an ordinary resident
+  producer must strictly precede its correlated consumer CTA in worker rank,
+  while a certified wait-free transient source may rely on every source ticket
+  being issued before any resident ticket. Ticket order is not completion; the
+  counter still gates completion and visibility. If this compositional proof
+  fails, retain a genuine multi-segment frontier such as Qwen 74/22 or the
+  exact per-iteration event. This is a lowering strength reduction, never a
+  scheduling input.
+- [ ] Before changing that default, ablate the orthogonal post-placement
+  choice between the maximal schedule frontier and any whole-plan-safe entry
+  quotient on DeepSeek, Qwen, FlashMLA, Muse, and Gemma. DeepSeek proves that
+  waits inside an accumulator loop can create a register cliff; Qwen proves
+  that a safe entry wait can erase useful overlap. Keep the `WorkerSchedule`,
+  ownership, obligations, and final joint progress/publication validation
+  identical. Do not add a root/site heuristic or overload
+  `cross_loop_pipeline_depth`; reconcile any proposed lowering choice with the
+  one-fundamental-knob constraint before making it production policy.
+- [x] Treat Qwen 74/22, its collapsed-frontier ablation, and its relocated
+  placement as diagnostics only. Assert that the chosen split is derived from
+  the accepted schedule, not a tentative/pre-reordered scratch schedule.
+  Accept any generic exact schedule that is numerically correct and beats
+  matched standalone; a small regression from the historical best is
+  acceptable.
+- [x] After placement, derive the nested counter quotient and all
+  schedule-dependent physical publication participants/sites and epoch layout.
+  Ordinary counter semantics, root-barrier edges, continuation identity, and
+  source ownership are already frozen and may not be repartitioned.
+- [x] Preserve the already-frozen multi-producer common quotient through
   post-placement publication lowering. Derive physical publishers and epoch
   stride from exact per-arm publication occurrences and their static maximum
-  fan-in. If that physical derivation fails, reject the optimized proposal;
-  never repartition or split the event after scheduling.
-- [ ] Validate final counters, root barriers, participants, replay bounds, and
+  fan-in. If that optional compact physical derivation fails, retain the exact
+  per-iteration event on the identical schedule; never repartition the event
+  or rerun scheduling.
+- [x] Validate final counters, root barriers, participants, replay bounds, and
   complete progress once from `ReadinessGraph` plus the accepted
-  `WorkerSchedule`. An unknown proof rejects the complete optimized proposal;
-  codegen only renders it.
+  `WorkerSchedule`. An unknown compact-quotient proof falls back to exact keys;
+  an unknown exact proof rejects the schedule candidate. Codegen only renders
+  the resulting plan.
 - [ ] After parity, remove obsolete local placement passes and the
   constant/parameterized policy split. Keep only synchronization derivation
   that still has a final-plan consumer.
@@ -1423,9 +1819,11 @@ concrete counterexample to the old ordering.
 - [ ] Before accepting any early-admission action, prove from that same event
   and its existing relations that the required counter/publication lowering is
   available. This is an action-legality check inside the one scheduler, not a
-  filtered graph, capability object, or alternate policy. A schedule-dependent
-  nested mechanism is attempted transactionally: if its final quotient cannot
-  lower, reject the entire optimized proposal once.
+  filtered graph, capability object, or alternate policy. Nested placement is
+  scheduled against the exact per-iteration event, whose lowering is the
+  legality floor. A schedule-dependent compact quotient is attempted only
+  after placement; if it cannot lower, retain the exact event on that identical
+  placement rather than rescheduling.
 - [ ] Keep every eligible consumer resident while constructing the first
   unified cohort schedule. After resident placement is final, admit a
   continuation only when one local dominance proof covers every possible
@@ -1449,16 +1847,18 @@ concrete counterexample to the old ordering.
   adjacent nested iterations exactly when their latest required producer wave
   has the same relation to the consumer's admission wave. Keep the exact
   per-iteration event as semantic truth; the quotient is only the emitted
-  synchronization plan. If an optimized placement relied on a quotient that
-  cannot lower, discard that proposal. A root-entry counter or root barrier is
-  used only when the placement was already proved safe with that coarser wait,
-  including in the rebuilt all-resident fallback.
+  synchronization strength reduction. Placement never relies on that quotient:
+  if it cannot lower or fails final progress, emit the exact per-iteration event
+  on the same schedule. A root-entry counter or root barrier is used only when
+  exact per-iteration lowering was unavailable before scheduling and the
+  placement was therefore proved safe with that coarser wait from the outset.
 - [ ] Finalize ordinary counters, continuation counters, and root-barrier
   fallbacks once after placement, then validate the final result against the
   original dependency obligations. No late step may silently change ownership.
-  A rejected optimized proposal is discarded in full and may fall back once to
-  root-major placement; placement and synchronization must not repeatedly
-  mutate one another.
+  A rejected optional quotient falls back to exact keys without changing the
+  accepted schedule. Only failure of that exact synchronization can reject the
+  schedule candidate and advance to the next canonical fallback; placement and
+  synchronization must not repeatedly mutate one another.
 - [ ] Make conservative root-major order the fallback of that same policy.
   Concrete wave-aligned and symbolic slot-packed schedules must not remain
   competing semantic baselines.
@@ -2934,11 +3334,13 @@ relations prove all of the following:
 - the symbolic segment-precedence quotient is acyclic; and
 - the backend resident-capacity certificate covers every involved strand.
 
-If an optimized placement relies on a nested frontier whose maximum/composition
-is not representable, reject that complete proposal. The single all-resident
-root-major fallback then derives a root-entry counter or root barrier from the
-unchanged semantic event. Do not retain the placement while silently
-coarsening the wait it relied on.
+The optimized placement is proved against exact per-iteration nested readiness,
+not against the compact frontier. If the frontier maximum/composition is not
+representable, or the resulting stronger wait fails the final progress proof,
+retain the exact keys on the identical placement. A root-entry counter or root
+barrier is permitted only as a pre-scheduling fallback when exact lowering is
+unavailable; it may never be introduced after placement because moving a wait
+earlier can create a same-strand cycle.
 
 ## Synchronization and execution ownership
 
@@ -3886,13 +4288,17 @@ Expected scheduler steps:
    composition proves an exact readiness-major replacement.
 2. Advance the exact root 5→6 fan-in-8, 6→7 fan-in-16, and 7→8 fan-in-1
    cohorts without interrupting unfinished producer runs.
-3. Pack roots from their symbolic prefix offsets. In the historical B1
-   relation, that arithmetic puts root 13's 96 tasks on workers 576--671 and
-   root 14's 512 tasks on workers 672--1183 in the same wave.
-4. After placement, derive root 14's nested wait partition from the exact
+3. Reserve root 12's complete 1,536-task producer suffix. Derive each worker's
+   last reserved occurrence from its task-to-worker/rank relation. After the
+   first 1,184 assignments, 74 complete fan-in-16 keys are ready and 832
+   workers have retired while 352 workers retain one later producer task.
+4. Place root 13's ready 74-task prefix and root 14's complete 512-task cohort
+   only in those one-use retired slots; do not move or delay the remaining
+   root-12 tasks. The later 22 root-13 tasks retain the non-retired lanes.
+5. After placement, derive root 14's nested wait partition from the exact
    schedule. It yields 74 earlier producers followed by 22 later producers;
    neither number belongs in priority policy.
-5. Keep root 13 resident unless continuation dominance is proved. Preserve
+6. Keep root 13 resident unless continuation dominance is proved. Preserve
    existing safe continuations only through the same ownership proof.
 
 Collapsing 74/22 to one fan-in-96 wait costs about 2 us. Moving the placement
@@ -3983,12 +4389,16 @@ B4 waves 0--66: r0 full
    wave 80: r3 0--1087
 ```
 
-The scheduler should preserve the complete r0 producer run, admit r1 only in
-its terminal tail, then admit r2/r3 only in r1's terminal tail. `B` changes
-only the interval endpoints. It must not pipeline one completed slice's r2/r3
-through later r0 slices: the measured 77-segment N64 schedule did exactly that
-and regressed 235.376 versus 175.984 us local. A conservative five-segment
-event plan measured 172.064 versus 173.968 us local.
+The scheduler should preserve the complete r0 producer reservation. At B1,
+19,968 tasks over 1,184 workers leave 1,024 workers with one final producer
+occurrence and only 160 workers retired before that last rank. Those 160 lanes
+may admit complete r1 cohorts once, but they may not be recycled through r2/r3
+while r0 remains active. After r0 completes, ordinary retirement and priority
+apply to r1 and its descendants. `B` changes only the relation endpoints. The
+measured 77-segment N64 schedule violated this rule by repeatedly piping one
+completed slice through later r0 slices and regressed 235.376 versus 175.984 us
+local. A conservative five-segment event plan measured 172.064 versus 173.968
+us local.
 
 Current all-exact dynamic B1/B2 is 1579.104/3110.080 us versus
 1649.600/3244.000 us matched standalone, but this does not prove that event-

@@ -56,43 +56,217 @@ def _replace_once(source: str, old: str, new: str) -> str:
     return source.replace(old, new, 1)
 
 
-def _make_batched_kernel() -> Kernel:
+def _make_batched_kernel(
+    *,
+    dynamic_batch: bool = False,
+    triton_do_not_specialize: bool | None = None,
+    ragged_attention: bool = True,
+) -> Kernel:
     """Derive a ragged kernel without copying the thousand-line tuned body."""
+    if triton_do_not_specialize is None:
+        triton_do_not_specialize = dynamic_batch
     source = textwrap.dedent(inspect.getsource(qwen.qwen3_decode_layer.fn))
     source = _replace_once(
         source,
         '@helion.aot_kernel(static_shapes=True, backend="triton")',
-        '@helion.kernel(static_shapes=True, autotune_effort="none")',
+        "@helion.kernel("
+        f'static_shapes={not dynamic_batch!r}, autotune_effort="none", '
+        f"triton_do_not_specialize={triton_do_not_specialize!r}"
+        ")",
     )
-    source = _replace_once(source, "    eps,\n):", "    eps,\n    context_lens,\n):")
+    if ragged_attention:
+        source = _replace_once(
+            source,
+            "    eps,\n):",
+            "    eps,\n    context_lens,\n):",
+        )
+    if dynamic_batch:
+        invariant_size_dimensions = {
+            "hidden_states": (1,),
+            "residual": (1,),
+            "pre_weight": (0,),
+            "pre_q": (1,),
+            "pre_scale": (1,),
+            "qkv_weight_q": (0, 1),
+            "qkv_weight_scale": (0, 1),
+            "q_weight": (0,),
+            "k_weight": (0,),
+            "cos_sin": (0, 1),
+            "kv_cache": (1, 2, 3),
+            "block_table": (1,),
+            "o_weight_q": (0, 1),
+            "o_weight_scale": (0, 1),
+            "attention_q": (1,),
+            "attention_scale": (1,),
+            "post_weight": (0,),
+            "ffn_q": (1,),
+            "ffn_scale": (1,),
+            "w13_q": (0, 1),
+            "w13_scale": (0, 1),
+            "w2_q": (0, 1),
+            "w2_scale": (0, 1),
+        }
+        tensor_ranks = {
+            "hidden_states": 2,
+            "residual": 2,
+            "pre_weight": 1,
+            "pre_q": 2,
+            "pre_scale": 2,
+            "qkv_weight_q": 2,
+            "qkv_weight_scale": 2,
+            "q_weight": 1,
+            "k_weight": 1,
+            "cos_sin": 2,
+            "position": 1,
+            "kv_cache": 4,
+            "block_table": 2,
+            "slot_mapping": 1,
+            "o_weight_q": 2,
+            "o_weight_scale": 2,
+            "attention_q": 2,
+            "attention_scale": 2,
+            "post_weight": 1,
+            "ffn_q": 2,
+            "ffn_scale": 2,
+            "w13_q": 2,
+            "w13_scale": 2,
+            "w2_q": 2,
+            "w2_scale": 2,
+        }
+        if ragged_attention:
+            tensor_ranks["context_lens"] = 1
+        invariant_specializations = "".join(
+            f"    hl.specialize({name}.size({dimension}))\n"
+            for name, dimensions in invariant_size_dimensions.items()
+            for dimension in dimensions
+        ) + "".join(
+            f"    hl.specialize({name}.stride({dimension}))\n"
+            for name, rank in tensor_ranks.items()
+            for dimension in range(rank)
+        )
+        source = _replace_once(
+            source,
+            "):\n    pre_result = pre_q",
+            "):\n"
+            f"    dynamic_batch_size = "
+            f"{'context_lens' if ragged_attention else 'hidden_states'}.size(0)\n"
+            "    torch._check(dynamic_batch_size >= 1)\n"
+            + invariant_specializations
+            + "    pre_result = pre_q",
+        )
+        source = _replace_once(
+            source,
+            "    pre_num_tokens, pre_hidden_size = pre_input.shape",
+            "    _, pre_hidden_size = pre_input.shape\n"
+            "    pre_num_tokens = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    qkv_mm_m, qkv_mm_k = qkv_mm_activation_q.size()",
+            "    _, qkv_mm_k = qkv_mm_activation_q.size()\n"
+            "    qkv_mm_m = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    batch = hidden_states.shape[0]",
+            "    batch = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    qk_num_tokens = qk_qkv.shape[0]",
+            "    qk_num_tokens = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    cache_num_tokens, cache_num_kv_heads, cache_head_dim = cache_key.shape",
+            "    _, cache_num_kv_heads, cache_head_dim = cache_key.shape\n"
+            "    cache_num_tokens = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "        attention_split_num_tokens,\n        attention_split_num_q_heads,",
+            "        _,\n        attention_split_num_q_heads,",
+        )
+        source = _replace_once(
+            source,
+            "    attention_split_num_kv_heads = attention_split_kv_cache.shape[2]",
+            "    attention_split_num_tokens = dynamic_batch_size\n"
+            "    attention_split_num_kv_heads = attention_split_kv_cache.shape[2]",
+        )
+        source = _replace_once(
+            source,
+            "    hl.specialize(attention_merge_num_kv_heads)\n",
+            "",
+        )
+        source = _replace_once(
+            source,
+            "    hl.specialize(attention_merge_query_heads)\n",
+            "",
+        )
+        source = _replace_once(
+            source,
+            "    attention_quant_num_tokens, attention_quant_hidden_size = (\n"
+            "        attention_quant_input.shape\n"
+            "    )",
+            "    _, attention_quant_hidden_size = attention_quant_input.shape\n"
+            "    attention_quant_num_tokens = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    o_mm_m, o_mm_k = o_mm_activation_q.size()",
+            "    _, o_mm_k = o_mm_activation_q.size()\n    o_mm_m = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    post_num_tokens, post_hidden_size = post_input.shape",
+            "    _, post_hidden_size = post_input.shape\n"
+            "    post_num_tokens = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    w13_m, w13_k = w13_activation_q.size()",
+            "    _, w13_k = w13_activation_q.size()\n    w13_m = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    activation_m, activation_twice_intermediate = activation_gate_up.size()",
+            "    _, activation_twice_intermediate = activation_gate_up.size()\n"
+            "    activation_m = dynamic_batch_size",
+        )
+        source = _replace_once(
+            source,
+            "    w2_m, w2_k = w2_activation_q.size()",
+            "    _, w2_k = w2_activation_q.size()\n    w2_m = dynamic_batch_size",
+        )
     source = _replace_once(
         source, '            float("-inf"),', f"            {_NEGATIVE_FLOAT32},"
     )
 
-    guarded_begin = source.index("        attention_split_query_head = (")
-    guarded_end_marker = "            attention_split_m_i = attention_split_m_ij\n"
-    guarded_end = source.index(guarded_end_marker, guarded_begin) + len(
-        guarded_end_marker
-    )
-    guarded_body = source[guarded_begin:guarded_end]
-    score_compute = """            attention_split_scores = torch.bmm(
+    if ragged_attention:
+        guarded_begin = source.index("        attention_split_query_head = (")
+        guarded_end_marker = "            attention_split_m_i = attention_split_m_ij\n"
+        guarded_end = source.index(guarded_end_marker, guarded_begin) + len(
+            guarded_end_marker
+        )
+        guarded_body = source[guarded_begin:guarded_end]
+        score_compute = """            attention_split_scores = torch.bmm(
                 attention_split_q_blk,
                 attention_split_k.transpose(1, 2),
                 torch.float32,
             )
 """
-    masked_scores = (
-        score_compute
-        + f"""            attention_split_scores = torch.where(
+        masked_scores = (
+            score_compute
+            + f"""            attention_split_scores = torch.where(
                 attention_split_n[None, None, :]
                 < attention_split_context_len[:, None, None],
                 attention_split_scores,
                 {_NEGATIVE_FLOAT32},
             )
 """
-    )
-    guarded_body = _replace_once(guarded_body, score_compute, masked_scores)
-    guard = """        attention_split_context_len = hl.load(
+        )
+        guarded_body = _replace_once(guarded_body, score_compute, masked_scores)
+        guard = """        attention_split_context_len = hl.load(
             context_lens, [attention_split_token]
         )
         if (
@@ -100,12 +274,12 @@ def _make_batched_kernel() -> Kernel:
             < attention_split_context_len
         ):
 """
-    source = (
-        source[:guarded_begin]
-        + guard
-        + textwrap.indent(guarded_body, "    ")
-        + source[guarded_end:]
-    )
+        source = (
+            source[:guarded_begin]
+            + guard
+            + textwrap.indent(guarded_body, "    ")
+            + source[guarded_end:]
+        )
 
     module_name = "_helion_qwen3_batched_scheduler_probe"
     filename = f"<{module_name}>"

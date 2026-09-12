@@ -544,7 +544,7 @@ def _compile_persistent(
     original_slice = cross_loop_scheduler._task_order_slice
     original_validate = cross_loop_scheduler._validate_worker_schedule_tasks
     original_traversal = cross_loop_scheduler._root_schedule_traversal
-    original_max_list_nodes = cross_loop_scheduler._MAX_GLOBAL_LIST_NODES
+    original_max_list_nodes = cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES
     original_max_list_segments = cross_loop_scheduler._MAX_GLOBAL_LIST_SEGMENTS
     records: list[dict[str, object]] = []
 
@@ -768,7 +768,7 @@ def _compile_persistent(
         return result
 
     try:
-        cross_loop_scheduler._MAX_GLOBAL_LIST_NODES = max_list_nodes
+        cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES = max_list_nodes
         cross_loop_scheduler._MAX_GLOBAL_LIST_SEGMENTS = max_list_segments
         cross_loop_scheduler._global_unit_list_schedule = (
             traced if global_list else lambda *unused_args, **unused_kwargs: None
@@ -777,7 +777,7 @@ def _compile_persistent(
         compiled = bound.compile_config(config)
     finally:
         cross_loop_scheduler._global_unit_list_schedule = original
-        cross_loop_scheduler._MAX_GLOBAL_LIST_NODES = original_max_list_nodes
+        cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES = original_max_list_nodes
         cross_loop_scheduler._MAX_GLOBAL_LIST_SEGMENTS = original_max_list_segments
     return compiled, tuple(records), dict(config)
 
@@ -1030,7 +1030,7 @@ def main() -> None:
     parser.add_argument(
         "--max-list-nodes",
         type=int,
-        default=cross_loop_scheduler._MAX_GLOBAL_LIST_NODES,
+        default=cross_loop_scheduler._MAX_GLOBAL_LIST_EDGES,
     )
     parser.add_argument(
         "--max-list-segments",

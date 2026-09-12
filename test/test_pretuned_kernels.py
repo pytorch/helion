@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib.util
+import inspect
 import math
 import os
 import sys
@@ -110,6 +111,36 @@ def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
         changed[index] = value + 1
         with pytest.raises(ValueError):
             key(*changed)
+
+
+def test_qwen3_decode_layer_has_explicit_runtime_metadata_contract() -> None:
+    module = _import_pretuned_kernel_module("qwen3_decode_layer")
+    heuristic = _import_pretuned_heuristic("qwen3_decode_layer")
+    kernel = module.qwen3_decode_layer
+    assert not kernel.settings.static_shapes
+    assert not kernel.settings.triton_do_not_specialize
+
+    parameters = tuple(inspect.signature(kernel.fn).parameters)
+    tensor_parameters = parameters[: len(heuristic._TENSOR_SIGNATURES)]
+    assert tensor_parameters[-1] == "context_lens"
+    source = inspect.getsource(kernel.fn)
+    for name, (shape, _dtype) in zip(
+        tensor_parameters,
+        heuristic._TENSOR_SIGNATURES,
+        strict=True,
+    ):
+        for dimension in range(len(shape)):
+            assert f"hl.specialize({name}.size({dimension}))" in source
+            assert f"hl.specialize({name}.stride({dimension}))" in source
+
+    assert "hl.load(context_lens" in source
+    assert "hl.specialize(context_lens[" not in source
+    assert "attention_split_valid_n = (" in source
+    assert "extra_mask=attention_split_valid_n[None, :]," in source
+    assert source.count("extra_mask=attention_split_valid_n[None, :, None],") == 2
+    assert "attention_split_split_end" not in source
+    assert source.count("for attention_split_tile_local_n in hl.tile(") == 1
+    assert "attention_split_tail_" not in source
 
 
 def test_pre_captured_graph_sweep_passes_resets(

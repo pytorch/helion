@@ -36,12 +36,13 @@ _TENSOR_SIGNATURES = (
     ((192, 32), torch.float32),
     ((4096, 12288), torch.float8_e4m3fn),
     ((32, 96), torch.float32),
+    ((1,), torch.int64),
 )
 _STATIC_ARGS = (4096, 12288, 32, 8, 128, 8192, 16, 128, 128, 1e-6)
 
 
 def key_qwen3_decode_layer(*args) -> int:
-    """This pretuned module intentionally supports one production shape."""
+    """This pretuned module intentionally supports one physical capacity."""
     tensor_count = len(_TENSOR_SIGNATURES)
     if (
         len(args) != tensor_count + len(_STATIC_ARGS)
