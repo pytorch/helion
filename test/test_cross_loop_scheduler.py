@@ -2066,6 +2066,60 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
+    def test_progress_rejects_a_second_launch_stage_source(self) -> None:
+        graph, counters = _transient_source_inlet_problem(4)
+        schedule = cross_loop_scheduler._with_transient_source_schedule_segment(
+            _baseline_worker_schedule(graph.root_domains, worker_count=2),
+            graph.root_task_orders,
+            0,
+        )
+        self.assertIsNotNone(schedule)
+        assert schedule is not None
+        bogus_source_segment = cross_loop_scheduler._normalize_dense_schedule_segment(
+            WorkerScheduleSegment(
+                root=1,
+                task_order=graph.root_task_orders[1],
+                worker_begin=0,
+                worker_count=2,
+                dispatch_offset=4,
+            ),
+            schedule.placement_domain,
+            launch_stage=0,
+        )
+        invalid = WorkerSchedule(
+            schedule.worker_count,
+            (
+                *schedule.without_roots(frozenset((1,))).segments,
+                bogus_source_segment,
+            ),
+        )
+
+        with _forbid_schedule_enumeration():
+            self.assertTrue(
+                _validate_worker_schedule_tasks(
+                    invalid,
+                    graph.root_task_orders,
+                )
+            )
+            self.assertFalse(
+                _has_valid_transient_source_schedule(
+                    invalid,
+                    graph,
+                    0,
+                    counters,
+                    frozenset(),
+                )
+            )
+            self.assertFalse(
+                cross_loop_scheduler._schedule_is_progress_safe(
+                    invalid,
+                    graph,
+                    counters,
+                    frozenset(),
+                    transient_source_root=0,
+                )
+            )
+
     def test_event_frontier_handles_trailing_transient_source_waves(self) -> None:
         graph, counters = _transient_source_inlet_problem(9)
         dispatch_offset = 0

@@ -568,13 +568,16 @@ policy: the event-frontier schedule saves 8.38 us over canonical placement at
 W1184, and ordinary `num_sm_multiplier=12` tuning reaches 161.728 us versus
 169.888 us for the best standalone while preserving the five-stage boundary,
 numerics, exact counters, R126/zero-spill resources, and one compiler policy.
-For Qwen B1/S8192, a same-plan source ablation also isolates 3.984 us of the
-historical regression to the required runtime ragged-attention masks: 106.432
-us masked versus 102.448 us with only the full-context attention body restored.
-The masked body introduces 22 spills where the unmasked control has none.
-This is a body/resource effect and remains separate from scheduler policy;
-the production masked persistent kernel is still faster than its matched
-masked standalone boundary.
+For Qwen B1/S8192, a same-plan source ablation isolates the required runtime
+ragged-attention masks from scheduler policy.  The masked body introduces 344
+additional SASS instructions and 22 spill bytes where the unmasked control has
+none.  One allocation order measured 106.432 versus 102.448 us, but reversing
+allocation/capture order exposed roughly 2-us code-placement modes and could
+erase or invert the apparent timing delta.  Therefore 3.984 us is a useful
+observed mode, not a stable causal estimate.  The robust facts are identical
+plans and the additional masked-body instructions/register pressure; the
+production masked persistent kernel remains faster than its matched masked
+standalone boundary.
 Nemotron fixed B1 provides a second branch-shaped scheduler check. At W592,
 depth one measures 120.640 us while depths two through four produce the same
 lowered code and measure 96.16--98.08 us. This recovers the historical
@@ -686,6 +689,21 @@ can create a general loop-carried-liveness cliff, but does not yet justify
 always coarsening: Qwen's fine 74/22 frontier has a measured overlap benefit.
 Any production choice must therefore be cross-workload and structural, not a
 DeepSeek root/site exception.
+
+A clean follow-up combines the two independently justified ingredients without
+changing fusion, numerics, placement, or compiler policy: routed activation
+uses N256 so the exact relation is one expert-level K8/fan-in-eight entry
+event, and the historical persistent resource geometry removes the remaining
+loop-carried wait state.  Over 500 cold-L2 samples it reaches **167.808 us**
+versus **174.080 us** for the historical persistent baseline and **156.304
+us** for matched standalone.  The `WorkerSchedule` is byte-for-byte identical;
+only the executable quotient changes from K64/fan-in-one to K8/fan-in-eight,
+and resources improve from R255/104 spill words to R116/zero spill.  The
+remaining 7.36% gap is therefore a shared single-kernel resource-envelope
+cost, not missing event-frontier placement.  The next ordinary configuration
+experiment is N256 activation plus routed-W2 N64xK512/stage2/nw1 at W444; it
+preserves 896 W2 CTAs while halving loop trips.  It is an autotuning/resource
+probe, not a scheduler special case.
 
 Post-backfill source-ticket checkpoint (2026-09-12): an over-conservative
 entry-compaction guard briefly left canonical FlashMLA's exact source
@@ -960,6 +978,13 @@ rendering are retained even where legacy helper names still say
   `WorkerSchedule`. An unknown compact-quotient proof falls back to exact keys;
   an unknown exact proof rejects the schedule candidate. Codegen only renders
   the resulting plan.
+- [x] Make the common progress proof validate the complete launch-stage source
+  invariant itself, rather than relying on every caller to pair it with a
+  second helper.  Lower a partial nested consumer relation through the same
+  per-iteration membership guard even when every supported iteration maps to
+  one constant readiness key; segmented lowering is reserved for total source
+  support.  These are general fail-closed correctness/coverage fixes and do
+  not change placement policy.
 - [ ] After parity, remove obsolete local placement passes and the
   constant/parameterized policy split. Keep only synchronization derivation
   that still has a final-plan consumer.

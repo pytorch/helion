@@ -30,6 +30,8 @@ from helion._compiler.cross_loop_scheduler import (
 )
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
+from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -792,6 +794,84 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         loop_target = lines[loop_index].strip().split()[1]
         self.assertTrue(lines[wait_index].startswith("        "))
         self.assertIn(loop_target, lines[wait_index])
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_partial_constant_nested_key_uses_membership_guard(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_partial_constant_nested_key(**kwargs: Any):
+            plan = original_build(**kwargs)
+            replacement = None
+            replaced_counters = []
+            for counter in plan.readiness_counters:
+                consumers = []
+                for consumer in counter.consumers:
+                    relation = consumer.keys_by_consumer
+                    nested_axes = cross_loop_scheduler.nested_logical_axes(
+                        plan.root_task_orders[consumer.consumer_root].target_domain,
+                        relation.source_domain,
+                    )
+                    if replacement is not None or len(nested_axes) != 1:
+                        consumers.append(consumer)
+                        continue
+                    (nested_axis,) = nested_axes
+                    source_bounds = tuple(
+                        (
+                            axis,
+                            1 if axis == nested_axis else 0,
+                            relation.source_domain.axis_count_expressions[axis],
+                            1,
+                        )
+                        for axis in relation.source_domain.axis_order
+                    )
+                    replacement = CoordinateRelation(
+                        relation.source_domain,
+                        relation.target_domain,
+                        (
+                            _CoordinateRelationPiece(
+                                source_bounds,
+                                tuple(
+                                    (axis, 0, 1, 1)
+                                    for axis in relation.target_domain.axis_order
+                                ),
+                            ),
+                        ),
+                    )
+                    consumers.append(
+                        dataclasses.replace(
+                            consumer,
+                            keys_by_consumer=replacement,
+                        )
+                    )
+                replaced_counters.append(
+                    dataclasses.replace(counter, consumers=tuple(consumers))
+                )
+            self.assertIsNotNone(replacement)
+            return dataclasses.replace(
+                plan,
+                readiness_counters=tuple(replaced_counters),
+            )
+
+        with mock.patch.object(
+            cross_loop_codegen,
+            "build_static_pipeline_plan",
+            side_effect=build_with_partial_constant_nested_key,
+        ):
+            bound = nested_load_store_chain.bind((x,))
+            code = bound.to_triton_code(
+                helion.Config(
+                    block_sizes=[1, 16],
+                    pid_type="persistent_blocked",
+                    cross_loop_schedule="static_pipeline",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+            )
+
+        self.assertIn("tile_dependency_nested_loop_wait", code)
+        self.assertIn("if ", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

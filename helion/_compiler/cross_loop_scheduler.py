@@ -8654,11 +8654,13 @@ def _schedule_is_progress_safe(
     if (
         (
             transient_source_root is not None
-            and _transient_source_schedule_segment(
+            and not _has_valid_transient_source_schedule(
                 worker_schedule,
+                readiness_graph,
                 transient_source_root,
+                readiness_counters,
+                root_barrier_edges,
             )
-            is None
         )
         or any(worker_schedule.segments_for_root(root) for root in continuation_roots)
         or not _has_symbolic_worker_rank(worker_schedule)

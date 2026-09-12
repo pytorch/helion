@@ -1500,16 +1500,18 @@ def emit_cross_loop_schedule(
         if len(nested_axes) != 1:
             raise AssertionError(
                 "nested loop lowering currently requires one loop axis"
-            )
+        )
         (nested_axis,) = nested_axes
         nested_symbol = coordinate_axis_symbol(nested_axis)
-        key_varies_within_piece = any(
+        requires_iteration_membership_guard = (
+            not readiness_consumer.keys_by_consumer.has_total_source()
+        ) or any(
             nested_symbol in sympy.sympify(expression).free_symbols
             for piece in readiness_consumer.keys_by_consumer.pieces
             for _axis, begin, end, _step in piece.target_ranges
             for expression in (begin, end)
         )
-        if key_varies_within_piece:
+        if requires_iteration_membership_guard:
             scheduled = False
 
             def rewrite(loop: ast.For) -> list[ast.stmt] | None:

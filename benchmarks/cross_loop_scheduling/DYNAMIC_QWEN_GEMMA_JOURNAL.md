@@ -1409,3 +1409,49 @@ B2 result, not a selected outlier. Artifacts:
 `/tmp/qwen_standalone_rollout_gpu7.json`,
 `/tmp/gemma_current_fixed_capacity_gpu7_pair500.json`, and
 `/tmp/gemma_b2_tuning_gpu7_summary.json`.
+
+## 2026-09-12: production-source attribution and same-GPU controls
+
+The checked-in Qwen B1/Q1 source was compiled on physical GPU 0 with only its
+decorator changed between `static_shapes=False` and `static_shapes=True`.
+The two variants have identical plans, normalized generated Triton, TTIR,
+TTGIR, and executable SASS instruction streams.  Both use R255, 22 spill
+bytes, 17,408 bytes shared memory, and one warp.  Explicit specialization of
+the fixed tensor capacities and strides therefore completely removes
+`static_shapes` as a scheduler or body-lowering variable while leaving the
+intended attention metadata as runtime tensor loads.
+
+The only device-body source difference from the old fixed-context control is
+the required ragged-attention work: runtime `context_lens`, the split guard,
+the per-element tail predicate, masked page/K/V loads, and the score select.
+Removing only those operations leaves the plan/counters/barriers identical,
+removes the 22 spill bytes, and shortens the binary by 344 SASS instructions
+(including 21 spill stores and 21 spill loads).  Timing of two large cubins in
+one process is unusually sensitive to allocation and code placement by about
+2 us: reversing allocation/capture order can erase or invert the apparent
+masked/unmasked difference.  The earlier statement that masks cost exactly
+3.984 us is therefore too strong.  A favorable isolated comparison is 100.320
+us masked versus 96.288 us unmasked, but the robust conclusion is structural:
+runtime raggedness creates the extra instructions and register pressure;
+`static_shapes=False` and the unified scheduler do not.
+
+On that same GPU, the current production persistent depth-one kernel is
+**100.320 us** versus **108.384 us** for the matched standalone boundary
+(7.44% lower latency).  Depth two's derived 74/22 frontier is also real: with
+an identical `WorkerSchedule`, replacing it by one root-entry fan-in-96 wait
+regresses 104.320 to 106.464 us.  Depth one remains the end-to-end autotuning
+winner because depth two's larger lowering uses 26 rather than 22 spill bytes.
+No Qwen-shaped scheduling exception follows from either result.
+
+The checked-in Gemma B1 source/config was then rerun on an otherwise idle
+physical GPU 2.  The exact public entry measured 51.01 us versus 124.93 us for
+vLLM's production FlashInfer CUTLASS path.  The mechanically matched
+eight-root Helion comparison measured **51.136 us persistent versus 55.200 us
+standalone**.  A clean older scheduler checkpoint measured 49.44 us in a
+separate public-entry run, but both compiler trees selected the exact same
+generated module and configuration: generated-source SHA256
+`0e9560efa9aefa58b77c1f9d9e331e1de024f08e4152143eb20d5fc850d84bdd`,
+multiplier four, W4, R128, zero spills, and 34,816 bytes shared.  The 49--51 us
+spread is consequently a measurement/code-placement mode, not a compiler
+regression.  The checked-in pretuned form and the fixed-capacity probe both
+remain performance passes through the unified compiler path.

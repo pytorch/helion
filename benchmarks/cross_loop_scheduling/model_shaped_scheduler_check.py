@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Inspect the production scheduler on small Qwen- and Gemma-shaped DAGs.
 
 This is intentionally a CPU-only structural probe.  It uses the compiler's
@@ -29,26 +28,23 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import dataclasses
+from itertools import pairwise
 from pathlib import Path
 import sys
 from typing import NamedTuple
 
 import sympy
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from helion._compiler import cross_loop_scheduler as scheduler  # noqa: E402
-from helion._compiler.tile_dependency import (  # noqa: E402
-    CoordinateDomain,
-    CoordinateRelation,
-    _CoordinateRelationPiece,
-    coordinate_axis_symbol,
-    pid_task_order,
-)
-
+from helion._compiler.tile_dependency import CoordinateDomain  # noqa: E402
+from helion._compiler.tile_dependency import CoordinateRelation  # noqa: E402
+from helion._compiler.tile_dependency import _CoordinateRelationPiece  # noqa: E402
+from helion._compiler.tile_dependency import coordinate_axis_symbol  # noqa: E402
+from helion._compiler.tile_dependency import pid_task_order  # noqa: E402
 
 Task = tuple[int, int]
 Slot = tuple[int, int, int]
@@ -428,15 +424,15 @@ def _event_edges(
                 consumer.keys_by_consumer.materialize()
             ):
                 for key in keys:
-                    for producer_task in producers_by_key[key]:
-                        edges.add(
-                            (
-                                producer_task,
-                                (consumer.consumer_root, consumer_task),
-                                event.event_id,
-                                key,
-                            )
+                    edges.update(
+                        (
+                            producer_task,
+                            (consumer.consumer_root, consumer_task),
+                            event.event_id,
+                            key,
                         )
+                        for producer_task in producers_by_key[key]
+                    )
     return tuple(sorted(edges))
 
 
@@ -453,7 +449,9 @@ def _evaluate(
     if placements.keys() != expected_tasks:
         missing = sorted(expected_tasks - placements.keys())
         extra = sorted(placements.keys() - expected_tasks)
-        raise AssertionError(f"coverage mismatch: missing={missing[:8]}, extra={extra[:8]}")
+        raise AssertionError(
+            f"coverage mismatch: missing={missing[:8]}, extra={extra[:8]}"
+        )
 
     # (predecessor, handoff charge, edge description)
     incoming: dict[Task, dict[Task, tuple[int, str]]] = {
@@ -464,18 +462,19 @@ def _evaluate(
         tasks_by_strand[(stage, worker)].append((wave, task))
     for strand_tasks in tasks_by_strand.values():
         strand_tasks.sort()
-        for (_wave_a, predecessor), (_wave_b, consumer) in zip(
-            strand_tasks,
-            strand_tasks[1:],
-        ):
+        for (_wave_a, predecessor), (_wave_b, consumer) in pairwise(strand_tasks):
             incoming[consumer][predecessor] = (0, "strand")
 
     event_edges = _event_edges(case.graph)
     for producer, consumer, event_id, key in event_edges:
         producer_slot = placements[producer]
         consumer_slot = placements[consumer]
-        producer_global_slot = producer_slot[2] * schedule.worker_count + producer_slot[1]
-        consumer_global_slot = consumer_slot[2] * schedule.worker_count + consumer_slot[1]
+        producer_global_slot = (
+            producer_slot[2] * schedule.worker_count + producer_slot[1]
+        )
+        consumer_global_slot = (
+            consumer_slot[2] * schedule.worker_count + consumer_slot[1]
+        )
         if producer_global_slot >= consumer_global_slot:
             raise AssertionError(
                 "readiness rank violation: "
@@ -542,9 +541,7 @@ def _task_label(
     root, ordinal = task
     domain = case.graph.root_domains[root]
     coordinates = domain.coordinates(ordinal)
-    coordinate_text = ",".join(
-        str(coordinates[axis]) for axis in domain.axis_order
-    )
+    coordinate_text = ",".join(str(coordinates[axis]) for axis in domain.axis_order)
     return f"r{root}:{coordinate_text}"
 
 
@@ -558,7 +555,9 @@ def _print_timeline(
     by_slot = {slot: task for task, slot in placements.items()}
     maximum_wave = max((slot[2] for slot in placements.values()), default=-1)
     print(f"\n{title}")
-    print("wave | " + " | ".join(f"w{worker}" for worker in range(schedule.worker_count)))
+    print(
+        "wave | " + " | ".join(f"w{worker}" for worker in range(schedule.worker_count))
+    )
     print("-" * (8 + 13 * schedule.worker_count))
     for wave in range(maximum_wave + 1):
         cells = []
@@ -620,7 +619,9 @@ def run_case(case: ShapeCase, *, workers: int, show_edges: bool) -> None:
         )
 
     print(f"\n{'=' * 80}\n{case.name}")
-    print("roots: " + ", ".join(f"r{i}={name}" for i, name in enumerate(case.root_names)))
+    print(
+        "roots: " + ", ".join(f"r{i}={name}" for i, name in enumerate(case.root_names))
+    )
     print(
         "baseline: "
         f"completion={baseline_metrics.completion}, "
