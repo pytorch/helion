@@ -256,8 +256,14 @@ def flash_bwd_shared_storage(
         sK: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
         sV: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
         sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
-        # Per-warp staging chunks for the bulk dQ reduce: 4 warps x 8KB
-        # (32 rows x 64 cols at head_dim 64, 16 rows x 128 cols at 128).
+        # Per-warp staging chunks for the bulk dQ reduce: 4 warps x 8KB. The
+        # reduce stages 8 rows per pass at a (head_dim + 4) padded stride: the
+        # +4 f32 pushes the row stride off the 32-bank alignment so the 8 active
+        # lanes (writing different rows at the same column offset) land in
+        # distinct banks (unpadded head_dim strides are bank-aligned -> heavy
+        # conflict). 8 rows x (head_dim+4) x 4 warps fits the 8192 budget for
+        # both head_dim 64 and 128; the 4-f32 tail per row is unused and the
+        # per-row bulk copies only the head_dim payload to row-major dQ.
         sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 8192], 1024]
 
     return SharedStorage
