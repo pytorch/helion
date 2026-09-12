@@ -267,7 +267,7 @@ def flash_bwd_shared_storage(
 def cpasync_reduce_bulk_add_f32(
     smem_ptr: cute.Pointer,
     gmem_ptr: cute.Pointer,
-    store_bytes: int,
+    store_bytes: object,
     *,
     loc: object = None,
     ip: object = None,
@@ -288,32 +288,6 @@ def cpasync_reduce_bulk_add_f32(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
-
-
-def fbwd_p_pairs_stub(
-    frg: cute.Tensor,
-    lse_frg: cute.Tensor,
-    off: int,
-    cnt: int,
-    scale2: Float32,
-    mask_lim: object = None,
-    col_base: int = 0,
-) -> None:
-    frg_any = cast("Any", frg)
-    for v in range(cnt):
-        frg_any[off + v] = Float32(0.001)
-
-
-def fbwd_ds_pairs_stub(
-    dp_frg: cute.Tensor,
-    p_frg: cute.Tensor,
-    p_off: int,
-    dlt_frg: cute.Tensor,
-    cnt: int,
-) -> None:
-    dp_any = cast("Any", dp_frg)
-    for v in range(cnt):
-        dp_any[v] = Float32(0.001)
 
 
 def fbwd_p_pairs_packed(
@@ -371,6 +345,144 @@ def fbwd_ds_pairs_packed(
         )
         dp_any[2 * v] = a
         dp_any[2 * v + 1] = b
+
+
+@functools.cache
+def flash_bwd_2cta_shared_storage(
+    head_dim: int,
+    dtype: object = cutlass.Float16,
+) -> type:
+    """SharedStorage for the 2-CTA (cluster (2,1,1)) fused backward kernel.
+
+    Per-CTA operand halves per the FA4 SM100 2-CTA backward: sQ/sdOt are the
+    natural-orientation (tile_m/2, D) halves feeding the S and dP gemms;
+    sdO/sQt are transposed (D/2, tile_m) halves feeding dV and dK; sKt is the
+    (D/2, 2*tile_n) B operand of the cluster-wide dQ gemm; sdS is the
+    exchanged dQ A operand (q-half x 2*tile_n) and sdS_xchg stages the
+    outgoing half for the DSMEM copy. All six TMA loads ride
+    PipelineTmaUmma pairs; the raw mbarriers are the leader-side handshakes.
+    """
+    half = 64 * head_dim  # (tile/2, D) or (D/2, tile) halves, in elements
+
+    @cute.struct
+    class SharedStorage:
+        q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        kt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        s_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dp_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_tmem_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_smem_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_cluster_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_holding_buf: cutlass.Int32
+        sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sQ: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sdOt: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sdO: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sQt: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sV: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sKt: cute.struct.Align[cute.struct.MemRange[dtype, half * 2], 1024]
+        sdS: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 256], 1024]
+        sdSx: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 128], 1024]
+        sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 4096], 1024]
+
+    return SharedStorage
+
+
+@dsl_user_op
+def set_block_rank(
+    smem_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """Map an smem pointer to the same offset in another CTA of the cluster."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32, cutlass.Int32(peer_cta_rank_in_cluster).ir_value()],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cpasync_bulk_s2cluster(
+    smem_src_ptr: cute.Pointer,
+    smem_dst_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    size: object,
+    peer_cta_rank_in_cluster: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Bulk smem->peer-CTA-smem copy completing on the peer's mbarrier.
+
+    Ported from flash-attention main's copy_utils.cpasync_bulk_s2cluster.
+    """
+    smem_src_ptr_i32 = smem_src_ptr.toint(loc=loc, ip=ip).ir_value()
+    smem_dst_ptr_i32 = set_block_rank(
+        smem_dst_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    mbar_ptr_i32 = set_block_rank(
+        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    llvm.inline_asm(
+        None,
+        [
+            smem_dst_ptr_i32,
+            smem_src_ptr_i32,
+            mbar_ptr_i32,
+            cutlass.Int32(size).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [$0], [$1], $3, [$2];",
+        "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def fbwd_ds_pairs_packed_off(
+    dp_frg: cute.Tensor,
+    dp_off: int,
+    p_frg: cute.Tensor,
+    p_off: int,
+    dlt_frg: cute.Tensor,
+    cnt: int,
+) -> None:
+    """In-place dS = P * (dP - delta[col]) over one chunk with a dP offset."""
+    dp_any = cast("Any", dp_frg)
+    p_any = cast("Any", p_frg)
+    dlt_any = cast("Any", dlt_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.sub_packed_f32x2(
+            (dp_any[dp_off + 2 * v], dp_any[dp_off + 2 * v + 1]),
+            (dlt_any[2 * v], dlt_any[2 * v + 1]),
+        )
+        a, b = cute.arch.mul_packed_f32x2(
+            (p_any[p_off + 2 * v], p_any[p_off + 2 * v + 1]), (a, b)
+        )
+        dp_any[dp_off + 2 * v] = a
+        dp_any[dp_off + 2 * v + 1] = b
 
 
 @dsl_user_op
