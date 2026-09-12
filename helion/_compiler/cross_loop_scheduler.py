@@ -2837,43 +2837,9 @@ class WorkerSchedule:
                         )
                 prior_runs.append((begin, end, last_step))
 
-    def root_at(self, worker: int, worker_step: int) -> int | None:
-        """Return the task family occupying one resident worker step."""
-        roots = tuple(
-            segment.root
-            for segment in self.segments
-            if segment.occupies(worker, worker_step)
-        )
-        if len(roots) > 1:
-            raise AssertionError(
-                f"worker {worker} step {worker_step} has multiple tasks"
-            )
-        return roots[0] if roots else None
-
     def segments_for_root(self, root: int) -> tuple[WorkerScheduleSegment, ...]:
         """Return the compressed static relation for one task family."""
         return tuple(segment for segment in self.segments if segment.root == root)
-
-    def workers_for_root(self, root: int) -> frozenset[int]:
-        """Materialize one root's resident worker support for diagnostics."""
-        return frozenset(
-            worker
-            for begin, end in self.worker_intervals_for_root(root)
-            for worker in range(begin, end)
-        )
-
-    def worker_intervals_for_root(self, root: int) -> tuple[WorkerInterval, ...]:
-        """Return one root's concrete compact resident-worker support.
-
-        Parameterized schedules expose their exact support through
-        :class:`RootBarrierPublicationPlan.participant_order` instead of
-        pretending that a runtime-rotated cohort is one static interval.
-        """
-        return root_barrier_publication_plan(self, root).participant_intervals
-
-    def active_worker_count_for_root(self, root: int) -> int | sympy.Expr:
-        """Return one root's exact real resident-owner count."""
-        return root_barrier_publication_plan(self, root).resident_arrival_count
 
     @cached_property
     def placement_domain(self) -> CoordinateDomain:
@@ -4099,10 +4065,6 @@ class ReadinessCounterPlan:
     def uniform_arrival_count(self) -> int | None:
         """Return constant fan-in without enumerating readiness keys."""
         return _uniform_arrival_count(self.producers)
-
-    def arrival_count_bounds(self) -> tuple[int, int] | None:
-        """Return proved fan-in bounds without enumerating readiness keys."""
-        return _arrival_count_bounds(self.producers)
 
 
 @dataclasses.dataclass(frozen=True)

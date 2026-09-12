@@ -82,8 +82,6 @@ def _forbid_schedule_enumeration() -> Iterator[None]:
     with (
         mock.patch.object(CoordinateRelation, "materialize", side_effect=error),
         mock.patch.object(CoordinateRelation, "targets", side_effect=error),
-        mock.patch.object(WorkerSchedule, "workers_for_root", side_effect=error),
-        mock.patch.object(WorkerSchedule, "root_at", side_effect=error),
     ):
         yield
 
@@ -1988,8 +1986,6 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertIsNone(source_segments[0].worker_step_bounds(0))
         self.assertIsNone(scheduled.worker_step_bounds_for_root(0))
-        self.assertEqual(scheduled.workers_for_root(0), frozenset())
-        self.assertEqual(scheduled.active_worker_count_for_root(0), 0)
         with _forbid_schedule_enumeration():
             source_publication = cross_loop_scheduler.root_barrier_publication_plan(
                 scheduled,
@@ -6552,7 +6548,13 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         self.assertEqual(schedule.segments[0].task_count, 4)
-        self.assertEqual(schedule.workers_for_root(0), frozenset(range(4)))
+        self.assertEqual(
+            cross_loop_scheduler.root_barrier_publication_plan(
+                schedule,
+                0,
+            ).participant_intervals,
+            ((0, 4),),
+        )
         self.assertIsNone(schedule.segments[0].logical_task_order)
         self.assertIsNone(schedule.dense_assignment(0))
 
@@ -7585,8 +7587,8 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
 
-        self.assertEqual(schedule.root_at(0, 0), 0)
-        self.assertEqual(schedule.root_at(1, 1), 1)
+        self.assertEqual(task_at(schedule, 0, 0), (0, 0))
+        self.assertEqual(task_at(schedule, 1, 1), (1, 0))
 
     def test_root_publication_plan_partitions_final_worker_occurrences(self) -> None:
         first_domain, second_domain = _identify_root_domains(
@@ -8241,7 +8243,10 @@ class TestCrossLoopScheduler(TestCase):
             self.assertTrue(arrival_count.is_total_function())
             self.assertIs(arrival_count.canonical_single_valued(), arrival_count)
             self.assertIsNone(counter.uniform_arrival_count())
-            self.assertEqual(counter.arrival_count_bounds(), (1, 2))
+            self.assertEqual(
+                cross_loop_scheduler._arrival_count_bounds(counter.producers),
+                (1, 2),
+            )
             self.assertFalse(
                 cross_loop_scheduler._supports_emitted_counter_plan_lowering(
                     counter,
@@ -8317,7 +8322,10 @@ class TestCrossLoopScheduler(TestCase):
 
         with _forbid_schedule_enumeration():
             self.assertTrue(counter.parameter_symbols)
-            self.assertEqual(counter.arrival_count_bounds(), (1, 1))
+            self.assertEqual(
+                cross_loop_scheduler._arrival_count_bounds(counter.producers),
+                (1, 1),
+            )
             self.assertTrue(
                 cross_loop_scheduler._supports_exact_counter_plan_lowering(
                     counter,
@@ -9333,7 +9341,10 @@ class TestCrossLoopScheduler(TestCase):
             sorted(len(producers) for producers in concrete_producers.materialize()),
             [1, 1, 1, 1, 3, 3, 3, 3, 4, 4, 4, 4],
         )
-        self.assertEqual(plan.arrival_count_bounds(), (1, 4))
+        self.assertEqual(
+            cross_loop_scheduler._arrival_count_bounds(plan.producers),
+            (1, 4),
+        )
 
     def test_nested_counter_declines_unproved_or_empty_inner_segments(self) -> None:
         maybe_empty = sympy.Symbol(
@@ -9771,7 +9782,12 @@ class TestCrossLoopScheduler(TestCase):
             (6, 2),
         )
         self.assertEqual(len(selected.readiness_counters[0].producers), 2)
-        self.assertEqual(selected.readiness_counters[0].arrival_count_bounds(), (2, 6))
+        self.assertEqual(
+            cross_loop_scheduler._arrival_count_bounds(
+                selected.readiness_counters[0].producers
+            ),
+            (2, 6),
+        )
         self.assertEqual(
             selected.readiness_counters[0].consumers[0].covered_obligations,
             consumer.covered_obligations,
@@ -9856,7 +9872,10 @@ class TestCrossLoopScheduler(TestCase):
         assert entry is not None
         self.assertEqual(exact[0].readiness_key_count, 32)
         self.assertEqual(entry.readiness_key_count, 8)
-        self.assertEqual(entry.arrival_count_bounds(), (4, 4))
+        self.assertEqual(
+            cross_loop_scheduler._arrival_count_bounds(entry.producers),
+            (4, 4),
+        )
 
         prior_wave = _schedule(
             32,
@@ -10071,7 +10090,10 @@ class TestCrossLoopScheduler(TestCase):
             ),
             (2, 3),
         )
-        self.assertEqual(compact[0].arrival_count_bounds(), (2, 3))
+        self.assertEqual(
+            cross_loop_scheduler._arrival_count_bounds(compact[0].producers),
+            (2, 3),
+        )
         self.assertEqual(len(compact[0].producers), 1)
         self.assertEqual(
             compact[0].consumers[0].covered_obligations,
@@ -11879,7 +11901,13 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
 
-        self.assertEqual(schedule.workers_for_root(0), frozenset((3, 4)))
+        self.assertEqual(
+            cross_loop_scheduler.root_barrier_publication_plan(
+                schedule,
+                0,
+            ).participant_intervals,
+            ((3, 5),),
+        )
         self.assertEqual(schedule.dense_assignment(0), (1, 4, 2, 2))
         self.assertIsNone(schedule.contiguous_global_interval(0))
 
@@ -12949,7 +12977,10 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(len(plans), 1)
         (plan,) = plans
         self.assertEqual(plan.readiness_key_count, 3)
-        self.assertEqual(plan.arrival_count_bounds(), (2, 3))
+        self.assertEqual(
+            cross_loop_scheduler._arrival_count_bounds(plan.producers),
+            (2, 3),
+        )
         self.assertIsNone(plan.uniform_arrival_count())
         self.assertEqual(
             _expected_arrivals(plan.readiness_key_domain, plan.producers), (3, 3, 2)
