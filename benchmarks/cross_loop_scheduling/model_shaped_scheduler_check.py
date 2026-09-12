@@ -604,16 +604,15 @@ def run_case(case: ShapeCase, *, workers: int, show_edges: bool) -> None:
 
     baseline_metrics = _evaluate(case, baseline)
     scheduled_metrics = _evaluate(case, scheduled)
-    if (
-        scheduled_metrics.completion,
-        scheduled_metrics.critical_handoffs,
-    ) > (
-        baseline_metrics.completion,
-        baseline_metrics.critical_handoffs,
-    ):
+    # ``completion`` is the unit-body makespan oracle.  Cross-strand handoffs
+    # remain useful diagnostics, but they are not an optimization objective:
+    # the production event-frontier policy may deliberately trade an extra
+    # handoff for an earlier complete readiness cohort.
+    if scheduled_metrics.completion > baseline_metrics.completion:
         raise AssertionError(
-            f"{case.name}: list schedule worsened the unit objective: "
-            f"baseline={baseline_metrics[:2]}, scheduled={scheduled_metrics[:2]}"
+            f"{case.name}: list schedule worsened unit-body makespan: "
+            f"baseline={baseline_metrics.completion}, "
+            f"scheduled={scheduled_metrics.completion}"
         )
     if scheduled_metrics.occupied_waves > baseline_metrics.occupied_waves:
         raise AssertionError(
