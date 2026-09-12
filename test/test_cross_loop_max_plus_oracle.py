@@ -12,12 +12,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 from typing import TypeAlias
-from unittest import mock
 
-import sympy
-
-from helion._compiler import cross_loop_scheduler
-from helion._compiler import tile_dependency
 from helion._compiler.cross_loop_scheduler import FinalArrivalContinuation
 from helion._compiler.cross_loop_scheduler import ReadinessConsumer
 from helion._compiler.cross_loop_scheduler import ReadinessEvent
@@ -291,23 +286,6 @@ def _materialized_readiness(graph: ReadinessGraph) -> frozenset[_Edge]:
     return frozenset(edges)
 
 
-def _materialized_slot_relation(
-    relation: CoordinateRelation,
-) -> frozenset[tuple[_Slot, _Slot]]:
-    """Materialize a small slot-to-slot relation for oracle assertions."""
-    source_axes = relation.source_domain.axis_order
-    target_axes = relation.target_domain.axis_order
-    result: set[tuple[_Slot, _Slot]] = set()
-    for source_index, target_indices in enumerate(relation.materialize()):
-        source_coordinates = relation.source_domain.coordinates(source_index)
-        source = tuple(source_coordinates[axis] for axis in source_axes)
-        for target_index in target_indices:
-            target_coordinates = relation.target_domain.coordinates(target_index)
-            target = tuple(target_coordinates[axis] for axis in target_axes)
-            result.add((source, target))
-    return frozenset(result)
-
-
 def _weighted_edges(
     readiness_edges: frozenset[_Edge],
     strand_edges: frozenset[_Edge],
@@ -568,24 +546,6 @@ class TestConcreteMaxPlusOracle(TestCase):
                     node: (1, worker, wave)
                     for node, (worker, wave) in placements.items()
                 }
-                for consumer_root in range(3):
-                    symbolic_readiness = (
-                        cross_loop_scheduler._resident_readiness_predecessors_by_slot(
-                            schedule,
-                            graph,
-                            consumer_root,
-                        )
-                    )
-                    self.assertIsNotNone(symbolic_readiness)
-                    assert symbolic_readiness is not None
-                    self.assertEqual(
-                        _materialized_slot_relation(symbolic_readiness),
-                        frozenset(
-                            (owners[consumer], owners[producer])
-                            for producer, consumer in readiness
-                            if consumer[0] == consumer_root
-                        ),
-                    )
                 expected_strand_edges: set[_Edge] = set()
                 for worker in range(2):
                     ordered = [
@@ -627,13 +587,6 @@ class TestConcreteMaxPlusOracle(TestCase):
         self.assertEqual(_score_resident(graph, schedule), (2, 1))
 
         missing = _schedule(graph, {(0, 0): (0, 0)}, worker_count=2)
-        self.assertIsNone(
-            cross_loop_scheduler._resident_readiness_predecessors_by_slot(
-                missing,
-                graph,
-                1,
-            )
-        )
         with self.assertRaisesRegex(_OracleInputError, "missing"):
             _score_resident(graph, missing)
 
@@ -646,130 +599,6 @@ class TestConcreteMaxPlusOracle(TestCase):
         )
         with self.assertRaisesRegex(_OracleInputError, "cycle"):
             _score_resident(cyclic, schedule)
-
-    def test_symbolic_resident_readiness_slot_composition(self) -> None:
-        task_count = sympy.Symbol(
-            "readiness_task_count",
-            integer=True,
-            nonnegative=True,
-        )
-        root_domains = tuple(
-            CoordinateDomain(
-                (100 + root,),
-                ((100 + root, count),),
-                ((100 + root, 1),),
-                kind="site",
-                identity=root,
-                _allow_empty=True,
-            )
-            for root, count in enumerate((3, task_count, 2))
-        )
-        key_domain = CoordinateDomain(
-            (0,),
-            ((0, 1),),
-            kind="event",
-            identity=0,
-        )
-        producer_axis = root_domains[1].axis_order[0]
-        consumer_axis = root_domains[2].axis_order[0]
-        graph = ReadinessGraph(
-            tuple(
-                pid_task_order(domain, domain.axis_order) for domain in root_domains
-            ),
-            (
-                ReadinessEvent(
-                    (
-                        ReadinessProducer(
-                            1,
-                            CoordinateRelation(
-                                key_domain,
-                                root_domains[1],
-                                (
-                                    _CoordinateRelationPiece(
-                                        ((0, 0, 1, 1),),
-                                        ((producer_axis, 0, task_count, 1),),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                    (
-                        ReadinessConsumer(
-                            2,
-                            CoordinateRelation.point_map(
-                                root_domains[2],
-                                key_domain,
-                                (
-                                    (
-                                        ((consumer_axis, 0, 2, 1),),
-                                        (sympy.Integer(0),),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-        )
-        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
-            root_domains,
-            graph.root_task_orders,
-            4,
-        )
-        with mock.patch.object(
-            CoordinateRelation,
-            "materialize",
-            side_effect=AssertionError("production slot composition must be symbolic"),
-        ):
-            relation = (
-                cross_loop_scheduler._resident_readiness_predecessors_by_slot(
-                    schedule,
-                    graph,
-                    2,
-                )
-            )
-
-        self.assertIsNotNone(relation)
-        assert relation is not None
-        self.assertLessEqual(
-            len(relation.pieces),
-            tile_dependency._MAX_RELATION_PIECES,
-        )
-        for concrete_count in (0, 1, 3, 4, 5, 7, 9):
-            concrete = relation.substitute_parameters({task_count: concrete_count})
-            expected = frozenset(
-                (
-                    (
-                        1,
-                        (3 + concrete_count + consumer) % 4,
-                        (3 + concrete_count + consumer) // 4,
-                    ),
-                    (1, (3 + producer) % 4, (3 + producer) // 4),
-                )
-                for consumer in range(2)
-                for producer in range(concrete_count)
-            )
-            self.assertEqual(_materialized_slot_relation(concrete), expected)
-
-        (event,) = graph.events
-        nested = ReadinessGraph(
-            graph.root_task_orders,
-            (
-                dataclasses.replace(
-                    event,
-                    producers=(
-                        dataclasses.replace(event.producers[0], producer_site_id=7),
-                    ),
-                ),
-            ),
-        )
-        self.assertIsNone(
-            cross_loop_scheduler._resident_readiness_predecessors_by_slot(
-                schedule,
-                nested,
-                2,
-            )
-        )
 
     def test_final_publishers_are_mutually_exclusive_alternatives(self) -> None:
         graph = _readiness_graph(

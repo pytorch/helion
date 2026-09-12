@@ -292,11 +292,11 @@ sections are not active work.
   Qwen, Gemma, Muse, Nemotron, and DeepSeek controls before changing policy.
 - [x] Discard the interrupted uncommitted symbolic chooser/apply rewrite. Do
   not stage, rewrite, or remove user-owned benchmark/probe changes.
-- [ ] Remove affine-repetition, translated-state, dynamic-`B` one-cubin, and
+- [x] Remove affine-repetition, translated-state, dynamic-`B` one-cubin, and
   parameterized-renderer work from the active implementation path. Retain
   generic relation primitives only when an independent dependency, ownership,
   counter, or static validation proof consumes them.
-- [ ] Keep the concrete max-plus/list-schedule oracle test-only. Delete no
+- [x] Keep the concrete max-plus/list-schedule oracle test-only. Delete no
   historical measurement or postmortem; relabel it rather than treating it as
   an acceptance gate.
 - [x] Audit the scheduler and codegen tests before adapting implementation.
@@ -519,6 +519,17 @@ nonzero common offset now derives exactly the zero-origin relation without
 specializing that offset; unequal offsets remain conservative. This restores
 Qwen's fan-in-32 nested counter under `static_shapes=False` and makes its
 lowered Triton match the static control after nonsemantic normalization.
+
+Cleanup checkpoint (2026-09-11): after the fixed-task-universe gate, the old
+parameterized cohort scheduler, symbolic/max-plus production scaffolding, and
+test-only root-major schedule builder have no production caller and are
+removed. The concrete max-plus implementation remains only as an independent
+test oracle. Codegen likewise removes the unreachable uint64 epoch-framed
+readiness/root-barrier state and now has one aligned uint32 replay protocol for
+fixed-capacity counters and barriers. The uint64 transient dispatch ticket is
+unrelated and remains. Concrete packed/root-major and relation-segment
+rendering are retained even where legacy helper names still say
+"parametric," because list-scheduled split segments actively consume them.
 
 ### Phase S3: post-placement synchronization validation and cleanup
 

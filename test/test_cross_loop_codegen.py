@@ -902,6 +902,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
         self.assertNotIn("tile_dependency_task_wait", code)
         self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertIn("ld.acquire.gpu.global.u32", code)
+        self.assertNotIn("ld.acquire.gpu.global.u64", code)
+        self.assertNotIn("tl.atomic_max", code)
+        self.assertNotIn("tile_dependency_parameterized_state", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1317,23 +1321,29 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 publishable_site_ids=kwargs.get("publishable_site_ids"),
                 prove_nonnegative=kwargs.get("prove_nonnegative"),
             )
-            canonical = cross_loop_scheduler._build_root_major_worker_schedule(
-                readiness_graph.root_domains,
-                readiness_graph.root_task_orders,
-                plan.worker_schedule.worker_count,
-            )
             root_order = (
                 1,
                 0,
                 *range(2, len(readiness_graph.root_domains)),
             )
-            permuted = cross_loop_scheduler._repack_root_major_schedule(
-                readiness_graph,
-                canonical,
-                root_order,
-                {},
+            first_slot = 0
+            segments = []
+            for root in root_order:
+                task_order = readiness_graph.root_task_orders[root]
+                segments.append(
+                    WorkerScheduleSegment(
+                        root=root,
+                        task_order=task_order,
+                        worker_begin=0,
+                        worker_count=plan.worker_schedule.worker_count,
+                        dispatch_offset=first_slot,
+                    )
+                )
+                first_slot += task_order.source_domain.size
+            permuted = WorkerSchedule(
+                worker_count=plan.worker_schedule.worker_count,
+                segments=tuple(segments),
             )
-            assert permuted is not None
             geometry = cross_loop_scheduler._parametric_root_major_schedule_geometry(
                 permuted
             )
@@ -1574,26 +1584,41 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             suffix_count = max(1, worker_count // 2)
             self.assertGreater(producer_count, worker_count + suffix_count)
             prefix_count = producer_count - suffix_count
-            canonical = cross_loop_scheduler._build_root_major_worker_schedule(
-                readiness_graph.root_domains,
-                readiness_graph.root_task_orders,
-                worker_count,
+            producer_order = readiness_graph.root_task_orders[0]
+            consumer_order = readiness_graph.root_task_orders[1]
+            prefix_order = _task_order_slice(producer_order, 0, prefix_count)
+            suffix_order = _task_order_slice(
+                producer_order,
+                prefix_count,
+                suffix_count,
             )
-            split = cross_loop_scheduler._repack_packed_schedule(
-                readiness_graph,
-                canonical,
-                (
-                    (0, 0, prefix_count),
-                    (0, prefix_count, suffix_count),
-                    (
-                        1,
-                        0,
-                        readiness_graph.root_domains[1].size_expr,
+            assert prefix_order is not None and suffix_order is not None
+            split = WorkerSchedule(
+                worker_count=worker_count,
+                segments=(
+                    WorkerScheduleSegment(
+                        root=0,
+                        task_order=prefix_order,
+                        worker_begin=0,
+                        worker_count=worker_count,
+                        dispatch_offset=0,
+                    ),
+                    WorkerScheduleSegment(
+                        root=0,
+                        task_order=suffix_order,
+                        worker_begin=0,
+                        worker_count=worker_count,
+                        dispatch_offset=prefix_count,
+                    ),
+                    WorkerScheduleSegment(
+                        root=1,
+                        task_order=consumer_order,
+                        worker_begin=0,
+                        worker_count=worker_count,
+                        dispatch_offset=producer_count,
                     ),
                 ),
-                {},
             )
-            assert split is not None
             self.assertIsNone(
                 cross_loop_scheduler._parametric_root_major_schedule_geometry(split)
             )
@@ -1640,6 +1665,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x[32:] + 1) * 2)
         self.assertIn("tile_dependency_schedule_slot", code)
         self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertIn("ld.acquire.gpu.global.u32", code)
+        self.assertNotIn("ld.acquire.gpu.global.u64", code)
+        self.assertNotIn("tl.atomic_max", code)
+        self.assertNotIn("tile_dependency_parameterized_state", code)
         self.assertEqual(
             code.count("tl.atomic_add(tile_dependency_state"),
             2,

@@ -120,12 +120,7 @@ class TestRaggedL2Schedule(TestCase):
         batch = sympy.Symbol("batch", integer=True, nonnegative=True)
         first = sympy.Symbol("first", integer=True, nonnegative=True)
         second = sympy.Symbol("second", integer=True, nonnegative=True)
-        dividend = (
-            3 * batch
-            + 2 * second
-            + 6 * FloorDiv(first, 2)
-            + sympy.Mod(first, 2)
-        )
+        dividend = 3 * batch + 2 * second + 6 * FloorDiv(first, 2) + sympy.Mod(first, 2)
         expression = 7 * FloorDiv(dividend, 7) + sympy.Mod(dividend, 7)
 
         self.assertEqual(
@@ -187,9 +182,7 @@ class TestRaggedL2Schedule(TestCase):
                 self.assertEqual(_singleton_targets(concrete), expected)
                 self.assertEqual(
                     _singleton_targets(
-                        flat_order.substitute_parameters(
-                            {batch: concrete_batch}
-                        )
+                        flat_order.substitute_parameters({batch: concrete_batch})
                     ),
                     expected,
                 )
@@ -259,15 +252,11 @@ class TestRaggedL2Schedule(TestCase):
                     2,
                 )
                 self.assertEqual(
-                    _singleton_targets(
-                        task_order.substitute_parameters(substitutions)
-                    ),
+                    _singleton_targets(task_order.substitute_parameters(substitutions)),
                     expected,
                 )
                 self.assertEqual(
-                    _singleton_targets(
-                        flat_order.substitute_parameters(substitutions)
-                    ),
+                    _singleton_targets(flat_order.substitute_parameters(substitutions)),
                     expected,
                 )
 
@@ -390,9 +379,7 @@ class TestRaggedL2Schedule(TestCase):
                     wraps=original_derivation,
                 ) as derivation:
                     self.assertIsNone(rebuilt.converse())
-                    self.assertIsNone(
-                        rebuilt.derive_converse_and_target_counts()[0]
-                    )
+                    self.assertIsNone(rebuilt.derive_converse_and_target_counts()[0])
                     self.assertEqual(derivation.call_count, 1)
 
     def test_ragged_l2_relation_proof_recovers_after_copy_and_pickle(self) -> None:
@@ -424,9 +411,7 @@ class TestRaggedL2Schedule(TestCase):
                     converse = _assert_exact_bijection(self, rebuilt, 15 * batch)
                 self.assertLessEqual(len(converse.pieces), 2)
                 for concrete_batch in (0, 1, 2, 8):
-                    concrete = rebuilt.substitute_parameters(
-                        {batch: concrete_batch}
-                    )
+                    concrete = rebuilt.substitute_parameters({batch: concrete_batch})
                     concrete_domain = domain.substitute_parameters(
                         {batch: concrete_batch}
                     )
@@ -438,273 +423,6 @@ class TestRaggedL2Schedule(TestCase):
                             2,
                         ),
                     )
-
-    def test_ragged_l2_survives_unaligned_packed_prefix(self) -> None:
-        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
-        worker_count = 7
-        prefix = _domain((1,), (3 * batch,), identity=0)
-        l2_domain = _domain(
-            (_FIRST_AXIS, _SECOND_AXIS, _BATCH_AXIS),
-            (5, 3, batch),
-            identity=1,
-        )
-        task_orders = (
-            pid_task_order(prefix, prefix.axis_order),
-            pid_task_order(
-                l2_domain,
-                l2_domain.axis_order,
-                l2_group_size=2,
-            ),
-        )
-        with (
-            mock.patch.object(
-                cross_loop_scheduler,
-                "_parametric_root_major_schedule_geometry_from_parts",
-                side_effect=AssertionError(
-                    "root-major geometry must be retained after validation"
-                ),
-            ),
-            mock.patch.object(
-                tile_dependency,
-                "_ordinalized_source_supports_are_disjoint",
-                side_effect=AssertionError(
-                    "dense source intervals must prove packed disjointness"
-                ),
-            ),
-        ):
-            schedule = cross_loop_scheduler._build_root_major_worker_schedule(
-                (prefix, l2_domain),
-                task_orders,
-                worker_count,
-            )
-
-        self.assertEqual(len(schedule.segments), 2)
-        self.assertIn(
-            cross_loop_scheduler._DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE,
-            schedule.__dict__,
-        )
-        self.assertLessEqual(len(schedule.segments[0].task_order.pieces), 3)
-        self.assertLessEqual(len(schedule.segments[1].task_order.pieces), 3)
-        for name, rebuilt in (
-            ("original", schedule),
-            ("deepcopy", copy.deepcopy(schedule)),
-            ("pickle", pickle.loads(pickle.dumps(schedule))),
-        ):
-            with self.subTest(roundtrip=name):
-                cross_loop_scheduler._root_task_placement_relation.cache_clear()
-                cross_loop_scheduler._root_schedule_traversal.cache_clear()
-                cross_loop_scheduler.root_barrier_publication_plan.cache_clear()
-                with mock.patch.object(
-                    CoordinateRelation,
-                    "materialize",
-                    side_effect=AssertionError(
-                        "schedule proof recovery must not enumerate runtime CTAs"
-                    ),
-                ):
-                    self.assertTrue(
-                        cross_loop_scheduler._validate_worker_schedule_tasks(
-                            rebuilt,
-                            task_orders,
-                        )
-                    )
-                    for root in range(2):
-                        placement = (
-                            cross_loop_scheduler._root_task_placement_relation(
-                                rebuilt,
-                                root,
-                            )
-                        )
-                        self.assertIsNotNone(placement)
-                        assert placement is not None
-                        self.assertTrue(placement.is_total_function())
-                        publication = (
-                            cross_loop_scheduler.root_barrier_publication_plan(
-                                rebuilt,
-                                root,
-                            )
-                        )
-                        self.assertIsNotNone(publication.participant_order)
-                        assert publication.participant_order is not None
-                        self.assertTrue(
-                            publication.participant_order
-                            .is_bijection_from_source_support()
-                        )
-
-                for concrete_batch in (0, 1, 2, 8):
-                    concrete_relations = tuple(
-                        segment.task_order.substitute_parameters(
-                            {batch: concrete_batch}
-                        )
-                        for segment in rebuilt.segments
-                    )
-                    prefix_targets = _singleton_targets(concrete_relations[0])
-                    l2_targets = _singleton_targets(concrete_relations[1])
-                    concrete_l2_domain = l2_domain.substitute_parameters(
-                        {batch: concrete_batch}
-                    )
-                    self.assertEqual(
-                        prefix_targets,
-                        tuple(range(3 * concrete_batch)),
-                    )
-                    self.assertEqual(
-                        l2_targets,
-                        _expected_l2_targets(
-                            concrete_l2_domain,
-                            concrete_l2_domain.axis_order,
-                            2,
-                        ),
-                    )
-                    for relation, target_count in zip(
-                        concrete_relations,
-                        (3 * concrete_batch, 15 * concrete_batch),
-                        strict=True,
-                    ):
-                        targets = _singleton_targets(relation)
-                        self.assertEqual(len(targets), target_count)
-                        self.assertEqual(len(set(targets)), target_count)
-                        self.assertEqual(sorted(targets), list(range(target_count)))
-                        _assert_exact_bijection(self, relation, target_count)
-
-                    occupied_supports = tuple(
-                        {
-                            source_index
-                            for source_index, targets in enumerate(
-                                relation.materialize()
-                            )
-                            if targets
-                        }
-                        for relation in concrete_relations
-                    )
-                    self.assertTrue(
-                        occupied_supports[0].isdisjoint(occupied_supports[1])
-                    )
-
-    def test_two_dynamic_axis_l2_survives_unaligned_packed_prefix(self) -> None:
-        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
-        query = sympy.Symbol("query", integer=True, nonnegative=True)
-        worker_count = 7
-        prefix = _domain((1,), (3,), identity=0)
-        l2_domain = _domain(
-            (_FIRST_AXIS, _SECOND_AXIS, _BATCH_AXIS, _QUERY_AXIS),
-            (5, 3, batch, query),
-            identity=1,
-        )
-        task_orders = (
-            pid_task_order(prefix, prefix.axis_order),
-            pid_task_order(
-                l2_domain,
-                l2_domain.axis_order,
-                l2_group_size=2,
-            ),
-        )
-        schedule = cross_loop_scheduler._build_root_major_worker_schedule(
-            (prefix, l2_domain),
-            task_orders,
-            worker_count,
-        )
-
-        self.assertEqual(len(schedule.segments), 2)
-        self.assertLessEqual(len(schedule.segments[0].task_order.pieces), 3)
-        self.assertLessEqual(len(schedule.segments[1].task_order.pieces), 3)
-        for name, rebuilt in (
-            ("original", schedule),
-            ("deepcopy", copy.deepcopy(schedule)),
-            ("pickle", pickle.loads(pickle.dumps(schedule))),
-        ):
-            with self.subTest(roundtrip=name):
-                cross_loop_scheduler._root_task_placement_relation.cache_clear()
-                cross_loop_scheduler._root_schedule_traversal.cache_clear()
-                cross_loop_scheduler.root_barrier_publication_plan.cache_clear()
-                with mock.patch.object(
-                    CoordinateRelation,
-                    "materialize",
-                    side_effect=AssertionError(
-                        "schedule proof recovery must not enumerate runtime CTAs"
-                    ),
-                ):
-                    self.assertTrue(
-                        cross_loop_scheduler._validate_worker_schedule_tasks(
-                            rebuilt,
-                            task_orders,
-                        )
-                    )
-                    for root in range(2):
-                        placement = (
-                            cross_loop_scheduler._root_task_placement_relation(
-                                rebuilt,
-                                root,
-                            )
-                        )
-                        self.assertIsNotNone(placement)
-                        assert placement is not None
-                        self.assertTrue(placement.is_total_function())
-                        publication = (
-                            cross_loop_scheduler.root_barrier_publication_plan(
-                                rebuilt,
-                                root,
-                            )
-                        )
-                        self.assertIsNotNone(publication.participant_order)
-                        assert publication.participant_order is not None
-                        self.assertTrue(
-                            publication.participant_order
-                            .is_bijection_from_source_support()
-                        )
-
-                for concrete_batch, concrete_query in (
-                    (0, 2),
-                    (2, 0),
-                    (1, 1),
-                    (2, 3),
-                ):
-                    with self.subTest(
-                        batch=concrete_batch,
-                        query=concrete_query,
-                    ):
-                        substitutions = {
-                            batch: concrete_batch,
-                            query: concrete_query,
-                        }
-                        concrete_relations = tuple(
-                            segment.task_order.substitute_parameters(substitutions)
-                            for segment in rebuilt.segments
-                        )
-                        self.assertEqual(
-                            _singleton_targets(concrete_relations[0]),
-                            (0, 1, 2),
-                        )
-                        concrete_l2_domain = l2_domain.substitute_parameters(
-                            substitutions
-                        )
-                        l2_targets = _singleton_targets(concrete_relations[1])
-                        expected_l2_targets = _expected_l2_targets(
-                            concrete_l2_domain,
-                            concrete_l2_domain.axis_order,
-                            2,
-                        )
-                        self.assertEqual(l2_targets, expected_l2_targets)
-                        self.assertEqual(
-                            len(l2_targets),
-                            15 * concrete_batch * concrete_query,
-                        )
-                        _assert_exact_bijection(
-                            self,
-                            concrete_relations[1],
-                            15 * concrete_batch * concrete_query,
-                        )
-                        occupied_supports = tuple(
-                            {
-                                source_index
-                                for source_index, targets in enumerate(
-                                    relation.materialize()
-                                )
-                                if targets
-                            }
-                            for relation in concrete_relations
-                        )
-                        self.assertTrue(
-                            occupied_supports[0].isdisjoint(occupied_supports[1])
-                        )
 
     def test_l2_edge_geometries_have_exact_constant_size_proofs(self) -> None:
         for first_count, second_count, group_size in (
@@ -822,9 +540,7 @@ class TestRaggedL2Schedule(TestCase):
             _assert_exact_bijection(self, task_order, 15 * batch)
         for concrete_batch in (0, 1, 2, 8):
             concrete_domain = domain.substitute_parameters({batch: concrete_batch})
-            concrete_order = task_order.substitute_parameters(
-                {batch: concrete_batch}
-            )
+            concrete_order = task_order.substitute_parameters({batch: concrete_batch})
             expected = _expected_l2_targets(
                 concrete_domain,
                 pid_axis_order,
