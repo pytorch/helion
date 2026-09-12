@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
+    from .cute_flash_bwd import AttentionBwdMatch
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
@@ -619,6 +620,10 @@ class CuteDeviceFunctionState:
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
+        # Set by the backward-attention detector (cute_flash_bwd.py): the
+        # matched kernel facts and the inner Q-loop block ids.
+        self.attention_flash_bwd_match: AttentionBwdMatch | None = None
+        self.attention_flash_bwd_block_ids: list[int] | None = None
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan

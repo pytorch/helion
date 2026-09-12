@@ -3167,7 +3167,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # otherwise so the flash knobs never widen the search surface for
             # ordinary cute kernels.
             from .backend import detect_flash_search_surface
+            from .cute.cute_flash_bwd import detect_flash_bwd_search_surface
 
+            detect_flash_bwd_search_surface(device_ir)
             flash_shape = detect_flash_search_surface(device_ir)
             if flash_shape is not None:
                 config_spec.enable_cute_flash_search(
