@@ -1846,6 +1846,12 @@ class LoopedReductionStrategy(ReductionStrategy):
             acc_full = backend.reduction_acc_init_expr(
                 shape_dims, constant_repr(default), acc_dtype
             )
+            acc_full = backend.wrap_reduction_accumulator(
+                acc_full,
+                thread_count=self._thread_count,
+                loop_block_size=self._loop_block_size,
+                acc_dtype=acc_dtype,
+            )
             device_loop.outer_prefix.append(
                 statement_from_string(f"{acc} = {acc_full}")
             )
