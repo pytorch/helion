@@ -623,6 +623,19 @@ spills. The best validated point therefore remains 75.616 us. The residual
 gap is a concrete limitation of one Triton kernel's shared warp/register/
 shared-memory envelope, not evidence for another scheduling rule.
 
+The final pointer-only range-stage experiment improves the redesign further to
+**73.728 us** at m5/W740/stage2 versus **61.312 us** standalone.  The requested
+stage setting appears explicitly in lowered `tl.range`.  Stage3 at m3 and
+stage4 at m2 each save 2.048 us against their same-worker-count stage2 control,
+but consume 69,632 and 104,448 bytes of shared memory respectively; the loss of
+resident CTAs makes their end-to-end results 77.792 and 85.952 us.  The deeper
+pipeline is therefore locally effective but globally unprofitable.  Current
+Helion main rejects m5 and measures **108.400 us** at its closest supported
+pointer-stage2 m4 point versus **63.280 us** standalone; same-source redesign
+m4 is **81.888 us**.  The redesign is 26.512 us faster than main at the matched
+worker count and passes the scheduler non-regression gate.  Stop resource
+tuning here and proceed to compiler cleanup.
+
 DeepSeek-V3 exposed two independent lowering defects before any priority
 change. First, adjacent pieces of one routed-W2 run were emitted as two bodies
 when packed reconstruction declined. Unioning their already-proved exact
@@ -704,6 +717,19 @@ cost, not missing event-frontier placement.  The next ordinary configuration
 experiment is N256 activation plus routed-W2 N64xK512/stage2/nw1 at W444; it
 preserves 896 W2 CTAs while halving loop trips.  It is an autotuning/resource
 probe, not a scheduler special case.
+
+The follow-up rejects that high-shared-memory candidate: N64xK512 requires
+66,560 bytes and only three resident CTAs/SM, regressing to 176.032 us versus
+156.160 us standalone.  Staying in the four-CTA envelope, the best stable
+incumbent is 165.760 us versus 158.112 us standalone.  Porting standalone's
+descriptor/eviction choices also regresses to 192.35 us: descriptor selection
+falls back to pointer loads in this composed kernel while suppressing every
+per-range `tl.range(num_stages=...)`.  Most importantly, the identical-source,
+closest-identical-config current Helion main control is 182.240 us versus
+158.096 us standalone.  The redesign is therefore 9.04% faster than main with
+effectively identical standalone timing.  DeepSeek has passed the scheduler
+non-regression gate; its remaining standalone gap is inherited body/resource
+work and must not delay scheduler cleanup.
 
 Post-backfill source-ticket checkpoint (2026-09-12): an over-conservative
 entry-compaction guard briefly left canonical FlashMLA's exact source
@@ -1026,9 +1052,34 @@ rendering are retained even where legacy helper names still say
   time, exact schedule/counter dump, and standalone-over-persistent Gantt. A
   generalized schedule may be slightly slower than a historical specialized
   result, but it must beat matched standalone before becoming the default.
+- [ ] Treat DeepSeek-V3 and Nemotron MoE as inherited resource-envelope
+  negative controls: their Helion-main persistent kernels were already slower
+  than matched standalone before this scheduler work.  Require the redesign to
+  match the identical-source, closest-identical-config current-main persistent
+  result; continue reporting standalone to expose the pre-existing body gap,
+  but do not hold scheduler cleanup hostage to closing it.  Finish the already
+  selected pointer-only/per-range-stage ablation, then stop tuning if main
+  parity is established.
 - [ ] Tune ordinary resource knobs independently: worker count,
   `num_sm_multiplier`, warps, range stages, register limits, and tile choices.
   None enters list priority.
+- [ ] Once the cross-workload parity gate passes, remove transient-source
+  identity as separately threaded state.  Launch-stage-zero ownership remains
+  an ordinary `WorkerSchedule.task_order` relation because FlashMLA needs that
+  execution capability; derive its unique source root, ticket order, external
+  frontiers, progress exemption, and codegen dispatch directly from the
+  schedule instead of carrying `transient_source_root` through
+  `StaticPipelinePlan` and helper parameters.  Reject zero or multiple source
+  roots wherever the selected lowering requires exactly one.  Add no new IR
+  or abstraction.
+- [ ] Replace `_select_final_arrival_ownership`'s discarded legacy scratch
+  placement with direct continuation-dominance selection inside the one frozen
+  scheduling transaction.  Then delete `place_nested_loop_consumers`,
+  `place_ready_families`, redundant transient-source validation calls, and any
+  compatibility helper with no remaining correctness/codegen consumer.  Each
+  deletion must preserve the accepted Qwen, Gemma, FlashMLA, and Muse plans or
+  be justified by the same final-plan invariants rather than exact segment
+  spelling.
 - [ ] Remove the production parametric cohort stack, symbolic cursor/repeat
   state, and affine-lifting hooks after confirming they have no independent
   consumer. Audit `_packed_schedule_segment_geometry` and its relation renderer

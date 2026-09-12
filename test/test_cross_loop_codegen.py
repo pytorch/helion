@@ -870,8 +870,32 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 )
             )
 
-        self.assertIn("tile_dependency_nested_loop_wait", code)
-        self.assertIn("if ", code)
+        tree = ast.parse(code)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        waits = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id.startswith("tile_dependency_nested_loop_wait")
+                for target in node.targets
+            )
+        ]
+        self.assertTrue(waits)
+
+        def has_if_ancestor(node: ast.AST) -> bool:
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.If):
+                    return True
+            return False
+
+        self.assertTrue(all(has_if_ancestor(wait) for wait in waits))
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

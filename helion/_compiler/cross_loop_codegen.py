@@ -1500,7 +1500,7 @@ def emit_cross_loop_schedule(
         if len(nested_axes) != 1:
             raise AssertionError(
                 "nested loop lowering currently requires one loop axis"
-        )
+            )
         (nested_axis,) = nested_axes
         nested_symbol = coordinate_axis_symbol(nested_axis)
         requires_iteration_membership_guard = (

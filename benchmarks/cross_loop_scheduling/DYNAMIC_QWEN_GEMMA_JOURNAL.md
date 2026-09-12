@@ -1448,8 +1448,9 @@ physical GPU 2.  The exact public entry measured 51.01 us versus 124.93 us for
 vLLM's production FlashInfer CUTLASS path.  The mechanically matched
 eight-root Helion comparison measured **51.136 us persistent versus 55.200 us
 standalone**.  A clean older scheduler checkpoint measured 49.44 us in a
-separate public-entry run, but both compiler trees selected the exact same
-generated module and configuration: generated-source SHA256
+separate public-entry run.  A direct compilation from current Helion `main`
+at `cfb135ef` also selected the exact same generated module and configuration
+as this branch and the preserved older control: generated-source SHA256
 `0e9560efa9aefa58b77c1f9d9e331e1de024f08e4152143eb20d5fc850d84bdd`,
 multiplier four, W4, R128, zero spills, and 34,816 bytes shared.  The 49--51 us
 spread is consequently a measurement/code-placement mode, not a compiler
