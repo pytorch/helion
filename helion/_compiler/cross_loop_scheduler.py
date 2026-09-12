@@ -9,6 +9,7 @@ import itertools
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import cast
 
 import sympy
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 WorkerInterval = tuple[int, int]
+CrossLoopDispatchMode = Literal["static", "elastic"]
 
 _SOURCE_LAUNCH_STAGE = 0
 _RESIDENT_LAUNCH_STAGE = 1
@@ -93,7 +95,8 @@ class WorkerScheduleSegment:
     Its source support is allowed to be partial.  The three integer placement
     fields remain only as the migration-compatible spelling of a dense run;
     :class:`WorkerSchedule` immediately normalizes that spelling into the
-    relation and all semantic queries consume the relation.
+    relation and all semantic queries consume the relation. ``dispatch_mode``
+    selects physical ownership of that exact traversal without changing it.
 
     Before normalization, constructors may still pass a dense logical task
     order plus ``dispatch_offset``::
@@ -112,6 +115,7 @@ class WorkerScheduleSegment:
     worker_begin: int
     worker_count: int
     dispatch_offset: int
+    dispatch_mode: CrossLoopDispatchMode = "static"
 
     def __post_init__(self) -> None:
         if self.root < 0:
@@ -126,6 +130,8 @@ class WorkerScheduleSegment:
             raise ValueError(
                 f"dispatch_offset must be nonnegative, got {self.dispatch_offset}"
             )
+        if self.dispatch_mode not in ("static", "elastic"):
+            raise ValueError(f"invalid cross-loop dispatch mode {self.dispatch_mode!r}")
         if self.task_order.target_domain.kind != "site" or (
             not self.task_order.pieces
             and self.task_order.target_domain.size_expr.is_zero is not True

@@ -1,8 +1,8 @@
 # Static/elastic cross-loop scheduler unification
 
-Status: canonical implementation plan.  Architecture, Qwen/Gemma, and
-execution/progress reviewers signed off on 2026-09-12.  The phase-0 executor
-ablation remains the deliberate performance kill gate.
+Status: canonical implementation plan after the 2026-09-12 phase-0 executor
+ablation rejected the first physical design.  Architecture, Qwen/Gemma, and
+execution/progress reviewers signed off on the revised one-shot packet design.
 
 This document supersedes the global event-frontier/list-scheduling roadmap in
 `parametric_event_frontier_scheduler_plan.md`.  That document remains useful
@@ -26,8 +26,9 @@ algorithms:
    `WorkerSchedule`, in source/root order.
 3. Select `static` or `elastic` execution independently for each root through
    one root-indexed autotuning field.
-4. Lower consecutive elastic roots with a dynamically claimed task stream over
-   the same fixed resident CTA cohort used by static roots.
+4. Lower the final segment sequence into one ordered packet stream.  Static
+   regions contribute coarse worker-strand packets; elastic regions contribute
+   one packet per logical task.
 5. Delete the global event-frontier/list placer, its pipeline-depth knob, and
    the special one-source ticket path after the general executor passes the
    performance gates below.
@@ -76,20 +77,46 @@ The experiments used two physical implementations:
 - DeepSeek and Nemotron launched a fixed resident cohort whose CTAs repeatedly
   claimed tickets from an atomic cursor.
 
-Muse m12 is evidence about logical order and elastic load balancing, not about
-a feasible fixed pool of 1,776 simultaneously resident CTAs.  That probe
-overlaunched 13,688 one-shot CTAs while requiring residency for 1,184.  The
-production fixed-pool gate therefore uses Muse m8; m12 must be retuned to a
-physically resident width rather than introducing a second width concept.
+The first signed-off draft proposed using the fixed resident claim loop for
+every elastic region.  Phase 0 rejected that design.  On canonical FlashMLA
+B4, 500 cold-L2 samples after a 10-second warmup measured:
 
-That distinction matters.  One-task-per-CTA overlaunch is excellent for a
-fully elastic graph but cannot safely express an arbitrary
-`static -> elastic -> static` sequence without a second phase/ownership
-protocol.  A fixed resident claim loop can express every mixture with one
-progress argument.  It is therefore the intended production mechanism, but
-it is not accepted on elegance alone: phase 0 must show that it preserves the
-MLA/Muse benefit and the all-static Qwen/Gemma behavior.  If it cannot, stop
-and revisit the design rather than retaining two permanent executors.
+| physical executor | latency | resources |
+| --- | ---: | --- |
+| one-shot root-major task packets | **61.440 us** | R80, 54-byte spill, 49,160-byte shared |
+| fixed W148 `T+W` claim loop | 104.416 us | R80, 104-byte spill, 49,160-byte shared |
+| matched standalone | 67.456 us | constituent kernels |
+
+All outputs were bit-exact and both persistent variants retained the required
+K22/fan-in16 compact counter.  Moving the complete packet body behind a common
+noinline boundary was not a valid control: Triton rejects the Blackwell TMEM
+attention body in a non-kernel function during `lowerTensorMemoryAlloc`.
+Therefore the 43-us gap is an executor/code-shape limitation, not missing
+readiness or an untuned knob.  The fixed-loop design failed its written kill
+gate and is abandoned.
+
+The replacement is a single **one-shot ordered packet stream**, which
+generalizes the successful source-ticket mechanism without retaining a source
+special case:
+
+- a maximal static run contributes exactly `W` packets; packet `w` executes
+  worker `w`'s unchanged static strand through every root in that run;
+- a maximal elastic run contributes one packet per logical root task in
+  canonical root/local-ordinal order; and
+- one monotone atomic ticket assigns those packet roles in actual CTA admission
+  order.  Each launched CTA executes one packet completely and retires.
+
+This handles arbitrary `static -> elastic -> static` sequences because the
+static unit is the complete resident cohort, not an individual root task.  It
+also preserves both measured endpoints: an all-elastic graph has exactly the
+MLA/Muse one-shot form, while an all-static graph has one `W`-packet run that
+strength-reduces to the current `program_id` worker mapping with no ticket
+atomic and byte-identical lowering.
+
+Muse m12 remains evidence about logical order and elastic load balancing, not
+about a feasible fixed pool of 1,776 simultaneously resident CTAs.  The
+one-shot stream does not require all elastic packets to be resident; any
+static run still requires its `W` worker packets to fit concurrently.
 
 ## Scope and non-goals
 
@@ -205,11 +232,13 @@ TileDependencyGraph
 
 Details:
 
-1. Counter and root-barrier selection is independent of dispatch mode.  Every
+1. Counter and root-barrier edge selection is independent of dispatch mode.
+   Every
    `TileDependencyGraph` obligation must remain represented by an emitted exact
    counter or root-barrier fallback.  Static worker/wave order is never allowed
    to discharge an obligation, because that implication would disappear when
-   either endpoint becomes elastic.
+   either endpoint becomes elastic.  Root-barrier participant and arrival
+   metadata is frozen only after dispatch modes are applied.
 2. `build_baseline_worker_schedule` produces one root-major segment per root.
 3. `_consumer_major_producer_order` may change the task permutation inside one
    root, transactionally.  It may not split, interleave, or reorder roots.  Its
@@ -297,6 +326,12 @@ with `W` workers, worker `w` executes the exact segment ordinals assigned to
 its strided slice.  It performs the segment's incoming waits, task-level waits,
 body, publications, and root-barrier publication using the frozen plan.
 
+Consecutive static roots form one maximal static run.  Its `W` packet roles
+are exactly the current persistent worker bodies restricted to those roots:
+static packet `w` visits every segment in the run and executes worker `w`'s
+slice before retiring.  This preserves cross-root strand chronology,
+continuations, and the current static progress proof inside the run.
+
 All-static code generation is a strict compatibility gate:
 
 - same root-local traversal;
@@ -311,71 +346,77 @@ global list machinery is removed.
 
 ## Elastic execution
 
-### Physical pool
+### Derived packet stream
 
-Launch exactly the existing `W` persistent CTAs, and prove that schedule width,
-launch-grid width, and the simultaneously resident cohort are the same `W`.
-Do not silently clamp or reinterpret `W` in mixed mode.  Every CTA keeps its stable
-worker ID and epoch for the whole kernel.  At an elastic region, those same
-CTAs repeatedly claim logical task ordinals from an atomic cursor.  No extra
-CTA is launched per task, and no static worker role is replaced.
+Codegen walks source roots, intersperses any mode-independent empty-root
+control required by the frozen `RootBarrierPublicationPlan`, and coalesces
+adjacent nonempty roots with the same mode.  The segments remain the only task
+schedule; empty controls, maximal runs, and prefix sums are local rendering
+facts, not stored schedule state and not a new abstraction.
 
-This one physical pool is what makes arbitrary mode sequences composable.
-Static and elastic are two ways for the same resident workers to consume the
-same segment traversal.
+For each run:
 
-### Derived elastic runs
+- a static run contributes `W` packets.  Local packet `w` executes worker
+  `w`'s exact static slices for all segments in that run, in segment order;
+- an elastic run with root task counts `T0, T1, ...` contributes
+  `T = sum(Ti)` packets.  Its local packet ordinal is decoded by prefix sums
+  into one root and one root-local ordinal, then mapped through that segment's
+  existing `logical_task_order`.
 
-Codegen coalesces adjacent elastic root segments into a maximal elastic run.
-This is a local rendering optimization, not stored schedule state and not a
-new abstraction.  Run boundaries are derived by scanning the final segment
-tuple; static roots and the ends of the schedule delimit runs.
-
-For a run with root task counts `T0, T1, ...`, concatenate their exact segment
-ordinals in root order.  A ticket is decoded by prefix sums into one root and
-one root-local ordinal, then passed through that segment's existing
-`logical_task_order`.  The ordinary `scheduled_root_task_body` emits waits,
-the unchanged root body, readiness publication, and continuation handling.
-
-Adjacent roots share a cursor so a worker can begin a ready downstream root as
-soon as all earlier-root tickets have been claimed.  This both preserves MLA
-overlap and avoids `W` terminal atomic operations per small root.  A static
-root intentionally terminates the run.
-
-### Replay-safe cursor protocol
-
-For a run containing the compile-time-invariant capacity
-`T = sum(Ti)` tasks, one invocation consumes exactly
-`T + W` cursor values:
+Concatenating the run ranges gives one fixed packet count
 
 ```text
-0 .. T-1       task tickets
-T .. T+W-1     one terminal ticket for each resident CTA
+P = sum(W for each static run)
+    + sum(Ti for every nonempty elastic root)
+    + required synthetic empty-root control packets.
 ```
 
-Each CTA loops until it claims one terminal ticket, then proceeds to the next
-segment/run.  Because a CTA exits after its first terminal claim, exactly `W`
-terminal claims occur and the next invocation begins on the next complete
-frame.  If `base(epoch) = (epoch - 1) * (T + W)`, every claim in that invocation
-must fall in `[base(epoch), base(epoch) + T + W)`.  Store one persistent
-`uint64` cursor per maximal elastic run.  Use the existing per-worker epoch as
-the sole readiness epoch; cursor arithmetic must agree with that epoch but
-must not become a second epoch source.
+No packet table or run object is stored in `StaticPipelinePlan`.  The emitted
+decoder directly uses segment-derived constant prefix ranges and the existing
+`scheduled_root_task_body`.  Kernel-scoped/TMEM roots stay in the kernel body;
+legal root helpers retain their current inlining/outlining decisions.
 
-Every one of the `W` CTAs must visit every elastic run exactly once, even if it
-owned no tasks in the preceding static root.  There may be no early return or
-conditional path around the claim loop.  The protocol is legal only while `T`
-is invariant for the cubin and every invocation consumes a complete frame.
-Runtime sequence lengths, routing, and masks may make a fixed-capacity task a
-no-op, but that task must still claim its ticket and perform every required
-publication.  Different runtime metadata may replay without resetting the
-cursor; changing `T` requires another compilation.  Overlapping launches may
-not share the same persistent state lease.  Integer overflow follows the
-existing persistent epoch/state lifetime contract and must be covered by an
-explicit test or bound.
+In a non-folded packet stream, a static packet's decoded logical worker `w` is
+the sole worker identity used for task slicing, epoch/state indexing, waits,
+and publication.  Physical `program_id`/SM identity must not leak into its
+semantics.  Static bodies therefore need the same role-relocatability audit as
+elastic bodies, even though they execute a coarser strand.
 
-The cursor atomic is relaxed.  Readiness publication/waits retain their
-existing release/acquire semantics.
+### Ordered one-shot admission
+
+Launch exactly `P` CTAs.  Every CTA performs one relaxed atomic increment on a
+single persistent `uint64` packet cursor, decodes the returned packet role,
+executes that complete role through waits, body, inline continuation, and
+publications, then retires.  The cursor determines logical admission order;
+CUDA block IDs do not.
+
+One invocation consumes exactly `P` cursor values.  With
+`base(epoch) = (epoch - 1) * P`, every claim in that invocation lies in
+`[base(epoch), base(epoch) + P)`, `packet = raw % P`, and
+`epoch = raw // P + 1`.  `P` is invariant for the cubin.  Runtime sequence
+lengths, routing, and masks may turn a capacity packet into a no-op, but it
+still executes all required publications.  Different runtime metadata can
+replay without reset; changing `P` requires another compilation.  Concurrent
+launches may not share the same persistent state lease.  Overflow follows the
+existing persistent-state lifetime contract.
+
+When every retained segment is static, the complete schedule is one all-static
+run, `P == W`, and every packet is the corresponding ordinary worker strand.
+Codegen must strength-reduce
+`packet` to `program_id`, retain the existing per-worker epoch protocol, and
+omit the cursor state and atomic.  This is an optimization of the identical
+packet semantics, not a second scheduler.  It is the strict Qwen/Gemma
+compatibility path.  Test the semantic all-static predicate directly; never
+fold merely because an unrelated elastic/mixed packet count happens to equal
+`W`.  Ignored continuation and empty-root config entries do not prevent the
+fold.
+
+For any mixed schedule containing a static run, prove that the compiled kernel
+can simultaneously residently support all `W` static worker packets.  The grid
+may contain more than `W` total packets; prior elastic packets drain and make
+room until the complete static cohort is active.  Never silently clamp or
+reinterpret `W`.  An all-elastic schedule needs no static-cohort residency
+proof beyond the backend's ordinary launch/resource constraints.
 
 ### Root-barrier publication
 
@@ -392,12 +433,14 @@ Rename `source_stage_arrival_count` to `elastic_task_arrival_count`.  Codegen
 consumes the frozen `RootBarrierPublicationPlan`; it does not recompute mode or
 arrival mass.  Per-task publication is used only for root-barrier fallback;
 ordinary exact readiness events retain their existing publication sites.
-For a statically empty root, retain the existing vacuous/synthetic single
-arrival.  Because an empty root has no segment or elastic terminal, the frozen
-publication plan assigns that arrival once to resident worker 0 at the root's
-canonical position in the top-level schedule loop (or to an exactly equivalent
-initialization site).  Empty-root ownership is explicit publication metadata,
-not an invented task segment.
+For an empty root, retain the existing vacuous/synthetic single arrival.  Its
+root dispatch config entry is ignored and it has no task segment.  In the
+semantic all-static fold, resident worker 0 publishes at that root's canonical
+control position.  In any non-folded packet stream, each required empty-root
+publication contributes one mode-independent control packet at that root's
+source-order position and that packet is included in `P`.  The frozen
+`RootBarrierPublicationPlan` is the sole authority for this control packet;
+empty-root handling does not invent a logical task segment.
 
 ## Progress and correctness proof
 
@@ -405,55 +448,64 @@ Correctness and liveness are separate obligations.
 
 ### Exact-once correctness
 
-For every non-continuation root:
+For every nonempty, non-continuation root:
 
 1. the segment traversal is a total function from dense ordinals to logical
    tasks;
 2. its inverse is single-valued and total over the root domain;
-3. static striding partitions those ordinals exactly once, or the elastic
-   cursor issues every ordinal exactly once; and
+3. a static run's `W` strand packets partition every static segment exactly
+   once, while an elastic run contributes exactly one packet for every root
+   ordinal; and
 4. all waits/publications are derived from the unchanged `ReadinessGraph`.
 
 Continuation contraction must cover its complete consumer root exactly once.
-The union of ordinary and continuation-owned roots must equal the configured
-root set.
+The union of ordinary, continuation-owned, and explicitly represented empty
+control roots must equal the configured root set.
 
 ### Progress invariant
 
 After recursively contracting continuation chains, the one-segment root tuple
-must be a strict topological order for every root-entry wait, nested-checkpoint
-wait, and root-barrier prerequisite.  Reject a backward or unsupported edge.
+must be a strict topological order for every cross-root root-entry wait,
+nested-checkpoint wait, and root-barrier prerequisite.  Reject a backward or
+unsupported cross-root edge.
 An elastic root with same-root inter-CTA waits is ineligible unless exact
 producer-ticket-before-consumer-ticket precedence is proved; the initial
 implementation rejects elasticity for every such root.  Static execution is
 accepted only if its existing strand/rank proof independently proves progress;
 otherwise the configuration is rejected rather than silently forced static.
 
-For a consumer that can begin:
+For a consumer packet that has been issued:
 
-- every producer in an earlier static root has a stable owner among the same
-  resident `W` CTAs; or
+- a producer in the same static run is covered by the existing exact
+  static-strand/rank proof and the bounded `W`-packet cohort;
+- every one of the `W` owner packets in an earlier static run was issued before
+  the cursor crossed that run's packet range; or
 - every producer in an earlier elastic root has already been claimed before a
-  cursor can cross that root's ticket interval.
+  packet cursor can cross that root's interval.
 
 Claimed does not mean completed.  Exact counters still gate completion and
-visibility.  A claimed producer is active on a resident CTA, completed, or
-waiting only on a strictly earlier contracted root; the minimal-unfinished-root
-induction supplies eventual progress.  A worker finishes the task and its
-publications before making its next claim.  A CTA
-waiting in a later root cannot evict or prevent the resident CTA that owns an
-earlier producer from running.  Induction over strict source-root order then
-rules out a wait cycle.
+visibility.  An earlier packet is active on a resident CTA, completed, or
+waiting only on a still-earlier packet/root.  A CTA retires only after its
+complete elastic task or static worker strand, inline continuation, and all
+publications finish.  A minimal-unfinished-packet induction therefore reaches
+runnable work and rules out a wait cycle.
 
 This proof covers all four transitions:
 
-- static -> static: existing persistent strand proof;
-- static -> elastic: early workers may claim consumers while slower static
-  producer owners continue;
-- elastic -> static: a worker exits the elastic interval only after every
-  producer ticket has been claimed; and
-- elastic -> elastic: the shared monotone cursor crosses the root boundary
-  only after every earlier-root ticket has been claimed.
+- static -> static: consecutive roots share one static run and use the existing
+  `W`-strand proof;
+- static -> elastic: every static owner packet is issued before the cursor
+  reaches an elastic consumer packet, although some owners may still run;
+- elastic -> static: every producer task packet is issued before the first
+  packet of the `W`-owner static cohort; and
+- elastic -> elastic: the monotone packet cursor crosses a root interval only
+  after every earlier-root task packet is issued.
+
+A static cohort may initially be admitted behind unfinished elastic packets.
+Those earlier packets cannot depend backward and therefore drain.  Because the
+kernel is proved capable of residently holding all `W` static packets, the
+complete cohort eventually becomes active; no subset of waiting static owners
+can permanently exclude an unissued peer.
 
 Nested waits use the owning consumer root in the same induction.  A
 final-arrival continuation executes only after its exact event completes, so
@@ -462,23 +514,27 @@ modes are applied, revalidate that each continuation consumer is covered once,
 its trigger event is exact, and that trigger's covered obligations contain
 every semantic dependency obligation of the continuation root.  This last
 condition is mandatory for an elastic trigger: the continuation executes
-inside its producer task before the cursor necessarily crosses the producer
-root, so it may not wait for an unclaimed sibling ticket through a second
+inside its producer packet before the cursor necessarily crosses the producer
+root, so it may not wait for an unissued sibling packet through a second
 prerequisite.  Every continuation chain must terminate in ordinary resident
 work.  The continuation body and all of its publications finish before the
-producer CTA claims another ticket.  No validator may weaken a wait or appeal
+producer CTA retires.  No validator may weaken a wait or appeal
 to likely CTA launch order.
 
-Elastic eligibility also requires an exact dense root traversal and a
-relocatable root body expressed through logical PID coordinates rather than a
-physical worker/SM identity.  Unsupported kernel-scoped identity or same-root
-coordination makes the elastic choice illegal.  An explicitly requested
-illegal `elastic` mode rejects the config; only the field's default selects
-static implicitly.  There is no partial-root elastic escape hatch.
+Elastic eligibility also requires an exact dense root traversal and a root body
+whose semantics use logical PID coordinates rather than a physical worker/SM
+identity.  A TMEM or other kernel-scoped body may remain inline in the entry
+kernel; it need not be outlineable.  An unsupported physical-identity
+dependency or same-root coordination makes the elastic choice illegal.  An
+explicitly requested illegal `elastic` mode rejects the config; only the
+field's default selects static implicitly.  There is no partial-root elastic
+escape hatch.
 
-The launch grid must remain no larger than the compiled-kernel resident
-capacity, exactly as required by the current static persistent path.  The
-proof never assumes that a later, not-yet-launched block will rescue progress.
+The launch grid may exceed resident capacity, but a mixed schedule's `W`-packet
+static cohort must fit simultaneously.  The proof never assumes that an
+unissued later packet will rescue progress; it relies only on already-issued
+earlier packets and the eventual admission of the bounded `W`-packet static
+cohort as preceding acyclic work drains.
 
 ## Why root is the mode boundary
 
@@ -496,36 +552,57 @@ because it has:
 - one publication policy; and
 - one stable source-level identity for autotuning.
 
-Maximal elastic runs are derived only to reduce dispatch overhead.  They never
-change this root-level meaning.
+Maximal same-mode runs are derived only to choose packet granularity and reduce
+dispatch overhead.  They never change this root-level meaning.
 
 ## Implementation roadmap
 
-### Phase 0: settle the physical executor
+### Phase 0: reject the fixed resident loop — complete
 
-- Add or adapt a reference-only generated-Triton ablation that runs the exact
-  MLA B4/B9 and Muse root-major task streams with a fixed `W`-CTA claim loop.
-- Compare it directly with the archived one-task-per-CTA executor, using the
-  same source/config, numerics, cold-L2 protocol, logical order, and outlined
-  per-ticket helper boundary.  The loop may change registers/spills, so record
-  and compare actual cubin resources rather than requiring equality.
-- Use Muse m8 as the fixed-pool gate.  Retune m12 only within a physically
-  resident `W`; do not add a second physical-width abstraction.
-- Include a synthetic or real `static -> elastic -> static` case and a case
-  with two elastic runs, so endpoint-only results cannot mask a mixed-mode
-  progress flaw.
-- Reconfirm all-static Qwen/Gemma controls.
+- The reference-only B4 probe measured 104.416 us fixed-loop versus 61.440 us
+  one-shot and 67.456 us standalone, bit-exact with K22/F16.
+- The loop doubled spills from 54 to 104 bytes at the same R80/49,160-byte
+  shared-memory envelope.
+- A common noinline packet helper is illegal for the TMEM attention root, so
+  the resource failure cannot be isolated away without changing the kernel
+  body boundary.
+- The negative probe and result are archived at reference-only commit
+  `d17e2db9`; they are not merged into production.
+- Therefore delete the fixed-loop/T+W design from the roadmap rather than
+  retaining it beside the fast path.
+
+### Phase 0b: validate the one-shot packet executor
+
+- Treat the archived FlashMLA B4/B9 and Muse m8 one-shot results as the positive
+  all-elastic controls, then reproduce them through production packet lowering.
+- Reconfirm that the all-static strength reduction emits the pre-refactor
+  Qwen/Gemma plan and code with no cursor/atomic.  The fresh GPU1 Qwen golden is
+  102.304 us for the checked-in AOT entrypoint, with identical plan/cubin across
+  the compared source wrappers, R255/22-byte spill/17,408-byte shared, and
+  continuations `{7, 8, 10}`.
+- As an isolation-only probe, force that unchanged Qwen worker body through
+  `W` one-shot CTAs with one atomic role assignment and cursor-derived epoch,
+  without changing any root/task mode.  Compare full-KV correctness, plan,
+  resources, and latency to direct `program_id`; run the same control for Gemma
+  if practical.  Production still folds all-static execution to no atomic.
+  This GPU1 control is complete: all 16 outputs and full KV were bit-exact,
+  resources remained R255/22-byte spill/17,408-byte shared, and the atomic role
+  assignment cost about 6.3 us (104.416--106.368 us direct versus
+  110.880--112.480 us atomic).  Mixed dispatch is therefore mechanically sound
+  but must recover more than that generic admission tax to be profitable; the
+  ordinary autotuner makes that decision.
 - Compare exact root-local traversals with and without the current
-  source-ticket-frontier branch before deleting that branch.
-- For FlashMLA, report and benchmark both the compact K22/fan-in16 root-entry
-  counter and exact K352/fan-in1 fallback under the fixed pool.  The archived
-  elastic win used K22/F16; prior exact K352/F1 measurements were about
-  71.52 us versus about 63.33 us compact and 67.49 us standalone.  Phase 0 is
-  not passed unless the generic mixed-mode quotient recovers K22/F16.
-- Accept the fixed-pool design only if MLA B4/B9 and Muse retain their
-  standalone wins and remain within roughly 2 us (or 3%, whichever is larger)
-  of the best archived elastic result.  Otherwise stop and redesign; do not
-  preserve both executors as permanent policy.
+  source-ticket-frontier branch before deleting that branch; Qwen is already a
+  no-op because it has no source segment, while MLA is the meaningful gate.
+- For FlashMLA, retain and report compact K22/fan-in16.  The exact K352/F1
+  fallback previously measured about 71.52 us versus about 63.33 us compact
+  and 67.49 us standalone; production is not accepted without the generic
+  root-entry quotient.
+- Add a synthetic or real `static -> elastic -> static` correctness/progress
+  case and a case with multiple same-mode runs.
+- Run one-shot and mixed-mode ablations for DeepSeek and Nemotron, whose
+  archived dynamic evidence used fixed resident loops.  Tune only the generic
+  root dispatch vector and existing resource knobs.
 
 ### Phase 1: install the root dispatch surface
 
@@ -557,17 +634,21 @@ change this root-level meaning.
   exception to the same contracted-root static/elastic proof.  Keep finer
   static segmented quotients on their existing rank proof.
 
-### Phase 3: lower elastic runs
+### Phase 3: lower the ordered packet stream
 
 - Reuse `scheduled_logical_task_expression` and
   `scheduled_root_task_body`; do not clone root bodies or decode PIDs again.
-- Derive maximal adjacent elastic runs locally in codegen.
-- Allocate one persistent `uint64` cursor per run.
-- Emit the `T + W` replay frame and worker claim loop.
-- Decode ticket ranges through each authoritative segment traversal.
+- Derive maximal adjacent same-mode runs locally in codegen.
+- Give every static run exactly `W` worker-strand packet roles and every
+  elastic run one packet per exact task ordinal.
+- Concatenate those ranges into fixed `P`, allocate one persistent `uint64`
+  cursor, launch `P` CTAs, and emit one claim/one complete role per CTA.
+- Decode elastic ticket ranges through each authoritative segment traversal;
+  render a static packet with the unchanged worker-strand code over its run.
 - Generalize frozen root-barrier publication from source tickets to elastic
   tasks.
-- Preserve the exact all-static generated path.
+- Strength-reduce the semantic all-static case to the exact current
+  `program_id`/per-worker-epoch path with no cursor or atomic.
 
 ### Phase 4: replace the progress proof
 
@@ -579,7 +660,8 @@ change this root-level meaning.
   would have been sufficient.
 - Prove root-entry counter quotient liveness from the same mixed-mode root
   theorem; do not add an elastic/source special case.
-- Prove cursor interval order and fixed resident capacity.
+- Prove global packet-prefix order, complete static-gang packet coverage, and
+  `W`-packet resident capacity whenever a static run exists.
 - Cover nested waits and root barriers from the same emitted prerequisite view.
 - Delete wave/list-priority proofs that are no longer semantic.
 
@@ -595,7 +677,8 @@ Delete, rather than leave dormant:
 - `_source_segment_ticket_order`, `_with_source_ticket_schedule_segment`, and
   `_has_valid_source_ticket_schedule`;
 - `_source_ticket_frontiers` inside root-local ordering;
-- source-ticket-only launch-grid and epoch branches; and
+- source-ticket-only launch-grid/epoch branches, replacing them with the
+  generic packet-prefix renderer; and
 - `cross_loop_pipeline_depth` and its autotuner/config/backend plumbing.
 
 Retain only generally required relation utilities.  Before deleting a helper,
@@ -613,8 +696,8 @@ Add focused tests for:
 - one segment per non-continuation root and source-root ordering;
 - root-indexed config defaulting/normalization;
 - exact static and elastic traversal equivalence;
-- adjacent elastic-run derivation without stored run state;
-- replay frames with `T`, `W`, empty roots, and multiple runs;
+- adjacent same-mode run derivation without stored run state;
+- replay frames with fixed `P`, empty roots, and multiple runs;
 - all four static/elastic transitions;
 - nested waits and continuations in both modes;
 - elastic producer -> continuation -> downstream execution (use DeepSeek root
@@ -655,8 +738,8 @@ The redesign is complete only when all of the following hold:
    `StaticPipelinePlan`.
 2. Every scheduled root has exactly one authoritative segment.
 3. Static and elastic render the same segment traversal.
-4. Arbitrary legal root-mode mixtures share one fixed resident CTA pool and
-   one progress proof.
+4. Arbitrary legal root-mode mixtures lower to one ordered packet stream and
+   one progress proof; all-static is only its identity strength reduction.
 5. `cross_loop_pipeline_depth`, global list placement, and transient/source
    ticket policy are absent from production code.
 6. No workload name, root literal, fan-in literal, or task-count threshold
@@ -675,6 +758,7 @@ facts match the current control; Qwen retains continuations at roots 7, 8, and
 10 with root 13 resident; Gemma retains root 6 resident and root 7 as its
 continuation; and static nested counters remain unchanged.
 
-If the fixed resident claim loop cannot satisfy both the elastic and static
-performance gates, the implementation pauses at phase 0.  The answer is not a
-second permanent scheduler hidden behind an MLA predicate.
+The failed fixed resident claim loop is not retained.  If the ordered packet
+stream cannot preserve all-elastic MLA/Muse, all-static Qwen/Gemma, and a
+correct mixed schedule, stop and revisit unification rather than adding a
+second permanent scheduler behind a workload predicate.

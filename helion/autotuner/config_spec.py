@@ -765,6 +765,7 @@ def shrink_block_sizes_for_numel_constraints(
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
 VALID_CROSS_LOOP_SCHEDULES = ("barrier", "static_pipeline")
+VALID_CROSS_LOOP_DISPATCH_MODES = ("static", "elastic")
 
 # Upper bound (power of two) that a matmul tile dimension's block size may reach
 # even when the dimension itself is smaller. Applied only to dimensions that
@@ -814,6 +815,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | {
         "cross_loop_schedule",
         "cross_loop_pipeline_depth",
+        "cross_loop_root_dispatch",
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -845,6 +847,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "static_ranges",
         "cross_loop_schedule",
         "cross_loop_pipeline_depth",
+        "cross_loop_root_dispatch",
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1100,6 +1103,7 @@ class ConfigSpec:
         # implicit cross-root dependency supported by the CUDA Triton backend.
         self.cross_loop_schedule: EnumFragment | None = None
         self.cross_loop_pipeline_depth: IntegerFragment | None = None
+        self.cross_loop_root_dispatch: ListOf | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
@@ -2208,24 +2212,37 @@ class ConfigSpec:
 
     def supports_config_key(self, key: str) -> bool:
         if (
-            key in ("cross_loop_schedule", "cross_loop_pipeline_depth")
+            key
+            in (
+                "cross_loop_schedule",
+                "cross_loop_pipeline_depth",
+                "cross_loop_root_dispatch",
+            )
             and self.device is not None
             and self.device.type != "cuda"
         ):
             return False
         return self.backend.supports_config_key(key)
 
-    def enable_cross_loop_schedule(self) -> None:
+    def enable_cross_loop_schedule(self, root_count: int) -> None:
         """Expose the compiler-owned cross-loop scheduling dimension."""
         if not self.supports_config_key("cross_loop_schedule"):
             raise InvalidConfig(
                 f"cross_loop_schedule is not supported by backend {self.backend_name!r}"
+            )
+        if type(root_count) is not int or root_count < 0:
+            raise ValueError(
+                f"root_count must be a nonnegative integer, got {root_count!r}"
             )
         self.cross_loop_schedule = EnumFragment(VALID_CROSS_LOOP_SCHEDULES)
         self.cross_loop_pipeline_depth = IntegerFragment(
             MIN_CROSS_LOOP_PIPELINE_DEPTH,
             MAX_CROSS_LOOP_PIPELINE_DEPTH,
             DEFAULT_CROSS_LOOP_PIPELINE_DEPTH,
+        )
+        self.cross_loop_root_dispatch = ListOf(
+            EnumFragment(VALID_CROSS_LOOP_DISPATCH_MODES),
+            length=root_count,
         )
 
     def supported_config_keys(self) -> frozenset[str]:
@@ -2356,7 +2373,11 @@ class ConfigSpec:
         if (
             any(
                 key in config
-                for key in ("cross_loop_schedule", "cross_loop_pipeline_depth")
+                for key in (
+                    "cross_loop_schedule",
+                    "cross_loop_pipeline_depth",
+                    "cross_loop_root_dispatch",
+                )
             )
             and self.cross_loop_schedule is None
             and self.supports_config_key("cross_loop_schedule")
@@ -2364,6 +2385,7 @@ class ConfigSpec:
             if _fix_invalid:
                 config.pop("cross_loop_schedule", None)
                 config.pop("cross_loop_pipeline_depth", None)
+                config.pop("cross_loop_root_dispatch", None)
             else:
                 raise InvalidConfig(
                     "cross_loop_schedule is available only for kernels "
@@ -2721,6 +2743,31 @@ class ConfigSpec:
                         "cross_loop_pipeline_depth must be an integer between "
                         f"{pipeline_depth_fragment.low} and "
                         f"{pipeline_depth_fragment.high}, got {pipeline_depth!r}"
+                    )
+            root_dispatch_fragment = self.cross_loop_root_dispatch
+            assert root_dispatch_fragment is not None
+            root_dispatch = config.setdefault(
+                "cross_loop_root_dispatch",
+                root_dispatch_fragment.default(),
+            )
+            root_dispatch_is_valid = (
+                type(root_dispatch) is list
+                and len(root_dispatch) == root_dispatch_fragment.length
+                and all(
+                    mode in VALID_CROSS_LOOP_DISPATCH_MODES for mode in root_dispatch
+                )
+            )
+            if not root_dispatch_is_valid:
+                if _fix_invalid:
+                    config["cross_loop_root_dispatch"] = (
+                        root_dispatch_fragment.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        "cross_loop_root_dispatch must be a list of length "
+                        f"{root_dispatch_fragment.length} containing only "
+                        f"{VALID_CROSS_LOOP_DISPATCH_MODES!r}, got "
+                        f"{root_dispatch!r}"
                     )
         if self.backend_name == "cute":
             self._cute_tcgen05_config.normalize_pre_pid_type(
@@ -3516,6 +3563,8 @@ class ConfigSpec:
             fields["cross_loop_schedule"] = self.cross_loop_schedule
             assert self.cross_loop_pipeline_depth is not None
             fields["cross_loop_pipeline_depth"] = self.cross_loop_pipeline_depth
+            assert self.cross_loop_root_dispatch is not None
+            fields["cross_loop_root_dispatch"] = self.cross_loop_root_dispatch
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
             fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):

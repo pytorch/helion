@@ -17,6 +17,7 @@ PidTypeLiteral = Literal[
     "persistent_interleaved",
 ]
 CrossLoopScheduleLiteral = Literal["barrier", "static_pipeline"]
+CrossLoopDispatchLiteral = Literal["static", "elastic"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
@@ -53,6 +54,7 @@ class Config(Mapping[str, object]):
         pid_type: PidTypeLiteral | None = None,
         cross_loop_schedule: CrossLoopScheduleLiteral | None = None,
         cross_loop_pipeline_depth: int | None = None,
+        cross_loop_root_dispatch: list[CrossLoopDispatchLiteral] | None = None,
         num_sm_multiplier: int | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
@@ -96,6 +98,9 @@ class Config(Mapping[str, object]):
             cross_loop_pipeline_depth: Maximum causal depth for static
                 cross-loop pipeline scheduling. Valid values are 1 through 4;
                 depth 1 preserves the canonical/local placement.
+            cross_loop_root_dispatch: Per-root physical dispatch mode for static
+                cross-loop scheduling. Each entry is ``"static"`` or
+                ``"elastic"``. Unsupported kernels reject this field.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configs may select intermediate occupancy points.
@@ -148,6 +153,7 @@ class Config(Mapping[str, object]):
             "pid_type": pid_type,
             "cross_loop_schedule": cross_loop_schedule,
             "cross_loop_pipeline_depth": cross_loop_pipeline_depth,
+            "cross_loop_root_dispatch": cross_loop_root_dispatch,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
@@ -305,6 +311,13 @@ class Config(Mapping[str, object]):
     @property
     def cross_loop_pipeline_depth(self) -> int:
         return cast("int", self.config.get("cross_loop_pipeline_depth", 1))
+
+    @property
+    def cross_loop_root_dispatch(self) -> list[CrossLoopDispatchLiteral]:
+        return cast(
+            "list[CrossLoopDispatchLiteral]",
+            self.config.get("cross_loop_root_dispatch", []),
+        )
 
     @property
     def xcd_remap(self) -> bool:

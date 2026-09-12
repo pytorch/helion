@@ -1812,6 +1812,17 @@ def _publication(readiness_producer: ReadinessProducer) -> CoordinateRelation:
 
 
 class TestCrossLoopScheduler(TestCase):
+    def test_worker_schedule_segment_dispatch_mode_is_explicit(self) -> None:
+        (root_domain,) = _identify_root_domains((_domain((10, 4)),))
+        (task_order,) = _default_root_task_orders((root_domain,))
+        default = WorkerScheduleSegment(0, task_order, 0, 4, 0)
+        elastic = dataclasses.replace(default, dispatch_mode="elastic")
+
+        self.assertEqual(default.dispatch_mode, "static")
+        self.assertEqual(elastic.dispatch_mode, "elastic")
+        with self.assertRaisesRegex(ValueError, "invalid cross-loop dispatch mode"):
+            dataclasses.replace(default, dispatch_mode=cast("Any", "dynamic"))
+
     def test_scalar_frontier_monotonicity_is_proved_symbolically(self) -> None:
         ordinal_domain = _domain((10, 8, 1), kind="task_order")
         frontier_domain = _domain((20, 64, 1), kind="task_order")
