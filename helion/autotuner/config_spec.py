@@ -1200,6 +1200,11 @@ class ConfigSpec:
         # not rediscover the unavailable flash path for a 128x128 candidate.
         self.cute_attention_generic_fallback_enabled: bool = False
         self._cute_attention_generic_fallback_block_size_targets: dict[int, int] = {}
+        # CuTe flash-attention BACKWARD surface: set when the fused
+        # backward-attention detector fires (see cute_flash_bwd.py). Pins the
+        # (kv_tile, q_tile) block sizes to the 128x128 flash envelope.
+        self.cute_flash_bwd_search_enabled: bool = False
+        self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
@@ -1916,6 +1921,23 @@ class ConfigSpec:
         self.cute_chunk_recurrence_register_cap = EnumFragment(
             choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
         )
+
+    def enable_cute_flash_bwd_search(
+        self,
+        *,
+        block_size_targets: Mapping[int, int],
+    ) -> None:
+        """Enable the CuTe flash-attention BACKWARD surface.
+
+        Pins the (kv_tile, q_tile) block sizes to the 128x128 envelope the
+        fused backward emitter supports.
+        """
+        self.cute_flash_bwd_search_enabled = True
+        self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
+        for block_id, target in block_size_targets.items():
+            spec = self.block_sizes.block_id_lookup(block_id)
+            spec.autotuner_min = target
+            spec.max_size = target
 
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
