@@ -19,6 +19,7 @@ from .. import exc
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..autotuner.config_spec import NumThreadsSpec
+from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
 from ..language.tile_proxy import Tile
@@ -561,6 +562,14 @@ class TensorAttributeType(TypeInfo):
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo:
         attr = self.attr()
+        if origin.is_device() and (
+            replacement := get_device_func_replacement(getattr(torch.Tensor, attr))
+        ):
+            result = CallableType(origin, replacement).propagate_call(
+                (self.tensor, *args), kwargs, origin
+            )
+            assert result is not None
+            return result
         if attr in {"dim", "ndimension"} and not (args or kwargs):
             return TypeInfo.from_example(self.tensor.fake_value.ndim, origin)
         stride_dim_kwarg = attr == "stride" and not args and set(kwargs) == {"dim"}
@@ -795,10 +804,6 @@ class CallableType(LiteralType):
             return LiteralType(origin, None)
         if self.value in (torch.nonzero, torch.Tensor.nonzero) and origin.is_device():
             raise exc.DataDependentOutputShapeNotSupported(op_desc="torch.nonzero")
-        if self.value in (torch.chunk, torch.Tensor.chunk) and origin.is_device():
-            raise exc.UnsupportedSplitOperation(op="torch.chunk")
-        if self.value in (torch.unbind, torch.Tensor.unbind) and origin.is_device():
-            raise exc.UnsupportedSplitOperation(op="torch.unbind")
         if self.value in (torch.split, torch.Tensor.split) and origin.is_device():
             raise exc.UnsupportedSplitOperation(op="torch.split")
         if (

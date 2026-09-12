@@ -12,6 +12,7 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
@@ -216,6 +217,208 @@ class TestViews(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.split", code)
             self.assertIn("tl.join", code)
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.chunk lowering is Triton-only")
+    def test_torch_chunk_two(self):
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, use_method: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            n, d = x.shape
+            d = hl.specialize(d)
+            lo = x.new_empty((n, d // 2))
+            hi = torch.empty_like(lo)
+            for tile in hl.tile(n):
+                values = x[tile, :]
+                if use_method:
+                    a, b = values.chunk(2, dim=-1)
+                else:
+                    a, b = torch.chunk(input=values, chunks=2, dim=1)
+                lo[tile, :] = a
+                hi[tile, :] = b
+            return lo, hi
+
+        for d in (64, 128):
+            x = torch.arange(65 * d, device=DEVICE, dtype=torch.float32).reshape(65, d)
+            expected = torch.chunk(x, 2, dim=-1)
+            for use_method in (False, True):
+                with self.subTest(d=d, use_method=use_method):
+                    code, result = code_and_output(
+                        fn, (x, use_method), block_sizes=[32]
+                    )
+                    torch.testing.assert_close(result, expected)
+                    if _get_backend() == "triton":
+                        self.assertIn("tl.split", code)
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.unbind lowering is Triton-only")
+    def test_torch_unbind_two(self):
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, use_method: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            n, d = x.shape
+            d = hl.specialize(d)
+            lo = x.new_empty((n, d // 2))
+            hi = torch.empty_like(lo)
+            for tile in hl.tile(n):
+                values = x[tile, :].reshape(tile, 2, d // 2)
+                if use_method:
+                    permuted = values.permute(0, 2, 1)
+                    # Exercise a saved bound method as well as a direct call.
+                    unbind = permuted.unbind
+                    a, b = unbind(dim=-1)
+                else:
+                    a, b = torch.unbind(input=values, dim=1)
+                lo[tile, :] = a
+                hi[tile, :] = b
+            return lo, hi
+
+        for d in (64, 128):
+            x = torch.arange(65 * d, device=DEVICE, dtype=torch.float32).reshape(65, d)
+            expected = torch.unbind(x.reshape(65, 2, d // 2), dim=1)
+            for use_method in (False, True):
+                with self.subTest(d=d, use_method=use_method):
+                    _code, result = code_and_output(
+                        fn, (x, use_method), block_sizes=[32]
+                    )
+                    torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.chunk and torch.unbind lowering is Triton-only")
+    def test_torch_chunk_unbind_accumulator(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def fn(x: torch.Tensor, use_unbind: hl.constexpr) -> torch.Tensor:
+            n, d = x.shape
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                acc = hl.zeros([tile, d])
+                for _step in hl.tile(2, block_size=1):
+                    acc = acc + x[tile, :]
+                    if use_unbind:
+                        grouped = acc.reshape(tile, 2, d // 2).permute(0, 2, 1)
+                        a, b = grouped.unbind(dim=-1)
+                    else:
+                        a, b = torch.chunk(acc, 2, dim=-1)
+                    acc = torch.stack((a * 2, b * 3), dim=-2).reshape(tile, d)
+                out[tile, :] = acc
+            return out
+
+        x = torch.arange(65 * 64, device=DEVICE, dtype=torch.float32).reshape(65, 64)
+        left, right = torch.chunk(x, 2, dim=-1)
+        expected = torch.cat((left * 6, right * 12), dim=-1)
+        for use_unbind in (False, True):
+            with self.subTest(use_unbind=use_unbind):
+                _code, result = code_and_output(fn, (x, use_unbind), block_sizes=[32])
+                torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.chunk and torch.unbind lowering is Triton-only")
+    def test_torch_chunk_unbind_axes(self):
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, leading_axis: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            n, d, k = x.shape
+            d, k = hl.specialize((d, k))
+            lo = x.new_empty((n, d // 2, k))
+            hi = torch.empty_like(lo)
+            for tile in hl.tile(n):
+                values = x[tile, :, :].reshape(tile, d, k)
+                if leading_axis:
+                    # Default dim=0 and the unbound Tensor method form.
+                    transposed = values.permute(1, 0, 2)
+                    left, right = torch.Tensor.chunk(transposed, 2)
+                    a = left.permute(1, 0, 2)
+                    b = right.permute(1, 0, 2)
+                else:
+                    a, b = values.chunk(2, dim=-2)
+                grouped = torch.stack((a, b), dim=0)
+                c, e = grouped.unbind()
+                lo[tile, :, :] = c
+                hi[tile, :, :] = e
+            return lo, hi
+
+        x = torch.arange(65 * 8 * 4, device=DEVICE, dtype=torch.float32).reshape(
+            65, 8, 4
+        )
+        expected = torch.chunk(x, 2, dim=1)
+        for leading_axis in (False, True):
+            with self.subTest(leading_axis=leading_axis):
+                _code, result = code_and_output(fn, (x, leading_axis), block_sizes=[32])
+                torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.unbind lowering is Triton-only")
+    def test_torch_unbind_stack_flattened_tiles(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n, _ = x.shape
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                left, right = torch.unbind(x[tile_m, tile_n, :], dim=-1)
+                out[tile_m, tile_n, :] = torch.stack((right, left), dim=-1)
+            return out
+
+        x = torch.arange(4 * 8 * 2, device=DEVICE, dtype=torch.float32).reshape(4, 8, 2)
+        _code, result = code_and_output(
+            fn, (x,), block_sizes=[2, 8], flatten_loops=[True]
+        )
+        torch.testing.assert_close(result, x.flip(-1))
+
+    @onlyBackends(["triton"])
+    def test_torch_stack_flattened_tiles_dim_zero(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty((2, m, n), device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                values = x[tile_m, tile_n]
+                out[:, tile_m, tile_n] = torch.stack((values, values + 1), dim=0)
+            return out
+
+        x = torch.arange(4 * 8, device=DEVICE, dtype=torch.float32).reshape(4, 8)
+        _code, result = code_and_output(
+            fn, (x,), block_sizes=[2, 8], flatten_loops=[True]
+        )
+        torch.testing.assert_close(result, torch.stack((x, x + 1), dim=0))
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.chunk and torch.unbind lowering is Triton-only")
+    def test_torch_chunk_unbind_dot_accumulator(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def fn(
+            x: torch.Tensor, weight: torch.Tensor, use_unbind: hl.constexpr
+        ) -> torch.Tensor:
+            n, k = x.shape
+            d = weight.size(1)
+            out = x.new_empty((n, d), dtype=torch.float32)
+            for tile in hl.tile(n):
+                acc = hl.zeros([tile, d])
+                for tile_k in hl.tile(k, block_size=16):
+                    acc = hl.dot(x[tile, tile_k], weight[tile_k, :], acc=acc)
+                    if use_unbind:
+                        grouped = acc.reshape(tile, 2, d // 2).permute(0, 2, 1)
+                        a, b = grouped.unbind(dim=-1)
+                    else:
+                        a, b = torch.chunk(acc, 2, dim=-1)
+                    acc = torch.stack((a * 2, b * 3), dim=-2).reshape(tile, d)
+                out[tile, :] = acc
+            return out
+
+        x = torch.randn((65, 32), device=DEVICE, dtype=torch.float16)
+        weight = torch.randn((32, 64), device=DEVICE, dtype=torch.float16)
+        scale = torch.tensor([2.0] * 32 + [3.0] * 32, device=DEVICE)
+        first = x[:, :16].float() @ weight[:16, :].float()
+        second = x[:, 16:].float() @ weight[16:, :].float()
+        expected = (first * scale + second) * scale
+        for use_unbind in (False, True):
+            with self.subTest(use_unbind=use_unbind):
+                _code, result = code_and_output(
+                    fn, (x, weight, use_unbind), block_sizes=[32]
+                )
+                torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
     def test_join_broadcast_scalar(self):
         @helion.kernel(config={"block_size": 64})
