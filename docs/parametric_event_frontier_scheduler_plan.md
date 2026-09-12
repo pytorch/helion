@@ -472,6 +472,23 @@ were identical. The Qwen plans enter the same concrete
 identical schedules, barriers, and all seven counters, including the nested
 8->9 fan-in-32 counter.
 
+The canonical ragged FlashMLA B4/Q4/H16 case also passes this stricter
+contract. Its temporary fixed-capacity source uses `static_shapes=False` and
+explicitly specializes `num_heads` in addition to the already fixed B, Q,
+block-N, split/task capacity, query/cache dimensions, and block-table column
+capacity. The resulting plan has no parameter symbols and uses one canonical
+`build_worker_schedule` plus one global-list proposal. One cubin replayed the
+canonical sequence lengths, different lengths within the same fixed
+14/14/37/353 task buckets, and a semantic page permutation while retaining
+runtime `seq_lens` and block-table loads. Persistent and matched standalone
+were bit-exact in every replay. Over 200 cold-L2 samples, persistent was
+63.42 us versus 69.47 us for the matched three-launch Helion boundary and
+73.60 us for the ThunderKittens performance control. The latter still has its
+known nonfinite-output defect, so it is not a numerical reference. Crossing a
+specialized task-count bucket remains outside this milestone; both current
+Helion source boundaries expose a pre-existing all-empty-tail numerical issue
+in that case.
+
 For contrast, fully runtime batch cardinality remains a historical stress
 control, not the immediate contract. A one-cubin Qwen B1/B2 build is 6--12%
 slower and follows the obsolete parameterized root-major policy. A one-cubin
