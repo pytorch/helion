@@ -706,6 +706,7 @@ def _flash_bwd_wg_compute_block(
     n_tiles: int,
     m_mod_tiles: int,
     steps_expr: str,
+    persistent: bool = False,
 ) -> str:
     """One compute warpgroup's body (h = column half 0/1, warps 4-7 / 8-11)."""
     d = plan.head_dim
@@ -716,6 +717,14 @@ def _flash_bwd_wg_compute_block(
         if plan.causal
         else "fbwd_m_start + fbwd_i"
     )
+    # LSE/Delta staging slot. The two slots are separated by named barrier 3
+    # of the iteration in between, so the slot must alternate on the RUNNING
+    # iteration count. Persistent: `fbwd_i` restarts per tile, and with an odd
+    # `fbwd_steps` (causal walks) the next tile's first write would land in
+    # the slot the other warps of the group may still be reading (Delta of the
+    # previous tile's last iteration); `fbwd_phase` toggles once per iteration
+    # across tiles, so it is exactly that running parity.
+    par_expr = "fbwd_phase * 128" if persistent else "(fbwd_i % 2) * 128"
     p_pass_call = (
         "\n                _helion_flash_rt.fbwd_p_pairs_packed(tLDrS, "
         "fbwd_lse_frg, fbwd_ch * 32, 32, fbwd_scale2, " + mask_arg + ", fbwd_ch * 32)"
@@ -762,7 +771,7 @@ def _flash_bwd_wg_compute_block(
             fbwd_qbase = (fbwd_m_tile % {m_mod_tiles}) * 128 + {64 * h}
             fbwd_row_base = fbwd_q_row_base + fbwd_m_tile * 128
             fbwd_mask_lim = fbwd_kv_base + fbwd_thr_row - fbwd_qbase
-            fbwd_par = (fbwd_i % 2) * 128
+            fbwd_par = {par_expr}
             if fbwd_local_tidx < 64:
                 fbwd_stage_col = fbwd_row_base + {64 * h} + fbwd_local_tidx
                 fbwd_sLSE[fbwd_par + {64 * h} + fbwd_local_tidx] = _fbwd_mLSE[fbwd_stage_col]
@@ -990,8 +999,14 @@ def emit_flash_bwd_device_body(
             if (fbwd_i > 0) | (fbwd_tile_it > 0):
                 _helion_flash_rt.mbar_spin_wait(fbwd_dq_empty_ptr, fbwd_dqe_phase, 10000000)
                 fbwd_dqe_phase ^= 1"""
-        dq_empty_wait_tail = """
-        if fbwd_steps > 1:
+        # Persistent: a later tile with fbwd_steps == 1 skips the loop, so
+        # its only dQ gemm must still wait for the release of the previous
+        # tile's last dQ (one wait per dQ gemm except the kernel's first).
+        tail_cond = (
+            "(fbwd_steps > 1) | (fbwd_tile_it > 0)" if persistent else "fbwd_steps > 1"
+        )
+        dq_empty_wait_tail = f"""
+        if {tail_cond}:
             _helion_flash_rt.mbar_spin_wait(fbwd_dq_empty_ptr, fbwd_dqe_phase, 10000000)
             fbwd_dqe_phase ^= 1"""
 
@@ -1022,6 +1037,14 @@ def emit_flash_bwd_device_body(
                 cute.copy(_fbwd_tma_dq, tDQsDQ, tDQgDQ)
                 cute.arch.cp_async_bulk_commit_group()"""
 
+    # Persistent: the MMA warp's last ds_full wait of a tile must flip the
+    # parity like every other one, or the next tile's first wait is one phase
+    # behind: it passes early (dK/dQ read a stale dS) and, as soon as the
+    # compute warps get one more ds_full arrival ahead, it waits on the
+    # current phase forever (the deadlock: MMA @ds_full, compute @dp_full,
+    # reduce @dq_full, load @q_empty).
+    ds_tail_toggle = "\n        fbwd_dsf_phase ^= 1" if persistent else ""
+
     compute_blocks = "".join(
         _flash_bwd_wg_compute_block(
             h=h,
@@ -1032,6 +1055,7 @@ def emit_flash_bwd_device_body(
             n_tiles=n_tiles,
             m_mod_tiles=m_mod_tiles,
             steps_expr=steps_expr,
+            persistent=persistent,
         ).replace("FBWD_DK_OFF", str(dk_off))
         for h in (0, 1)
     )
@@ -1231,7 +1255,7 @@ def emit_flash_bwd_device_body(
             _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(fbwd_dv_addr, fbwd_s_addr, _helion_flash_ptx.make_smem_desc_start_addr(sdOt[None, None, None, fbwd_doe.index].iterator), fbwd_dot_base, tTSrP[None, None, None, 0].layout, tTSrDOt[None, None, None, 0].layout, "helion_fbwd_ts_idesc", zero_init=False)
             fbwd_doe.release()
         # Tail: dK/dQ of the last iteration.
-        _helion_flash_rt.mbar_spin_wait(fbwd_ds_full_ptr, fbwd_dsf_phase, 10000000)
+        _helion_flash_rt.mbar_spin_wait(fbwd_ds_full_ptr, fbwd_dsf_phase, 10000000){ds_tail_toggle}
         _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dk_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qe.index].iterator), fbwd_qt_base, tKSrQt[None, None, None, 0].layout, "helion_fbwd_dsnk_desc", "helion_fbwd_dsk_idesc", a_layout=tKSrDS[None, None, None, 0].layout, a_base=fbwd_dsnk_base, zero_init=fbwd_dk_zero){dq_empty_wait_tail}
         _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dqa_addr, _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, 0].iterator), fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dsmn_desc", "helion_fbwd_dq_idesc", a_layout=tDQrDS[None, None, None, 0].layout, a_base=fbwd_dsmn_base, zero_init=True)
         with cute.arch.elect_one():
@@ -1943,14 +1967,15 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
     q_stage = 2 if d == 128 else 4
     do_stage = 1 if d == 128 else 4
     total_tiles = plan.total_kv_rows // 128
-    # NOTE: the persistent tile-scheduler path (cute_flash_bwd_persistent=1)
-    # currently DEADLOCKS on a fresh compile -- a pre-existing bug that a stale
-    # warm cubin masked (the earlier "after2" persistent numbers came from a
-    # warm cache). The non-persistent path is faster than the old persistent
-    # number anyway (9.58ms vs 10.07ms d128), so force it off until the
-    # scheduler deadlock is root-caused. The knob remains in the search space
-    # but is a no-op, so cold autotune stays deadlock-free.
-    persistent = False
+    # Persistent tile scheduler (cute_flash_bwd_persistent=1): each CTA walks
+    # tile_id += grid_dim. The former fresh-compile deadlock was the MMA warp's
+    # tail ds_full wait not flipping its parity (see ds_tail_toggle). It is
+    # still slower than the non-persistent launch (d128 +0.5%, d128-causal and
+    # s4k-b8 +8%: static round-robin tiles, no inter-tile overlap), so the
+    # autotuner is expected to keep picking 0.
+    persistent = (
+        bool(df.config.config.get("cute_flash_bwd_persistent", 0)) and not two_cta
+    )
 
     emit_flash_module_statements(cg)
 
