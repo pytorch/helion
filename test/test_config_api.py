@@ -81,7 +81,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
-from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -160,7 +159,9 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
-            "cross_loop_schedule": st.sampled_from(["barrier", "static_pipeline"]),
+            "cross_loop_pipeline": st.sampled_from(
+                ["barrier", "static", "dynamic"]
+            ),
             "indexing": st.sampled_from(["pointer", "tensor_descriptor"]),
         }
     )
@@ -194,7 +195,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "num_warps",
                     "num_stages",
                     "pid_type",
-                    "cross_loop_schedule",
+                    "cross_loop_pipeline",
                     "indexing",
                 }
             )
@@ -389,8 +390,7 @@ class TestConfigAPI(TestCase):
             "num_warps",
             "num_stages",
             "pid_type",
-            "cross_loop_schedule",
-            "cross_loop_root_dispatch",
+            "cross_loop_pipeline",
             "indexing",
         }
 
@@ -403,74 +403,44 @@ class TestConfigAPI(TestCase):
         # Expected kwargs must be present as keyword-only
         self.assertTrue(expected.issubset(kwonly))
 
-    def test_cross_loop_schedule_is_an_admitted_triton_field(self) -> None:
+    def test_cross_loop_pipeline_is_an_admitted_triton_field(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
 
-        self.assertEqual(helion.Config().cross_loop_schedule, "barrier")
-        self.assertEqual(helion.Config().cross_loop_root_dispatch, [])
+        self.assertEqual(helion.Config().cross_loop_pipeline, "barrier")
         self.assertEqual(
-            helion.Config(cross_loop_schedule="static_pipeline").cross_loop_schedule,
-            "static_pipeline",
-        )
-        self.assertEqual(
-            helion.Config(
-                cross_loop_root_dispatch=["static", "dynamic"]
-            ).cross_loop_root_dispatch,
-            ["static", "dynamic"],
+            helion.Config(cross_loop_pipeline="dynamic").cross_loop_pipeline,
+            "dynamic",
         )
 
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(backend=TritonBackend())
-            self.assertTrue(spec.supports_config_key("cross_loop_schedule"))
-            self.assertTrue(spec.supports_config_key("cross_loop_root_dispatch"))
-            self.assertNotIn("cross_loop_schedule", spec._flat_fields())
-            self.assertNotIn("cross_loop_root_dispatch", spec._flat_fields())
+            self.assertTrue(spec.supports_config_key("cross_loop_pipeline"))
+            self.assertNotIn("cross_loop_pipeline", spec._flat_fields())
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "only for kernels with compiler-inferred cross-loop dependencies",
             ):
-                spec.normalize(helion.Config(cross_loop_schedule="barrier"))
+                spec.normalize(helion.Config(cross_loop_pipeline="barrier"))
 
-            spec.enable_cross_loop_schedule(3)
-            field = spec._flat_fields()["cross_loop_schedule"]
+            spec.enable_cross_loop_pipeline()
+            field = spec._flat_fields()["cross_loop_pipeline"]
             self.assertIsInstance(field, EnumFragment)
             assert isinstance(field, EnumFragment)
-            self.assertIs(field, spec.cross_loop_schedule)
-            self.assertEqual(field.choices, ("barrier", "static_pipeline"))
-            dispatch_field = spec._flat_fields()["cross_loop_root_dispatch"]
-            self.assertIsInstance(dispatch_field, ListOf)
-            assert isinstance(dispatch_field, ListOf)
-            self.assertIs(dispatch_field, spec.cross_loop_root_dispatch)
-            self.assertEqual(dispatch_field.length, 3)
-            self.assertIsInstance(dispatch_field.inner, EnumFragment)
-            assert isinstance(dispatch_field.inner, EnumFragment)
-            self.assertEqual(dispatch_field.inner.choices, ("static", "dynamic"))
+            self.assertIs(field, spec.cross_loop_pipeline)
+            self.assertEqual(field.choices, ("barrier", "static", "dynamic"))
             self.assertEqual(
-                spec.default_config()["cross_loop_schedule"],
+                spec.default_config()["cross_loop_pipeline"],
                 "barrier",
             )
-            self.assertEqual(
-                spec.default_config()["cross_loop_root_dispatch"],
-                ["static", "static", "static"],
-            )
 
-            static_config = spec.default_config()
-            static_config.config["cross_loop_schedule"] = "static_pipeline"
-            static_config.config["cross_loop_root_dispatch"] = [
-                "dynamic",
-                "static",
-                "dynamic",
-            ]
-            spec.normalize(static_config)
+            dynamic_config = spec.default_config()
+            dynamic_config.config["cross_loop_pipeline"] = "dynamic"
+            spec.normalize(dynamic_config)
             generation = ConfigGeneration(spec)
-            round_trip = generation.unflatten(generation.flatten(static_config))
+            round_trip = generation.unflatten(generation.flatten(dynamic_config))
             self.assertEqual(
-                round_trip["cross_loop_schedule"],
-                "static_pipeline",
-            )
-            self.assertEqual(
-                round_trip["cross_loop_root_dispatch"],
-                ["dynamic", "static", "dynamic"],
+                round_trip["cross_loop_pipeline"],
+                "dynamic",
             )
 
             with self.assertRaisesRegex(
@@ -478,48 +448,27 @@ class TestConfigAPI(TestCase):
                 "must be one of",
             ):
                 spec.normalize(
-                    helion.Config.from_dict({"cross_loop_schedule": "unknown"})
+                    helion.Config.from_dict({"cross_loop_pipeline": "unknown"})
                 )
 
-            for invalid_dispatch in (
-                "static",
-                ("static", "static", "static"),
-                ["static", "dynamic"],
-                ["static", "dynamic", "unknown"],
-            ):
-                with (
-                    self.subTest(invalid_dispatch=invalid_dispatch),
-                    self.assertRaisesRegex(
-                        exc.InvalidConfig,
-                        "must be a list of length 3",
-                    ),
-                ):
-                    spec.normalize(
-                        helion.Config.from_dict(
-                            {"cross_loop_root_dispatch": invalid_dispatch}
-                        )
-                    )
-
-    def test_cross_loop_schedule_is_not_supported_on_amd(self) -> None:
+    def test_cross_loop_pipeline_is_not_supported_on_amd(self) -> None:
         with patch("helion._compat.is_hip", return_value=True):
             spec = ConfigSpec(backend=TritonBackend())
-            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
-            self.assertFalse(spec.supports_config_key("cross_loop_root_dispatch"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "is not supported by backend",
             ):
-                spec.enable_cross_loop_schedule(3)
+                spec.enable_cross_loop_pipeline()
 
-    def test_cross_loop_schedule_is_not_supported_on_xpu(self) -> None:
+    def test_cross_loop_pipeline_is_not_supported_on_xpu(self) -> None:
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(
                 backend=TritonBackend(),
                 device=torch.device("xpu"),
                 num_sm=1,
             )
-            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
-            self.assertFalse(spec.supports_config_key("cross_loop_root_dispatch"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
 
     def test_warp_specialization_uses_effective_launcher_warp_count(self) -> None:
         backend = TritonBackend()

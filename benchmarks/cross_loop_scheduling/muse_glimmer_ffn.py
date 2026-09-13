@@ -521,7 +521,7 @@ def _compile_persistent(
             "num_warps": 1,
             "num_stages": 2,
             "pid_type": "persistent_blocked",
-            "cross_loop_schedule": "static_pipeline",
+            "cross_loop_pipeline": "static",
             "num_sm_multiplier": multiplier,
             "maxnreg": maxnreg,
             # Complete one readiness key at a time.  The first source axis is

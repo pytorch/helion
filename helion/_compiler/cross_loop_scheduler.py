@@ -8883,17 +8883,14 @@ def build_static_pipeline_plan(
     publishable_site_ids: frozenset[int] | None = None,
     continuation_ineligible_roots: frozenset[int] = frozenset(),
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-    cross_loop_root_dispatch: tuple[CrossLoopDispatchMode, ...] | None = None,
+    cross_loop_dispatch_mode: CrossLoopDispatchMode = "static",
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
-    if cross_loop_root_dispatch is None:
-        cross_loop_root_dispatch = ("static",) * len(root_task_orders)
-    if len(cross_loop_root_dispatch) != len(root_task_orders) or any(
-        mode not in ("static", "dynamic") for mode in cross_loop_root_dispatch
-    ):
+    if cross_loop_dispatch_mode not in ("static", "dynamic"):
         raise ValueError(
-            "cross-loop root dispatch must contain one static/dynamic mode per root"
+            "cross-loop dispatch mode must be either 'static' or 'dynamic'"
         )
+    root_dispatch_modes = (cross_loop_dispatch_mode,) * len(root_task_orders)
     schedule_capacity_parameters = frozenset(
         symbol
         for task_order in root_task_orders
@@ -8901,7 +8898,7 @@ def build_static_pipeline_plan(
     )
     if schedule_capacity_parameters:
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' requires a fixed task "
+            f"cross_loop_pipeline={cross_loop_dispatch_mode!r} requires a fixed task "
             "capacity and task order; specialize the schedule-affecting "
             "capacity (for example B_capacity and Q) while keeping runtime "
             "metadata values unspecialized; unresolved parameters: "
@@ -8986,13 +8983,13 @@ def build_static_pipeline_plan(
     proposal = (
         all_resident_plan
         if not continuations
-        and all(mode == "static" for mode in cross_loop_root_dispatch)
+        and cross_loop_dispatch_mode == "static"
         else _try_finalize_pipeline_proposal(
             readiness_graph=readiness_graph,
             worker_count=worker_count,
             readiness_counters=scheduling_counters,
             root_barrier_edges=all_resident_barriers,
-            root_dispatch_modes=cross_loop_root_dispatch,
+            root_dispatch_modes=root_dispatch_modes,
         )
     )
     if proposal is None and continuations:
@@ -9006,10 +9003,10 @@ def build_static_pipeline_plan(
             worker_count=worker_count,
             readiness_counters=all_resident_counters,
             root_barrier_edges=all_resident_barriers,
-            root_dispatch_modes=cross_loop_root_dispatch,
+            root_dispatch_modes=root_dispatch_modes,
         )
     if proposal is None:
-        if any(mode == "dynamic" for mode in cross_loop_root_dispatch):
+        if cross_loop_dispatch_mode == "dynamic":
             raise exc.InvalidConfig(
                 "the requested dynamic root dispatch does not admit a "
                 "progress-safe cross-loop schedule"

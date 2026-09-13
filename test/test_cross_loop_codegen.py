@@ -698,7 +698,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     nested_store_chain,
                     (x,),
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     **extra_config,
                 )
@@ -711,15 +711,14 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_dynamic_then_static_run_preserves_nested_readiness(self) -> None:
+    def test_dynamic_pipeline_preserves_nested_readiness(self) -> None:
         x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
         code, out = code_and_output(
             nested_load_store_chain,
             (x,),
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
-            cross_loop_root_dispatch=["dynamic", "static", "static"],
+            cross_loop_pipeline="dynamic",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -739,16 +738,15 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             for index, line in enumerate(lines[wait_index + 1 :], wait_index + 1)
             if line.startswith("    for ") and " in tl.range(" in line
         )
-        # Every dynamic producer packet is issued before the static cohort.
-        # The compact entry wait therefore cannot starve an unlaunched
-        # producer; its counter still gates completion and visibility.
+        # Every producer packet is issued before its consumers. The compact
+        # entry wait therefore cannot starve an unlaunched producer; its
+        # counter still gates completion and visibility.
         self.assertLess(wait_index, loop_index)
         self.assertTrue(lines[wait_index].startswith("    "))
         self.assertFalse(lines[wait_index].startswith("        "))
         self.assertIn("tl.cast(256, tl.uint32)", lines[wait_index + 1])
-        # The dynamic root has 256 tasks and the static run has 148 worker
-        # packets.  Monotone admission claims the former before the latter.
-        self.assertIn("% tl.cast(404, tl.uint64)", code)
+        # The producer root has 256 tasks. Monotone admission claims all of
+        # them before any consumer packet.
         self.assertIn("tile_dependency_dispatch_ticket_1 < 256", code)
 
     @skipIfNotCUDA()
@@ -761,8 +759,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[8, 8],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
-                cross_loop_root_dispatch=["dynamic", "dynamic"],
+                cross_loop_pipeline="dynamic",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -772,37 +769,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertNotIn("_minimum_resident_programs=", code)
         self.assertNotIn("tile_dependency_packet_dispatch", code)
         self.assertNotIn("tile_dependency_scheduled_logical_task", code)
-
-    @skipIfNotCUDA()
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_multiple_static_dynamic_runs_share_one_packet_stream(self) -> None:
-        x = torch.arange(8 * 4, device=DEVICE, dtype=torch.float32).reshape(8, 4)
-        with mock.patch.object(
-            cross_loop_scheduler,
-            "choose_final_arrival_continuations",
-            return_value=(),
-        ):
-            code, out = code_and_output(
-                readiness_counter_chain,
-                (x,),
-                pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
-                cross_loop_root_dispatch=[
-                    "static",
-                    "dynamic",
-                    "static",
-                    "dynamic",
-                ],
-                num_sm_multiplier=1,
-                num_warps=1,
-            )
-
-        torch.testing.assert_close(out, torch.tensor([528.0], device=DEVICE))
-        self.assertIn("tile_dependency_raw_dispatch_ticket", code)
-        self.assertGreaterEqual(
-            code.count("tile_dependency_dispatch_ticket_1 >="),
-            4,
-        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -826,8 +792,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 block_sizes=[1, 16, 1, 32],
                 l2_groupings=[2, 2],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
-                cross_loop_root_dispatch=["dynamic", "dynamic"],
+                cross_loop_pipeline="dynamic",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -872,8 +837,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     (x + launch,),
                     block_sizes=[1, 16, 1, 32],
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
-                    cross_loop_root_dispatch=["dynamic", "dynamic"],
+                    cross_loop_pipeline="dynamic",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
@@ -893,49 +857,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_kernel_scope_prefix_outlines_static_packet_suffix(self) -> None:
-        x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
-        kernel_scope_call = 0
-
-        def first_root_requires_kernel_scope(*_args: object) -> bool:
-            nonlocal kernel_scope_call
-            result = kernel_scope_call % 2 == 0
-            kernel_scope_call += 1
-            return result
-
-        with (
-            mock.patch.object(
-                cross_loop_scheduler,
-                "choose_final_arrival_continuations",
-                return_value=(),
-            ),
-            mock.patch.object(
-                cross_loop_codegen,
-                "_triton_root_requires_kernel_scope",
-                side_effect=first_root_requires_kernel_scope,
-            ),
-        ):
-            code, out = code_and_output(
-                cartesian_affine_chain,
-                (x,),
-                block_sizes=[1, 16, 1, 32],
-                pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
-                cross_loop_root_dispatch=["dynamic", "static"],
-                num_sm_multiplier=1,
-                num_warps=1,
-            )
-
-        torch.testing.assert_close(out, (x + 1) * 2)
-        marker = "@triton.jit(noinline=True)\ndef tile_dependency_packet_dispatch"
-        helper_begin = code.index(marker)
-        helper_end = code.index("\n@triton.jit", helper_begin + len(marker))
-        helper = code[helper_begin:helper_end]
-        self.assertIn("tile_dependency_logical_worker =", helper)
-        self.assertIn("tile_dependency_root_1_scheduled_task", helper)
-
-    @skipIfNotCUDA()
-    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_exact_nested_keys_wait_inside_each_loop_iteration(self) -> None:
         x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
 
@@ -949,7 +870,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x,),
                 block_sizes=[1, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1039,7 +960,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 helion.Config(
                     block_sizes=[1, 16],
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
@@ -1102,7 +1023,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x,),
                 block_sizes=[1, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1137,7 +1058,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[8, 8],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1171,7 +1092,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                         (x + launch,),
                         block_sizes=[1, producer_width, 1, consumer_width],
                         pid_type="persistent_blocked",
-                        cross_loop_schedule="static_pipeline",
+                        cross_loop_pipeline="static",
                         num_sm_multiplier=1,
                         num_warps=1,
                     )
@@ -1192,7 +1113,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[1, 16, 1, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1216,7 +1137,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 readiness_counter_chain,
                 (x + launch,),
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1249,7 +1170,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 32],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1276,7 +1197,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[16, 32],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1297,7 +1218,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 mixed_radix_continuation,
                 (x + launch,),
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1319,7 +1240,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch,),
                 block_sizes=[16, 32, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1341,7 +1262,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 (x + launch, y + launch),
                 block_sizes=[16, 16, 16],
                 pid_type="persistent_blocked",
-                cross_loop_schedule="static_pipeline",
+                cross_loop_pipeline="static",
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -1359,7 +1280,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             coalesced_multi_producer_join,
             (x, y),
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1394,7 +1315,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             coalesced_single_producer_fanout,
             (x,),
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1413,7 +1334,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             direct_nested_continuation,
             (x,),
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1452,7 +1373,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     block_sizes=[1, 16, 1, 32],
                     l2_groupings=[2, 2],
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
@@ -1470,7 +1391,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[4, 1, 4, 32],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1493,7 +1414,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[16, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1509,7 +1430,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             specialized_quotient_chain,
             (x, 8, 2),
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1530,7 +1451,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             block_sizes=[1, 16, 1, 32],
             loop_orders=[[1, 0], [0, 1]],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1550,7 +1471,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16, 1, 32],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1569,7 +1490,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1593,7 +1514,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     (x,),
                     block_sizes=[1, 16],
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
@@ -1612,7 +1533,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=2,
             num_warps=1,
         )
@@ -1638,7 +1559,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1655,7 +1576,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             (x,),
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -1675,7 +1596,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         config = helion.Config(
             block_sizes=[1, 16, 1, 32],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=4,
             num_warps=8,
         )
@@ -1758,7 +1679,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     kernel_args,
                     block_sizes=block_sizes,
                     pid_type="persistent_blocked",
-                    cross_loop_schedule="static_pipeline",
+                    cross_loop_pipeline="static",
                     num_sm_multiplier=1,
                     num_warps=4,
                     num_stages=2,
@@ -1825,7 +1746,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             kernel_args,
             block_sizes=[1, 16, 1, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_sm_multiplier=1,
             num_warps=4,
             num_stages=2,

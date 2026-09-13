@@ -591,12 +591,12 @@ def emit_cross_loop_schedule(
     corresponding counters. The targets are epoch-scaled, so fixed CUDA
     Graph arguments need neither a reset kernel nor a host-side epoch update.
     """
-    schedule = device_function.config.cross_loop_schedule
-    if schedule == "barrier":
+    pipeline = device_function.config.cross_loop_pipeline
+    if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
-    if schedule != "static_pipeline":
-        raise exc.InvalidConfig(f"unknown cross_loop_schedule value {schedule!r}")
+    if pipeline not in ("static", "dynamic"):
+        raise exc.InvalidConfig(f"unknown cross_loop_pipeline value {pipeline!r}")
 
     configured_case_geometries = tuple(
         _static_case_geometry(owner, root, device_function)
@@ -604,7 +604,7 @@ def emit_cross_loop_schedule(
     )
     if any(geometry is None for geometry in configured_case_geometries):
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' requires representable "
+            f"cross_loop_pipeline={pipeline!r} requires representable "
             "top-level task counts"
         )
     case_geometries = tuple(
@@ -684,7 +684,7 @@ def emit_cross_loop_schedule(
     )
     if any(domain is None for domain in configured_root_domains):
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' requires representable root domains"
+            f"cross_loop_pipeline={pipeline!r} requires representable root domains"
         )
     root_domains = tuple(
         domain for domain in configured_root_domains if domain is not None
@@ -696,7 +696,7 @@ def emit_cross_loop_schedule(
     )
     if root_task_orders is None:
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' requires a "
+            f"cross_loop_pipeline={pipeline!r} requires a "
             "representable root PID task order"
         )
     static_pipeline_plan = build_static_pipeline_plan(
@@ -707,18 +707,7 @@ def emit_cross_loop_schedule(
         publishable_site_ids=publishable_site_ids,
         continuation_ineligible_roots=kernel_scope_roots,
         prove_nonnegative=CompileEnvironment.current().known_nonnegative,
-        cross_loop_root_dispatch=cast(
-            "tuple[CrossLoopDispatchMode, ...]",
-            tuple(
-                cast(
-                    "list[str]",
-                    device_function.config.get(
-                        "cross_loop_root_dispatch",
-                        ["static"] * len(root_domains),
-                    ),
-                )
-            ),
-        ),
+        cross_loop_dispatch_mode=cast("CrossLoopDispatchMode", pipeline),
     )
     if static_pipeline_plan.root_task_orders != root_task_orders:
         raise AssertionError("pipeline plan changed the configured root task orders")
@@ -1045,7 +1034,7 @@ def emit_cross_loop_schedule(
                     scheduled_task_roots.add(root)
                     return
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' cannot render the "
+            f"cross_loop_pipeline={pipeline!r} cannot render the "
             f"configured traversal for root {root}"
         )
 
@@ -1067,7 +1056,7 @@ def emit_cross_loop_schedule(
             )
             if reference is None:
                 raise exc.InvalidConfig(
-                    "cross_loop_schedule='static_pipeline' cannot render the "
+                    f"cross_loop_pipeline={pipeline!r} cannot render the "
                     f"configured traversal for root {segment.root}"
                 )
             if segment.task_order != reference:
@@ -2210,7 +2199,7 @@ def emit_cross_loop_schedule(
                 id(segment) not in segment_geometry_by_identity for segment in segments
             ):
                 raise exc.InvalidConfig(
-                    "cross_loop_schedule='static_pipeline' does not support "
+                    f"cross_loop_pipeline={pipeline!r} does not support "
                     f"root {root}'s packed worker assignment"
                 )
             static_segments_by_root[root] = segments
@@ -2220,7 +2209,7 @@ def emit_cross_loop_schedule(
             segment.dispatch_offset % segment.worker_count for segment in segments
         ):
             raise exc.InvalidConfig(
-                "cross_loop_schedule='static_pipeline' does not "
+                f"cross_loop_pipeline={pipeline!r} does not "
                 f"support root {root}'s worker assignment"
             )
         static_segments_by_root[root] = segments

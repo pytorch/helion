@@ -217,15 +217,15 @@ class TestTileDependencyAnalysis(TestCase):
         self.assertEqual(
             host_function.device_ir.implicit_dependency_starts, frozenset()
         )
-        self.assertNotIn("cross_loop_schedule", bound.config_spec._flat_fields())
+        self.assertNotIn("cross_loop_pipeline", bound.config_spec._flat_fields())
 
     @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
-    def test_regular_kernels_do_not_expose_cross_loop_schedule(self) -> None:
+    def test_regular_kernels_do_not_expose_cross_loop_pipeline(self) -> None:
         x = torch.empty(8, device=DEVICE)
         for kernel in (single_loop, independent_loops):
             bound = kernel.bind((x,))
             self.assertNotIn(
-                "cross_loop_schedule",
+                "cross_loop_pipeline",
                 bound.config_spec._flat_fields(),
             )
 
@@ -278,15 +278,15 @@ class TestTileDependencyAnalysis(TestCase):
 @skipIfNotCUDA()
 @skipIfRefEager("tile-dependency lowering is unavailable in ref eager mode")
 class TestTritonTileDependencyLowering(TestCase):
-    def test_implicit_dependency_exposes_cross_loop_schedule(self) -> None:
+    def test_implicit_dependency_exposes_cross_loop_pipeline(self) -> None:
         x = torch.empty(8, device=DEVICE)
         bound = implicit_tile_dependency_chain.bind((x,))
-        fragment = bound.config_spec._flat_fields()["cross_loop_schedule"]
+        fragment = bound.config_spec._flat_fields()["cross_loop_pipeline"]
         self.assertIsInstance(fragment, EnumFragment)
         assert isinstance(fragment, EnumFragment)
-        self.assertEqual(fragment.choices, ("barrier", "static_pipeline"))
+        self.assertEqual(fragment.choices, ("barrier", "static", "dynamic"))
         self.assertEqual(
-            bound.config_spec.default_config()["cross_loop_schedule"],
+            bound.config_spec.default_config()["cross_loop_pipeline"],
             "barrier",
         )
 
@@ -348,7 +348,7 @@ class TestTritonTileDependencyLowering(TestCase):
             (x,),
             block_sizes=[8, 8],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
         )
         torch.testing.assert_close(output, (x + 1) * 2)
         self.assertIn("tile_dependency_root_barrier_wait", code)
@@ -364,11 +364,11 @@ class TestTritonTileDependencyLowering(TestCase):
         }
         static_config = helion.Config(
             **common,
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
         )
         barrier_config = helion.Config(
             **common,
-            cross_loop_schedule="barrier",
+            cross_loop_pipeline="barrier",
         )
 
         static_before = bound.to_code(static_config)
@@ -386,7 +386,7 @@ class TestTritonTileDependencyLowering(TestCase):
             (x,),
             block_sizes=[8, 8, 8],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
         )
         out0, out1 = outputs
         torch.testing.assert_close(out0, (x + 1) * 2)
@@ -403,7 +403,7 @@ class TestTritonTileDependencyLowering(TestCase):
             (x,),
             block_sizes=[8, 8, 8],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_warps=1,
         )
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
@@ -420,7 +420,7 @@ class TestTritonTileDependencyLowering(TestCase):
         config = helion.Config(
             block_sizes=[16, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_warps=1,
         )
 
@@ -435,7 +435,7 @@ class TestTritonTileDependencyLowering(TestCase):
         config = helion.Config(
             block_sizes=[16, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_warps=1,
         )
         code = bound.to_code(config)
@@ -472,7 +472,7 @@ class TestTritonTileDependencyLowering(TestCase):
             (a, b, c),
             block_sizes=[16, 16, 16, 16, 16, 16],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_warps=4,
         )
         torch.testing.assert_close(output, a, atol=0, rtol=0)
@@ -496,7 +496,7 @@ class TestTritonTileDependencyLowering(TestCase):
                 "pointer",
             ],
             pid_type="persistent_blocked",
-            cross_loop_schedule="static_pipeline",
+            cross_loop_pipeline="static",
             num_warps=4,
         )
 

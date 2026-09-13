@@ -4143,7 +4143,7 @@ class TestCrossLoopScheduler(TestCase):
             self.assertEqual(counter.uniform_arrival_count(), 2)
             self.assertTrue(plan.worker_schedule.segments_for_root(1))
 
-    def test_pipeline_freezes_root_dispatch_after_scheduling(self) -> None:
+    def test_pipeline_freezes_uniform_dispatch_after_scheduling(self) -> None:
         dependency_graph = _dependency_graph(
             [[10], [20]],
             _access(
@@ -4167,7 +4167,7 @@ class TestCrossLoopScheduler(TestCase):
             ),
             axis_geometry={10: (8, 16), 20: (4, 32)},
             worker_count=4,
-            cross_loop_root_dispatch=("dynamic", "static"),
+            cross_loop_dispatch_mode="dynamic",
         )
 
         self.assertEqual(
@@ -4175,7 +4175,7 @@ class TestCrossLoopScheduler(TestCase):
                 (segment.root, segment.dispatch_mode)
                 for segment in plan.worker_schedule.segments
             ),
-            ((0, "dynamic"), (1, "static")),
+            ((0, "dynamic"), (1, "dynamic")),
         )
 
     def test_unsupported_access_scale_uses_root_barrier(self) -> None:

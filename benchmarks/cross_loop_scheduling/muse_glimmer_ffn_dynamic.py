@@ -457,7 +457,7 @@ def _compile(
         values.update(
             {
                 "pid_type": "persistent_blocked",
-                "cross_loop_schedule": "static_pipeline",
+                "cross_loop_pipeline": "dynamic",
                 "num_sm_multiplier": multiplier,
             }
         )
