@@ -4,6 +4,13 @@ Status: canonical implementation plan after the 2026-09-12 phase-0 executor
 ablation rejected the first physical design.  Architecture, Qwen/Gemma, and
 execution/progress reviewers signed off on the revised one-shot packet design.
 
+Follow-up roadmap decision (not yet implemented): collapse the currently
+implemented root-indexed dispatch vector and `cross_loop_schedule` into one
+kernel-wide `cross_loop_pipeline` enum with values `barrier`, `static`, and
+`dynamic`.  The mixed-mode implementation remains useful validation that both
+executors share one schedule, but current measurements do not justify exposing
+or autotuning a combinatorial per-root policy.
+
 This document supersedes the global event-frontier/list-scheduling roadmap in
 `parametric_event_frontier_scheduler_plan.md`.  That document remains useful
 history for the symbolic relation work already merged into this branch, but it
@@ -16,22 +23,25 @@ compiler implementation.
 
 ## Decision
 
-Build one compiler scheduler with two execution choices, not two scheduling
-algorithms:
+Build one compiler scheduler with two scheduled execution choices, not two
+scheduling algorithms:
 
 1. Construct one canonical, depth-one logical schedule from the existing
    `TileDependencyGraph`, `ReadinessGraph`, readiness counters, final-arrival
    continuations, and root-local ordering pass.
 2. Represent every non-continuation root exactly once in the existing
    `WorkerSchedule`, in source/root order.
-3. Select `static` or `dynamic` execution independently for each root through
-   one root-indexed autotuning field.
-4. Lower the final segment sequence into one ordered packet stream.  Static
-   regions contribute coarse worker-strand packets; dynamic regions contribute
-   one packet per logical task.
-5. Delete the global event-frontier/list placer, its pipeline-depth knob, and
-   the special one-source ticket path after the general executor passes the
-   performance gates below.
+3. Select one kernel-wide cross-loop execution policy: `barrier`, `static`, or
+   `dynamic`.
+4. For `static` and `dynamic`, lower the same final segment sequence through
+   the same code-generation machinery.  Static execution assigns persistent
+   worker strands directly; dynamic execution contributes one ordered packet
+   per logical task.  `barrier` retains the conventional phase/barrier
+   lowering and is the default/fallback.
+5. Delete the root-indexed dispatch vector and mixed-run machinery after the
+   uniform endpoint gates below pass.  The already-deleted global
+   event-frontier/list placer, pipeline-depth knob, and special one-source
+   ticket path remain deleted.
 
 The scheduler still makes important decisions: it derives exact readiness,
 selects continuations, chooses a root-local task permutation, and proves
@@ -41,8 +51,11 @@ tried to approximate with fixed workers.
 
 The north star is simplification.  The final compiler must have one semantic
 DAG, one readiness graph, one worker schedule, one continuation identity, and
-one code-generation path.  Static versus dynamic is a physical execution
-property of a root in that schedule, not another scheduler or plan IR.
+one scheduled code-generation path.  Static versus dynamic is a kernel-wide
+physical ownership policy over that same schedule, not another scheduler or
+plan IR.  Dynamic still uses a monotone ticket to assign one-shot task packets,
+but unlike the deleted source-ticket escape hatch it does not construct a
+special schedule, special frontier, or source-to-static handoff.
 
 ## Evidence for the pivot
 
@@ -112,6 +125,26 @@ Current `static_shapes=False` controls are approximately 100.320 us on GPU0
 and 104.352 us on GPU7; acceptance uses a fresh same-device, same-source static
 golden.  Gemma A4B likewise has a strong checked-in static control around
 49--51 us at B1.
+
+Follow-up root-flip ablations found no mixed policy that beat the preferred
+uniform endpoint.  The decisive MLA B4 experiment used exactly the previously
+suggested handoff—dynamic attention root 0 followed by static roots 1--10—and
+measured 106.208 us, versus 61.280 us for all dynamic and 67.456 us for the
+matched standalone boundary.  It was bit-exact.  All static measured 169.792
+us; making only the final root static measured 65.264 us and still lost margin
+relative to all dynamic.  One-root flips also regressed Qwen (106.592 ->
+114.496 us), Gemma (51.136 -> 55.104 us), and DeepSeek (163.872 -> 167.776
+us); Nemotron and the tested Muse reduction flip were neutral within noise or
+slightly worse.  Full reproduction details live in
+`helion-dynamic-dispatch-probes/docs/root_dispatch_flip_ablation.md`.
+
+This clarifies the old phrase "keep the second half resident."  The all-dynamic
+one-shot stream already issues downstream packets as producer CTAs retire;
+exact readiness counters let those consumers overlap the remaining producers.
+Static ownership is not required for the persistent kernel to remain resident.
+For MLA, a static suffix instead creates a complete fixed-worker cohort whose
+strands cannot steal unevenly released reduction work.  That loses the load
+balancing the dynamic endpoint was intended to provide.
 
 The experiments used two physical implementations:
 
@@ -333,9 +366,9 @@ There is no list-schedule proposal, candidate cascade, priority queue,
 criticality class, release credit, affine-repeat policy, or pipeline-depth
 search in this pipeline.
 
-## Autotuning surface
+## Current implemented autotuning surface
 
-Replace `cross_loop_pipeline_depth` with one field:
+The first unification milestone replaced `cross_loop_pipeline_depth` with:
 
 ```python
 cross_loop_root_dispatch: list[Literal["static", "dynamic"]]
@@ -355,7 +388,9 @@ meaning stable when continuation selection removes a root.  The entry for a
 continuation root is ignored; duplicate autotuner candidates are acceptable
 and preferable to topology-specific knob shapes.
 
-Expected useful settings are evidence, not compiler heuristics:
+The root-vector implementation proved arbitrary mixtures correct and made the
+two endpoints directly comparable.  It is now an intermediate implementation,
+not the intended public surface.  Expected endpoint settings were:
 
 - FlashMLA B4/B9: all non-continuation roots dynamic;
 - Muse FFN: all non-continuation roots dynamic;
@@ -367,6 +402,50 @@ Expected useful settings are evidence, not compiler heuristics:
 Do not infer a mode from a model name, root number, fan-in literal, task count
 threshold, or a topology-shaped candidate list.  The only compiler policy is
 legality; profitability belongs to the ordinary autotuner.
+
+## Planned kernel-wide autotuning surface
+
+Replace both `cross_loop_schedule` and `cross_loop_root_dispatch` with one
+ordinary enum:
+
+```python
+cross_loop_pipeline: Literal["barrier", "static", "dynamic"]
+```
+
+The default and first autotuner candidate is `"barrier"`, preserving the
+general conventional lowering.  The meanings are exact:
+
+- `barrier`: use the existing grid/phase-barrier lowering and do not build the
+  scheduled executor;
+- `static`: build the canonical schedule once and execute every retained root
+  with direct persistent-worker ownership; and
+- `dynamic`: build that identical canonical schedule and execute every
+  retained root as ordered one-shot packets assigned by the monotone ticket.
+
+This is one fundamental autotuning coordinate, like the other scalar Triton
+execution knobs.  It has three fixed choices for every eligible kernel; do not
+derive a topology-specific candidate set.  Unsupported scheduled endpoints
+are ordinary invalid configurations, while `barrier` remains available.  A
+continuation root has no independent dispatch decision because it is already
+contracted into its triggering producer by the shared schedule.
+
+Do not retain compatibility aliases for the two superseded experimental keys.
+Checked-in configurations and tests should migrate mechanically.  Rename
+`CrossLoopScheduleLiteral` to `CrossLoopPipelineLiteral`; remove
+`CrossLoopDispatchLiteral`, the root-count-dependent `ListOf` field, and the
+root-count argument that existed only to size it.
+
+Keep the existing `WorkerSchedule`, `WorkerScheduleSegment`, readiness plans,
+continuations, and task renderers.  It is acceptable for a segment to retain a
+derived `dispatch_mode` internally if that keeps rendering simple, but there
+must be exactly one authoritative kernel-wide mode and no independently
+mutable per-root copy.  Prefer passing that scalar mode through plan
+construction and deriving segment behavior from it.
+
+The burden of proof for restoring per-root tuning is now empirical.  Reopen
+that design only if a real, model-agnostic mixed workload materially beats
+both uniform endpoints and the benefit survives matched cold-L2 measurement.
+Do not restore it merely because a mixture is mechanically expressible.
 
 ## Static execution
 
@@ -793,6 +872,50 @@ For every retained binary record registers, spills, shared memory, warps,
 stages, worker count, and dispatch vector.  A schedule speedup caused by changed
 fusion or numerics is invalid.
 
+### Phase 8: collapse physical policy to one kernel-wide knob — planned
+
+This phase is intentionally deferred.  Do not begin it until the current
+uniform endpoint measurements and compiler state are saved.
+
+- Add `cross_loop_pipeline` as an `EnumFragment` over exactly
+  `("barrier", "static", "dynamic")`, defaulting to `"barrier"`.
+- Remove public/runtime/backend/autotuner support for `cross_loop_schedule` and
+  `cross_loop_root_dispatch`; do not retain aliases.
+- Rename `enable_cross_loop_schedule(root_count)` to the corresponding
+  root-count-independent pipeline-enablement API.
+- Route `barrier` directly to the existing phase-loop lowering.  Route both
+  scheduled values through one schedule-construction transaction, passing one
+  scalar ownership mode to the final plan/lowering boundary.
+- Remove root-vector normalization, mutation, uniform-candidate synthesis,
+  ignored continuation entries, adjacent-mode run construction, and mixed-run
+  packet-prefix bookkeeping.
+- Preserve one-shot dynamic packet allocation and the all-static direct-PID
+  strength reduction.  Do not reintroduce the source-ticket frontier, a
+  resident claim loop, or separate schedule builders.
+- Simplify the progress proof to the two uniform scheduled endpoints.  Delete
+  mixed `static -> dynamic` and `dynamic -> static` transition obligations,
+  while retaining exact readiness, continuation, replay, and packet-coverage
+  proofs.
+- Replace mixed-policy tests with three-way config/API tests and uniform
+  static/dynamic semantic controls.  Remove tests whose only contract is
+  per-root mutation; retain task-rendering tests that remain generally useful.
+- Mechanically migrate checked-in benchmark configurations, excluding the two
+  user-owned dirty Qwen probe files until their edits can be preserved
+  explicitly.
+- Re-run the complete acceptance matrix: `barrier` as fallback; static for
+  Qwen, Gemma, and MLA Q1/Q2; dynamic for MLA B4/B9, Muse, DeepSeek, and
+  Nemotron.  Require unchanged numerics, fusion, continuations, cold-L2
+  margins, and replay correctness.
+- Compare lowered Triton for the static endpoint against the current
+  byte-identical Qwen/Gemma controls and dynamic packet facts against the
+  current MLA controls.  Any endpoint regression is a blocker; do not recover
+  it with a workload predicate.
+
+Expected simplifications include deleting the combinatorial `ListOf` search
+dimension, mixed-run coalescing, mixed-cohort residency validation, and two of
+the four packet-transition proof cases.  The dynamic ticket remains only as a
+generic physical allocator over the canonical schedule.
+
 ## Acceptance criteria
 
 The redesign is complete only when all of the following hold:
@@ -801,8 +924,9 @@ The redesign is complete only when all of the following hold:
    `StaticPipelinePlan`.
 2. Every scheduled root has exactly one authoritative segment.
 3. Static and dynamic render the same segment traversal.
-4. Arbitrary legal root-mode mixtures lower to one ordered packet stream and
-   one progress proof; all-static is only its identity strength reduction.
+4. `static` and `dynamic` lower the same canonical root/segment traversal;
+   all-static is its direct-PID strength reduction and all-dynamic is its
+   one-shot packet allocation.
 5. `cross_loop_pipeline_depth`, global list placement, and transient/source
    ticket policy are absent from production code.
 6. No workload name, root literal, fan-in literal, or task-count threshold
@@ -813,16 +937,20 @@ The redesign is complete only when all of the following hold:
 9. DeepSeek/Nemotron retain at least the dynamic-root-major signal; remaining
    gaps to standalone are reported as body/resource work, not hidden.
 10. Correctness, replay, root barriers, nested waits, and continuations pass
-    in static, dynamic, and mixed synthetic tests; statically zero-capacity
-    roots are rejected explicitly.
+    in both scheduled modes; statically zero-capacity roots are rejected
+    explicitly.
+11. `cross_loop_pipeline` is the only public cross-loop policy knob, has the
+    fixed choices `barrier`, `static`, and `dynamic`, and defaults to
+    `barrier`.
 
-The all-static golden additionally requires: omitted dispatch field defaults to
-all static; no cursor allocation or atomic claim appears; plan/counter/barrier
-facts match the current control; Qwen retains continuations at roots 7, 8, and
-10 with root 13 resident; Gemma retains root 6 as its continuation and root 7
-resident; and static nested counters remain unchanged.
+The static golden additionally requires: explicit
+`cross_loop_pipeline="static"` emits no cursor allocation or atomic claim;
+plan/counter/barrier facts match the current control; Qwen retains
+continuations at roots 7, 8, and 10 with root 13 resident; Gemma retains root 6
+as its continuation and root 7 resident; and static nested counters remain
+unchanged.  Omitting the new field must instead select `barrier`.
 
 The failed fixed resident claim loop is not retained.  If the ordered packet
-stream cannot preserve all-dynamic MLA/Muse, all-static Qwen/Gemma, and a
-correct mixed schedule, stop and revisit unification rather than adding a
-second permanent scheduler behind a workload predicate.
+stream cannot preserve dynamic MLA/Muse and static Qwen/Gemma through the same
+canonical schedule, stop and revisit unification rather than adding a second
+permanent scheduler behind a workload predicate.
