@@ -819,8 +819,8 @@ The redesign is complete only when all of the following hold:
 The all-static golden additionally requires: omitted dispatch field defaults to
 all static; no cursor allocation or atomic claim appears; plan/counter/barrier
 facts match the current control; Qwen retains continuations at roots 7, 8, and
-10 with root 13 resident; Gemma retains root 6 resident and root 7 as its
-continuation; and static nested counters remain unchanged.
+10 with root 13 resident; Gemma retains root 6 as its continuation and root 7
+resident; and static nested counters remain unchanged.
 
 The failed fixed resident claim loop is not retained.  If the ordered packet
 stream cannot preserve all-dynamic MLA/Muse, all-static Qwen/Gemma, and a
