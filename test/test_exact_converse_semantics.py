@@ -7,10 +7,6 @@ from unittest import mock
 
 import sympy
 
-from helion._compiler import cross_loop_scheduler
-from helion._compiler.cross_loop_scheduler import RootBarrierPublication
-from helion._compiler.cross_loop_scheduler import RootBarrierPublicationPlan
-from helion._compiler.cross_loop_scheduler import WorkerSchedule
 from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
@@ -110,59 +106,6 @@ class TestExactConverseSemantics(TestCase):
                 )
         self.assertEqual(task_order.source_domain, old_domain)
 
-    def test_reorder_symbolic_source_axes_retains_exact_converse(self) -> None:
-        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
-        source = CoordinateDomain(
-            (10, 11),
-            ((10, 3), (11, batch)),
-            kind="task_order",
-            _allow_empty=True,
-        )
-        target = CoordinateDomain(
-            (20, 21),
-            ((20, batch), (21, 3)),
-            identity=0,
-            _allow_empty=True,
-        )
-        relation = CoordinateRelation.point_map(
-            source,
-            target,
-            (
-                (
-                    ((10, 0, 3, 1), (11, 0, batch, 1)),
-                    (coordinate_axis_symbol(11), coordinate_axis_symbol(10)),
-                ),
-            ),
-        )
-        self.assertIsNotNone(relation.converse())
-
-        with mock.patch.object(
-            CoordinateRelation,
-            "_factored_source_support_converse",
-            new_callable=mock.PropertyMock,
-            side_effect=AssertionError("source reorder must retain its converse"),
-        ):
-            reordered = relation.reorder_source_axes((11, 10))
-            self.assertIsNotNone(reordered)
-            assert reordered is not None
-            self.assertEqual(reordered.source_domain.shape_expr, (batch, 3))
-            self.assertTrue(reordered.source_domain._allow_empty)
-            self.assertTrue(reordered.is_bijection_from_source_support())
-            converse = reordered.converse()
-            self.assertIsNotNone(converse)
-            assert converse is not None
-            self.assertEqual(converse.target_domain, reordered.source_domain)
-
-        for concrete_batch in (0, 1, 4):
-            with self.subTest(batch=concrete_batch):
-                concrete = reordered.substitute_parameters({batch: concrete_batch})
-                original = relation.substitute_parameters({batch: concrete_batch})
-                self.assertTrue(concrete.is_bijection_from_source_support())
-                self.assertEqual(
-                    concrete.materialize(source_axis_order=(10, 11)),
-                    original.materialize(source_axis_order=(10, 11)),
-                )
-
     def test_relation_transform_exact_converse_provenance(self) -> None:
         extent = sympy.Symbol("extent", integer=True, nonnegative=True)
         source = CoordinateDomain(
@@ -196,12 +139,9 @@ class TestExactConverseSemantics(TestCase):
             _allow_empty=True,
         )
         renamed = relation.rename_target_axes(renamed_target)
-        reordered = relation.reorder_source_axes((11, 10))
         self.assertIsNotNone(renamed)
-        self.assertIsNotNone(reordered)
-        assert renamed is not None and reordered is not None
+        assert renamed is not None
         self.assertIsNotNone(_memoized_exact_converse(renamed))
-        self.assertIsNotNone(_memoized_exact_converse(reordered))
 
         def assert_cached_converse_is_exact(
             transformed: CoordinateRelation,
@@ -225,8 +165,6 @@ class TestExactConverseSemantics(TestCase):
         for concrete_extent in (0, 1, 4):
             with self.subTest(transform="rename_target", extent=concrete_extent):
                 assert_cached_converse_is_exact(renamed, concrete_extent)
-            with self.subTest(transform="reorder_source", extent=concrete_extent):
-                assert_cached_converse_is_exact(reordered, concrete_extent)
             with self.subTest(transform="substitute", extent=concrete_extent):
                 assert_cached_converse_is_exact(relation, concrete_extent)
 
@@ -350,31 +288,6 @@ class TestExactConverseSemantics(TestCase):
         self.assertIsNotNone(inverse)
         assert inverse is not None
         self.assertTrue(inverse.is_total_function())
-
-    def test_normalized_segment_widening_does_not_reconstruct_converse(
-        self,
-    ) -> None:
-        _old_domain, widened_domain, task_order = self._partial_worker_task_order()
-        segment = WorkerScheduleSegment(
-            root=0,
-            task_order=task_order,
-            worker_begin=0,
-            worker_count=4,
-            dispatch_offset=0,
-        )
-
-        with mock.patch.object(
-            CoordinateRelation,
-            "_factored_source_support_converse",
-            new_callable=mock.PropertyMock,
-            side_effect=AssertionError("normalization must retain its converse"),
-        ):
-            normalized = cross_loop_scheduler._normalize_dense_schedule_segment(
-                segment,
-                widened_domain,
-            )
-            self.assertIsNotNone(_memoized_exact_converse(normalized.task_order))
-            WorkerSchedule(4, (normalized,))
 
     def test_static_quotient_bounds_are_valid_for_signed_integer_base(self) -> None:
         value = sympy.Symbol("value", integer=True)
@@ -562,131 +475,53 @@ class TestExactConverseSemantics(TestCase):
             ),
         )
 
-    def test_worker_schedule_requires_disjoint_source_support(self) -> None:
-        schedule_domain = CoordinateDomain(
-            (-3, -2, -1),
-            ((-3, 2), (-2, 6), (-1, 1)),
-            kind="worker",
-        )
-        left_target = CoordinateDomain((10,), ((10, 4),), identity=0)
-        right_target = CoordinateDomain((20,), ((20, 2),), identity=1)
-        worker = coordinate_axis_symbol(-2)
-
-        def placement(
-            target: CoordinateDomain,
-            begin: int,
-            end: int,
-        ) -> CoordinateRelation:
-            return CoordinateRelation.point_map(
-                schedule_domain,
-                target,
-                (
-                    (
-                        ((-3, 1, 2, 1), (-2, begin, end, 1), (-1, 0, 1, 1)),
-                        (worker - begin,),
-                    ),
-                ),
-            )
-
-        left = placement(left_target, 0, 4)
-        adjacent = placement(right_target, 4, 6)
-        overlap = placement(right_target, 3, 5)
-        self.assertTrue(left.has_disjoint_source_support(adjacent))
-        self.assertFalse(left.has_disjoint_source_support(overlap))
-
-        # Dense-support intervals are comparable only after both relations
-        # use the same source-axis basis.  Dropping each relation's own fixed
-        # axis would incorrectly make these overlapping supports look like
-        # adjacent scalar intervals.
-        crossed_domain = CoordinateDomain((0, 1), ((0, 2), (1, 4)))
-        crossed_left = CoordinateRelation.point_map(
-            crossed_domain,
-            CoordinateDomain((10,), ((10, 2),)),
-            (
-                (
-                    ((0, 1, 2, 1), (1, 2, 4, 1)),
-                    (coordinate_axis_symbol(1) - 2,),
-                ),
-            ),
-        )
-        crossed_right = CoordinateRelation.point_map(
-            crossed_domain,
-            CoordinateDomain((20,), ((20, 2),)),
-            (
-                (
-                    ((0, 0, 2, 1), (1, 2, 3, 1)),
-                    (coordinate_axis_symbol(0),),
-                ),
-            ),
-        )
-        self.assertIsNotNone(crossed_left.converse())
-        self.assertIsNotNone(crossed_right.converse())
-        self.assertFalse(crossed_left.has_disjoint_source_support(crossed_right))
-
-        with mock.patch.object(
-            cross_loop_scheduler,
-            "_root_major_schedule_geometry_from_parts",
-            side_effect=AssertionError(
-                "derived geometry must not replace relation validation"
-            ),
-        ):
-            WorkerSchedule(
-                6,
-                (
-                    WorkerScheduleSegment(0, left, 0, 4, 0),
-                    WorkerScheduleSegment(1, adjacent, 4, 2, 0),
-                ),
-            )
-            with self.assertRaisesRegex(ValueError, "support overlaps"):
-                WorkerSchedule(
-                    6,
-                    (
-                        WorkerScheduleSegment(0, left, 0, 4, 0),
-                        WorkerScheduleSegment(1, overlap, 3, 2, 0),
-                    ),
-                )
-
-    def test_schedule_bijection_rejects_padded_and_out_of_domain_support(
+    def test_local_order_rejects_padded_and_out_of_domain_support(
         self,
     ) -> None:
-        schedule_domain = CoordinateDomain(
-            (-3, -2, -1),
-            ((-3, 2), (-2, 4), (-1, 1)),
-            kind="worker",
+        local_order = CoordinateDomain(
+            (10,),
+            ((10, 3),),
+            kind="task_order",
         )
-        target = CoordinateDomain((10,), ((10, 3),), identity=0)
-        worker = coordinate_axis_symbol(-2)
+        target = CoordinateDomain(
+            (20,),
+            ((20, 3),),
+            kind="site",
+            identity=0,
+        )
+        ordinal = coordinate_axis_symbol(10)
         valid = CoordinateRelation.point_map(
-            schedule_domain,
+            local_order,
             target,
             (
                 (
-                    ((-3, 1, 2, 1), (-2, 1, 4, 1), (-1, 0, 1, 1)),
-                    (worker - 1,),
+                    ((10, 0, 3, 1),),
+                    (ordinal,),
                 ),
             ),
         )
         self.assertTrue(valid.is_bijection_from_source_support())
         self.assertIsNotNone(valid.converse())
+        WorkerScheduleSegment(root=0, task_order=valid)
 
         invalid_relations = {
             "padded target tail": CoordinateRelation.point_map(
-                schedule_domain,
+                local_order,
                 target,
                 (
                     (
-                        ((-3, 1, 2, 1), (-2, 1, 4, 1), (-1, 0, 1, 1)),
-                        (worker,),
+                        ((10, 0, 3, 1),),
+                        (ordinal + 1,),
                     ),
                 ),
             ),
             "out-of-domain source": CoordinateRelation.point_map(
-                schedule_domain,
+                local_order,
                 target,
                 (
                     (
-                        ((-3, 1, 2, 1), (-2, -1, 2, 1), (-1, 0, 1, 1)),
-                        (worker + 1,),
+                        ((10, -1, 2, 1),),
+                        (ordinal + 1,),
                     ),
                 ),
             ),
@@ -699,56 +534,6 @@ class TestExactConverseSemantics(TestCase):
                 self.assertFalse(transformed.is_bijection_from_source_support())
                 with self.assertRaisesRegex(
                     ValueError,
-                    "own each logical task once",
+                    "not an exact local bijection",
                 ):
-                    WorkerSchedule(
-                        4,
-                        (WorkerScheduleSegment(0, transformed, 0, 4, 0),),
-                    )
-
-    def test_root_barrier_participant_order_requires_support_bijection(self) -> None:
-        workers = CoordinateDomain((-1,), ((-1, 4),), kind="worker")
-        arrivals = CoordinateDomain(
-            (-2,),
-            ((-2, 2),),
-            kind="value",
-            identity=0,
-        )
-
-        def participant_order(
-            assignments: tuple[tuple[int, int], ...],
-        ) -> CoordinateRelation:
-            return CoordinateRelation.point_map(
-                workers,
-                arrivals,
-                tuple(
-                    (
-                        ((-1, worker, worker + 1, 1),),
-                        (sympy.Integer(arrival),),
-                    )
-                    for worker, arrival in assignments
-                ),
-            )
-
-        valid_order = participant_order(((1, 0), (3, 1)))
-        self.assertTrue(valid_order.is_bijection_from_source_support())
-        valid = RootBarrierPublicationPlan(
-            root=0,
-            participant_intervals=(),
-            participant_order=valid_order,
-            publications=(RootBarrierPublication(0, ()),),
-            resident_arrival_count=2,
-            continuation_arrival_count=0,
-            dynamic_task_arrival_count=0,
-        )
-
-        invalid_orders = {
-            "missing arrival": participant_order(((1, 0),)),
-            "duplicate arrival": participant_order(((1, 0), (3, 0))),
-            "padded arrival": participant_order(((1, 0), (3, 2))),
-        }
-        for name, invalid_order in invalid_orders.items():
-            with self.subTest(case=name):
-                self.assertFalse(invalid_order.is_bijection_from_source_support())
-                with self.assertRaises(ValueError):
-                    dataclasses.replace(valid, participant_order=invalid_order)
+                    WorkerScheduleSegment(root=0, task_order=transformed)

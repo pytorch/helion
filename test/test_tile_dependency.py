@@ -2539,34 +2539,6 @@ class TestTileDependency(TestCase):
             ),
         )
 
-    def test_source_support_comparison_preserves_target_clipping(self) -> None:
-        source = CoordinateDomain((10,), ((10, 2),), kind="worker")
-        target = CoordinateDomain((20,), ((20, 1),), kind="site")
-        coordinate = coordinate_axis_symbol(10)
-        clipped = CoordinateRelation.point_map(
-            source,
-            target,
-            ((((10, 0, 2, 1),), (coordinate,)),),
-        )
-        full = CoordinateRelation.point_map(
-            source,
-            target,
-            ((((10, 0, 2, 1),), (sympy.Integer(0),)),),
-        )
-
-        self.assertFalse(clipped.has_same_source_support(full))
-        self.assertNotEqual(clipped.materialize(), full.materialize())
-
-        larger_target = CoordinateDomain((30,), ((30, 2),), kind="site")
-        unclipped = CoordinateRelation.point_map(
-            source,
-            larger_target,
-            ((((10, 0, 2, 1),), (coordinate,)),),
-        )
-        self.assertIsNotNone(clipped.converse())
-        self.assertIsNotNone(unclipped.converse())
-        self.assertFalse(clipped.has_same_source_support(unclipped))
-
     def test_project_source_keeps_symbolic_outer_axis_and_unions_static_inner(
         self,
     ) -> None:
@@ -3047,9 +3019,7 @@ class TestTileDependency(TestCase):
                         frozenset(
                             producer_index
                             for producer_index in supported_producers
-                            if consumer_index - 1
-                            <= producer_index
-                            < consumer_index + 2
+                            if consumer_index - 1 <= producer_index < consumer_index + 2
                         )
                         for consumer_index in range(consumer.size)
                     ),
@@ -3148,9 +3118,7 @@ class TestTileDependency(TestCase):
                 ),
             ),
         )
-        self.assertIsNone(
-            producer_keys.overlapping_sources(clipped_consumer_keys)
-        )
+        self.assertIsNone(producer_keys.overlapping_sources(clipped_consumer_keys))
 
         invalid_keys = CoordinateRelation.point_map(
             producer,
@@ -3452,8 +3420,7 @@ class TestTileDependency(TestCase):
                         (
                             (
                                 -1,
-                                producer_scale * producer_coordinate
-                                + producer_offset,
+                                producer_scale * producer_coordinate + producer_offset,
                                 producer_scale * producer_coordinate
                                 + producer_offset
                                 + producer_width,
@@ -3472,8 +3439,7 @@ class TestTileDependency(TestCase):
                         (
                             (
                                 -1,
-                                consumer_scale * consumer_coordinate
-                                + consumer_offset,
+                                consumer_scale * consumer_coordinate + consumer_offset,
                                 consumer_scale * consumer_coordinate
                                 + consumer_offset
                                 + consumer_width,
@@ -3573,9 +3539,7 @@ class TestTileDependency(TestCase):
                 direct = direct_producer.overlapping_sources(direct_consumer)
                 self.assertIsNotNone(direct)
                 assert direct is not None
-                specialized = overlap.substitute_parameters(
-                    {extent: concrete_extent}
-                )
+                specialized = overlap.substitute_parameters({extent: concrete_extent})
                 expected = tuple(
                     frozenset(range(0, consumer_index + 1, 2))
                     for consumer_index in range(concrete_extent)
@@ -4296,9 +4260,7 @@ class TestTileDependency(TestCase):
         carrier_converse = CoordinateRelation.point_map(
             carrier_target,
             source,
-            (
-                (((30, 0, count, 1),), (carrier_index,)),
-            ),
+            ((((30, 0, count, 1),), (carrier_index,)),),
         )
         _remember_exact_converse(carrier, carrier_converse)
 
@@ -4346,9 +4308,7 @@ class TestTileDependency(TestCase):
         )
         _remember_exact_converse(carrier, carrier_converse)
 
-        self.assertIsNone(
-            relation.target_count_by_source(source_support=carrier)
-        )
+        self.assertIsNone(relation.target_count_by_source(source_support=carrier))
 
     def test_target_count_with_support_rejects_overlapping_targets(self) -> None:
         source = CoordinateDomain((10,), ((10, 3),), kind="site")
@@ -5056,9 +5016,7 @@ class TestTileDependency(TestCase):
 
         concrete_required = required.substitute_parameters({batch: 4})
         concrete_values = value_by_task.substitute_parameters({batch: 4})
-        concrete_maximum = concrete_required.max_target_value_by_source(
-            concrete_values
-        )
+        concrete_maximum = concrete_required.max_target_value_by_source(concrete_values)
         self.assertIsNotNone(concrete_maximum)
         assert concrete_maximum is not None
         self.assertEqual(concrete_maximum.materialize(), (frozenset((0,)),))
@@ -5175,9 +5133,7 @@ class TestTileDependency(TestCase):
                         "oversized partial source proof must decline before partition"
                     ),
                 ):
-                    self.assertIsNone(
-                        required.max_target_value_by_source(values)
-                    )
+                    self.assertIsNone(required.max_target_value_by_source(values))
 
     def test_target_value_extreme_retains_complete_plateaus(self) -> None:
         source = CoordinateDomain((), (), kind="event")
@@ -5365,7 +5321,7 @@ class TestTileDependency(TestCase):
                 checked += 1
         self.assertEqual(checked, 125)
 
-    def test_partial_value_support_handles_overlap_extra_and_weighting(self) -> None:
+    def test_partial_value_support_handles_overlap_and_extra_pieces(self) -> None:
         source = CoordinateDomain((), (), kind="event")
         target_axis = 20
         target = CoordinateDomain(
@@ -5376,11 +5332,6 @@ class TestTileDependency(TestCase):
         value_domain = CoordinateDomain(
             (30,),
             ((30, 16),),
-            kind="value",
-        )
-        potential_domain = CoordinateDomain(
-            (31,),
-            ((31, 8),),
             kind="value",
         )
         target_coordinate = coordinate_axis_symbol(target_axis)
@@ -5414,42 +5365,6 @@ class TestTileDependency(TestCase):
         self.assertEqual(result[0].materialize(), (frozenset((4,)),))
         self.assertEqual(result[1].materialize(), (frozenset((3,)),))
 
-        partial_values = CoordinateRelation.point_map(
-            target,
-            value_domain,
-            (
-                (
-                    ((target_axis, 0, 4, 1),),
-                    (target_coordinate,),
-                ),
-            ),
-        )
-        target_potential = CoordinateRelation.point_map(
-            target,
-            potential_domain,
-            (
-                (
-                    ((target_axis, 0, 5, 1),),
-                    (4 - target_coordinate,),
-                ),
-            ),
-        )
-        source_potential = CoordinateRelation.point_map(
-            source,
-            potential_domain,
-            (((), (sympy.Integer(2),)),),
-        )
-        weighted = required.weighted_max_target_value_and_attainers_by_source(
-            partial_values,
-            target_potential=target_potential,
-            source_potential=source_potential,
-            offset=1,
-        )
-        self.assertIsNotNone(weighted)
-        assert weighted is not None
-        self.assertEqual(weighted[0].materialize(), (frozenset((7,)),))
-        self.assertEqual(weighted[1].materialize(), (frozenset((1, 2, 3)),))
-
         missing_one = CoordinateRelation.point_map(
             target,
             value_domain,
@@ -5465,13 +5380,6 @@ class TestTileDependency(TestCase):
                 maximize=True,
             )
         )
-        self.assertIsNone(
-            required.weighted_max_target_value_and_attainers_by_source(
-                missing_one,
-                target_potential=target_potential,
-            )
-        )
-
         conflicting_overlap = CoordinateRelation.point_map(
             target,
             value_domain,
@@ -6175,821 +6083,6 @@ class TestTileDependency(TestCase):
                 )
             )
 
-    def test_weighted_max_pullback_matches_exhaustive_small_oracle(self) -> None:
-        source_axis = 10
-        target_axis = 20
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, 2),),
-            kind="event",
-        )
-        target = CoordinateDomain(
-            (target_axis,),
-            ((target_axis, 2),),
-            kind="site",
-        )
-        values = CoordinateDomain((30,), ((30, 32),), kind="value")
-        potentials = CoordinateDomain((31,), ((31, 4),), kind="value")
-
-        def scalar_map(
-            domain: CoordinateDomain,
-            value_domain: CoordinateDomain,
-            scalars: tuple[int, ...],
-        ) -> CoordinateRelation:
-            (axis,) = domain.axis_order
-            return CoordinateRelation.point_map(
-                domain,
-                value_domain,
-                tuple(
-                    (((axis, coordinate, coordinate + 1, 1),), (scalar,))
-                    for coordinate, scalar in enumerate(scalars)
-                ),
-            )
-
-        checked = 0
-        for relation_bits in range(1 << (source.size * target.size)):
-            required = CoordinateRelation(
-                source,
-                target,
-                tuple(
-                    _CoordinateRelationPiece(
-                        ((source_axis, source_index, source_index + 1, 1),),
-                        ((target_axis, target_index, target_index + 1, 1),),
-                    )
-                    for source_index in range(source.size)
-                    for target_index in range(target.size)
-                    if relation_bits
-                    & (1 << (source_index * target.size + target_index))
-                ),
-            )
-            for value_scalars in itertools.product(range(3), repeat=target.size):
-                value_by_target = scalar_map(target, values, value_scalars)
-                for target_scalars in itertools.product(range(2), repeat=target.size):
-                    target_potential = scalar_map(
-                        target,
-                        potentials,
-                        target_scalars,
-                    )
-                    for source_scalars in itertools.product(
-                        range(2), repeat=source.size
-                    ):
-                        source_potential = scalar_map(
-                            source,
-                            potentials,
-                            source_scalars,
-                        )
-                        for offset in (0, 1):
-                            result = required.weighted_max_target_value_and_attainers_by_source(
-                                value_by_target,
-                                target_potential=target_potential,
-                                source_potential=source_potential,
-                                offset=offset,
-                            )
-                            self.assertIsNotNone(
-                                result,
-                                (
-                                    relation_bits,
-                                    value_scalars,
-                                    target_scalars,
-                                    source_scalars,
-                                    offset,
-                                ),
-                            )
-                            assert result is not None
-                            maximum, attainers = result
-                            for source_index in range(source.size):
-                                related_targets = tuple(
-                                    target_index
-                                    for target_index in range(target.size)
-                                    if relation_bits
-                                    & (1 << (source_index * target.size + target_index))
-                                )
-                                weighted = {
-                                    target_index: (
-                                        value_scalars[target_index]
-                                        + target_scalars[target_index]
-                                        + offset
-                                        + source_scalars[source_index]
-                                    )
-                                    for target_index in related_targets
-                                }
-                                expected_value = (
-                                    frozenset((max(weighted.values()),))
-                                    if weighted
-                                    else frozenset()
-                                )
-                                expected_attainers = frozenset(
-                                    target_index
-                                    for target_index, value in weighted.items()
-                                    if value in expected_value
-                                )
-                                self.assertEqual(
-                                    maximum.targets(source_index),
-                                    expected_value,
-                                )
-                                self.assertEqual(
-                                    attainers.targets(source_index),
-                                    expected_attainers,
-                                )
-                            checked += 1
-        self.assertEqual(checked, 4_608)
-
-    def test_weighted_max_pullback_preserves_clipping_ties_and_empty_fibers(
-        self,
-    ) -> None:
-        source_axis = 10
-        target_axis = 20
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, 2),),
-            kind="event",
-        )
-        target = CoordinateDomain(
-            (target_axis,),
-            ((target_axis, 5),),
-            kind="site",
-        )
-        values = CoordinateDomain((30,), ((30, 32),), kind="value")
-        target_potentials = CoordinateDomain((31,), ((31, 5),), kind="value")
-        source_potentials = CoordinateDomain((32,), ((32, 3),), kind="value")
-        target_coordinate = coordinate_axis_symbol(target_axis)
-        source_coordinate = coordinate_axis_symbol(source_axis)
-        required = CoordinateRelation(
-            source,
-            target,
-            (
-                _CoordinateRelationPiece(
-                    ((source_axis, 0, 1, 1),),
-                    ((target_axis, -3, 9, 2),),
-                ),
-                _CoordinateRelationPiece(
-                    ((source_axis, 1, 2, 1),),
-                    ((target_axis, 7, 11, 1),),
-                ),
-            ),
-        )
-        value_by_target = CoordinateRelation.point_map(
-            target,
-            values,
-            (
-                (
-                    ((target_axis, 0, 5, 1),),
-                    (target_coordinate,),
-                ),
-            ),
-        )
-        target_potential = CoordinateRelation.point_map(
-            target,
-            target_potentials,
-            (
-                (
-                    ((target_axis, 0, 5, 1),),
-                    (4 - target_coordinate,),
-                ),
-            ),
-        )
-        source_potential = CoordinateRelation.point_map(
-            source,
-            source_potentials,
-            (
-                (
-                    ((source_axis, 0, 2, 1),),
-                    (source_coordinate + 1,),
-                ),
-            ),
-        )
-
-        result = required.weighted_max_target_value_and_attainers_by_source(
-            value_by_target,
-            target_potential=target_potential,
-            source_potential=source_potential,
-            offset=2,
-        )
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        maximum, attainers = result
-        self.assertEqual(maximum.materialize(), (frozenset((7,)), frozenset()))
-        self.assertEqual(
-            attainers.materialize(),
-            (frozenset((0, 2, 4)), frozenset()),
-        )
-
-    def test_pointwise_scalar_add_handles_strided_partial_symbolic_support(
-        self,
-    ) -> None:
-        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
-        source_axis = 10
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, extent),),
-            kind="event",
-            _allow_empty=True,
-        )
-        values = CoordinateDomain(
-            (30,),
-            ((30, extent + 10),),  # pyrefly: ignore[unsupported-operation]
-            kind="value",
-        )
-        potentials = CoordinateDomain((31,), ((31, 2),), kind="value")
-        source_coordinate = coordinate_axis_symbol(source_axis)
-        partial = CoordinateRelation.point_map(
-            source,
-            values,
-            (
-                (
-                    ((source_axis, -2, extent - 1, 2),),  # pyrefly: ignore[unsupported-operation]
-                    (source_coordinate + 2,),
-                ),
-            ),
-        )
-        total = CoordinateRelation.point_map(
-            source,
-            potentials,
-            (
-                (
-                    ((source_axis, 0, extent, 1),),
-                    (sympy.Integer(1),),
-                ),
-            ),
-        )
-
-        with mock.patch.object(
-            CoordinateRelation,
-            "materialize",
-            side_effect=AssertionError("pointwise addition must not enumerate"),
-        ):
-            combined = partial.pointwise_add_scalar(total, offset=2)
-
-        self.assertIsNotNone(combined)
-        assert combined is not None
-        for concrete_extent in range(6):
-            concrete = combined.substitute_parameters({extent: concrete_extent})
-            self.assertEqual(
-                concrete.materialize(),
-                tuple(
-                    frozenset((coordinate + 5,))
-                    if coordinate % 2 == 0 and coordinate < concrete_extent - 1
-                    else frozenset()
-                    for coordinate in range(concrete_extent)
-                ),
-            )
-
-    def test_pointwise_scalar_add_accepts_exact_partial_cover(self) -> None:
-        source_axis = 10
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, 3),),
-            kind="event",
-        )
-        values = CoordinateDomain((30,), ((30, 8),), kind="value")
-        addends = CoordinateDomain((31,), ((31, 2),), kind="value")
-        source_coordinate = coordinate_axis_symbol(source_axis)
-
-        def scalar_map(
-            mask: int,
-            target: CoordinateDomain,
-            value: sympy.Expr,
-        ) -> CoordinateRelation:
-            return CoordinateRelation.point_map(
-                source,
-                target,
-                tuple(
-                    (
-                        ((source_axis, index, index + 1, 1),),
-                        (value,),
-                    )
-                    for index in range(3)
-                    if mask & (1 << index)
-                ),
-            )
-
-        checked = 0
-        for left_mask in range(8):
-            left = scalar_map(left_mask, values, source_coordinate + 1)
-            for right_mask in range(8):
-                right = scalar_map(right_mask, addends, sympy.Integer(1))
-                with mock.patch.object(
-                    CoordinateRelation,
-                    "materialize",
-                    side_effect=AssertionError("pointwise addition must not enumerate"),
-                ):
-                    result = left.pointwise_add_scalar(right, offset=1)
-                if left_mask & ~right_mask:
-                    self.assertIsNone(result, (left_mask, right_mask))
-                    continue
-                self.assertIsNotNone(result, (left_mask, right_mask))
-                assert result is not None
-                self.assertEqual(
-                    result.materialize(),
-                    tuple(
-                        frozenset((index + 3,))
-                        if left_mask & (1 << index)
-                        else frozenset()
-                        for index in range(3)
-                    ),
-                )
-                checked += 1
-        self.assertEqual(checked, 27)
-
-    def test_pointwise_scalar_add_partial_cover_edge_cases(self) -> None:
-        source_axis = 10
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, 5),),
-            kind="event",
-        )
-        values = CoordinateDomain((30,), ((30, 10),), kind="value")
-        addends = CoordinateDomain((31,), ((31, 4),), kind="value")
-        source_coordinate = coordinate_axis_symbol(source_axis)
-        left = CoordinateRelation.point_map(
-            source,
-            values,
-            (
-                (
-                    ((source_axis, -2, 7, 2),),
-                    (source_coordinate + 1,),
-                ),
-            ),
-        )
-        exact = CoordinateRelation.point_map(
-            source,
-            addends,
-            (
-                (((source_axis, -4, 3, 2),), (sympy.Integer(1),)),
-                (((source_axis, 4, 9, 2),), (sympy.Integer(1),)),
-                # An identical overlap must not be counted twice.
-                (((source_axis, 4, 9, 2),), (sympy.Integer(1),)),
-            ),
-        )
-
-        result = left.pointwise_add_scalar(exact)
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(
-            result.materialize(),
-            tuple(
-                frozenset((index + 2,)) if index % 2 == 0 else frozenset()
-                for index in range(5)
-            ),
-        )
-
-        missing_one = CoordinateRelation.point_map(
-            source,
-            addends,
-            ((((source_axis, -4, 3, 2),), (sympy.Integer(1),)),),
-        )
-        conflicting = CoordinateRelation.point_map(
-            source,
-            addends,
-            (
-                (((source_axis, -4, 7, 2),), (sympy.Integer(1),)),
-                (((source_axis, 2, 3, 1),), (sympy.Integer(2),)),
-            ),
-        )
-        invalid_addend = CoordinateRelation.point_map(
-            source,
-            CoordinateDomain((31,), ((31, 1),), kind="value"),
-            ((((source_axis, -4, 7, 2),), (sympy.Integer(5),)),),
-        )
-        oversized_addend = CoordinateRelation.point_map(
-            source,
-            values,
-            ((((source_axis, -4, 7, 2),), (sympy.Integer(9),)),),
-        )
-        self.assertIsNone(left.pointwise_add_scalar(missing_one))
-        self.assertIsNone(left.pointwise_add_scalar(conflicting))
-        self.assertIsNone(left.pointwise_add_scalar(invalid_addend))
-        self.assertIsNone(left.pointwise_add_scalar(oversized_addend))
-
-        empty = CoordinateRelation(source, values, ())
-        self.assertEqual(
-            empty.pointwise_add_scalar(conflicting),
-            empty,
-        )
-
-    def test_pointwise_scalar_add_preserves_total_rhs_with_empty_junk(self) -> None:
-        source_axis = 10
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, 2),),
-            kind="event",
-        )
-        values = CoordinateDomain((30,), ((30, 4),), kind="value")
-        addends = CoordinateDomain((31,), ((31, 2),), kind="value")
-        source_coordinate = coordinate_axis_symbol(source_axis)
-        left = CoordinateRelation.point_map(
-            source,
-            values,
-            (
-                (
-                    ((source_axis, 0, 2, 1),),
-                    (source_coordinate + 1,),
-                ),
-            ),
-        )
-        total_with_empty_junk = CoordinateRelation.point_map(
-            source,
-            addends,
-            (
-                (
-                    ((source_axis, -2, 4, 1),),
-                    (sympy.Mod(source_coordinate, 2),),
-                ),
-                (
-                    ((source_axis, -2, -2, 1),),
-                    (source_coordinate,),
-                ),
-            ),
-        )
-        self.assertTrue(total_with_empty_junk.is_total_function())
-
-        result = left.pointwise_add_scalar(total_with_empty_junk)
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        self.assertEqual(
-            result.materialize(),
-            (frozenset((1,)), frozenset((3,))),
-        )
-
-        query = CoordinateDomain((), (), kind="event")
-        required = CoordinateRelation.total(query, source)
-        maximum = required.max_target_value_by_source(total_with_empty_junk)
-        self.assertIsNotNone(maximum)
-        assert maximum is not None
-        self.assertEqual(maximum.materialize(), (frozenset((1,)),))
-
-        partial_left = CoordinateRelation.point_map(
-            source,
-            values,
-            ((((source_axis, 0, 1, 1),), (sympy.Integer(1),)),),
-        )
-        partial_with_empty_junk = CoordinateRelation.point_map(
-            source,
-            addends,
-            (
-                (((source_axis, 0, 1, 1),), (sympy.Integer(1),)),
-                (((source_axis, -2, -2, 1),), (source_coordinate,)),
-            ),
-        )
-        partial_result = partial_left.pointwise_add_scalar(partial_with_empty_junk)
-        self.assertIsNotNone(partial_result)
-        assert partial_result is not None
-        self.assertEqual(
-            partial_result.materialize(),
-            (frozenset((2,)), frozenset()),
-        )
-        partial_required = CoordinateRelation(
-            query,
-            source,
-            (_CoordinateRelationPiece((), ((source_axis, 0, 1, 1),)),),
-        )
-        partial_maximum = partial_required.max_target_value_by_source(
-            partial_with_empty_junk
-        )
-        self.assertIsNotNone(partial_maximum)
-        assert partial_maximum is not None
-        self.assertEqual(partial_maximum.materialize(), (frozenset((1,)),))
-
-    def test_pointwise_scalar_add_partial_symbolic_cover(self) -> None:
-        extent = sympy.Symbol(
-            "partial_add_extent",
-            integer=True,
-            nonnegative=True,
-        )
-        source_axis = 10
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, extent),),
-            kind="event",
-            _allow_empty=True,
-        )
-        values = CoordinateDomain(
-            (30,),
-            ((30, extent + 3),),  # pyrefly: ignore[unsupported-operation]
-            kind="value",
-        )
-        addends = CoordinateDomain((31,), ((31, 2),), kind="value")
-        source_coordinate = coordinate_axis_symbol(source_axis)
-        split = sympy.Min(sympy.Integer(2), extent)
-        left = CoordinateRelation.point_map(
-            source,
-            values,
-            (
-                (
-                    ((source_axis, 0, extent, 1),),
-                    (source_coordinate,),
-                ),
-            ),
-        )
-        exact = CoordinateRelation.point_map(
-            source,
-            addends,
-            (
-                (((source_axis, 0, split, 1),), (sympy.Integer(1),)),
-                (((source_axis, split, extent, 1),), (sympy.Integer(1),)),
-            ),
-        )
-
-        with mock.patch.object(
-            CoordinateRelation,
-            "materialize",
-            side_effect=AssertionError("symbolic pointwise addition must not enumerate"),
-        ):
-            result = left.pointwise_add_scalar(exact)
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        for concrete_extent in (0, 1, 2, 3, 7):
-            concrete = result.substitute_parameters({extent: concrete_extent})
-            self.assertEqual(
-                concrete.materialize(),
-                tuple(
-                    frozenset((coordinate + 1,))
-                    for coordinate in range(concrete_extent)
-                ),
-            )
-
-        missing_last = CoordinateRelation.point_map(
-            source,
-            addends,
-            (
-                (
-                    ((source_axis, 0, sympy.Max(0, extent - 1), 1),),
-                    (sympy.Integer(1),),
-                ),
-            ),
-        )
-        self.assertIsNone(left.pointwise_add_scalar(missing_last))
-
-    def test_pointwise_scalar_add_partial_cover_respects_budget(self) -> None:
-        source_axis = 10
-        source = CoordinateDomain(
-            (source_axis,),
-            ((source_axis, 5),),
-            kind="event",
-        )
-        values = CoordinateDomain((30,), ((30, 8),), kind="value")
-        addends = CoordinateDomain((31,), ((31, 3),), kind="value")
-        source_coordinate = coordinate_axis_symbol(source_axis)
-        left = CoordinateRelation.point_map(
-            source,
-            values,
-            (
-                (((source_axis, 0, 1, 1),), (source_coordinate,)),
-                (((source_axis, 2, 3, 1),), (source_coordinate,)),
-            ),
-        )
-        exact = CoordinateRelation.point_map(
-            source,
-            addends,
-            (
-                (((source_axis, 0, 2, 1),), (sympy.Integer(1),)),
-                (((source_axis, 2, 4, 1),), (sympy.Integer(2),)),
-            ),
-        )
-        self.assertIsNotNone(left.pointwise_add_scalar(exact))
-        with mock.patch(
-            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
-            7,
-        ):
-            self.assertIsNone(left.pointwise_add_scalar(exact))
-
-    def test_weighted_max_pullback_partitions_symbolically_and_substitutes(
-        self,
-    ) -> None:
-        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
-        scale = sympy.Symbol("scale", integer=True, positive=True)
-        bias = sympy.Symbol("bias", integer=True, nonnegative=True)
-        source_axis = 10
-        outer_axis = 11
-        target_axis = 20
-        source = CoordinateDomain(
-            (source_axis, outer_axis),
-            ((source_axis, 4), (outer_axis, batch)),
-            kind="event",
-            _allow_empty=True,
-        )
-        target = CoordinateDomain(
-            (target_axis,),
-            ((target_axis, 4),),
-            kind="site",
-        )
-        values = CoordinateDomain(
-            (30,),
-            ((30, 3 * scale + bias + batch + 10),),  # pyrefly: ignore[unsupported-operation]
-            kind="value",
-        )
-        target_potentials = CoordinateDomain(
-            (31,),
-            ((31, 3 * scale + 1),),  # pyrefly: ignore[unsupported-operation]
-            kind="value",
-        )
-        source_potentials = CoordinateDomain(
-            (32,),
-            ((32, batch + 4),),  # pyrefly: ignore[unsupported-operation]
-            kind="value",
-        )
-        source_coordinate = coordinate_axis_symbol(source_axis)
-        outer_coordinate = coordinate_axis_symbol(outer_axis)
-        target_coordinate = coordinate_axis_symbol(target_axis)
-        source_bounds = (
-            (source_axis, 0, 4, 1),
-            (outer_axis, 0, batch, 1),
-        )
-        required = CoordinateRelation(
-            source,
-            target,
-            (
-                _CoordinateRelationPiece(
-                    source_bounds,
-                    (
-                        (
-                            target_axis,
-                            source_coordinate,
-                            source_coordinate + 1,
-                            1,
-                        ),
-                    ),
-                ),
-                _CoordinateRelationPiece(
-                    source_bounds,
-                    (
-                        (
-                            target_axis,
-                            3 - source_coordinate,
-                            4 - source_coordinate,
-                            1,
-                        ),
-                    ),
-                ),
-            ),
-        )
-        value_by_target = CoordinateRelation.point_map(
-            target,
-            values,
-            ((((target_axis, 0, 4, 1),), (target_coordinate,)),),
-        )
-        target_potential = CoordinateRelation.point_map(
-            target,
-            target_potentials,
-            (
-                (
-                    ((target_axis, 0, 4, 1),),
-                    (scale * target_coordinate,),
-                ),
-            ),
-        )
-        source_potential = CoordinateRelation.point_map(
-            source,
-            source_potentials,
-            (
-                (
-                    source_bounds,
-                    (source_coordinate + outer_coordinate,),
-                ),
-            ),
-        )
-
-        with mock.patch.object(
-            CoordinateRelation,
-            "materialize",
-            side_effect=AssertionError("symbolic pullback must not enumerate"),
-        ):
-            result = required.weighted_max_target_value_and_attainers_by_source(
-                value_by_target,
-                target_potential=target_potential,
-                source_potential=source_potential,
-                offset=bias,
-            )
-
-        self.assertIsNotNone(result)
-        assert result is not None
-        maximum, attainers = result
-        for concrete_batch, concrete_scale, concrete_bias in itertools.product(
-            range(4),
-            (1, 3),
-            (0, 2),
-        ):
-            substitutions = {
-                batch: concrete_batch,
-                scale: concrete_scale,
-                bias: concrete_bias,
-            }
-            concrete_maximum = maximum.substitute_parameters(substitutions)
-            concrete_attainers = attainers.substitute_parameters(substitutions)
-            expected_values: list[frozenset[int]] = []
-            expected_attainers: list[frozenset[int]] = []
-            for outer in range(concrete_batch):
-                for source_index in range(4):
-                    winner = max(source_index, 3 - source_index)
-                    expected_values.append(
-                        frozenset(
-                            (
-                                (concrete_scale + 1) * winner
-                                + concrete_bias
-                                + source_index
-                                + outer,
-                            )
-                        )
-                    )
-                    expected_attainers.append(frozenset((winner,)))
-            self.assertEqual(concrete_maximum.materialize(), tuple(expected_values))
-            self.assertEqual(
-                concrete_attainers.materialize(),
-                tuple(expected_attainers),
-            )
-
-    def test_weighted_max_pullback_declines_unsupported_combinations(self) -> None:
-        source = CoordinateDomain((), (), kind="event")
-        target_axis = 20
-        target = CoordinateDomain(
-            (target_axis,),
-            ((target_axis, 2),),
-            kind="site",
-        )
-        small_values = CoordinateDomain((30,), ((30, 5),), kind="value")
-        potentials = CoordinateDomain((31,), ((31, 5),), kind="value")
-        target_coordinate = coordinate_axis_symbol(target_axis)
-        required = CoordinateRelation.total(source, target)
-        value_by_target = CoordinateRelation.point_map(
-            target,
-            small_values,
-            ((((target_axis, 0, 2, 1),), (target_coordinate + 3,)),),
-        )
-        oversized_sum = CoordinateRelation.point_map(
-            target,
-            potentials,
-            ((((target_axis, 0, 2, 1),), (sympy.Integer(2),)),),
-        )
-
-        # Scalar arithmetic retains the left carrier.  It must decline when
-        # that finite carrier cannot represent the mathematical sum.
-        self.assertIsNone(value_by_target.pointwise_add_scalar(oversized_sum))
-        self.assertIsNone(
-            required.weighted_max_target_value_and_attainers_by_source(
-                value_by_target,
-                target_potential=oversized_sum,
-            )
-        )
-
-        parameter = sympy.Symbol("parameter", integer=True, positive=True)
-        symbolic_values = CoordinateDomain(
-            (30,),
-            ((30, parameter + 10),),  # pyrefly: ignore[unsupported-operation]
-            kind="value",
-        )
-        symbolic_potentials = CoordinateDomain(
-            (31,),
-            ((31, parameter + 1),),  # pyrefly: ignore[unsupported-operation]
-            kind="value",
-        )
-        crossing_values = CoordinateRelation.point_map(
-            target,
-            symbolic_values,
-            (
-                (((target_axis, 0, 1, 1),), (sympy.Integer(0),)),
-                (((target_axis, 1, 2, 1),), (sympy.Integer(4),)),
-            ),
-        )
-        crossing_potential = CoordinateRelation.point_map(
-            target,
-            symbolic_potentials,
-            (
-                (((target_axis, 0, 1, 1),), (parameter,)),
-                (((target_axis, 1, 2, 1),), (sympy.Integer(0),)),
-            ),
-        )
-        self.assertIsNone(
-            required.weighted_max_target_value_and_attainers_by_source(
-                crossing_values,
-                target_potential=crossing_potential,
-            )
-        )
-
-        with mock.patch(
-            "helion._compiler.tile_dependency._MAX_RELATION_PRODUCT_STATES",
-            3,
-        ):
-            self.assertIsNone(
-                required.weighted_max_target_value_and_attainers_by_source(
-                    crossing_values,
-                    target_potential=crossing_potential,
-                )
-            )
-        with mock.patch(
-            "helion._compiler.tile_dependency._MAX_RELATION_PIECES",
-            1,
-        ):
-            self.assertIsNone(
-                required.weighted_max_target_value_and_attainers_by_source(
-                    crossing_values,
-                    target_potential=crossing_potential,
-                )
-            )
-
     def test_symbolic_max_target_value_respects_stride_alignment(self) -> None:
         consumer_axis = 57
         producer_axis = 29
@@ -7290,9 +6383,7 @@ class TestTileDependency(TestCase):
             concrete_maximum = maximum.substitute_parameters(substitutions)
             values_by_task = concrete_values.materialize()
             oracle = tuple(
-                frozenset(
-                    (max(max(values_by_task[task]) for task in tasks_for_key),)
-                )
+                frozenset((max(max(values_by_task[task]) for task in tasks_for_key),))
                 for tasks_for_key in concrete_required.materialize()
             )
             self.assertEqual(concrete_maximum.materialize(), oracle)
@@ -7337,9 +6428,7 @@ class TestTileDependency(TestCase):
         # The shifted mixed-radix rank wraps within the final fiber.  Its
         # maximum would require another source partition, so the bounded
         # extrema proof must decline instead of selecting an endpoint.
-        self.assertIsNone(
-            required_producers.max_target_value_by_source(cyclic_wave)
-        )
+        self.assertIsNone(required_producers.max_target_value_by_source(cyclic_wave))
 
         for modulus in (4, 6, 8, 12):
             for width in range(2, modulus + 1):
@@ -7452,9 +6541,7 @@ class TestTileDependency(TestCase):
             side_effect=AssertionError("symbolic bound proof must not enumerate"),
         ):
             self.assertTrue(relation(FloorDiv(3 * batch + 3, 4)).is_total_function())
-            self.assertFalse(
-                relation(FloorDiv(3 * batch + 2, 4)).is_total_function()
-            )
+            self.assertFalse(relation(FloorDiv(3 * batch + 2, 4)).is_total_function())
 
     def test_out_of_domain_source_support_is_not_counted_as_total(self) -> None:
         source = CoordinateDomain((10,), ((10, 2),), identity=0)
@@ -7822,9 +6909,7 @@ class TestTileDependency(TestCase):
             ),
         )
         _remember_exact_converse(projected, projected_inverse)
-        self.assertIsNone(
-            _dense_linear_source_support_interval(projected, (51,))
-        )
+        self.assertIsNone(_dense_linear_source_support_interval(projected, (51,)))
 
     def test_event_frontier_partial_bijection_is_symbolic(self) -> None:
         count = sympy.Symbol("count", integer=True, nonnegative=True)
@@ -7971,7 +7056,7 @@ class TestTileDependency(TestCase):
         self.assertIsNone(relation.source_support_cardinality())
         self.assertFalse(relation.is_total_function())
 
-    def test_pointwise_strict_order_is_proved_on_common_affine_partition(
+    def test_pointwise_order_where_defined_is_proved_on_common_affine_partition(
         self,
     ) -> None:
         source = CoordinateDomain((10,), ((10, 8),), identity=0)
@@ -7995,17 +7080,13 @@ class TestTileDependency(TestCase):
             ),
         )
 
-        self.assertTrue(left.is_pointwise_strictly_less_than(right))
         self.assertTrue(left.is_pointwise_equal_to(left))
-        self.assertFalse(right.is_pointwise_strictly_less_than(left))
-        self.assertFalse(left.is_pointwise_strictly_less_than(left))
 
         partial_right = CoordinateRelation.point_map(
             source,
             values,
             ((((10, 0, 7, 1),), (coordinate + 1,)),),
         )
-        self.assertFalse(left.is_pointwise_strictly_less_than(partial_right))
         partial_left = CoordinateRelation.point_map(
             source,
             values,
@@ -8068,9 +7149,7 @@ class TestTileDependency(TestCase):
             "helion._compiler.tile_dependency._MAX_RELATION_PIECES",
             1,
         ):
-            self.assertFalse(
-                left.is_pointwise_strictly_less_than_where_defined(right)
-            )
+            self.assertFalse(left.is_pointwise_strictly_less_than_where_defined(right))
 
     def test_partitioned_total_function_avoids_global_canonicalization(self) -> None:
         source = CoordinateDomain((10,), ((10, 128),), identity=0)

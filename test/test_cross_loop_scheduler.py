@@ -157,9 +157,7 @@ def segment_task_at_index(
     """Materialize one task-order index for small scheduler tests."""
     if not 0 <= task_order_index < segment.task_count:
         raise IndexError(task_order_index)
-    logical_order = segment.logical_task_order
-    if logical_order is None:
-        raise AssertionError("segment has no dense diagnostic traversal")
+    logical_order = segment.task_order
     source_coordinates = logical_order.source_domain.coordinates(task_order_index)
     targets = logical_order.target_coordinates(source_coordinates)
     if len(targets) != 1:
@@ -175,113 +173,31 @@ def segment_task_at_index(
     )
 
 
-def segment_placement(
-    segment: WorkerScheduleSegment,
-    task: int,
-) -> tuple[int, int] | None:
-    """Materialize one task's placement for small scheduler tests."""
-    if segment.is_normalized:
-        converse = segment.task_order.converse()
-        placements = (
-            frozenset()
-            if converse is None
-            else converse.target_coordinates(
-                segment.task_order.target_domain.coordinates(task)
-            )
-        )
-        if len(placements) > 1:
-            raise AssertionError("symbolic schedule maps one task more than once")
-        if not placements:
-            return None
-        coordinates = dict(
-            zip(
-                segment.task_order.source_domain.axis_order,
-                next(iter(placements)),
-                strict=True,
-            )
-        )
-        _launch_stage_axis, worker_axis, wave_axis = (
-            segment.task_order.source_domain.axis_order
-        )
-        return coordinates[worker_axis], coordinates[wave_axis]
-
-    converse = segment.task_order.converse()
-    task_order_indices = (
-        converse.targets(task)
-        if converse is not None
-        else frozenset(
-            task_order_index
-            for task_order_index in range(segment.task_count)
-            if segment_task_at_index(segment, task_order_index) == task
-        )
-    )
-    if len(task_order_indices) > 1:
-        raise AssertionError("symbolic schedule maps one task more than once")
-    if not task_order_indices:
-        return None
-    dispatch_index = segment.dispatch_index(next(iter(task_order_indices)))
-    return (
-        segment.worker_begin + dispatch_index % segment.worker_count,
-        dispatch_index // segment.worker_count,
-    )
-
-
-def segment_task_at(
-    segment: WorkerScheduleSegment,
-    worker: int,
-    worker_step: int,
-) -> int | None:
-    """Materialize the task at one segment worker step for small tests."""
-    if segment.is_normalized:
-        launch_stage_axis, worker_axis, wave_axis = (
-            segment.task_order.source_domain.axis_order
-        )
-        targets = segment.task_order.target_coordinates(
-            {
-                launch_stage_axis: 1,
-                worker_axis: worker,
-                wave_axis: worker_step,
-            }
-        )
-        if len(targets) > 1:
-            raise AssertionError("one worker wave maps to multiple tasks")
-        if not targets:
-            return None
-        return segment.task_order.target_domain.index(
-            dict(
-                zip(
-                    segment.task_order.target_domain.axis_order,
-                    next(iter(targets)),
-                    strict=True,
-                )
-            )
-        )
-
-    worker_offset = worker - segment.worker_begin
-    if not 0 <= worker_offset < segment.worker_count or worker_step < 0:
-        return None
-    task_order_index = (
-        worker_step * segment.worker_count + worker_offset - segment.dispatch_offset
-    )
-    if not 0 <= task_order_index < segment.task_count:
-        return None
-    return segment_task_at_index(segment, task_order_index)
-
-
 def placement(
     schedule: WorkerSchedule,
     root: int,
     task: int,
 ) -> tuple[int, int] | None:
     """Materialize one task's placement for small scheduler tests."""
-    placements = tuple(
-        result
-        for segment in schedule.segments_for_root(root)
-        if (result := segment_placement(segment, task)) is not None
+    relation = cross_loop_scheduler._root_task_placement_relation(schedule, root)
+    placements = (
+        frozenset()
+        if relation is None
+        else relation.target_coordinates(relation.source_domain.coordinates(task))
     )
     if len(placements) > 1:
         raise AssertionError(f"task ({root}, {task}) has multiple placements")
-    return placements[0] if placements else None
+    if not placements:
+        return None
+    coordinates = dict(
+        zip(
+            schedule.placement_domain.axis_order,
+            next(iter(placements)),
+            strict=True,
+        )
+    )
+    _launch_stage_axis, worker_axis, wave_axis = schedule.placement_domain.axis_order
+    return coordinates[worker_axis], coordinates[wave_axis]
 
 
 def task_at(
@@ -290,11 +206,39 @@ def task_at(
     worker_step: int,
 ) -> tuple[int, int] | None:
     """Materialize the task at one worker step for small tests."""
-    tasks = tuple(
-        (segment.root, task)
-        for segment in schedule.segments
-        if (task := segment_task_at(segment, worker, worker_step)) is not None
-    )
+    launch_stage_axis, worker_axis, wave_axis = schedule.placement_domain.axis_order
+    source = {
+        launch_stage_axis: 1,
+        worker_axis: worker,
+        wave_axis: worker_step,
+    }
+    tasks: list[tuple[int, int]] = []
+    for segment in schedule.segments:
+        placement_relation = cross_loop_scheduler._root_task_placement_relation(
+            schedule,
+            segment.root,
+        )
+        execution = (
+            None if placement_relation is None else placement_relation.converse()
+        )
+        targets = (
+            frozenset() if execution is None else execution.target_coordinates(source)
+        )
+        tasks.extend(
+            (
+                segment.root,
+                segment.task_order.target_domain.index(
+                    dict(
+                        zip(
+                            segment.task_order.target_domain.axis_order,
+                            target,
+                            strict=True,
+                        )
+                    )
+                ),
+            )
+            for target in targets
+        )
     if len(tasks) > 1:
         raise AssertionError(f"worker {worker} step {worker_step} has multiple tasks")
     return tasks[0] if tasks else None
@@ -302,19 +246,13 @@ def task_at(
 
 def task_order(schedule: WorkerSchedule, root: int) -> tuple[int, ...]:
     """Materialize one root's order for small scheduler tests."""
-    placed_tasks: list[tuple[int, int]] = []
-    for segment in schedule.segments_for_root(root):
-        for task_order_index in range(segment.task_count):
-            dispatch_index = segment.dispatch_index(task_order_index)
-            task = segment_task_at_index(segment, task_order_index)
-            placed_tasks.append((dispatch_index, task))
-    placed_tasks.sort()
-    if any(
-        left_offset == right_offset
-        for (left_offset, _), (right_offset, _) in itertools.pairwise(placed_tasks)
-    ):
-        raise AssertionError(f"root {root} has overlapping schedule segments")
-    return tuple(task for _offset, task in placed_tasks)
+    segment = schedule.segment_for_root(root)
+    if segment is None:
+        return ()
+    return tuple(
+        segment_task_at_index(segment, task_order_index)
+        for task_order_index in range(segment.task_count)
+    )
 
 
 def _materialized_producer_tasks_by_key(
@@ -852,10 +790,8 @@ def _branching_continuation_problem() -> tuple[
             _segment(
                 root,
                 graph.root_task_orders[root],
-                workers=(0, 2),
-                dispatch_offset=slot,
             )
-            for slot, root in enumerate((0, 1, 7))
+            for root in (0, 1, 7)
         ),
     )
     return graph, prepared, plans
@@ -864,17 +800,8 @@ def _branching_continuation_problem() -> tuple[
 def _segment(
     root: int,
     task_order: CoordinateRelation,
-    *,
-    workers: tuple[int, int],
-    dispatch_offset: int,
 ) -> WorkerScheduleSegment:
-    return WorkerScheduleSegment(
-        root=root,
-        task_order=task_order,
-        worker_begin=workers[0],
-        worker_count=workers[1],
-        dispatch_offset=dispatch_offset,
-    )
+    return WorkerScheduleSegment(root=root, task_order=task_order)
 
 
 def _schedule(worker_count: int, *segments: WorkerScheduleSegment) -> WorkerSchedule:
@@ -1573,7 +1500,7 @@ class TestCrossLoopScheduler(TestCase):
             50_000_000,
         )
 
-    def test_worker_schedule_normalizes_dense_runs_to_one_schedule_domain(
+    def test_worker_schedule_derives_wave_aligned_static_placement(
         self,
     ) -> None:
         first_domain, second_domain = _identify_root_domains(
@@ -1584,21 +1511,16 @@ class TestCrossLoopScheduler(TestCase):
             _segment(
                 0,
                 pid_task_order(first_domain, first_domain.axis_order),
-                workers=(0, 4),
-                dispatch_offset=0,
             ),
             _segment(
                 1,
                 pid_task_order(second_domain, second_domain.axis_order),
-                workers=(0, 4),
-                dispatch_offset=8,
             ),
         )
 
-        self.assertTrue(all(segment.is_normalized for segment in schedule.segments))
         self.assertTrue(
             all(
-                segment.task_order.source_domain == schedule.placement_domain
+                segment.task_order.source_domain.kind == "task_order"
                 for segment in schedule.segments
             )
         )
@@ -1611,103 +1533,29 @@ class TestCrossLoopScheduler(TestCase):
             [(0, 2), (1, 2), (2, 2)],
         )
 
-    def test_normalized_segment_task_count_uses_relation_support(self) -> None:
-        target_domain = _identify_root_domains((_domain((10, 3, 1)),))[0]
-        schedule_domain = CoordinateDomain(
-            axis_order=(-3, -2, -1),
-            axis_counts_items=((-3, 2), (-2, 4), (-1, 3)),
-            kind="worker",
-        )
-        worker = coordinate_axis_symbol(-2)
-        relation = CoordinateRelation.point_map(
-            schedule_domain,
-            target_domain,
-            (
-                (
-                    ((-3, 1, 2, 1), (-2, 1, 4, 1), (-1, 1, 2, 1)),
-                    (worker - 1,),
-                ),
-            ),
-        )
-        segment = WorkerScheduleSegment(0, relation, 1, 3, 3)
-        schedule = WorkerSchedule(4, (segment,))
-
-        self.assertEqual(schedule.segments[0].task_count, 3)
-        self.assertEqual(schedule.segments[0].task_order.source_domain.size, 24)
-        self.assertEqual(
-            [placement(schedule, 0, task) for task in range(target_domain.size)],
-            [(1, 1), (2, 1), (3, 1)],
-        )
-        root_placement = cross_loop_scheduler._root_task_placement_relation(
-            schedule,
-            0,
-        )
-        self.assertIsNotNone(root_placement)
-        assert root_placement is not None
-        self.assertTrue(root_placement.is_total_function())
-
     def test_worker_schedule_rejects_equal_cardinality_with_duplicate_tasks(
         self,
     ) -> None:
         target_domain = _identify_root_domains((_domain((10, 2, 1)),))[0]
-        schedule_domain = CoordinateDomain(
-            axis_order=(-3, -2, -1),
-            axis_counts_items=((-3, 2), (-2, 2), (-1, 1)),
-            kind="worker",
+        order_domain = CoordinateDomain(
+            axis_order=(-1,),
+            axis_counts_items=((-1, 2),),
+            kind="task_order",
         )
         duplicate = CoordinateRelation.point_map(
-            schedule_domain,
+            order_domain,
             target_domain,
             (
                 (
-                    ((-3, 1, 2, 1), (-2, 0, 2, 1), (-1, 0, 1, 1)),
+                    ((-1, 0, 2, 1),),
                     (sympy.Integer(0),),
                 ),
             ),
         )
 
         self.assertEqual(duplicate.source_support_cardinality(), 2)
-        with self.assertRaisesRegex(ValueError, "own each logical task once"):
-            WorkerSchedule(
-                2,
-                (WorkerScheduleSegment(0, duplicate, 0, 2, 0),),
-            )
-
-    def test_worker_schedule_rejects_symbolic_overlapping_support(self) -> None:
-        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
-        first_domain, second_domain = _identify_root_domains(
-            (
-                CoordinateDomain((10,), ((10, batch),), ((10, 1),)),
-                CoordinateDomain((20,), ((20, batch),), ((20, 1),)),
-            )
-        )
-        schedule_domain = CoordinateDomain(
-            axis_order=(-3, -2, -1),
-            axis_counts_items=((-3, 2), (-2, 1), (-1, batch)),
-            kind="worker",
-        )
-        wave = coordinate_axis_symbol(-1)
-
-        def placement(domain: CoordinateDomain) -> CoordinateRelation:
-            return CoordinateRelation.point_map(
-                schedule_domain,
-                domain,
-                (
-                    (
-                        ((-3, 1, 2, 1), (-2, 0, 1, 1), (-1, 0, batch, 1)),
-                        (wave,),
-                    ),
-                ),
-            )
-
-        with self.assertRaisesRegex(ValueError, "support overlaps"):
-            WorkerSchedule(
-                1,
-                (
-                    WorkerScheduleSegment(0, placement(first_domain), 0, 1, 0),
-                    WorkerScheduleSegment(1, placement(second_domain), 0, 1, 0),
-                ),
-            )
+        with self.assertRaisesRegex(ValueError, "exact local bijection"):
+            WorkerScheduleSegment(0, duplicate)
 
     def test_static_pipeline_plan_owns_configured_root_orders(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 2, 1)),))
@@ -1746,7 +1594,6 @@ class TestCrossLoopScheduler(TestCase):
         assert dynamic_publication is not None
         self.assertEqual(dynamic_publication.resident_arrival_count, 0)
         self.assertEqual(dynamic_publication.dynamic_task_arrival_count, 2)
-        self.assertEqual(dynamic_publication.publications, ())
 
         order_axis = order.source_domain.axis_order[0]
         duplicate = CoordinateRelation.point_map(
@@ -1762,46 +1609,14 @@ class TestCrossLoopScheduler(TestCase):
         with self.assertRaisesRegex(ValueError, "not an exact bijection"):
             dataclasses.replace(plan, root_task_orders=(duplicate,))
 
-    def test_static_pipeline_plan_rejects_duplicate_root_segments(self) -> None:
+    def test_worker_schedule_rejects_duplicate_root_segments(self) -> None:
         (root_domain,) = _identify_root_domains((_domain((10, 2, 1)),))
-
-        def partial_order(axis: int, task: int) -> CoordinateRelation:
-            source = CoordinateDomain(
-                (axis,),
-                ((axis, 1),),
-                kind="task_order",
-            )
-            return CoordinateRelation.point_map(
-                source,
-                root_domain,
-                (
-                    (
-                        ((axis, 0, 1, 1),),
-                        (sympy.Integer(task),),
-                    ),
-                ),
-            )
-
-        schedule = _schedule(
-            1,
-            _segment(0, partial_order(20, 0), workers=(0, 1), dispatch_offset=0),
-            _segment(0, partial_order(21, 1), workers=(0, 1), dispatch_offset=1),
-        )
+        order = pid_task_order(root_domain, root_domain.axis_order)
         with self.assertRaisesRegex(ValueError, "at most one segment per root"):
-            cross_loop_scheduler.root_barrier_publication_plan(
-                schedule,
-                0,
-                dispatch_mode="static",
-            )
-        with self.assertRaisesRegex(
-            ValueError,
-            "one source-ordered resident-stage segment",
-        ):
-            cross_loop_scheduler.StaticPipelinePlan(
-                worker_schedule=schedule,
-                root_task_orders=(pid_task_order(root_domain, root_domain.axis_order),),
-                readiness_counters=(),
-                root_barrier_edges=frozenset(),
+            _schedule(
+                1,
+                WorkerScheduleSegment(0, order),
+                WorkerScheduleSegment(0, order),
             )
 
     def test_static_pipeline_plan_rejects_unlowerable_counter(self) -> None:
@@ -2277,7 +2092,7 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
-    def test_dense_schedule_rejects_logical_order_with_empty_targets(self) -> None:
+    def test_worker_schedule_rejects_incomplete_local_order(self) -> None:
         target_domain = _identify_root_domains((_domain((10, 1, 1)),))[0]
         order_domain = CoordinateDomain(
             axis_order=(20,),
@@ -2297,72 +2112,9 @@ class TestCrossLoopScheduler(TestCase):
 
         with self.assertRaisesRegex(
             ValueError,
-            "logical task order cannot be flattened exactly",
+            "incompatible local domains",
         ):
-            WorkerSchedule(
-                2,
-                (WorkerScheduleSegment(0, logical_order, 0, 2, 0),),
-            )
-
-    def test_worker_schedule_ignores_stale_dense_compatibility_fields(self) -> None:
-        target_domain = _identify_root_domains((_domain((10, 4, 1)),))[0]
-        schedule_domain = CoordinateDomain(
-            axis_order=(-3, -2, -1),
-            axis_counts_items=((-3, 2), (-2, 4), (-1, 2)),
-            kind="worker",
-        )
-        worker = coordinate_axis_symbol(-2)
-        relation = CoordinateRelation.point_map(
-            schedule_domain,
-            target_domain,
-            (
-                (
-                    ((-3, 1, 2, 1), (-2, 0, 4, 1), (-1, 0, 1, 1)),
-                    (worker,),
-                ),
-            ),
-        )
-
-        schedule = WorkerSchedule(
-            4,
-            (
-                # The relation owns four workers in wave zero. These stale
-                # fields describe a different in-domain four-slot bijection:
-                # workers 0/1 across waves zero and one. Bijection alone must
-                # not make that incompatible dispatch certificate valid.
-                WorkerScheduleSegment(0, relation, 0, 2, 0),
-            ),
-        )
-
-        self.assertEqual(schedule.segments[0].task_count, 4)
-        self.assertEqual(
-            cross_loop_scheduler.root_barrier_publication_plan(
-                schedule,
-                0,
-                dispatch_mode="static",
-            ).participant_intervals,
-            ((0, 4),),
-        )
-        self.assertIsNone(schedule.segments[0].logical_task_order)
-        self.assertIsNone(schedule.dense_assignment(0))
-        authoritative_order = (
-            cross_loop_scheduler._authoritative_dense_segment_logical_order(
-                schedule.segments[0]
-            )
-        )
-        self.assertIsNotNone(authoritative_order)
-        assert authoritative_order is not None
-        self.assertEqual(
-            authoritative_order.materialize(),
-            tuple(frozenset((task,)) for task in range(4)),
-        )
-        traversal = cross_loop_scheduler._root_schedule_traversal(
-            schedule.segments,
-            pid_task_order(target_domain, target_domain.axis_order),
-        )
-        self.assertIsNotNone(traversal)
-        assert traversal is not None
-        self.assertIsNotNone(traversal.scheduled_ordinal_to_logical_task)
+            WorkerScheduleSegment(0, logical_order)
 
     def test_packed_relation_reuses_constructive_interval_proof(self) -> None:
         batch = sympy.Symbol("batch", integer=True, positive=True)
@@ -2598,123 +2350,11 @@ class TestCrossLoopScheduler(TestCase):
         with _forbid_schedule_enumeration():
             schedule = WorkerSchedule(
                 444,
-                (WorkerScheduleSegment(0, woven, 0, 444, 0),),
+                (WorkerScheduleSegment(0, woven),),
             )
         self.assertEqual(
             schedule.segments[0].task_order.target_domain, reference.target_domain
         )
-
-    def test_reflected_woven_worker_schedule_has_traversal_certificate(self) -> None:
-        (target,) = _identify_root_domains((_domain((20, 1, 1), (21, 1536, 1)),))
-        schedule_domain = CoordinateDomain(
-            axis_order=(-3, -2, -1),
-            axis_counts_items=((-3, 2), (-2, 1184), (-1, 14)),
-            kind="worker",
-        )
-        worker = coordinate_axis_symbol(-2)
-        wave = coordinate_axis_symbol(-1)
-        logical_n = (
-            592 * wave
-            + sympy.Mod(worker, 8)
-            + 8 * sympy.floor(worker / 16)
-            - 768 * sympy.floor(sympy.Mod(worker, 16) / 8)
-            - 6336
-        )
-        targets = (
-            (20, sympy.Integer(0), sympy.Integer(1), 1),
-            (21, logical_n, logical_n + 1, 1),
-        )
-        placement = CoordinateRelation(
-            schedule_domain,
-            target,
-            (
-                _CoordinateRelationPiece(
-                    ((-3, 1, 2, 1), (-2, 0, 1184, 1), (-1, 12, 13, 1)),
-                    targets,
-                ),
-                _CoordinateRelationPiece(
-                    ((-3, 1, 2, 1), (-2, 0, 352, 1), (-1, 13, 14, 1)),
-                    targets,
-                ),
-            ),
-        )
-        schedule = WorkerSchedule(
-            1184,
-            (
-                WorkerScheduleSegment(
-                    0,
-                    placement,
-                    0,
-                    1184,
-                    12 * 1184,
-                ),
-            ),
-        )
-        reference = pid_task_order(target, target.axis_order)
-
-        with _forbid_schedule_enumeration():
-            traversal = _root_schedule_traversal(schedule.segments, reference)
-            self.assertIsNotNone(traversal)
-            assert traversal is not None
-            self.assertIsNotNone(traversal.scheduled_ordinal_to_logical_task)
-            self.assertIsNotNone(traversal.logical_task_to_scheduled_ordinal)
-            assert traversal.scheduled_ordinal_to_logical_task is not None
-            assert traversal.logical_task_to_scheduled_ordinal is not None
-            self.assertTrue(
-                traversal.scheduled_ordinal_to_logical_task.is_total_function()
-            )
-            self.assertTrue(
-                traversal.logical_task_to_scheduled_ordinal.is_total_function()
-            )
-
-    def test_worker_schedule_tuple_order_must_match_each_worker_strand(self) -> None:
-        first_domain, second_domain = _identify_root_domains(
-            (_domain((10, 1, 1)), _domain((20, 1, 1)))
-        )
-
-        with self.assertRaisesRegex(
-            ValueError,
-            "tuple order disagrees with worker-step order",
-        ):
-            _schedule(
-                1,
-                _segment(
-                    1,
-                    pid_task_order(second_domain, second_domain.axis_order),
-                    workers=(0, 1),
-                    dispatch_offset=1,
-                ),
-                _segment(
-                    0,
-                    pid_task_order(first_domain, first_domain.axis_order),
-                    workers=(0, 1),
-                    dispatch_offset=0,
-                ),
-            )
-
-    def test_worker_schedule_skips_unassigned_segments_without_ordering(self) -> None:
-        first_domain, second_domain = _identify_root_domains(
-            (_domain((10, 1, 1)), _domain((20, 1, 1)))
-        )
-
-        schedule = _schedule(
-            2,
-            _segment(
-                1,
-                pid_task_order(second_domain, second_domain.axis_order),
-                workers=(1, 1),
-                dispatch_offset=1,
-            ),
-            _segment(
-                0,
-                pid_task_order(first_domain, first_domain.axis_order),
-                workers=(0, 1),
-                dispatch_offset=0,
-            ),
-        )
-
-        self.assertEqual(task_at(schedule, 0, 0), (0, 0))
-        self.assertEqual(task_at(schedule, 1, 1), (1, 0))
 
     def test_root_publication_plan_owns_continuation_arrival_count(self) -> None:
         producer_domain, continuation_domain = _identify_root_domains(
@@ -2749,8 +2389,6 @@ class TestCrossLoopScheduler(TestCase):
             _segment(
                 0,
                 pid_task_order(producer_domain, producer_domain.axis_order),
-                workers=(0, 4),
-                dispatch_offset=0,
             ),
         )
 
@@ -2767,8 +2405,6 @@ class TestCrossLoopScheduler(TestCase):
                 )
 
             self.assertEqual(publication.participant_intervals, ())
-            self.assertIsNone(publication.participant_order)
-            self.assertEqual(publication.publications, ())
             self.assertEqual(publication.resident_arrival_count, 0)
             self.assertEqual(publication.continuation_arrival_count, 3)
             self.assertEqual(publication.dynamic_task_arrival_count, 0)
@@ -2845,24 +2481,8 @@ class TestCrossLoopScheduler(TestCase):
                 )
                 self.assertTrue(schedule.segments[0].task_order.is_single_valued())
             relation = schedule.segments[0].task_order
-            launch_axis, worker_axis, wave_axis = relation.source_domain.axis_order
-            actual: list[int] = []
-            for ordinal in range(domain.size):
-                wave, worker = divmod(ordinal, 4)
-                targets = relation.target_coordinates(
-                    {
-                        launch_axis: 1,
-                        worker_axis: worker,
-                        wave_axis: wave,
-                    }
-                )
-                self.assertEqual(len(targets), 1)
-                target = next(iter(targets))
-                actual.append(
-                    domain.index(dict(zip(domain.axis_order, target, strict=True)))
-                )
             self.assertEqual(
-                actual,
+                [next(iter(targets)) for targets in relation.materialize()],
                 [next(iter(targets)) for targets in configured_order.materialize()],
             )
 
@@ -3430,7 +3050,7 @@ class TestCrossLoopScheduler(TestCase):
             (counter,) = plan.readiness_counters
             self.assertIsNone(counter.continuation_consumer_index)
             self.assertEqual(counter.uniform_arrival_count(), 2)
-            self.assertTrue(plan.worker_schedule.segments_for_root(1))
+            self.assertIsNotNone(plan.worker_schedule.segment_for_root(1))
 
     def test_pipeline_freezes_uniform_dispatch_after_scheduling(self) -> None:
         dependency_graph = _dependency_graph(
@@ -3518,9 +3138,9 @@ class TestCrossLoopScheduler(TestCase):
         with _forbid_schedule_enumeration():
             schedule = _schedule(
                 2,
-                _segment(0, permuted, workers=(0, 2), dispatch_offset=0),
+                _segment(0, permuted),
             )
-            traversal = _root_schedule_traversal(schedule.segments, reference)
+            traversal = _root_schedule_traversal(schedule.segments[0], reference)
         self.assertIsNotNone(traversal)
         assert traversal is not None
         self.assertFalse(traversal.matches_reference)
@@ -4132,8 +3752,6 @@ class TestCrossLoopScheduler(TestCase):
             _segment(
                 0,
                 producer_order,
-                workers=(0, 1184),
-                dispatch_offset=0,
             ),
         )
         event_frontier = _event_ready_after_worker_steps(
@@ -4242,14 +3860,10 @@ class TestCrossLoopScheduler(TestCase):
             _segment(
                 0,
                 graph.root_task_orders[0],
-                workers=(0, 6),
-                dispatch_offset=0,
             ),
             _segment(
                 1,
                 graph.root_task_orders[1],
-                workers=(6, 1),
-                dispatch_offset=1,
             ),
         )
         order_domain = _domain(
@@ -4265,12 +3879,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         final = _schedule(
             8,
-            _segment(0, final_order, workers=(0, 6), dispatch_offset=0),
+            _segment(0, final_order),
             _segment(
                 1,
                 graph.root_task_orders[1],
-                workers=(6, 1),
-                dispatch_offset=1,
             ),
         )
         scratch_counters = (
@@ -4440,14 +4052,10 @@ class TestCrossLoopScheduler(TestCase):
             _segment(
                 0,
                 graph.root_task_orders[0],
-                workers=(0, 32),
-                dispatch_offset=0,
             ),
             _segment(
                 1,
                 graph.root_task_orders[1],
-                workers=(0, 8),
-                dispatch_offset=8,
             ),
         )
         same_wave = _schedule(
@@ -4455,14 +4063,10 @@ class TestCrossLoopScheduler(TestCase):
             _segment(
                 0,
                 graph.root_task_orders[0],
-                workers=(0, 32),
-                dispatch_offset=0,
             ),
             _segment(
                 1,
                 graph.root_task_orders[1],
-                workers=(32, 8),
-                dispatch_offset=0,
             ),
         )
         with _forbid_schedule_enumeration():
@@ -4547,69 +4151,21 @@ class TestCrossLoopScheduler(TestCase):
         graph = _readiness_graph((producer_domain, consumer_domain), event)
         exact = (ReadinessCounterPlan(event.producers, event.consumers),)
 
-        # The static worker-rank helper can derive different two-stage
-        # frontiers at different waves. Canonical root order proves the
-        # stronger, mode-independent one-wait root-entry quotient.
+        # Canonical root order proves the mode-independent one-wait root-entry
+        # quotient without depending on a hand-authored worker placement.
         schedule = _schedule(
             8,
             _segment(
                 0,
                 graph.root_task_orders[0],
-                workers=(0, 2),
-                dispatch_offset=0,
             ),
             _segment(
                 1,
                 graph.root_task_orders[1],
-                workers=(2, 6),
-                dispatch_offset=6,
             ),
         )
-        self.assertEqual(schedule.worker_step_bounds_for_root(0), (0, 2))
-        self.assertEqual(schedule.worker_step_bounds_for_root(1), (1, 2))
-
-        nested_readiness = cross_loop_scheduler._nested_loop_readiness(
-            graph,
-            event,
-            consumer,
-            worker_schedule=schedule,
-            continuation_by_root={},
-        )
-        self.assertIsNotNone(nested_readiness)
-        assert nested_readiness is not None
-        frontier = cross_loop_scheduler._uniform_nested_readiness_frontier(
-            nested_readiness.ready_after_worker_step,
-            21,
-        )
-        self.assertIsNotNone(frontier)
-        assert frontier is not None
-        self.assertEqual(
-            cross_loop_scheduler._nested_ready_prefix_boundaries(frontier, 1),
-            (0, 2, 5),
-        )
-        earliest = cross_loop_scheduler._split_nested_loop_at_readiness(
-            graph,
-            nested_readiness,
-            consumer_worker_step=1,
-        )
-        latest = cross_loop_scheduler._split_nested_loop_at_readiness(
-            graph,
-            nested_readiness,
-            consumer_worker_step=2,
-        )
-        self.assertIsNotNone(earliest)
-        self.assertIsNotNone(latest)
-        assert earliest is not None and latest is not None
-        self.assertEqual(earliest.readiness_key_count, 2)
-        self.assertEqual(latest.readiness_key_count, 2)
-        self.assertEqual(
-            _expected_arrivals(earliest.readiness_key_domain, earliest.producers),
-            (2, 3),
-        )
-        self.assertEqual(
-            _expected_arrivals(latest.readiness_key_domain, latest.producers),
-            (4, 1),
-        )
+        self.assertEqual(schedule.worker_step_bounds_for_root(0), (0, 0))
+        self.assertEqual(schedule.worker_step_bounds_for_root(1), (1, 1))
 
         compact = cross_loop_scheduler._compact_nested_loop_counters_for_schedule(
             graph,
@@ -5500,7 +5056,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         validate_worker_schedule(
             configured,
-            baseline.without_roots(frozenset((1, 2, 3))),
+            WorkerSchedule(
+                baseline.worker_count,
+                tuple(segment for segment in baseline.segments if segment.root == 0),
+            ),
             continuations,
         )
 
@@ -6343,28 +5902,26 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(task_at(schedule, 3, 1), (1, 3))
 
     def test_root_major_geometry_accepts_underfilled_canonical_root(self) -> None:
-        root_domains = (
-            _domain((10, 4, 1)),
-            _domain((20, 2, 1)),
-        )
-        schedule = _baseline_worker_schedule(root_domains, worker_count=4)
+        for first_count in (3, 4):
+            with self.subTest(first_count=first_count):
+                root_domains = (
+                    _domain((10, first_count, 1)),
+                    _domain((20, 2, 1)),
+                )
+                schedule = _baseline_worker_schedule(root_domains, worker_count=4)
 
-        # The second segment's dense compatibility spelling uses only its two
-        # active workers. Its authoritative relation nevertheless occupies
-        # global packed slots [4, 6), which is the root-major proof.
-        self.assertEqual(schedule.segments[1].worker_count, 2)
-        with _forbid_schedule_enumeration():
-            geometry = cross_loop_scheduler._root_major_schedule_geometry(schedule)
+                with _forbid_schedule_enumeration():
+                    geometry = cross_loop_scheduler._root_major_schedule_geometry(
+                        schedule
+                    )
 
-        self.assertIsNotNone(geometry)
-        assert geometry is not None
-        self.assertEqual(
-            tuple(
-                (segment.root, first_slot, task_count)
-                for segment, first_slot, task_count in geometry
-            ),
-            ((0, 0, 4), (1, 4, 2)),
-        )
+                self.assertEqual(
+                    tuple(
+                        (segment.root, first_slot, task_count)
+                        for segment, first_slot, task_count in geometry
+                    ),
+                    ((0, 0, first_count), (1, 4, 2)),
+                )
 
     def test_baseline_worker_schedule_compacts_around_excluded_roots(self) -> None:
         root_domains = _identify_root_domains(
@@ -6398,10 +5955,10 @@ class TestCrossLoopScheduler(TestCase):
                 root_task_orders=(wrong_size,),
                 events=(),
             )
-        with self.assertRaisesRegex(ValueError, "incompatible domains"):
+        with self.assertRaisesRegex(ValueError, "incompatible local domains"):
             converse = wrong_size.converse()
             assert converse is not None
-            _segment(0, converse, workers=(0, 2), dispatch_offset=0)
+            _segment(0, converse)
 
     def test_baseline_worker_schedule_preserves_pid_task_order(self) -> None:
         root_domains = (_domain((10, 4, 1), identity=0),)
@@ -6429,37 +5986,13 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(placement(schedule, 0, 1), (0, 1))
         self.assertEqual(placement(schedule, 0, 3), (1, 1))
 
-    def test_worker_schedule_segment_uses_symbolic_order_across_rounds(self) -> None:
-        task_axis = 10
-        task_order_axis = 20
-        task_domain = _domain((task_axis, 15), identity=2)
-        task_order_domain = _domain((task_order_axis, 3), kind="task_order")
-        segment = _segment(
-            2,
-            _full_point_map(
-                task_order_domain,
-                task_domain,
-                10 + 2 * coordinate_axis_symbol(task_order_axis),
-            ),
-            workers=(2, 2),
-            dispatch_offset=0,
-        )
-
-        self.assertEqual(segment_placement(segment, 10), (2, 0))
-        self.assertEqual(segment_placement(segment, 12), (3, 0))
-        self.assertEqual(segment_placement(segment, 14), (2, 1))
-        self.assertEqual(segment_placement(segment, 11), None)
-        self.assertEqual(segment_task_at(segment, 2, 1), 14)
-
-    def test_worker_support_excludes_unused_segment_capacity(self) -> None:
+    def test_underfilled_root_publication_excludes_unused_workers(self) -> None:
         task_domain = _domain((10, 2), identity=0)
         schedule = _schedule(
             6,
             _segment(
                 0,
                 _one_dimensional_task_range(task_domain, 0, 2),
-                workers=(1, 4),
-                dispatch_offset=2,
             ),
         )
 
@@ -6469,9 +6002,8 @@ class TestCrossLoopScheduler(TestCase):
                 0,
                 dispatch_mode="static",
             ).participant_intervals,
-            ((3, 5),),
+            ((0, 2),),
         )
-        self.assertEqual(schedule.dense_assignment(0), (1, 4, 2, 2))
         self.assertIsNone(schedule.contiguous_global_interval(0))
 
     def test_root_local_preparation_orders_continuation_producers_atomically(
@@ -6520,7 +6052,10 @@ class TestCrossLoopScheduler(TestCase):
             event.consumers,
             continuation_consumer_index=0,
         )
-        resident = baseline.without_roots(frozenset((1,)))
+        resident = WorkerSchedule(
+            baseline.worker_count,
+            tuple(segment for segment in baseline.segments if segment.root != 1),
+        )
         schedule = cross_loop_scheduler._consumer_major_producer_order(
             readiness_graph,
             resident,
@@ -6573,14 +6108,10 @@ class TestCrossLoopScheduler(TestCase):
             _segment(
                 1,
                 readiness_graph.root_task_orders[1],
-                workers=(0, 1),
-                dispatch_offset=0,
             ),
             _segment(
                 0,
                 readiness_graph.root_task_orders[0],
-                workers=(0, 1),
-                dispatch_offset=1,
             ),
         )
         with self.assertRaisesRegex(ValueError, "dependency/order cycle"):

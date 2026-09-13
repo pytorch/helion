@@ -25,8 +25,6 @@ from .tile_dependency import CoordinateRelation
 from .tile_dependency import DependencyObligation
 from .tile_dependency import TileDependencyGraph
 from .tile_dependency import _CoordinateRelationPiece
-from .tile_dependency import _logical_expression_bounds
-from .tile_dependency import _simplify_logical_expression
 from .tile_dependency import consumer_to_preceding_site_relation
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
@@ -41,99 +39,47 @@ CrossLoopDispatchMode = Literal["static", "dynamic"]
 _RESIDENT_LAUNCH_STAGE = 1
 
 
-def _normalize_intervals(
-    intervals: tuple[WorkerInterval, ...] | list[WorkerInterval],
-) -> tuple[WorkerInterval, ...]:
-    """Return a sorted, disjoint union of half-open integer intervals."""
-    result: list[WorkerInterval] = []
-    for begin, end in sorted(intervals):
-        if begin >= end:
-            continue
-        if result and begin <= result[-1][1]:
-            result[-1] = (result[-1][0], max(result[-1][1], end))
-        else:
-            result.append((begin, end))
-    return tuple(result)
-
-
-def _interval_cardinality(intervals: tuple[WorkerInterval, ...]) -> int:
-    """Return the exact number of integers in disjoint half-open intervals."""
-    return sum(end - begin for begin, end in _normalize_intervals(intervals))
-
-
 @dataclasses.dataclass(frozen=True)
 class WorkerScheduleSegment:
-    """One root's ownership relation in a static persistent-worker schedule.
+    """One root's compact logical traversal in a persistent-worker schedule.
 
-    In a normalized :class:`WorkerSchedule`, ``task_order`` maps global
-    ``(launch stage, worker, wave)`` coordinates directly to logical tasks.
-    Its source support is allowed to be partial.  The three integer placement
-    fields remain only as the migration-compatible spelling of a dense run;
-    :class:`WorkerSchedule` immediately normalizes that spelling into the
-    relation and all semantic queries consume the relation. Physical dispatch
-    is selected once by the owning :class:`StaticPipelinePlan`; it is not a
-    property of an individual segment.
-
-    Before normalization, constructors may still pass a dense logical task
-    order plus ``dispatch_offset``::
-
-        dispatch_index = dispatch_offset + task_order_index
-        worker = worker_begin + dispatch_index % worker_count
-        worker_step = dispatch_index // worker_count
-
-    This compatibility form is never a second accepted schedule: construction
-    succeeds only when it can be converted exactly to the authoritative
-    relation.
+    ``task_order`` is the sole schedule truth: a dense, possibly
+    multidimensional local order mapped bijectively to the root's logical task
+    domain.  Static worker/wave placement and dynamic packet tickets are
+    derived by :class:`WorkerSchedule`; neither is stored here.
     """
 
     root: int
     task_order: CoordinateRelation
-    worker_begin: int
-    worker_count: int
-    dispatch_offset: int
 
     def __post_init__(self) -> None:
         if self.root < 0:
             raise ValueError(f"root must be nonnegative, got {self.root}")
-        if self.worker_begin < 0:
-            raise ValueError(
-                f"worker_begin must be nonnegative, got {self.worker_begin}"
+        if (
+            self.task_order.source_domain.kind != "task_order"
+            or self.task_order.target_domain.kind != "site"
+            or not _equal_integer_expressions(
+                self.task_order.source_domain.size_expr,
+                self.task_order.target_domain.size_expr,
             )
-        if self.worker_count <= 0:
-            raise ValueError(f"worker_count must be positive, got {self.worker_count}")
-        if self.dispatch_offset < 0:
-            raise ValueError(
-                f"dispatch_offset must be nonnegative, got {self.dispatch_offset}"
+            or (
+                not self.task_order.pieces
+                and self.task_order.target_domain.size_expr.is_zero is not True
             )
-        if self.task_order.target_domain.kind != "site" or (
-            not self.task_order.pieces
-            and self.task_order.target_domain.size_expr.is_zero is not True
         ):
-            raise ValueError(
-                "symbolic worker schedule relation has incompatible domains"
-            )
-        if self.task_order.source_domain.kind not in ("task_order", "worker"):
-            raise ValueError(
-                "worker schedule source must be a task order or schedule domain"
-            )
-        if self.task_order.source_domain.kind == "worker" and (
-            len(self.task_order.source_domain.axis_order) != 3
-            or self.task_order.source_domain.axis_count_expressions[
-                self.task_order.source_domain.axis_order[0]
-            ]
-            != 2
+            raise ValueError("worker schedule segment has incompatible local domains")
+        converse = self.task_order.converse()
+        if (
+            not self.task_order.is_total_function()
+            or converse is None
+            or not converse.is_total_function()
         ):
-            raise ValueError("normalized worker schedule has incompatible axes")
+            raise ValueError("worker schedule segment is not an exact local bijection")
 
     @cached_property
     def task_count_expr(self) -> sympy.Expr:
-        """Exact number of schedule slots owned by this segment relation."""
-        if self.task_order.source_domain.kind == "task_order":
-            return self.task_order.source_domain.size_expr
-        cardinality = self.task_order.source_support_cardinality()
-        if cardinality is None:
-            raise ValueError("worker schedule support cardinality is not exact")
-        return sympy.sympify(cardinality)
+        """Exact number of local tasks in this segment."""
+        return self.task_order.source_domain.size_expr
 
     @cached_property
     def task_count(self) -> int:
@@ -142,499 +88,6 @@ class WorkerScheduleSegment:
         if task_count.free_symbols or not isinstance(task_count, sympy.Integer):
             raise ValueError("worker schedule task count is symbolic")
         return int(task_count)
-
-    @property
-    def is_normalized(self) -> bool:
-        """Return whether ``task_order`` is the authoritative schedule map."""
-        return self.task_order.source_domain.kind == "worker"
-
-    @cached_property
-    def launch_stage(self) -> int | None:
-        """Return the sole launch stage occupied by this relation, if proved."""
-        if not self.is_normalized:
-            return None
-        canonical = self.task_order.canonical_single_valued()
-        if canonical is None:
-            canonical = self.task_order
-        launch_stage_axis = canonical.source_domain.axis_order[0]
-        bounds = {
-            (begin, end, step)
-            for piece in canonical.pieces
-            for axis, begin, end, step in piece.source_bounds_items
-            if axis == launch_stage_axis
-        }
-        if len(bounds) != 1:
-            return None
-        (launch_stage_bound,) = bounds
-        begin, end, step = launch_stage_bound
-        if (
-            step != 1
-            or end != begin + 1  # pyrefly: ignore[unsupported-operation]
-            or begin != _RESIDENT_LAUNCH_STAGE
-        ):
-            return None
-        return int(begin)
-
-    @cached_property
-    def resident_slot_interval(self) -> tuple[sympy.Expr, sympy.Expr] | None:
-        """Return this segment's exact dense resident global-slot interval.
-
-        The interval is derived from the authoritative placement relation;
-        legacy dense compatibility fields are deliberately ignored. Empty
-        relations have no intrinsic position and are handled by their owning
-        packed schedule proof.
-        """
-        if not self.is_normalized or self.launch_stage != _RESIDENT_LAUNCH_STAGE:
-            return None
-        _launch_stage_axis, worker_axis, wave_axis = (
-            self.task_order.source_domain.axis_order
-        )
-        return tile_dependency._dense_linear_source_support_interval(
-            self.task_order,
-            (worker_axis, wave_axis),
-        )
-
-    @cached_property
-    def logical_task_order(self) -> CoordinateRelation | None:
-        """Derive the dense logical traversal represented by this run.
-
-        This is compatibility and code-rendering machinery.  Placement and
-        correctness use ``task_order`` itself after normalization.
-        """
-        if not self.is_normalized:
-            return self.task_order
-        try:
-            task_count = self.task_count_expr
-        except ValueError:
-            return None
-        ordinal_axis = (
-            max(
-                (
-                    *self.task_order.source_domain.axis_order,
-                    *self.task_order.target_domain.axis_order,
-                ),
-                default=0,
-            )
-            + 1
-        )
-        ordinal_domain = CoordinateDomain(
-            axis_order=(ordinal_axis,),
-            axis_counts_items=((ordinal_axis, task_count),),
-            kind="task_order",
-            _allow_empty=task_count.is_zero is True,
-        )
-        if task_count.is_zero is True:
-            result = CoordinateRelation(
-                source_domain=ordinal_domain,
-                target_domain=self.task_order.target_domain,
-                pieces=(),
-            )
-            converse = CoordinateRelation(
-                source_domain=self.task_order.target_domain,
-                target_domain=ordinal_domain,
-                pieces=(),
-            )
-            tile_dependency._remember_exact_converse(result, converse)
-            return result
-        ordinal = coordinate_axis_symbol(ordinal_axis)
-        dispatch_index = self.dispatch_offset + ordinal  # pyrefly: ignore[unsupported-operation]
-        launch_stage_axis, worker_axis, wave_axis = (
-            self.task_order.source_domain.axis_order
-        )
-        launch_stage = self.launch_stage
-        if launch_stage is None:
-            return None
-        launch_stage_bound = (launch_stage, launch_stage + 1, 1)
-
-        if task_count.free_symbols:
-            # Prove the compatibility fields directly against an exact dense
-            # ordinalization of the authoritative placement support.  Codegen
-            # still consumes these fields, so authoritative ownership alone
-            # must not make a stale dense dispatch certificate renderable.
-            support_relation = CoordinateRelation.point_map(
-                self.task_order.source_domain,
-                ordinal_domain,
-                tuple(
-                    (piece.source_bounds_items, (sympy.Integer(0),))
-                    for piece in self.task_order.pieces
-                ),
-            ).coalesce_adjacent_source_boxes()
-            support_ordinal = support_relation._ordinalized_source_support
-            authoritative_dispatch = (
-                None if support_ordinal is None else support_ordinal.converse()
-            )
-            compatibility_dispatch = CoordinateRelation.point_map(
-                ordinal_domain,
-                self.task_order.source_domain,
-                (
-                    (
-                        ((ordinal_axis, 0, task_count, 1),),
-                        (
-                            sympy.Integer(launch_stage),
-                            self.worker_begin
-                            + sympy.Mod(dispatch_index, self.worker_count),
-                            sympy.floor(dispatch_index / self.worker_count),
-                        ),
-                    ),
-                ),
-            )
-            if (
-                support_ordinal is not None
-                and authoritative_dispatch is not None
-                and authoritative_dispatch.is_total_function()
-                and authoritative_dispatch.is_pointwise_equal_on_same_support(
-                    compatibility_dispatch
-                )
-            ):
-                logical_order = tile_dependency._factor_through_source_ordinalization(
-                    self.task_order,
-                    support_ordinal,
-                    authoritative_dispatch,
-                )
-                logical_to_ordinal = (
-                    None if logical_order is None else logical_order.converse()
-                )
-                if (
-                    logical_order is not None
-                    and logical_order.is_total_function()
-                    and logical_to_ordinal is not None
-                    and logical_to_ordinal.is_single_valued()
-                ):
-                    return logical_order
-            return None
-
-        # Retain the bounded concrete compatibility proof for older segmented
-        # schedules whose source support has no compact ordinalization.
-        task_count_int = int(task_count)
-        canonical = self.task_order.canonical_single_valued()
-        if canonical is None:
-            return None
-        schedule_ordinal = (
-            coordinate_axis_symbol(wave_axis) * self.worker_count  # pyrefly: ignore[unsupported-operation]
-            + coordinate_axis_symbol(worker_axis)
-            - self.worker_begin
-            - self.dispatch_offset
-        )
-        for piece in canonical.pieces:
-            bounds = {
-                axis: (begin, end, step)
-                for axis, begin, end, step in piece.source_bounds_items
-            }
-            worker_begin, worker_end, _worker_step = bounds[worker_axis]
-            ordinal_bounds = _logical_expression_bounds(
-                schedule_ordinal,
-                domain=canonical.source_domain,
-                source_bounds=piece.source_bounds_items,
-            )
-            if (
-                bounds[launch_stage_axis] != launch_stage_bound
-                or worker_begin < self.worker_begin
-                or worker_end > self.worker_begin + self.worker_count
-                or ordinal_bounds is None
-                or ordinal_bounds[0] < 0  # pyrefly: ignore[unsupported-operation]
-                or ordinal_bounds[1] >= task_count_int  # pyrefly: ignore[unsupported-operation]
-            ):
-                return None
-        substitutions = {
-            coordinate_axis_symbol(launch_stage_axis): sympy.Integer(launch_stage),
-            coordinate_axis_symbol(worker_axis): self.worker_begin  # pyrefly: ignore[unsupported-operation]
-            + sympy.Mod(dispatch_index, self.worker_count),  # pyrefly: ignore[unsupported-operation]
-            coordinate_axis_symbol(wave_axis): sympy.floor(
-                dispatch_index / self.worker_count
-            ),
-        }
-        full_ordinal_bounds = ((ordinal_axis, 0, task_count_int, 1),)
-        pieces: list[
-            tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
-        ] = []
-        for piece in self.task_order.pieces:
-            source_bounds = {
-                axis: (begin, end, step)
-                for axis, begin, end, step in piece.source_bounds_items
-            }
-            if source_bounds[launch_stage_axis] != launch_stage_bound:
-                continue
-            worker_begin, worker_end, worker_step = source_bounds[worker_axis]
-            wave_begin, wave_end, wave_step = source_bounds[wave_axis]
-            if wave_end == wave_begin + 1:
-                ordinal_begin = (
-                    wave_begin * self.worker_count
-                    + worker_begin
-                    - self.worker_begin
-                    - self.dispatch_offset
-                )
-                ordinal_end = ordinal_begin + worker_end - worker_begin
-                ordinal_step = worker_step
-            elif (
-                worker_begin == self.worker_begin
-                and worker_end == self.worker_begin + self.worker_count
-                and worker_step == 1
-            ):
-                ordinal_begin = wave_begin * self.worker_count - self.dispatch_offset
-                ordinal_end = (
-                    (wave_end - 1) * self.worker_count
-                    - self.dispatch_offset
-                    + self.worker_count
-                )
-                ordinal_step = wave_step
-                if wave_step != 1:
-                    return None
-            elif worker_end == worker_begin + 1 and worker_step == 1:
-                ordinal_begin = (
-                    wave_begin * self.worker_count
-                    + worker_begin
-                    - self.worker_begin
-                    - self.dispatch_offset
-                )
-                ordinal_end = (
-                    (wave_end - 1) * self.worker_count
-                    + worker_begin
-                    - self.worker_begin
-                    - self.dispatch_offset
-                    + 1
-                )
-                ordinal_step = wave_step * self.worker_count
-            else:
-                return None
-            ordinal_begin = max(0, ordinal_begin)
-            ordinal_end = min(task_count_int, ordinal_end)
-            if ordinal_begin >= ordinal_end:
-                continue
-            ordinal_bounds = ((ordinal_axis, ordinal_begin, ordinal_end, ordinal_step),)
-            target_expressions: list[sympy.Expr] = []
-            for _axis, begin, end, step in piece.target_ranges:
-                if step != 1 or sympy.simplify(end - begin) != 1:  # pyrefly: ignore[unsupported-operation]
-                    return None
-                expression = (
-                    ordinal
-                    if sympy.simplify(
-                        begin
-                        - (  # pyrefly: ignore[unsupported-operation]
-                            coordinate_axis_symbol(worker_axis)  # pyrefly: ignore[unsupported-operation]
-                            - self.worker_begin  # pyrefly: ignore[unsupported-operation]
-                            + coordinate_axis_symbol(wave_axis) * self.worker_count  # pyrefly: ignore[unsupported-operation]
-                            - self.dispatch_offset
-                        )
-                    )
-                    == 0
-                    else cast("sympy.Expr", begin.xreplace(substitutions))
-                )
-                target_expressions.append(
-                    _simplify_logical_expression(
-                        expression,
-                        domain=ordinal_domain,
-                        source_bounds=full_ordinal_bounds,
-                    )
-                )
-            pieces.append(
-                (
-                    ordinal_bounds,
-                    tuple(target_expressions),
-                )
-            )
-        result = CoordinateRelation.point_map(
-            ordinal_domain,
-            self.task_order.target_domain,
-            tuple(pieces),
-        )
-        compact = result.coalesce_adjacent_source_boxes()
-        if not compact.is_total_function():
-            return None
-        result = compact
-        if not result.is_total_function():
-            return None
-        schedule_to_ordinal = CoordinateRelation.point_map(
-            self.task_order.source_domain,
-            ordinal_domain,
-            (
-                (
-                    tuple(
-                        (
-                            axis,
-                            0,
-                            self.task_order.source_domain.axis_count_expressions[axis],
-                            1,
-                        )
-                        for axis in self.task_order.source_domain.axis_order
-                    ),
-                    (schedule_ordinal,),
-                ),
-            ),
-        )
-        logical_to_schedule = self.task_order.converse()
-        logical_to_ordinal = (
-            None
-            if logical_to_schedule is None
-            else logical_to_schedule.then(schedule_to_ordinal)
-        )
-        if logical_to_ordinal is None:
-            return None
-        tile_dependency._remember_exact_converse(result, logical_to_ordinal)
-        return result
-
-    def logical_task_wave_relation(
-        self,
-        wave_domain: CoordinateDomain,
-    ) -> CoordinateRelation | None:
-        """Derive this dense rendering run's task-order-to-wave map."""
-        logical_order = self.logical_task_order
-        if logical_order is None:
-            return None
-        if logical_order.source_domain.size_expr.is_zero is True:
-            return CoordinateRelation(
-                source_domain=logical_order.source_domain,
-                target_domain=wave_domain,
-                pieces=(),
-            )
-        local_ordinal = _flat_domain_index_expression(logical_order.source_domain)
-        wave = sympy.floor(  # pyrefly: ignore[bad-argument-type]
-            (self.dispatch_offset + local_ordinal) / self.worker_count  # pyrefly: ignore[unsupported-operation]
-        )
-        return CoordinateRelation.point_map(
-            logical_order.source_domain,
-            wave_domain,
-            (
-                (
-                    tuple(
-                        (
-                            axis,
-                            0,
-                            logical_order.source_domain.axis_count_expressions[axis],
-                            1,
-                        )
-                        for axis in logical_order.source_domain.axis_order
-                    ),
-                    (wave,),
-                ),
-            ),
-        )
-
-    def dispatch_index(self, task_order_index: int) -> int:
-        """Return the linearized dispatch index for one ordered task."""
-        if not 0 <= task_order_index < self.task_count:
-            raise IndexError(task_order_index)
-        return self.dispatch_offset + task_order_index
-
-    def worker_step_bounds(self, worker: int) -> tuple[int, int] | None:
-        """Return this segment's first and last resident step on one worker."""
-        if self.is_normalized and self.launch_stage != _RESIDENT_LAUNCH_STAGE:
-            return None
-        worker_offset = worker - self.worker_begin
-        if not 0 <= worker_offset < self.worker_count:
-            return None
-        begin = self.dispatch_offset
-        end = begin + self.task_count
-        first = begin + (worker_offset - begin) % self.worker_count
-        if first >= end:
-            return None
-        last = first + (end - 1 - first) // self.worker_count * self.worker_count
-        return first // self.worker_count, last // self.worker_count
-
-    def worker_step_runs(self) -> tuple[tuple[int, int, int, int], ...]:
-        """Return resident ``(worker begin, end, first step, last step)`` runs.
-
-        A dense dispatch has only constant-many changes: at the first-dispatch
-        wrap and the final-dispatch wrap.  Partitioning at those endpoints
-        proves the bounds for arbitrary task and worker counts without
-        iterating either domain.  Production optimized schedules impose the
-        narrower wave-aligned form when constructing their rank certificate.
-        """
-        if self.is_normalized:
-            canonical = self.task_order.canonical_single_valued()
-            if canonical is None and self.task_order.is_single_valued():
-                canonical = self.task_order
-            if canonical is None:
-                raise ValueError("worker schedule relation is not single-valued")
-            launch_stage_axis, worker_axis, wave_axis = (
-                canonical.source_domain.axis_order
-            )
-            support_by_waves: dict[
-                tuple[int, int, int], list[tuple[int, int, int]]
-            ] = {}
-            for piece in canonical.pieces:
-                bounds = {
-                    axis: (begin, end, step)
-                    for axis, begin, end, step in piece.source_bounds_items
-                }
-                if bounds[launch_stage_axis] != (
-                    _RESIDENT_LAUNCH_STAGE,
-                    _RESIDENT_LAUNCH_STAGE + 1,
-                    1,
-                ):
-                    continue
-                worker_begin, worker_end, worker_step = bounds[worker_axis]
-                wave_begin, wave_end, wave_step = bounds[wave_axis]
-                support_by_waves.setdefault(
-                    (wave_begin, wave_end, wave_step), []
-                ).append((worker_begin, worker_end, worker_step))
-            runs: list[tuple[int, int, int, int]] = []
-            for (
-                wave_begin,
-                wave_end,
-                wave_step,
-            ), worker_support in support_by_waves.items():
-                if wave_step != 1:
-                    raise ValueError("worker schedule wave support must be contiguous")
-                support_begin = min(begin for begin, _end, _step in worker_support)
-                support_end = max(end for _begin, end, _step in worker_support)
-                support_count = sum(
-                    len(range(begin, end, step)) for begin, end, step in worker_support
-                )
-                if support_count != support_end - support_begin:
-                    raise ValueError("worker schedule has noncontiguous worker support")
-                for index, (begin, end, step) in enumerate(worker_support):
-                    for other_begin, other_end, other_step in worker_support[
-                        index + 1 :
-                    ]:
-                        overlap_begin = max(begin, other_begin)
-                        overlap_end = min(end, other_end)
-                        if overlap_begin >= overlap_end:
-                            continue
-                        if (other_begin - begin) % math.gcd(step, other_step) == 0:
-                            raise ValueError("worker schedule support overlaps")
-                runs.append((support_begin, support_end, wave_begin, wave_end - 1))
-            return tuple(sorted(dict.fromkeys(runs), key=operator.itemgetter(2, 0)))
-
-        worker_count = self.worker_count
-        first_residue = self.dispatch_offset % worker_count
-        active_count = min(self.task_count, worker_count)
-        first_end = first_residue + active_count
-        support = (
-            ((first_residue, first_end),)
-            if first_end <= worker_count
-            else ((0, first_end - worker_count), (first_residue, worker_count))
-        )
-        final_residue = (self.dispatch_offset + self.task_count - 1) % worker_count
-        structural_cuts = {0, worker_count, first_residue, final_residue + 1}
-        structural_cuts.update(
-            endpoint for interval in support for endpoint in interval
-        )
-        cuts = sorted(structural_cuts)
-        runs: list[tuple[int, int, int, int]] = []
-        for begin, end in itertools.pairwise(cuts):
-            if begin >= end or not any(
-                support_begin <= begin and end <= support_end
-                for support_begin, support_end in support
-            ):
-                continue
-            begin_bounds = self.worker_step_bounds(self.worker_begin + begin)
-            end_bounds = self.worker_step_bounds(self.worker_begin + end - 1)
-            if begin_bounds is None or begin_bounds != end_bounds:
-                raise AssertionError("worker-step structural partition is incomplete")
-            runs.append(
-                (
-                    self.worker_begin + begin,
-                    self.worker_begin + end,
-                    *begin_bounds,
-                )
-            )
-        return tuple(runs)
-
-    def worker_intervals(self) -> tuple[WorkerInterval, ...]:
-        """Return the active-worker support without worker enumeration."""
-        return _normalize_intervals(
-            [(begin, end) for begin, end, _first, _last in self.worker_step_runs()]
-        )
 
 
 def _flat_domain_index_expression(domain: CoordinateDomain) -> sympy.Expr:
@@ -673,259 +126,6 @@ def _worker_schedule_domain(
         kind="worker",
         _allow_empty=wave_count_expr.is_zero is True,
     )
-
-
-def _normalize_dense_schedule_segment(
-    segment: WorkerScheduleSegment,
-    schedule_domain: CoordinateDomain,
-) -> WorkerScheduleSegment:
-    """Convert one legacy dense run to its exact schedule ownership relation."""
-    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
-    if segment.is_normalized:
-        source = segment.task_order.source_domain
-        if source == schedule_domain:
-            return segment
-        source_counts = source.axis_count_expressions
-        schedule_counts = schedule_domain.axis_count_expressions
-        if (
-            source.axis_order != schedule_domain.axis_order
-            or not _equal_integer_expressions(
-                source_counts[launch_stage_axis],
-                schedule_counts[launch_stage_axis],
-            )
-            or not _equal_integer_expressions(
-                source_counts[worker_axis],
-                schedule_counts[worker_axis],
-            )
-            or sympy.simplify(
-                schedule_counts[wave_axis] - source_counts[wave_axis]
-            ).is_nonnegative
-            is not True
-        ):
-            raise ValueError("worker schedule segments do not share one domain")
-        rebased_task_order = segment.task_order.rebase_source_domain(schedule_domain)
-        if rebased_task_order is None:
-            raise ValueError("worker schedule segment cannot widen its source domain")
-        return dataclasses.replace(segment, task_order=rebased_task_order)
-
-    logical_order = segment.task_order
-    worker = coordinate_axis_symbol(worker_axis)
-    wave = coordinate_axis_symbol(wave_axis)
-    local_ordinal = (
-        wave * segment.worker_count  # pyrefly: ignore[unsupported-operation]
-        + worker
-        - segment.worker_begin
-        - segment.dispatch_offset
-    )
-    ordinal_axis = (
-        max(
-            (
-                *schedule_domain.axis_order,
-                *logical_order.source_domain.axis_order,
-                *logical_order.target_domain.axis_order,
-            ),
-            default=0,
-        )
-        + 1
-    )
-    ordinal_domain = CoordinateDomain(
-        axis_order=(ordinal_axis,),
-        axis_counts_items=((ordinal_axis, logical_order.source_domain.size),),
-        kind="task_order",
-    )
-    flat_logical_order = _flat_task_order_relation(logical_order, ordinal_domain)
-    if (
-        flat_logical_order is None
-        or not flat_logical_order.is_total_function()
-        or flat_logical_order.converse() is None
-    ):
-        raise ValueError("logical task order cannot be flattened exactly")
-
-    def dispatch_boxes(
-        ordinal_begin: int,
-        ordinal_end: int,
-        ordinal_step: int,
-    ) -> tuple[tuple[tuple[int, int, int, int], ...], ...]:
-        """Map one dense ordinal interval to constant-many schedule boxes."""
-        if ordinal_step != 1:
-            ordinal_values = range(ordinal_begin, ordinal_end, ordinal_step)
-            if not ordinal_values:
-                return ()
-            dispatch_begin = segment.dispatch_offset + ordinal_values[0]
-            dispatch_last = segment.dispatch_offset + ordinal_values[-1]
-            first_wave, first_worker = divmod(dispatch_begin, segment.worker_count)
-            last_wave, last_worker = divmod(dispatch_last, segment.worker_count)
-            if first_wave == last_wave:
-                return (
-                    (
-                        (
-                            launch_stage_axis,
-                            _RESIDENT_LAUNCH_STAGE,
-                            _RESIDENT_LAUNCH_STAGE + 1,
-                            1,
-                        ),
-                        (
-                            worker_axis,
-                            segment.worker_begin + first_worker,
-                            segment.worker_begin + last_worker + 1,
-                            ordinal_step,
-                        ),
-                        (wave_axis, first_wave, first_wave + 1, 1),
-                    ),
-                )
-            if ordinal_step % segment.worker_count == 0 and first_worker == last_worker:
-                return (
-                    (
-                        (
-                            launch_stage_axis,
-                            _RESIDENT_LAUNCH_STAGE,
-                            _RESIDENT_LAUNCH_STAGE + 1,
-                            1,
-                        ),
-                        (
-                            worker_axis,
-                            segment.worker_begin + first_worker,
-                            segment.worker_begin + first_worker + 1,
-                            1,
-                        ),
-                        (
-                            wave_axis,
-                            first_wave,
-                            last_wave + 1,
-                            ordinal_step // segment.worker_count,
-                        ),
-                    ),
-                )
-            raise ValueError("strided task order crosses worker-wave boundaries")
-        dispatch_begin = segment.dispatch_offset + ordinal_begin
-        dispatch_end = segment.dispatch_offset + ordinal_end
-        first_wave, first_worker = divmod(dispatch_begin, segment.worker_count)
-        final_wave, final_worker = divmod(dispatch_end, segment.worker_count)
-        boxes: list[tuple[tuple[int, int, int, int], ...]] = []
-
-        def add(
-            worker_offset_begin: int, worker_offset_end: int, begin: int, end: int
-        ) -> None:
-            if worker_offset_begin >= worker_offset_end or begin >= end:
-                return
-            boxes.append(
-                (
-                    (
-                        launch_stage_axis,
-                        _RESIDENT_LAUNCH_STAGE,
-                        _RESIDENT_LAUNCH_STAGE + 1,
-                        1,
-                    ),
-                    (
-                        worker_axis,
-                        segment.worker_begin + worker_offset_begin,
-                        segment.worker_begin + worker_offset_end,
-                        1,
-                    ),
-                    (wave_axis, begin, end, 1),
-                )
-            )
-
-        if first_wave == final_wave:
-            add(first_worker, final_worker, first_wave, first_wave + 1)
-            return tuple(boxes)
-        add(first_worker, segment.worker_count, first_wave, first_wave + 1)
-        middle_begin = first_wave + 1
-        middle_end = final_wave
-        add(0, segment.worker_count, middle_begin, middle_end)
-        add(0, final_worker, final_wave, final_wave + 1)
-        return tuple(boxes)
-
-    (ordinal_axis,) = ordinal_domain.axis_order
-    ordinal_symbol = coordinate_axis_symbol(ordinal_axis)
-    schedule_to_ordinal = CoordinateRelation.point_map(
-        schedule_domain,
-        ordinal_domain,
-        tuple(
-            (source_bounds, (local_ordinal,))
-            for source_bounds in dispatch_boxes(0, segment.task_count, 1)
-        ),
-    )
-    dispatch_index = segment.dispatch_offset + ordinal_symbol
-    ordinal_to_schedule = CoordinateRelation.point_map(
-        ordinal_domain,
-        schedule_domain,
-        (
-            (
-                ((ordinal_axis, 0, segment.task_count, 1),),
-                (
-                    sympy.Integer(_RESIDENT_LAUNCH_STAGE),
-                    segment.worker_begin
-                    + sympy.Mod(dispatch_index, segment.worker_count),
-                    cast(
-                        "sympy.Expr",
-                        FloorDiv(dispatch_index, segment.worker_count),
-                    ),
-                ),
-            ),
-        ),
-    )
-    tile_dependency._remember_exact_converse(
-        schedule_to_ordinal,
-        ordinal_to_schedule,
-    )
-    schedule_relation = schedule_to_ordinal.then(flat_logical_order)
-    if schedule_relation is None:
-        schedule_pieces: list[
-            tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
-        ] = []
-        for piece in flat_logical_order.pieces:
-            ((piece_axis, piece_begin, piece_end, piece_step),) = (
-                piece.source_bounds_items
-            )
-            if piece_axis != ordinal_axis:
-                raise ValueError("dense worker schedule has the wrong ordinal axis")
-            if any(
-                step != 1 or sympy.simplify(end - begin) != 1  # pyrefly: ignore[unsupported-operation]
-                for _axis, begin, end, step in piece.target_ranges
-            ):
-                raise ValueError("dense worker schedule requires a logical point map")
-            for source_bounds in dispatch_boxes(
-                piece_begin,
-                piece_end,
-                piece_step,
-            ):
-                target_expressions = tuple(
-                    cast(
-                        "sympy.Expr",
-                        begin.xreplace({ordinal_symbol: local_ordinal}),
-                    )
-                    for _axis, begin, _end, _step in piece.target_ranges
-                )
-                schedule_pieces.append((source_bounds, target_expressions))
-        schedule_relation = CoordinateRelation.point_map(
-            schedule_domain,
-            logical_order.target_domain,
-            tuple(schedule_pieces),
-        )
-        logical_to_ordinal = (
-            tile_dependency._memoized_exact_converse(flat_logical_order)
-            or flat_logical_order.converse()
-        )
-        schedule_inverse = (
-            None
-            if logical_to_ordinal is None
-            else logical_to_ordinal.then(ordinal_to_schedule)
-        )
-        if schedule_inverse is not None:
-            tile_dependency._remember_exact_converse(
-                schedule_relation,
-                schedule_inverse,
-            )
-    if (
-        schedule_relation is None
-        or tile_dependency._memoized_exact_converse(schedule_relation) is None
-        or not schedule_relation.is_single_valued()
-        or schedule_relation.source_support_cardinality()
-        != logical_order.source_domain.size
-    ):
-        raise ValueError("dense worker run does not have exact schedule support")
-    return dataclasses.replace(segment, task_order=schedule_relation)
 
 
 def _task_order_ordinal_domain(
@@ -1616,169 +816,6 @@ def _packed_root_major_task_order_relation(
     )
 
 
-def _packed_schedule_segment_geometry_from_parts(
-    worker_count: int,
-    segments: tuple[WorkerScheduleSegment, ...],
-) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
-    """Prove one ordered packed-segment stream directly from its relations.
-
-    Each result is ``(segment, first_slot, task_count)``. Roots may repeat;
-    unused slots may separate segments; this is a rendering/chronology proof,
-    not a root-major policy classification. A statically empty relation
-    inherits the current stream position because it owns no placement from
-    which to recover one.
-    """
-    if not segments or not all(segment.is_normalized for segment in segments):
-        return None
-    schedule_domain = segments[0].task_order.source_domain
-    if (
-        any(segment.task_order.source_domain != schedule_domain for segment in segments)
-        or schedule_domain.kind != "worker"
-        or len(schedule_domain.axis_order) != 3
-    ):
-        return None
-    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
-    schedule_counts = schedule_domain.axis_count_expressions
-    if not _equal_integer_expressions(
-        schedule_counts[launch_stage_axis],
-        2,
-    ) or not _equal_integer_expressions(schedule_counts[worker_axis], worker_count):
-        return None
-
-    previous_end: sympy.Expr = sympy.Integer(0)
-    has_nonempty_segment = False
-    has_gap = False
-    seen_roots: set[int] = set()
-    has_repeated_root = False
-    result: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
-    for segment in segments:
-        task_count = sympy.simplify(segment.task_count_expr)
-        if task_count.is_zero is not True:
-            if segment.root in seen_roots:
-                has_repeated_root = True
-            seen_roots.add(segment.root)
-        if task_count.is_zero is True and not segment.task_order.pieces:
-            interval = (previous_end, previous_end)
-        else:
-            interval = segment.resident_slot_interval
-            if interval is None:
-                return None
-        interval_begin, interval_end = interval
-        if not has_nonempty_segment and task_count.is_zero is not True:
-            if not _equal_integer_expressions(interval_begin, 0):
-                return None
-            has_nonempty_segment = True
-        if not tile_dependency._is_provably_nonnegative(
-            sympy.simplify(interval_begin - previous_end),
-            None,
-        ) or not _equal_integer_expressions(
-            sympy.simplify(interval_end - interval_begin),
-            task_count,
-        ):
-            return None
-        if not _equal_integer_expressions(interval_begin, previous_end):
-            has_gap = True
-        result.append((segment, interval_begin, task_count))
-        previous_end = interval_end
-
-    # The relation renderer is required for a root split around another run.
-    # For ordinary one-segment-per-root schedules, retain the simpler legacy
-    # lowering: accepting their wave-alignment gaps here needlessly outlines
-    # small roots and turns singleton dispatch into a loop.
-    if has_gap and not has_repeated_root:
-        return None
-
-    if not _equal_integer_expressions(
-        schedule_counts[wave_axis],
-        _ceildiv_nonnegative_expression(previous_end, worker_count),
-    ):
-        return None
-    return tuple(result)
-
-
-def _packed_schedule_segment_geometry(
-    worker_schedule: WorkerSchedule,
-) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
-    """Return exact ordered packed-segment geometry, allowing gaps and repeats."""
-    return _packed_schedule_segment_geometry_from_parts(
-        worker_schedule.worker_count,
-        worker_schedule.segments,
-    )
-
-
-def _root_major_schedule_geometry_from_parts(
-    worker_count: int,
-    segments: tuple[WorkerScheduleSegment, ...],
-) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
-    """Recognize and prove the compiler's exact packed root-major relation.
-
-    Each result item is ``(segment, first_slot, task_count)``. This structural
-    proof is shared by schedule validation, barrier ownership, and codegen, so
-    none of those consumers reconstructs a schedule from runtime shape hints.
-    """
-    if not segments:
-        return None
-    if not all(segment.is_normalized for segment in segments):
-        return None
-    schedule_domain = segments[0].task_order.source_domain
-    if any(segment.task_order.source_domain != schedule_domain for segment in segments):
-        return None
-    if schedule_domain.kind != "worker" or len(schedule_domain.axis_order) != 3:
-        return None
-    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
-    schedule_counts = schedule_domain.axis_count_expressions
-    if not _equal_integer_expressions(
-        schedule_counts[launch_stage_axis], 2
-    ) or not _equal_integer_expressions(schedule_counts[worker_axis], worker_count):
-        return None
-
-    first_slot: sympy.Expr = sympy.Integer(0)
-    result: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
-    seen_roots: set[int] = set()
-    for segment in segments:
-        relation = segment.task_order
-        target_domain = relation.target_domain
-        if segment.root in seen_roots:
-            return None
-        seen_roots.add(segment.root)
-        task_count = target_domain.size_expr
-        statically_empty = task_count.is_zero is True and not relation.pieces
-        if statically_empty:
-            expected = _packed_root_major_relation(
-                schedule_domain,
-                target_domain,
-                first_slot,
-                worker_count,
-                target_domain.axis_order,
-            )
-            if relation != expected:
-                return None
-        else:
-            if not relation.has_same_source_support(
-                _packed_root_major_relation(
-                    schedule_domain,
-                    target_domain,
-                    first_slot,
-                    worker_count,
-                    target_domain.axis_order,
-                ),
-            ):
-                return None
-        result.append((segment, first_slot, task_count))
-        first_slot = sympy.simplify(sympy.Add(first_slot, task_count))
-
-    if not _equal_integer_expressions(
-        schedule_counts[wave_axis],
-        _ceildiv_nonnegative_expression(first_slot, worker_count),
-    ):
-        return None
-    return tuple(result)
-
-
-class _WorkerScheduleChronologyError(ValueError):
-    """Raised when segment tuple order disagrees with a resident strand."""
-
-
 def _worker_schedule_piece_budget_is_valid(piece_count: int) -> bool:
     """Apply the one aggregate relation budget used by every schedule."""
     return piece_count <= tile_dependency._MAX_RELATION_PIECES and (
@@ -1789,98 +826,13 @@ def _worker_schedule_piece_budget_is_valid(piece_count: int) -> bool:
     )
 
 
-def _validate_normalized_worker_schedule(
-    worker_count: int,
-    segments: tuple[WorkerScheduleSegment, ...],
-) -> None:
-    """Prove exact ownership from the authoritative schedule relations."""
-    if not segments:
-        return None
-    schedule_domain = segments[0].task_order.source_domain
-    if schedule_domain.kind != "worker" or len(schedule_domain.axis_order) != 3:
-        raise ValueError("worker schedule has an incompatible placement domain")
-    launch_stage_axis, worker_axis, _wave_axis = schedule_domain.axis_order
-    counts = schedule_domain.axis_count_expressions
-    if not _equal_integer_expressions(counts[launch_stage_axis], 2) or not (
-        _equal_integer_expressions(counts[worker_axis], worker_count)
-    ):
-        raise ValueError("worker schedule has incompatible launch or worker bounds")
-    if any(segment.task_order.source_domain != schedule_domain for segment in segments):
-        raise ValueError("worker schedule segments do not share one domain")
-    total_piece_count = sum(len(segment.task_order.pieces) for segment in segments)
-    if not _worker_schedule_piece_budget_is_valid(total_piece_count):
-        raise ValueError("worker schedule exceeds the symbolic relation budget")
-
-    for index, segment in enumerate(segments):
-        relation = segment.task_order
-        statically_empty = (
-            relation.target_domain.size_expr.is_zero is True and not relation.pieces
-        )
-        if not statically_empty and segment.launch_stage is None:
-            raise ValueError("worker schedule segment is not an exact point map")
-        if not statically_empty and relation.converse() is None:
-            raise ValueError("worker schedule segment has no exact converse")
-        if any(
-            not relation.has_disjoint_source_support(other.task_order)
-            for other in segments[index + 1 :]
-        ):
-            raise ValueError("worker schedule segment support overlaps")
-
-    for root in sorted({segment.root for segment in segments}):
-        root_segments = tuple(segment for segment in segments if segment.root == root)
-        target_domain = root_segments[0].task_order.target_domain
-        if any(
-            segment.task_order.target_domain != target_domain
-            for segment in root_segments
-        ):
-            raise ValueError("one root uses multiple logical task domains")
-        relations = tuple(segment.task_order for segment in root_segments)
-        inverses = tuple(relation.converse() for relation in relations)
-        combined_inverse: CoordinateRelation | None = None
-        for inverse in inverses:
-            if inverse is None:
-                break
-            combined_inverse = (
-                inverse if combined_inverse is None else combined_inverse.union(inverse)
-            )
-            if combined_inverse is None:
-                break
-        cardinalities = tuple(
-            relation.source_support_cardinality() for relation in relations
-        )
-        if (
-            any(inverse is None for inverse in inverses)
-            or any(not relation.is_single_valued() for relation in relations)
-            or any(
-                inverse is not None and not inverse.is_single_valued()
-                for inverse in inverses
-            )
-            or any(cardinality is None for cardinality in cardinalities)
-            or any(
-                inverse is not None
-                and other_inverse is not None
-                and not inverse.has_disjoint_source_support(other_inverse)
-                for index, inverse in enumerate(inverses)
-                for other_inverse in inverses[index + 1 :]
-            )
-            or combined_inverse is None
-            or not combined_inverse.is_total_function()
-            or not _equal_integer_expressions(
-                sympy.Add(*(value for value in cardinalities if value is not None)),
-                target_domain.size_expr,
-            )
-        ):
-            raise ValueError("worker schedule does not own each logical task once")
-
-
 @dataclasses.dataclass(frozen=True)
 class WorkerSchedule:
-    """The authoritative ownership and chronology of persistent work.
+    """The ordered local traversals executed by persistent workers.
 
-    Every normalized segment maps the same global schedule coordinate space
-    directly to logical tasks.  Tuple order is retained only as a stable
-    rendering order for the concrete compatibility lowering; the ``wave``
-    coordinate is semantic chronology.
+    Segment tuple order is semantic.  Static dispatch starts every segment on
+    a fresh worker wave; dynamic dispatch packs the same local traversals into
+    a dense ticket stream.  Both placements are derived prefix folds.
     """
 
     worker_count: int
@@ -1900,115 +852,56 @@ class WorkerSchedule:
     def __post_init__(self) -> None:
         if self.worker_count <= 0:
             raise ValueError(f"worker_count must be positive, got {self.worker_count}")
-        input_segments = self.segments
-        has_legacy_segments = any(
-            not segment.is_normalized for segment in input_segments
+        roots = tuple(segment.root for segment in self.segments)
+        if len(set(roots)) != len(roots):
+            raise ValueError("worker schedule requires at most one segment per root")
+        total_piece_count = sum(
+            len(segment.task_order.pieces) for segment in self.segments
         )
-        normalized_axes = {
-            segment.task_order.source_domain.axis_order
-            for segment in input_segments
-            if segment.is_normalized
-        }
-        if len(normalized_axes) > 1:
-            raise ValueError("worker schedule segments use different schedule axes")
-        if input_segments and not has_legacy_segments:
-            schedule_domains = {
-                segment.task_order.source_domain for segment in input_segments
-            }
-            if len(schedule_domains) != 1:
-                raise ValueError("worker schedule segments do not share one domain")
-            (schedule_domain,) = schedule_domains
-        else:
-            if normalized_axes:
-                (schedule_axes,) = normalized_axes
-            else:
-                minimum_axis = min(
-                    (
-                        axis
-                        for segment in input_segments
-                        for domain in (
-                            segment.task_order.source_domain,
-                            segment.task_order.target_domain,
-                        )
-                        for axis in domain.axis_order
-                    ),
-                    default=0,
-                )
-                schedule_axes = (
-                    minimum_axis - 3,
-                    minimum_axis - 2,
-                    minimum_axis - 1,
-                )
-            _launch_stage_axis, _worker_axis, wave_axis = schedule_axes
-            nonempty_segments = tuple(
-                segment
-                for segment in input_segments
-                if segment.task_count_expr.is_zero is not True
-            )
-            maximum_wave = max(
-                (
-                    (
-                        segment.dispatch_index(segment.task_count - 1)
-                        // segment.worker_count
-                    )
-                    if not segment.is_normalized
-                    else segment.task_order.source_domain.axis_counts[wave_axis] - 1
-                    for segment in nonempty_segments
-                ),
-                default=-1,
-            )
-            schedule_domain = _worker_schedule_domain(
-                self.worker_count,
-                maximum_wave + 1,
-                schedule_axes,
-            )
-        normalized_segments = tuple(
-            _normalize_dense_schedule_segment(segment, schedule_domain)
-            for segment in input_segments
+        if not _worker_schedule_piece_budget_is_valid(total_piece_count):
+            raise ValueError("worker schedule exceeds the symbolic relation budget")
+
+    def segment_for_root(self, root: int) -> WorkerScheduleSegment | None:
+        """Return the sole local traversal for one resident task family."""
+        return next(
+            (segment for segment in self.segments if segment.root == root), None
         )
-        object.__setattr__(self, "segments", normalized_segments)
-        _validate_normalized_worker_schedule(
-            self.worker_count,
-            normalized_segments,
-        )
-
-        # The dense compatibility fields are still used by the legacy concrete
-        # renderer.  Check their tuple chronology only when this instance was
-        # constructed from that spelling; relation validation above is the
-        # semantic proof for every schedule form.
-        if not has_legacy_segments:
-            return
-
-        prior_runs: list[tuple[int, int, int]] = []
-        for segment in self.segments:
-            if segment.worker_begin + segment.worker_count > self.worker_count:
-                raise ValueError(
-                    "worker schedule segment exceeds the resident worker domain"
-                )
-            for begin, end, first_step, last_step in segment.worker_step_runs():
-                for prior_begin, prior_end, prior_last_step in prior_runs:
-                    if (
-                        max(begin, prior_begin) < min(end, prior_end)
-                        and first_step <= prior_last_step
-                    ):
-                        overlap_begin = max(begin, prior_begin)
-                        raise _WorkerScheduleChronologyError(
-                            "worker schedule tuple order disagrees with worker-step "
-                            f"order for worker {overlap_begin}: {first_step} follows "
-                            f"{prior_last_step}"
-                        )
-                prior_runs.append((begin, end, last_step))
-
-    def segments_for_root(self, root: int) -> tuple[WorkerScheduleSegment, ...]:
-        """Return the compressed static relation for one task family."""
-        return tuple(segment for segment in self.segments if segment.root == root)
 
     @cached_property
     def placement_domain(self) -> CoordinateDomain:
-        """The common launch-stage, worker, and wave schedule domain."""
-        if self.segments:
-            return self.segments[0].task_order.source_domain
-        return _worker_schedule_domain(self.worker_count, 1, (-3, -2, -1))
+        """The derived launch-stage, worker, and padded-wave proof domain."""
+        minimum_axis = min(
+            (
+                axis
+                for segment in self.segments
+                for domain in (
+                    segment.task_order.source_domain,
+                    segment.task_order.target_domain,
+                )
+                for axis in domain.axis_order
+            ),
+            default=0,
+        )
+        geometry = _root_major_schedule_geometry(self)
+        wave_count = (
+            sympy.Integer(0)
+            if not geometry
+            else sympy.simplify(
+                cast(
+                    "sympy.Expr",
+                    FloorDiv(geometry[-1][1], self.worker_count),
+                )
+                + _ceildiv_nonnegative_expression(
+                    geometry[-1][2],
+                    self.worker_count,
+                )
+            )
+        )
+        return _worker_schedule_domain(
+            self.worker_count,
+            wave_count,
+            (minimum_axis - 3, minimum_axis - 2, minimum_axis - 1),
+        )
 
     @cached_property
     def worker_step_domain(self) -> CoordinateDomain:
@@ -2029,132 +922,87 @@ class WorkerSchedule:
 
     def last_worker_steps_for_root(self, root: int) -> dict[int, int]:
         """Return each participating resident worker's final occupied step."""
-        result: dict[int, int] = {}
-        for segment in self.segments_for_root(root):
-            for (
-                worker_begin,
-                worker_end,
-                _first_wave,
-                last_wave,
-            ) in segment.worker_step_runs():
-                for worker in range(worker_begin, worker_end):
-                    result[worker] = max(result.get(worker, -1), last_wave)
-        return result
+        geometry = _root_major_schedule_geometry(self)
+        matching = tuple(item for item in geometry if item[0].root == root)
+        if not matching:
+            return {}
+        (segment, first_slot, task_count) = matching[0]
+        first_slot = sympy.simplify(first_slot)
+        task_count = sympy.simplify(task_count)
+        if first_slot.free_symbols or task_count.free_symbols:
+            raise ValueError("worker-step diagnostics require concrete task counts")
+        first_wave = int(first_slot) // self.worker_count
+        count = int(task_count)
+        return {
+            worker: first_wave + (count - 1 - worker) // self.worker_count
+            for worker in range(min(self.worker_count, count))
+        }
 
     def worker_step_bounds_for_root(self, root: int) -> tuple[int, int] | None:
         """Return the first and last occupied resident steps for one root."""
-        segments = self.segments_for_root(root)
-        if not segments:
-            return None
-        worker_steps = tuple(
-            (first_wave, last_wave)
-            for segment in segments
-            for _worker_begin, _worker_end, first_wave, last_wave in (
-                segment.worker_step_runs()
-            )
+        matching = tuple(
+            item for item in _root_major_schedule_geometry(self) if item[0].root == root
         )
-        if not worker_steps:
+        if not matching:
             return None
-        return (
-            min(begin for begin, _end in worker_steps),
-            max(end for _begin, end in worker_steps),
-        )
+        _segment, first_slot, task_count = matching[0]
+        first_slot = sympy.simplify(first_slot)
+        task_count = sympy.simplify(task_count)
+        if first_slot.free_symbols or task_count.free_symbols:
+            return None
+        first_wave = int(first_slot) // self.worker_count
+        count = int(task_count)
+        if count <= 0:
+            return None
+        return first_wave, first_wave + (count - 1) // self.worker_count
 
-    def dense_assignment(self, root: int) -> tuple[int, int, int, int] | None:
-        """Return one root's dense worker and schedule interval.
+    def contiguous_global_interval(
+        self,
+        root: int,
+    ) -> tuple[sympy.Expr, sympy.Expr] | None:
+        """Return the root's padded static interval when all workers participate.
 
-        The tuple contains ``worker_begin``, ``worker_count``,
-        ``dispatch_offset``, and ``task_count``.  A root split across different
-        worker ranges or separated schedule intervals is not dense.
+        Root-local reordering deliberately retains the established ``T >= W``
+        eligibility rule.  Smaller roots still have exact derived placement,
+        but changing their local traversal is a separate scheduling policy.
         """
-        segments = sorted(
-            self.segments_for_root(root),
-            key=lambda segment: segment.dispatch_offset,
+        matching = tuple(
+            item for item in _root_major_schedule_geometry(self) if item[0].root == root
         )
-        if not segments:
+        if not matching:
             return None
-        worker_begin = segments[0].worker_begin
-        worker_count = segments[0].worker_count
-        dispatch_offset = segments[0].dispatch_offset
-        schedule_end = dispatch_offset
-        for segment in segments:
-            if (
-                segment.logical_task_order is None
-                or segment.worker_begin != worker_begin
-                or segment.worker_count != worker_count
-                or segment.dispatch_offset != schedule_end
-            ):
-                return None
-            schedule_end += segment.task_count
-        return (
-            worker_begin,
-            worker_count,
-            dispatch_offset,
-            schedule_end - dispatch_offset,
-        )
-
-    def contiguous_global_interval(self, root: int) -> tuple[int, int] | None:
-        """Return one dense global schedule interval without task expansion."""
-        assignment = self.dense_assignment(root)
-        if assignment is None:
-            return None
-        worker_begin, worker_count, dispatch_offset, task_count = assignment
-        if worker_begin or worker_count != self.worker_count:
-            return None
-        return dispatch_offset, dispatch_offset + task_count
-
-    def without_roots(self, roots: frozenset[int]) -> WorkerSchedule:
-        """Remove complete locally executed families without task expansion."""
-        if not roots:
-            return self
-        return WorkerSchedule(
-            worker_count=self.worker_count,
-            segments=tuple(
-                segment for segment in self.segments if segment.root not in roots
-            ),
-        )
-
-
-_DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE = "_derived_root_major_geometry"
-
-
-def _remember_root_major_schedule_geometry(
-    worker_schedule: WorkerSchedule,
-    geometry: tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...],
-) -> None:
-    """Retain builder-derived root-major geometry outside schedule semantics."""
-    if tuple(item[0] for item in geometry) != worker_schedule.segments:
-        raise AssertionError("root-major geometry does not cover schedule segments")
-    first_slot: sympy.Expr = sympy.Integer(0)
-    for segment, actual_first_slot, task_count in geometry:
-        if not _equal_integer_expressions(actual_first_slot, first_slot) or not (
-            _equal_integer_expressions(
-                task_count,
-                segment.task_order.target_domain.size_expr,
-            )
+        _segment, first_slot, task_count = matching[0]
+        if not tile_dependency._is_provably_nonnegative(
+            sympy.simplify(task_count - self.worker_count),
+            None,
         ):
-            raise AssertionError("root-major geometry disagrees with schedule domains")
-        first_slot = sympy.simplify(first_slot + task_count)
-    worker_schedule.__dict__[_DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE] = geometry
+            return None
+        return first_slot, sympy.simplify(first_slot + task_count)
 
 
 def _root_major_schedule_geometry(
     worker_schedule: WorkerSchedule,
-) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...] | None:
-    """Return the proved packed root-major geometry, when supported."""
-    memoized = worker_schedule.__dict__.get(_DERIVED_ROOT_MAJOR_GEOMETRY_ATTRIBUTE)
-    if memoized is not None:
-        return cast(
-            "tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...]",
-            memoized,
+) -> tuple[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr], ...]:
+    """Return the schedule's derived wave-aligned static geometry."""
+    first_wave: sympy.Expr = sympy.Integer(0)
+    result: list[tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]] = []
+    for segment in worker_schedule.segments:
+        task_count = segment.task_count_expr
+        result.append(
+            (
+                segment,
+                sympy.simplify(first_wave * worker_schedule.worker_count),
+                task_count,
+            )
         )
-    geometry = _root_major_schedule_geometry_from_parts(
-        worker_schedule.worker_count,
-        worker_schedule.segments,
-    )
-    if geometry is not None:
-        _remember_root_major_schedule_geometry(worker_schedule, geometry)
-    return geometry
+        first_wave = sympy.simplify(
+            first_wave
+            + _ceildiv_nonnegative_expression(
+                task_count,
+                worker_schedule.worker_count,
+            )
+        )
+    return tuple(result)
 
 
 @cache
@@ -2162,32 +1010,28 @@ def _root_task_placement_relation(
     worker_schedule: WorkerSchedule,
     root: int,
 ) -> CoordinateRelation | None:
-    """Map every logical task of one root to its unique schedule slot.
-
-    Segment relations are authoritative.  Their exact converses are combined
-    directly rather than rebuilding task order from dispatch arithmetic.
-    """
-    segments = worker_schedule.segments_for_root(root)
-    if not segments:
+    """Derive logical-task-to-static-placement from the local traversal."""
+    segment = worker_schedule.segment_for_root(root)
+    if segment is None:
         return None
-    result: CoordinateRelation | None = None
-    root_domain = segments[0].task_order.target_domain
-    for segment in segments:
-        if segment.task_order.target_domain != root_domain:
-            return None
-        converse = segment.task_order.converse()
-        if (
-            converse is None
-            or converse.source_domain != root_domain
-            or converse.target_domain != worker_schedule.placement_domain
-            or not converse.is_single_valued()
-        ):
-            return None
-        result = converse if result is None else result.union(converse)
-        if result is None:
-            return None
-    assert result is not None
-    return result if result.is_total_function() else None
+    matching = tuple(
+        item
+        for item in _root_major_schedule_geometry(worker_schedule)
+        if item[0] == segment
+    )
+    if len(matching) != 1:
+        return None
+    _segment, first_slot, _task_count = matching[0]
+    execution = _packed_root_major_task_order_relation(
+        worker_schedule.placement_domain,
+        segment.task_order,
+        first_slot,
+        worker_schedule.worker_count,
+    )
+    placement = None if execution is None else execution.converse()
+    return (
+        placement if placement is not None and placement.is_total_function() else None
+    )
 
 
 @cache
@@ -2195,37 +1039,50 @@ def _root_task_wave_relation(
     worker_schedule: WorkerSchedule,
     root: int,
 ) -> CoordinateRelation | None:
-    """Map every logical task of one root to its authoritative wave."""
-    # Prefer the compact dense rendering certificate when every segment has
-    # one.  This preserves formulas such as ``floor(task / worker_count)``;
-    # taking the converse of worker/wave support first would split the same
-    # function into one constant piece per wave and can obscure later event
-    # frontier calculations.  ``logical_task_order`` has already proved that
-    # each certificate exactly matches its authoritative segment support.
-    dense_waves: CoordinateRelation | None = None
-    dense_supported = True
-    for segment in worker_schedule.segments_for_root(root):
-        logical_order = segment.logical_task_order
-        waves_by_ordinal = segment.logical_task_wave_relation(
-            worker_schedule.worker_step_domain
+    """Derive logical-task-to-static-wave from one local ordinal view."""
+    segment = worker_schedule.segment_for_root(root)
+    if segment is None:
+        return None
+    matching = tuple(
+        item
+        for item in _root_major_schedule_geometry(worker_schedule)
+        if item[0] == segment
+    )
+    if len(matching) != 1:
+        return None
+    _segment, first_slot, task_count = matching[0]
+    ordinal_domain = _task_order_ordinal_domain(segment.task_order)
+    logical_to_ordinal = _logical_task_to_order_ordinal(
+        segment.task_order,
+        ordinal_domain,
+    )
+    if logical_to_ordinal is not None:
+        (ordinal_axis,) = ordinal_domain.axis_order
+        ordinal = coordinate_axis_symbol(ordinal_axis)
+        first_wave = cast(
+            "sympy.Expr", FloorDiv(first_slot, worker_schedule.worker_count)
         )
-        logical_to_ordinal = None if logical_order is None else logical_order.converse()
-        segment_waves = (
-            None
-            if logical_to_ordinal is None or waves_by_ordinal is None
-            else logical_to_ordinal.then(waves_by_ordinal)
+        waves_by_ordinal = CoordinateRelation.point_map(
+            ordinal_domain,
+            worker_schedule.worker_step_domain,
+            (
+                (
+                    ((ordinal_axis, 0, task_count, 1),),
+                    (
+                        sympy.simplify(
+                            first_wave
+                            + cast(
+                                "sympy.Expr",
+                                FloorDiv(ordinal, worker_schedule.worker_count),
+                            )
+                        ),
+                    ),
+                ),
+            ),
         )
-        if segment_waves is None:
-            dense_supported = False
-            break
-        dense_waves = (
-            segment_waves if dense_waves is None else dense_waves.union(segment_waves)
-        )
-        if dense_waves is None:
-            dense_supported = False
-            break
-    if dense_supported and dense_waves is not None and dense_waves.is_total_function():
-        return dense_waves
+        dense_waves = logical_to_ordinal.then(waves_by_ordinal)
+        if dense_waves is not None and dense_waves.is_total_function():
+            return dense_waves
 
     placement = _root_task_placement_relation(worker_schedule, root)
     if placement is None:
@@ -2307,10 +1164,10 @@ def _maximum_root_wave_by_key(
     keys_by_task: CoordinateRelation,
 ) -> CoordinateRelation | None:
     """Map each emitted key to its latest producer wave from schedule support."""
-    segments = worker_schedule.segments_for_root(root)
-    if not segments or any(
-        segment.task_order.target_domain != keys_by_task.source_domain
-        for segment in segments
+    segment = worker_schedule.segment_for_root(root)
+    if (
+        segment is None
+        or segment.task_order.target_domain != keys_by_task.source_domain
     ):
         return None
     task_waves = _root_task_wave_relation(worker_schedule, root)
@@ -2319,58 +1176,38 @@ def _maximum_root_wave_by_key(
     )
     if direct is not None:
         return direct
+    placement = _root_task_placement_relation(worker_schedule, root)
+    execution = None if placement is None else placement.converse()
+    keys_by_slot = None if execution is None else execution.then(keys_by_task)
+    slots_by_key = None if keys_by_slot is None else keys_by_slot.converse()
+    waves_by_key = (
+        None
+        if slots_by_key is None
+        else slots_by_key.project_target(worker_schedule.worker_step_domain)
+    )
     identity = CoordinateRelation.identity(
         worker_schedule.worker_step_domain,
         worker_schedule.worker_step_domain,
     )
-    maxima: list[CoordinateRelation] = []
-    for segment in segments:
-        keys_by_slot = segment.task_order.then(keys_by_task)
-        slots_by_key = None if keys_by_slot is None else keys_by_slot.converse()
-        waves_by_key = (
-            None
-            if slots_by_key is None
-            else slots_by_key.project_target(worker_schedule.worker_step_domain)
-        )
-        maximum = (
-            None
-            if waves_by_key is None
-            else waves_by_key.max_target_value_by_source(identity)
-        )
-        if maximum is None:
-            return None
-        maxima.append(maximum)
-    combined = maxima[0]
-    for maximum in maxima[1:]:
-        combined = combined.union(maximum)
-        if combined is None:
-            return None
-    return combined.max_target_value_by_source(identity)
-
-
-@dataclasses.dataclass(frozen=True)
-class RootBarrierPublication:
-    """Workers that publish one root after a particular segment occurrence."""
-
-    segment_index: int
-    worker_intervals: tuple[WorkerInterval, ...]
+    return (
+        None
+        if waves_by_key is None
+        else waves_by_key.max_target_value_by_source(identity)
+    )
 
 
 @dataclasses.dataclass(frozen=True)
 class RootBarrierPublicationPlan:
     """The sole derivation of root-barrier ownership and arrival mass.
 
-    ``participant_order`` is an exact worker-to-dense-owner relation when the
-    participant cohort depends on runtime parameters.  Concrete schedules use
-    ``participant_intervals`` as a proved strength reduction. Every emission
-    site contributes one arrival; code generation must consume the counts and
-    support here rather than reconstructing schedule geometry.
+    Static dispatch publishes once from each worker in
+    ``participant_intervals`` after the root's sole segment. Dynamic dispatch
+    publishes once per task. Continuations publish at their final-arrival
+    execution site.
     """
 
     root: int
     participant_intervals: tuple[WorkerInterval, ...]
-    participant_order: CoordinateRelation | None
-    publications: tuple[RootBarrierPublication, ...]
     resident_arrival_count: int | sympy.Expr
     continuation_arrival_count: int | sympy.Expr
     dynamic_task_arrival_count: int
@@ -2386,19 +1223,6 @@ class RootBarrierPublicationPlan:
             )
         ):
             raise ValueError("root-barrier arrival counts must be nonnegative")
-        if self.participant_order is None:
-            return
-        if self.continuation_arrival_count != 0 or self.dynamic_task_arrival_count:
-            raise ValueError(
-                "symbolic resident ownership cannot overlap external publication"
-            )
-        if not _equal_integer_expressions(
-            self.participant_order.target_domain.size_expr,
-            self.real_arrival_count,
-        ):
-            raise ValueError("participant order does not cover physical arrivals")
-        if not self.participant_order.is_bijection_from_source_support():
-            raise ValueError("participant order is not an exact support bijection")
 
     @property
     def real_arrival_count(self) -> int | sympy.Expr:
@@ -2415,8 +1239,6 @@ class RootBarrierPublicationPlan:
     def parameter_symbols(self) -> frozenset[sympy.Symbol]:
         """Return every runtime parameter used by publication semantics."""
         symbols: set[sympy.Symbol] = set()
-        if self.participant_order is not None:
-            symbols.update(self.participant_order.parameter_symbols)
         for count in (
             self.resident_arrival_count,
             self.continuation_arrival_count,
@@ -2430,89 +1252,6 @@ def _concrete_or_symbolic_integer(expression: int | sympy.Expr) -> int | sympy.E
     """Keep symbolic integers symbolic while normalizing exact constants."""
     simplified = sympy.simplify(sympy.sympify(expression))
     return int(simplified) if isinstance(simplified, sympy.Integer) else simplified
-
-
-def _root_major_participant_order_from_geometry(
-    segment: WorkerScheduleSegment,
-    first_slot: sympy.Expr,
-    task_count: sympy.Expr,
-    worker_count: int,
-) -> tuple[CoordinateRelation, int | sympy.Expr] | None:
-    """Project a previously proved root-major placement to dense arrivals."""
-    if not _equal_integer_expressions(
-        segment.task_order.target_domain.size_expr,
-        task_count,
-    ):
-        return None
-
-    _launch_stage_axis, worker_axis, _wave_axis = (
-        segment.task_order.source_domain.axis_order
-    )
-    worker_domain = CoordinateDomain(
-        axis_order=(worker_axis,),
-        axis_counts_items=((worker_axis, worker_count),),
-        kind="worker",
-    )
-    real_arrival_count = _concrete_or_symbolic_integer(
-        SymbolicMin(sympy.Integer(worker_count), task_count)
-    )
-    participant_axis = (
-        min(
-            (
-                *segment.task_order.source_domain.axis_order,
-                *segment.task_order.target_domain.axis_order,
-            )
-        )
-        - 1
-    )
-    participant_domain = CoordinateDomain(
-        axis_order=(participant_axis,),
-        axis_counts_items=((participant_axis, real_arrival_count),),
-        kind="value",
-    )
-    worker = coordinate_axis_symbol(worker_axis)
-    first_worker = sympy.Mod(first_slot, worker_count)
-    local_ordinal = sympy.Mod(
-        worker + worker_count - first_worker,  # pyrefly: ignore[unsupported-operation]
-        worker_count,
-    )
-    participant_order = CoordinateRelation.point_map(
-        worker_domain,
-        participant_domain,
-        (
-            (
-                ((worker_axis, 0, worker_count, 1),),
-                (local_ordinal,),
-            ),
-        ),
-    )
-    if not participant_order.is_single_valued():
-        raise AssertionError("root-major participant order is not single-valued")
-    participant = coordinate_axis_symbol(participant_axis)
-    workers_by_participant = CoordinateRelation.point_map(
-        participant_domain,
-        worker_domain,
-        (
-            (
-                (
-                    (
-                        participant_axis,
-                        0,
-                        real_arrival_count,
-                        1,
-                    ),
-                ),
-                (sympy.Mod(participant + first_worker, worker_count),),
-            ),
-        ),
-    )
-    if not workers_by_participant.is_total_function():
-        raise AssertionError("root-major participant converse is not total")
-    tile_dependency._remember_exact_converse(
-        participant_order,
-        workers_by_participant,
-    )
-    return participant_order, real_arrival_count
 
 
 @cache
@@ -2546,85 +1285,41 @@ def root_barrier_publication_plan(
     )
     if dispatch_mode not in ("static", "dynamic"):
         raise ValueError(f"invalid cross-loop dispatch mode {dispatch_mode!r}")
-    root_segments = worker_schedule.segments_for_root(root)
-    if len(root_segments) > 1:
-        raise ValueError("root publication requires at most one segment per root")
-    dynamic_segments = root_segments if dispatch_mode == "dynamic" else ()
+    segment = worker_schedule.segment_for_root(root)
+    dynamic_segment = segment if dispatch_mode == "dynamic" else None
     dynamic_task_arrival_count = (
-        dynamic_segments[0].task_order.target_domain.size if dynamic_segments else 0
+        dynamic_segment.task_order.target_domain.size
+        if dynamic_segment is not None
+        else 0
     )
-    if dynamic_segments:
+    if dynamic_segment is not None:
         if continuation_arrival_count != 0:
             raise ValueError("a dynamic root cannot also be continuation-owned")
         return RootBarrierPublicationPlan(
             root=root,
             participant_intervals=(),
-            participant_order=None,
-            publications=(),
             resident_arrival_count=0,
             continuation_arrival_count=0,
             dynamic_task_arrival_count=dynamic_task_arrival_count,
         )
-    root_major_geometry = _root_major_schedule_geometry(worker_schedule)
-    packed_geometry = (
-        None
-        if root_major_geometry is not None
-        else _packed_schedule_segment_geometry(worker_schedule)
-    )
-    relation_geometry = (
-        root_major_geometry if root_major_geometry is not None else packed_geometry
-    )
-    if relation_geometry is not None:
-        matching = tuple(
-            segment_index
-            for segment_index, (segment, _first_slot, _task_count) in enumerate(
-                relation_geometry
-            )
-            if segment.root == root
-        )
-        if len(matching) == 1:
-            segment_index = matching[0]
-            segment, first_slot, task_count = relation_geometry[segment_index]
-            participant = _root_major_participant_order_from_geometry(
-                segment,
-                first_slot,
-                task_count,
-                worker_schedule.worker_count,
-            )
-            if participant is None:
-                raise ValueError("root-major participant support is not proved")
-            participant_order, real_arrival_count = participant
-            if continuation_arrival_count != 0 or dynamic_task_arrival_count:
-                raise ValueError(
-                    "relation-derived resident ownership overlaps another execution role"
-                )
-            return RootBarrierPublicationPlan(
-                root=root,
-                participant_intervals=(),
-                participant_order=participant_order,
-                publications=(RootBarrierPublication(segment_index, ()),),
-                resident_arrival_count=real_arrival_count,
-                continuation_arrival_count=0,
-                dynamic_task_arrival_count=0,
-            )
-        if not matching and not root_segments and continuation_arrival_count == 0:
-            raise ValueError(f"relation schedule has no root {root}")
-
-    if root_segments and continuation_arrival_count != 0:
+    if segment is not None and continuation_arrival_count != 0:
         raise ValueError("resident root ownership overlaps continuation ownership")
-    if root_segments:
-        (segment,) = root_segments
-        segment_index = worker_schedule.segments.index(segment)
-        participant_intervals = segment.worker_intervals()
-        publications = (
-            (RootBarrierPublication(segment_index, participant_intervals),)
-            if participant_intervals
-            else ()
+    if segment is not None:
+        resident_arrival_count = _concrete_or_symbolic_integer(
+            SymbolicMin(
+                sympy.Integer(worker_schedule.worker_count),
+                segment.task_count_expr,
+            )
         )
-        resident_arrival_count = _interval_cardinality(participant_intervals)
+        if not isinstance(resident_arrival_count, int):
+            raise ValueError("static root publication requires concrete root capacity")
+        participant_intervals = (
+            ((0, resident_arrival_count),) if resident_arrival_count else ()
+        )
     else:
+        if continuation_arrival_count == 0:
+            raise ValueError(f"worker schedule has no root {root}")
         participant_intervals = ()
-        publications = ()
         resident_arrival_count = 0
     real_arrival_count = _concrete_or_symbolic_integer(
         sympy.Add(
@@ -2640,8 +1335,6 @@ def root_barrier_publication_plan(
     return RootBarrierPublicationPlan(
         root=root,
         participant_intervals=participant_intervals,
-        participant_order=None,
-        publications=publications,
         resident_arrival_count=resident_arrival_count,
         continuation_arrival_count=continuation_arrival_count,
         dynamic_task_arrival_count=dynamic_task_arrival_count,
@@ -2659,7 +1352,6 @@ def build_baseline_worker_schedule(
     if worker_count <= 0:
         raise ValueError(f"worker_count must be positive, got {worker_count}")
     segments: list[WorkerScheduleSegment] = []
-    worker_step_begin = 0
     if len(root_domains) != len(root_task_orders):
         raise ValueError("root domains and task orders must have equal length")
     if any(root < 0 or root >= len(root_domains) for root in excluded_roots):
@@ -2672,17 +1364,12 @@ def build_baseline_worker_schedule(
         task_count = domain.size
         if task_count == 0:
             raise ValueError("cross-loop scheduling requires positive root capacity")
-        active_workers = min(worker_count, task_count)
         segments.append(
             WorkerScheduleSegment(
                 root=root,
                 task_order=task_order,
-                worker_begin=0,
-                worker_count=active_workers,
-                dispatch_offset=worker_step_begin * active_workers,
             )
         )
-        worker_step_begin += (task_count + worker_count - 1) // worker_count
     return WorkerSchedule(worker_count=worker_count, segments=tuple(segments))
 
 
@@ -4560,8 +3247,8 @@ def _compact_nested_loop_counters_for_schedule(
                     continue
                 root_order_precedes = False
                 break
-        consumer_segment = worker_schedule.segments_for_root(consumer_root)
-        consumer_is_static = dispatch_mode == "static" and len(consumer_segment) == 1
+        consumer_segment = worker_schedule.segment_for_root(consumer_root)
+        consumer_is_static = dispatch_mode == "static" and consumer_segment is not None
         if (
             entry_is_smaller
             and same_root_producer
@@ -4619,7 +3306,7 @@ def _compact_nested_loop_counters_for_schedule(
             ),
         }
         if dispatch_mode != "static" or any(
-            len(worker_schedule.segments_for_root(root)) != 1 for root in relevant_roots
+            worker_schedule.segment_for_root(root) is None for root in relevant_roots
         ):
             result.append(plan)
             continue
@@ -4749,15 +3436,9 @@ class StaticPipelinePlan:
         """Return the finalized publication plan for every applicable root."""
         root_count = len(self.root_task_orders)
         producer_roots = {producer for producer, _consumer in self.root_barrier_edges}
-        uses_relation_segment_renderer = (
-            _root_major_schedule_geometry(self.worker_schedule) is None
-            and _packed_schedule_segment_geometry(self.worker_schedule) is not None
-        )
-        publication_roots = producer_roots | (
-            set()
-            if uses_relation_segment_renderer
-            else {segment.root for segment in self.worker_schedule.segments}
-        )
+        publication_roots = producer_roots | {
+            segment.root for segment in self.worker_schedule.segments
+        }
         root_level_counters = tuple(
             counter
             for counter in self.readiness_counters
@@ -5326,9 +4007,11 @@ def _continuation_dominance_owner(
     for segment in occupied_schedule.segments:
         if segment.root in removed_roots | frozenset((consumer.consumer_root,)):
             continue
-        placement = segment.task_order.rebase_source_domain(owner_domain)
+        occupied_execution = execution_by_slot_by_root.get(segment.root)
         occupied_support = (
-            None if placement is None else placement.project_target(empty_domain)
+            None
+            if occupied_execution is None
+            else occupied_execution.project_target(empty_domain)
         )
         if occupied_support is None or not virtual_support.has_disjoint_source_support(
             occupied_support
@@ -6439,18 +5122,9 @@ def _canonical_schedule_root_positions(
         if root not in continuation_roots
     )
     segment_roots = tuple(segment.root for segment in worker_schedule.segments)
-    if (
-        segment_roots != expected_roots
-        or any(
-            segment.launch_stage != _RESIDENT_LAUNCH_STAGE
-            for segment in worker_schedule.segments
-        )
-        or any(
-            segment.task_order.source_domain != worker_schedule.placement_domain
-            or segment.task_order.target_domain
-            != root_task_orders[segment.root].target_domain
-            for segment in worker_schedule.segments
-        )
+    if segment_roots != expected_roots or any(
+        segment.task_order.target_domain != root_task_orders[segment.root].target_domain
+        for segment in worker_schedule.segments
     ):
         return None
     return {root: root for root in expected_roots}
@@ -6476,113 +5150,6 @@ class _ScheduledRootTraversal:
     scheduled_ordinal_to_logical_task: CoordinateRelation | None
     logical_task_to_scheduled_ordinal: CoordinateRelation | None
     matches_reference: bool
-
-
-def _authoritative_dense_segment_logical_order(
-    segment: WorkerScheduleSegment,
-) -> CoordinateRelation | None:
-    """Flatten one normalized resident segment from its exact support.
-
-    ``WorkerScheduleSegment`` retains legacy dense-placement fields so older
-    constructors can be normalized, but those fields are not schedule
-    semantics afterwards.  This fallback derives the dense ordinal solely
-    from the authoritative ``(worker, wave)`` support and the worker extent in
-    its source domain.  It is therefore safe even when the compatibility
-    fields no longer describe the normalized relation.
-    """
-    if not segment.is_normalized or segment.launch_stage != _RESIDENT_LAUNCH_STAGE:
-        return None
-    interval = segment.resident_slot_interval
-    if interval is None:
-        return None
-    first_slot, final_slot = interval
-    try:
-        task_count = segment.task_count_expr
-    except ValueError:
-        return None
-    if not _equal_integer_expressions(final_slot - first_slot, task_count):
-        return None
-
-    schedule_domain = segment.task_order.source_domain
-    launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
-    launch_worker_count = schedule_domain.axis_count_expressions[worker_axis]
-    ordinal_axis = (
-        max(
-            (
-                *schedule_domain.axis_order,
-                *segment.task_order.target_domain.axis_order,
-            ),
-            default=0,
-        )
-        + 1
-    )
-    ordinal_domain = CoordinateDomain(
-        axis_order=(ordinal_axis,),
-        axis_counts_items=((ordinal_axis, task_count),),
-        kind="task_order",
-        _allow_empty=task_count.is_zero is True,
-    )
-    if task_count.is_zero is True:
-        return CoordinateRelation(
-            source_domain=ordinal_domain,
-            target_domain=segment.task_order.target_domain,
-            pieces=(),
-        )
-
-    schedule_ordinal = sympy.simplify(
-        coordinate_axis_symbol(wave_axis) * launch_worker_count
-        + coordinate_axis_symbol(worker_axis)
-        - first_slot
-    )
-    schedule_to_ordinal = CoordinateRelation.point_map(
-        schedule_domain,
-        ordinal_domain,
-        tuple(
-            (piece.source_bounds_items, (schedule_ordinal,))
-            for piece in segment.task_order.pieces
-        ),
-    ).coalesce_adjacent_source_boxes()
-    ordinal = coordinate_axis_symbol(ordinal_axis)
-    absolute_slot = sympy.simplify(first_slot + ordinal)
-    ordinal_to_schedule = CoordinateRelation.point_map(
-        ordinal_domain,
-        schedule_domain,
-        (
-            (
-                ((ordinal_axis, 0, task_count, 1),),
-                (
-                    sympy.Integer(_RESIDENT_LAUNCH_STAGE),
-                    sympy.Mod(absolute_slot, launch_worker_count),
-                    FloorDiv(absolute_slot, launch_worker_count),
-                ),
-            ),
-        ),
-    )
-    tile_dependency._remember_exact_converse(
-        schedule_to_ordinal,
-        ordinal_to_schedule,
-    )
-    logical_order = tile_dependency._factor_through_source_ordinalization(
-        segment.task_order,
-        schedule_to_ordinal,
-        ordinal_to_schedule,
-    )
-    logical_to_schedule = segment.task_order.converse()
-    logical_to_ordinal = (
-        None
-        if logical_to_schedule is None
-        else logical_to_schedule.then(schedule_to_ordinal)
-    )
-    if (
-        logical_order is None
-        or not logical_order.is_total_function()
-        or logical_to_ordinal is None
-        or not logical_to_ordinal.is_single_valued()
-        or not logical_to_ordinal.is_total_function()
-    ):
-        return None
-    tile_dependency._remember_exact_converse(logical_order, logical_to_ordinal)
-    return logical_order
 
 
 @cache
@@ -6718,13 +5285,12 @@ def _logical_task_to_reference_ordinal(
 
 @cache
 def _root_schedule_traversal(
-    segments: tuple[WorkerScheduleSegment, ...],
+    segment: WorkerScheduleSegment | None,
     reference_task_order: CoordinateRelation,
 ) -> _ScheduledRootTraversal | None:
     """Derive the symbolic traversal certificate for one complete root run."""
-    if len(segments) != 1:
+    if segment is None:
         return None
-    (segment,) = segments
     root_domain = reference_task_order.target_domain
     try:
         task_count = segment.task_count_expr
@@ -6757,9 +5323,7 @@ def _root_schedule_traversal(
         kind="task_order",
         _allow_empty=root_domain.size_expr.is_zero is True,
     )
-    logical_order = segment.logical_task_order
-    if logical_order is None:
-        logical_order = _authoritative_dense_segment_logical_order(segment)
+    logical_order = segment.task_order
     if (
         logical_order is None
         or logical_order.target_domain != root_domain
@@ -7071,9 +5635,6 @@ def _consumer_major_producer_order(
             replacements[root] = WorkerScheduleSegment(
                 root=root,
                 task_order=task_order,
-                worker_begin=0,
-                worker_count=schedule.worker_count,
-                dispatch_offset=schedule_interval[0],
             )
         if not replacements:
             return schedule
@@ -7090,8 +5651,8 @@ def _consumer_major_producer_order(
             return WorkerSchedule(schedule.worker_count, tuple(segments))
         except ValueError:
             # Reordering is a speculative optimization.  If the proposed
-            # dense orders cannot be normalized into one exact ownership
-            # relation, retain the complete input schedule atomically.
+            # local orders are not exact bijections, retain the complete input
+            # schedule atomically.
             return schedule
 
     # First derive counter-admission cohorts.  A newly released subset remains
@@ -7155,12 +5716,12 @@ def _consumer_major_producer_order(
             consumer_root = consumer.consumer_root
             consumer_order = selected_admission_orders.get(consumer_root)
             if consumer_order is None:
-                consumer_segments = worker_schedule.segments_for_root(consumer_root)
-                if not consumer_segments and consumer_root in continuation_by_root:
+                consumer_segment = worker_schedule.segment_for_root(consumer_root)
+                if consumer_segment is None and consumer_root in continuation_by_root:
                     consumer_order = readiness_graph.root_task_orders[consumer_root]
                 else:
                     consumer_traversal = _root_schedule_traversal(
-                        consumer_segments,
+                        consumer_segment,
                         readiness_graph.root_task_orders[consumer_root],
                     )
                     consumer_order = (

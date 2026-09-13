@@ -706,6 +706,17 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, (x + 1) * 2)
                 self.assertIn("tile_dependency_readiness_wait", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
+                # Both roots underfill the launch cohort. Their static local
+                # strands use only the participating prefix width; padded wave
+                # placement must not leak the launch-wide stride into codegen.
+                self.assertIn(
+                    "tl.range(tl.program_id(0) - 0 + 0, 2, 2)",
+                    code,
+                )
+                self.assertIn(
+                    "tl.range(tl.program_id(0) - 0 + 2, 10, 8)",
+                    code,
+                )
                 if expected_range_option is not None:
                     self.assertIn(expected_range_option, code)
 
@@ -772,8 +783,50 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_dynamic_dense_relation_fallback_uses_authoritative_order(self) -> None:
+    def test_dynamic_dispatch_uses_reordered_local_order(self) -> None:
         x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
+        original_build = cross_loop_codegen.build_static_pipeline_plan
+
+        def build_with_reversed_producer_order(**kwargs: Any):
+            plan = original_build(**kwargs)
+            segments = list(plan.worker_schedule.segments)
+            producer = segments[0]
+            source = producer.task_order.source_domain
+            target = producer.task_order.target_domain
+            materialized = producer.task_order.materialize()
+            pieces = []
+            for source_index in range(source.size):
+                source_coordinates = source.coordinates(source_index)
+                (target_index,) = materialized[source.size - 1 - source_index]
+                target_coordinates = target.coordinates(target_index)
+                pieces.append(
+                    (
+                        tuple(
+                            (
+                                axis,
+                                source_coordinates[axis],
+                                source_coordinates[axis] + 1,
+                                1,
+                            )
+                            for axis in source.axis_order
+                        ),
+                        tuple(target_coordinates[axis] for axis in target.axis_order),
+                    )
+                )
+            reversed_order = CoordinateRelation.point_map(
+                source,
+                target,
+                tuple(pieces),
+            )
+            segments[0] = dataclasses.replace(producer, task_order=reversed_order)
+            return dataclasses.replace(
+                plan,
+                worker_schedule=dataclasses.replace(
+                    plan.worker_schedule,
+                    segments=tuple(segments),
+                ),
+            )
+
         with (
             mock.patch.object(
                 cross_loop_scheduler,
@@ -782,15 +835,14 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             ),
             mock.patch.object(
                 cross_loop_codegen,
-                "_root_schedule_traversal",
-                return_value=None,
+                "build_static_pipeline_plan",
+                side_effect=build_with_reversed_producer_order,
             ),
         ):
             code, out = code_and_output(
                 cartesian_affine_chain,
                 (x,),
                 block_sizes=[1, 16, 1, 32],
-                l2_groupings=[2, 2],
                 pid_type="persistent_blocked",
                 cross_loop_pipeline="dynamic",
                 num_sm_multiplier=1,
@@ -805,7 +857,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             for line in code.splitlines()
             if "tile_dependency_scheduled_pid_task =" in line
         )
-        self.assertIn("tl.minimum", scheduled_pid)
+        self.assertIn("tile_dependency_scheduled_logical_task", scheduled_pid)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1470,7 +1522,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tile_dependency_continuation_task", code)
-        self.assertIn("tile_dependency_scheduled_logical_task", code)
+        self.assertNotIn("tile_dependency_scheduled_logical_task", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
