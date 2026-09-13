@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import itertools
 import math
+import pickle
 import random
 from typing import Literal
 from unittest import mock
@@ -16,6 +18,7 @@ from torch.utils._sympy.functions import Min as SymbolicMin
 import helion
 from helion import exc
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cross_loop_scheduler import WorkerScheduleSegment
 from helion._compiler.device_ir_analysis import DeviceIRAnalysis
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import CoordinateDomain
@@ -27,6 +30,7 @@ from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyGraph
 from helion._compiler.tile_dependency import TileDependencyKind
+from helion._compiler.tile_dependency import _bounded_parameter_expression_interval
 from helion._compiler.tile_dependency import _coalesce_adjacent_target_boxes
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _dense_linear_overlap_relation
@@ -35,6 +39,7 @@ from helion._compiler.tile_dependency import _dense_mixed_radix_converse
 from helion._compiler.tile_dependency import _is_provably_nonnegative
 from helion._compiler.tile_dependency import _layout_is_injective
 from helion._compiler.tile_dependency import _logical_expression_bounds
+from helion._compiler.tile_dependency import _memoized_exact_converse
 from helion._compiler.tile_dependency import (
     _piecewise_single_source_mixed_radix_converse,
 )
@@ -44,6 +49,7 @@ from helion._compiler.tile_dependency import (
 from helion._compiler.tile_dependency import _positive_integer_shift_is_nonnegative
 from helion._compiler.tile_dependency import _relation_source_cells
 from helion._compiler.tile_dependency import _remember_exact_converse
+from helion._compiler.tile_dependency import _simplify_integer_quotients
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_linear_access_relation
 from helion._compiler.tile_dependency import _symbolic_producers_by_consumer
@@ -8614,3 +8620,828 @@ class TestTileDependency(TestCase):
 
         self.assertEqual(len(plan.edges), 1)
         self.assertEqual(plan.edges[0].tensor_names, frozenset(("base", "view")))
+
+
+class TestExactConverseSemantics(TestCase):
+    @staticmethod
+    def _partial_worker_task_order(
+        *,
+        target_identity: int = 0,
+    ) -> tuple[
+        CoordinateDomain,
+        CoordinateDomain,
+        CoordinateRelation,
+    ]:
+        schedule_domain = CoordinateDomain(
+            (-3, -2, -1),
+            ((-3, 2), (-2, 4), (-1, 2)),
+            kind="worker",
+        )
+        widened_domain = CoordinateDomain(
+            (-3, -2, -1),
+            ((-3, 2), (-2, 4), (-1, 3)),
+            kind="worker",
+        )
+        target_domain = CoordinateDomain(
+            (10,),
+            ((10, 3),),
+            identity=target_identity,
+        )
+        worker = coordinate_axis_symbol(-2)
+        task = coordinate_axis_symbol(10)
+        task_order = CoordinateRelation.point_map(
+            schedule_domain,
+            target_domain,
+            (
+                (
+                    ((-3, 1, 2, 1), (-2, 0, 3, 1), (-1, 0, 1, 1)),
+                    (worker,),
+                ),
+            ),
+        )
+        exact_converse = CoordinateRelation.point_map(
+            target_domain,
+            schedule_domain,
+            (
+                (
+                    ((10, 0, 3, 1),),
+                    (sympy.Integer(1), task, sympy.Integer(0)),
+                ),
+            ),
+        )
+        _remember_exact_converse(task_order, exact_converse)
+        return schedule_domain, widened_domain, task_order
+
+    def test_source_domain_rebase_retains_exact_converse_without_reproof(
+        self,
+    ) -> None:
+        old_domain, widened_domain, task_order = self._partial_worker_task_order()
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "_factored_source_support_converse",
+            new_callable=mock.PropertyMock,
+            side_effect=AssertionError("source rebasing must retain its converse"),
+        ):
+            rebased = task_order.rebase_source_domain(widened_domain)
+            self.assertIsNotNone(rebased)
+            assert rebased is not None
+            self.assertEqual(rebased.pieces, task_order.pieces)
+            self.assertTrue(rebased.is_bijection_from_source_support())
+            converse = rebased.converse()
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            self.assertEqual(converse.target_domain, widened_domain)
+            self.assertTrue(converse.is_total_function())
+
+        launch_axis, worker_axis, wave_axis = widened_domain.axis_order
+        for launch_stage in range(2):
+            for worker in range(4):
+                self.assertEqual(
+                    rebased.target_coordinates(
+                        {
+                            launch_axis: launch_stage,
+                            worker_axis: worker,
+                            wave_axis: 2,
+                        }
+                    ),
+                    frozenset(),
+                )
+        self.assertEqual(task_order.source_domain, old_domain)
+
+    def test_relation_transform_exact_converse_provenance(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, nonnegative=True)
+        source = CoordinateDomain(
+            (10, 11),
+            ((10, 2), (11, extent)),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        target = CoordinateDomain(
+            (20, 21),
+            ((20, extent), (21, 2)),
+            identity=0,
+            _allow_empty=True,
+        )
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((10, 0, 2, 1), (11, 0, extent, 1)),
+                    (coordinate_axis_symbol(11), coordinate_axis_symbol(10)),
+                ),
+            ),
+        )
+        self.assertIsNotNone(relation.converse())
+
+        renamed_target = CoordinateDomain(
+            (30, 31),
+            ((30, extent), (31, 2)),
+            identity=1,
+            _allow_empty=True,
+        )
+        renamed = relation.rename_target_axes(renamed_target)
+        self.assertIsNotNone(renamed)
+        assert renamed is not None
+        self.assertIsNotNone(_memoized_exact_converse(renamed))
+
+        def assert_cached_converse_is_exact(
+            transformed: CoordinateRelation,
+            concrete_extent: int,
+        ) -> None:
+            concrete = transformed.substitute_parameters({extent: concrete_extent})
+            converse = _memoized_exact_converse(concrete)
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            forward = concrete.materialize()
+            expected = tuple(
+                frozenset(
+                    source_index
+                    for source_index, targets in enumerate(forward)
+                    if target_index in targets
+                )
+                for target_index in range(concrete.target_domain.size)
+            )
+            self.assertEqual(converse.materialize(), expected)
+
+        for concrete_extent in (0, 1, 4):
+            with self.subTest(transform="rename_target", extent=concrete_extent):
+                assert_cached_converse_is_exact(renamed, concrete_extent)
+            with self.subTest(transform="substitute", extent=concrete_extent):
+                assert_cached_converse_is_exact(relation, concrete_extent)
+
+        projected_target = relation.project_target(
+            CoordinateDomain(
+                (20,),
+                ((20, extent),),
+                identity=0,
+                _allow_empty=True,
+            )
+        )
+        projected_source = relation.project_source(
+            CoordinateDomain(
+                (11,),
+                ((11, extent),),
+                kind="task_order",
+                _allow_empty=True,
+            )
+        )
+        narrow_source = CoordinateDomain(
+            (11,),
+            ((11, extent),),
+            kind="task_order",
+            _allow_empty=True,
+        )
+        narrow_target = CoordinateDomain(
+            (20,),
+            ((20, extent),),
+            identity=0,
+            _allow_empty=True,
+        )
+        narrow = CoordinateRelation.point_map(
+            narrow_source,
+            narrow_target,
+            (
+                (
+                    ((11, 0, extent, 1),),
+                    (coordinate_axis_symbol(11),),
+                ),
+            ),
+        )
+        self.assertIsNotNone(narrow.converse())
+        lifted_source = narrow.lift_source(source)
+        replaced = dataclasses.replace(relation)
+        for name, transformed in (
+            ("project_target", projected_target),
+            ("project_source", projected_source),
+            ("lift_source", lifted_source),
+            ("dataclasses.replace", replaced),
+        ):
+            with self.subTest(transform=name):
+                self.assertIsNotNone(transformed)
+                assert transformed is not None
+                self.assertIsNone(_memoized_exact_converse(transformed))
+
+    def test_source_and_target_coalescing_retain_exact_converse(self) -> None:
+        source = CoordinateDomain((10,), ((10, 4),), kind="task_order")
+        target = CoordinateDomain((20,), ((20, 4),), identity=0)
+        source_coordinate = coordinate_axis_symbol(10)
+        source_partitioned = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (((10, 0, 2, 1),), (source_coordinate,)),
+                (((10, 2, 4, 1),), (source_coordinate,)),
+            ),
+        )
+        self.assertIsNotNone(source_partitioned.converse())
+        source_coalesced = source_partitioned.coalesce_adjacent_source_boxes()
+        self.assertEqual(len(source_coalesced.pieces), 1)
+
+        singleton_source = CoordinateDomain(
+            (30,),
+            ((30, 1),),
+            kind="task_order",
+        )
+        target_partitioned = CoordinateRelation(
+            singleton_source,
+            target,
+            (
+                _CoordinateRelationPiece(
+                    ((30, 0, 1, 1),),
+                    ((20, sympy.Integer(0), sympy.Integer(2), 1),),
+                ),
+                _CoordinateRelationPiece(
+                    ((30, 0, 1, 1),),
+                    ((20, sympy.Integer(2), sympy.Integer(4), 1),),
+                ),
+            ),
+        )
+        self.assertIsNotNone(target_partitioned.converse())
+        target_coalesced = target_partitioned.coalesce_adjacent_target_boxes()
+        self.assertEqual(len(target_coalesced.pieces), 1)
+
+        for name, transformed in (
+            ("source", source_coalesced),
+            ("target", target_coalesced),
+        ):
+            with self.subTest(coalescing=name):
+                converse = _memoized_exact_converse(transformed)
+                self.assertIsNotNone(converse)
+                assert converse is not None
+                forward = transformed.materialize()
+                expected = tuple(
+                    frozenset(
+                        source_index
+                        for source_index, targets in enumerate(forward)
+                        if target_index in targets
+                    )
+                    for target_index in range(transformed.target_domain.size)
+                )
+                self.assertEqual(converse.materialize(), expected)
+
+    def test_source_support_ordinalization_retains_constructed_inverse(self) -> None:
+        _old_domain, _widened_domain, task_order = self._partial_worker_task_order()
+
+        ordinalization = task_order._ordinalized_source_support
+        self.assertIsNotNone(ordinalization)
+        assert ordinalization is not None
+        inverse = _memoized_exact_converse(ordinalization)
+        self.assertIsNotNone(inverse)
+        assert inverse is not None
+        self.assertTrue(inverse.is_total_function())
+
+    def test_static_quotient_bounds_are_valid_for_signed_integer_base(self) -> None:
+        value = sympy.Symbol("value", integer=True)
+
+        def quotient(numerator: sympy.Expr, divisor: int) -> sympy.Expr:
+            return sympy.floor(numerator / divisor)  # pyrefly: ignore[bad-return]
+
+        bounded = 1 + quotient(value, 4) - quotient(value + 2, 4)
+        remainder_complement = 5 + 4 * quotient(value, 4) - value
+        negative = quotient(value - 1, 4) - quotient(value, 4)
+        oversized_offset = 1 + quotient(value, 4) - quotient(value + 5, 4)
+        mismatched_divisor = 1 + quotient(value, 4) - quotient(value + 2, 5)
+
+        self.assertEqual(
+            _bounded_parameter_expression_interval(bounded),
+            (0, 1),
+        )
+        self.assertEqual(
+            _bounded_parameter_expression_interval(remainder_complement),
+            (2, 5),
+        )
+        self.assertTrue(_is_provably_nonnegative(bounded, None))
+        self.assertTrue(_is_provably_nonnegative(remainder_complement, None))
+        self.assertFalse(_is_provably_nonnegative(negative, None))
+        self.assertFalse(_is_provably_nonnegative(oversized_offset, None))
+        self.assertFalse(_is_provably_nonnegative(mismatched_divisor, None))
+
+    def test_full_source_composition_does_not_restore_clipped_points(self) -> None:
+        source = CoordinateDomain((10,), ((10, 2),), kind="worker")
+        middle = CoordinateDomain((20,), ((20, 1),), kind="task_order")
+        target = CoordinateDomain((30,), ((30, 1),), kind="site")
+        source_coordinate = coordinate_axis_symbol(10)
+        middle_coordinate = coordinate_axis_symbol(20)
+        first = CoordinateRelation.point_map(
+            source,
+            middle,
+            ((((10, 0, 2, 1),), (source_coordinate,)),),
+        )
+        first_inverse = CoordinateRelation.point_map(
+            middle,
+            source,
+            ((((20, 0, 1, 1),), (middle_coordinate,)),),
+        )
+        _remember_exact_converse(first, first_inverse)
+        following = CoordinateRelation.point_map(
+            middle,
+            target,
+            ((((20, 0, 1, 1),), (sympy.Integer(0),)),),
+        )
+        following_inverse = CoordinateRelation.point_map(
+            target,
+            middle,
+            ((((30, 0, 1, 1),), (sympy.Integer(0),)),),
+        )
+        _remember_exact_converse(following, following_inverse)
+
+        self.assertEqual(
+            first.materialize(),
+            (frozenset((0,)), frozenset()),
+        )
+        self.assertIsNone(first.then(following))
+
+    def test_composition_and_union_retain_only_existing_exact_converses(
+        self,
+    ) -> None:
+        source = CoordinateDomain((10,), ((10, 4),), kind="worker")
+        ordinal = CoordinateDomain((20,), ((20, 4),), kind="task_order")
+        target = CoordinateDomain((30,), ((30, 4),), identity=0)
+        source_coordinate = coordinate_axis_symbol(10)
+        ordinal_coordinate = coordinate_axis_symbol(20)
+        first = CoordinateRelation.point_map(
+            source,
+            ordinal,
+            ((((10, 0, 4, 1),), (source_coordinate,)),),
+        )
+        following = CoordinateRelation.point_map(
+            ordinal,
+            target,
+            ((((20, 0, 4, 1),), (3 - ordinal_coordinate,)),),
+        )
+
+        with mock.patch.object(
+            CoordinateRelation,
+            "converse",
+            side_effect=AssertionError("composition must not initiate a proof"),
+        ):
+            unproved = first.then(following)
+        self.assertIsNotNone(unproved)
+        assert unproved is not None
+        self.assertIsNone(_memoized_exact_converse(unproved))
+
+        self.assertIsNotNone(first.converse())
+        self.assertIsNotNone(following.converse())
+        with mock.patch.object(
+            CoordinateRelation,
+            "converse",
+            side_effect=AssertionError("composition must use retained proofs"),
+        ):
+            composed = first.then(following)
+        self.assertIsNotNone(composed)
+        assert composed is not None
+        composed_converse = _memoized_exact_converse(composed)
+        self.assertIsNotNone(composed_converse)
+        assert composed_converse is not None
+        self.assertEqual(
+            composed_converse.materialize(),
+            (frozenset((3,)), frozenset((2,)), frozenset((1,)), frozenset((0,))),
+        )
+
+        left = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 0, 2, 1),), (source_coordinate,)),),
+        )
+        right = CoordinateRelation.point_map(
+            source,
+            target,
+            ((((10, 2, 4, 1),), (source_coordinate,)),),
+        )
+        self.assertIsNotNone(left.converse())
+        self.assertIsNotNone(right.converse())
+        with mock.patch.object(
+            CoordinateRelation,
+            "converse",
+            side_effect=AssertionError("union must use retained proofs"),
+        ):
+            combined = left.union(right)
+        self.assertIsNotNone(combined)
+        assert combined is not None
+        self.assertIsNotNone(_memoized_exact_converse(combined))
+        self.assertTrue(combined.is_bijection_from_source_support())
+
+        # Derived proof state is not part of equality and is not copied by a
+        # value transformation whose new forward relation has not been proved.
+        transformed = dataclasses.replace(composed)
+        self.assertEqual(transformed, composed)
+        self.assertEqual(hash(transformed), hash(composed))
+        self.assertIsNone(_memoized_exact_converse(transformed))
+        for rebuilt in (copy.deepcopy(composed), pickle.loads(pickle.dumps(composed))):
+            self.assertEqual(rebuilt, composed)
+            self.assertEqual(hash(rebuilt), hash(composed))
+            self.assertIsNone(_memoized_exact_converse(rebuilt))
+
+    def test_manual_relation_without_construction_witness_uses_bounded_fallback(
+        self,
+    ) -> None:
+        source = CoordinateDomain((10,), ((10, 6),), kind="task_order")
+        target = CoordinateDomain((20,), ((20, 6),), identity=0)
+        permutation = (2, 5, 1, 4, 0, 3)
+        derived = CoordinateRelation.point_map(
+            source,
+            target,
+            tuple(
+                (
+                    ((10, source_index, source_index + 1, 1),),
+                    (sympy.Integer(target_index),),
+                )
+                for source_index, target_index in enumerate(permutation)
+            ),
+        )
+
+        # Reconstruct from semantic fields so no constructor provenance or
+        # propagated converse can be required for acceptance.
+        manual = CoordinateRelation(
+            source_domain=derived.source_domain,
+            target_domain=derived.target_domain,
+            pieces=derived.pieces,
+        )
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("the bounded proof must stay symbolic"),
+        ):
+            self.assertTrue(manual.is_bijection_from_source_support())
+            converse = manual.converse()
+            self.assertIsNotNone(converse)
+            assert converse is not None
+            self.assertTrue(converse.is_total_function())
+
+        self.assertEqual(
+            converse.materialize(),
+            tuple(
+                frozenset((permutation.index(target_index),))
+                for target_index in range(len(permutation))
+            ),
+        )
+
+    def test_local_order_rejects_padded_and_out_of_domain_support(
+        self,
+    ) -> None:
+        local_order = CoordinateDomain(
+            (10,),
+            ((10, 3),),
+            kind="task_order",
+        )
+        target = CoordinateDomain(
+            (20,),
+            ((20, 3),),
+            kind="site",
+            identity=0,
+        )
+        ordinal = coordinate_axis_symbol(10)
+        valid = CoordinateRelation.point_map(
+            local_order,
+            target,
+            (
+                (
+                    ((10, 0, 3, 1),),
+                    (ordinal,),
+                ),
+            ),
+        )
+        self.assertTrue(valid.is_bijection_from_source_support())
+        self.assertIsNotNone(valid.converse())
+        WorkerScheduleSegment(root=0, task_order=valid)
+
+        invalid_relations = {
+            "padded target tail": CoordinateRelation.point_map(
+                local_order,
+                target,
+                (
+                    (
+                        ((10, 0, 3, 1),),
+                        (ordinal + 1,),
+                    ),
+                ),
+            ),
+            "out-of-domain source": CoordinateRelation.point_map(
+                local_order,
+                target,
+                (
+                    (
+                        ((10, -1, 2, 1),),
+                        (ordinal + 1,),
+                    ),
+                ),
+            ),
+        }
+        for name, invalid in invalid_relations.items():
+            with self.subTest(case=name):
+                # Replacing a relation after proving its converse must not
+                # retain a stale proof for the changed forward relation.
+                transformed = dataclasses.replace(valid, pieces=invalid.pieces)
+                self.assertFalse(transformed.is_bijection_from_source_support())
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "not an exact local bijection",
+                ):
+                    WorkerScheduleSegment(root=0, task_order=transformed)
+
+
+_FIRST_AXIS = 10
+_SECOND_AXIS = 20
+_BATCH_AXIS = 30
+
+
+def _domain(
+    axes: tuple[int, ...],
+    counts: tuple[int | sympy.Expr, ...],
+    *,
+    identity: int = 0,
+    allow_empty: bool = False,
+) -> CoordinateDomain:
+    return CoordinateDomain(
+        axes,
+        tuple(zip(axes, counts, strict=True)),
+        tuple((axis, 1) for axis in axes),
+        identity=identity,
+        _allow_empty=allow_empty,
+    )
+
+
+def _coordinates_in_linear_order(
+    axes: tuple[int, ...],
+    counts: dict[int, int],
+) -> tuple[dict[int, int], ...]:
+    """Enumerate a small test domain with ``axes[0]`` varying fastest."""
+    coordinates = []
+    for ordinal in range(math.prod(counts[axis] for axis in axes)):
+        remainder = ordinal
+        point: dict[int, int] = {}
+        for axis in axes:
+            point[axis] = remainder % counts[axis]
+            remainder //= counts[axis]
+        coordinates.append(point)
+    return tuple(coordinates)
+
+
+def _expected_l2_targets(
+    domain: CoordinateDomain,
+    pid_axis_order: tuple[int, ...],
+    group_size: int,
+) -> tuple[int, ...]:
+    """Independent oracle for Helion's existing grouped-PID traversal."""
+    counts = domain.axis_counts
+    first_axis, second_axis, *outer_axes = pid_axis_order
+    first_count = counts[first_axis]
+    second_count = counts[second_axis]
+    if first_count == 0 or second_count == 0:
+        return ()
+    actual_group_size = min(group_size, first_count)
+    result: list[int] = []
+    for outer in _coordinates_in_linear_order(tuple(outer_axes), counts):
+        for first_begin in range(0, first_count, actual_group_size):
+            first_end = min(first_begin + actual_group_size, first_count)
+            for second in range(second_count):
+                for first in range(first_begin, first_end):
+                    result.append(
+                        domain.index(
+                            {
+                                **outer,
+                                first_axis: first,
+                                second_axis: second,
+                            }
+                        )
+                    )
+    return tuple(result)
+
+
+def _singleton_targets(relation: CoordinateRelation) -> tuple[int, ...]:
+    result: list[int] = []
+    for targets in relation.materialize():
+        if not targets:
+            continue
+        if len(targets) != 1:
+            raise AssertionError(f"expected point map, got {targets}")
+        result.append(next(iter(targets)))
+    return tuple(result)
+
+
+def _assert_exact_bijection(
+    test: TestCase,
+    relation: CoordinateRelation,
+    expected_cardinality: int | sympy.Expr,
+) -> CoordinateRelation:
+    cardinality = relation.source_support_cardinality()
+    test.assertIsNotNone(cardinality)
+    assert cardinality is not None
+    test.assertEqual(sympy.simplify(cardinality - expected_cardinality), 0)
+    test.assertTrue(relation.is_single_valued())
+    test.assertTrue(relation.is_bijection_from_source_support())
+    converse = relation.converse()
+    test.assertIsNotNone(converse)
+    assert converse is not None
+    test.assertTrue(converse.is_total_function())
+    return converse
+
+
+class TestRaggedL2Schedule(TestCase):
+    def test_nested_quotient_remainder_identity_is_simplified_first(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        first = sympy.Symbol("first", integer=True, nonnegative=True)
+        second = sympy.Symbol("second", integer=True, nonnegative=True)
+        dividend = 3 * batch + 2 * second + 6 * FloorDiv(first, 2) + sympy.Mod(first, 2)
+        expression = 7 * FloorDiv(dividend, 7) + sympy.Mod(dividend, 7)
+
+        self.assertEqual(
+            _simplify_integer_quotients(expression),
+            _simplify_integer_quotients(dividend),
+        )
+
+    def test_l2_edge_geometries_have_exact_constant_size_proofs(self) -> None:
+        for first_count, second_count, group_size in (
+            (0, 3, 2),
+            (5, 0, 2),
+            (4, 3, 2),
+            (5, 3, 5),
+            (5, 3, 8),
+        ):
+            with self.subTest(
+                first_count=first_count,
+                second_count=second_count,
+                group_size=group_size,
+            ):
+                domain = _domain(
+                    (_FIRST_AXIS, _SECOND_AXIS),
+                    (first_count, second_count),
+                    allow_empty=first_count == 0 or second_count == 0,
+                )
+                task_order = pid_task_order(
+                    domain,
+                    domain.axis_order,
+                    l2_group_size=group_size,
+                )
+                expected = _expected_l2_targets(
+                    domain,
+                    domain.axis_order,
+                    group_size,
+                )
+                self.assertEqual(_singleton_targets(task_order), expected)
+                self.assertEqual(len(task_order.pieces), 0 if not expected else 1)
+                with mock.patch.object(
+                    CoordinateRelation,
+                    "materialize",
+                    side_effect=AssertionError("L2 proof must stay structural"),
+                ):
+                    converse = _assert_exact_bijection(
+                        self,
+                        task_order,
+                        first_count * second_count,
+                    )
+                self.assertLessEqual(len(converse.pieces), 2)
+
+    def test_l2_small_shape_oracle_and_large_shape_piece_bound(self) -> None:
+        for first_count in range(1, 9):
+            for second_count in range(1, 5):
+                for group_size in sorted({1, 2, 3, first_count, first_count + 2}):
+                    with self.subTest(
+                        first_count=first_count,
+                        second_count=second_count,
+                        group_size=group_size,
+                    ):
+                        domain = _domain(
+                            (_FIRST_AXIS, _SECOND_AXIS),
+                            (first_count, second_count),
+                        )
+                        task_order = pid_task_order(
+                            domain,
+                            domain.axis_order,
+                            l2_group_size=group_size,
+                        )
+                        self.assertEqual(len(task_order.pieces), 1)
+                        self.assertEqual(
+                            _singleton_targets(task_order),
+                            _expected_l2_targets(
+                                domain,
+                                domain.axis_order,
+                                group_size,
+                            ),
+                        )
+
+        # This shape exceeded the historical group_count * second_count
+        # witness limit. Its semantic representation is still constant-size.
+        large_domain = _domain(
+            (_FIRST_AXIS, _SECOND_AXIS),
+            (4097, 3),
+        )
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("large L2 order must not enumerate"),
+        ):
+            large_order = pid_task_order(
+                large_domain,
+                large_domain.axis_order,
+                l2_group_size=2,
+            )
+            self.assertEqual(len(large_order.pieces), 1)
+            large_converse = _assert_exact_bijection(
+                self,
+                large_order,
+                4097 * 3,
+            )
+        self.assertLessEqual(len(large_converse.pieces), 2)
+
+    def test_ragged_l2_preserves_axis_permutation_forward_semantics(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, nonnegative=True)
+        domain = _domain(
+            (_BATCH_AXIS, _FIRST_AXIS, _SECOND_AXIS),
+            (batch, 5, 3),
+        )
+        pid_axis_order = (_FIRST_AXIS, _SECOND_AXIS, _BATCH_AXIS)
+        task_order = pid_task_order(
+            domain,
+            pid_axis_order,
+            l2_group_size=2,
+        )
+
+        self.assertEqual(len(task_order.pieces), 1)
+        for concrete_batch in (0, 1, 2, 8):
+            concrete_domain = domain.substitute_parameters({batch: concrete_batch})
+            concrete_order = task_order.substitute_parameters({batch: concrete_batch})
+            expected = _expected_l2_targets(
+                concrete_domain,
+                pid_axis_order,
+                2,
+            )
+            self.assertEqual(_singleton_targets(concrete_order), expected)
+            self.assertEqual(sorted(expected), list(range(15 * concrete_batch)))
+
+    def test_bounded_binary_floordiv_selector_is_generic(self) -> None:
+        source = CoordinateDomain((1,), ((1, 6),), kind="task_order")
+        target = CoordinateDomain((2,), ((2, 6),), identity=0)
+        coordinate = coordinate_axis_symbol(1)
+        selector = FloorDiv(coordinate, 3)
+        selected = coordinate + selector * (8 - 2 * coordinate)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((1, 0, 6, 1),),
+                    (selected,),
+                ),
+            ),
+        )
+
+        self.assertEqual(_singleton_targets(relation), (0, 1, 2, 5, 4, 3))
+        for name, rebuilt in (
+            ("direct", relation),
+            ("deepcopy", copy.deepcopy(relation)),
+            ("pickle", pickle.loads(pickle.dumps(relation))),
+        ):
+            with self.subTest(roundtrip=name):
+                with mock.patch.object(
+                    CoordinateRelation,
+                    "materialize",
+                    side_effect=AssertionError(
+                        "bounded selector proof must not enumerate"
+                    ),
+                ):
+                    converse = _assert_exact_bijection(self, rebuilt, 6)
+                self.assertLessEqual(len(converse.pieces), 2)
+                self.assertEqual(
+                    _singleton_targets(converse),
+                    (0, 1, 2, 5, 4, 3),
+                )
+
+    def test_nonbinary_floordiv_selector_declines_conservatively(self) -> None:
+        source = CoordinateDomain((1,), ((1, 9),), kind="task_order")
+        target = CoordinateDomain((2,), ((2, 9),), identity=0)
+        coordinate = coordinate_axis_symbol(1)
+        selector = FloorDiv(coordinate, 3)
+        relation = CoordinateRelation.point_map(
+            source,
+            target,
+            (
+                (
+                    ((1, 0, 9, 1),),
+                    (coordinate + 6 - 6 * selector,),
+                ),
+            ),
+        )
+
+        # This happens to be a permutation, but proving a three-way selector
+        # is outside the bounded binary-selector grammar. Do not silently
+        # expand it into one relation piece per source point.
+        self.assertEqual(
+            sorted(_singleton_targets(relation)),
+            list(range(9)),
+        )
+        semantic_copy = CoordinateRelation(
+            relation.source_domain,
+            relation.target_domain,
+            relation.pieces,
+        )
+        with mock.patch.object(
+            CoordinateRelation,
+            "materialize",
+            side_effect=AssertionError("unsupported selectors must not enumerate"),
+        ):
+            self.assertIsNone(semantic_copy.converse())
+            self.assertFalse(semantic_copy.is_bijection_from_source_support())
+        self.assertEqual(len(semantic_copy.pieces), 1)

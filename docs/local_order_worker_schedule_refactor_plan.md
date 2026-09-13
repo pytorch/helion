@@ -166,3 +166,50 @@ Validation:
 - Pretuned Qwen dynamic-shape and same-source static-shape compilation produce
   identical normalized device code and the same R255/spill22/17,408-byte
   resource envelope; the dynamic-shape isolated cold-L2 result was 100.480 us.
+
+## Narrow follow-up cleanup
+
+After the representation refactor was stable, a second call-graph audit removed
+only machinery outside the compiler's accepted capability boundary:
+
+- `WorkerScheduleSegment` now enforces the already-existing fixed-capacity
+  invariant locally and exposes only an integer `task_count`.
+- Worker/wave geometry uses integer prefix arithmetic; baseline construction
+  derives its domains from the authoritative root task orders instead of
+  accepting the same information twice.
+- The cached root traversal retains only the flattened forward relation and its
+  reference-order result.  Codegen renders the sole segment's authoritative
+  local order directly when that flattened view is unavailable.
+- The parameterized flat static-inner/dynamic-outer converse was deleted.  It
+  was only exercised or needed for parameterized flattened task-order
+  inversion, while the production pipeline rejects parameterized worker
+  schedules before planning.  Symbolic dependency/layout construction and
+  concrete substitution remain unchanged.
+- Branch-only relation, L2-order, and layout-provenance tests were folded into
+  the established tile-dependency and runtime-specialization test modules.
+
+This follow-up removes 754 net lines across compiler and focused tests (378
+compiler lines and 376 test lines), without adding an abstraction or changing a
+scheduling decision.
+
+Validation after the cleanup:
+
+- 353 focused scheduler, dependency, exact-converse, ragged-L2,
+  runtime-specialization, and codegen tests passed, plus 302 subtests; 3 tests
+  were skipped by their existing backend guards.
+- Representative static and dynamic generated Triton retained their exact
+  pre-cleanup hashes (8,008 and 7,075 bytes).
+- FlashMLA B4/B9 remained bit-exact and faster than standalone: 63.440 versus
+  69.504 us, and 89.952 versus 104.304 us, respectively.  Both full generated
+  source hashes were unchanged.
+- Pretuned Qwen retained the same plan, normalized device source, and
+  R255/spill22/17,408-byte resource envelope.
+- Pretuned Gemma4 A4B remained bit-exact at 52.960 versus 55.168 us standalone,
+  with unchanged normalized device source and R128/spill0/34,816-byte resources.
+- Muse dynamic remained bit-exact at 153.408 versus 165.632 us standalone.  A
+  direct pre/post run measured 153.344 versus 153.408 us; the generated-source
+  diff was one equivalent, shorter ordinal expression.
+- DeepSeek and Nemotron dynamic MoE retained byte-identical generated source,
+  identical plans and resource envelopes, and matched their pre-cleanup
+  same-device timings within noise (165.760 versus 165.552 us for DeepSeek;
+  81.600 versus 83.808 us for Nemotron).

@@ -943,7 +943,6 @@ def _baseline_worker_schedule(
             pid_axis_orders,
         )
     return _build_baseline_worker_schedule(
-        root_domains,
         root_task_orders,
         worker_count,
     )
@@ -1025,7 +1024,7 @@ class TestCrossLoopScheduler(TestCase):
     def test_pipeline_dispatch_mode_is_explicit(self) -> None:
         (root_domain,) = _identify_root_domains((_domain((10, 4)),))
         (task_order,) = _default_root_task_orders((root_domain,))
-        schedule = _build_baseline_worker_schedule((root_domain,), (task_order,), 4)
+        schedule = _build_baseline_worker_schedule((task_order,), 4)
         default = cross_loop_scheduler.StaticPipelinePlan(
             worker_schedule=schedule,
             root_task_orders=(task_order,),
@@ -1132,7 +1131,6 @@ class TestCrossLoopScheduler(TestCase):
             (0, 1),
         )
         self.assertEqual(plan.dispatch_mode, "static")
-        self.assertFalse(hasattr(cross_loop_scheduler, "_global_unit_list_schedule"))
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset())
 
@@ -1686,7 +1684,6 @@ class TestCrossLoopScheduler(TestCase):
             )
         with self.assertRaisesRegex(ValueError, "positive root capacity"):
             _build_baseline_worker_schedule(
-                (empty_domain,),
                 (empty_order,),
                 worker_count=2,
             )
@@ -2116,19 +2113,28 @@ class TestCrossLoopScheduler(TestCase):
         ):
             WorkerScheduleSegment(0, logical_order)
 
+    def test_worker_schedule_rejects_parameterized_local_order(self) -> None:
+        task_count = sympy.Symbol("task_count", integer=True, positive=True)
+        target_domain = CoordinateDomain(
+            axis_order=(10,),
+            axis_counts_items=((10, task_count),),
+            kind="site",
+            identity=0,
+        )
+        logical_order = pid_task_order(target_domain, target_domain.axis_order)
+
+        with self.assertRaisesRegex(ValueError, "fixed capacity"):
+            WorkerScheduleSegment(0, logical_order)
+
     def test_packed_relation_reuses_constructive_interval_proof(self) -> None:
-        batch = sympy.Symbol("batch", integer=True, positive=True)
-        worker_count = 148
-        first_slot = 2 * batch
-        left_count = sympy.Integer(3)
-        right_count = 2 * batch + 1
+        worker_count = 8
+        first_slot = 2
+        left_count = 3
+        right_count = 5
         final_slot = first_slot + left_count + right_count
         schedule_domain = cross_loop_scheduler._worker_schedule_domain(
             worker_count,
-            cross_loop_scheduler._ceildiv_nonnegative_expression(
-                final_slot,
-                worker_count,
-            ),
+            (final_slot + worker_count - 1) // worker_count,
             (-3, -2, -1),
         )
         left_domain, right_domain = _identify_root_domains(
@@ -2183,42 +2189,16 @@ class TestCrossLoopScheduler(TestCase):
                 (first_slot + left_count, final_slot),
             )
 
-        for concrete_batch in (1, 73, 74, 75):
-            with self.subTest(batch=concrete_batch):
-                substitutions = {batch: concrete_batch}
-                concrete_left = left.substitute_parameters(substitutions)
-                concrete_right = right.substitute_parameters(substitutions)
-                concrete_first = 2 * concrete_batch
-                self.assertEqual(
-                    tile_dependency._dense_linear_source_support_interval(
-                        concrete_left,
-                        (-2, -1),
-                    ),
-                    (concrete_first, concrete_first + 3),
-                )
-                self.assertEqual(
-                    tile_dependency._dense_linear_source_support_interval(
-                        concrete_right,
-                        (-2, -1),
-                    ),
-                    (
-                        concrete_first + 3,
-                        concrete_first + 3 + 2 * concrete_batch + 1,
-                    ),
-                )
-
-        concrete_schedule = schedule_domain.substitute_parameters({batch: 1})
         overlap_domain = _identify_root_domains((_domain((30, 2, 1)),))[0]
         overlap = cross_loop_scheduler._packed_root_major_task_order_relation(
-            concrete_schedule,
+            schedule_domain,
             pid_task_order(overlap_domain, overlap_domain.axis_order),
             4,
             worker_count,
         )
         self.assertIsNotNone(overlap)
         assert overlap is not None
-        concrete_left = left.substitute_parameters({batch: 1})
-        self.assertFalse(concrete_left.has_disjoint_source_support(overlap))
+        self.assertFalse(left.has_disjoint_source_support(overlap))
 
         mismatched_worker_domain = cross_loop_scheduler._worker_schedule_domain(
             8,
@@ -2265,7 +2245,7 @@ class TestCrossLoopScheduler(TestCase):
                     (-3, -2, -1),
                 ),
                 two_axis_domain,
-                sympy.Integer(0),
+                0,
                 4,
                 (50, 50, 51),
             )
@@ -2986,7 +2966,6 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(counters, ())
         self.assertEqual(barriers, frozenset(((0, 1),)))
         plan_schedule = _build_baseline_worker_schedule(
-            readiness_graph.root_domains,
             readiness_graph.root_task_orders,
             worker_count=2,
         )
@@ -3131,7 +3110,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
 
-    def test_worker_schedule_accepts_symbolic_permuted_traversal(self) -> None:
+    def test_worker_schedule_accepts_permuted_local_order(self) -> None:
         (domain,) = _identify_root_domains((_domain((10, 2, 1), (11, 3, 1)),))
         reference = pid_task_order(domain, (11, 10))
         permuted = pid_task_order(domain, (10, 11))
@@ -4457,7 +4436,6 @@ class TestCrossLoopScheduler(TestCase):
             event,
         )
         baseline = _build_baseline_worker_schedule(
-            readiness_graph.root_domains,
             readiness_graph.root_task_orders,
             worker_count=2,
         )
@@ -5040,7 +5018,6 @@ class TestCrossLoopScheduler(TestCase):
             ((1, 1, 1, 1),) * 3,
         )
         baseline = _build_baseline_worker_schedule(
-            configured.root_domains,
             configured.root_task_orders,
             worker_count=4,
         )
@@ -5566,7 +5543,6 @@ class TestCrossLoopScheduler(TestCase):
         )
         readiness_graph = _configured_readiness_graph(graph, root_domains)
         baseline = _build_baseline_worker_schedule(
-            root_domains,
             readiness_graph.root_task_orders,
             worker_count=4,
         )
@@ -5877,7 +5853,6 @@ class TestCrossLoopScheduler(TestCase):
         with self.assertRaisesRegex(ValueError, "strict source-ordered dependency"):
             cross_loop_scheduler.StaticPipelinePlan(
                 worker_schedule=_build_baseline_worker_schedule(
-                    root_domains,
                     root_task_orders,
                     worker_count=2,
                 ),
@@ -5932,7 +5907,6 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
         schedule = _build_baseline_worker_schedule(
-            root_domains,
             _default_root_task_orders(root_domains),
             worker_count=4,
             excluded_roots=frozenset((1,)),
@@ -6004,7 +5978,6 @@ class TestCrossLoopScheduler(TestCase):
             ).participant_intervals,
             ((0, 2),),
         )
-        self.assertIsNone(schedule.contiguous_global_interval(0))
 
     def test_root_local_preparation_orders_continuation_producers_atomically(
         self,

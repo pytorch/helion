@@ -1809,40 +1809,22 @@ def emit_cross_loop_schedule(
             return logical_task_from_coordinates(root, task_coordinates)
 
         # Some existing PID permutations have no single representable flattened
-        # relation. Render the certificate's local-order range directly; never
-        # reconstruct physical placement in codegen.
-        expression = ""
-        for segment, ordinal_begin, ordinal_end in reversed(
-            traversal.segment_ordinal_ranges
-        ):
-            ordinal_begin_value = int(ordinal_begin)
-            ordinal_end_value = int(ordinal_end)
-            logical_order = segment.task_order
-            task_order_delta = f"(({task_order_index}) - {ordinal_begin_value})"
-            membership = (
-                f"({task_order_delta}) >= 0 and "
-                f"({task_order_delta}) < {ordinal_end_value - ordinal_begin_value}"
-            )
-            task_order_coordinates = flat_task_coordinates(
-                task_order_delta,
-                logical_order.source_domain.axis_order,
-                logical_order.source_domain.axis_count_expressions,
-            )
-            task_coordinates, relation_membership = relation_point_coordinates(
-                logical_order,
-                task_order_coordinates,
-            )
-            if relation_membership != "True":
-                membership = f"({membership}) and ({relation_membership})"
-            segment_task = logical_task_from_coordinates(root, task_coordinates)
-            expression = (
-                segment_task
-                if not expression
-                else f"tl.where({membership}, {segment_task}, {expression})"
-            )
-        if not expression:
+        # relation. Render the sole authoritative local order directly; its
+        # caller already bounds ``task_order_index`` to this root's task count.
+        segment = static_pipeline_plan.worker_schedule.segment_for_root(root)
+        if segment is None:
             raise AssertionError(f"root {root} has no certified traversal")
-        return expression
+        logical_order = segment.task_order
+        task_order_coordinates = flat_task_coordinates(
+            task_order_index,
+            logical_order.source_domain.axis_order,
+            logical_order.source_domain.axis_count_expressions,
+        )
+        task_coordinates, _membership = relation_point_coordinates(
+            logical_order,
+            task_order_coordinates,
+        )
+        return logical_task_from_coordinates(root, task_coordinates)
 
     def scheduled_root_task_body(
         root: int,
@@ -2108,17 +2090,9 @@ def emit_cross_loop_schedule(
             )
         ]
 
-    def static_run_body(
-        segments: tuple[WorkerScheduleSegment, ...],
-    ) -> list[ast.stmt]:
-        """Render complete logical worker strands for one static run."""
-        body: list[ast.stmt] = []
-        for segment in segments:
-            body.extend(static_segment_body(segment))
-        return body
-
     if not uses_packet_dispatch:
-        result.extend(static_run_body(static_pipeline_plan.worker_schedule.segments))
+        for segment in static_pipeline_plan.worker_schedule.segments:
+            result.extend(static_segment_body(segment))
         result.append(
             statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
         )
