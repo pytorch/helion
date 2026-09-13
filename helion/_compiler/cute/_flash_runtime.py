@@ -10,7 +10,6 @@ from dataclasses import dataclass
 import functools
 from functools import partial
 from itertools import starmap
-import os
 from typing import Any
 from typing import cast
 
@@ -307,68 +306,6 @@ def cpasync_reduce_bulk_add_f32(
     )
 
 
-# exp2 emulation (FA4 forward's trick): 2^x = 2^floor(x) * p(frac(x)) with a
-# degree-3 minimax polynomial on [0, 1) evaluated on the FMA pipe (packed
-# f32x2) and the exponent folded in with an integer add, so part of the
-# softmax leaves the 16-lane/clk XU (MUFU) pipe. Relative error ~1e-4, well
-# below the bf16 rounding of P. Every ``FBWD_EX2_EMU_EVERY``-th pair uses it
-# (0 = all MUFU).
-FBWD_EX2_EMU_EVERY = int(os.environ.get("HELION_FBWD_EX2_EMU", "0"))
-_POLY_EX2_3 = (
-    1.0,
-    0.695146143436431884765625,
-    0.227564394474029541015625,
-    0.077119089663028717041015625,
-)
-
-
-@dsl_user_op
-def combine_int_frac_ex2(
-    x_rounded: Float32, frac_ex2: Float32, *, loc: object = None, ip: object = None
-) -> Float32:
-    """2^floor * frac_ex2: add the 8-bit integer floor (low bits of the
-    round-down-biased value) straight into the exponent field."""
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [
-                Float32(x_rounded).ir_value(loc=loc, ip=ip),
-                Float32(frac_ex2).ir_value(loc=loc, ip=ip),
-            ],
-            "{\n\t"
-            ".reg .s32 xr, fe, xe, o;\n\t"
-            "mov.b32 xr, $1;\n\t"
-            "mov.b32 fe, $2;\n\t"
-            "shl.b32 xe, xr, 23;\n\t"
-            "add.s32 o, xe, fe;\n\t"
-            "mov.b32 $0, o;\n\t"
-            "}\n",
-            "=f,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-def ex2_emulation_packed(x: Float32, y: Float32) -> tuple[Float32, Float32]:
-    """Two exp2 values via range reduction + degree-3 polynomial (x, y <= 0)."""
-    fp32_round_int = float(2**23 + 2**22)
-    xc = cute.arch.fmax(x, Float32(-127.0))
-    yc = cute.arch.fmax(y, Float32(-127.0))
-    xr, yr = cute.arch.add_packed_f32x2(
-        (xc, yc), (fp32_round_int, fp32_round_int), rnd="rm"
-    )
-    xb, yb = cute.arch.sub_packed_f32x2((xr, yr), (fp32_round_int, fp32_round_int))
-    xf, yf = cute.arch.sub_packed_f32x2((xc, yc), (xb, yb))
-    px, py = (Float32(_POLY_EX2_3[3]), Float32(_POLY_EX2_3[3]))
-    for c in (_POLY_EX2_3[2], _POLY_EX2_3[1], _POLY_EX2_3[0]):
-        px, py = cute.arch.fma_packed_f32x2(
-            (px, py), (xf, yf), (Float32(c), Float32(c))
-        )
-    return combine_int_frac_ex2(xr, px), combine_int_frac_ex2(yr, py)
-
-
 def fbwd_p_pairs_packed(
     frg: cute.Tensor,
     lse_frg: cute.Tensor,
@@ -377,6 +314,7 @@ def fbwd_p_pairs_packed(
     scale2: Float32,
     mask_lim: object = None,
     col_base: int = 0,
+    exp2_f32: bool = False,
 ) -> None:
     """In-place P = exp2(s * scale2 - lse[col]) over one chunk, packed pairs.
 
@@ -384,6 +322,11 @@ def fbwd_p_pairs_packed(
     (fma_packed_f32x2 + two fastmath exp2 per f32 pair). ``mask_lim`` (when
     not None) applies the causal keep-threshold ``col >= mask_lim`` with
     ``col = col_base + pair index`` (columns are the static fragment order).
+    ``exp2_f32`` (autotuner knob ``cute_flash_bwd_exp2_f32``) evaluates the two
+    exp2 on the f32 MUFU path (two ex2.approx.ftz.f32, no f16 pack/unpack);
+    otherwise one packed ex2.approx.f16x2 serves the pair. The f32 path is
+    ~2-5% faster where the compute warps are latency-bound (causal / d64),
+    the f16x2 one where the MUFU pipe is the limit (d128 non-causal).
     """
     frg_any = cast("Any", frg)
     lse_any = cast("Any", lse_frg)
@@ -393,8 +336,9 @@ def fbwd_p_pairs_packed(
             (scale2, scale2),
             (-lse_any[2 * v], -lse_any[2 * v + 1]),
         )
-        if FBWD_EX2_EMU_EVERY and (col_base // 2 + v) % FBWD_EX2_EMU_EVERY == 0:
-            a, b = ex2_emulation_packed(a, b)
+        if exp2_f32:
+            a = cute.arch.exp2(a)
+            b = cute.arch.exp2(b)
         else:
             a, b = exp2_approx_f16x2_to_f32(a, b)
         if mask_lim is not None:
@@ -466,6 +410,7 @@ def flash_bwd_2cta_shared_storage(
         dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         ds_cluster_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        s_read_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
         # MMA operand start addresses, re-read with ld.volatile every
