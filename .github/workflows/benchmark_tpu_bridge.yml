@@ -134,16 +134,26 @@ jobs:
             # args where a default shape exceeds TPU vmem.
             #
             # Precision follows the canonical helion examples per kernel: bf16
-            # for gemm/softmax/layer_norm/rms_norm (examples/rms_norm.py runs
-            # both fwd and bwd at bf16), and fp32 for kl_div and welford
-            # (examples/kl_div.py and examples/welford.py use fp32 inputs).
-            # kl_div keeps its loss reduction in fp32; welford's bf16 layer-norm
-            # output drifts ~1 ULP on near-zero values and trips the 1e-2
-            # accuracy tolerance for every correct impl. Force fp32 for those two
-            # so each impl isn't compared against a downcast bf16 baseline.
+            # for gemm/softmax/layer_norm and rms_norm forward, fp32 for kl_div
+            # and welford (examples/kl_div.py and examples/welford.py use fp32
+            # inputs). kl_div keeps its loss reduction in fp32; welford's bf16
+            # layer-norm output drifts ~1 ULP on near-zero values and trips the
+            # 1e-2 accuracy tolerance for every correct impl.
+            #
+            # rms_norm-bwd fails differently: dweight reduces over all M rows,
+            # and the eager baseline runs that accumulation in bf16, where
+            # cancellation moves individual elements tens of percent away from
+            # the true gradient. examples/rms_norm.py already accumulates
+            # grad_weight in fp32, so at bf16 each impl is measured against a
+            # baseline noisier than itself and no correct impl can pass. dx is
+            # elementwise and stays in tolerance either way, and rms_norm
+            # forward has no cross-row reduction, so it stays bf16.
+            #
+            # Forcing fp32 for these keeps each impl from being compared
+            # against a downcast bf16 baseline.
             PRECISION=bf16
             case "$kernel" in
-              kl_div|welford) PRECISION=fp32 ;;
+              kl_div|welford|rms_norm-bwd) PRECISION=fp32 ;;
             esac
             # Cap each kernel at HELION_BENCHMARK_KERNEL_TIMEOUT. The bridge
             # shells out to tritonbench's runner, which never reads that
