@@ -24,7 +24,6 @@ from .cross_loop_scheduler import ReadinessCounterPlan
 from .cross_loop_scheduler import ReadinessProducer
 from .cross_loop_scheduler import RootBarrierPublication
 from .cross_loop_scheduler import WorkerInterval
-from .cross_loop_scheduler import WorkerSchedule
 from .cross_loop_scheduler import WorkerScheduleSegment
 from .cross_loop_scheduler import _normalize_intervals
 from .cross_loop_scheduler import _packed_root_major_task_order_relation
@@ -69,20 +68,6 @@ _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
 )
-
-
-def _schedule_dispatch_runs(
-    worker_schedule: WorkerSchedule,
-) -> tuple[tuple[CrossLoopDispatchMode, tuple[WorkerScheduleSegment, ...]], ...]:
-    """Group canonical segments into maximal same-mode rendering runs."""
-    runs: list[tuple[CrossLoopDispatchMode, tuple[WorkerScheduleSegment, ...]]] = []
-    for segment in worker_schedule.segments:
-        if runs and runs[-1][0] == segment.dispatch_mode:
-            mode, segments = runs[-1]
-            runs[-1] = (mode, (*segments, segment))
-        else:
-            runs.append((segment.dispatch_mode, (segment,)))
-    return tuple(runs)
 
 
 def _ast_fingerprint(nodes: list[ast.stmt]) -> tuple[str, ...]:
@@ -784,31 +769,25 @@ def emit_cross_loop_schedule(
         )
         if publication_plan is not None
     }
-    dispatch_runs = _schedule_dispatch_runs(static_pipeline_plan.worker_schedule)
-    dispatch_entries: list[
-        tuple[
-            int,
-            CrossLoopDispatchMode,
-            tuple[WorkerScheduleSegment, ...],
-        ]
-    ] = [(segments[0].root, mode, segments) for mode, segments in dispatch_runs]
-    uses_packet_dispatch = any(mode == "dynamic" for mode, _segments in dispatch_runs)
-    packet_count = sum(
-        launch_worker_count
-        if mode == "static"
-        else sum(segment.task_count for segment in segments)
-        for _root, mode, segments in dispatch_entries
+    dispatch_mode = static_pipeline_plan.dispatch_mode
+    if dispatch_mode != pipeline:
+        raise AssertionError("pipeline plan disagrees with configured dispatch mode")
+    uses_packet_dispatch = dispatch_mode == "dynamic"
+    packet_count = (
+        sum(
+            segment.task_count
+            for segment in static_pipeline_plan.worker_schedule.segments
+        )
+        if uses_packet_dispatch
+        else launch_worker_count
     )
     launch_program_count = packet_count if uses_packet_dispatch else launch_worker_count
-    resident_grid_size_expr = strategy.grid_size_expr
-    if uses_packet_dispatch:
-        worker = device_function.new_var("tile_dependency_logical_worker", dce=True)
 
-    # A static run requires its complete W-packet cohort to become resident.
-    # All-dynamic streams rely only on monotone retirement/admission and must
-    # not inherit the resident-pool constraint (their grid may be much larger).
-    if any(mode == "static" for mode, _segments in dispatch_runs):
-        device_function.triton_minimum_resident_programs = resident_grid_size_expr
+    # Static execution requires its complete worker cohort to be resident.
+    # Dynamic execution relies only on monotone retirement/admission and must
+    # not inherit that constraint because its grid may be much larger.
+    if not uses_packet_dispatch:
+        device_function.triton_minimum_resident_programs = strategy.grid_size_expr
     device_function.preamble.extend(strategy._persistent_setup_statements(total_expr))
     if uses_packet_dispatch:
         strategy.grid_size_expr = str(packet_count)
@@ -1041,11 +1020,11 @@ def emit_cross_loop_schedule(
     if has_schedule_segment_geometry:
         assert schedule_segment_geometry is not None
         for segment, first_position, _task_count in schedule_segment_geometry:
-            if uses_relation_segment_renderer and segment.dispatch_mode == "static":
+            if uses_relation_segment_renderer and not uses_packet_dispatch:
                 # Relation-segment dispatch maps each global slot to the
                 # configured PID before entering the shared root body.
                 continue
-            if segment.dispatch_mode == "dynamic":
+            if uses_packet_dispatch:
                 remember_authoritative_traversal(segment.root, (segment,))
                 continue
             reference = _packed_root_major_task_order_relation(
@@ -2187,10 +2166,10 @@ def emit_cross_loop_schedule(
 
     static_segments_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
     for root in range(len(root_domains)):
-        segments = tuple(
-            segment
-            for segment in static_pipeline_plan.worker_schedule.segments_for_root(root)
-            if segment.dispatch_mode == "static"
+        segments = (
+            ()
+            if uses_packet_dispatch
+            else static_pipeline_plan.worker_schedule.segments_for_root(root)
         )
         if not segments:
             continue
@@ -2481,8 +2460,6 @@ def emit_cross_loop_schedule(
         """Render complete logical worker strands for one static run."""
         body: list[ast.stmt] = []
         for segment in segments:
-            if segment.dispatch_mode != "static":
-                raise AssertionError("static run contains a dynamic segment")
             segment_index = segment_index_by_identity[id(segment)]
             if schedule_segment_geometry is not None:
                 segment_geometry = segment_geometry_by_identity.get(id(segment))
@@ -2529,10 +2506,7 @@ def emit_cross_loop_schedule(
         return body
 
     if not uses_packet_dispatch:
-        resident_body: list[ast.stmt] = []
-        for _root, _mode, segments in dispatch_entries:
-            resident_body.extend(static_run_body(segments))
-        result.extend(resident_body)
+        result.extend(static_run_body(static_pipeline_plan.worker_schedule.segments))
         result.append(
             statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
         )
@@ -2540,66 +2514,40 @@ def emit_cross_loop_schedule(
         assert dispatch_ticket is not None
         packet_begin = 0
         packet_branches: list[tuple[int, bool, ast.stmt]] = []
-        for _root, mode, segments in dispatch_entries:
-            if mode == "static":
-                packet_end = packet_begin + launch_worker_count
-                packet_body = [
-                    statement_from_string(
-                        f"{worker} = {dispatch_ticket} - {packet_begin}"
+        for segment in static_pipeline_plan.worker_schedule.segments:
+            segment_root = segment.root
+            packet_end = packet_begin + segment.task_count
+            local_task = f"({dispatch_ticket} - {packet_begin})"
+            task_body = _wait_for_dependencies(
+                device_function=device_function,
+                dependencies=root_barrier_input_dependencies(segment_root),
+                prefix="tile_dependency_root_barrier_wait",
+            )
+            task_body.extend(
+                scheduled_root_task_body(
+                    segment_root,
+                    local_task,
+                    f"{case_offsets[segment_root]} + {local_task}",
+                    (dispatch_ticket,),
+                )
+            )
+            task_body.extend(root_barrier_publication(segment_root))
+            packet_branches.append(
+                (
+                    packet_begin,
+                    segment_root in kernel_scope_roots,
+                    create(
+                        ast.If,
+                        test=expr_from_string(
+                            f"{dispatch_ticket} >= {packet_begin} and "
+                            f"{dispatch_ticket} < {packet_end}"
+                        ),
+                        body=task_body,
+                        orelse=[],
                     ),
-                    *static_run_body(segments),
-                ]
-                packet_branches.append(
-                    (
-                        packet_begin,
-                        any(segment.root in kernel_scope_roots for segment in segments),
-                        create(
-                            ast.If,
-                            test=expr_from_string(
-                                f"{dispatch_ticket} >= {packet_begin} and "
-                                f"{dispatch_ticket} < {packet_end}"
-                            ),
-                            body=packet_body,
-                            orelse=[],
-                        ),
-                    )
                 )
-                packet_begin = packet_end
-                continue
-            for segment in segments:
-                segment_root = segment.root
-                packet_end = packet_begin + segment.task_count
-                local_task = f"({dispatch_ticket} - {packet_begin})"
-                task_body = _wait_for_dependencies(
-                    device_function=device_function,
-                    dependencies=root_barrier_input_dependencies(segment_root),
-                    prefix="tile_dependency_root_barrier_wait",
-                )
-                task_body.extend(
-                    scheduled_root_task_body(
-                        segment_root,
-                        local_task,
-                        f"{case_offsets[segment_root]} + {local_task}",
-                        (dispatch_ticket,),
-                    )
-                )
-                task_body.extend(root_barrier_publication(segment_root))
-                packet_branches.append(
-                    (
-                        packet_begin,
-                        segment_root in kernel_scope_roots,
-                        create(
-                            ast.If,
-                            test=expr_from_string(
-                                f"{dispatch_ticket} >= {packet_begin} and "
-                                f"{dispatch_ticket} < {packet_end}"
-                            ),
-                            body=task_body,
-                            orelse=[],
-                        ),
-                    )
-                )
-                packet_begin = packet_end
+            )
+            packet_begin = packet_end
         if packet_begin != packet_count:
             raise AssertionError("packet stream does not cover its launch grid")
         # TMEM and similar kernel-scoped operations cannot cross a Triton

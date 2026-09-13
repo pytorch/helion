@@ -1132,34 +1132,47 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_readiness_counter_supports_chaining(self) -> None:
         x = torch.arange(8 * 4, device=DEVICE, dtype=torch.float32).reshape(8, 4)
-        for launch in range(2):
-            code, out = code_and_output(
-                readiness_counter_chain,
-                (x + launch,),
-                pid_type="persistent_blocked",
-                cross_loop_pipeline="static",
-                num_sm_multiplier=1,
-                num_warps=1,
-            )
-            torch.testing.assert_close(out, torch.sum(x + launch + 1).reshape(1))
-        self.assertGreaterEqual(code.count("tile_dependency_continuation_previous"), 2)
-        continuation_lines = [
-            line
-            for line in code.splitlines()
-            if "tile_dependency_continuation_previous" in line
-            and "tl.atomic_add" in line
-        ]
-        self.assertEqual(len(continuation_lines), 2)
-        for line in continuation_lines:
-            self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line)
-        self.assertIn(
-            f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
-            continuation_lines[1],
-        )
-        self.assertIn("tile_dependency_root_barrier_wait", code)
-        self.assertIn("ld.acquire.gpu.global.u32", code)
-        self.assertNotIn("ld.acquire.gpu.global.u64", code)
-        self.assertNotIn("tl.atomic_max", code)
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                for launch in range(2):
+                    code, out = code_and_output(
+                        readiness_counter_chain,
+                        (x + launch,),
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                    torch.testing.assert_close(
+                        out, torch.sum(x + launch + 1).reshape(1)
+                    )
+                self.assertGreaterEqual(
+                    code.count("tile_dependency_continuation_previous"), 2
+                )
+                continuation_lines = [
+                    line
+                    for line in code.splitlines()
+                    if "tile_dependency_continuation_previous" in line
+                    and "tl.atomic_add" in line
+                ]
+                self.assertEqual(len(continuation_lines), 2)
+                for line in continuation_lines:
+                    self.assertIn(
+                        f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line
+                    )
+                self.assertIn(
+                    f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
+                    continuation_lines[1],
+                )
+                self.assertIn("tile_dependency_root_barrier_wait", code)
+                self.assertIn("ld.acquire.gpu.global.u32", code)
+                self.assertNotIn("ld.acquire.gpu.global.u64", code)
+                self.assertNotIn("tl.atomic_max", code)
+                if pipeline == "dynamic":
+                    self.assertIn("tile_dependency_raw_dispatch_ticket", code)
+                    self.assertNotIn("_minimum_resident_programs=", code)
+                else:
+                    self.assertNotIn("tile_dependency_raw_dispatch_ticket", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

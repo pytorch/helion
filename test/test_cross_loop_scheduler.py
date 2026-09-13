@@ -1098,42 +1098,23 @@ def _publication(readiness_producer: ReadinessProducer) -> CoordinateRelation:
 
 
 class TestCrossLoopScheduler(TestCase):
-    def test_worker_schedule_segment_dispatch_mode_is_explicit(self) -> None:
+    def test_pipeline_dispatch_mode_is_explicit(self) -> None:
         (root_domain,) = _identify_root_domains((_domain((10, 4)),))
         (task_order,) = _default_root_task_orders((root_domain,))
-        default = WorkerScheduleSegment(0, task_order, 0, 4, 0)
+        schedule = _build_baseline_worker_schedule((root_domain,), (task_order,), 4)
+        default = cross_loop_scheduler.StaticPipelinePlan(
+            worker_schedule=schedule,
+            root_task_orders=(task_order,),
+            readiness_counters=(),
+            root_barrier_edges=frozenset(),
+        )
         dynamic = dataclasses.replace(default, dispatch_mode="dynamic")
 
         self.assertEqual(default.dispatch_mode, "static")
         self.assertEqual(dynamic.dispatch_mode, "dynamic")
+        self.assertIs(default.worker_schedule, dynamic.worker_schedule)
         with self.assertRaisesRegex(ValueError, "invalid cross-loop dispatch mode"):
             dataclasses.replace(default, dispatch_mode=cast("Any", "invalid"))
-
-    def test_root_dispatch_modes_preserve_the_accepted_traversal(self) -> None:
-        root_domains = _identify_root_domains((_domain((10, 5)), _domain((20, 3))))
-        task_orders = _default_root_task_orders(root_domains)
-        schedule = _build_baseline_worker_schedule(root_domains, task_orders, 4)
-
-        dispatched = cross_loop_scheduler._with_root_dispatch_modes(
-            schedule,
-            ("dynamic", "static"),
-            root_count=2,
-        )
-
-        self.assertEqual(
-            tuple(segment.dispatch_mode for segment in dispatched.segments),
-            ("dynamic", "static"),
-        )
-        self.assertEqual(
-            tuple(segment.task_order for segment in dispatched.segments),
-            tuple(segment.task_order for segment in schedule.segments),
-        )
-        with self.assertRaisesRegex(ValueError, "length must match"):
-            cross_loop_scheduler._with_root_dispatch_modes(
-                schedule,
-                ("static",),
-                root_count=2,
-            )
 
     def test_scalar_frontier_monotonicity_is_proved_symbolically(self) -> None:
         ordinal_domain = _domain((10, 8, 1), kind="task_order")
@@ -1196,6 +1177,7 @@ class TestCrossLoopScheduler(TestCase):
                     graph,
                     plans,
                     frozenset(),
+                    dispatch_mode="static",
                 )
             )
 
@@ -1222,12 +1204,10 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertEqual(finalize.call_count, 1)
         self.assertEqual(
-            tuple(
-                (segment.root, segment.dispatch_mode)
-                for segment in plan.worker_schedule.segments
-            ),
-            ((0, "static"), (1, "static")),
+            tuple(segment.root for segment in plan.worker_schedule.segments),
+            (0, 1),
         )
+        self.assertEqual(plan.dispatch_mode, "static")
         self.assertFalse(hasattr(cross_loop_scheduler, "_global_unit_list_schedule"))
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset())
@@ -1585,6 +1565,7 @@ class TestCrossLoopScheduler(TestCase):
                     graph,
                     (),
                     frozenset(),
+                    dispatch_mode="static",
                 )
             )
 
@@ -1759,17 +1740,13 @@ class TestCrossLoopScheduler(TestCase):
             cross_loop_scheduler.root_barrier_publication_plan(
                 schedule,
                 0,
+                dispatch_mode="static",
             ),
         )
-        dynamic_schedule = cross_loop_scheduler._with_root_dispatch_modes(
-            schedule,
-            ("dynamic",),
-            root_count=1,
-        )
-        dynamic_publication = cross_loop_scheduler.root_barrier_publication_plan(
-            dynamic_schedule,
-            0,
-        )
+        dynamic_plan = dataclasses.replace(plan, dispatch_mode="dynamic")
+        dynamic_publication = dynamic_plan.root_barrier_publication_plans[0]
+        self.assertIsNotNone(dynamic_publication)
+        assert dynamic_publication is not None
         self.assertEqual(dynamic_publication.resident_arrival_count, 0)
         self.assertEqual(dynamic_publication.dynamic_task_arrival_count, 2)
         self.assertEqual(dynamic_publication.publications, ())
@@ -2323,6 +2300,7 @@ class TestCrossLoopScheduler(TestCase):
             cross_loop_scheduler.root_barrier_publication_plan(
                 schedule,
                 0,
+                dispatch_mode="static",
             ).participant_intervals,
             ((0, 4),),
         )
@@ -3403,6 +3381,7 @@ class TestCrossLoopScheduler(TestCase):
             publication = cross_loop_scheduler.root_barrier_publication_plan(
                 schedule,
                 0,
+                dispatch_mode="static",
             )
 
         self.assertEqual(publication.participant_intervals, ((0, 4),))
@@ -3471,20 +3450,25 @@ class TestCrossLoopScheduler(TestCase):
             ),
         )
 
-        with _forbid_schedule_enumeration():
-            publication = cross_loop_scheduler.root_barrier_publication_plan(
-                schedule,
-                1,
-                (counter,),
-            )
+        for dispatch_mode in ("static", "dynamic"):
+            with (
+                self.subTest(dispatch_mode=dispatch_mode),
+                _forbid_schedule_enumeration(),
+            ):
+                publication = cross_loop_scheduler.root_barrier_publication_plan(
+                    schedule,
+                    1,
+                    (counter,),
+                    dispatch_mode=dispatch_mode,
+                )
 
-        self.assertEqual(publication.participant_intervals, ())
-        self.assertIsNone(publication.participant_order)
-        self.assertEqual(publication.publications, ())
-        self.assertEqual(publication.resident_arrival_count, 0)
-        self.assertEqual(publication.continuation_arrival_count, 3)
-        self.assertEqual(publication.dynamic_task_arrival_count, 0)
-        self.assertEqual(publication.real_arrival_count, 3)
+            self.assertEqual(publication.participant_intervals, ())
+            self.assertIsNone(publication.participant_order)
+            self.assertEqual(publication.publications, ())
+            self.assertEqual(publication.resident_arrival_count, 0)
+            self.assertEqual(publication.continuation_arrival_count, 3)
+            self.assertEqual(publication.dynamic_task_arrival_count, 0)
+            self.assertEqual(publication.real_arrival_count, 3)
 
     def test_baseline_preserves_piecewise_configured_orders(self) -> None:
         l2_domain = _domain((10, 4, 1), (11, 3, 1), identity=0)
@@ -4096,6 +4080,7 @@ class TestCrossLoopScheduler(TestCase):
                     readiness_graph,
                     counters,
                     barriers,
+                    dispatch_mode="static",
                 )
             )
 
@@ -4159,23 +4144,30 @@ class TestCrossLoopScheduler(TestCase):
                 block_ids=(20,),
             ),
         )
-        plan = _configured_static_pipeline_plan(
+        root_domains = (
+            _domain((10, 8, 16)),
+            _domain((20, 4, 32)),
+        )
+        static_plan = _configured_static_pipeline_plan(
             dependency_graph=dependency_graph,
-            root_domains=(
-                _domain((10, 8, 16)),
-                _domain((20, 4, 32)),
-            ),
+            root_domains=root_domains,
+            axis_geometry={10: (8, 16), 20: (4, 32)},
+            worker_count=4,
+        )
+        dynamic_plan = _configured_static_pipeline_plan(
+            dependency_graph=dependency_graph,
+            root_domains=root_domains,
             axis_geometry={10: (8, 16), 20: (4, 32)},
             worker_count=4,
             cross_loop_dispatch_mode="dynamic",
         )
 
+        self.assertEqual(static_plan.dispatch_mode, "static")
+        self.assertEqual(dynamic_plan.dispatch_mode, "dynamic")
+        self.assertEqual(static_plan.worker_schedule, dynamic_plan.worker_schedule)
         self.assertEqual(
-            tuple(
-                (segment.root, segment.dispatch_mode)
-                for segment in plan.worker_schedule.segments
-            ),
-            ((0, "dynamic"), (1, "dynamic")),
+            tuple(segment.root for segment in dynamic_plan.worker_schedule.segments),
+            (0, 1),
         )
 
     def test_unsupported_access_scale_uses_root_barrier(self) -> None:
@@ -5002,6 +4994,7 @@ class TestCrossLoopScheduler(TestCase):
                 graph,
                 scratch,
                 exact,
+                dispatch_mode="static",
             )
         )
         final_counters = (
@@ -5009,6 +5002,7 @@ class TestCrossLoopScheduler(TestCase):
                 graph,
                 final,
                 exact,
+                dispatch_mode="static",
             )
         )
         self.assertEqual(
@@ -5049,7 +5043,7 @@ class TestCrossLoopScheduler(TestCase):
                 worker_count=scratch.worker_count,
                 readiness_counters=exact,
                 root_barrier_edges=frozenset(),
-                root_dispatch_modes=("static", "static"),
+                dispatch_mode="static",
             )
 
         self.assertIsNotNone(selected)
@@ -5094,6 +5088,8 @@ class TestCrossLoopScheduler(TestCase):
             readiness_graph: ReadinessGraph,
             readiness_counters: tuple[ReadinessCounterPlan, ...],
             root_barrier_edges: frozenset[tuple[int, int]],
+            *,
+            dispatch_mode: cross_loop_scheduler.CrossLoopDispatchMode,
         ) -> bool:
             # Model the final progress proof finding that the stronger entry
             # wait has introduced a same-strand cycle.  It was not an input to
@@ -5106,6 +5102,7 @@ class TestCrossLoopScheduler(TestCase):
                 readiness_graph,
                 readiness_counters,
                 root_barrier_edges,
+                dispatch_mode=dispatch_mode,
             )
 
         with (
@@ -5130,7 +5127,7 @@ class TestCrossLoopScheduler(TestCase):
                 worker_count=scratch.worker_count,
                 readiness_counters=exact,
                 root_barrier_edges=frozenset(),
-                root_dispatch_modes=("static", "static"),
+                dispatch_mode="static",
             )
 
         self.assertIsNotNone(exact_fallback)
@@ -5184,23 +5181,13 @@ class TestCrossLoopScheduler(TestCase):
                 dispatch_offset=0,
             ),
         )
-        dynamic_then_static = cross_loop_scheduler._with_root_dispatch_modes(
-            prior_wave,
-            ("dynamic", "static"),
-            root_count=2,
-        )
-        all_dynamic = cross_loop_scheduler._with_root_dispatch_modes(
-            prior_wave,
-            ("dynamic", "dynamic"),
-            root_count=2,
-        )
-
         with _forbid_schedule_enumeration():
             prior_wave_compact = (
                 cross_loop_scheduler._compact_nested_loop_counters_for_schedule(
                     graph,
                     prior_wave,
                     exact,
+                    dispatch_mode="static",
                 )
             )
             same_wave_compact = (
@@ -5208,20 +5195,15 @@ class TestCrossLoopScheduler(TestCase):
                     graph,
                     same_wave,
                     exact,
-                )
-            )
-            dynamic_then_static_compact = (
-                cross_loop_scheduler._compact_nested_loop_counters_for_schedule(
-                    graph,
-                    dynamic_then_static,
-                    exact,
+                    dispatch_mode="static",
                 )
             )
             all_dynamic_compact = (
                 cross_loop_scheduler._compact_nested_loop_counters_for_schedule(
                     graph,
-                    all_dynamic,
+                    prior_wave,
                     exact,
+                    dispatch_mode="dynamic",
                 )
             )
 
@@ -5229,7 +5211,6 @@ class TestCrossLoopScheduler(TestCase):
         # are issued before root 1 regardless of static worker-wave placement.
         self.assertEqual(prior_wave_compact, (entry,))
         self.assertEqual(same_wave_compact, (entry,))
-        self.assertEqual(dynamic_then_static_compact, (entry,))
         self.assertEqual(all_dynamic_compact, (entry,))
         self.assertTrue(
             cross_loop_scheduler._schedule_is_progress_safe(
@@ -5237,14 +5218,16 @@ class TestCrossLoopScheduler(TestCase):
                 graph,
                 (entry,),
                 frozenset(),
+                dispatch_mode="static",
             )
         )
         self.assertTrue(
             cross_loop_scheduler._schedule_is_progress_safe(
-                all_dynamic,
+                prior_wave,
                 graph,
                 all_dynamic_compact,
                 frozenset(),
+                dispatch_mode="dynamic",
             )
         )
 
@@ -5348,6 +5331,7 @@ class TestCrossLoopScheduler(TestCase):
             graph,
             schedule,
             exact,
+            dispatch_mode="static",
         )
 
         self.assertEqual(len(compact), 1)
@@ -5382,6 +5366,7 @@ class TestCrossLoopScheduler(TestCase):
                 graph,
                 compact,
                 frozenset(),
+                dispatch_mode="static",
             )
         )
 
@@ -7174,6 +7159,7 @@ class TestCrossLoopScheduler(TestCase):
             cross_loop_scheduler.root_barrier_publication_plan(
                 schedule,
                 0,
+                dispatch_mode="static",
             ).participant_intervals,
             ((3, 5),),
         )
@@ -7993,6 +7979,7 @@ class TestCrossLoopScheduler(TestCase):
                 readiness_graph,
                 schedule.readiness_counters,
                 schedule.root_barrier_edges,
+                dispatch_mode=schedule.dispatch_mode,
             )
         )
 
@@ -8619,5 +8606,6 @@ class TestCrossLoopScheduler(TestCase):
                 readiness_graph,
                 overlapped.readiness_counters,
                 overlapped.root_barrier_edges,
+                dispatch_mode=overlapped.dispatch_mode,
             )
         )

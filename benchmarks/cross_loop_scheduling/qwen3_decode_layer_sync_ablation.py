@@ -144,6 +144,7 @@ def _compile_variant(
             graph,
             result.readiness_counters,
             result.root_barrier_edges,
+            dispatch_mode=result.dispatch_mode,
         )
         records.append(
             {

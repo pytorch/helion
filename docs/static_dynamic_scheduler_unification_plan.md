@@ -1,15 +1,9 @@
 # Static/dynamic cross-loop scheduler unification
 
-Status: canonical implementation plan after the 2026-09-12 phase-0 executor
-ablation rejected the first physical design.  Architecture, Qwen/Gemma, and
-execution/progress reviewers signed off on the revised one-shot packet design.
-
-Follow-up roadmap decision (not yet implemented): collapse the currently
-implemented root-indexed dispatch vector and `cross_loop_schedule` into one
-kernel-wide `cross_loop_pipeline` enum with values `barrier`, `static`, and
-`dynamic`.  The mixed-mode implementation remains useful validation that both
-executors share one schedule, but current measurements do not justify exposing
-or autotuning a combinatorial per-root policy.
+Status: implemented.  The public and internal policy is one kernel-wide
+`cross_loop_pipeline` enum with values `barrier`, `static`, and `dynamic`.
+Architecture, Qwen/Gemma, and execution/progress reviewers signed off on the
+one-shot packet design and the removal of the experimental per-root policy.
 
 This document supersedes the global event-frontier/list-scheduling roadmap in
 `parametric_event_frontier_scheduler_plan.md`.  That document remains useful
@@ -38,8 +32,8 @@ scheduling algorithms:
    worker strands directly; dynamic execution contributes one ordered packet
    per logical task.  `barrier` retains the conventional phase/barrier
    lowering and is the default/fallback.
-5. Delete the root-indexed dispatch vector and mixed-run machinery after the
-   uniform endpoint gates below pass.  The already-deleted global
+5. Keep no root-indexed dispatch vector or mixed-run machinery.  The
+   already-deleted global
    event-frontier/list placer, pipeline-depth knob, and special one-source
    ticket path remain deleted.
 
@@ -171,28 +165,19 @@ Therefore the 43-us gap is an executor/code-shape limitation, not missing
 readiness or an untuned knob.  The fixed-loop design failed its written kill
 gate and is abandoned.
 
-The replacement is a single **one-shot ordered packet stream**, which
-generalizes the successful source-ticket mechanism without retaining a source
-special case:
-
-- a maximal static run contributes exactly `W` packets; packet `w` executes
-  worker `w`'s unchanged static strand through every root in that run;
-- a maximal dynamic run contributes one packet per logical root task in
-  canonical root/local-ordinal order; and
-- one monotone atomic ticket assigns those packet roles in actual CTA admission
-  order.  Each launched CTA executes one packet completely and retires.
-
-This handles arbitrary `static -> dynamic -> static` sequences because the
-static unit is the complete resident cohort, not an individual root task.  It
-also preserves both measured endpoints: an all-dynamic graph has exactly the
-MLA/Muse one-shot form, while an all-static graph has one `W`-packet run that
-strength-reduces to the current `program_id` worker mapping with no ticket
-atomic and byte-identical lowering.
+The intermediate root-vector implementation generalized the successful
+source-ticket mechanism to arbitrary static/dynamic runs.  Those experiments
+proved both uniform endpoints and the shared readiness machinery.  The final
+design retains only the useful endpoints: dynamic launches one ticket-owning
+CTA per logical task in canonical segment/local-ordinal order, while static
+uses the unchanged `W` persistent worker strands with no ticket atomic.  No
+mixed packet-run renderer remains.
 
 Muse m12 remains evidence about logical order and dynamic load balancing, not
 about a feasible fixed pool of 1,776 simultaneously resident CTAs.  The
-one-shot stream does not require all dynamic packets to be resident; any
-static run still requires its `W` worker packets to fit concurrently.
+one-shot stream does not require all dynamic packets to be resident.  The
+uniform static endpoint still requires its `W` worker packets to fit
+concurrently.
 
 ## Scope and non-goals
 
@@ -238,7 +223,7 @@ consumer waits, exact fan-in, and fallback root-barrier obligations.
 
 ### `StaticPipelinePlan`
 
-Keep the existing fields unchanged:
+The frozen plan owns the single physical-policy scalar:
 
 ```python
 StaticPipelinePlan(
@@ -246,12 +231,14 @@ StaticPipelinePlan(
     root_task_orders,
     readiness_counters,
     root_barrier_edges,
+    dispatch_mode,
 )
 ```
 
 Continuation identity remains solely in
-`ReadinessCounterPlan.continuation_consumer_index`.  Dispatch choice is encoded
-by the retained root segment, not copied into another plan field.
+`ReadinessCounterPlan.continuation_consumer_index`.  `dispatch_mode` is the
+only static/dynamic authority and applies to every retained segment.  It is
+copied neither onto segments nor into a root-indexed vector.
 
 ### `WorkerSchedule` and `WorkerScheduleSegment`
 
@@ -264,16 +251,7 @@ representation:
 - each segment's target is an exact, bijective cover of that root's tasks;
 - the segment's normalized relation plus its exact dense support define the
   only task traversal used by both static and dynamic rendering; and
-- one scalar field on the existing segment says whether that traversal is
-  statically owned or dynamically claimed.
-
-Add `dispatch_mode: Literal["static", "dynamic"] = "static"` to the existing
-`WorkerScheduleSegment`.  This is one field on the authority we already have,
-not a new abstraction or parallel plan.  All segments remain in the current
-resident launch stage while the old source-ticket path is removed.  The old
-stage-zero meaning, its extra launch grid, and its singular-source rules are
-then deleted.  The resulting degenerate launch-stage axis may be removed in a
-later mechanical cleanup; it must not be repurposed as dispatch mode.
+- segments contain no physical-dispatch policy.
 
 Cross-root chronology is now the source-root order, not an ordering induced by
 dispatch mode or by splitting a root into several segment occurrences.  The
@@ -288,8 +266,9 @@ This is the single-source-of-truth rule:
 
 ```text
 root task order
-    -> one normalized WorkerScheduleSegment with one dispatch_mode
-    -> either static striding or dynamic ticket decoding
+    -> one normalized WorkerScheduleSegment
+    -> StaticPipelinePlan.dispatch_mode
+    -> either static striding or dynamic ticket decoding for every segment
 ```
 
 Neither renderer may recreate or alter the logical PID order.
@@ -306,7 +285,7 @@ TileDependencyGraph
   -> transactional root-local producer ordering of the seed
   -> final-arrival continuation selection/assignment
   -> transactional schedule rebuild + final root-local ordering
-  -> apply per-root static/dynamic choices
+  -> apply one kernel-wide static/dynamic choice
   -> exact coverage + progress + publication validation
   -> optional nested-counter quotient as an emitted strength reduction
   -> freeze StaticPipelinePlan
@@ -330,7 +309,7 @@ Details:
    ordinary readiness cannot express a required ordering, generalize that
    readiness rule rather than querying dispatch mode.
 4. Continuations are selected exactly as today from this accepted all-static
-   schedule.  The dispatch vector may not create a new continuation.  A
+   schedule.  The physical policy may not create a new continuation.  A
    continuation is executed by the CTA that observes the final readiness
    arrival; this rule is independent of whether that producer task was
    statically owned or dynamically claimed.
@@ -342,18 +321,17 @@ Details:
    equivalence test proves they can be collapsed: first order the all-resident
    seed used for continuation choice, then rebuild and run the same root-local
    transaction under the final continuation counters.
-6. The configured root dispatch vector changes only each remaining segment's
-   `dispatch_mode` field.
+6. The configured policy is attached once to the final plan.  It does not
+   mutate the accepted `WorkerSchedule`.
 7. Nested counter compaction remains a post-selection lowering optimization.
    It cannot feed back into schedule construction.  There are two generic
    proofs, both derived from the final schedule:
 
    - A root-entry quotient is legal when every contributing producer
-     recursively contracts to a strictly earlier root and the mixed-mode
-     progress theorem proves that its work is resident/claimed before the
-     consumer can block.  Static producers use stable resident ownership;
-     dynamic producers use ticket-interval precedence.  Completion remains
-     gated by the compact counter.
+     recursively contracts to a strictly earlier root and the selected
+     endpoint's progress theorem proves that its work is resident or claimed
+     before the consumer can block.  Completion remains gated by the compact
+     counter.
    - A finer segmented quotient retains the existing worker-rank proof only
      when every relevant occurrence is static.
 
@@ -366,47 +344,9 @@ There is no list-schedule proposal, candidate cascade, priority queue,
 criticality class, release credit, affine-repeat policy, or pipeline-depth
 search in this pipeline.
 
-## Current implemented autotuning surface
+## Kernel-wide autotuning surface
 
-The first unification milestone replaced `cross_loop_pipeline_depth` with:
-
-```python
-cross_loop_root_dispatch: list[Literal["static", "dynamic"]]
-```
-
-Its length is the number of task-family roots known when
-`ConfigSpec.enable_cross_loop_schedule(root_count)` is called.  Implement it
-with the existing `ListOf(EnumFragment(...), length=root_count)` machinery.
-Default every entry to `"static"` to preserve current-main behavior.
-
-This is one config field but has one binary coordinate per root.  Use ordinary
-`ListOf` neighbor generation, including its uniform candidates.  Do not add a
-topology-pruned search space or a custom candidate generator.
-
-The field is indexed by source root, not by schedule segment.  That makes its
-meaning stable when continuation selection removes a root.  The entry for a
-continuation root is ignored; duplicate autotuner candidates are acceptable
-and preferable to topology-specific knob shapes.
-
-The root-vector implementation proved arbitrary mixtures correct and made the
-two endpoints directly comparable.  It is now an intermediate implementation,
-not the intended public surface.  Expected endpoint settings were:
-
-- FlashMLA B4/B9: all non-continuation roots dynamic;
-- Muse FFN: all non-continuation roots dynamic;
-- Qwen3 decode/FFN: all static;
-- Gemma A4B: initially all static;
-- DeepSeek-V3 and Nemotron MoE: initially all dynamic, then tune mixed vectors
-  if individual heavy roots prefer resident ownership.
-
-Do not infer a mode from a model name, root number, fan-in literal, task count
-threshold, or a topology-shaped candidate list.  The only compiler policy is
-legality; profitability belongs to the ordinary autotuner.
-
-## Planned kernel-wide autotuning surface
-
-Replace both `cross_loop_schedule` and `cross_loop_root_dispatch` with one
-ordinary enum:
+The only public scheduling coordinate is one ordinary enum:
 
 ```python
 cross_loop_pipeline: Literal["barrier", "static", "dynamic"]
@@ -429,18 +369,13 @@ are ordinary invalid configurations, while `barrier` remains available.  A
 continuation root has no independent dispatch decision because it is already
 contracted into its triggering producer by the shared schedule.
 
-Do not retain compatibility aliases for the two superseded experimental keys.
-Checked-in configurations and tests should migrate mechanically.  Rename
-`CrossLoopScheduleLiteral` to `CrossLoopPipelineLiteral`; remove
-`CrossLoopDispatchLiteral`, the root-count-dependent `ListOf` field, and the
-root-count argument that existed only to size it.
+There are no compatibility aliases for the superseded experimental keys.
+`CrossLoopPipelineLiteral` is the sole runtime type, and pipeline enablement is
+independent of root count.
 
 Keep the existing `WorkerSchedule`, `WorkerScheduleSegment`, readiness plans,
-continuations, and task renderers.  It is acceptable for a segment to retain a
-derived `dispatch_mode` internally if that keeps rendering simple, but there
-must be exactly one authoritative kernel-wide mode and no independently
-mutable per-root copy.  Prefer passing that scalar mode through plan
-construction and deriving segment behavior from it.
+continuations, and task renderers.  Pass the scalar mode through plan
+construction and derive all rendering and publication behavior from it.
 
 The burden of proof for restoring per-root tuning is now empirical.  Reopen
 that design only if a real, model-agnostic mixed workload materially beats
@@ -454,11 +389,10 @@ with `W` workers, worker `w` executes the exact segment ordinals assigned to
 its strided slice.  It performs the segment's incoming waits, task-level waits,
 body, publications, and root-barrier publication using the frozen plan.
 
-Consecutive static roots form one maximal static run.  Its `W` packet roles
-are exactly the current persistent worker bodies restricted to those roots:
-static packet `w` visits every segment in the run and executes worker `w`'s
-slice before retiring.  This preserves cross-root strand chronology,
-continuations, and the current static progress proof inside the run.
+The `W` resident worker strands cover the complete segment sequence.  Worker
+`w` visits every retained segment in order and executes its slice before
+retiring.  This preserves cross-root strand chronology, continuations, and the
+existing static progress proof.
 
 All-static code generation is a strict compatibility gate:
 
@@ -476,30 +410,19 @@ global list machinery is removed.
 
 ### Derived packet stream
 
-Codegen walks source roots and coalesces adjacent roots with the same mode.  The
-segments remain the only task schedule; maximal runs and prefix sums are local
-rendering facts, not stored schedule state and not a new abstraction.
-
-For each run:
-
-- a static run contributes `W` packets.  Local packet `w` executes worker
-  `w`'s exact static slices for all segments in that run, in segment order;
-- a dynamic run with root task counts `T0, T1, ...` contributes
-  `T = sum(Ti)` packets.  Its local packet ordinal is decoded by prefix sums
-  into one root and one root-local ordinal, then mapped through that segment's
-  normalized relation and exact dense-support certificate.
-
-Concatenating the run ranges gives one fixed packet count
+The segments remain the only task schedule.  In dynamic mode, a root with task
+count `Ti` contributes exactly `Ti` one-task packets.  Concatenating their
+dense ranges in segment order gives one fixed packet count
 
 ```text
-P = sum(W for each static run)
-    + sum(Ti for every dynamic root).
+P = sum(Ti for every retained root).
 ```
 
-No packet table or run object is stored in `StaticPipelinePlan`.  The emitted
-decoder directly uses segment-derived constant prefix ranges and the existing
-`scheduled_root_task_body`.  Kernel-scoped/TMEM roots stay in the kernel body;
-legal root helpers retain their current inlining/outlining decisions.
+No packet table or run object is stored in `StaticPipelinePlan`.  Codegen uses
+segment-derived constant prefix ranges to decode a ticket into one root and
+one root-local ordinal, then calls the existing `scheduled_root_task_body`.
+Kernel-scoped/TMEM roots stay in the kernel body; legal root helpers retain
+their current inlining/outlining decisions.
 When the proved segment traversal matches the configured canonical PID order,
 the dynamic local ordinal is that PID directly; codegen omits the otherwise
 redundant logical-coordinate round trip.  Permuted or nonrepresentable
@@ -514,12 +437,6 @@ body.  If every branch is helper-safe, leave the selector inline; if the final
 branch requires kernel scope, there is no suffix to outline.  This is derived
 solely from the existing kernel-scope legality classification, not a workload,
 root-count, or task-count heuristic, and it does not change packet order.
-
-In a non-folded packet stream, a static packet's decoded logical worker `w` is
-the sole worker identity used for task slicing, epoch/state indexing, waits,
-and publication.  Physical `program_id`/SM identity must not leak into its
-semantics.  Static bodies therefore need the same role-relocatability audit as
-dynamic bodies, even though they execute a coarser strand.
 
 ### Ordered one-shot admission
 
@@ -539,22 +456,12 @@ replay without reset; changing `P` requires another compilation.  Concurrent
 launches may not share the same persistent state lease.  Overflow follows the
 existing persistent-state lifetime contract.
 
-When every retained segment is static, the complete schedule is one all-static
-run, `P == W`, and every packet is the corresponding ordinary worker strand.
-Codegen must strength-reduce
-`packet` to `program_id`, retain the existing per-worker epoch protocol, and
-omit the cursor state and atomic.  This is an optimization of the identical
-packet semantics, not a second scheduler.  It is the strict Qwen/Gemma
-compatibility path.  Test the semantic all-static predicate directly; never
-fold merely because an unrelated dynamic/mixed packet count happens to equal
-`W`.  Ignored continuation config entries do not prevent the fold.
-
-For any mixed schedule containing a static run, prove that the compiled kernel
-can simultaneously residently support all `W` static worker packets.  The grid
-may contain more than `W` total packets; prior dynamic packets drain and make
-room until the complete static cohort is active.  Never silently clamp or
-reinterpret `W`.  An all-dynamic schedule needs no static-cohort residency
-proof beyond the backend's ordinary launch/resource constraints.
+Static mode does not instantiate this packet stream.  Codegen directly uses
+`program_id` as the logical worker, retains the existing per-worker epoch
+protocol, and emits no cursor state or atomic.  This is the strict Qwen/Gemma
+compatibility path over the same `WorkerSchedule`, not another scheduling
+algorithm.  Dynamic mode needs no all-worker residency proof beyond the
+backend's ordinary launch/resource constraints.
 
 ### Root-barrier publication
 
@@ -586,8 +493,8 @@ For every non-continuation root:
 1. the segment traversal is a total function from dense ordinals to logical
    tasks;
 2. its inverse is single-valued and total over the root domain;
-3. a static run's `W` strand packets partition every static segment exactly
-   once, while a dynamic run contributes exactly one packet for every root
+3. static mode's `W` strands partition every segment exactly once, while
+   dynamic mode contributes exactly one packet for every retained root
    ordinal; and
 4. all waits/publications are derived from the unchanged `ReadinessGraph`.
 
@@ -607,14 +514,13 @@ implementation rejects dynamic dispatch for every such root.  Static execution i
 accepted only if its existing strand/rank proof independently proves progress;
 otherwise the configuration is rejected rather than silently forced static.
 
-For a consumer packet that has been issued:
+Static and dynamic use separate physical progress lemmas over the same
+topological segment sequence:
 
-- a producer in the same static run is covered by the existing exact
-  static-strand/rank proof and the bounded `W`-packet cohort;
-- every one of the `W` owner packets in an earlier static run was issued before
-  the cursor crossed that run's packet range; or
-- every producer in an earlier dynamic root has already been claimed before a
-  packet cursor can cross that root's interval.
+- static mode uses the existing exact strand/rank proof over the bounded
+  resident `W`-worker cohort; and
+- in dynamic mode, every producer packet in an earlier root interval has
+  already been claimed before the cursor can issue a consumer packet.
 
 Claimed does not mean completed.  Exact counters still gate completion and
 visibility.  An earlier packet is active on a resident CTA, completed, or
@@ -622,23 +528,6 @@ waiting only on a still-earlier packet/root.  A CTA retires only after its
 complete dynamic task or static worker strand, inline continuation, and all
 publications finish.  A minimal-unfinished-packet induction therefore reaches
 runnable work and rules out a wait cycle.
-
-This proof covers all four transitions:
-
-- static -> static: consecutive roots share one static run and use the existing
-  `W`-strand proof;
-- static -> dynamic: every static owner packet is issued before the cursor
-  reaches a dynamic consumer packet, although some owners may still run;
-- dynamic -> static: every producer task packet is issued before the first
-  packet of the `W`-owner static cohort; and
-- dynamic -> dynamic: the monotone packet cursor crosses a root interval only
-  after every earlier-root task packet is issued.
-
-A static cohort may initially be admitted behind unfinished dynamic packets.
-Those earlier packets cannot depend backward and therefore drain.  Because the
-kernel is proved capable of residently holding all `W` static packets, the
-complete cohort eventually becomes active; no subset of waiting static owners
-can permanently exclude an unissued peer.
 
 Nested waits use the owning consumer root in the same induction.  A
 final-arrival continuation executes only after its exact event completes, so
@@ -663,32 +552,27 @@ explicitly requested illegal `dynamic` mode rejects the config; only the
 field's default selects static implicitly.  There is no partial-root dynamic
 escape hatch.
 
-The launch grid may exceed resident capacity, but a mixed schedule's `W`-packet
-static cohort must fit simultaneously.  The proof never assumes that an
-unissued later packet will rescue progress; it relies only on already-issued
-earlier packets and the eventual admission of the bounded `W`-packet static
-cohort as preceding acyclic work drains.
+The dynamic proof never assumes that an unissued later packet will rescue
+progress.  It relies only on already-issued earlier packets and the strict
+acyclic segment order as work retires.
 
-## Why root is the mode boundary
+## Why policy is kernel-wide
 
-A list-schedule segment is merely a contiguous occurrence created by
-cross-root placement; it is not a semantic task family.  Choosing execution
-mode on those occurrences would make the knob unstable and would require the
-list scheduler to exist before the mode could be interpreted.
+Static/dynamic controls physical ownership, not dependency semantics or task
+order.  Making it kernel-wide keeps the accepted `WorkerSchedule` independent
+of autotuning and gives each endpoint one compact progress proof.  Earlier
+per-root experiments established that mixtures were mechanically possible,
+but they did not improve the preferred endpoint on any canonical probe and
+introduced packet-run transitions, residency obligations, and a combinatorial
+search dimension.  They are therefore deliberately absent rather than hidden
+behind an internal policy.
 
-After list placement is removed, every root has exactly one segment.  Root and
-segment boundaries therefore coincide.  Root is the safe semantic boundary
-because it has:
+## Historical implementation roadmap
 
-- one exact logical task domain and traversal;
-- one set of incoming readiness obligations;
-- one publication policy; and
-- one stable source-level identity for autotuning.
-
-Maximal same-mode runs are derived only to choose packet granularity and reduce
-dispatch overhead.  They never change this root-level meaning.
-
-## Implementation roadmap
+Phases 0--7 below record the experimental root-vector implementation that
+established the endpoint semantics and performance evidence.  Their mixed-mode
+language is historical, not part of the final compiler contract.  Phase 8 is
+the authoritative scalar-policy cleanup.
 
 ### Phase 0: reject the fixed resident loop — complete
 
@@ -872,49 +756,31 @@ For every retained binary record registers, spills, shared memory, warps,
 stages, worker count, and dispatch vector.  A schedule speedup caused by changed
 fusion or numerics is invalid.
 
-### Phase 8: collapse physical policy to one kernel-wide knob — planned
+### Phase 8: collapse physical policy to one kernel-wide knob — complete
 
-This phase is intentionally deferred.  Do not begin it until the current
-uniform endpoint measurements and compiler state are saved.
-
-- Add `cross_loop_pipeline` as an `EnumFragment` over exactly
+- `cross_loop_pipeline` is an `EnumFragment` over exactly
   `("barrier", "static", "dynamic")`, defaulting to `"barrier"`.
-- Remove public/runtime/backend/autotuner support for `cross_loop_schedule` and
-  `cross_loop_root_dispatch`; do not retain aliases.
-- Rename `enable_cross_loop_schedule(root_count)` to the corresponding
-  root-count-independent pipeline-enablement API.
-- Route `barrier` directly to the existing phase-loop lowering.  Route both
-  scheduled values through one schedule-construction transaction, passing one
-  scalar ownership mode to the final plan/lowering boundary.
-- Remove root-vector normalization, mutation, uniform-candidate synthesis,
-  ignored continuation entries, adjacent-mode run construction, and mixed-run
-  packet-prefix bookkeeping.
-- Preserve one-shot dynamic packet allocation and the all-static direct-PID
-  strength reduction.  Do not reintroduce the source-ticket frontier, a
-  resident claim loop, or separate schedule builders.
-- Simplify the progress proof to the two uniform scheduled endpoints.  Delete
-  mixed `static -> dynamic` and `dynamic -> static` transition obligations,
-  while retaining exact readiness, continuation, replay, and packet-coverage
-  proofs.
-- Replace mixed-policy tests with three-way config/API tests and uniform
-  static/dynamic semantic controls.  Remove tests whose only contract is
-  per-root mutation; retain task-rendering tests that remain generally useful.
-- Mechanically migrate checked-in benchmark configurations, excluding the two
-  user-owned dirty Qwen probe files until their edits can be preserved
-  explicitly.
-- Re-run the complete acceptance matrix: `barrier` as fallback; static for
-  Qwen, Gemma, and MLA Q1/Q2; dynamic for MLA B4/B9, Muse, DeepSeek, and
-  Nemotron.  Require unchanged numerics, fusion, continuations, cold-L2
-  margins, and replay correctness.
-- Compare lowered Triton for the static endpoint against the current
-  byte-identical Qwen/Gemma controls and dynamic packet facts against the
-  current MLA controls.  Any endpoint regression is a blocker; do not recover
-  it with a workload predicate.
+- Public/runtime/backend/autotuner support for `cross_loop_schedule` and
+  `cross_loop_root_dispatch` was removed without aliases.
+- Pipeline enablement no longer takes a root count.
+- `barrier` routes to the existing phase-loop lowering.  Both scheduled values
+  share one construction transaction and carry one scalar mode on the frozen
+  plan.
+- Root-vector normalization, per-segment mode mutation, adjacent-mode runs,
+  and mixed-run packet bookkeeping were deleted.
+- One-shot dynamic packet allocation and direct-PID static execution remain;
+  source-ticket frontiers, resident claim loops, and separate builders do not.
+- Mixed-policy tests were replaced by three-way API tests and uniform endpoint
+  controls.
+- Representative static and dynamic generated Triton is byte-identical to the
+  saved pre-cleanup endpoints.  The full correctness and performance matrix
+  remains the release gate whenever unrelated backend changes invalidate the
+  recorded binaries.
 
-Expected simplifications include deleting the combinatorial `ListOf` search
-dimension, mixed-run coalescing, mixed-cohort residency validation, and two of
-the four packet-transition proof cases.  The dynamic ticket remains only as a
-generic physical allocator over the canonical schedule.
+The cleanup deleted the combinatorial `ListOf` search dimension, mixed-run
+coalescing, mixed-cohort residency validation, and mixed-transition proof
+cases.  The dynamic ticket remains only as a generic physical allocator over
+the canonical schedule.
 
 ## Acceptance criteria
 

@@ -95,8 +95,9 @@ class WorkerScheduleSegment:
     Its source support is allowed to be partial.  The three integer placement
     fields remain only as the migration-compatible spelling of a dense run;
     :class:`WorkerSchedule` immediately normalizes that spelling into the
-    relation and all semantic queries consume the relation. ``dispatch_mode``
-    selects physical ownership of that exact traversal without changing it.
+    relation and all semantic queries consume the relation. Physical dispatch
+    is selected once by the owning :class:`StaticPipelinePlan`; it is not a
+    property of an individual segment.
 
     Before normalization, constructors may still pass a dense logical task
     order plus ``dispatch_offset``::
@@ -115,7 +116,6 @@ class WorkerScheduleSegment:
     worker_begin: int
     worker_count: int
     dispatch_offset: int
-    dispatch_mode: CrossLoopDispatchMode = "static"
 
     def __post_init__(self) -> None:
         if self.root < 0:
@@ -130,8 +130,6 @@ class WorkerScheduleSegment:
             raise ValueError(
                 f"dispatch_offset must be nonnegative, got {self.dispatch_offset}"
             )
-        if self.dispatch_mode not in ("static", "dynamic"):
-            raise ValueError(f"invalid cross-loop dispatch mode {self.dispatch_mode!r}")
         if self.task_order.target_domain.kind != "site" or (
             not self.task_order.pieces
             and self.task_order.target_domain.size_expr.is_zero is not True
@@ -3333,6 +3331,8 @@ def root_barrier_publication_plan(
     worker_schedule: WorkerSchedule,
     root: int,
     readiness_counters: tuple[ReadinessCounterPlan, ...] = (),
+    *,
+    dispatch_mode: CrossLoopDispatchMode,
 ) -> RootBarrierPublicationPlan:
     """Assign every participating worker to its final root occurrence once.
 
@@ -3360,13 +3360,12 @@ def root_barrier_publication_plan(
         if continuation_domains
         else 0
     )
-    dynamic_segments = tuple(
-        segment
-        for segment in worker_schedule.segments_for_root(root)
-        if segment.dispatch_mode == "dynamic"
-    )
+    if dispatch_mode not in ("static", "dynamic"):
+        raise ValueError(f"invalid cross-loop dispatch mode {dispatch_mode!r}")
+    root_segments = worker_schedule.segments_for_root(root)
+    dynamic_segments = root_segments if dispatch_mode == "dynamic" else ()
     if len(dynamic_segments) > 1:
-        raise ValueError("one root cannot have multiple dynamic segments")
+        raise ValueError("dynamic dispatch requires one segment per root")
     dynamic_task_arrival_count = (
         dynamic_segments[0].task_order.target_domain.size if dynamic_segments else 0
     )
@@ -3533,34 +3532,6 @@ def build_baseline_worker_schedule(
         )
         worker_step_begin += (task_count + worker_count - 1) // worker_count
     return WorkerSchedule(worker_count=worker_count, segments=tuple(segments))
-
-
-def _with_root_dispatch_modes(
-    worker_schedule: WorkerSchedule,
-    root_dispatch_modes: tuple[CrossLoopDispatchMode, ...],
-    *,
-    root_count: int,
-) -> WorkerSchedule:
-    """Freeze root-indexed physical dispatch on the accepted task traversal."""
-    if len(root_dispatch_modes) != root_count:
-        raise ValueError(
-            "cross-loop root dispatch length must match the root count: "
-            f"expected {root_count}, got {len(root_dispatch_modes)}"
-        )
-    if any(mode not in ("static", "dynamic") for mode in root_dispatch_modes):
-        raise ValueError("cross-loop root dispatch contains an invalid mode")
-    if any(not 0 <= segment.root < root_count for segment in worker_schedule.segments):
-        raise ValueError("worker schedule segment references an unknown root")
-    return WorkerSchedule(
-        worker_count=worker_schedule.worker_count,
-        segments=tuple(
-            dataclasses.replace(
-                segment,
-                dispatch_mode=root_dispatch_modes[segment.root],
-            )
-            for segment in worker_schedule.segments
-        ),
-    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5346,6 +5317,8 @@ def _compact_nested_loop_counters_for_schedule(
     readiness_graph: ReadinessGraph,
     worker_schedule: WorkerSchedule,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
+    *,
+    dispatch_mode: CrossLoopDispatchMode,
 ) -> tuple[ReadinessCounterPlan, ...]:
     """Derive optional nested counter quotients from one accepted schedule.
 
@@ -5436,9 +5409,7 @@ def _compact_nested_loop_counters_for_schedule(
                 root_order_precedes = False
                 break
         consumer_segment = worker_schedule.segments_for_root(consumer_root)
-        consumer_is_static = (
-            len(consumer_segment) == 1 and consumer_segment[0].dispatch_mode == "static"
-        )
+        consumer_is_static = dispatch_mode == "static" and len(consumer_segment) == 1
         if (
             entry_is_smaller
             and same_root_producer
@@ -5495,9 +5466,8 @@ def _compact_nested_loop_counters_for_schedule(
                 if _relation_may_be_nonempty(relation) is not False
             ),
         }
-        if any(
-            len(segments := worker_schedule.segments_for_root(root)) != 1
-            or segments[0].dispatch_mode != "static"
+        if dispatch_mode != "static" or any(
+            len(worker_schedule.segments_for_root(root)) != 1
             for root in relevant_roots
         ):
             result.append(plan)
@@ -5547,8 +5517,11 @@ class StaticPipelinePlan:
     root_task_orders: tuple[CoordinateRelation, ...]
     readiness_counters: tuple[ReadinessCounterPlan, ...]
     root_barrier_edges: frozenset[tuple[int, int]]
+    dispatch_mode: CrossLoopDispatchMode = "static"
 
     def __post_init__(self) -> None:
+        if self.dispatch_mode not in ("static", "dynamic"):
+            raise ValueError(f"invalid cross-loop dispatch mode {self.dispatch_mode!r}")
         _validate_root_task_orders(self.root_task_orders)
         if any(task_order.parameter_symbols for task_order in self.root_task_orders):
             raise ValueError("pipeline plan root task capacity is parameterized")
@@ -5653,6 +5626,7 @@ class StaticPipelinePlan:
                 self.worker_schedule,
                 root,
                 root_level_counters,
+                dispatch_mode=self.dispatch_mode,
             )
             if root in publication_roots
             else None
@@ -8404,6 +8378,8 @@ def _schedule_is_progress_safe(
     readiness_graph: ReadinessGraph,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
+    *,
+    dispatch_mode: CrossLoopDispatchMode,
 ) -> bool:
     """Prove canonical static/dynamic packet progress from root order.
 
@@ -8530,8 +8506,7 @@ def _schedule_is_progress_safe(
             continue
         # Same-root inter-CTA readiness has no packet-prefix edge.  It remains
         # legal only for static ownership with the existing exact rank proof.
-        segment = worker_schedule.segments_for_root(consumer_root)[0]
-        if segment.dispatch_mode != "static" or prerequisite.counter_plan is None:
+        if dispatch_mode != "static" or prerequisite.counter_plan is None:
             return False
         consumer = prerequisite.counter_consumer
         assert consumer is not None
@@ -8743,7 +8718,7 @@ def _try_finalize_pipeline_proposal(
     worker_count: int,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
-    root_dispatch_modes: tuple[CrossLoopDispatchMode, ...],
+    dispatch_mode: CrossLoopDispatchMode,
 ) -> StaticPipelinePlan | None:
     """Freeze one canonical placement, then lower its final counters."""
     emitted_continuations = _emitted_final_arrival_continuations(
@@ -8766,7 +8741,6 @@ def _try_finalize_pipeline_proposal(
         excluded_roots=continuation_roots,
     )
 
-    prepared_schedule = ownership_base
     prepared_candidate = _consumer_major_producer_order(
         readiness_graph,
         ownership_base,
@@ -8774,47 +8748,28 @@ def _try_finalize_pipeline_proposal(
         root_barrier_edges,
         excluded_roots=continuation_roots,
     )
-    if _validate_worker_schedule_tasks(
-        prepared_candidate,
-        readiness_graph.root_task_orders,
-        excluded_roots=continuation_roots,
-    ) and _schedule_is_progress_safe(
-        prepared_candidate,
-        readiness_graph,
-        readiness_counters,
-        root_barrier_edges,
-    ):
-        prepared_schedule = prepared_candidate
-
     # Root-local ordering is a transactional permutation of one frozen
     # ownership/prerequisite plan. It may fall back to canonical task order,
     # but it cannot split or move a root.
-    candidates = (prepared_schedule, ownership_base)
+    candidates = (prepared_candidate, ownership_base)
     attempted: set[int] = set()
     for candidate in candidates:
-        if candidate is None or id(candidate) in attempted:
+        if id(candidate) in attempted:
             continue
         attempted.add(id(candidate))
-        if not _validate_worker_schedule_tasks(
-            candidate,
-            readiness_graph.root_task_orders,
-            excluded_roots=continuation_roots,
-        ) or not _schedule_is_progress_safe(
+        if not _schedule_is_progress_safe(
             candidate,
             readiness_graph,
             readiness_counters,
             root_barrier_edges,
+            dispatch_mode=dispatch_mode,
         ):
             continue
-        dispatched_candidate = _with_root_dispatch_modes(
-            candidate,
-            root_dispatch_modes,
-            root_count=len(readiness_graph.root_domains),
-        )
         compact_counters = _compact_nested_loop_counters_for_schedule(
             readiness_graph,
-            dispatched_candidate,
+            candidate,
             readiness_counters,
+            dispatch_mode=dispatch_mode,
         )
         exact_covered_obligations = frozenset(
             obligation
@@ -8852,19 +8807,21 @@ def _try_finalize_pipeline_proposal(
                 )
                 != emitted_continuations
                 or not _schedule_is_progress_safe(
-                    dispatched_candidate,
+                    candidate,
                     readiness_graph,
                     emitted_counters,
                     root_barrier_edges,
+                    dispatch_mode=dispatch_mode,
                 )
             ):
                 continue
             try:
                 return StaticPipelinePlan(
-                    worker_schedule=dispatched_candidate,
+                    worker_schedule=candidate,
                     root_task_orders=readiness_graph.root_task_orders,
                     readiness_counters=emitted_counters,
                     root_barrier_edges=root_barrier_edges,
+                    dispatch_mode=dispatch_mode,
                 )
             except (ValueError, exc.CrossLoopSchedulingError):
                 # Physical publication rejection first retries the exact keys
@@ -8890,7 +8847,6 @@ def build_static_pipeline_plan(
         raise ValueError(
             "cross-loop dispatch mode must be either 'static' or 'dynamic'"
         )
-    root_dispatch_modes = (cross_loop_dispatch_mode,) * len(root_task_orders)
     schedule_capacity_parameters = frozenset(
         symbol
         for task_order in root_task_orders
@@ -8949,7 +8905,7 @@ def build_static_pipeline_plan(
         worker_count=worker_count,
         readiness_counters=all_resident_counters,
         root_barrier_edges=all_resident_barriers,
-        root_dispatch_modes=("static",) * len(root_task_orders),
+        dispatch_mode="static",
     )
     if all_resident_plan is None:
         raise exc.InvalidConfig(
@@ -8989,11 +8945,11 @@ def build_static_pipeline_plan(
             worker_count=worker_count,
             readiness_counters=scheduling_counters,
             root_barrier_edges=all_resident_barriers,
-            root_dispatch_modes=root_dispatch_modes,
+            dispatch_mode=cross_loop_dispatch_mode,
         )
     )
     if proposal is None and continuations:
-        # Continuation ownership is optional.  A dispatch vector that is
+        # Continuation ownership is optional.  A kernel-wide dispatch policy that is
         # otherwise legal must not be rejected merely because the continuation
         # chosen from the all-static seed is incompatible with that physical
         # ownership.  Retry the identical schedule/counters without contracting
@@ -9003,12 +8959,12 @@ def build_static_pipeline_plan(
             worker_count=worker_count,
             readiness_counters=all_resident_counters,
             root_barrier_edges=all_resident_barriers,
-            root_dispatch_modes=root_dispatch_modes,
+            dispatch_mode=cross_loop_dispatch_mode,
         )
     if proposal is None:
         if cross_loop_dispatch_mode == "dynamic":
             raise exc.InvalidConfig(
-                "the requested dynamic root dispatch does not admit a "
+                "the requested dynamic cross-loop pipeline does not admit a "
                 "progress-safe cross-loop schedule"
             )
         proposal = all_resident_plan
