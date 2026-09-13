@@ -17,7 +17,7 @@ PidTypeLiteral = Literal[
     "persistent_interleaved",
 ]
 CrossLoopScheduleLiteral = Literal["barrier", "static_pipeline"]
-CrossLoopDispatchLiteral = Literal["static", "elastic"]
+CrossLoopDispatchLiteral = Literal["static", "dynamic"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
@@ -96,7 +96,7 @@ class Config(Mapping[str, object]):
                 dependency schedule. Unsupported kernels reject this field.
             cross_loop_root_dispatch: Per-root physical dispatch mode for static
                 cross-loop scheduling. Each entry is ``"static"`` or
-                ``"elastic"``. Unsupported kernels reject this field.
+                ``"dynamic"``. Unsupported kernels reject this field.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configs may select intermediate occupancy points.

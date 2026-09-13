@@ -414,9 +414,9 @@ class TestConfigAPI(TestCase):
         )
         self.assertEqual(
             helion.Config(
-                cross_loop_root_dispatch=["static", "elastic"]
+                cross_loop_root_dispatch=["static", "dynamic"]
             ).cross_loop_root_dispatch,
-            ["static", "elastic"],
+            ["static", "dynamic"],
         )
 
         with patch("helion._compat.is_hip", return_value=False):
@@ -444,7 +444,7 @@ class TestConfigAPI(TestCase):
             self.assertEqual(dispatch_field.length, 3)
             self.assertIsInstance(dispatch_field.inner, EnumFragment)
             assert isinstance(dispatch_field.inner, EnumFragment)
-            self.assertEqual(dispatch_field.inner.choices, ("static", "elastic"))
+            self.assertEqual(dispatch_field.inner.choices, ("static", "dynamic"))
             self.assertEqual(
                 spec.default_config()["cross_loop_schedule"],
                 "barrier",
@@ -457,9 +457,9 @@ class TestConfigAPI(TestCase):
             static_config = spec.default_config()
             static_config.config["cross_loop_schedule"] = "static_pipeline"
             static_config.config["cross_loop_root_dispatch"] = [
-                "elastic",
+                "dynamic",
                 "static",
-                "elastic",
+                "dynamic",
             ]
             spec.normalize(static_config)
             generation = ConfigGeneration(spec)
@@ -470,7 +470,7 @@ class TestConfigAPI(TestCase):
             )
             self.assertEqual(
                 round_trip["cross_loop_root_dispatch"],
-                ["elastic", "static", "elastic"],
+                ["dynamic", "static", "dynamic"],
             )
 
             with self.assertRaisesRegex(
@@ -484,8 +484,8 @@ class TestConfigAPI(TestCase):
             for invalid_dispatch in (
                 "static",
                 ("static", "static", "static"),
-                ["static", "elastic"],
-                ["static", "elastic", "unknown"],
+                ["static", "dynamic"],
+                ["static", "dynamic", "unknown"],
             ):
                 with (
                     self.subTest(invalid_dispatch=invalid_dispatch),

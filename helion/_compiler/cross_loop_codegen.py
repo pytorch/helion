@@ -803,7 +803,7 @@ def emit_cross_loop_schedule(
             tuple[WorkerScheduleSegment, ...],
         ]
     ] = [(segments[0].root, mode, segments) for mode, segments in dispatch_runs]
-    uses_packet_dispatch = any(mode == "elastic" for mode, _segments in dispatch_runs)
+    uses_packet_dispatch = any(mode == "dynamic" for mode, _segments in dispatch_runs)
     packet_count = sum(
         launch_worker_count
         if mode == "static"
@@ -816,7 +816,7 @@ def emit_cross_loop_schedule(
         worker = device_function.new_var("tile_dependency_logical_worker", dce=True)
 
     # A static run requires its complete W-packet cohort to become resident.
-    # All-elastic streams rely only on monotone retirement/admission and must
+    # All-dynamic streams rely only on monotone retirement/admission and must
     # not inherit the resident-pool constraint (their grid may be much larger).
     if any(mode == "static" for mode, _segments in dispatch_runs):
         device_function.triton_minimum_resident_programs = resident_grid_size_expr
@@ -1056,7 +1056,7 @@ def emit_cross_loop_schedule(
                 # Relation-segment dispatch maps each global slot to the
                 # configured PID before entering the shared root body.
                 continue
-            if segment.dispatch_mode == "elastic":
+            if segment.dispatch_mode == "dynamic":
                 remember_authoritative_traversal(segment.root, (segment,))
                 continue
             reference = _packed_root_major_task_order_relation(
@@ -2493,7 +2493,7 @@ def emit_cross_loop_schedule(
         body: list[ast.stmt] = []
         for segment in segments:
             if segment.dispatch_mode != "static":
-                raise AssertionError("static run contains an elastic segment")
+                raise AssertionError("static run contains a dynamic segment")
             segment_index = segment_index_by_identity[id(segment)]
             if schedule_segment_geometry is not None:
                 segment_geometry = segment_geometry_by_identity.get(id(segment))

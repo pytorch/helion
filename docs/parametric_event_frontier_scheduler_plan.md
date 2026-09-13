@@ -3,10 +3,10 @@
 > **Implementation-roadmap update (2026-09-12):** The global
 > event-frontier/list-placement design in this document is retained as design
 > history.  It is superseded by
-> [`static_elastic_scheduler_unification_plan.md`](static_elastic_scheduler_unification_plan.md),
+> [`static_dynamic_scheduler_unification_plan.md`](static_dynamic_scheduler_unification_plan.md),
 > which keeps the reusable symbolic relation/readiness work but replaces
 > pipeline-depth/list placement and the special source-ticket path with one
-> canonical schedule and per-root static/elastic execution.
+> canonical schedule and per-root static/dynamic execution.
 
 ## Status
 

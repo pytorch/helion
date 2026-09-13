@@ -765,7 +765,7 @@ def shrink_block_sizes_for_numel_constraints(
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
 VALID_CROSS_LOOP_SCHEDULES = ("barrier", "static_pipeline")
-VALID_CROSS_LOOP_DISPATCH_MODES = ("static", "elastic")
+VALID_CROSS_LOOP_DISPATCH_MODES = ("static", "dynamic")
 
 # Upper bound (power of two) that a matmul tile dimension's block size may reach
 # even when the dimension itself is smaller. Applied only to dimensions that

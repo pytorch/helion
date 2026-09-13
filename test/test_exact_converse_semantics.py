@@ -783,7 +783,7 @@ class TestExactConverseSemantics(TestCase):
             publications=(RootBarrierPublication(0, ()),),
             resident_arrival_count=2,
             continuation_arrival_count=0,
-            elastic_task_arrival_count=0,
+            dynamic_task_arrival_count=0,
         )
 
         invalid_orders = {

@@ -1102,12 +1102,12 @@ class TestCrossLoopScheduler(TestCase):
         (root_domain,) = _identify_root_domains((_domain((10, 4)),))
         (task_order,) = _default_root_task_orders((root_domain,))
         default = WorkerScheduleSegment(0, task_order, 0, 4, 0)
-        elastic = dataclasses.replace(default, dispatch_mode="elastic")
+        dynamic = dataclasses.replace(default, dispatch_mode="dynamic")
 
         self.assertEqual(default.dispatch_mode, "static")
-        self.assertEqual(elastic.dispatch_mode, "elastic")
+        self.assertEqual(dynamic.dispatch_mode, "dynamic")
         with self.assertRaisesRegex(ValueError, "invalid cross-loop dispatch mode"):
-            dataclasses.replace(default, dispatch_mode=cast("Any", "dynamic"))
+            dataclasses.replace(default, dispatch_mode=cast("Any", "invalid"))
 
     def test_root_dispatch_modes_preserve_the_accepted_traversal(self) -> None:
         root_domains = _identify_root_domains((_domain((10, 5)), _domain((20, 3))))
@@ -1116,13 +1116,13 @@ class TestCrossLoopScheduler(TestCase):
 
         dispatched = cross_loop_scheduler._with_root_dispatch_modes(
             schedule,
-            ("elastic", "static"),
+            ("dynamic", "static"),
             root_count=2,
         )
 
         self.assertEqual(
             tuple(segment.dispatch_mode for segment in dispatched.segments),
-            ("elastic", "static"),
+            ("dynamic", "static"),
         )
         self.assertEqual(
             tuple(segment.task_order for segment in dispatched.segments),
@@ -1761,18 +1761,18 @@ class TestCrossLoopScheduler(TestCase):
                 0,
             ),
         )
-        elastic_schedule = cross_loop_scheduler._with_root_dispatch_modes(
+        dynamic_schedule = cross_loop_scheduler._with_root_dispatch_modes(
             schedule,
-            ("elastic",),
+            ("dynamic",),
             root_count=1,
         )
-        elastic_publication = cross_loop_scheduler.root_barrier_publication_plan(
-            elastic_schedule,
+        dynamic_publication = cross_loop_scheduler.root_barrier_publication_plan(
+            dynamic_schedule,
             0,
         )
-        self.assertEqual(elastic_publication.resident_arrival_count, 0)
-        self.assertEqual(elastic_publication.elastic_task_arrival_count, 2)
-        self.assertEqual(elastic_publication.publications, ())
+        self.assertEqual(dynamic_publication.resident_arrival_count, 0)
+        self.assertEqual(dynamic_publication.dynamic_task_arrival_count, 2)
+        self.assertEqual(dynamic_publication.publications, ())
 
         order_axis = order.source_domain.axis_order[0]
         duplicate = CoordinateRelation.point_map(
@@ -3483,7 +3483,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(publication.publications, ())
         self.assertEqual(publication.resident_arrival_count, 0)
         self.assertEqual(publication.continuation_arrival_count, 3)
-        self.assertEqual(publication.elastic_task_arrival_count, 0)
+        self.assertEqual(publication.dynamic_task_arrival_count, 0)
         self.assertEqual(publication.real_arrival_count, 3)
 
     def test_baseline_preserves_piecewise_configured_orders(self) -> None:
@@ -4167,7 +4167,7 @@ class TestCrossLoopScheduler(TestCase):
             ),
             axis_geometry={10: (8, 16), 20: (4, 32)},
             worker_count=4,
-            cross_loop_root_dispatch=("elastic", "static"),
+            cross_loop_root_dispatch=("dynamic", "static"),
         )
 
         self.assertEqual(
@@ -4175,7 +4175,7 @@ class TestCrossLoopScheduler(TestCase):
                 (segment.root, segment.dispatch_mode)
                 for segment in plan.worker_schedule.segments
             ),
-            ((0, "elastic"), (1, "static")),
+            ((0, "dynamic"), (1, "static")),
         )
 
     def test_unsupported_access_scale_uses_root_barrier(self) -> None:
@@ -5184,14 +5184,14 @@ class TestCrossLoopScheduler(TestCase):
                 dispatch_offset=0,
             ),
         )
-        elastic_then_static = cross_loop_scheduler._with_root_dispatch_modes(
+        dynamic_then_static = cross_loop_scheduler._with_root_dispatch_modes(
             prior_wave,
-            ("elastic", "static"),
+            ("dynamic", "static"),
             root_count=2,
         )
-        all_elastic = cross_loop_scheduler._with_root_dispatch_modes(
+        all_dynamic = cross_loop_scheduler._with_root_dispatch_modes(
             prior_wave,
-            ("elastic", "elastic"),
+            ("dynamic", "dynamic"),
             root_count=2,
         )
 
@@ -5210,17 +5210,17 @@ class TestCrossLoopScheduler(TestCase):
                     exact,
                 )
             )
-            elastic_then_static_compact = (
+            dynamic_then_static_compact = (
                 cross_loop_scheduler._compact_nested_loop_counters_for_schedule(
                     graph,
-                    elastic_then_static,
+                    dynamic_then_static,
                     exact,
                 )
             )
-            all_elastic_compact = (
+            all_dynamic_compact = (
                 cross_loop_scheduler._compact_nested_loop_counters_for_schedule(
                     graph,
-                    all_elastic,
+                    all_dynamic,
                     exact,
                 )
             )
@@ -5229,8 +5229,8 @@ class TestCrossLoopScheduler(TestCase):
         # are issued before root 1 regardless of static worker-wave placement.
         self.assertEqual(prior_wave_compact, (entry,))
         self.assertEqual(same_wave_compact, (entry,))
-        self.assertEqual(elastic_then_static_compact, (entry,))
-        self.assertEqual(all_elastic_compact, (entry,))
+        self.assertEqual(dynamic_then_static_compact, (entry,))
+        self.assertEqual(all_dynamic_compact, (entry,))
         self.assertTrue(
             cross_loop_scheduler._schedule_is_progress_safe(
                 same_wave,
@@ -5241,9 +5241,9 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertTrue(
             cross_loop_scheduler._schedule_is_progress_safe(
-                all_elastic,
+                all_dynamic,
                 graph,
-                all_elastic_compact,
+                all_dynamic_compact,
                 frozenset(),
             )
         )

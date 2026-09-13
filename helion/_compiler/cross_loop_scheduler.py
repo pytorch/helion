@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 WorkerInterval = tuple[int, int]
-CrossLoopDispatchMode = Literal["static", "elastic"]
+CrossLoopDispatchMode = Literal["static", "dynamic"]
 
 _SOURCE_LAUNCH_STAGE = 0
 _RESIDENT_LAUNCH_STAGE = 1
@@ -130,7 +130,7 @@ class WorkerScheduleSegment:
             raise ValueError(
                 f"dispatch_offset must be nonnegative, got {self.dispatch_offset}"
             )
-        if self.dispatch_mode not in ("static", "elastic"):
+        if self.dispatch_mode not in ("static", "dynamic"):
             raise ValueError(f"invalid cross-loop dispatch mode {self.dispatch_mode!r}")
         if self.task_order.target_domain.kind != "site" or (
             not self.task_order.pieces
@@ -3186,7 +3186,7 @@ class RootBarrierPublicationPlan:
     publications: tuple[RootBarrierPublication, ...]
     resident_arrival_count: int | sympy.Expr
     continuation_arrival_count: int | sympy.Expr
-    elastic_task_arrival_count: int
+    dynamic_task_arrival_count: int
 
     def __post_init__(self) -> None:
         if any(
@@ -3194,14 +3194,14 @@ class RootBarrierPublicationPlan:
             for count in (
                 self.resident_arrival_count,
                 self.continuation_arrival_count,
-                self.elastic_task_arrival_count,
+                self.dynamic_task_arrival_count,
                 self.real_arrival_count,
             )
         ):
             raise ValueError("root-barrier arrival counts must be nonnegative")
         if self.participant_order is None:
             return
-        if self.continuation_arrival_count != 0 or self.elastic_task_arrival_count:
+        if self.continuation_arrival_count != 0 or self.dynamic_task_arrival_count:
             raise ValueError(
                 "symbolic resident ownership cannot overlap external publication"
             )
@@ -3220,7 +3220,7 @@ class RootBarrierPublicationPlan:
             sympy.Add(
                 sympy.sympify(self.resident_arrival_count),
                 sympy.sympify(self.continuation_arrival_count),
-                self.elastic_task_arrival_count,
+                self.dynamic_task_arrival_count,
             )
         )
 
@@ -3360,19 +3360,19 @@ def root_barrier_publication_plan(
         if continuation_domains
         else 0
     )
-    elastic_segments = tuple(
+    dynamic_segments = tuple(
         segment
         for segment in worker_schedule.segments_for_root(root)
-        if segment.dispatch_mode == "elastic"
+        if segment.dispatch_mode == "dynamic"
     )
-    if len(elastic_segments) > 1:
-        raise ValueError("one root cannot have multiple elastic segments")
-    elastic_task_arrival_count = (
-        elastic_segments[0].task_order.target_domain.size if elastic_segments else 0
+    if len(dynamic_segments) > 1:
+        raise ValueError("one root cannot have multiple dynamic segments")
+    dynamic_task_arrival_count = (
+        dynamic_segments[0].task_order.target_domain.size if dynamic_segments else 0
     )
-    if elastic_segments:
+    if dynamic_segments:
         if continuation_arrival_count != 0:
-            raise ValueError("an elastic root cannot also be continuation-owned")
+            raise ValueError("a dynamic root cannot also be continuation-owned")
         return RootBarrierPublicationPlan(
             root=root,
             participant_intervals=(),
@@ -3380,7 +3380,7 @@ def root_barrier_publication_plan(
             publications=(),
             resident_arrival_count=0,
             continuation_arrival_count=0,
-            elastic_task_arrival_count=elastic_task_arrival_count,
+            dynamic_task_arrival_count=dynamic_task_arrival_count,
         )
     root_major_geometry = _root_major_schedule_geometry(worker_schedule)
     packed_geometry = (
@@ -3411,7 +3411,7 @@ def root_barrier_publication_plan(
             if participant is None:
                 raise ValueError("root-major participant support is not proved")
             participant_order, real_arrival_count = participant
-            if continuation_arrival_count != 0 or elastic_task_arrival_count:
+            if continuation_arrival_count != 0 or dynamic_task_arrival_count:
                 raise ValueError(
                     "relation-derived resident ownership overlaps another execution role"
                 )
@@ -3422,10 +3422,10 @@ def root_barrier_publication_plan(
                 publications=(RootBarrierPublication(segment_index, ()),),
                 resident_arrival_count=real_arrival_count,
                 continuation_arrival_count=0,
-                elastic_task_arrival_count=0,
+                dynamic_task_arrival_count=0,
             )
         if not matching:
-            if continuation_arrival_count == 0 and elastic_task_arrival_count == 0:
+            if continuation_arrival_count == 0 and dynamic_task_arrival_count == 0:
                 raise ValueError(f"relation schedule has no root {root}")
         elif root_major_geometry is not None:
             raise ValueError(f"root-major schedule has no unique root {root}")
@@ -3479,7 +3479,7 @@ def root_barrier_publication_plan(
         sympy.Add(
             resident_arrival_count,
             sympy.sympify(continuation_arrival_count),
-            elastic_task_arrival_count,
+            dynamic_task_arrival_count,
         )
     )
     if not isinstance(real_arrival_count, int) or real_arrival_count <= 0:
@@ -3493,7 +3493,7 @@ def root_barrier_publication_plan(
         publications=publications,
         resident_arrival_count=resident_arrival_count,
         continuation_arrival_count=continuation_arrival_count,
-        elastic_task_arrival_count=elastic_task_arrival_count,
+        dynamic_task_arrival_count=dynamic_task_arrival_count,
     )
 
 
@@ -3547,7 +3547,7 @@ def _with_root_dispatch_modes(
             "cross-loop root dispatch length must match the root count: "
             f"expected {root_count}, got {len(root_dispatch_modes)}"
         )
-    if any(mode not in ("static", "elastic") for mode in root_dispatch_modes):
+    if any(mode not in ("static", "dynamic") for mode in root_dispatch_modes):
         raise ValueError("cross-loop root dispatch contains an invalid mode")
     if any(not 0 <= segment.root < root_count for segment in worker_schedule.segments):
         raise ValueError("worker schedule segment references an unknown root")
@@ -5486,7 +5486,7 @@ def _compact_nested_loop_counters_for_schedule(
             result.append(entry)
             continue
         # A segmented quotient is expressed in static worker-wave rank.  Do
-        # not transfer that certificate to elastic ownership.
+        # not transfer that certificate to dynamic ownership.
         relevant_roots = {
             consumer_root,
             *(
@@ -8405,12 +8405,12 @@ def _schedule_is_progress_safe(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
 ) -> bool:
-    """Prove canonical static/elastic packet progress from root order.
+    """Prove canonical static/dynamic packet progress from root order.
 
     The accepted schedule has one exact segment per non-continuation root in
     source order.  Every cross-root prerequisite must therefore point to an
     earlier packet interval.  Static same-root waits may additionally use the
-    existing exact worker-rank proof; elastic same-root waits are rejected.
+    existing exact worker-rank proof; dynamic same-root waits are rejected.
     No CTA DAG, list placement, or dispatch-specific dependency graph exists.
     """
     continuations = _emitted_final_arrival_continuations(
@@ -8889,10 +8889,10 @@ def build_static_pipeline_plan(
     if cross_loop_root_dispatch is None:
         cross_loop_root_dispatch = ("static",) * len(root_task_orders)
     if len(cross_loop_root_dispatch) != len(root_task_orders) or any(
-        mode not in ("static", "elastic") for mode in cross_loop_root_dispatch
+        mode not in ("static", "dynamic") for mode in cross_loop_root_dispatch
     ):
         raise ValueError(
-            "cross-loop root dispatch must contain one static/elastic mode per root"
+            "cross-loop root dispatch must contain one static/dynamic mode per root"
         )
     schedule_capacity_parameters = frozenset(
         symbol
@@ -9009,9 +9009,9 @@ def build_static_pipeline_plan(
             root_dispatch_modes=cross_loop_root_dispatch,
         )
     if proposal is None:
-        if any(mode == "elastic" for mode in cross_loop_root_dispatch):
+        if any(mode == "dynamic" for mode in cross_loop_root_dispatch):
             raise exc.InvalidConfig(
-                "the requested elastic root dispatch does not admit a "
+                "the requested dynamic root dispatch does not admit a "
                 "progress-safe cross-loop schedule"
             )
         proposal = all_resident_plan

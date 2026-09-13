@@ -711,7 +711,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_elastic_then_static_run_preserves_nested_readiness(self) -> None:
+    def test_dynamic_then_static_run_preserves_nested_readiness(self) -> None:
         x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
         code, out = code_and_output(
             nested_load_store_chain,
@@ -719,7 +719,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             block_sizes=[1, 16],
             pid_type="persistent_blocked",
             cross_loop_schedule="static_pipeline",
-            cross_loop_root_dispatch=["elastic", "static", "static"],
+            cross_loop_root_dispatch=["dynamic", "static", "static"],
             num_sm_multiplier=1,
             num_warps=1,
         )
@@ -739,21 +739,21 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             for index, line in enumerate(lines[wait_index + 1 :], wait_index + 1)
             if line.startswith("    for ") and " in tl.range(" in line
         )
-        # Every elastic producer packet is issued before the static cohort.
+        # Every dynamic producer packet is issued before the static cohort.
         # The compact entry wait therefore cannot starve an unlaunched
         # producer; its counter still gates completion and visibility.
         self.assertLess(wait_index, loop_index)
         self.assertTrue(lines[wait_index].startswith("    "))
         self.assertFalse(lines[wait_index].startswith("        "))
         self.assertIn("tl.cast(256, tl.uint32)", lines[wait_index + 1])
-        # The elastic root has 256 tasks and the static run has 148 worker
+        # The dynamic root has 256 tasks and the static run has 148 worker
         # packets.  Monotone admission claims the former before the latter.
         self.assertIn("% tl.cast(404, tl.uint64)", code)
         self.assertIn("tile_dependency_dispatch_ticket_1 < 256", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_all_elastic_root_barrier_replays(self) -> None:
+    def test_all_dynamic_root_barrier_replays(self) -> None:
         x = torch.arange(32 * 32, device=DEVICE, dtype=torch.float32).reshape(32, 32)
         for launch in range(2):
             code, out = code_and_output(
@@ -762,7 +762,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 block_sizes=[8, 8],
                 pid_type="persistent_blocked",
                 cross_loop_schedule="static_pipeline",
-                cross_loop_root_dispatch=["elastic", "elastic"],
+                cross_loop_root_dispatch=["dynamic", "dynamic"],
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -775,7 +775,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_multiple_static_elastic_runs_share_one_packet_stream(self) -> None:
+    def test_multiple_static_dynamic_runs_share_one_packet_stream(self) -> None:
         x = torch.arange(8 * 4, device=DEVICE, dtype=torch.float32).reshape(8, 4)
         with mock.patch.object(
             cross_loop_scheduler,
@@ -789,9 +789,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 cross_loop_schedule="static_pipeline",
                 cross_loop_root_dispatch=[
                     "static",
-                    "elastic",
+                    "dynamic",
                     "static",
-                    "elastic",
+                    "dynamic",
                 ],
                 num_sm_multiplier=1,
                 num_warps=1,
@@ -806,7 +806,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_elastic_dense_relation_fallback_uses_authoritative_order(self) -> None:
+    def test_dynamic_dense_relation_fallback_uses_authoritative_order(self) -> None:
         x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
         with (
             mock.patch.object(
@@ -827,7 +827,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 l2_groupings=[2, 2],
                 pid_type="persistent_blocked",
                 cross_loop_schedule="static_pipeline",
-                cross_loop_root_dispatch=["elastic", "elastic"],
+                cross_loop_root_dispatch=["dynamic", "dynamic"],
                 num_sm_multiplier=1,
                 num_warps=1,
             )
@@ -844,7 +844,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_kernel_scope_prefix_outlines_elastic_packet_suffix(self) -> None:
+    def test_kernel_scope_prefix_outlines_dynamic_packet_suffix(self) -> None:
         x = torch.arange(4 * 64, device=DEVICE, dtype=torch.float32).reshape(4, 64)
         kernel_scope_call = 0
 
@@ -873,7 +873,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     block_sizes=[1, 16, 1, 32],
                     pid_type="persistent_blocked",
                     cross_loop_schedule="static_pipeline",
-                    cross_loop_root_dispatch=["elastic", "elastic"],
+                    cross_loop_root_dispatch=["dynamic", "dynamic"],
                     num_sm_multiplier=1,
                     num_warps=1,
                 )
@@ -921,7 +921,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 block_sizes=[1, 16, 1, 32],
                 pid_type="persistent_blocked",
                 cross_loop_schedule="static_pipeline",
-                cross_loop_root_dispatch=["elastic", "static"],
+                cross_loop_root_dispatch=["dynamic", "static"],
                 num_sm_multiplier=1,
                 num_warps=1,
             )
