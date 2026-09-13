@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 WorkerInterval = tuple[int, int]
 CrossLoopDispatchMode = Literal["static", "dynamic"]
 
-_SOURCE_LAUNCH_STAGE = 0
 _RESIDENT_LAUNCH_STAGE = 1
 
 
@@ -54,30 +53,6 @@ def _normalize_intervals(
             result[-1] = (result[-1][0], max(result[-1][1], end))
         else:
             result.append((begin, end))
-    return tuple(result)
-
-
-def _subtract_intervals(
-    minuend: tuple[WorkerInterval, ...],
-    subtrahend: tuple[WorkerInterval, ...],
-) -> tuple[WorkerInterval, ...]:
-    """Return ``minuend - subtrahend`` using only interval endpoints."""
-    result: list[WorkerInterval] = []
-    subtrahend = _normalize_intervals(subtrahend)
-    for begin, end in _normalize_intervals(minuend):
-        cursor = begin
-        for remove_begin, remove_end in subtrahend:
-            if remove_end <= cursor:
-                continue
-            if remove_begin >= end:
-                break
-            if cursor < remove_begin:
-                result.append((cursor, min(remove_begin, end)))
-            cursor = max(cursor, remove_end)
-            if cursor >= end:
-                break
-        if cursor < end:
-            result.append((cursor, end))
     return tuple(result)
 
 
@@ -195,7 +170,7 @@ class WorkerScheduleSegment:
         if (
             step != 1
             or end != begin + 1  # pyrefly: ignore[unsupported-operation]
-            or begin not in (_SOURCE_LAUNCH_STAGE, _RESIDENT_LAUNCH_STAGE)
+            or begin != _RESIDENT_LAUNCH_STAGE
         ):
             return None
         return int(begin)
@@ -463,10 +438,9 @@ class WorkerScheduleSegment:
             tuple(pieces),
         )
         compact = result.coalesce_adjacent_source_boxes()
-        if compact.is_total_function():
-            result = compact
-        elif launch_stage != _SOURCE_LAUNCH_STAGE:
+        if not compact.is_total_function():
             return None
+        result = compact
         if not result.is_total_function():
             return None
         schedule_to_ordinal = CoordinateRelation.point_map(
@@ -704,12 +678,8 @@ def _worker_schedule_domain(
 def _normalize_dense_schedule_segment(
     segment: WorkerScheduleSegment,
     schedule_domain: CoordinateDomain,
-    *,
-    launch_stage: int = _RESIDENT_LAUNCH_STAGE,
 ) -> WorkerScheduleSegment:
     """Convert one legacy dense run to its exact schedule ownership relation."""
-    if launch_stage not in (_SOURCE_LAUNCH_STAGE, _RESIDENT_LAUNCH_STAGE):
-        raise ValueError(f"invalid launch stage {launch_stage}")
     launch_stage_axis, worker_axis, wave_axis = schedule_domain.axis_order
     if segment.is_normalized:
         source = segment.task_order.source_domain
@@ -790,8 +760,8 @@ def _normalize_dense_schedule_segment(
                     (
                         (
                             launch_stage_axis,
-                            launch_stage,
-                            launch_stage + 1,
+                            _RESIDENT_LAUNCH_STAGE,
+                            _RESIDENT_LAUNCH_STAGE + 1,
                             1,
                         ),
                         (
@@ -808,8 +778,8 @@ def _normalize_dense_schedule_segment(
                     (
                         (
                             launch_stage_axis,
-                            launch_stage,
-                            launch_stage + 1,
+                            _RESIDENT_LAUNCH_STAGE,
+                            _RESIDENT_LAUNCH_STAGE + 1,
                             1,
                         ),
                         (
@@ -842,8 +812,8 @@ def _normalize_dense_schedule_segment(
                 (
                     (
                         launch_stage_axis,
-                        launch_stage,
-                        launch_stage + 1,
+                        _RESIDENT_LAUNCH_STAGE,
+                        _RESIDENT_LAUNCH_STAGE + 1,
                         1,
                     ),
                     (
@@ -884,7 +854,7 @@ def _normalize_dense_schedule_segment(
             (
                 ((ordinal_axis, 0, segment.task_count, 1),),
                 (
-                    sympy.Integer(launch_stage),
+                    sympy.Integer(_RESIDENT_LAUNCH_STAGE),
                     segment.worker_begin
                     + sympy.Mod(dispatch_index, segment.worker_count),
                     cast(
@@ -1227,736 +1197,6 @@ def _flat_task_order_relation(
     return result
 
 
-def _concrete_task_order_slice(
-    task_order: CoordinateRelation,
-    begin: int,
-    count: int,
-) -> CoordinateRelation | None:
-    """Retain the bounded concrete slice fallback for manual relations."""
-
-    def retain_exact_converse(
-        relation: CoordinateRelation,
-    ) -> CoordinateRelation | None:
-        converse = tile_dependency._memoized_exact_converse(relation)
-        if converse is None:
-            converse = relation.derive_converse_and_target_counts()[0]
-            if converse is not None:
-                tile_dependency._remember_exact_converse(relation, converse)
-        return converse
-
-    if begin < 0 or count <= 0 or begin + count > task_order.source_domain.size:
-        return None
-    if begin == 0 and count == task_order.source_domain.size:
-        return task_order if retain_exact_converse(task_order) is not None else None
-    task_order_converse = retain_exact_converse(task_order)
-    if task_order_converse is None:
-        return None
-
-    # Preserve the configured Cartesian task-order domain when the flat slice
-    # is one rectangle.  Besides producing much smaller formulas, this keeps
-    # piecewise PID permutations invertible for exact-once validation.
-    source_axes = task_order.source_domain.axis_order
-    source_counts = task_order.source_domain.axis_counts
-    begin_coordinates = task_order.source_domain.coordinates(begin)
-    source_stride = 1
-    for split_index, split_axis in enumerate(source_axes):
-        split_count = source_counts[split_axis]
-        if (
-            begin % source_stride
-            or count % source_stride
-            or (span := count // source_stride) > split_count
-            or begin_coordinates[split_axis] + span > split_count
-        ):
-            source_stride *= split_count
-            continue
-        rectangular_domain = CoordinateDomain(
-            axis_order=source_axes,
-            axis_counts_items=tuple(
-                (
-                    axis,
-                    source_counts[axis]
-                    if axis in source_axes[:split_index]
-                    else span
-                    if axis == split_axis
-                    else 1,
-                )
-                for axis in source_axes
-            ),
-            kind="task_order",
-        )
-        rectangular_to_source = CoordinateRelation.point_map(
-            rectangular_domain,
-            task_order.source_domain,
-            (
-                (
-                    tuple(
-                        (axis, 0, rectangular_domain.axis_counts[axis], 1)
-                        for axis in source_axes
-                    ),
-                    tuple(
-                        coordinate_axis_symbol(axis) + begin_coordinates[axis]  # pyrefly: ignore[unsupported-operation]
-                        for axis in source_axes
-                    ),
-                ),
-            ),
-        )
-        rectangular_converse = CoordinateRelation.point_map(
-            task_order.source_domain,
-            rectangular_domain,
-            (
-                (
-                    tuple(
-                        (
-                            axis,
-                            begin_coordinates[axis],
-                            begin_coordinates[axis]
-                            + rectangular_domain.axis_counts[axis],
-                            1,
-                        )
-                        for axis in source_axes
-                    ),
-                    tuple(
-                        coordinate_axis_symbol(axis) - begin_coordinates[axis]  # pyrefly: ignore[unsupported-operation]
-                        for axis in source_axes
-                    ),
-                ),
-            ),
-        )
-        tile_dependency._remember_exact_converse(
-            rectangular_to_source,
-            rectangular_converse,
-        )
-        rectangular = rectangular_to_source.then(task_order)
-        if rectangular is not None and retain_exact_converse(rectangular) is not None:
-            return rectangular
-        source_stride *= split_count
-
-    axes = (
-        *task_order.source_domain.axis_order,
-        *task_order.target_domain.axis_order,
-    )
-    slice_axis = max(axes, default=0) + 1
-    slice_domain = CoordinateDomain(
-        axis_order=(slice_axis,),
-        axis_counts_items=((slice_axis, count),),
-        kind="task_order",
-    )
-    flat_index = coordinate_axis_symbol(slice_axis) + begin  # pyrefly: ignore[unsupported-operation]
-    coordinates: list[sympy.Expr] = []
-    stride = 1
-    source_cuts = {0, count}
-    for axis in task_order.source_domain.axis_order:
-        axis_count = task_order.source_domain.axis_counts[axis]
-        coordinates.append(
-            cast(
-                "sympy.Expr",
-                sympy.Mod(
-                    sympy.floor(flat_index / stride),  # pyrefly: ignore[unsupported-operation]
-                    axis_count,
-                ),
-            )
-        )
-        if axis_count > 1:
-            period = stride * axis_count
-            boundary = (begin // period + 1) * period
-            boundary_count = max(0, (begin + count - 1 - boundary) // period + 1)
-            if boundary_count > tile_dependency._MAX_RELATION_PIECES - len(source_cuts):
-                return None
-            while boundary < begin + count:
-                source_cuts.add(boundary - begin)
-                boundary += period
-        stride *= axis_count
-    slice_to_source = CoordinateRelation.point_map(
-        slice_domain,
-        task_order.source_domain,
-        tuple(
-            (
-                ((slice_axis, piece_begin, piece_end, 1),),
-                tuple(coordinates),
-            )
-            for piece_begin, piece_end in itertools.pairwise(sorted(source_cuts))
-        ),
-    )
-    source_to_slice = retain_exact_converse(slice_to_source)
-    if source_to_slice is None:
-        return None
-    result = slice_to_source.then(task_order)
-    if result is not None and retain_exact_converse(result) is not None:
-        return result
-
-    # A configured task order can be piecewise over a non-leading source axis.
-    # A flat slice then crosses those pieces periodically rather than at one
-    # contiguous cut (for example, eight tasks from each half of a 16-wide
-    # axis).  Partition the bounded slice into affine progressions aligned to
-    # the existing pieces.  This remains symbolic: it enumerates relation
-    # boxes, not logical tasks or target coordinates.
-    source_strides: dict[int, int] = {}
-    stride = 1
-    for axis in task_order.source_domain.axis_order:
-        source_strides[axis] = stride
-        stride *= task_order.source_domain.axis_counts[axis]
-    aligned_pieces: list[
-        tuple[tuple[tuple[int, int, int, int], ...], tuple[sympy.Expr, ...]]
-    ] = []
-    slice_end = begin + count
-    for task_order_piece in task_order.pieces:
-        if any(
-            step != 1 or sympy.simplify(end - piece_begin) != 1
-            for _axis, piece_begin, end, step in task_order_piece.target_ranges
-        ):
-            return None
-        substitutions = {
-            coordinate_axis_symbol(axis): expression
-            for axis, expression in zip(
-                task_order.source_domain.axis_order,
-                coordinates,
-                strict=True,
-            )
-        }
-        target_expressions = tuple(
-            cast("sympy.Expr", piece_begin.xreplace(substitutions))
-            for _axis, piece_begin, _end, _step in task_order_piece.target_ranges
-        )
-        bounds = {
-            axis: (piece_begin, piece_end, piece_step)
-            for axis, piece_begin, piece_end, piece_step in (
-                task_order_piece.source_bounds_items
-            )
-        }
-        varying_axis = max(
-            task_order.source_domain.axis_order,
-            key=lambda axis: len(range(*bounds[axis])),
-        )
-        fixed_axes = tuple(
-            axis for axis in task_order.source_domain.axis_order if axis != varying_axis
-        )
-        varying_begin, varying_end, varying_step = bounds[varying_axis]
-        varying_count = len(range(varying_begin, varying_end, varying_step))
-        if not varying_count:
-            continue
-        fixed_value_count = 1
-        for axis in fixed_axes:
-            fixed_value_count *= len(range(*bounds[axis]))
-        if fixed_value_count > tile_dependency._MAX_RELATION_PIECES - len(
-            aligned_pieces
-        ):
-            return None
-        for fixed_values in itertools.product(
-            *(range(*bounds[axis]) for axis in fixed_axes)
-        ):
-            fixed_coordinates = dict(zip(fixed_axes, fixed_values, strict=True))
-            flat_begin = (
-                sum(
-                    fixed_coordinates[axis] * source_strides[axis]
-                    for axis in fixed_axes
-                )
-                + varying_begin * source_strides[varying_axis]
-            )
-            flat_step = varying_step * source_strides[varying_axis]
-            first_position = max(0, (begin - flat_begin + flat_step - 1) // flat_step)
-            final_position = min(
-                varying_count,
-                (slice_end - flat_begin + flat_step - 1) // flat_step,
-            )
-            if first_position >= final_position:
-                continue
-            first_flat = flat_begin + first_position * flat_step
-            final_flat = flat_begin + (final_position - 1) * flat_step
-            aligned_pieces.append(
-                (
-                    (
-                        (
-                            slice_axis,
-                            first_flat - begin,
-                            final_flat - begin + 1,
-                            flat_step,
-                        ),
-                    ),
-                    target_expressions,
-                )
-            )
-    result = CoordinateRelation.point_map(
-        slice_domain,
-        task_order.target_domain,
-        tuple(aligned_pieces),
-    )
-    result_converse = task_order_converse.then(source_to_slice)
-    if result_converse is None:
-        result_converse = retain_exact_converse(result)
-        if result_converse is None:
-            return None
-    tile_dependency._remember_exact_converse(result, result_converse)
-    return result
-
-
-def _task_order_slice(
-    task_order: CoordinateRelation,
-    ordinal_begin: int | sympy.Expr,
-    task_count: int | sympy.Expr,
-) -> CoordinateRelation | None:
-    """Return one exact dense ordinal slice of a task traversal."""
-    ordinal_begin = sympy.simplify(sympy.sympify(ordinal_begin))
-    task_count = sympy.simplify(sympy.sympify(task_count))
-    if ordinal_begin.is_integer is not True or task_count.is_integer is not True:
-        return None
-
-    wholly_concrete = (
-        not task_order.parameter_symbols
-        and not ordinal_begin.free_symbols
-        and not task_count.free_symbols
-    )
-
-    ordinal_count = task_order.source_domain.size_expr
-    if (
-        not tile_dependency._is_provably_nonnegative(ordinal_begin, None)
-        or not tile_dependency._is_provably_nonnegative(task_count, None)
-        or not tile_dependency._is_provably_nonnegative(
-            sympy.simplify(ordinal_count - ordinal_begin - task_count),
-            None,
-        )
-    ):
-        return None
-
-    if _equal_integer_expressions(ordinal_begin, 0) and _equal_integer_expressions(
-        task_count,
-        ordinal_count,
-    ):
-        return task_order if task_order.converse() is not None else None
-
-    # Preserve the established concrete spelling for an empty slice.  Empty
-    # runtime remainders are represented by the symbolic relation and vanish
-    # after substitution; the public concrete helper has historically
-    # declined a caller-requested empty interval.
-    if wholly_concrete and task_count.is_zero is True:
-        if not isinstance(ordinal_begin, sympy.Integer) or not isinstance(
-            task_count, sympy.Integer
-        ):
-            return None
-        return _concrete_task_order_slice(
-            task_order,
-            int(ordinal_begin),
-            int(task_count),
-        )
-
-    # Keep the established concrete representation when it can express the
-    # slice. If it declines, continue through the same exact symbolic
-    # relation path used by a polymorphic compile rather than making that
-    # decline a separate scheduling policy.
-    if wholly_concrete:
-        if not isinstance(ordinal_begin, sympy.Integer) or not isinstance(
-            task_count, sympy.Integer
-        ):
-            return None
-        concrete_slice = _concrete_task_order_slice(
-            task_order,
-            int(ordinal_begin),
-            int(task_count),
-        )
-        if concrete_slice is not None:
-            return concrete_slice
-
-    slice_axis = (
-        max(
-            (
-                *task_order.source_domain.axis_order,
-                *task_order.target_domain.axis_order,
-            ),
-            default=0,
-        )
-        + 2
-    )
-    slice_domain = CoordinateDomain(
-        axis_order=(slice_axis,),
-        axis_counts_items=((slice_axis, task_count),),
-        kind="task_order",
-        _allow_empty=task_count.is_zero is True,
-    )
-    if task_count.is_zero is True:
-        result = CoordinateRelation(
-            source_domain=slice_domain,
-            target_domain=task_order.target_domain,
-            pieces=(),
-        )
-        converse = CoordinateRelation(
-            source_domain=task_order.target_domain,
-            target_domain=slice_domain,
-            pieces=(),
-        )
-        tile_dependency._remember_exact_converse(result, converse)
-        return result
-
-    # Preserve an aligned static-inner/symbolic-outer slice in its native
-    # coordinates. Besides keeping the forward relation compact, this gives
-    # its inverse explicit logical support. A flattened inverse whose support
-    # exists only through target clipping cannot be safely composed into a
-    # later packed placement without a general multi-axis preimage proof.
-    source_axes = task_order.source_domain.axis_order
-    source_counts = task_order.source_domain.axis_count_expressions
-    if len(source_axes) >= 2:
-        inner_axis = source_axes[0]
-        inner_count_expression = source_counts[inner_axis]
-        if (
-            not inner_count_expression.free_symbols
-            and inner_count_expression.is_integer is True
-            and int(inner_count_expression) > 0
-        ):
-            inner_count = sympy.Integer(int(inner_count_expression))
-            is_leading_cohort = _equal_integer_expressions(
-                ordinal_begin,
-                0,
-            ) and _equal_integer_expressions(task_count, inner_count)
-            is_after_leading_cohort = _equal_integer_expressions(
-                ordinal_begin,
-                inner_count,
-            ) and _equal_integer_expressions(
-                ordinal_begin + task_count,
-                ordinal_count,
-            )
-            slice_piece_count = 1 if is_leading_cohort else len(source_axes) - 1
-            if (
-                (is_leading_cohort or is_after_leading_cohort)
-                and slice_piece_count <= tile_dependency._MAX_RELATION_PIECES
-                and tile_dependency._relation_product_is_within_budget(
-                    slice_piece_count,
-                    len(source_axes),
-                )
-            ):
-                source_strides: dict[int, sympy.Expr] = {}
-                stride: sympy.Expr = sympy.Integer(1)
-                for axis in source_axes:
-                    source_strides[axis] = stride
-                    stride = sympy.simplify(stride * source_counts[axis])
-                flat_source_ordinal = _flat_domain_index_expression(
-                    task_order.source_domain
-                )
-                source_to_slice_pieces: list[
-                    tuple[
-                        tuple[
-                            tuple[int, int | sympy.Expr, int | sympy.Expr, int],
-                            ...,
-                        ],
-                        tuple[sympy.Expr, ...],
-                    ]
-                ] = []
-                slice_to_source_pieces: list[
-                    tuple[
-                        tuple[
-                            tuple[int, int | sympy.Expr, int | sympy.Expr, int],
-                            ...,
-                        ],
-                        tuple[sympy.Expr, ...],
-                    ]
-                ] = []
-                slice_ordinal = coordinate_axis_symbol(slice_axis)
-
-                def mixed_radix_digit(
-                    value: sympy.Expr,
-                    axis: int,
-                ) -> sympy.Expr:
-                    axis_stride = source_strides[axis]
-                    quotient = (
-                        value
-                        if axis_stride == 1
-                        else cast("sympy.Expr", FloorDiv(value, axis_stride))
-                    )
-                    axis_count = sympy.sympify(source_counts[axis])
-                    return (
-                        sympy.Mod(quotient, axis_count)
-                        if not axis_count.free_symbols
-                        else sympy.simplify(
-                            quotient
-                            - cast("sympy.Expr", FloorDiv(quotient, axis_count))
-                            * axis_count
-                        )
-                    )
-
-                if is_leading_cohort:
-                    source_to_slice_pieces.append(
-                        (
-                            tuple(
-                                (
-                                    (axis, 0, inner_count, 1)
-                                    if index == 0
-                                    else (axis, 0, 1, 1)
-                                )
-                                for index, axis in enumerate(source_axes)
-                            ),
-                            (flat_source_ordinal,),
-                        )
-                    )
-                    slice_to_source_pieces.append(
-                        (
-                            ((slice_axis, 0, inner_count, 1),),
-                            (
-                                slice_ordinal,
-                                *(sympy.Integer(0) for _axis in source_axes[1:]),
-                            ),
-                        )
-                    )
-                else:
-                    for pivot_index in range(1, len(source_axes)):
-                        pivot_axis = source_axes[pivot_index]
-                        pivot_stride = source_strides[pivot_axis]
-                        next_stride = sympy.simplify(
-                            pivot_stride * source_counts[pivot_axis]
-                        )
-                        source_to_slice_pieces.append(
-                            (
-                                tuple(
-                                    (
-                                        (axis, 0, source_counts[axis], 1)
-                                        if index < pivot_index
-                                        else (
-                                            axis,
-                                            1,
-                                            source_counts[axis],
-                                            1,
-                                        )
-                                        if index == pivot_index
-                                        else (axis, 0, 1, 1)
-                                    )
-                                    for index, axis in enumerate(source_axes)
-                                ),
-                                (flat_source_ordinal - inner_count,),
-                            )
-                        )
-                        slice_piece_begin = sympy.simplify(pivot_stride - inner_count)
-                        slice_piece_end = sympy.simplify(next_stride - inner_count)
-                        local_ordinal = sympy.simplify(
-                            slice_ordinal - slice_piece_begin
-                        )
-                        native_coordinates: list[sympy.Expr] = []
-                        for index, axis in enumerate(source_axes):
-                            if index < pivot_index:
-                                native_coordinates.append(
-                                    mixed_radix_digit(local_ordinal, axis)
-                                )
-                            elif index == pivot_index:
-                                native_coordinates.append(
-                                    sympy.simplify(
-                                        1
-                                        + cast(
-                                            "sympy.Expr",
-                                            FloorDiv(local_ordinal, pivot_stride),
-                                        )
-                                    )
-                                )
-                            else:
-                                native_coordinates.append(sympy.Integer(0))
-                        slice_to_source_pieces.append(
-                            (
-                                (
-                                    (
-                                        slice_axis,
-                                        slice_piece_begin,
-                                        slice_piece_end,
-                                        1,
-                                    ),
-                                ),
-                                tuple(native_coordinates),
-                            )
-                        )
-
-                if (
-                    len(source_to_slice_pieces) <= tile_dependency._MAX_RELATION_PIECES
-                    and len(slice_to_source_pieces)
-                    <= tile_dependency._MAX_RELATION_PIECES
-                ):
-                    source_to_slice = CoordinateRelation.point_map(
-                        task_order.source_domain,
-                        slice_domain,
-                        tuple(source_to_slice_pieces),
-                    )
-                    slice_to_source = CoordinateRelation.point_map(
-                        slice_domain,
-                        task_order.source_domain,
-                        tuple(slice_to_source_pieces),
-                    )
-                    tile_dependency._remember_exact_converse(
-                        source_to_slice,
-                        slice_to_source,
-                    )
-                    tile_dependency._remember_single_valued(source_to_slice)
-                    tile_dependency._remember_single_valued(slice_to_source)
-                    try:
-                        tile_dependency._remember_dense_source_support_interval(
-                            source_to_slice,
-                            source_axes,
-                            ordinal_begin,
-                            ordinal_begin + task_count,
-                        )
-                        tile_dependency._remember_dense_source_support_interval(
-                            slice_to_source,
-                            (slice_axis,),
-                            0,
-                            task_count,
-                        )
-                    except ValueError:
-                        pass
-                    else:
-                        ordinal_domain = _task_order_ordinal_domain(task_order)
-                        flat_task_order = _flat_task_order_relation(
-                            task_order,
-                            ordinal_domain,
-                        )
-                        task_order_inverse = task_order.converse()
-                        if not (
-                            flat_task_order is not None
-                            and task_order_inverse is not None
-                            and task_order.is_total_function()
-                            and task_order.is_single_valued()
-                            and task_order_inverse.is_single_valued()
-                        ):
-                            flat_task_order = None
-                        if flat_task_order is not None:
-                            assert task_order_inverse is not None
-                            (ordinal_axis,) = ordinal_domain.axis_order
-                            slice_to_ordinal = CoordinateRelation.point_map(
-                                slice_domain,
-                                ordinal_domain,
-                                (
-                                    (
-                                        ((slice_axis, 0, task_count, 1),),
-                                        (slice_ordinal + ordinal_begin,),
-                                    ),
-                                ),
-                            )
-                            result = slice_to_ordinal._then_without_converse(
-                                flat_task_order
-                            )
-                            result_inverse = task_order_inverse.then(source_to_slice)
-                            if result is not None and result_inverse is not None:
-                                tile_dependency._remember_exact_converse(
-                                    result,
-                                    result_inverse,
-                                )
-                                tile_dependency._remember_single_valued(result)
-                                tile_dependency._remember_single_valued(result_inverse)
-                                tile_dependency._remember_dense_source_support_interval(
-                                    result,
-                                    (slice_axis,),
-                                    0,
-                                    task_count,
-                                )
-                                return result
-
-    if len(source_axes) == 2:
-        inner_axis, outer_axis = source_axes
-        inner_count_expression = source_counts[inner_axis]
-        if (
-            not inner_count_expression.free_symbols
-            and inner_count_expression.is_integer is True
-            and int(inner_count_expression) > 0
-        ):
-            inner_count = int(inner_count_expression)
-            begin_remainder = sympy.simplify(sympy.Mod(ordinal_begin, inner_count))
-            count_remainder = sympy.simplify(sympy.Mod(task_count, inner_count))
-            if begin_remainder == 0 and count_remainder == 0:
-                outer_begin = sympy.simplify(FloorDiv(ordinal_begin, inner_count))
-                outer_count = sympy.simplify(FloorDiv(task_count, inner_count))
-                outer_end = sympy.simplify(outer_begin + outer_count)
-                source_counts = task_order.source_domain.axis_count_expressions
-                if tile_dependency._is_provably_nonnegative(
-                    sympy.simplify(source_counts[outer_axis] - outer_end),
-                    None,
-                ):
-                    local_ordinal = coordinate_axis_symbol(slice_axis)
-                    slice_to_source = CoordinateRelation.point_map(
-                        slice_domain,
-                        task_order.source_domain,
-                        (
-                            (
-                                ((slice_axis, 0, task_count, 1),),
-                                (
-                                    sympy.Mod(local_ordinal, inner_count),
-                                    outer_begin
-                                    + cast(
-                                        "sympy.Expr",
-                                        FloorDiv(local_ordinal, inner_count),
-                                    ),
-                                ),
-                            ),
-                        ),
-                    )
-                    source_to_slice = CoordinateRelation.point_map(
-                        task_order.source_domain,
-                        slice_domain,
-                        (
-                            (
-                                (
-                                    (inner_axis, 0, inner_count, 1),
-                                    (outer_axis, outer_begin, outer_end, 1),
-                                ),
-                                (
-                                    coordinate_axis_symbol(inner_axis)
-                                    + inner_count
-                                    * (
-                                        coordinate_axis_symbol(outer_axis) - outer_begin
-                                    ),
-                                ),
-                            ),
-                        ),
-                    )
-                    tile_dependency._remember_exact_converse(
-                        slice_to_source,
-                        source_to_slice,
-                    )
-                    result = slice_to_source.then(task_order)
-                    task_order_inverse = task_order.converse()
-                    result_inverse = (
-                        None
-                        if task_order_inverse is None
-                        else task_order_inverse.then(source_to_slice)
-                    )
-                    if result is not None and result_inverse is not None:
-                        tile_dependency._remember_exact_converse(
-                            result,
-                            result_inverse,
-                        )
-                        return result
-
-    ordinal_domain = _task_order_ordinal_domain(task_order)
-    flat_task_order = _flat_task_order_relation(task_order, ordinal_domain)
-    if flat_task_order is not None:
-        (ordinal_axis,) = ordinal_domain.axis_order
-        slice_ordinal = coordinate_axis_symbol(slice_axis)
-        ordinal = coordinate_axis_symbol(ordinal_axis)
-        slice_to_ordinal = CoordinateRelation.point_map(
-            slice_domain,
-            ordinal_domain,
-            (
-                (
-                    ((slice_axis, 0, task_count, 1),),
-                    (slice_ordinal + ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
-                ),
-            ),
-        )
-        # Keep the inverse's source box rectangular and let the slice target
-        # domain clip ordinals outside the selected interval. This is the exact
-        # converse of the translation above, and ordinary point composition
-        # restricts any supported task-order representation through the same
-        # path for constant and symbolic bounds.
-        ordinal_to_slice = CoordinateRelation.point_map(
-            ordinal_domain,
-            slice_domain,
-            (
-                (
-                    ((ordinal_axis, 0, ordinal_count, 1),),
-                    (ordinal - ordinal_begin,),  # pyrefly: ignore[unsupported-operation]
-                ),
-            ),
-        )
-        tile_dependency._remember_exact_converse(slice_to_ordinal, ordinal_to_slice)
-        result = slice_to_ordinal.then(flat_task_order)
-        if (
-            result is not None
-            and tile_dependency._memoized_exact_converse(result) is not None
-        ):
-            return result
-
-    return None
-
-
 def _equal_integer_expressions(
     left: int | sympy.Expr,
     right: int | sympy.Expr,
@@ -2260,32 +1500,11 @@ def _packed_root_major_task_order_relation(
     task_order: CoordinateRelation,
     first_slot: sympy.Expr,
     worker_count: int,
-    *,
-    ordinal_begin: int | sympy.Expr = 0,
-    task_count: int | sympy.Expr | None = None,
 ) -> CoordinateRelation | None:
-    """Compose packed slots with a complete or sliced logical traversal."""
+    """Compose packed slots with one complete logical traversal."""
     if (
         not task_order.is_bijection_from_source_support()
         or task_order.converse() is None
-    ):
-        return None
-    ordinal_begin = sympy.simplify(sympy.sympify(ordinal_begin))
-    full_task_count = task_order.source_domain.size_expr
-    task_count = (
-        full_task_count
-        if task_count is None
-        else sympy.simplify(sympy.sympify(task_count))
-    )
-    if (
-        ordinal_begin.is_integer is not True
-        or task_count.is_integer is not True
-        or not tile_dependency._is_provably_nonnegative(ordinal_begin, None)
-        or not tile_dependency._is_provably_nonnegative(task_count, None)
-        or not tile_dependency._is_provably_nonnegative(
-            sympy.simplify(full_task_count - ordinal_begin - task_count),
-            None,
-        )
     ):
         return None
 
@@ -2324,43 +1543,6 @@ def _packed_root_major_task_order_relation(
             tile_dependency._remember_single_valued(composed_inverse)
         return composed
 
-    is_full_traversal = _equal_integer_expressions(
-        ordinal_begin,
-        0,
-    ) and _equal_integer_expressions(task_count, full_task_count)
-    if not is_full_traversal:
-        sliced_order = _task_order_slice(task_order, ordinal_begin, task_count)
-        if sliced_order is None:
-            return None
-        packed_local = _packed_root_major_relation(
-            schedule_domain,
-            sliced_order.source_domain,
-            first_slot,
-            worker_count,
-            sliced_order.source_domain.axis_order,
-        )
-        composed = (
-            None
-            if packed_local is None
-            else retain_packed_support(
-                packed_local,
-                sliced_order,
-                packed_local.then(sliced_order),
-            )
-        )
-        cardinality = (
-            None if composed is None else composed.source_support_cardinality()
-        )
-        inverse = None if composed is None else composed.converse()
-        if (
-            composed is None
-            or cardinality is None
-            or not _equal_integer_expressions(cardinality, task_count)
-            or inverse is None
-            or not inverse.is_single_valued()
-        ):
-            return None
-        return composed
     packed_source = _packed_root_major_relation(
         schedule_domain,
         task_order.source_domain,
@@ -2556,11 +1738,7 @@ def _root_major_schedule_geometry_from_parts(
     for segment in segments:
         relation = segment.task_order
         target_domain = relation.target_domain
-        if (
-            segment.root in seen_roots
-            or segment.worker_begin != 0
-            or segment.worker_count != worker_count
-        ):
+        if segment.root in seen_roots:
             return None
         seen_roots.add(segment.root)
         task_count = target_domain.size_expr
@@ -2658,6 +1836,15 @@ def _validate_normalized_worker_schedule(
             raise ValueError("one root uses multiple logical task domains")
         relations = tuple(segment.task_order for segment in root_segments)
         inverses = tuple(relation.converse() for relation in relations)
+        combined_inverse: CoordinateRelation | None = None
+        for inverse in inverses:
+            if inverse is None:
+                break
+            combined_inverse = (
+                inverse if combined_inverse is None else combined_inverse.union(inverse)
+            )
+            if combined_inverse is None:
+                break
         cardinalities = tuple(
             relation.source_support_cardinality() for relation in relations
         )
@@ -2676,6 +1863,8 @@ def _validate_normalized_worker_schedule(
                 for index, inverse in enumerate(inverses)
                 for other_inverse in inverses[index + 1 :]
             )
+            or combined_inverse is None
+            or not combined_inverse.is_total_function()
             or not _equal_integer_expressions(
                 sympy.Add(*(value for value in cardinalities if value is not None)),
                 target_domain.size_expr,
@@ -3334,12 +2523,7 @@ def root_barrier_publication_plan(
     *,
     dispatch_mode: CrossLoopDispatchMode,
 ) -> RootBarrierPublicationPlan:
-    """Assign every participating worker to its final root occurrence once.
-
-    The reverse scan and interval subtraction are the authoritative derivation
-    used for both the barrier arrival count and the codegen emission sites.
-    No worker or task is enumerated.
-    """
+    """Assign every participating worker to its sole resident root segment."""
     continuation_domains = tuple(
         consumer.keys_by_consumer.source_domain
         for counter in readiness_counters
@@ -3363,9 +2547,9 @@ def root_barrier_publication_plan(
     if dispatch_mode not in ("static", "dynamic"):
         raise ValueError(f"invalid cross-loop dispatch mode {dispatch_mode!r}")
     root_segments = worker_schedule.segments_for_root(root)
+    if len(root_segments) > 1:
+        raise ValueError("root publication requires at most one segment per root")
     dynamic_segments = root_segments if dispatch_mode == "dynamic" else ()
-    if len(dynamic_segments) > 1:
-        raise ValueError("dynamic dispatch requires one segment per root")
     dynamic_task_arrival_count = (
         dynamic_segments[0].task_order.target_domain.size if dynamic_segments else 0
     )
@@ -3423,57 +2607,25 @@ def root_barrier_publication_plan(
                 continuation_arrival_count=0,
                 dynamic_task_arrival_count=0,
             )
-        if not matching:
-            if continuation_arrival_count == 0 and dynamic_task_arrival_count == 0:
-                raise ValueError(f"relation schedule has no root {root}")
-        elif root_major_geometry is not None:
-            raise ValueError(f"root-major schedule has no unique root {root}")
-        else:
-            # A root split across several symbolic segments needs a
-            # parameter-dependent final-occurrence owner per segment. The
-            # current publication plan has only exact static worker intervals,
-            # so use that existing strength reduction only when every relevant
-            # relation is parameter-free. A constant worker projection is not
-            # enough: a later symbolic segment may be empty at runtime.
-            if any(
-                relation_geometry[segment_index][0].task_order.parameter_symbols
-                for segment_index in matching
-            ):
-                raise ValueError(
-                    "root-barrier publication for a repeated relation-scheduled "
-                    "root is not yet representable"
-                )
-    later_workers: tuple[WorkerInterval, ...] = ()
-    reverse_publications: list[RootBarrierPublication] = []
-    for segment_index in reversed(range(len(worker_schedule.segments))):
-        segment = worker_schedule.segments[segment_index]
-        if segment.root != root or segment.launch_stage == _SOURCE_LAUNCH_STAGE:
-            continue
-        segment_workers = segment.worker_intervals()
-        publication_workers = _subtract_intervals(segment_workers, later_workers)
-        if publication_workers:
-            reverse_publications.append(
-                RootBarrierPublication(segment_index, publication_workers)
-            )
-        later_workers = _normalize_intervals([*later_workers, *segment_workers])
+        if not matching and not root_segments and continuation_arrival_count == 0:
+            raise ValueError(f"relation schedule has no root {root}")
 
-    publications = tuple(reversed(reverse_publications))
-    published_intervals = _normalize_intervals(
-        [
-            interval
-            for publication in publications
-            for interval in publication.worker_intervals
-        ]
-    )
-    published_count = sum(
-        _interval_cardinality(publication.worker_intervals)
-        for publication in publications
-    )
-    if published_intervals != later_workers or published_count != _interval_cardinality(
-        later_workers
-    ):
-        raise AssertionError("root publication ownership is not an exact partition")
-    resident_arrival_count = published_count
+    if root_segments and continuation_arrival_count != 0:
+        raise ValueError("resident root ownership overlaps continuation ownership")
+    if root_segments:
+        (segment,) = root_segments
+        segment_index = worker_schedule.segments.index(segment)
+        participant_intervals = segment.worker_intervals()
+        publications = (
+            (RootBarrierPublication(segment_index, participant_intervals),)
+            if participant_intervals
+            else ()
+        )
+        resident_arrival_count = _interval_cardinality(participant_intervals)
+    else:
+        participant_intervals = ()
+        publications = ()
+        resident_arrival_count = 0
     real_arrival_count = _concrete_or_symbolic_integer(
         sympy.Add(
             resident_arrival_count,
@@ -3487,7 +2639,7 @@ def root_barrier_publication_plan(
         )
     return RootBarrierPublicationPlan(
         root=root,
-        participant_intervals=later_workers,
+        participant_intervals=participant_intervals,
         participant_order=None,
         publications=publications,
         resident_arrival_count=resident_arrival_count,
@@ -5467,8 +4619,7 @@ def _compact_nested_loop_counters_for_schedule(
             ),
         }
         if dispatch_mode != "static" or any(
-            len(worker_schedule.segments_for_root(root)) != 1
-            for root in relevant_roots
+            len(worker_schedule.segments_for_root(root)) != 1 for root in relevant_roots
         ):
             result.append(plan)
             continue
@@ -5567,15 +4718,6 @@ class StaticPipelinePlan:
             for consumer_index, consumer in enumerate(counter.consumers):
                 if consumer_index == counter.continuation_consumer_index:
                     continuation_roots.add(consumer.consumer_root)
-
-        if (
-            _emittable_readiness_counters(
-                self.readiness_counters,
-                root_domains,
-            )
-            != self.readiness_counters
-        ):
-            raise ValueError("readiness counter is unsupported by the current renderer")
 
         if (
             _canonical_schedule_root_positions(
@@ -7279,52 +6421,6 @@ def derive_final_arrival_continuations(
 _MAX_SYMBOLIC_RELATION_WORK = 2_000_000
 
 
-def _validate_worker_schedule_tasks(
-    worker_schedule: WorkerSchedule,
-    root_task_orders: tuple[CoordinateRelation, ...],
-    *,
-    excluded_roots: frozenset[int] = frozenset(),
-) -> bool:
-    """Prove exact ownership, with explicitly excluded roots absent."""
-    if any(root < 0 or root >= len(root_task_orders) for root in excluded_roots):
-        return False
-    for root, reference_task_order in enumerate(root_task_orders):
-        root_domain = reference_task_order.target_domain
-        segments = worker_schedule.segments_for_root(root)
-        if root in excluded_roots:
-            if segments:
-                return False
-            continue
-        if root_domain.size_expr.is_zero is True:
-            if segments:
-                return False
-            continue
-        if not segments:
-            return False
-        if any(
-            segment.task_order.source_domain != worker_schedule.placement_domain
-            or segment.task_order.target_domain != root_domain
-            for segment in segments
-        ):
-            return False
-        placement = _root_task_placement_relation(worker_schedule, root)
-        if placement is not None:
-            continue
-        # The traversal compatibility path uses concrete ordinal domains.
-        # A symbolic schedule is valid only when its authoritative placement
-        # relation itself proves exact ownership.
-        if root_domain.parameter_symbols or any(
-            segment.task_order.parameter_symbols for segment in segments
-        ):
-            return False
-        if sum(segment.task_count for segment in segments) != root_domain.size:
-            return False
-        traversal = _root_schedule_traversal(segments, reference_task_order)
-        if traversal is None or traversal.logical_task_to_scheduled_ordinal is None:
-            return False
-    return True
-
-
 def _canonical_schedule_root_positions(
     worker_schedule: WorkerSchedule,
     root_task_orders: tuple[CoordinateRelation, ...],
@@ -7349,10 +6445,11 @@ def _canonical_schedule_root_positions(
             segment.launch_stage != _RESIDENT_LAUNCH_STAGE
             for segment in worker_schedule.segments
         )
-        or not _validate_worker_schedule_tasks(
-            worker_schedule,
-            root_task_orders,
-            excluded_roots=continuation_roots,
+        or any(
+            segment.task_order.source_domain != worker_schedule.placement_domain
+            or segment.task_order.target_domain
+            != root_task_orders[segment.root].target_domain
+            for segment in worker_schedule.segments
         )
     ):
         return None
@@ -7624,37 +6721,31 @@ def _root_schedule_traversal(
     segments: tuple[WorkerScheduleSegment, ...],
     reference_task_order: CoordinateRelation,
 ) -> _ScheduledRootTraversal | None:
-    """Derive the one symbolic traversal certificate consumed downstream.
-
-    Codegen maps each concatenated segment ordinal through the corresponding
-    ``segment.task_order`` before recovering the root's canonical PID.  The
-    schedule therefore need not reproduce the reference traversal.  When the
-    union of directly composed inverse relations is representable and total,
-    equal cardinality proves exact-once ownership without materializing either
-    domain.  Optimized candidates require that inverse.  Existing conservative
-    PID permutations may retain only the segment ranges used by codegen.
-    """
-    root_domain = reference_task_order.target_domain
-    if not segments:
+    """Derive the symbolic traversal certificate for one complete root run."""
+    if len(segments) != 1:
         return None
+    (segment,) = segments
+    root_domain = reference_task_order.target_domain
     try:
-        segment_task_counts = tuple(segment.task_count_expr for segment in segments)
+        task_count = segment.task_count_expr
     except ValueError:
         return None
-    if not _equal_integer_expressions(
-        sympy.Add(*segment_task_counts),
-        root_domain.size_expr,
+    if not _equal_integer_expressions(task_count, root_domain.size_expr):
+        return None
+    if (
+        not _equal_integer_expressions(
+            reference_task_order.source_domain.size_expr,
+            root_domain.size_expr,
+        )
+        or not reference_task_order.is_total_function()
     ):
         return None
+
     ordinal_axis = (
         max(
             (
                 *root_domain.axis_order,
-                *(
-                    axis
-                    for segment in segments
-                    for axis in segment.task_order.source_domain.axis_order
-                ),
+                *segment.task_order.source_domain.axis_order,
             ),
             default=0,
         )
@@ -7666,90 +6757,30 @@ def _root_schedule_traversal(
         kind="task_order",
         _allow_empty=root_domain.size_expr.is_zero is True,
     )
-    root_to_scheduled: CoordinateRelation | None = None
-    scheduled_to_root: CoordinateRelation | None = None
-    inverse_relation_supported = True
-    forward_relation_supported = True
-    segment_ordinal_ranges: list[
-        tuple[WorkerScheduleSegment, sympy.Expr, sympy.Expr]
-    ] = []
-    ordinal_begin: sympy.Expr = sympy.Integer(0)
-    for segment, segment_task_count in zip(
-        segments,
-        segment_task_counts,
-        strict=True,
-    ):
-        logical_order = segment.logical_task_order
-        if logical_order is None:
-            logical_order = _authoritative_dense_segment_logical_order(segment)
-        if (
-            logical_order is None
-            or logical_order.target_domain != root_domain
-            or not logical_order.is_total_function()
-        ):
-            return None
-        forward_piece = _flat_task_order_relation(
-            logical_order,
-            ordinal_domain,
-            ordinal_begin=ordinal_begin,
-        )
-        inverse_piece = _logical_task_to_order_ordinal(
-            logical_order,
-            ordinal_domain,
-            ordinal_begin=ordinal_begin,
-        )
-        if inverse_piece is None or not inverse_relation_supported:
-            inverse_relation_supported = False
-            root_to_scheduled = None
-        else:
-            root_to_scheduled = (
-                inverse_piece
-                if root_to_scheduled is None
-                else root_to_scheduled.union(inverse_piece)
-            )
-            if root_to_scheduled is None:
-                inverse_relation_supported = False
-        if forward_piece is None or not forward_relation_supported:
-            forward_relation_supported = False
-            scheduled_to_root = None
-        else:
-            scheduled_to_root = (
-                forward_piece
-                if scheduled_to_root is None
-                else scheduled_to_root.union(forward_piece)
-            )
-            if scheduled_to_root is None:
-                forward_relation_supported = False
-        segment_ordinal_ranges.append(
-            (
-                segment,
-                ordinal_begin,
-                sympy.simplify(ordinal_begin + segment_task_count),
-            )
-        )
-        ordinal_begin = sympy.simplify(ordinal_begin + segment_task_count)
+    logical_order = segment.logical_task_order
+    if logical_order is None:
+        logical_order = _authoritative_dense_segment_logical_order(segment)
     if (
-        not _equal_integer_expressions(
-            reference_task_order.source_domain.size_expr,
-            root_domain.size_expr,
-        )
-        or not reference_task_order.is_total_function()
+        logical_order is None
+        or logical_order.target_domain != root_domain
+        or not logical_order.is_total_function()
     ):
         return None
+
+    scheduled_to_root = _flat_task_order_relation(logical_order, ordinal_domain)
+    root_to_scheduled = _logical_task_to_order_ordinal(
+        logical_order,
+        ordinal_domain,
+    )
     if root_to_scheduled is not None and not root_to_scheduled.is_total_function():
         root_to_scheduled = None
-
     if scheduled_to_root is not None and not scheduled_to_root.is_single_valued():
         scheduled_to_root = None
     if scheduled_to_root is not None and not scheduled_to_root.is_total_function():
         scheduled_to_root = None
     if scheduled_to_root is not None:
-        # Segment boundaries are placement details, not logical traversal
-        # discontinuities.  Joining identical adjacent point maps can expose a
-        # single mixed-radix bijection whose inverse is provable only over the
-        # complete root domain (for example, complementary prefix/suffix
-        # slices).  The joined forward relation remains derived directly from
-        # the authoritative schedule relation.
+        # A woven PID traversal can expose its exact inverse only after
+        # adjacent pieces of the complete root traversal are coalesced.
         joined_forward = scheduled_to_root.coalesce_adjacent_source_boxes()
         if joined_forward.is_total_function():
             scheduled_to_root = joined_forward
@@ -7761,13 +6792,13 @@ def _root_schedule_traversal(
                 and converse.is_total_function()
             ):
                 root_to_scheduled = converse
+
     reference_ordinal = _logical_task_to_reference_ordinal(
         reference_task_order,
         ordinal_domain,
     )
-
     return _ScheduledRootTraversal(
-        segment_ordinal_ranges=tuple(segment_ordinal_ranges),
+        segment_ordinal_ranges=((segment, sympy.Integer(0), task_count),),
         scheduled_ordinal_to_logical_task=scheduled_to_root,
         logical_task_to_scheduled_ordinal=root_to_scheduled,
         matches_reference=(
@@ -8752,11 +7783,11 @@ def _try_finalize_pipeline_proposal(
     # ownership/prerequisite plan. It may fall back to canonical task order,
     # but it cannot split or move a root.
     candidates = (prepared_candidate, ownership_base)
-    attempted: set[int] = set()
+    attempted: set[WorkerSchedule] = set()
     for candidate in candidates:
-        if id(candidate) in attempted:
+        if candidate in attempted:
             continue
-        attempted.add(id(candidate))
+        attempted.add(candidate)
         if not _schedule_is_progress_safe(
             candidate,
             readiness_graph,
@@ -8806,12 +7837,15 @@ def _try_finalize_pipeline_proposal(
                     emitted_counters,
                 )
                 != emitted_continuations
-                or not _schedule_is_progress_safe(
-                    candidate,
-                    readiness_graph,
-                    emitted_counters,
-                    root_barrier_edges,
-                    dispatch_mode=dispatch_mode,
+                or (
+                    emitted_counters != readiness_counters
+                    and not _schedule_is_progress_safe(
+                        candidate,
+                        readiness_graph,
+                        emitted_counters,
+                        root_barrier_edges,
+                        dispatch_mode=dispatch_mode,
+                    )
                 )
             ):
                 continue
@@ -8938,8 +7972,7 @@ def build_static_pipeline_plan(
         scheduling_counters = all_resident_counters
     proposal = (
         all_resident_plan
-        if not continuations
-        and cross_loop_dispatch_mode == "static"
+        if not continuations and cross_loop_dispatch_mode == "static"
         else _try_finalize_pipeline_proposal(
             readiness_graph=readiness_graph,
             worker_count=worker_count,

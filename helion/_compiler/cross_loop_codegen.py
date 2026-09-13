@@ -751,11 +751,6 @@ def emit_cross_loop_schedule(
             for readiness_consumer in plan.consumers
         )
     )
-    continuation_roots = {
-        continuation_consumer.consumer_root
-        for plan in readiness_counter_plans
-        if (continuation_consumer := plan.continuation_consumer) is not None
-    }
     launch_worker_count = static_pipeline_plan.worker_schedule.worker_count
     root_barrier_producer_roots = sorted(
         {producer for producer, _consumer in root_barrier_edges}
@@ -769,19 +764,12 @@ def emit_cross_loop_schedule(
         )
         if publication_plan is not None
     }
-    dispatch_mode = static_pipeline_plan.dispatch_mode
-    if dispatch_mode != pipeline:
+    if static_pipeline_plan.dispatch_mode != pipeline:
         raise AssertionError("pipeline plan disagrees with configured dispatch mode")
-    uses_packet_dispatch = dispatch_mode == "dynamic"
-    packet_count = (
-        sum(
-            segment.task_count
-            for segment in static_pipeline_plan.worker_schedule.segments
-        )
-        if uses_packet_dispatch
-        else launch_worker_count
+    uses_packet_dispatch = pipeline == "dynamic"
+    packet_count = sum(
+        segment.task_count for segment in static_pipeline_plan.worker_schedule.segments
     )
-    launch_program_count = packet_count if uses_packet_dispatch else launch_worker_count
 
     # Static execution requires its complete worker cohort to be resident.
     # Dynamic execution relies only on monotone retirement/admission and must
@@ -821,7 +809,7 @@ def emit_cross_loop_schedule(
     readiness_counter_state_offset = reserve_state(readiness_counter_count)
     root_barrier_state_offset = reserve_state(root_barrier_count)
     epoch_state_count = launch_worker_count if not uses_packet_dispatch else 0
-    static_state_base = str(
+    counter_state_base = str(
         (epoch_state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
         // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
@@ -830,7 +818,7 @@ def emit_cross_loop_schedule(
         _register_cross_loop_state(
             device_function,
             name_hint="tile_dependency_state",
-            numel=(f"{static_state_base} + {state_count}"),
+            numel=(f"{counter_state_base} + {state_count}"),
             dtype=_CROSS_LOOP_COUNTER_DTYPE,
         )
         if epoch_state_count or state_count != 0
@@ -852,7 +840,7 @@ def emit_cross_loop_schedule(
             return None
         if state_arg is None:
             raise AssertionError("uint32 cross-loop state was not allocated")
-        return f"{state_arg} + ({static_state_base}) + {offset}"
+        return f"{state_arg} + ({counter_state_base}) + {offset}"
 
     epoch_arg = state_arg
     readiness_counter_arg = state_section(readiness_counter_state_offset)
@@ -881,12 +869,12 @@ def emit_cross_loop_schedule(
             statement_from_string(
                 f"{dispatch_ticket} = tl.cast("
                 f"{raw_dispatch_ticket} % tl.cast("
-                f"{launch_program_count}, tl.uint64), tl.int32)"
+                f"{packet_count}, tl.uint64), tl.int32)"
             ),
             statement_from_string(
                 f"{epoch_var} = tl.cast("
                 f"{raw_dispatch_ticket} // tl.cast("
-                f"{launch_program_count}, tl.uint64) + 1, tl.uint32)"
+                f"{packet_count}, tl.uint64) + 1, tl.uint32)"
             ),
         ]
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
@@ -1041,17 +1029,11 @@ def emit_cross_loop_schedule(
             if segment.task_order != reference:
                 scheduled_task_roots.add(segment.root)
     else:
-        for root, task_order in enumerate(root_task_orders):
+        for root in range(len(root_task_orders)):
             segments = static_pipeline_plan.worker_schedule.segments_for_root(root)
             if not segments:
                 continue
-            traversal = _root_schedule_traversal(segments, task_order)
-            if traversal is None:
-                remember_authoritative_traversal(root, segments)
-            else:
-                root_schedule_traversals[root] = traversal
-            if traversal is not None and not traversal.matches_reference:
-                scheduled_task_roots.add(root)
+            remember_authoritative_traversal(root, segments)
     readiness_consumers_by_root: dict[
         int,
         list[tuple[ReadinessCounterPlan, ReadinessConsumer]],
@@ -1921,8 +1903,8 @@ def emit_cross_loop_schedule(
                 segment.task_order,
                 {
                     launch_stage_axis: str(_RESIDENT_LAUNCH_STAGE),
-                    worker_axis: f"(({global_slot}) % {segment.worker_count})",
-                    wave_axis: f"(({global_slot}) // {segment.worker_count})",
+                    worker_axis: f"(({global_slot}) % {launch_worker_count})",
+                    wave_axis: f"(({global_slot}) // {launch_worker_count})",
                 },
                 allow_exact_partial=True,
             )
@@ -2164,35 +2146,6 @@ def emit_cross_loop_schedule(
             )
         ]
 
-    static_segments_by_root: dict[int, tuple[WorkerScheduleSegment, ...]] = {}
-    for root in range(len(root_domains)):
-        segments = (
-            ()
-            if uses_packet_dispatch
-            else static_pipeline_plan.worker_schedule.segments_for_root(root)
-        )
-        if not segments:
-            continue
-        if schedule_segment_geometry is not None:
-            if any(
-                id(segment) not in segment_geometry_by_identity for segment in segments
-            ):
-                raise exc.InvalidConfig(
-                    f"cross_loop_pipeline={pipeline!r} does not support "
-                    f"root {root}'s packed worker assignment"
-                )
-            static_segments_by_root[root] = segments
-            continue
-        traversal = root_schedule_traversals.get(root)
-        if traversal is None or any(
-            segment.dispatch_offset % segment.worker_count for segment in segments
-        ):
-            raise exc.InvalidConfig(
-                f"cross_loop_pipeline={pipeline!r} does not "
-                f"support root {root}'s worker assignment"
-            )
-        static_segments_by_root[root] = segments
-
     def worker_membership_condition(
         intervals: tuple[WorkerInterval, ...],
     ) -> str:
@@ -2241,10 +2194,6 @@ def emit_cross_loop_schedule(
     ) -> list[ast.stmt]:
         """Lower one run at its authoritative position in the segment stream."""
         root = segment.root
-        if root in continuation_roots:
-            raise AssertionError("continuation-owned root has a static segment")
-        if segment not in static_segments_by_root.get(root, ()):
-            raise AssertionError("static segment is not owned by its root")
         task_dispatch: list[ast.stmt]
         execution_plan = root_publication_plans.get(root)
         participant_order = (
@@ -2357,11 +2306,7 @@ def emit_cross_loop_schedule(
                         type_comment=None,
                     )
                 ]
-        elif (
-            segment.task_count == 1
-            and root_domains[root].size == 1
-            and len(static_segments_by_root[root]) == 1
-        ):
+        elif segment.task_count == 1 and root_domains[root].size == 1:
             task_dispatch = scheduled_root_task_body(
                 root,
                 "0",
@@ -2476,7 +2421,12 @@ def emit_cross_loop_schedule(
                     )
                 )
                 continue
-            traversal = root_schedule_traversals[segment.root]
+            traversal = root_schedule_traversals.get(segment.root)
+            if traversal is None or segment.dispatch_offset % segment.worker_count:
+                raise exc.InvalidConfig(
+                    f"cross_loop_pipeline={pipeline!r} does not "
+                    f"support root {segment.root}'s worker assignment"
+                )
             if len(traversal.segment_ordinal_ranges) != 1:
                 raise AssertionError(
                     "canonical static dispatch requires one traversal range per root"

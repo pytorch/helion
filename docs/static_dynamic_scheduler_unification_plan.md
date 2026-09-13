@@ -103,7 +103,7 @@ standalone are constituent-body/resource work; the scheduler does not hide
 them by changing numerics or fusion.
 
 The canonical Q1 and Q2 cases deliberately exercise different synchronization
-mechanisms under the same `static/static` root policy.  Q1 publishes a
+mechanisms under the same kernel-wide `static` policy.  Q1 publishes a
 fan-in-128 root barrier; Q2 contracts its second root into a direct same-CTA
 continuation.  Both exactly match their two-launch standalone boundary and
 pass 20 alternating-input CUDA Graph replays.  This rules out selecting an
@@ -776,6 +776,37 @@ fusion or numerics is invalid.
   saved pre-cleanup endpoints.  The full correctness and performance matrix
   remains the release gate whenever unrelated backend changes invalidate the
   recorded binaries.
+
+### Phase 9: remove retired split-root machinery — complete
+
+- Exact ownership, including a total converse over each root task domain, is
+  proved once when `WorkerSchedule` is constructed.  Final-plan validation
+  checks only its source-ordered one-segment-per-root contract and configured
+  domains; there is no second ownership validator.
+- Root-barrier publication and traversal consume one segment per retained root.
+  Repeated-root final-occurrence scans and multi-segment traversal unions were
+  deleted.
+- Partial task-order slicing and the partial packed-root API were deleted.
+  They existed only to split a root for the retired cross-root list placer.
+- The standalone max-plus/list-placement oracle test was deleted with that
+  retired policy; continuation legality remains covered by the scheduler and
+  code-generation suites.
+- The dormant source launch-stage behavior was removed while retaining the
+  existing three-axis relation layout for generated-code stability.
+- Root-major geometry now recognizes underfilled roots from authoritative
+  relation support rather than legacy `worker_count` fields.  Codegen decodes
+  that support with the launch worker count.
+- The packed-geometry fallback remains intentionally: it is a conservative
+  fallback when the stronger symbolic support-equivalence proof declines, not
+  a second scheduling policy.
+- Finalization reuses an already-successful exact-counter progress proof and
+  deduplicates schedule candidates by value.
+- The cleanup removed about 3,000 production/test lines while preserving the
+  endpoint contract.  Post-cleanup cold-L2 checks measured FlashMLA B4 at
+  61.44 us versus 69.50 us standalone, Qwen's checked-in dynamic-shape source
+  at 100.42 us versus 100.54 us for its same-source static-shape control, and
+  Gemma4 A4B B1 at 49.15 us versus 55.26 us standalone.  Outputs and replay
+  were exact in all three checks.
 
 The cleanup deleted the combinatorial `ListOf` search dimension, mixed-run
 coalescing, mixed-cohort residency validation, and mixed-transition proof

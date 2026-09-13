@@ -1157,9 +1157,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 ]
                 self.assertEqual(len(continuation_lines), 2)
                 for line in continuation_lines:
-                    self.assertIn(
-                        f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line
-                    )
+                    self.assertIn(f"* {_CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}", line)
                 self.assertIn(
                     f"+ {16 * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS} +",
                     continuation_lines[1],
@@ -1472,7 +1470,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         torch.testing.assert_close(out, (x + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
         self.assertIn("tile_dependency_continuation_task", code)
-        self.assertIn("tile_dependency_schedule_slot", code)
+        self.assertIn("tile_dependency_scheduled_logical_task", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()

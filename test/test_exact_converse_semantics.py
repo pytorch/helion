@@ -20,7 +20,6 @@ from helion._compiler.tile_dependency import _is_provably_nonnegative
 from helion._compiler.tile_dependency import _memoized_exact_converse
 from helion._compiler.tile_dependency import _remember_exact_converse
 from helion._compiler.tile_dependency import coordinate_axis_symbol
-from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import TestCase
 
 
@@ -562,49 +561,6 @@ class TestExactConverseSemantics(TestCase):
                 for target_index in range(len(permutation))
             ),
         )
-
-    def test_multisegment_root_requires_exact_union_ownership(self) -> None:
-        target = CoordinateDomain((10,), ((10, 6),), identity=0)
-        task_order = pid_task_order(target, target.axis_order)
-        prefix = cross_loop_scheduler._task_order_slice(task_order, 0, 4)
-        suffix = cross_loop_scheduler._task_order_slice(task_order, 4, 2)
-        duplicate = cross_loop_scheduler._task_order_slice(task_order, 2, 2)
-        self.assertIsNotNone(prefix)
-        self.assertIsNotNone(suffix)
-        self.assertIsNotNone(duplicate)
-        assert prefix is not None and suffix is not None and duplicate is not None
-
-        valid = WorkerSchedule(
-            6,
-            (
-                WorkerScheduleSegment(0, prefix, 0, 4, 0),
-                WorkerScheduleSegment(0, suffix, 4, 2, 0),
-            ),
-        )
-        first, second = (segment.task_order for segment in valid.segments)
-        self.assertTrue(first.has_disjoint_source_support(second))
-        combined = first.union(second)
-        self.assertIsNotNone(combined)
-        assert combined is not None
-        self.assertTrue(combined.is_bijection_from_source_support())
-        combined_converse = combined.converse()
-        self.assertIsNotNone(combined_converse)
-        assert combined_converse is not None
-        self.assertTrue(combined_converse.is_total_function())
-
-        with self.assertRaisesRegex(ValueError, "own each logical task once"):
-            WorkerSchedule(
-                6,
-                (WorkerScheduleSegment(0, prefix, 0, 4, 0),),
-            )
-        with self.assertRaisesRegex(ValueError, "own each logical task once"):
-            WorkerSchedule(
-                6,
-                (
-                    WorkerScheduleSegment(0, prefix, 0, 4, 0),
-                    WorkerScheduleSegment(0, duplicate, 4, 2, 0),
-                ),
-            )
 
     def test_worker_schedule_requires_disjoint_source_support(self) -> None:
         schedule_domain = CoordinateDomain(
