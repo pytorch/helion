@@ -27,7 +27,6 @@ from ... import exc
 from ...language import _decorators
 from ...language.memory_ops import _CUTE_L2_LAST_SUFFIX
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
-from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
 from ...language.memory_ops import _codegen_cute_store_permute_lane_loops
@@ -70,6 +69,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+_CUTE_ALIGNMENT_MAX_BYTES = 32
+
+
 def _persistent_vec_alignment_signature(values: Sequence[object]) -> Hashable:
     """Cache-key facts needed by persistent vector alignment/extent checks."""
     if (
@@ -80,21 +82,21 @@ def _persistent_vec_alignment_signature(values: Sequence[object]) -> Hashable:
         return None
     tensor = values[0]
     element_size = tensor.element_size()
-    max_vector_elements = max(_CUTE_VECTOR_MAX_BYTES // element_size, 1)
+    max_vector_elements = max(_CUTE_ALIGNMENT_MAX_BYTES // element_size, 1)
     return (
-        int(tensor.data_ptr()) % _CUTE_VECTOR_MAX_BYTES,
+        int(tensor.data_ptr()) % _CUTE_ALIGNMENT_MAX_BYTES,
         tuple(int(size) % max_vector_elements for size in tensor.shape),
         tuple(
             (
                 int(stride) == 1,
-                (int(stride) * element_size) % _CUTE_VECTOR_MAX_BYTES,
+                (int(stride) * element_size) % _CUTE_ALIGNMENT_MAX_BYTES,
             )
             for stride in tensor.stride()
         ),
     )
 
 
-_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY = "cute_persistent_vec_alignment_matrix_v2"
+_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY = "cute_persistent_vec_alignment_matrix_v3"
 
 
 def _persistent_vec_alignment_matrix_signature(
@@ -106,7 +108,7 @@ def _persistent_vec_alignment_matrix_signature(
 def register_persistent_vec_alignment_specializations(
     env: CompileEnvironment,
 ) -> None:
-    """Specialize persistent-vector candidates on runtime pointer alignment.
+    """Specialize vector candidates on runtime pointer alignment.
 
     Dynamic FakeTensors intentionally carry symbolic storage offsets.  The
     branch-local vectorizer therefore consults the real input tensor during
@@ -127,8 +129,8 @@ def register_persistent_vec_alignment_specializations(
         RuntimeInputSpecialization(
             sources=sources,
             classifier_identity=(
-                "byte_alignment_matrix_v2",
-                _CUTE_VECTOR_MAX_BYTES,
+                "byte_alignment_matrix_v3",
+                _CUTE_ALIGNMENT_MAX_BYTES,
                 tuple(map(repr, sources)),
             ),
             classifier=_persistent_vec_alignment_matrix_signature,
@@ -143,7 +145,7 @@ def runtime_tensor_has_specialized_alignment(
     required_alignment: int,
 ) -> bool:
     """Return a cache-key-backed runtime base-pointer alignment proof."""
-    if required_alignment <= 0 or _CUTE_VECTOR_MAX_BYTES % required_alignment:
+    if required_alignment <= 0 or _CUTE_ALIGNMENT_MAX_BYTES % required_alignment:
         return False
     runtime_tensor = env.runtime_value_for_tensor(tensor)
     if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
@@ -2796,7 +2798,7 @@ def _cute_vector_load_ctx(
 
     ``mode`` is one of ``"vec"`` (explicit ``cute.arch.load(..., V)``) or
     ``"unroll"`` (per-element scalar bitcast inside a constexpr V-loop).
-    Returns None when any predicate for a 128-bit gmem load fails, in which
+    Returns None when any predicate for a vector gmem load fails, in which
     case the caller falls back to ``_cute_scalar_load_expr``.
     """
     from ..reduction_strategy import LoopedReductionStrategy
@@ -2977,15 +2979,22 @@ def _cute_vector_load_ctx(
         if mode == "unroll":
             if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
                 return None
-            # Cap at one LDG.128 per hoist (fp32 V=8 would need 32 bytes);
-            # oversized configs stay on the (correct) scalar fallback.
-            if vec_width * tensor.dtype.itemsize > 16:
+            capability = env.config_spec.target_device_capability
+            max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
+            if vec_width * tensor.dtype.itemsize > max_bytes:
                 return None
             # Need a lane base index var + a constexpr V-loop var; both
             # are set up by the strategy's codegen_device_loop.
             if (
                 getattr(strategy, "_cute_lane_base_index_var", None) is None
                 or getattr(strategy, "_cute_lane_body", None) is None
+            ):
+                return None
+            if (
+                vec_width * tensor.dtype.itemsize > 16
+                and not _persistent_vec_is_exact_aligned(
+                    state, strategy, index_exprs, tensor, vec_width
+                )
             ):
                 return None
             return vec_width, inner_block_id, "unroll"
@@ -3050,12 +3059,14 @@ def _cute_vector_load_ctx(
             # fail the cover check and stay on per-element scalar loads.
             if not _cute_flat_multi_cover_ok(env, strategy, tensor, subscript):
                 return None
-            numel = functools.reduce(  # pyrefly: ignore [incompatible-overload-residual]
-                operator.mul,
-                [
-                    env.block_sizes[bid].numel
-                    for bid in strategy.block_ids  # pyrefly: ignore
-                ],
+            numel = (
+                functools.reduce(  # pyrefly: ignore [incompatible-overload-residual]
+                    operator.mul,
+                    [
+                        env.block_sizes[bid].numel
+                        for bid in strategy.block_ids  # pyrefly: ignore
+                    ],
+                )
             )
             if not env.known_multiple(numel, vec_width):
                 return None

@@ -1522,6 +1522,12 @@ class DeviceFunction:
                 rename_groups=rename_groups,
                 fast_math=CompileEnvironment.current().settings.fast_math,
             )
+            from .cute.cluster_sum import fuse_cluster_sums
+
+            kernel_body = fuse_cluster_sums(kernel_body)
+            from .cute.cluster_prefetch import prefetch_cluster_epilogue
+
+            kernel_body = prefetch_cluster_epilogue(kernel_body, constexpr_values)
             # ``ex2.approx.ftz`` is a numerics change (denormal exp outputs
             # flush to zero), so it is gated on the fast_math SETTING —
             # tuned configs must never change numerics.
