@@ -52,6 +52,9 @@ from .dma import allocate_indirect_dma_resources
 from .dma import async_copy_statements
 from .dma import indirect_group_statements
 from .dma import is_tpu_dma_aligned_shape
+from .memory_access import MEMORY_ACCESS_META
+from .memory_access import MemoryAccess
+from .memory_access import MemoryAccessKind
 from .tensorcore_plan import DmaAccessPlan
 from .tensorcore_plan import build_dma_access_candidates
 
@@ -588,6 +591,7 @@ def _emit_resident_prep_refill_once(
 
 LoopTensor = tuple[torch.Tensor, torch.fx.Node, tuple[object, ...]]
 LoopTensors = Mapping[int, LoopTensor]
+LoopAccesses = list[MemoryAccess]
 
 
 def _classify_loop_tensors(
@@ -1019,6 +1023,49 @@ def plan_grid_indirect_accesses(graphs: list[GraphInfo]) -> None:
                 load_resources_by_storage[storage_id] = resources
             device_fn.pallas_grid_dma_bindings[node] = resources
             device_fn.pallas_memory_space[id(access.tensor)] = PallasMemorySpace.HBM
+
+
+def _own_memory_accesses(graph_info: object) -> LoopAccesses:
+    """Returns the analyzed memory accesses in ``graph_info``'s own nodes.
+
+    Nested control-flow graphs are not followed; ``_descendant_memory_accesses``
+    covers those.
+    """
+    return [
+        access
+        for node in graph_info.graph.nodes  # type: ignore[union-attr]
+        if isinstance((access := node.meta.get(MEMORY_ACCESS_META)), MemoryAccess)
+    ]
+
+
+def _descendant_memory_accesses(
+    graph_info: object,
+    state: CodegenState,
+) -> LoopAccesses:
+    """Returns the memory accesses in every control-flow graph below ``graph_info``.
+
+    Accesses in ``graph_info`` itself are excluded. Each reachable graph is
+    visited once, depth-first; the order does not matter because every access is
+    collected.
+    """
+    from .plan_tiling import control_flow_child_graph_ids
+
+    accesses: LoopAccesses = []
+    seen: set[int] = set()
+    pending: list[object] = [graph_info]
+    while pending:
+        info = pending.pop()
+        for node in info.graph.nodes:  # type: ignore[union-attr]
+            if node.op != "call_function":
+                continue
+            for graph_id in control_flow_child_graph_ids(node):
+                if not isinstance(graph_id, int) or graph_id in seen:
+                    continue
+                seen.add(graph_id)
+                child = state.get_graph(graph_id)
+                accesses.extend(_own_memory_accesses(child))
+                pending.append(child)
+    return accesses
 
 
 def _tensor_dim_subscripts(subscript_meta: Sequence[object]) -> list[object]:
@@ -3145,8 +3192,7 @@ def _record_aligned_tiles(
     state: CodegenState,
     env: CompileEnvironment,
     block_ids: list[int],
-    loaded_tensors: LoopTensors,
-    stored_tensors: LoopTensors,
+    accesses: LoopAccesses,
 ) -> None:
     """Record jagged row tiles that read an aligned-enclosing window.
 
@@ -3157,9 +3203,13 @@ def _record_aligned_tiles(
     A DIRECT row that does not carry is omitted: it reads at the exact offset.  S
     is the largest float-tensor sublane (bf16 forces 16); tiles that carry are
     also registered for the store fold/save.
+
+    ``accesses`` covers this loop and every loop nested inside it, as collected
+    by ``_own_memory_accesses`` and ``_descendant_memory_accesses``.
     """
     from .backend import SliceAddressing
     from .backend import _slice_addressing
+    from .plan_tiling import NonePattern
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import is_row_map_axis
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
@@ -3175,22 +3225,35 @@ def _record_aligned_tiles(
     # Strictest addressing each row needs over the tensors it slices.
     addressing: dict[int, SliceAddressing] = {}
     written_bids: set[int] = set()
-    for tensors, is_store in (
-        (loaded_tensors, False),
-        (stored_tensors, True),
-    ):
-        for fake, _node, sub_meta in tensors.values():
-            dim_to_bid = _get_dim_block_ids(sub_meta, env)
-            if is_store:
-                written_bids.update(dim_to_bid.values())
-            if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+    atomic_write_bids: set[int] = set()
+    for access in accesses:
+        fake = access.tensor
+        dim_to_bid: dict[int, int] = {}
+        tensor_dim = 0
+        for pattern in access.patterns:
+            if isinstance(pattern, NonePattern):
+                # A NonePattern adds a result dim without consuming a tensor
+                # dim, so it must not advance tensor_dim.
                 continue
-            lane_block = _lane_tile(state, fake, dim_to_bid)
-            for dim, dim_bid in dim_to_bid.items():
-                if _slice_addressing(fake, dim, lane_block) is SliceAddressing.ALIGNED:
-                    addressing[dim_bid] = SliceAddressing.ALIGNED
-                else:
-                    addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
+            if isinstance((bid := getattr(pattern, "block_id", None)), int):
+                dim_to_bid[tensor_dim] = bid
+            tensor_dim += 1
+        if access.kind is not MemoryAccessKind.LOAD:
+            written_bids.update(dim_to_bid.values())
+        if access.kind is MemoryAccessKind.ATOMIC:
+            # Only the ordinary store lowering calls emit_carry_store; the
+            # atomic one assigns the ref in place, so the boundary fold and
+            # save never run for it and its head rows are never restored.
+            atomic_write_bids.update(dim_to_bid.values())
+        if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
+            continue
+        lane_block = _lane_tile(state, fake, dim_to_bid)
+        for dim, dim_bid in dim_to_bid.items():
+            access_addressing = _slice_addressing(fake, dim, lane_block)
+            if access_addressing is SliceAddressing.ALIGNED:
+                addressing[dim_bid] = SliceAddressing.ALIGNED
+            else:
+                addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
     sublane = max(sublanes)
     for i, bid in enumerate(block_ids):
@@ -3199,11 +3262,20 @@ def _record_aligned_tiles(
         if not _loop_dim_steps_by_block(state, i):
             continue  # even an aligned begin can leave begin + i * step unaligned
         carry = needs_ordered_carry(state, bid)
-        direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
-        if direct and not carry:
-            continue  # reads any offset; a plain clamped slice suffices
+        if carry and bid in atomic_write_bids:
+            raise NotImplementedError(
+                "Pallas: an atomic write through a jagged row tile whose "
+                "slices must be sublane-aligned bypasses the ordered carry, "
+                "so it cannot share the row with a carried store."
+            )
         if not carry:
+            addr = addressing.get(bid)
+            if addr is None or addr is SliceAddressing.DIRECT:
+                continue  # nothing slices the dim, or a clamped slice suffices
             if bid in written_bids:
+                # Some access rounded the window begin down, so every store on
+                # this dim writes the head rows [aligned_begin, begin), whether
+                # the store itself is DIRECT or ALIGNED.
                 raise NotImplementedError(
                     "Pallas: a jagged row tile whose slices must be "
                     "sublane-aligned and that is written through its row dim is "
@@ -3254,7 +3326,15 @@ def _build_inner_loop_window(
 ) -> InnerLoopWindow:
     """Build the iteration window for an inner tile loop."""
     loaded, stored = _classify_loop_tensors(graph_info, state)
-    _record_aligned_tiles(state, env, block_ids, loaded, stored)
+    _record_aligned_tiles(
+        state,
+        env,
+        block_ids,
+        [
+            *_own_memory_accesses(graph_info),
+            *_descendant_memory_accesses(graph_info, state),
+        ],
+    )
     grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
     begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
         state, block_ids, block_size_vars
