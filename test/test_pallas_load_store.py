@@ -471,6 +471,38 @@ class TestPallasJaggedCarryRejects(TestCase):
         ):
             _run(seq_offsets, jagged, dense, [8, 128, 128], kernel=kernel)
 
+    @parametrize("out_dtype", [torch.bfloat16, torch.float32])
+    def test_untiled_column_store_rejected(self, out_dtype: torch.dtype) -> None:
+        # With offsets [0, 13, 32] and a 16-row bf16 block, the second group
+        # logically starts at row 13 but its aligned window starts at row 0.
+        # The load mask zeroes rows [0, 13), so a full store would overwrite the
+        # first group with zeros. The untiled ":" column has no carry block
+        # with which to save those rows; reject instead of silently corrupting.
+        # An f32 output is stored DIRECT on its own, but the bf16 load rounds
+        # the window, so that store writes the head rows all the same.
+        @helion.kernel(backend="pallas")
+        def jagged_full_row_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    out[st, :] = (jagged[st, :] * 2).to(out.dtype)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        out = torch.empty((32, 128), dtype=out_dtype)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            jagged_full_row_store.bind((seq_offsets, jagged, out)).to_code(
+                helion.Config(block_sizes=[16], pallas_loop_type="emit_pipeline")
+            )
+
     def test_multi_grid_group_rejected(self) -> None:
         # The fold guard keys seq_offsets program_id(0), so a second grid dimension is
         # refused rather than folding against the wrong program id.
