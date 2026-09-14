@@ -1962,10 +1962,7 @@ def _pallas_loop_begin_and_step_exprs(
             # Align the tile begin DOWN to the sublane (aligned-enclosing).
             sublane = aligned_dim[block_ids[i]]
             begin_expr = f"(({begin_expr}) - ({begin_expr}) % {sublane})"
-        if step is None or sympy.sympify(step) in (
-            sympy.Integer(0),
-            sympy.Integer(1),
-        ):
+        if _loop_dim_steps_by_block(state, i):
             iter_step_expr = block_size_vars[i]
             slice_size_expr = block_size_vars[i]
         else:
@@ -3099,6 +3096,18 @@ def _lane_tile(
     return last if isinstance(last, int) else None
 
 
+def _loop_dim_steps_by_block(state: CodegenState, i: int) -> bool:
+    """Whether loop dim ``i`` advances by its block size."""
+    # step is argument 4 of _for_loop_step; a plain _for_loop has no such
+    # argument, and either way a missing step means "advance by the block".
+    steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
+    step = steps[i] if isinstance(steps, (list, tuple)) else steps
+    return step is None or sympy.sympify(step) in (
+        sympy.Integer(0),
+        sympy.Integer(1),
+    )
+
+
 def _loop_dim_is_dynamic(state: CodegenState, i: int) -> bool:
     """Whether loop dim ``i`` has a runtime begin and end (a fully-dynamic jagged
     tile).  The tracing-time form of is_dynamic_bound_tile, used here because the
@@ -3162,6 +3171,8 @@ def _aligned_dim(
     for i, bid in enumerate(block_ids):
         if not _loop_dim_is_dynamic(state, i):
             continue  # static begin or end: not a fully-dynamic jagged tile
+        if not _loop_dim_steps_by_block(state, i):
+            continue  # even an aligned begin can leave begin + i * step unaligned
         carry = needs_ordered_carry(state, bid)
         direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
         if direct and not carry:
@@ -3176,6 +3187,7 @@ def _aligned_dim(
                 "(its dense bf16 output store cannot be proven sublane-aligned)."
             )
         aligned_dim[bid] = sublane
+        state.device_function.aligned_tiles[bid] = sublane
         if carry:
             begin, end = _get_loop_begin_and_end(state, i)
             state.device_function.carry_tiles[bid] = CarryBoundaryTile(
@@ -3185,6 +3197,18 @@ def _aligned_dim(
                 sublane=sublane,
             )
     return aligned_dim
+
+
+def _annotate_provable_sublane_alignment(
+    state: CodegenState,
+    block_id: int,
+    offset_expr: str,
+) -> str:
+    """Annotate ``offset_expr`` with its provable sublane alignment, if any."""
+    sublane_alignment = state.device_function.proven_sublane_alignment(block_id)
+    if sublane_alignment is None:
+        return offset_expr
+    return f"pl.multiple_of({offset_expr}, {sublane_alignment})"
 
 
 def _codegen_emit_pipeline(state: CodegenState) -> object:
@@ -3430,19 +3454,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
             elif bid is not None and is_dynamic_bound_tile(state, bid):
-                # Jagged row tile from an inner pipeline.  pl.multiple_of is
-                # assume_multiple: it suppresses the tiled-row alignment check.
-                # Safe because the begin is rounded to the sublane in the dim's
-                # own loop, and a DIRECT f32 single-lane-tile row reads
-                # contiguously.  Always emitted, as sibling loops reference the
-                # same jagged dim.  Must precede the outer-non-grid branch.
+                # Jagged row tile from an inner pipeline. Always emitted, as
+                # sibling loops reference the same jagged dim. Must precede the
+                # outer-non-grid branch.
                 block_m = state.device_function.block_size_var(bid)
-                offset_v = state.codegen.offset_var(bid)
-                sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
-                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
-                lambda_parts.append(
-                    f"pl.ds(pl.multiple_of({offset_v}, {sublane}), {block_m})"
+                start_expr = _annotate_provable_sublane_alignment(
+                    state, bid, state.codegen.offset_var(bid)
                 )
+                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
+                lambda_parts.append(f"pl.ds({start_expr}, {block_m})")
             elif bid is not None and state.codegen.active_device_loops.get(bid):
                 # Outer non-grid device loop -- the HBM ref is pre-sliced via
                 # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the

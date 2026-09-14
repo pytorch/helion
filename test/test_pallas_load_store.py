@@ -377,6 +377,49 @@ class TestPallasJaggedCarryBmm(TestCase):
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasMultipleOfPromises(TestCase):
+    """What we are willing to assert to Mosaic about a runtime row offset."""
+
+    def test_direct_row_window_gets_no_sublane_promise(self) -> None:
+        # A jagged row that is only ever read must not be promised a sublane
+        # alignment, because nothing rounded its window down.
+        @helion.kernel(backend="pallas")
+        def nested_direct_window(
+            seq_offsets: torch.Tensor,
+            outer_read: torch.Tensor,
+            nested_read: torch.Tensor,
+            dense_out: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            _, width = nested_read.shape
+            groups = seq_offsets.size(0) - 1
+            scalar_out = torch.empty(
+                (groups,), dtype=torch.float32, device=nested_read.device
+            )
+            for group in hl.grid(groups):
+                begin, end = seq_offsets[group], seq_offsets[group + 1]
+                for rows in hl.tile(begin, end):
+                    scalar_out[group] = outer_read[rows, 0].sum()
+                    for cols in hl.tile(0, width):
+                        dense_out[group, cols] = dense_out[group, cols] + nested_read[
+                            rows, cols
+                        ].float().sum(0)
+            return scalar_out, dense_out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        outer_read = torch.randn((32, 128), dtype=torch.float32)
+        nested_read = torch.randn((32, 128), dtype=torch.float32)
+        dense_out = torch.zeros((2, 128), dtype=torch.float32)
+        code = nested_direct_window.bind(
+            (seq_offsets, outer_read, nested_read, dense_out)
+        ).to_code(
+            helion.Config(block_sizes=[16, 128], pallas_loop_type="emit_pipeline")
+        )
+        # 8 is the f32 sublane.
+        self.assertNotRegex(code, r"multiple_of\(\w+, 8\)")
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasJaggedCarryRejects(TestCase):
     """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
 
