@@ -689,6 +689,22 @@ class Backend(abc.ABC):
         """
         return self.full_expr(shape_dims, value_expr, dtype)
 
+    def wrap_reduction_accumulator(
+        self,
+        acc_full: str,
+        *,
+        thread_count: int,
+        loop_block_size: int,
+        acc_dtype: torch.dtype,
+    ) -> str:
+        """Wrap the looped-reduction accumulator init expression, if needed.
+
+        FlyDSL's runtime scf.for carries the accumulator as an iter_arg whose init
+        type must match the per-thread vector the loop body yields, so it wraps
+        the scalar seed in ``fx.Vector.filled(...)``. Identity by default.
+        """
+        return acc_full
+
     def reshape_expr(self, expr: str, shape: str) -> str:
         raise exc.BackendUnsupported(self.name, "reshape")
 
