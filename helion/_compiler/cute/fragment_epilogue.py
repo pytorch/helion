@@ -135,12 +135,36 @@ class _DestinationSubtileProgram:
 
 
 @dataclasses.dataclass(frozen=True)
+class Tcgen05FragmentTmaHostLoad:
+    """One staged host load and its proven coordinates within the matrix tile."""
+
+    node: Node
+    flat: _Index
+    local_indices: tuple[_Index, _Index]
+
+
+@dataclasses.dataclass(frozen=True)
+class Tcgen05FragmentTmaHostTensor:
+    """One rank-2 host tensor proven to stay within its current source tile."""
+
+    host_tensor_fx_node: Node
+    host_tensor_val: torch.Tensor
+    staging_tile_shape: tuple[int, int]
+    loads: tuple[Tcgen05FragmentTmaHostLoad, ...]
+
+    @property
+    def load_nodes(self) -> frozenset[Node]:
+        return frozenset(load.node for load in self.loads)
+
+
+@dataclasses.dataclass(frozen=True)
 class Tcgen05FragmentEpiloguePlan:
     anchor: Node
     store_node: Node
     value_node: Node
     boundary_nodes: frozenset[Node]
     owned_nodes: frozenset[Node]
+    tma_host_tensors: tuple[Tcgen05FragmentTmaHostTensor, ...]
     source_shape: tuple[int, ...]
     destination_shape: tuple[int, ...]
     store_tile_sizes: tuple[int | torch.SymInt, ...]
@@ -151,6 +175,11 @@ class Tcgen05FragmentEpiloguePlan:
     @property
     def changes_shape(self) -> bool:
         return self.source_shape != self.destination_shape
+
+    @property
+    def has_host_loads(self) -> bool:
+        """Whether the fragment reads tensors other than the MMA carrier."""
+        return _nodes_have_host_loads(self.owned_nodes)
 
     @property
     def streaming_program(self) -> _SourceSubtileProgram | None:
@@ -445,6 +474,16 @@ def _is_host_tensor(node: Node) -> bool:
     return node.op == "call_function" and node.target is _tracing_ops._host_tensor
 
 
+def _nodes_have_host_loads(nodes: frozenset[Node]) -> bool:
+    return any(
+        node.target is memory_ops.load
+        and bool(node.args)
+        and isinstance(node.args[0], Node)
+        and _is_host_tensor(node.args[0])
+        for node in nodes
+    )
+
+
 def _shape_only_subscript(node: Node) -> bool:
     source = node.args[0] if node.args else None
     indices = node.args[1] if len(node.args) > 1 else None
@@ -661,6 +700,9 @@ def _validate_host_load(node: Node, output_node: Node) -> None:
                 raise _UnsupportedFragment
             (block_id,) = block_ids
             canonical = env.canonical_block_id(block_id)
+            index_uses_arithmetic = isinstance(
+                index, Node
+            ) and _tile_index_uses_arithmetic(index)
             expected = (
                 None
                 if tensor_indices
@@ -672,7 +714,12 @@ def _validate_host_load(node: Node, output_node: Node) -> None:
                     expected is not None
                     and canonical != env.canonical_block_id(expected)
                 )
-                or not _extent_matches_block(source_value.shape[tensor_dim], block_id)
+                or (
+                    not index_uses_arithmetic
+                    and not _extent_matches_block(
+                        source_value.shape[tensor_dim], block_id
+                    )
+                )
             ):
                 raise _UnsupportedFragment
             used.add(canonical)
@@ -843,13 +890,13 @@ def analyze_tcgen05_fragment_epilogue_candidate(
     anchor: Node,
     *,
     expected_output_block_ids: tuple[int, ...],
-) -> bool:
-    """Side-effect-free preflight sharing the fragment planner's extraction."""
+) -> bool | None:
+    """Return host-load presence, or ``None`` when the candidate is invalid."""
     try:
-        _extract_region(graphs, anchor, expected_output_block_ids)
+        region = _extract_region(graphs, anchor, expected_output_block_ids)
     except _UnsupportedFragment:
-        return False
-    return True
+        return None
+    return _nodes_have_host_loads(region.owned)
 
 
 def _interpret_index(
@@ -1650,6 +1697,281 @@ def _collect_demands(
     return result
 
 
+def _collect_host_loads(
+    node: Node,
+    flat: _Index,
+    *,
+    region: _Region,
+    config: Config,
+    projection: int | None = None,
+    memo: dict[tuple[Node, _Index, int | None], frozenset[tuple[Node, _Index]]]
+    | None = None,
+) -> frozenset[tuple[Node, _Index]]:
+    if memo is None:
+        memo = {}
+    key = (node, flat, projection)
+    if key in memo:
+        return memo[key]
+
+    def evaluate(
+        current: Node, current_flat: _Index, current_projection: int | None
+    ) -> object:
+        if (
+            current is not node
+            or current_flat != flat
+            or current_projection != projection
+        ):
+            return _collect_host_loads(
+                current,
+                current_flat,
+                region=region,
+                config=config,
+                projection=current_projection,
+                memo=memo,
+            )
+        if current in region.boundaries or current.target is tile_index:
+            return frozenset()
+        source = current.args[0] if current.args else None
+        if (
+            current.target is memory_ops.load
+            and isinstance(source, Node)
+            and _is_host_tensor(source)
+        ):
+            return frozenset({(current, current_flat)})
+        inputs = _pointwise_inputs(current)
+        if inputs is not None:
+            loads: set[tuple[Node, _Index]] = set()
+            output_shape = _shape(current, config)
+            for input_node in inputs:
+                loads.update(
+                    _collect_host_loads(
+                        input_node,
+                        _broadcast_flat(
+                            current_flat, output_shape, _shape(input_node, config)
+                        ),
+                        region=region,
+                        config=config,
+                        memo=memo,
+                    )
+                )
+            return frozenset(loads)
+        raise _UnsupportedFragment
+
+    def choose(selector: _Index, left: object, right: object) -> object:
+        if not isinstance(left, frozenset) or not isinstance(right, frozenset):
+            raise _UnsupportedFragment
+        return left | right
+
+    result = _resolve_shape(
+        node,
+        flat,
+        config=config,
+        evaluate=evaluate,
+        choose=choose,
+        projection=projection,
+    )
+    if not isinstance(result, frozenset):
+        raise _UnsupportedFragment
+    memo[key] = result
+    return result
+
+
+def _fragment_tma_host_tensors(
+    host_loads: frozenset[tuple[Node, _Index]],
+    *,
+    source_shape: tuple[int, ...],
+    destination_shape: tuple[int, ...],
+    source_global_shape: tuple[int | torch.SymInt, ...],
+    expected_output_block_ids: tuple[int, ...],
+    config: Config,
+) -> tuple[Tcgen05FragmentTmaHostTensor, ...]:
+    """Find host tensors whose accesses stay inside one source tensor tile.
+
+    Fragment loads may cross normal epilogue-subtile boundaries (rotary output
+    columns 0 and 1 read coefficient columns 0 and 64).  The staged lifetime is
+    therefore one complete output-tile iteration. A staged tensor need not have
+    the output's exact shape: each matrix dimension is divided across the same
+    number of runtime tiles, allowing proportional layouts such as separate
+    ``[M, D / 2]`` coefficient tables. Every accessed coordinate must still be
+    proven inside the corresponding source tile. This exact enumeration is
+    bounded by the admitted 128x{64,128} fragment envelope and is independent
+    of the number of runtime tiles.
+    """
+    if (
+        source_shape != destination_shape
+        or len(source_shape) != 3
+        or len(source_global_shape) != 3
+        or len(expected_output_block_ids) != 3
+    ):
+        return ()
+
+    env = CompileEnvironment.current()
+    tile_origins: dict[int, _Index] = {}
+    tile_indices: list[_Index] = []
+    output_tile_counts: list[int] = []
+    for dim, (global_extent, tile_extent, block_id) in enumerate(
+        zip(
+            source_global_shape,
+            source_shape,
+            expected_output_block_ids,
+            strict=True,
+        )
+    ):
+        extent = env.size_hint(global_extent)
+        if extent <= 0 or tile_extent <= 0 or extent % tile_extent:
+            return ()
+        tile_count = extent // tile_extent
+        tile = _Index.variable(f"fragment_tma_tile_{dim}", tile_count - 1)
+        origin = _mul(tile, tile_extent)
+        tile_origins[env.canonical_block_id(block_id)] = origin
+        tile_indices.append(tile)
+        output_tile_counts.append(tile_count)
+
+    destination_bm, destination_bn = destination_shape[-2:]
+    loads_by_tensor: dict[Node, list[tuple[Node, _Index]]] = {}
+    for load_node, flat in host_loads:
+        source = load_node.args[0] if load_node.args else None
+        if isinstance(source, Node):
+            loads_by_tensor.setdefault(source, []).append((load_node, flat))
+
+    descriptors: list[Tcgen05FragmentTmaHostTensor] = []
+    for source, loads in sorted(loads_by_tensor.items(), key=lambda item: item[0].name):
+        tensor = source.meta.get("val")
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
+            continue
+        tensor_extents = tuple(env.size_hint(extent) for extent in tensor.shape)
+        if any(extent <= 0 for extent in tensor_extents):
+            continue
+
+        staging_tile_shape: list[int] = []
+        staging_origins: list[_Index] = []
+        for tensor_dim, tensor_extent in enumerate(tensor_extents):
+            output_dim = tensor_dim + 1
+            tile_count = output_tile_counts[output_dim]
+            if tensor_extent % tile_count:
+                break
+            staging_extent = tensor_extent // tile_count
+            if staging_extent <= 0:
+                break
+            staging_tile_shape.append(staging_extent)
+            staging_origins.append(_mul(tile_indices[output_dim], staging_extent))
+        if len(staging_tile_shape) != 2:
+            continue
+
+        evaluators: list[tuple[_IndexEvaluator, _IndexEvaluator]] = []
+        proven_loads: list[Tcgen05FragmentTmaHostLoad] = []
+        supported = True
+        for load_node, flat in sorted(
+            loads, key=lambda item: (item[0].name, str(item[1].semantic))
+        ):
+            indices = load_node.args[1] if len(load_node.args) > 1 else None
+            if not isinstance(indices, (list, tuple)) or len(indices) != 2:
+                supported = False
+                break
+            output_shape = _shape(load_node, config)
+            local_indices: list[_Index] = []
+            for tensor_dim, index in enumerate(indices):
+                if not (
+                    isinstance(index, Node)
+                    and isinstance(index.meta.get("val"), torch.Tensor)
+                ):
+                    supported = False
+                    break
+                try:
+                    index_block_ids = {
+                        env.canonical_block_id(block_id)
+                        for block_id in _tile_index_block_ids(index)
+                    }
+                    expected_block_id = env.canonical_block_id(
+                        expected_output_block_ids[tensor_dim + 1]
+                    )
+                    if index_block_ids != {expected_block_id}:
+                        supported = False
+                        break
+                    index_flat = _broadcast_flat(
+                        flat,
+                        output_shape,
+                        _shape(index, config),
+                    )
+                    logical = _logical_index_value(
+                        index,
+                        index_flat,
+                        config=config,
+                        tile_origins=tile_origins,
+                    )
+                except (_UnsupportedFragment, IndexError, StopIteration, ValueError):
+                    supported = False
+                    break
+                local = _add(logical, _mul(staging_origins[tensor_dim], -1))
+                fixed_bounds = {
+                    symbol: lower
+                    for symbol, lower, upper in local.bounds
+                    if lower == upper
+                }
+                if fixed_bounds:
+                    local = _Index(
+                        cast("sympy.Expr", local.semantic.subs(fixed_bounds)),
+                        tuple(
+                            bound
+                            for bound in local.bounds
+                            if bound[0] not in fixed_bounds
+                        ),
+                    )
+                unsupported_symbols = [
+                    symbol
+                    for symbol in local.semantic.free_symbols
+                    if str(symbol) not in ("row", "column")
+                ]
+                if unsupported_symbols:
+                    supported = False
+                    break
+                local_indices.append(local)
+            if not supported:
+                break
+            local_evaluators = (
+                local_indices[0].compile(),
+                local_indices[1].compile(),
+            )
+            evaluators.append(local_evaluators)
+            proven_loads.append(
+                Tcgen05FragmentTmaHostLoad(
+                    node=load_node,
+                    flat=flat,
+                    local_indices=(local_indices[0], local_indices[1]),
+                )
+            )
+        if not supported:
+            continue
+
+        staging_bm, staging_bn = staging_tile_shape
+        variables = {"row": 0, "column": 0}
+        for m in range(destination_bm):
+            variables["row"] = m
+            for n in range(destination_bn):
+                variables["column"] = n
+                if any(
+                    not (
+                        0 <= evaluate_m(variables) < staging_bm
+                        and 0 <= evaluate_n(variables) < staging_bn
+                    )
+                    for evaluate_m, evaluate_n in evaluators
+                ):
+                    supported = False
+                    break
+            if not supported:
+                break
+        if supported:
+            descriptors.append(
+                Tcgen05FragmentTmaHostTensor(
+                    host_tensor_fx_node=source,
+                    host_tensor_val=tensor,
+                    staging_tile_shape=(staging_bm, staging_bn),
+                    loads=tuple(proven_loads),
+                )
+            )
+    return tuple(descriptors)
+
+
 def analyze_tcgen05_fragment_epilogue_plan(
     graphs: Sequence[GraphInfo],
     anchor: Node,
@@ -1740,6 +2062,20 @@ def analyze_tcgen05_fragment_epilogue_plan(
         output_flat = _flat_from_coords(
             [_Index.constant(0), row, column], destination_shape
         )
+        host_loads = _collect_host_loads(
+            region.value,
+            output_flat,
+            region=region,
+            config=config,
+        )
+        tma_host_tensors = _fragment_tma_host_tensors(
+            host_loads,
+            source_shape=source_shape,
+            destination_shape=destination_shape,
+            source_global_shape=source_global_shape,
+            expected_output_block_ids=expected_output_block_ids,
+            config=config,
+        )
         demands = tuple(
             sorted(
                 _collect_demands(
@@ -1825,6 +2161,7 @@ def analyze_tcgen05_fragment_epilogue_plan(
             value_node=region.value,
             boundary_nodes=region.boundaries,
             owned_nodes=region.owned,
+            tma_host_tensors=tma_host_tensors,
             source_shape=source_shape,
             destination_shape=destination_shape,
             store_tile_sizes=store_tile_sizes,
@@ -1879,6 +2216,14 @@ def _register_index_expression(registers: Sequence[int], position: str) -> str:
     return f"({expression})"
 
 
+@dataclasses.dataclass(frozen=True)
+class _HostPrefetch:
+    node: Node
+    flat: _Index
+    buffer: str
+    dtype: str
+
+
 class _Evaluator:
     def __init__(
         self,
@@ -1887,20 +2232,29 @@ class _Evaluator:
         *,
         carrier: str,
         destination_position: str,
+        destination_register: str,
         destination_coordinate: str,
         output_flat: _Index,
         boundary_registers: tuple[_BoundaryRegisterMap, ...],
         indent: str,
         terminals: dict[tuple[str, Node, _Index], ast.AST],
+        host_prefetches: dict[tuple[Node, _Index], _HostPrefetch] | None = None,
+        staged_host_loads: Mapping[
+            tuple[Node, _Index], tuple[str, str, Tcgen05FragmentTmaHostLoad]
+        ]
+        | None = None,
     ) -> None:
         self.state = state
         self.plan = plan
         self.carrier = carrier
         self.destination_position = destination_position
+        self.destination_register = destination_register
         self.output_flat = output_flat
         self.boundary_registers = boundary_registers
         self.indent = indent
         self.terminals = terminals
+        self.host_prefetches = host_prefetches
+        self.staged_host_loads = staged_host_loads
         self.memo: dict[tuple[Node, _Index, int | None], ast.AST] = {}
         self.lines: list[str] = []
         tile_shape = plan.destination_shape
@@ -1982,8 +2336,41 @@ class _Evaluator:
         assert isinstance(source, Node) and isinstance(indices, (list, tuple))
         tensor = source.meta["val"]
         assert isinstance(tensor, torch.Tensor)
-        tensor_name = self.state.device_function.tensor_arg(tensor).name
-        self.state.device_function.placeholder_args.add(tensor_name)
+
+        staged = (
+            self.staged_host_loads.get((node, flat))
+            if self.staged_host_loads is not None
+            else None
+        )
+        if staged is not None:
+            smem_name, consumer_state, staged_load = staged
+            local_m, local_n = staged_load.local_indices
+            result = self._bind(
+                "tcgen05_epi_load",
+                expr_from_string(
+                    f"{smem_name}[("
+                    f"{local_m.render(self.variables)}, "
+                    f"{local_n.render(self.variables)}, "
+                    f"{consumer_state}.index)]"
+                ),
+            )
+            self.terminals[key] = result
+            return result
+
+        if self.host_prefetches is not None:
+            prefetch = self.host_prefetches.get((node, flat))
+            if prefetch is None:
+                prefetch = _HostPrefetch(
+                    node=node,
+                    flat=flat,
+                    buffer=self.state.device_function.new_var("tcgen05_epi_prefetch"),
+                    dtype=CompileEnvironment.current().backend.dtype_str(tensor.dtype),
+                )
+                self.host_prefetches[(node, flat)] = prefetch
+            result = expr_from_string(f"{prefetch.buffer}[{self.destination_register}]")
+            self.terminals[key] = result
+            return result
+
         output_shape = _shape(node, self.state.device_function.config)
         output_coords = _coords_from_flat(flat, output_shape)
         tensor_indices = [
@@ -2029,14 +2416,13 @@ class _Evaluator:
                     f"cutlass.Int32({output_coords[output_dim].render(self.variables)})"
                 )
                 output_dim += 1
+        tensor_name = self.state.device_function.tensor_arg(tensor).name
+        self.state.device_function.placeholder_args.add(tensor_name)
+        dtype = env.backend.dtype_str(tensor.dtype)
         load_expr = _cute_scalar_load_expr(tensor_name, index_exprs, tensor.dtype)
         if bounds:
-            dtype = env.backend.dtype_str(tensor.dtype)
             load_expr = f"({load_expr} if {' and '.join(bounds)} else {dtype}(0))"
-        result = self._bind(
-            "tcgen05_epi_load",
-            expr_from_string(load_expr),
-        )
+        result = self._bind("tcgen05_epi_load", expr_from_string(load_expr))
         self.terminals[key] = result
         return result
 
@@ -2162,7 +2548,12 @@ def _render_tcgen05_fragment_group(
     target_dtype: str,
     indent: str,
     output_name: str | None = None,
-) -> tuple[str, str]:
+    prefetch_host_loads: bool = False,
+    staged_host_loads: Mapping[
+        tuple[Node, _Index], tuple[str, str, Tcgen05FragmentTmaHostLoad]
+    ]
+    | None = None,
+) -> tuple[str, str, str]:
     output_shape = plan.destination_shape
     row = _Index.variable("row", output_shape[-2] - 1)
     column = _Index.variable("column", output_shape[-1] - 1)
@@ -2173,44 +2564,86 @@ def _render_tcgen05_fragment_group(
     destination_index = df.new_var("tcgen05_epi_register")
     destination_coordinate = df.new_var("tcgen05_epi_coord")
     body_indent = indent + "    "
-    terminals: dict[tuple[str, Node, _Index], ast.AST] = {}
+    destination_register = _register_index_expression(
+        program.destination_registers, destination_position
+    )
+    host_prefetches: dict[tuple[Node, _Index], _HostPrefetch] | None = (
+        {} if prefetch_host_loads else None
+    )
     evaluator = _Evaluator(
         state,
         plan,
         carrier=carrier_name,
         destination_position=destination_position,
+        destination_register=destination_index,
         destination_coordinate=destination_coordinate,
         output_flat=output_flat,
         boundary_registers=program.boundary_registers,
         indent=body_indent,
-        terminals=terminals,
+        terminals={},
+        host_prefetches=host_prefetches,
+        staged_host_loads=staged_host_loads,
     )
     value = evaluator.evaluate(plan.value_node, output_flat)
-    destination_register = _register_index_expression(
-        program.destination_registers, destination_position
-    )
+
+    early_prelude = ""
+    if host_prefetches:
+        prefetch_evaluator = _Evaluator(
+            state,
+            plan,
+            carrier=carrier_name,
+            destination_position=destination_position,
+            destination_register=destination_index,
+            destination_coordinate=destination_coordinate,
+            output_flat=output_flat,
+            boundary_registers=program.boundary_registers,
+            indent=body_indent,
+            terminals={},
+            staged_host_loads=staged_host_loads,
+        )
+        prefetch_body: list[str] = []
+        for prefetch in host_prefetches.values():
+            previous_line_count = len(prefetch_evaluator.lines)
+            loaded = prefetch_evaluator.evaluate(prefetch.node, prefetch.flat)
+            prefetch_body.extend(prefetch_evaluator.lines[previous_line_count:])
+            prefetch_body.append(
+                f"{body_indent}{prefetch.buffer}[{destination_index}] = "
+                f"{prefetch.dtype}({ast.unparse(loaded)})\n"
+            )
+        early_prelude = (
+            "".join(
+                f"{indent}{prefetch.buffer} = cute.make_rmem_tensor("
+                f"cute.make_layout({carrier_name}.shape), {prefetch.dtype})\n"
+                for prefetch in host_prefetches.values()
+            )
+            + f"{indent}for {destination_position} in "
+            f"range({len(program.destination_registers)}):\n"
+            f"{body_indent}{destination_index} = {destination_register}\n"
+            f"{body_indent}{destination_coordinate} = "
+            f"{coordinate_name}[{destination_index}]\n" + "".join(prefetch_body)
+        )
+
     output_setup = (
         f"{indent}{output} = cute.make_rmem_tensor("
         f"cute.make_layout({carrier_name}.shape), {target_dtype})\n"
         if output_name is None
         else ""
     )
-    prelude = (
+    late_prelude = (
         f"{indent}assert cute.size({carrier_name}.shape) == "
         f"{plan.source_register_count}, "
         '"tcgen05 source fragment must be complete"\n'
         f"{output_setup}"
         f"{indent}for {destination_position} in "
         f"range({len(program.destination_registers)}):\n"
-        f"{body_indent}{destination_index} = "
-        f"{destination_register}\n"
+        f"{body_indent}{destination_index} = {destination_register}\n"
         f"{body_indent}{destination_coordinate} = "
         f"{coordinate_name}[{destination_index}]\n"
         f"{''.join(evaluator.lines)}"
         f"{body_indent}{output}[{destination_index}] = "
         f"{target_dtype}({ast.unparse(value)})\n"
     )
-    return prelude, output
+    return early_prelude, late_prelude, output
 
 
 def render_tcgen05_fragment_epilogue(
@@ -2221,12 +2654,17 @@ def render_tcgen05_fragment_epilogue(
     coordinate_name: str,
     target_dtype: str,
     indent: str,
-) -> tuple[str, str]:
+    prefetch_host_loads: bool = False,
+    staged_host_loads: Mapping[
+        tuple[Node, _Index], tuple[str, str, Tcgen05FragmentTmaHostLoad]
+    ]
+    | None = None,
+) -> tuple[str, str, str]:
     """Render a uniform same-shape thread-local register program."""
     program = plan.streaming_program
     if program is None:
         raise RuntimeError("shape-changing fragment requires the scheduled renderer")
-    prelude, output = _render_tcgen05_fragment_group(
+    early_prelude, late_prelude, output = _render_tcgen05_fragment_group(
         state,
         plan,
         program,
@@ -2234,8 +2672,10 @@ def render_tcgen05_fragment_epilogue(
         coordinate_name=coordinate_name,
         target_dtype=target_dtype,
         indent=indent,
+        prefetch_host_loads=prefetch_host_loads,
+        staged_host_loads=staged_host_loads,
     )
-    return prelude, f"{output}.load()"
+    return early_prelude, late_prelude, f"{output}.load()"
 
 
 def render_tcgen05_fragment_epilogue_group(
@@ -2250,7 +2690,7 @@ def render_tcgen05_fragment_epilogue_group(
     indent: str,
 ) -> str:
     """Fill one destination fragment from its resident source subtile."""
-    prelude, _ = _render_tcgen05_fragment_group(
+    early_prelude, late_prelude, _ = _render_tcgen05_fragment_group(
         state,
         plan,
         program,
@@ -2260,4 +2700,5 @@ def render_tcgen05_fragment_epilogue_group(
         indent=indent,
         output_name=destination_name,
     )
-    return prelude
+    assert not early_prelude
+    return late_prelude
