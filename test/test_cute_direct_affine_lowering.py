@@ -29,6 +29,7 @@ from helion._compiler.cute.direct_affine_replay import DirectAffineStateStoreRep
 from helion._compiler.cute.direct_affine_replay import DirectAffineStepReplay
 from helion._compiler.cute.direct_affine_replay import DirectAffineValueReplay
 from helion._compiler.device_function import TensorArg
+from helion._testing import DEVICE
 
 
 def _expression(source: str) -> ast.expr:
@@ -762,29 +763,29 @@ def _runtime_inputs(token_count: int) -> tuple[object, ...]:
     vectors = sequences * token_count
     shape = (vectors, heads, width)
     vector_inputs = tuple(
-        (torch.randn(shape, device="cuda") * 0.1).to(torch.bfloat16) for _ in range(4)
+        (torch.randn(shape, device=DEVICE) * 0.1).to(torch.bfloat16) for _ in range(4)
     )
     checkpoint_pool = (
         torch.randn(
             (vectors + 2, heads, width, width),
-            device="cuda",
+            device=DEVICE,
         )
         * 0.01
     ).to(torch.bfloat16)
     checkpoint_ids = torch.arange(
         vectors,
-        device="cuda",
+        device=DEVICE,
         dtype=torch.int32,
     ).reshape(sequences, token_count)
     return (
         *vector_inputs,
-        (torch.randn((vectors, heads), device="cuda") * 0.1).to(torch.bfloat16),
-        torch.randn((heads,), device="cuda") * 0.1,
-        torch.randn((heads * width,), device="cuda") * 0.1,
+        (torch.randn((vectors, heads), device=DEVICE) * 0.1).to(torch.bfloat16),
+        torch.randn((heads,), device=DEVICE) * 0.1,
+        torch.randn((heads * width,), device=DEVICE) * 0.1,
         checkpoint_pool,
         checkpoint_ids,
-        torch.full((sequences,), token_count, device="cuda", dtype=torch.int32),
-        torch.empty(shape, device="cuda", dtype=torch.bfloat16),
+        torch.full((sequences,), token_count, device=DEVICE, dtype=torch.int32),
+        torch.empty(shape, device=DEVICE, dtype=torch.bfloat16),
         width**-0.5,
         -5.0,
         token_count,
