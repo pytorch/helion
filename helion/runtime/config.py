@@ -22,7 +22,7 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
-NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
+NumSmMultiplierLiteral = Literal[1, 2, 4, 8, 16, 32, 64, 128]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
 
@@ -115,8 +115,8 @@ class Config(Mapping[str, object]):
                 the same compiler-derived dependency schedule with fixed worker
                 ownership or one-shot packet dispatch, respectively.
                 Unsupported kernels reject this field.
-            num_sm_multiplier: Multiplier for the number of SMs in persistent
-                kernels (1, 2, 4, 8).
+            num_sm_multiplier: Power-of-two multiplier for the number of SMs in
+                persistent kernels.
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
             maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
                 Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
