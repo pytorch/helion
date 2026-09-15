@@ -74,6 +74,7 @@ from .._dist_utils import kernel_uses_symm_mem
 from .._logging import LazyString
 from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
+from ..autotuner.logger import match_launch_resource_error
 from ..language.constexpr import ConstExpr
 from .config import Config
 from .ref_mode import RefModeContext
@@ -124,6 +125,10 @@ CompiledConfig = Callable[..., _R]
 # pallas._tpu_compile_capture).
 # Off by default so the eager dispatch path is unchanged.
 _TPU_COMPILE_CAPTURE = os.environ.get("HELION_TPU_COMPILE_CAPTURE", "0") == "1"
+
+# Retry a failed kernel launch with the heuristic's other configs, then the default.
+# Experimental: not in settings yet
+_RETRY_WITH_FALLBACK = os.environ.get("HELION_RETRY_WITH_FALLBACK", "0") == "1"
 
 # Cache for GraphModule hashes
 _graph_module_hash_cache: WeakIdKeyDictionary = WeakIdKeyDictionary()
@@ -2150,6 +2155,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         )
         self._run: Callable[..., _R] | None = None
         self._config: Config | None = None
+        self.fallback_configs: list[Config] = []
         self._compiler_seed_specialization_extractors: tuple[
             _CompilerSeedSpecializationExtractor, ...
         ] = ()
@@ -2337,6 +2343,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                             self.env.config_spec.compiler_seed_configs.append(
                                 seed_config
                             )
+
+            self.fallback_configs = [self.env.config_spec.default_config()]
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -2850,10 +2858,47 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """
         config = self._normalize_config(config)
         self._run = self.compile_config(config)
+        if _RETRY_WITH_FALLBACK:
+            fallback_configs = [c for c in self.fallback_configs if c != config]
+            self._run = self._run_with_fallback(self._run, fallback_configs)
         self._config = config
         counters["best_config_decorator"][
             self.format_kernel_decorator(config, self.settings)
         ] = 1
+
+    def _run_with_fallback(
+        self, run: CompiledConfig, fallbacks: list[Config]
+    ) -> CompiledConfig:
+        """Retry with ``fallbacks`` on a launch resource error."""
+
+        def run_with_fallback(*args: object) -> _R:
+            try:
+                return run(*args)
+            except Exception as e:
+                if not match_launch_resource_error(e):
+                    raise
+                for i, candidate in enumerate(fallbacks):
+                    log.warning(
+                        f"Kernel {self.kernel.name} failed to launch; trying "
+                        f"fallback config {i + 1}/{len(fallbacks)}"
+                    )
+                    try:
+                        compiled = self.compile_config(candidate)
+                        result = compiled(*args)
+                        # Cache the working config.
+                        # For dynamic shapes, other shapes in the bucket might fail so we keep the retry
+                        self._run = (
+                            compiled
+                            if self.settings.static_shapes
+                            else self._run_with_fallback(compiled, fallbacks)
+                        )
+                        return result
+                    except Exception:
+                        continue
+                log.error(f"No working config found for kernel {self.kernel.name}")
+                raise e
+
+        return run_with_fallback
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
         """
