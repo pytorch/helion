@@ -1278,8 +1278,6 @@ def _make_attention_metadata(
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
         seq_lens=seq_lens,
         seq_lens_cpu_upper_bound=torch.tensor([CONTEXT], dtype=torch.int32),
-        _seq_lens_cpu=torch.tensor([CONTEXT], dtype=torch.int32),
-        _num_computed_tokens_cpu=torch.tensor([CONTEXT - 1], dtype=torch.int32),
         num_reqs=1,
         num_actual_tokens=1,
         max_query_len=1,
