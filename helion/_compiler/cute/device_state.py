@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .direct_affine_candidate import DirectAffineCandidate
+    from .direct_affine_plan import DirectAffinePlan
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
@@ -595,6 +597,13 @@ class CuteDeviceFunctionState:
         # Grouped two-phase lowering for structurally proven fixed-token,
         # split-input BF16 rank-1 recurrences.
         self.fixed_token_rank1_plan: CuteFixedTokenRank1Plan | None = None
+        # Names-agnostic affine regions awaiting late address and ownership
+        # proofs. Discovery alone never changes the ordinary lowering.
+        self.direct_affine_candidates: tuple[DirectAffineCandidate, ...] = ()
+        # Installed only after late generated-address and effect proofs succeed.
+        # Its CTA shape is authoritative because the direct lowering replaces
+        # the ordinary lane topology.
+        self.direct_affine_plan: DirectAffinePlan | None = None
         # Packed one-warp lowering for structurally proven split-input T=1
         # BF16 rank-1 recurrences.  It precedes the grouped fixed-token path.
         self.split_single_token_rank1_plan: CuteSplitSingleTokenRank1Plan | None = None

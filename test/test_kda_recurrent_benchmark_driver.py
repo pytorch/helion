@@ -30,6 +30,29 @@ ORDINARY_CONFIGS = {
     },
 }
 
+DIRECT_CONFIGS = {
+    "t3-lower-bound-n8-h16": {
+        "block_sizes": [64],
+        "num_threads": [4, 32],
+        "loop_orders": [[2, 1, 0]],
+        "num_warps": 4,
+        "num_stages": 1,
+        "indexing": "pointer",
+        "pid_type": "flat",
+        "cute_affine_scan_schedule": "direct_m16n8_v1",
+    },
+    "t5-precomputed-n32-h16-hv32": {
+        "block_sizes": [128],
+        "num_threads": [8, 32],
+        "loop_orders": [[2, 1, 0]],
+        "num_warps": 8,
+        "num_stages": 1,
+        "indexing": "pointer",
+        "pid_type": "flat",
+        "cute_affine_scan_schedule": "direct_m16n16_v1",
+    },
+}
+
 
 def test_reportable_t5_case_is_in_default_scope() -> None:
     case = recurrent.CASES["t5-precomputed-n32-h16-hv32"]
@@ -62,6 +85,42 @@ def test_recommended_configs_round_trip_through_external_map(
     assert {name: json.loads(config) for name, config in loaded.items()} == (
         ORDINARY_CONFIGS
     )
+
+
+def test_recommended_direct_configs_round_trip_through_external_map(
+    tmp_path: Path,
+) -> None:
+    config_map = tmp_path / "recurrent-direct-configs.json"
+    config_map.write_text(json.dumps(DIRECT_CONFIGS), encoding="utf-8")
+
+    loaded = recurrent._load_helion_config_map(config_map)
+
+    assert {name: json.loads(config) for name, config in loaded.items()} == (
+        DIRECT_CONFIGS
+    )
+
+
+@pytest.mark.parametrize(("case_name", "config"), DIRECT_CONFIGS.items())
+def test_recurrent_codegen_expectation_tracks_resolved_direct_config(
+    case_name: str, config: dict[str, object]
+) -> None:
+    plan_kind, markers, patterns, forbidden_patterns = (
+        recurrent._helion_codegen_expectation(recurrent.CASES[case_name], config)
+    )
+
+    schedule = config["cute_affine_scan_schedule"]
+    assert isinstance(schedule, str)
+    expected_plan = {
+        "direct_m16n8_v1": "direct-affine-m16n8-interleaved-async-state_first",
+        "direct_m16n16_v1": "direct-affine-m16n16-role_major-async-state_first",
+    }[schedule]
+    assert plan_kind == expected_plan
+    assert markers == ()
+    assert forbidden_patterns == ()
+    assert any("short_affine_scan_mma" in pattern for pattern in patterns)
+    mma = "m16n8" if "m16n8" in expected_plan else "m16n16"
+    assert any(f"project_retain_affine_{mma}_bf16" in pattern for pattern in patterns)
+    assert not any("fixed_rank1" in marker for marker in markers)
 
 
 def test_ordinary_eligible_recurrent_config_keeps_fixed_token_provenance() -> None:
@@ -110,3 +169,4 @@ def test_ordinary_ineligible_recurrent_config_tracks_generic_codegen(
     assert markers == ()
     assert patterns == ()
     assert any("fixed_rank1" in pattern for pattern in forbidden_patterns)
+    assert any("short_affine_scan_mma" in pattern for pattern in forbidden_patterns)
