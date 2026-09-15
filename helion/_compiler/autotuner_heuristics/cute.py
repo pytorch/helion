@@ -10,6 +10,7 @@ from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
 
+from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
@@ -405,6 +406,194 @@ class CuteFixedTokenRank1Heuristic(AutotunerHeuristic):
             indexing="pointer",
             pid_type="flat",
         )
+
+
+def _affine_scan_search_context(
+    env: CompileEnvironment, *, require_supported_extent: bool
+) -> tuple[int, int, int, dict[tuple[str, int], list[MemoryOpFact]]] | None:
+    spec = env.config_spec
+    grid_fact = spec.kernel_grid_fact
+    if (
+        spec.matmul_facts
+        or len(spec.block_sizes) != 1
+        or grid_fact is None
+        or len(grid_fact.roots) != 1
+    ):
+        return None
+    (root,) = grid_fact.roots
+    row_spec = cast("Any", spec.block_sizes[0])
+    row_block_id = row_spec.block_id
+    if row_block_id not in root.block_ids:
+        return None
+
+    reduction_blocks = [block for block in env.block_sizes if block.reduction]
+    if len(reduction_blocks) != 1:
+        return None
+    reduction = reduction_blocks[0]
+    try:
+        feature_extent = int(reduction.numel)
+    except (TypeError, ValueError):
+        return None
+    if require_supported_extent and feature_extent != 128:
+        return None
+
+    by_tensor: dict[tuple[str, int], list[MemoryOpFact]] = {}
+    for fact in spec.memory_op_facts:
+        if fact.tensor_name is not None and fact.graph_id == root.root_graph_id:
+            by_tensor.setdefault((fact.tensor_name, fact.graph_id), []).append(fact)
+    return row_block_id, reduction.block_id, len(root.block_ids), by_tensor
+
+
+def _affine_scan_search_geometry(
+    env: CompileEnvironment,
+) -> tuple[int, int, int, int] | None:
+    """Infer an unambiguous seed from a possible affine-scan region.
+
+    This is deliberately a structural superset of the semantic matcher.  The
+    late lowering remains authoritative for the recurrence, accesses, aliases,
+    and generated thread coordinates.
+    """
+
+    context = _affine_scan_search_context(env, require_supported_extent=True)
+    if context is None:
+        return None
+    row_block_id, feature_block_id, root_rank, by_tensor = context
+    possible_step_counts: set[int] = set()
+    for state_key, facts in by_tensor.items():
+        if (
+            facts[0].dtype is not torch.bfloat16
+            or facts[0].ndim < 2
+            or not any(fact.kind == "load" for fact in facts)
+        ):
+            continue
+        step_count = sum(fact.kind == "store" for fact in facts)
+        if not 2 <= step_count <= 8:
+            continue
+        non_state_stores = sum(
+            fact.kind == "store" and fact.dtype is torch.bfloat16
+            for key, other_facts in by_tensor.items()
+            if key != state_key
+            for fact in other_facts
+        )
+        if non_state_stores >= step_count:
+            possible_step_counts.add(step_count)
+    if len(possible_step_counts) != 1:
+        return None
+    (step_count,) = possible_step_counts
+    return row_block_id, feature_block_id, step_count, root_rank
+
+
+def _may_have_affine_scan(
+    env: CompileEnvironment, *, require_supported_extent: bool
+) -> bool:
+    """Cheap superset used to expose direct choices without seed assumptions."""
+
+    context = _affine_scan_search_context(
+        env, require_supported_extent=require_supported_extent
+    )
+    if context is None:
+        return False
+    by_tensor = context[3]
+    return any(
+        facts[0].dtype is torch.bfloat16
+        and facts[0].ndim >= 2
+        and any(fact.kind == "load" for fact in facts)
+        and sum(fact.kind == "store" for fact in facts) >= 2
+        and sum(
+            fact.kind == "store" and fact.dtype is torch.bfloat16
+            for other_name, other_facts in by_tensor.items()
+            if other_name != name
+            for fact in other_facts
+        )
+        >= 2
+        for name, facts in by_tensor.items()
+    )
+
+
+class CuteAffineScanHeuristic(AutotunerHeuristic):
+    """Expose the generic direct-affine schedule behind a structural gate."""
+
+    name = "cute_affine_scan"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        capability = env.config_spec.target_device_capability
+        if capability is None or capability < (8, 0) or not env.settings.fast_math:
+            return frozenset()
+        if not _may_have_affine_scan(env, require_supported_extent=False):
+            return frozenset()
+        if not _may_have_affine_scan(env, require_supported_extent=True):
+            return cls.CACHE_SPECIALIZATION_FACTS
+        geometry = _affine_scan_search_geometry(env)
+        env.config_spec.enable_cute_affine_scan_search(
+            step_count=None if geometry is None else geometry[2]
+        )
+        # The geometry predicate consumes runtime tensor extents.  Keep the
+        # negative binding specialized too, so a later dynamic-shape call that
+        # does match cannot reuse a ConfigSpec where the choices stayed hidden.
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_affine_scan_schedule is not None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        geometry = _affine_scan_search_geometry(env)
+        if geometry is None or env.config_spec.cute_affine_scan_schedule is None:
+            return None
+        row_block_id, feature_block_id, step_count, root_rank = geometry
+        from ..cute.direct_affine_plan import DirectAffineMma
+        from ..cute.direct_affine_plan import decode_direct_affine_schedule
+        from ..cute.direct_affine_plan import select_direct_affine_schedule
+
+        schedule_name = select_direct_affine_schedule(step_count)
+        schedule = decode_direct_affine_schedule(schedule_name)
+        if schedule is None:
+            return None
+        row_extent = 64 if schedule.mma is DirectAffineMma.M16N8 else 128
+        row_spec = cast("Any", env.config_spec.block_sizes[0])
+        if not row_spec.min_size <= row_extent <= row_spec.max_size or not {
+            row_block_id,
+            feature_block_id,
+        }.issubset(env.config_spec.num_threads.valid_block_ids()):
+            return None
+        values = {
+            "block_sizes": cast(
+                "list[int]",
+                _seq_config_list(
+                    env.config_spec.block_sizes,
+                    {row_block_id: row_extent},
+                ),
+            ),
+            "num_threads": cast(
+                "list[int]",
+                _seq_config_list(
+                    env.config_spec.num_threads,
+                    {row_block_id: row_extent // 16, feature_block_id: 32},
+                ),
+            ),
+            "loop_orders": [list(reversed(range(root_rank)))],
+            "num_warps": row_extent // 16,
+            "num_stages": 1,
+            "indexing": "pointer",
+            "pid_type": "flat",
+            CUTE_AFFINE_SCAN_SCHEDULE_KEY: schedule_name,
+        }
+        return [Config.from_dict(values)]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
 
 
 class CuteAsyncStateLoadHeuristic(AutotunerHeuristic):
