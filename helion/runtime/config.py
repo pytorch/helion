@@ -22,6 +22,11 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteAffineScanScheduleLiteral = Literal[
+    "ordinary",
+    "direct_m16n8_v1",
+    "direct_m16n16_v1",
+]
 NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
@@ -58,6 +63,7 @@ class Config(Mapping[str, object]):
         cute_async_store_policy: CuteAsyncStorePolicyLiteral | None = None,
         cute_bf16x2_recurrence: bool | None = None,
         cute_proven_bounds: bool | None = None,
+        cute_affine_scan_schedule: CuteAffineScanScheduleLiteral | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -106,6 +112,10 @@ class Config(Mapping[str, object]):
                 recurrence into native BF16x2 operations.
             cute_proven_bounds: Remove CuTe index guards only when exact launch
                 dimensions and cache-specialized tensor sizes prove them true.
+            cute_affine_scan_schedule: Physical schedule for a compatible affine
+                scan. ``"ordinary"`` disables the direct lowering;
+                ``"direct_m16n8_v1"`` and ``"direct_m16n16_v1"`` select the
+                measured direct schedule profiles.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -165,6 +175,7 @@ class Config(Mapping[str, object]):
             "cute_async_store_policy": cute_async_store_policy,
             "cute_bf16x2_recurrence": cute_bf16x2_recurrence,
             "cute_proven_bounds": cute_proven_bounds,
+            "cute_affine_scan_schedule": cute_affine_scan_schedule,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -431,6 +442,13 @@ class Config(Mapping[str, object]):
     @property
     def cute_proven_bounds(self) -> bool:
         return cast("bool", self.config.get("cute_proven_bounds", False))
+
+    @property
+    def cute_affine_scan_schedule(self) -> CuteAffineScanScheduleLiteral:
+        return cast(
+            "CuteAffineScanScheduleLiteral",
+            self.config.get("cute_affine_scan_schedule", "ordinary"),
+        )
 
     @property
     def indexing(self) -> IndexingLiteral | list[IndexingLiteral]:

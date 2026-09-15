@@ -65,6 +65,7 @@ from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -778,6 +779,7 @@ VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc4",
     "split_alias_cpc5",
 )
+CUTE_AFFINE_SCAN_SCHEDULE_KEY = "cute_affine_scan_schedule"
 
 
 def _cute_chunk_recurrence_config_is_safe(
@@ -841,6 +843,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -884,6 +887,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1178,6 +1182,9 @@ class ConfigSpec:
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
+        # Enabled only after a generic matcher proves a compatible affine scan.
+        # The first choice is the semantic-neutral ordinary lowering.
+        self.cute_affine_scan_schedule: EnumFragment | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
@@ -2003,6 +2010,15 @@ class ConfigSpec:
             )
         )
 
+    def enable_cute_affine_scan_search(self, *, step_count: int | None) -> None:
+        """Expose measured direct-affine schedules for a compatible CuTe scan."""
+
+        if self.backend_name != "cute":
+            raise InvalidConfig("direct affine scan configuration requires CuTe")
+        self.cute_affine_scan_schedule = EnumFragment(
+            choices=direct_affine_schedule_choices(step_count)
+        )
+
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
         if not self.cute_flash_search_enabled or "block_sizes" not in config:
             return
@@ -2513,6 +2529,28 @@ class ConfigSpec:
             else:
                 raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
 
+    def _normalize_cute_affine_scan(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        fragment = self.cute_affine_scan_schedule
+        if fragment is None:
+            if CUTE_AFFINE_SCAN_SCHEDULE_KEY in config and not fix_invalid:
+                raise InvalidConfig(
+                    "CuTe affine scan schedule requires a compatible affine scan"
+                )
+            config.pop(CUTE_AFFINE_SCAN_SCHEDULE_KEY, None)
+            return
+
+        value = config.setdefault(CUTE_AFFINE_SCAN_SCHEDULE_KEY, fragment.default())
+        if type(value) is not str or value not in fragment.choices:
+            if fix_invalid:
+                config[CUTE_AFFINE_SCAN_SCHEDULE_KEY] = fragment.default()
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_AFFINE_SCAN_SCHEDULE_KEY} must be one of "
+                    f"{fragment.choices!r}, got {value!r}"
+                )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -2777,6 +2815,7 @@ class ConfigSpec:
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -3999,6 +4038,8 @@ class ConfigSpec:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
                 )
+            if self.cute_affine_scan_schedule is not None:
+                fields[CUTE_AFFINE_SCAN_SCHEDULE_KEY] = self.cute_affine_scan_schedule
             fields.update(self.user_defined_tunables)
             return fields
 
