@@ -14327,6 +14327,10 @@ class TestCuteLowerings(unittest.TestCase):
             ],
         )
         grid.add_lane_loop(0, "synthetic_lane_0", 4)
+        self.assertEqual(
+            grid.lane_loop_block_ids,
+            {"synthetic_lane_0": frozenset({0})},
+        )
         body = grid.wrap_body([statement_from_string("out = 1")])
 
         code = ast.unparse(ast.Module(body=body, type_ignores=[]))
