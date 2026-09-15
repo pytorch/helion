@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from .._compat import _regs_per_block
 from .._compat import device_num_sm
+from .._compat import get_triton_version
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -2555,6 +2556,42 @@ class ConfigSpec:
         self.normalize(normalized)
         return normalized
 
+    def _normalize_amd_mfma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        if (
+            config.get("matrix_instr_nonkdim") != 32
+            or self.backend_name != "triton"
+            or torch.version.hip is None
+            or not (3, 4) <= get_triton_version().release < (3, 8)
+        ):
+            return
+        properties = torch.cuda.get_device_properties(self.device)
+        arch = properties.gcnArchName  # pyrefly: ignore [missing-attribute]
+        if arch.split(":")[0] != "gfx950":
+            return
+
+        block_sizes = cast("list[int]", config["block_sizes"])
+        for fact in self.matmul_facts:
+            n = (
+                self.block_sizes.config_get(block_sizes, fact.n_block_id, fact.static_n)
+                if fact.n_block_id is not None
+                else fact.static_n
+            )
+            if n is None or n >= 16:
+                continue
+            # Triton 3.4-3.7 lack triton-lang/triton#10305 (fixed in 3.8):
+            # MFMA32's wide-store epilogue corrupts the compiler heap for N < 16.
+            # Automatic instruction selection avoids that layout.
+            if fix_invalid:
+                config["matrix_instr_nonkdim"] = 0
+                return
+            raise InvalidConfig(
+                "matrix_instr_nonkdim=32 with a matmul N tile smaller than 16 "
+                "can crash Triton 3.4-3.7 on gfx950; use matrix_instr_nonkdim=0 "
+                "or 16, or an N tile of at least 16"
+            )
+
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
     ) -> None:
@@ -2989,6 +3026,7 @@ class ConfigSpec:
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
         cross_loop_schedule_fragment = self.cross_loop_schedule
         if cross_loop_schedule_fragment is not None:
             cross_loop_schedule = config.setdefault(
