@@ -1933,9 +1933,12 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
         and plan.total_kv_rows % 256 == 0
     )
     # FA4 1-CTA staging: Q double-buffered (spans two skewed iterations);
-    # dO single-stage at head_dim 128 to fit the 227KB smem budget.
-    q_stage = 2
-    do_stage = 2 if d == 64 else 1
+    # TMA ring depths, bounded by the 227KB smem budget: head_dim 128 fits
+    # Q x2 + dO x1 next to K/V/dS/dQ staging; head_dim 64 has room for 4-deep
+    # Q and dO rings, which hide the load latency under the dQ reduce traffic
+    # (-5% at s8192/d64 vs 2/2).
+    q_stage = 2 if d == 128 else 4
+    do_stage = 1 if d == 128 else 4
     total_tiles = plan.total_kv_rows // 128
     # NOTE: the persistent tile-scheduler path (cute_flash_bwd_persistent=1)
     # currently DEADLOCKS on a fresh compile -- a pre-existing bug that a stale
