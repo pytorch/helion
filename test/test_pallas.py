@@ -5492,6 +5492,25 @@ class TestPallas(TestCase):
         self.assertNotIn("pltpu.make_async_copy", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_dynamic_unroll_rejects_ordered_carry(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def dependent_row_map(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for mb_cta in hl.tile(m, block_size=8):
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    for nb in hl.tile(n):
+                        out[mb, nb] = x[mb, nb] * 2
+            return out
+
+        x = torch.randn(16, 128, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig, "does not support ordered carry"
+        ):
+            dependent_row_map.bind((x,)).to_code(
+                helion.Config(block_sizes=[8, 128], pallas_loop_type="unroll")
+            )
+
     def test_dependent_tile_end_composes_with_streaming_loop_types(self) -> None:
         x = torch.randn(192, 192, device=DEVICE, dtype=torch.float32)
         bound = pallas_causal_prefix_sum.bind((x,))
@@ -5646,6 +5665,37 @@ class TestPallas(TestCase):
         self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 1)
         self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
+
+    def test_nested_pipeline_blockspec_records_dynamic_row_padding(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_pipeline_copy(
+            offsets: torch.Tensor, x: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for group in hl.grid(offsets.size(0) - 1):
+                begin = offsets[group]
+                end = offsets[group + 1]
+                for tile_m in hl.tile(begin, end):
+                    for tile_n in hl.tile(n):
+                        out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+            return out
+
+        offsets = torch.tensor([0, 13, 25], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(25, 128, device=DEVICE, dtype=torch.bfloat16)
+        code = nested_pipeline_copy.bind((offsets, x)).to_code(
+            helion.Config(
+                block_sizes=[16, 128],
+                pallas_loop_type="emit_pipeline",
+            )
+        )
+        pad_dims = re.search(r"_ds_pad_dims=(\[.*?\])", code)
+        self.assertIsNotNone(pad_dims, "expected _ds_pad_dims in the launcher call")
+        # Entries are (arg index, dim, block size, extra pad). The row dim of
+        # both the input (arg 1) and the output (arg 2) is sliced only by the
+        # nested pipeline, whose dynamic begin needs block_size - 1 = 15 rows.
+        self.assertIn("(1, 0, 16, 15)", pad_dims.group(1))
+        self.assertIn("(2, 0, 16, 15)", pad_dims.group(1))
 
     def test_pipeline_begin_aligned_skips_pad(self) -> None:
         # A block-aligned inner begin (the outer tile's offset) needs no boundary
