@@ -1296,6 +1296,19 @@ class LoopedReductionStrategy(ReductionStrategy):
                 thread_count, tile_dispatch.strategies
             )
         self._thread_count = thread_count
+        if thread_count > 0:
+            # Thread-level backends (e.g. FlyDSL) may override the per-block thread
+            # count of a looped whole-row reduction; tile-level backends return
+            # None here and keep the default.
+            _override = env.backend.looped_reduction_thread_count(
+                requested=thread_count,
+                block_size=block_size,
+                block_index=block_index,
+                config=fn.config,
+                config_spec=env.config_spec,
+            )
+            if _override is not None:
+                self._thread_count = _override
         self.block_size = block_size
         self._loop_block_size = block_size
         self._cute_reduction_lane_var: str | None = None
