@@ -99,6 +99,7 @@ import importlib
 import importlib.machinery
 import importlib.metadata
 import importlib.util
+import inspect
 from itertools import product
 from itertools import starmap
 import json
@@ -118,6 +119,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import Iterator
+from typing import Mapping
 from typing import NoReturn
 from typing import Protocol
 from typing import cast
@@ -155,6 +157,7 @@ ALL_IMPLS = (
     "flexattention-cute",
     "sdpa",
     "fa4",
+    "fa4-tuned",
     "kernelagent-1x",
     "kernelagent-2x",
     "kernelagent-10x",
@@ -502,6 +505,7 @@ _DISPLAY_IMPLS = (
     "tlx",
     "flexattention-cute",
     "fa4",
+    "fa4-tuned",
     "sdpa",
     "helion-cute",
     "kernelagent-1x",
@@ -521,6 +525,7 @@ _IMPL_LABELS = {
     "flexattention-cute": "FlexAttention (backend=CuTe)",
     "sdpa": "torch SDPA",
     "fa4": "FA4",
+    "fa4-tuned": "FA4 (autotuned per shape)",
     "kernelagent-1x": "KernelAgent Public (1x Helion tuning time)",
     "kernelagent-2x": "KernelAgent Public (2x Helion tuning time)",
     "kernelagent-10x": "KernelAgent Public (10x Helion tuning time)",
@@ -538,6 +543,7 @@ _IMPL_KEYS = {
     "flexattention-cute": "flexattention_cute",
     "sdpa": "torch_sdpa",
     "fa4": "fa4",
+    "fa4-tuned": "fa4_tuned",
     "kernelagent-1x": "kernelagent_1x",
     "kernelagent-2x": "kernelagent_2x",
     "kernelagent-10x": "kernelagent_10x",
@@ -1365,7 +1371,7 @@ def _implementation_version(
             ),
             "version_label": f"cuDNN {cudnn_label}",
         }
-    if impl == "fa4":
+    if impl in ("fa4", "fa4-tuned"):
         if not resolve_external_sources:
             return {
                 "version": "FlashAttention version not resolved (implementation skipped)",
@@ -10686,6 +10692,205 @@ def _benchmark_fa4(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def _fa4_tuned_plan(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Return the recorded tuned FA4 configuration for this GPU and shape.
+
+    ``flash_attn_func`` picks its tile shape and scheduler from FA4's own
+    built-in heuristic, which is not the best configuration on every part. This
+    table holds configurations found by autotuning FA4 itself on the target
+    hardware, so the baseline we compare against is FA4 at its best rather than
+    FA4 at its default.
+    """
+    key = (
+        args.z,
+        args.h,
+        args.seq_len,
+        args.head_dim,
+        args.dtype,
+        int(bool(args.causal)),
+    )
+    return _FA4_TUNED_PLANS.get((_gpu_name(), key))
+
+
+# Forwarded to ``_flash_attn_fwd`` verbatim. Same allowlist the FA4 autotune
+# harness used to produce these plans: scheduling knobs only, never anything
+# that changes what is computed.
+_FA4_TUNED_FWD_KNOBS = (
+    "tile_mn",
+    "mma_pv_is_rs",
+    "intra_wg_overlap",
+    "num_threads",
+    "num_splits",
+    "pack_gqa",
+)
+_FA4_TUNED_ALLOWED_FWD_KWARGS = frozenset(
+    {"disable_scheduler_metadata", "seqlen_k_per_split"}
+)
+_FA4_TUNED_ALLOWED_ENV = frozenset(
+    {"FA_CLC", "FA_DISABLE_2CTA", "FLASH_ATTENTION_NUM_SMS"}
+)
+
+# Winning configurations from the FA4 autotune campaign, transcribed from
+# helion_paper/data/attention_fa4_tuned_gb300.csv. Keyed by
+# (GPU name, (z, h, seq_len, head_dim, dtype, causal)).
+_FA4_TUNED_PLANS: dict[
+    tuple[str, tuple[int, int, int, int, str, int]], dict[str, Any]
+] = {
+    ("NVIDIA GB300", (2, 32, 32768, 64, "float16", 0)): {"tile_mn": [128, 160]},
+    ("NVIDIA GB300", (2, 32, 65536, 64, "float16", 0)): {
+        "tile_mn": [128, 160],
+        "env": {"FA_CLC": "1"},
+        "fwd_kwargs": {"disable_scheduler_metadata": True},
+    },
+    ("NVIDIA GB300", (2, 32, 131072, 64, "float16", 0)): {
+        "tile_mn": [128, 160],
+        "fwd_kwargs": {"disable_scheduler_metadata": True},
+    },
+    ("NVIDIA GB300", (2, 32, 262144, 64, "float16", 0)): {
+        "tile_mn": [128, 160],
+        "num_splits": 2,
+        "fwd_kwargs": {"seqlen_k_per_split": 131200},
+    },
+    ("NVIDIA GB300", (2, 32, 65536, 64, "float16", 1)): {"tile_mn": [128, 160]},
+    ("NVIDIA GB300", (2, 32, 131072, 64, "float16", 1)): {"tile_mn": [128, 160]},
+    ("NVIDIA GB300", (2, 32, 262144, 64, "float16", 1)): {"tile_mn": [128, 160]},
+    ("NVIDIA GB300", (2, 32, 524288, 64, "float16", 1)): {
+        "tile_mn": [128, 160],
+        "num_splits": -1,
+    },
+}
+
+
+@contextlib.contextmanager
+def _fa4_tuned_environment(env: Mapping[str, str]) -> Iterator[None]:
+    """Apply a plan's FA4 toggles, restoring the previous values afterwards."""
+    unknown = set(env) - _FA4_TUNED_ALLOWED_ENV
+    if unknown:
+        raise SystemExit(f"tuned FA4 plan sets non-FA4 environment: {sorted(unknown)}")
+    previous = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _benchmark_fa4_tuned(args: argparse.Namespace) -> dict[str, Any]:
+    """FA4 driven at its autotuned per-shape configuration.
+
+    Calls ``_flash_attn_fwd`` with the recorded scheduling knobs instead of
+    letting ``flash_attn_func`` apply FA4's default heuristic. Skips cleanly
+    when no plan is recorded for the GPU and shape.
+    """
+    if _uses_bias(args) or _epilogue(args) != "none":
+        return _skipped_result(
+            "fa4-tuned", args, "tuned FA4 plans cover identity-epilogue attention only"
+        )
+    plan = _fa4_tuned_plan(args)
+    if plan is None:
+        return _skipped_result(
+            "fa4-tuned",
+            args,
+            f"no tuned FA4 plan recorded for {_gpu_name()} at this shape",
+        )
+    plan = copy.deepcopy(plan)
+    for key, raw_value in getattr(args, "fa4_config", ()):
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        if key in _FA4_TUNED_ALLOWED_FWD_KWARGS:
+            plan.setdefault("fwd_kwargs", {})[key] = value
+        else:
+            plan[key] = value
+
+    _import_fa4()
+    from flash_attn.cute.interface import _flash_attn_fwd
+
+    dtype = _dtype_from_name(args.dtype)
+    q, k, v = _make_inputs(args, dtype)
+    causal = bool(args.causal)
+
+    expected: torch.Tensor | None = None
+    if not args.skip_correctness:
+        expected = _attention_output_reference(args, q, k, v)
+
+    qt = q.transpose(1, 2).contiguous()  # (B, H, S, D) -> (B, S, H, D)
+    del q
+    kt = k.transpose(1, 2).contiguous()
+    del k
+    vt = v.transpose(1, 2).contiguous()
+    del v
+    torch.cuda.empty_cache()
+
+    kwargs: dict[str, Any] = {"softmax_scale": None, "causal": causal}
+    for knob in _FA4_TUNED_FWD_KNOBS:
+        if knob in plan:
+            value = plan[knob]
+            kwargs[knob] = tuple(value) if knob == "tile_mn" else value
+    fwd_kwargs = plan.get("fwd_kwargs", {})
+    unknown_kwargs = set(fwd_kwargs) - _FA4_TUNED_ALLOWED_FWD_KWARGS
+    if unknown_kwargs:
+        raise SystemExit(
+            f"tuned FA4 plan sets non-scheduling kwargs: {sorted(unknown_kwargs)}"
+        )
+    kwargs.update(fwd_kwargs)
+
+    # The recorded plans come from FA4 beta26; an older checkout may not accept
+    # every scheduling knob. Drop what this build cannot take and say so in the
+    # result, rather than crashing or silently pretending the plan was applied.
+    supported = set(inspect.signature(_flash_attn_fwd).parameters)
+    dropped = sorted(set(kwargs) - supported)
+    for key in dropped:
+        del kwargs[key]
+
+    def run() -> torch.Tensor:
+        # beta23 returns (out, lse); beta26 returns (out, lse, p, row_max).
+        returned = _flash_attn_fwd(qt, kt, vt, **kwargs)
+        return returned[0] if isinstance(returned, tuple) else returned
+
+    with _fa4_tuned_environment(plan.get("env", {})), _scrubbed_argv():
+        accuracy = "PASS"
+        if expected is not None:
+            out = run()  # (B, S, H, D)
+            got = out.transpose(1, 2)  # back to (B, H, S, D)
+            accuracy = "PASS" if _check_close(got, expected, dtype) else "FAIL"
+            del expected, got, out
+            torch.cuda.empty_cache()
+        stats = _bench_steady(
+            run,
+            num_runs=args.num_runs,
+            warmup_ms=args.warmup_ms,
+            rep_ms=args.rep_ms,
+            cooldown_max_temp_c=_cooldown_target_temp_c(args),
+        )
+    return _result(
+        "fa4-tuned",
+        args,
+        stats,
+        accuracy=accuracy,
+        benchmark_timer="event",
+        config=repr(plan),
+        notes=[
+            "Tuned FA4 plan from helion_paper attention_fa4_tuned_gb300.csv.",
+            *(
+                [
+                    (
+                        "This FlashAttention build does not accept "
+                        f"{', '.join(dropped)}; the plan ran without it."
+                    )
+                ]
+                if dropped
+                else []
+            ),
+        ],
+    )
+
+
 def _benchmark_tilegym_tileir(args: argparse.Namespace) -> dict[str, Any]:
     """TileGym's handwritten Triton FMHA running through NV Triton TileIR."""
     try:
@@ -11067,6 +11272,8 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
         return _benchmark_flexattention(args)
     if args.impl == "fa4":
         return _benchmark_fa4(args)
+    if args.impl == "fa4-tuned":
+        return _benchmark_fa4_tuned(args)
     raise SystemExit(f"unknown impl {args.impl!r}")
 
 
@@ -12564,6 +12771,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     # Internal: backend selector threaded through the helion dispatch.
+    parser.add_argument(
+        "--fa4-config",
+        action="append",
+        type=_parse_key_value,
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Override one field of the tuned FA4 plan, for ablating which of "
+            "the baseline's choices carry its advantage. Repeat as needed, "
+            "e.g. --fa4-config n_block_size=128."
+        ),
+    )
     parser.add_argument("--helion-backend", default="triton", help=argparse.SUPPRESS)
     parser.add_argument(
         "--helion-force-flash-config",
