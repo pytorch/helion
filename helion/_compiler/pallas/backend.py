@@ -310,6 +310,7 @@ class PallasBackend(Backend):
             "pallas_worklist_grouping",
             "pallas_loop_type",
             "pallas_emit_pipeline_group_size",
+            "pallas_use_low_level_scheduler",
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
@@ -1347,6 +1348,9 @@ class PallasBackend(Backend):
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
 
+        if config.get("pallas_use_low_level_scheduler", False):
+            launcher_args.append("_use_low_level_scheduler=True")
+
         # No-tiling pure 2D matmul: emit ``_matmul_dot_general=...`` so the
         # launcher uses ``jax.jit(lax.dot_general(...))`` instead of
         # ``pl.pallas_call(...)``. XLA can then attach cross_program_prefetch,
@@ -1739,6 +1743,7 @@ class JaxLaunchMeta:
     out_dtypes: list[str]
     interpret: bool
     collective_id: int | None
+    use_low_level_scheduler: bool
     n_args: int
 
 
@@ -2036,6 +2041,7 @@ def capture_jax_launch_metadata(
     ]
     interpret = bool(kw.get("_pallas_interpret") or False)
     collective_id = cast("int | None", kw.get("_collective_id"))
+    use_low_level_scheduler = bool(kw.get("_use_low_level_scheduler") or False)
 
     # Derive the grid, output shapes, and shape-derived scalar launch args from the
     # RUNTIME input shapes so a single standalone is correct at every dynamic shape.
@@ -2169,6 +2175,7 @@ def capture_jax_launch_metadata(
         out_dtypes=out_dtypes,
         interpret=interpret,
         collective_id=collective_id,
+        use_low_level_scheduler=use_low_level_scheduler,
         n_args=len(launch_args),
     )
 
@@ -2361,6 +2368,9 @@ def build_jax_fn_ast(
         ast.parse(f"_USER_POSITIONS = {meta.user_positions!r}").body[0],
         ast.parse(f"_INTERPRET = {meta.interpret!r}").body[0],
         ast.parse(f"_COLLECTIVE_ID = {meta.collective_id!r}").body[0],
+        ast.parse(f"_USE_LOW_LEVEL_SCHEDULER = {meta.use_low_level_scheduler!r}").body[
+            0
+        ],
         ast.parse(f"_N_ARGS = {meta.n_args}").body[0],
     ]
     entrypoint = ast.parse(_jax_entrypoint_source(meta, device_kernel)).body[0]
@@ -2434,6 +2444,7 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        smem_arg_indices=_SMEM_ARG_INDICES,",
         "        collective_id=_COLLECTIVE_ID,",
         "        interpret=_INTERPRET,",
+        "        use_low_level_scheduler=_USE_LOW_LEVEL_SCHEDULER,",
         "        compact=None,",
         "        orig_shapes=orig_shapes,",
         "        ds_pad_dims=_DS_PAD_DIMS,",

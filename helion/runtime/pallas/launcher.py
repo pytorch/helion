@@ -1594,6 +1594,7 @@ def _pallas_pl_kernel_jit_fn(
     input_output_aliases: dict[int, int],
     interpret: bool,
     collective_id: int | None,
+    use_low_level_scheduler: bool,
 ) -> Callable[..., object]:
     """Build the ``pl.kernel`` jit_fn that drives the Helion device kernel.
 
@@ -1732,6 +1733,8 @@ def _pallas_pl_kernel_jit_fn(
         compiler_params: dict[str, object] = {
             "vmem_limit_bytes": _get_vmem_limit_bytes(pltpu, interpret)
         }
+        if use_low_level_scheduler:
+            compiler_params["flags"] = {"XLA_TPU_FORCE_LP_LLO_SCHEDULER": True}
         if collective_id is not None:
             compiler_params["collective_id"] = collective_id
         kernel_kwargs["compiler_params"] = pltpu.CompilerParams(  # type: ignore[union-attr]
@@ -1815,6 +1818,7 @@ def _pallas_compile_jit_fn(
     _hbm_arg_indices: list[int] | None,
     _matmul_dot_general: dict[str, object] | None,
     _collective_id: int | None,
+    _use_low_level_scheduler: bool,
     interpret: bool,
     placeholder_fn: Callable[[object], object] | None = None,
 ) -> _PallasCompileResult:
@@ -2004,6 +2008,7 @@ def _pallas_compile_jit_fn(
             input_output_aliases=pallas_aliases,
             interpret=interpret,
             collective_id=_collective_id,
+            use_low_level_scheduler=_use_low_level_scheduler,
         )
         jit_fn = _x64_scoped_jit_fn(jit_fn)
 
@@ -2034,6 +2039,7 @@ def _pallas_jax_call(
     smem_arg_indices: list[int] | None,
     collective_id: int | None,
     interpret: bool,
+    use_low_level_scheduler: bool = False,
     compact: dict[str, object] | None = None,
     orig_shapes: dict[int, tuple[int, ...]] | None = None,
     ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
@@ -2077,6 +2083,7 @@ def _pallas_jax_call(
             _hbm_arg_indices=hbm_arg_indices,
             _matmul_dot_general=None,
             _collective_id=collective_id,
+            _use_low_level_scheduler=use_low_level_scheduler,
             interpret=interpret,
         )
 
@@ -2132,6 +2139,7 @@ def _pallas_install_launcher_cache(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None,
     _pallas_interpret: bool | None,
     _collective_id: int | None,
+    _use_low_level_scheduler: bool,
     _matmul_dot_general: dict[str, object] | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
@@ -2175,6 +2183,7 @@ def _pallas_install_launcher_cache(
         _hbm_arg_indices=_hbm_arg_indices,
         _matmul_dot_general=_matmul_dot_general,
         _collective_id=_collective_id,
+        _use_low_level_scheduler=_use_low_level_scheduler,
         interpret=interpret,
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret
@@ -2267,6 +2276,7 @@ def default_pallas_launcher(
     _ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     _pallas_interpret: bool | None = None,
     _collective_id: int | None = None,
+    _use_low_level_scheduler: bool = False,
     _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
     _compact_build_worklist: Callable[..., object] | None = None,
@@ -2373,6 +2383,7 @@ def default_pallas_launcher(
                 _ds_pad_dims=_ds_pad_dims,
                 _pallas_interpret=_pallas_interpret,
                 _collective_id=_collective_id,
+                _use_low_level_scheduler=_use_low_level_scheduler,
                 _matmul_dot_general=_matmul_dot_general,
             )
         setattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, scratch_key)

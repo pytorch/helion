@@ -4670,6 +4670,24 @@ class TestPallas(TestCase):
         )
         torch.testing.assert_close(result, x[128:].sum(dim=0, keepdim=True))
 
+    def test_attention_low_level_scheduler_correctness(self) -> None:
+        """The optional TPU low-level scheduler preserves numerical results."""
+        query = torch.randn(1, 1, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 1, 256, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 1, 256, 128, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+            pallas_use_low_level_scheduler=True,
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
     def test_attention_fori_loop_correctness(self) -> None:
         """Fori attention buffers K/V while loop-invariant Q remains unchanged."""
         query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
