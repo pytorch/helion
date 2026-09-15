@@ -311,6 +311,7 @@ class PallasBackend(Backend):
             "pallas_loop_type",
             "pallas_emit_pipeline_group_size",
             "pallas_use_low_level_scheduler",
+            "pallas_fold_dot_lhs_cast",
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",

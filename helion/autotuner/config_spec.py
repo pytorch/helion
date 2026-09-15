@@ -808,6 +808,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
+        "pallas_fold_dot_lhs_cast",
         "pallas_pre_broadcast",
         *CUTE_TCGEN05_TUNABLE_KEYS,
     }
@@ -857,6 +858,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
+        "pallas_fold_dot_lhs_cast",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -894,6 +896,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
+        "pallas_fold_dot_lhs_cast",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -3144,9 +3147,15 @@ class ConfigSpec:
                 use_low_level_scheduler, bool
             ):
                 raise InvalidConfig("pallas_use_low_level_scheduler must be a bool")
+            fold_dot_lhs_cast = config.get("pallas_fold_dot_lhs_cast")
+            if fold_dot_lhs_cast is not None and not isinstance(
+                fold_dot_lhs_cast, bool
+            ):
+                raise InvalidConfig("pallas_fold_dot_lhs_cast must be a bool")
         else:
             config.pop("pallas_emit_pipeline_group_size", None)
             config.pop("pallas_use_low_level_scheduler", None)
+            config.pop("pallas_fold_dot_lhs_cast", None)
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
