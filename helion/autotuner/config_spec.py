@@ -806,6 +806,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "occupancy",
         "pallas_worklist_grouping",
         "pallas_loop_type",
+        "pallas_emit_pipeline_group_size",
         "pallas_pre_broadcast",
         *CUTE_TCGEN05_TUNABLE_KEYS,
     }
@@ -853,6 +854,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_emit_pipeline_group_size",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -888,6 +890,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_emit_pipeline_group_size",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -3125,6 +3128,16 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        if config.get("pallas_loop_type") == "emit_pipeline":
+            group_size = config.get("pallas_emit_pipeline_group_size")
+            if group_size is not None and (
+                type(group_size) is not int or group_size < 1
+            ):
+                raise InvalidConfig(
+                    "pallas_emit_pipeline_group_size must be a positive integer"
+                )
+        else:
+            config.pop("pallas_emit_pipeline_group_size", None)
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops

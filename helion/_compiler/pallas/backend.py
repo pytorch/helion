@@ -309,6 +309,7 @@ class PallasBackend(Backend):
             "flatten_loops",
             "pallas_worklist_grouping",
             "pallas_loop_type",
+            "pallas_emit_pipeline_group_size",
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
