@@ -324,6 +324,30 @@ def patch_gdn_tritonbench(operator_name: str, Operator: type[Any]) -> None:
     _PATCHED_GDN_OPERATOR_CLASSES.add(Operator)
 
 
+def patch_welford_tritonbench(operator_name: str, Operator: type[Any]) -> None:
+    if operator_name != "welford":
+        return
+
+    # pyrefly: ignore [missing-import]
+    from tritonbench.utils import triton_op
+
+    @triton_op.register_benchmark(operator_name=operator_name, cls=Operator)
+    def torch_compile_layer_norm(
+        self: object, weight: torch.Tensor, bias: torch.Tensor, x: torch.Tensor
+    ) -> Callable[[], torch.Tensor]:
+        # Helion's Welford kernel computes LayerNorm. Compile the existing
+        # LayerNorm reference instead of TritonBench's sequential Python Welford
+        # loop, which unrolls into a huge graph and makes compilation and
+        # cudagraph capture impractical for wide inputs.
+        return torch.compile(
+            Operator.eager_layer_norm(self, weight, bias, x),
+            mode="max-autotune-no-cudagraphs",
+        )
+
+    # Also avoid the sequential loop when running without an explicit --only.
+    triton_op.REGISTERED_BENCHMARKS["welford"]["torch_compile_welford"].enabled = False
+
+
 def helion_benchmark_method_name(func_name: str) -> str:
     prefix = "helion_"
     return func_name if func_name.startswith(prefix) else f"{prefix}{func_name}"
@@ -775,8 +799,8 @@ KERNEL_METRIC_MAPPINGS: dict[str, dict[str, str]] = {
         "eager_layer_norm": "baseline",
         "triton_welford-speedup": "triton_speedup",
         "triton_welford-accuracy": "triton_accuracy",
-        "torch_compile_welford-speedup": "torch_compile_speedup",
-        "torch_compile_welford-accuracy": "torch_compile_accuracy",
+        "torch_compile_layer_norm-speedup": "torch_compile_speedup",
+        "torch_compile_layer_norm-accuracy": "torch_compile_accuracy",
         "helion_welford-speedup": "helion_speedup",
         "helion_welford-accuracy": "helion_accuracy",
         "helion_welford-latency": "helion_latency_ms",
@@ -1492,6 +1516,7 @@ def run_kernel_variants(
         patch_rope_tritonbench_inputs(operator_name, Operator)
         patch_mamba2_tritonbench_inputs(operator_name, Operator)
         patch_gdn_tritonbench(operator_name, Operator)
+        patch_welford_tritonbench(operator_name, Operator)
     except ImportError as e:
         print(
             f"Error: Could not import operator '{operator_name}' from tritonbench",
