@@ -10553,8 +10553,36 @@ def _import_fa4() -> types.ModuleType:
     """
     import cutlass._mlir.dialects.nvvm as nvvm
     import cutlass.cute as cute
+    import cutlass.utils
 
     fa4_root = _resolve_fa4_root()
+    if importlib.util.find_spec("cutlass.utils.ampere_helpers") is None:
+        # cutlass 4.7 removed the sm80 helper module; FA4 only reads
+        # SMEM_CAPACITY["sm80"] from it (and only on the sm80 code path,
+        # which never runs on Blackwell). Stub it so the import succeeds.
+        ampere_stub = types.ModuleType("cutlass.utils.ampere_helpers")
+        ampere_stub.SMEM_CAPACITY = {  # pyrefly: ignore [missing-attribute]
+            "sm80": 163 * 1024,
+            "sm86": 99 * 1024,
+            "sm89": 99 * 1024,
+        }
+        sys.modules["cutlass.utils.ampere_helpers"] = ampere_stub
+        cutlass.utils.ampere_helpers = ampere_stub  # pyrefly: ignore [missing-attribute]
+    if not hasattr(cute, "make_fragment"):
+        # cutlass 4.7 renamed make_fragment -> make_rmem_tensor (same signature).
+        cute.make_fragment = cute.make_rmem_tensor  # pyrefly: ignore [missing-attribute]
+    if not hasattr(cute.core.Tensor, "to"):
+        # cutlass 4.7 removed Tensor.to (rmem fragment dtype conversion);
+        # quack's cvt_copy and FA4 epilogues still call it. Reconstruct it as
+        # fragment-allocate + TensorSSA convert + store (the 4.7-native form).
+        def _tensor_to(
+            self: object, dtype: object, *, loc: object = None, ip: object = None
+        ) -> object:
+            out = cute.make_rmem_tensor(self.layout, dtype)  # pyrefly: ignore
+            out.store(self.load().to(dtype))  # pyrefly: ignore [missing-attribute]
+            return out
+
+        cute.core.Tensor.to = _tensor_to  # pyrefly: ignore [missing-attribute]
     for sym in ("ThrMma", "ThrCopy"):
         if not hasattr(cute.core, sym):
             setattr(cute.core, sym, getattr(cute, sym))
