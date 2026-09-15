@@ -101,8 +101,10 @@ class _TensorMetadata:
 def _static_size(value: object) -> int | None:
     if isinstance(value, int):
         return value
-    if isinstance(value, torch.SymInt) and isinstance(value._sympy_(), sympy.Integer):
-        return int(value._sympy_())
+    if isinstance(value, torch.SymInt):
+        symbolic = value._sympy_()
+        if isinstance(symbolic, sympy.Integer):
+            return int(symbolic)
     return None
 
 
