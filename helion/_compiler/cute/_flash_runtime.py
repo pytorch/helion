@@ -218,6 +218,7 @@ def flash_bwd_shared_storage(
     head_dim: int,
     q_stage: int,
     do_stage: int,
+    kv_stage: int = 1,
     dtype: object = cutlass.Float16,
 ) -> type:
     """SharedStorage for the fused attention-BACKWARD kernel (1-CTA).
@@ -235,8 +236,8 @@ def flash_bwd_shared_storage(
     class SharedStorage:
         q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
         do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, do_stage * 2]
-        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
         s_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         dp_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
@@ -246,10 +247,13 @@ def flash_bwd_shared_storage(
         dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
         dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
-        # both compute warpgroups' dK/dV TMA stores done (K/V buffers free)
-        epi_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
+        # MMA operand start addresses, re-read with ld.volatile per iteration
+        mma_base: cute.struct.MemRange[cutlass.Int32, 8]
+        # CLC tile scheduler: 2-stage response ring (16 B each) + full/empty pairs
+        clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
         sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
         sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
         sQ: cute.struct.Align[
@@ -258,8 +262,12 @@ def flash_bwd_shared_storage(
         sdO: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * do_stage], 1024
         ]
-        sK: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
-        sV: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sK: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+        ]
+        sV: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+        ]
         sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
         # dQ drain staging for the 2D TMA tensor reduce-add: 8 x (32 x 32) fp32
         # boxes in the canonical SWIZZLE_128B epilogue layout (4KB each, 1KB
@@ -464,6 +472,9 @@ def flash_bwd_2cta_shared_storage(
         # iteration so ptxas cannot hoist the per-k descriptors (see
         # ``ld_volatile_shared_u32``).
         mma_base: cute.struct.MemRange[cutlass.Int32, 8]
+        # CLC tile scheduler: 2-stage response ring (16 B each) + full/empty pairs
+        clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
         sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
         sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
         sQ: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]

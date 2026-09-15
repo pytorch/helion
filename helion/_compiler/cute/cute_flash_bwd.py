@@ -706,13 +706,18 @@ def _fbwd_epilogue_block(
     kv_tile: str,
     io_dtype: str,
     dkv_wait: str,
-    handshake: bool,
+    v_empty_expr: str,
 ) -> str:
-    """dK/dV epilogue of compute warpgroup ``h``: TMEM -> registers -> the free
-    V (h=0) / K (h=1) operand buffer as (128, 64) SWIZZLE_128B boxes -> one TMA
-    store per box. ``handshake`` arrives on ``epi_done`` when the stores have
-    completed (the 1-CTA MMA warp releases K/V only then)."""
-    buf = "sV" if h == 0 else "sK"
+    """dK/dV epilogue of compute warpgroup ``h``: TMEM -> registers -> a free
+    smem buffer as (128, 64) SWIZZLE_128B boxes -> one TMA store per box.
+
+    dV (h=0) stages through this tile's V operand slot (free once dP(n-1)
+    retired, i.e. at dv_done) and hands the slot back to the load warp with an
+    arrive on the V ring's empty barrier (``v_empty_expr``) after the store has
+    completed; dK (h=1) stages through sdS (free after the tail dQ, i.e. at
+    dkv_done), so K/Kt can be released by the MMA warp at the tail and the next
+    tile's K loads overlap the epilogue."""
+    buf = "sV" if h == 0 else "sdS"
     tma = "_fbwd_tma_dv" if h == 0 else "_fbwd_tma_dk"
     gm = "_fbwd_mdVt" if h == 0 else "_fbwd_mdKt"
     warp_lo = 4 if h == 0 else 8
@@ -731,11 +736,11 @@ def _fbwd_epilogue_block(
         fbwd_rego.store(fbwd_reg.load().to({io_dtype}))"""
         + (
             f"""
-        cute.autovec_copy(fbwd_row64, fbwd_sEpi[fbwd_local_tidx, None, {c // 4}])
+        cute.autovec_copy(fbwd_row64, fbwd_sEpi[fbwd_local_tidx, None, fbwd_epi_slot0 + {c // 4}])
         cute.arch.fence_view_async_shared()
         _helion_flash_rt.named_barrier_wait_unaligned({5 + h}, 128)
         if warp_idx == {warp_lo}:
-            tEPIsS{c // 4}, tEPIgS{c // 4} = cute_cpasync_flash.tma_partition({tma}, 0, cute.make_layout(1), cute.group_modes(fbwd_sEpi[None, None, {c // 4}], 0, 2), cute.group_modes(fbwd_gEpi[None, None, {kv_tile}, {c // 4}], 0, 2))
+            tEPIsS{c // 4}, tEPIgS{c // 4} = cute_cpasync_flash.tma_partition({tma}, 0, cute.make_layout(1), cute.group_modes(fbwd_sEpi[None, None, fbwd_epi_slot0 + {c // 4}], 0, 2), cute.group_modes(fbwd_gEpi[None, None, {kv_tile}, {c // 4}], 0, 2))
             cute.copy({tma}, tEPIsS{c // 4}, tEPIgS{c // 4})
             cute.arch.cp_async_bulk_commit_group()"""
             if c % 4 == 3
@@ -746,8 +751,15 @@ def _fbwd_epilogue_block(
     hs = (
         """
             with cute.arch.elect_one():
-                _helion_flash_rt.mbarrier_arrive(fbwd_epi_done_ptr)"""
-        if handshake
+                _helion_flash_rt.mbarrier_arrive(fbwd_kv_empty_ptr)"""
+        if h == 0
+        else ""
+    )
+    kv_empty = (
+        f"""
+        fbwd_kv_empty_ptr = {v_empty_expr}
+"""
+        if h == 0
         else ""
     )
     done_ptr = "fbwd_dv_done_ptr" if h == 0 else "fbwd_dkv_done_ptr"
@@ -769,8 +781,8 @@ def _fbwd_epilogue_block(
         # per lane -- and each complete box is TMA-stored by the group's first
         # warp (warp-collective issue).
         fbwd_sEpi = storage.{buf}.get_tensor(_fbwd_epil.outer, swizzle=_fbwd_epil.inner)
-        fbwd_gEpi = cute.local_tile({gm}, (128, 64), (None, None))
-{chunks}
+        fbwd_epi_slot0 = {f"{d // 64} * (FBWD_KV_SLOT)" if h == 0 else "0"}
+        fbwd_gEpi = cute.local_tile({gm}, (128, 64), (None, None)){kv_empty}{chunks}
         if warp_idx == {warp_lo}:
             cute.arch.cp_async_bulk_wait_group(0){hs}
 """
@@ -825,8 +837,8 @@ def _flash_bwd_wg_compute_block(
         kv_tile="fbwd_tile_id",
         io_dtype=io_dtype,
         dkv_wait="fbwd_tile_it % 2",
-        handshake=True,
-    )
+        v_empty_expr="storage.v_mbar_ptr.data_ptr() + FBWD_KV_STAGE + fbwd_tile_it % FBWD_KV_STAGE",
+    ).replace("FBWD_KV_SLOT", "fbwd_tile_it % FBWD_KV_STAGE")
     # Next tile of the walk without a division: +1 inside a stripe, and a jump
     # to the next stripe's diagonal when the stripe ends (causal GQA walk).
     m_tile_next = (
@@ -941,6 +953,77 @@ def _flash_bwd_wg_compute_block(
 """
 
 
+_FBWD_CLC_SETUP = """
+    # CLC dynamic tile scheduler: warp 15 steals not-yet-launched tiles and the
+    # 16-byte responses flow through a 2-stage ring every warp consumes. All
+    # 512 threads of every CTA in the cluster release into the leader's empty
+    # barrier, so its arrive count scales with the cluster size.
+    fbwd_clc_params = cutlass_utils_flash.ClcDynamicPersistentTileSchedulerParams(problem_shape_ntile_mnl=(TOTAL_CTAS, 1, 1), cluster_shape_mnk=(CLUSTER_N, 1, 1))
+    fbwd_clc_hw = cutlass_utils_flash.ClcDynamicPersistentTileScheduler.create(fbwd_clc_params, cute.arch.block_idx(), cute.arch.grid_dim(), storage.clc_response.data_ptr())
+    fbwd_clc_base = storage.clc_response.data_ptr()
+    fbwd_clc_pipe = cutlass_pipeline_flash.PipelineClcFetchAsync.create(barrier_storage=storage.clc_mbar_ptr.data_ptr(), num_stages=2, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread, CONSUMERS), tx_count=16, cta_layout_vmnk=CTA_LAYOUT)
+    fbwd_clc_cstate = cutlass_pipeline_flash.make_pipeline_state(cutlass_pipeline_flash.PipelineUserType.Consumer, 2)
+"""
+
+_FBWD_CLC_CONSUME = (
+    "{ind}fbwd_clc_pipe.consumer_wait(fbwd_clc_cstate)\n"
+    "{ind}fbwd_clc_rptr = (fbwd_clc_base + fbwd_clc_cstate.index * cutlass.Int32(4)).align(16)\n"
+    "{ind}fbwd_work = fbwd_clc_hw.work_tile_info_from_clc_response(fbwd_clc_rptr)\n"
+    "{ind}fbwd_clc_pipe.consumer_release(fbwd_clc_cstate)\n"
+    "{ind}fbwd_clc_cstate.advance()\n"
+)
+
+
+def _fbwd_clc_setup(total_ctas: int, cluster: int, cta_layout: str) -> str:
+    return (
+        _FBWD_CLC_SETUP.replace("TOTAL_CTAS", str(total_ctas))
+        .replace("CLUSTER_N", str(cluster))
+        .replace("CONSUMERS", str(512 * cluster))
+        .replace("CTA_LAYOUT", cta_layout)
+    )
+
+
+def _fbwd_clc_consume_only(ind: str) -> str:
+    """A warp with no per-tile work still consumes every CLC response."""
+    return (
+        f"{ind}fbwd_work = fbwd_clc_hw.initial_work_tile_info()\n"
+        f"{ind}while fbwd_work.is_valid_tile:\n" + _FBWD_CLC_CONSUME.format(ind=ind + "    ")
+    )
+
+
+def _fbwd_clc_scheduler(ind: str, leader_guard: str | None) -> str:
+    """Scheduler warp: steal the next tile (leader CTA only in a cluster; the
+    multicast response reaches every CTA) and consume like everyone else."""
+    issue = (
+        f"{ind}    with cute.arch.elect_one():\n"
+        f"{ind}        cute.arch.issue_clc_query(fbwd_clc_mbar, fbwd_clc_rptr)\n"
+    )
+    if leader_guard is not None:
+        issue = f"{ind}    if {leader_guard}:\n" + "".join(
+            "    " + line + "\n" for line in issue.splitlines()
+        )
+    # The query is issued only once the current tile's dV is complete (dv_done):
+    # reserving the next tile at tile start would commit it a whole tile early
+    # and, with causal tiles of very different lengths, leave the tail badly
+    # balanced (gqa-causal lost 12% that way); the epilogue still hides the
+    # response latency.
+    return (
+        f"{ind}fbwd_clc_pstate = cutlass_pipeline_flash.make_pipeline_state(cutlass_pipeline_flash.PipelineUserType.Producer, 2)\n"
+        f"{ind}fbwd_clc_tile_it = cutlass.Int32(0)\n"
+        f"{ind}fbwd_work = fbwd_clc_hw.initial_work_tile_info()\n"
+        f"{ind}while fbwd_work.is_valid_tile:\n"
+        f"{ind}    _helion_flash_rt.mbar_spin_wait(fbwd_dv_done_ptr, fbwd_clc_tile_it % 2, 10000000)\n"
+        f"{ind}    fbwd_clc_tile_it = fbwd_clc_tile_it + 1\n"
+        f"{ind}    fbwd_clc_pipe.producer_acquire(fbwd_clc_pstate)\n"
+        f"{ind}    fbwd_clc_mbar = fbwd_clc_pipe.producer_get_barrier(fbwd_clc_pstate)\n"
+        f"{ind}    fbwd_clc_rptr = (fbwd_clc_base + fbwd_clc_pstate.index * cutlass.Int32(4)).align(16)\n"
+        + issue
+        + f"{ind}    fbwd_clc_pstate.advance()\n"
+        + _FBWD_CLC_CONSUME.format(ind=ind + "    ")
+        + f"{ind}fbwd_clc_pipe.producer_tail(fbwd_clc_pstate)\n"
+    )
+
+
 def _fbwd_tile_setup_lines(plan: AttentionBwdPlan, indent: str) -> str:
     n_tiles = plan.n_dim // 128
     m_tiles = plan.mm_dim // 128
@@ -990,7 +1073,7 @@ def _fbwd_wrap_persistent(body: str, plan: AttentionBwdPlan, total_tiles: int) -
     regions.append((s, e))
     # MMA warp: K/V waits .. ve release
     s = find("        fbwd_ke = fbwd_k_cons.wait_and_advance()")
-    e = find("        fbwd_ve.release()", s)
+    e = find("        fbwd_ke.release()", s)
     regions.append((s, e))
     # reduce warps: locate its for-loop after the tRDcDQ partition
     anchor = find("        tRDcDQ = fbwd_thr_dq_ld.partition_D(tDQcDQ)")
@@ -1008,20 +1091,23 @@ def _fbwd_wrap_persistent(body: str, plan: AttentionBwdPlan, total_tiles: int) -
     for _ in range(2):
         blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
         s = find("        fbwd_stage_col0 = ", blk)
-        e = find("                _helion_flash_rt.mbarrier_arrive(fbwd_epi_done_ptr)", s)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        while e + 1 < len(lines) and lines[e + 1].startswith("            "):
+            e += 1  # WG0's V-slot release sits under the same if
         regions.append((s, e))
         pos = e + 1
 
     setup = _fbwd_tile_setup_lines(plan, " " * 12)
+    # Dynamic schedule: the first tile is this CTA's blockIdx, later tiles
+    # come from the CLC response ring (warp 15 steals not-yet-launched CTAs),
+    # so the hardware's launch order and load balance are preserved.
     head = (
-        "        fbwd_tile_id = cutlass.Int32(cute.arch.block_idx()[0])\n"
+        "        fbwd_work = fbwd_clc_hw.initial_work_tile_info()\n"
         "        fbwd_tile_it = cutlass.Int32(0)\n"
-        f"        while fbwd_tile_id < {total_tiles}:\n" + setup
+        "        while fbwd_work.is_valid_tile:\n"
+        "            fbwd_tile_id = cutlass.Int32(fbwd_work.tile_idx[0])\n" + setup
     )
-    tail = (
-        "            fbwd_tile_id = fbwd_tile_id + fbwd_grid_dim\n"
-        "            fbwd_tile_it = fbwd_tile_it + 1\n"
-    )
+    tail = _FBWD_CLC_CONSUME.format(ind=" " * 12) + "            fbwd_tile_it = fbwd_tile_it + 1\n"
     out = []
     prev = 0
     for s, e in sorted(regions):
@@ -1044,6 +1130,7 @@ def emit_flash_bwd_device_body(
     out_scale_expr: str,
     q_stage: int,
     do_stage: int,
+    kv_stage: int = 1,
     persistent: bool = False,
     total_tiles: int = 0,
 ) -> str:
@@ -1181,7 +1268,7 @@ def emit_flash_bwd_device_body(
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_v)
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_do)
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_dq)
-    _fbwd_storage_cls = _helion_flash_rt.flash_bwd_shared_storage({d}, {q_stage}, {do_stage}, {io_dtype})
+    _fbwd_storage_cls = _helion_flash_rt.flash_bwd_shared_storage({d}, {q_stage}, {do_stage}, {kv_stage}, {io_dtype})
     smem = cutlass_utils_flash.SmemAllocator()
     storage = smem.allocate(_fbwd_storage_cls)
     sQ = storage.sQ.get_tensor(_fbwd_qsl.outer, swizzle=_fbwd_qsl.inner)
@@ -1205,7 +1292,6 @@ def emit_flash_bwd_device_body(
     fbwd_dq_empty_ptr = storage.dq_empty_mbar.data_ptr()
     fbwd_dkv_done_ptr = storage.dkv_done_mbar.data_ptr()
     fbwd_dv_done_ptr = storage.dv_done_mbar.data_ptr()
-    fbwd_epi_done_ptr = storage.epi_done_mbar.data_ptr()
     fbwd_tmem_dealloc_ptr = storage.tmem_dealloc_mbar.data_ptr()
     if tidx == 0:
         cute.arch.mbarrier_init(fbwd_s_full_ptr, 1)
@@ -1216,7 +1302,6 @@ def emit_flash_bwd_device_body(
         cute.arch.mbarrier_init(fbwd_dq_empty_ptr, 128)
         cute.arch.mbarrier_init(fbwd_dkv_done_ptr, 1)
         cute.arch.mbarrier_init(fbwd_dv_done_ptr, 1)
-        cute.arch.mbarrier_init(fbwd_epi_done_ptr, 2)
     cute.arch.mbarrier_init_fence()
     cute.arch.sync_threads()
     fbwd_tmem_user_bar = cutlass_pipeline_flash.NamedBarrier(barrier_id=2, num_threads=13 * 32)
@@ -1225,9 +1310,9 @@ def emit_flash_bwd_device_body(
     fbwd_k_bytes = cute.size_in_bytes({io_dtype}, cute.select(_fbwd_ksl, mode=[0, 1, 2]))
     fbwd_q_prod, fbwd_q_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages={q_stage}, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_q_bytes, barrier_storage=storage.q_mbar_ptr.data_ptr()).make_participants()
     fbwd_do_prod, fbwd_do_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages={do_stage}, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_q_bytes, barrier_storage=storage.do_mbar_ptr.data_ptr()).make_participants()
-    fbwd_k_prod, fbwd_k_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_k_bytes, barrier_storage=storage.k_mbar_ptr.data_ptr()).make_participants()
-    fbwd_v_prod, fbwd_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_k_bytes, barrier_storage=storage.v_mbar_ptr.data_ptr()).make_participants()
-    fbwd_sst = _fbwd_ss_mma.get_slice(0)
+    fbwd_k_prod, fbwd_k_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages={kv_stage}, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_k_bytes, barrier_storage=storage.k_mbar_ptr.data_ptr()).make_participants()
+    fbwd_v_prod, fbwd_v_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages={kv_stage}, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_k_bytes, barrier_storage=storage.v_mbar_ptr.data_ptr()).make_participants()
+{{clc_setup}}    fbwd_sst = _fbwd_ss_mma.get_slice(0)
     fbwd_tst = _fbwd_ts_mma.get_slice(0)
     fbwd_dskt = _fbwd_dsk_mma.get_slice(0)
     fbwd_dqt = _fbwd_dq_mma.get_slice(0)
@@ -1245,7 +1330,7 @@ def emit_flash_bwd_device_body(
     tDOsDO, tDOgDO_qdl = cute_cpasync_flash.tma_partition(_fbwd_tma_do, 0, cute.make_layout(1), cute.group_modes(sdO, 0, 3), cute.group_modes(tSgdO, 0, 3))
     if (warp_idx >= 12) & (warp_idx < 16):
         cute.arch.setmaxregister_decrease(88)
-    if warp_idx == 13:
+{{clc_warps}}    if warp_idx == 13:
         tKgK = tKgK_kdl[None, None, 0, 0]
         tQgQ = tQgQ_qdl[None, None, 0, 0]
         tVgV = tVgV_kdl[None, None, 0, 0]
@@ -1298,26 +1383,31 @@ def emit_flash_bwd_device_body(
         fbwd_dk_addr = tDK_t.iterator.toint()
         fbwd_dqa_addr = tDQ_t.iterator.toint()
         fbwd_k_base = _helion_flash_ptx.smem_desc_base_from_tensor(sK, _helion_flash_ptx.Major.K)
-        _helion_flash_ptx.declare_ptx_smem_desc_base(_helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, 0].iterator), fbwd_k_base, "helion_fbwd_k_desc")
         fbwd_v_base = _helion_flash_ptx.smem_desc_base_from_tensor(sV, _helion_flash_ptx.Major.K)
-        _helion_flash_ptx.declare_ptx_smem_desc_base(_helion_flash_ptx.make_smem_desc_start_addr(sV[None, None, None, 0].iterator), fbwd_v_base, "helion_fbwd_v_desc")
         _helion_flash_ptx.declare_ptx_idesc(_fbwd_ss_mma.op, "helion_fbwd_ss_idesc")
         fbwd_q_base = _helion_flash_ptx.smem_desc_base_from_tensor(sQ, _helion_flash_ptx.Major.K)
         fbwd_do_base = _helion_flash_ptx.smem_desc_base_from_tensor(sdO, _helion_flash_ptx.Major.K)
         fbwd_dot_base = _helion_flash_ptx.smem_desc_base_from_tensor(sdOt, _helion_flash_ptx.Major.MN)
         _helion_flash_ptx.declare_ptx_idesc(_fbwd_ts_mma.op, "helion_fbwd_ts_idesc")
         fbwd_dsnk_base = _helion_flash_ptx.smem_desc_base_from_tensor(fbwd_sdS_nk, _helion_flash_ptx.Major.K)
-        _helion_flash_ptx.declare_ptx_smem_desc_base(_helion_flash_ptx.make_smem_desc_start_addr(fbwd_sdS_nk[None, None, None, 0].iterator), fbwd_dsnk_base, "helion_fbwd_dsnk_desc")
         fbwd_qt_base = _helion_flash_ptx.smem_desc_base_from_tensor(sQt, _helion_flash_ptx.Major.MN)
         _helion_flash_ptx.declare_ptx_idesc(_fbwd_dsk_mma.op, "helion_fbwd_dsk_idesc")
         fbwd_dsmn_base = _helion_flash_ptx.smem_desc_base_from_tensor(fbwd_sdS_mn, _helion_flash_ptx.Major.MN)
-        _helion_flash_ptx.declare_ptx_smem_desc_base(_helion_flash_ptx.make_smem_desc_start_addr(fbwd_sdS_mn[None, None, None, 0].iterator), fbwd_dsmn_base, "helion_fbwd_dsmn_desc")
         fbwd_kt_base = _helion_flash_ptx.smem_desc_base_from_tensor(sKt, _helion_flash_ptx.Major.MN)
         _helion_flash_ptx.declare_ptx_idesc(_fbwd_dq_mma.op, "helion_fbwd_dq_idesc")
+        fbwd_mb = storage.mma_base.get_tensor(cute.make_layout(8))
+        fbwd_mb[2] = _helion_flash_ptx.make_smem_desc_start_addr(fbwd_sdS_nk[None, None, None, 0].iterator)
+        fbwd_mb[3] = _helion_flash_ptx.make_smem_desc_start_addr(fbwd_sdS_mn[None, None, None, 0].iterator)
         fbwd_pf_phase = cutlass.Int32(0)
         fbwd_dsf_phase = cutlass.Int32(0)
         fbwd_dqe_phase = cutlass.Int32(0)
         fbwd_ke = fbwd_k_cons.wait_and_advance()
+        fbwd_mb[0] = _helion_flash_ptx.make_smem_desc_start_addr(sK[None, None, None, fbwd_ke.index].iterator)
+        fbwd_mb[4] = _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, fbwd_ke.index].iterator)
+        fbwd_st_k = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 0)
+        fbwd_st_dsnk = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 2)
+        fbwd_st_dsmn = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 3)
+        fbwd_st_kt = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 4)
         fbwd_dv_zero = cutlass.Boolean(True)
         fbwd_dk_zero = cutlass.Boolean(True)
         # Prologue: S(0), dP(0), dV(0). FA4's 1-iteration software skew: each
@@ -1326,10 +1416,12 @@ def emit_flash_bwd_device_body(
         fbwd_qe = fbwd_q_cons.wait_and_advance()
         fbwd_doe = fbwd_do_cons.wait_and_advance()
         fbwd_ve = fbwd_v_cons.wait_and_advance()
-        _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_s_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQ[None, None, None, fbwd_qe.index].iterator), fbwd_q_base, tSrQ[None, None, None, 0].layout, "helion_fbwd_k_desc", "helion_fbwd_ss_idesc", a_layout=tSrK[None, None, None, 0].layout, a_base=fbwd_k_base, zero_init=True)
+        fbwd_mb[1] = _helion_flash_ptx.make_smem_desc_start_addr(sV[None, None, None, fbwd_ve.index].iterator)
+        fbwd_st_v = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 1)
+        _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_s_addr, fbwd_st_k, fbwd_k_base, tSrK[None, None, None, 0].layout, _helion_flash_ptx.make_smem_desc_start_addr(sQ[None, None, None, fbwd_qe.index].iterator), fbwd_q_base, tSrQ[None, None, None, 0].layout, "helion_fbwd_ss_idesc", zero_init=True)
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(fbwd_s_full_ptr){dq_empty_wait_prologue}
-        _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dp_addr, _helion_flash_ptx.make_smem_desc_start_addr(sdO[None, None, None, fbwd_doe.index].iterator), fbwd_do_base, tSrDO[None, None, None, 0].layout, "helion_fbwd_v_desc", "helion_fbwd_ss_idesc", a_layout=tSrV[None, None, None, 0].layout, a_base=fbwd_v_base, zero_init=True)
+        _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_dp_addr, fbwd_st_v, fbwd_v_base, tSrV[None, None, None, 0].layout, _helion_flash_ptx.make_smem_desc_start_addr(sdO[None, None, None, fbwd_doe.index].iterator), fbwd_do_base, tSrDO[None, None, None, 0].layout, "helion_fbwd_ss_idesc", zero_init=True)
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(fbwd_dp_full_ptr)
         _helion_flash_rt.mbar_spin_wait(fbwd_p_full_ptr, fbwd_pf_phase, 10000000)
@@ -1338,21 +1430,26 @@ def emit_flash_bwd_device_body(
         fbwd_dv_zero = cutlass.Boolean(False)
         fbwd_doe.release()
         for fbwd_i in cutlass.range(fbwd_steps - 1, unroll=1):
+            fbwd_st_k = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 0)
+            fbwd_st_v = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 1)
+            fbwd_st_dsnk = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 2)
+            fbwd_st_dsmn = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 3)
+            fbwd_st_kt = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 4)
             fbwd_qe2 = fbwd_q_cons.wait_and_advance()
-            _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_s_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQ[None, None, None, fbwd_qe2.index].iterator), fbwd_q_base, tSrQ[None, None, None, 0].layout, "helion_fbwd_k_desc", "helion_fbwd_ss_idesc", a_layout=tSrK[None, None, None, 0].layout, a_base=fbwd_k_base, zero_init=True)
+            _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_s_addr, fbwd_st_k, fbwd_k_base, tSrK[None, None, None, 0].layout, _helion_flash_ptx.make_smem_desc_start_addr(sQ[None, None, None, fbwd_qe2.index].iterator), fbwd_q_base, tSrQ[None, None, None, 0].layout, "helion_fbwd_ss_idesc", zero_init=True)
             with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(fbwd_s_full_ptr)
             _helion_flash_rt.mbar_spin_wait(fbwd_ds_full_ptr, fbwd_dsf_phase, 10000000)
             fbwd_dsf_phase ^= 1
-            _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dk_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qe.index].iterator), fbwd_qt_base, tKSrQt[None, None, None, 0].layout, "helion_fbwd_dsnk_desc", "helion_fbwd_dsk_idesc", a_layout=tKSrDS[None, None, None, 0].layout, a_base=fbwd_dsnk_base, zero_init=fbwd_dk_zero)
+            _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_dk_addr, fbwd_st_dsnk, fbwd_dsnk_base, tKSrDS[None, None, None, 0].layout, _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qe.index].iterator), fbwd_qt_base, tKSrQt[None, None, None, 0].layout, "helion_fbwd_dsk_idesc", zero_init=fbwd_dk_zero)
             fbwd_dk_zero = cutlass.Boolean(False){dq_empty_wait_g5}
-            _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dqa_addr, _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, 0].iterator), fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dsmn_desc", "helion_fbwd_dq_idesc", a_layout=tDQrDS[None, None, None, 0].layout, a_base=fbwd_dsmn_base, zero_init=True)
+            _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_dqa_addr, fbwd_st_dsmn, fbwd_dsmn_base, tDQrDS[None, None, None, 0].layout, fbwd_st_kt, fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dq_idesc", zero_init=True)
             with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(fbwd_dq_full_ptr)
             fbwd_qe.release()
             fbwd_qe = fbwd_qe2{dq_empty_wait_g2}
             fbwd_doe = fbwd_do_cons.wait_and_advance()
-            _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dp_addr, _helion_flash_ptx.make_smem_desc_start_addr(sdO[None, None, None, fbwd_doe.index].iterator), fbwd_do_base, tSrDO[None, None, None, 0].layout, "helion_fbwd_v_desc", "helion_fbwd_ss_idesc", a_layout=tSrV[None, None, None, 0].layout, a_base=fbwd_v_base, zero_init=True)
+            _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_dp_addr, fbwd_st_v, fbwd_v_base, tSrV[None, None, None, 0].layout, _helion_flash_ptx.make_smem_desc_start_addr(sdO[None, None, None, fbwd_doe.index].iterator), fbwd_do_base, tSrDO[None, None, None, 0].layout, "helion_fbwd_ss_idesc", zero_init=True)
             with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(fbwd_dp_full_ptr)
             _helion_flash_rt.mbar_spin_wait(fbwd_p_full_ptr, fbwd_pf_phase, 10000000)
@@ -1364,19 +1461,22 @@ def emit_flash_bwd_device_body(
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(fbwd_dv_done_ptr)
         # Tail: dK/dQ of the last iteration.
+        fbwd_st_k = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 0)
+        fbwd_st_v = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 1)
+        fbwd_st_dsnk = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 2)
+        fbwd_st_dsmn = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 3)
+        fbwd_st_kt = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 4)
         _helion_flash_rt.mbar_spin_wait(fbwd_ds_full_ptr, fbwd_dsf_phase, 10000000){ds_tail_toggle}
-        _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dk_addr, _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qe.index].iterator), fbwd_qt_base, tKSrQt[None, None, None, 0].layout, "helion_fbwd_dsnk_desc", "helion_fbwd_dsk_idesc", a_layout=tKSrDS[None, None, None, 0].layout, a_base=fbwd_dsnk_base, zero_init=fbwd_dk_zero){dq_empty_wait_tail}
-        _helion_flash_ptx.gemm_ptx_desc_base_qk(fbwd_dqa_addr, _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, 0].iterator), fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dsmn_desc", "helion_fbwd_dq_idesc", a_layout=tDQrDS[None, None, None, 0].layout, a_base=fbwd_dsmn_base, zero_init=True)
+        _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_dk_addr, fbwd_st_dsnk, fbwd_dsnk_base, tKSrDS[None, None, None, 0].layout, _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, fbwd_qe.index].iterator), fbwd_qt_base, tKSrQt[None, None, None, 0].layout, "helion_fbwd_dsk_idesc", zero_init=fbwd_dk_zero){dq_empty_wait_tail}
+        _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_dqa_addr, fbwd_st_dsmn, fbwd_dsmn_base, tDQrDS[None, None, None, 0].layout, fbwd_st_kt, fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dq_idesc", zero_init=True)
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(fbwd_dq_full_ptr)
         fbwd_qe.release()
         with cute.arch.elect_one():
             cute_tcgen05_flash.commit(fbwd_dkv_done_ptr)
-        # K/V smem doubles as the dV/dK TMA-store staging: release it only
-        # after both compute warpgroups' stores completed.
-        _helion_flash_rt.mbar_spin_wait(fbwd_epi_done_ptr, fbwd_tile_it % 2, 10000000)
+        # K is free once the tail dQ retired (dK is staged through sdS); the V
+        # slot doubles as the dV staging and is released by WG0's epilogue.
         fbwd_ke.release()
-        fbwd_ve.release()
         fbwd_tmem.relinquish_alloc_permit()
         _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
         fbwd_tmem.free(fbwd_tmem_ptr)
@@ -1404,8 +1504,21 @@ def emit_flash_bwd_device_body(
         cute.arch.cp_async_bulk_wait_group(0)
         _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)
 {compute_blocks}"""
+    body = body.replace("FBWD_KV_STAGE", str(kv_stage))
     if persistent:
+        body = body.replace(
+            "{clc_setup}",
+            _fbwd_clc_setup(total_tiles, 1, "cute.make_layout((1, 1, 1, 1))"),
+        ).replace(
+            "{clc_warps}",
+            "    if warp_idx == 14:\n"
+            + _fbwd_clc_consume_only(" " * 8)
+            + "    if warp_idx == 15:\n"
+            + _fbwd_clc_scheduler(" " * 8, None),
+        )
         body = _fbwd_wrap_persistent(body, plan, total_tiles)
+    else:
+        body = body.replace("{clc_setup}", "").replace("{clc_warps}", "")
     return body
 
 
@@ -1420,6 +1533,114 @@ def _fbwd2_m_tile(plan: AttentionBwdPlan, i: str) -> str:
         m_mod_tiles = plan.m_dim // 128
         return f"(({i}) // fbwd_seg * {m_mod_tiles} + fbwd_m_start + ({i}) % fbwd_seg)"
     return f"(fbwd_m_start + ({i}))"
+
+
+def _fbwd2_tile_setup_lines(plan: AttentionBwdPlan, indent: str) -> str:
+    """Per-tile derivations of the 2-CTA body from the cluster tile index."""
+    n_tiles = plan.n_dim // 128
+    m_tiles = plan.mm_dim // 128
+    m_mod_tiles = plan.m_dim // 128
+    causal_start = "fbwd_n_tile // 2 * 2" if plan.causal else "cutlass.Int32(0)"
+    lines = [
+        "fbwd_tile_id = fbwd_cl_tile * 2 + fbwd_rank",
+        f"fbwd_bh = fbwd_tile_id // {n_tiles}",
+        f"fbwd_n_tile = fbwd_tile_id % {n_tiles}",
+        f"fbwd_m_start = {causal_start}",
+    ]
+    if plan.causal:
+        lines += [
+            f"fbwd_seg = {m_mod_tiles} - fbwd_m_start",
+            f"fbwd_steps = {plan.group} * fbwd_seg",
+        ]
+    else:
+        lines += [f"fbwd_steps = {m_tiles} - fbwd_m_start"]
+    lines += [
+        f"fbwd_q_tile_base = fbwd_bh * {m_tiles}",
+        f"fbwd_q_row_base = fbwd_bh * {plan.mm_dim}",
+        "fbwd_kv_base = fbwd_n_tile // 2 * 256",
+    ]
+    return "".join(indent + line + "\n" for line in lines)
+
+
+def _fbwd2_wrap_persistent(body: str, plan: AttentionBwdPlan, total_pairs: int) -> str:
+    """Wrap each role's per-tile region of the 2-CTA body in a cluster-tile loop.
+
+    Same text-anchored scheme as ``_fbwd_wrap_persistent``: the regions are
+    the relay warp's relay loop, the load warp's per-tile loads, the leader
+    MMA warp's prologue..tail, the reduce warps' drain loop and both compute
+    warpgroups' staging..epilogue; barrier phase counters stay outside so the
+    parities continue across tiles.
+    """
+    lines = body.splitlines(keepends=True)
+
+    def find(anchor: str, start: int = 0) -> int:
+        for i in range(start, len(lines)):
+            if lines[i].startswith(anchor):
+                return i
+        raise AssertionError(f"anchor not found: {anchor[:80]}")
+
+    def block_end(start: int, indent: str) -> int:
+        e = start
+        while e + 1 < len(lines) and (
+            lines[e + 1].startswith(indent) or not lines[e + 1].strip()
+        ):
+            e += 1
+        while not lines[e].strip():
+            e -= 1
+        return e
+
+    regions = []
+    # relay warp 14: its per-tile relay loop
+    r14 = find("    if warp_idx == 14:")
+    s = find("        for fbwd_i in cutlass.range(fbwd_steps, unroll=1):", r14)
+    regions.append((s, block_end(s, "            ")))
+    # load warp 13: K load .. tail Qt load
+    r13 = find("    if warp_idx == 13:")
+    s = find("        fbwd_ke = fbwd_k_prod.acquire_and_advance()", r13)
+    e = find("        fbwd_q_prod.tail()", s) - 1
+    while not lines[e].strip():
+        e -= 1
+    regions.append((s, e))
+    # leader MMA warp: K wait .. Kt release
+    s = find("            fbwd_ke = fbwd_k_cons.wait_and_advance()")
+    e = find("            fbwd_kte.release()", s)
+    regions.append((s, e))
+    # reduce warps: their drain loop
+    anchor = find("        tRDcDQ = fbwd_thr_dq_ld.partition_D(tDQcDQ)")
+    s = find("        for fbwd_i in cutlass.range(fbwd_steps, unroll=1):", anchor)
+    regions.append((s, block_end(s, "            ")))
+    # compute warpgroups (2 blocks): LSE staging .. epilogue
+    pos = 0
+    for _ in range(2):
+        blk = find("        fbwd_scale2 = cutlass.Float32(", pos)
+        s = find("        fbwd_stage_col0 = ", blk)
+        e = find("            cute.arch.cp_async_bulk_wait_group(0)", s)
+        while e + 1 < len(lines) and lines[e + 1].startswith("            "):
+            e += 1
+        regions.append((s, e))
+        pos = e + 1
+
+    out = []
+    prev = 0
+    for s, e in sorted(regions):
+        assert s >= prev, "overlapping persistent regions"
+        ind = " " * (len(lines[s]) - len(lines[s].lstrip(" ")))
+        head = (
+            f"{ind}fbwd_work = fbwd_clc_hw.initial_work_tile_info()\n"
+            f"{ind}fbwd_tile_it = cutlass.Int32(0)\n"
+            f"{ind}while fbwd_work.is_valid_tile:\n"
+            f"{ind}    fbwd_cl_tile = cutlass.Int32(fbwd_work.tile_idx[0]) // 2\n"
+            + _fbwd2_tile_setup_lines(plan, ind + "    ")
+        )
+        tail = _FBWD_CLC_CONSUME.format(ind=ind + "    ") + f"{ind}    fbwd_tile_it = fbwd_tile_it + 1\n"
+        out.extend(lines[prev:s])
+        out.append(head)
+        for line in lines[s : e + 1]:
+            out.append("    " + line if line.strip() else line)
+        out.append(tail)
+        prev = e + 1
+    out.extend(lines[prev:])
+    return "".join(out)
 
 
 def _flash_bwd_2cta_wg_compute_block(
@@ -1458,9 +1679,9 @@ def _flash_bwd_2cta_wg_compute_block(
         epi_scale=epi_scale,
         kv_tile="fbwd_cl_tile * 2 + fbwd_rank",
         io_dtype=io_dtype,
-        dkv_wait="0",
-        handshake=False,
-    )
+        dkv_wait="fbwd_tile_it % 2",
+        v_empty_expr="storage.v_mbar_ptr.data_ptr() + 1",
+    ).replace("FBWD_KV_SLOT", "0")
     return f"""
     if (warp_idx >= {warp_lo}) & (warp_idx < {warp_hi}):
         cute.arch.setmaxregister_increase(136)
@@ -1568,8 +1789,9 @@ def _flash_bwd_2cta_wg_compute_block(
                 if fbwd_ch == 0:
                     # sdS / the exchange staging are the dQ(i-1) operands: gate
                     # only the first smem write on the dQ gemm (FA4), not the
-                    # dP pass.
-                    if fbwd_i > 0:
+                    # dP pass (a later tile's first write waits for the
+                    # previous tile's last dQ).
+                    if (fbwd_i > 0) | (fbwd_tile_it > 0):
                         _helion_flash_rt.mbar_spin_wait(fbwd_dq_full_ptr, fbwd_dqf_phase, 10000000)
                         fbwd_dqf_phase ^= 1
                 if fbwd_rank == {h}:
@@ -1602,6 +1824,8 @@ def emit_flash_bwd_2cta_device_body(
     io_dtype: str,
     scale2_expr: str,
     out_scale_expr: str,
+    persistent: bool = False,
+    total_pairs: int = 0,
 ) -> str:
     """2-CTA (cluster (2,1,1)) fused backward device body for head_dim 128."""
     d = plan.head_dim
@@ -1636,15 +1860,10 @@ def emit_flash_bwd_2cta_device_body(
     fbwd_local_tidx = tidx % 128
     fbwd_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
     fbwd_is_leader = fbwd_rank == cutlass.Int32(0)
-    fbwd_tile_id = cutlass.Int32(cute.arch.block_idx()[0])
-    fbwd_cl_tile = fbwd_tile_id // 2
-    fbwd_bh = fbwd_tile_id // {n_tiles}
-    fbwd_n_tile = fbwd_tile_id % {n_tiles}
-    fbwd_m_start = {causal_start}{seg_lines}
-    fbwd_q_tile_base = fbwd_bh * {m_tiles}
-    fbwd_q_row_base = fbwd_bh * {plan.mm_dim}
-    fbwd_kv_base = fbwd_n_tile // 2 * 256
-    if warp_idx == 0:
+    fbwd_tile_it = cutlass.Int32(0)
+    fbwd_num_clusters = cutlass.Int32(cute.arch.grid_dim()[0]) // 2
+    fbwd_cl_tile = cutlass.Int32(cute.arch.block_idx()[0]) // 2
+{_fbwd2_tile_setup_lines(plan, "    ")}    if warp_idx == 0:
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_q)
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_k)
         cute_cpasync_flash.prefetch_descriptor(_fbwd_tma_v)
@@ -1708,7 +1927,7 @@ def emit_flash_bwd_2cta_device_body(
     fbwd_do_prod, fbwd_do_cons = cutlass_pipeline_flash.PipelineTmaUmma.create(num_stages=1, producer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), consumer_group=cutlass_pipeline_flash.CooperativeGroup(cutlass_pipeline_flash.Agent.Thread), tx_count=fbwd_do_bytes, barrier_storage=storage.do_mbar_ptr.data_ptr(), cta_layout_vmnk=_fbwd_cluster_vmnk).make_participants()
     cutlass_pipeline_flash.pipeline_init_arrive(cluster_shape_mn=_fbwd_cluster_vmnk, is_relaxed=True)
     cutlass_pipeline_flash.pipeline_init_wait(cluster_shape_mn=_fbwd_cluster_vmnk)
-    fbwd_sst = _fbwd_ss_mma.get_slice(fbwd_rank)
+{{clc_setup}}    fbwd_sst = _fbwd_ss_mma.get_slice(fbwd_rank)
     fbwd_tst = _fbwd_ts_mma.get_slice(fbwd_rank)
     fbwd_dqt = _fbwd_dq_mma.get_slice(fbwd_rank)
     fbwd_mcast = cutlass_pipeline_flash.PipelineUmmaAsync._compute_tmem_sync_mask(_fbwd_cluster_vmnk)
@@ -1735,7 +1954,7 @@ def emit_flash_bwd_2cta_device_body(
     tKTsKT, tKTgKT_kdl = cute_cpasync_flash.tma_partition(_fbwd_tma_kt, 0, cute.make_layout(1), cute.group_modes(sKt, 0, 3), cute.group_modes(tDQgKt, 0, 3))
     if (warp_idx >= 12) & (warp_idx < 16):
         cute.arch.setmaxregister_decrease(104)
-    if warp_idx == 14:
+{{clc_warps}}    if warp_idx == 14:
         fbwd_rphase = cutlass.Int32(0)
         for fbwd_i in cutlass.range(fbwd_steps, unroll=1):
             _helion_flash_rt.mbar_spin_wait(fbwd_ds_cl_full_ptr, fbwd_rphase, 10000000)
@@ -1838,12 +2057,17 @@ def emit_flash_bwd_2cta_device_body(
             fbwd_mb[5] = _helion_flash_ptx.make_smem_desc_start_addr(sdO[None, None, None, 0].iterator)
             fbwd_mb[6] = _helion_flash_ptx.make_smem_desc_start_addr(sQt[None, None, None, 0].iterator)
             fbwd_mb[7] = _helion_flash_ptx.make_smem_desc_start_addr(sKt[None, None, None, 0].iterator)
-            fbwd_ke = fbwd_k_cons.wait_and_advance()
             fbwd_pf_phase = cutlass.Int32(0)
             fbwd_dst_phase = cutlass.Int32(0)
             fbwd_dss_phase = cutlass.Int32(0)
             fbwd_dcl_phase = cutlass.Int32(0)
             fbwd_dqe_phase = cutlass.Int32(0)
+            fbwd_ke = fbwd_k_cons.wait_and_advance()
+            if fbwd_tile_it > 0:
+                # dQ of the previous tile aliases S columns 64-127: wait for
+                # the reduce warps to have read it before this tile's S(0).
+                _helion_flash_rt.mbar_spin_wait(fbwd_dq_empty_ptr, fbwd_dqe_phase, 10000000)
+                fbwd_dqe_phase ^= 1
             fbwd_dk_zero = cutlass.Boolean(True)
             fbwd_st_k = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 0)
             fbwd_st_v = _helion_flash_rt.ld_volatile_shared_u32(fbwd_mb.iterator + 1)
@@ -1918,22 +2142,24 @@ def emit_flash_bwd_2cta_device_body(
                 cute_tcgen05_flash.commit(fbwd_dv_done_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
             fbwd_qte = fbwd_qt_cons.wait_and_advance()
             _helion_flash_rt.mbar_spin_wait(fbwd_ds_tmem_full_ptr, fbwd_dst_phase, 10000000)
+            fbwd_dst_phase ^= 1
             _helion_flash_ptx.gemm_ptx_precomputed_pv_ts(fbwd_dk_addr, fbwd_dp_addr, fbwd_st_qt, fbwd_qt_base, tTSrDS[None, None, None, 0].layout, tTSrQt[None, None, None, 0].layout, "helion_fbwd_ts_idesc", zero_init=fbwd_dk_zero, cta_group=2, a_offsets={_FBWD_2CTA_DS_OFFSETS})
             fbwd_qte.release()
             if fbwd_steps > 1:
                 _helion_flash_rt.mbar_spin_wait(fbwd_dq_empty_ptr, fbwd_dqe_phase, 10000000)
                 fbwd_dqe_phase ^= 1
             _helion_flash_rt.mbar_spin_wait(fbwd_ds_smem_full_ptr, fbwd_dss_phase, 10000000)
+            fbwd_dss_phase ^= 1
             _helion_flash_rt.mbar_spin_wait(fbwd_ds_cl_leader_ptr, fbwd_dcl_phase, 10000000)
+            fbwd_dcl_phase ^= 1
             _helion_flash_ptx.gemm_ptx_dyn_qk(fbwd_dqa_addr, fbwd_st_dsmn, fbwd_dsmn_base, tDQrDS[None, None, None, 0].layout, fbwd_st_kt, fbwd_kt_base, tDQrKt[None, None, None, 0].layout, "helion_fbwd_dq_idesc", zero_init=True, cta_group=2)
             with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(fbwd_dq_full_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
             with cute.arch.elect_one():
                 cute_tcgen05_flash.commit(fbwd_dkv_done_ptr, fbwd_mcast, cute_tcgen05_flash.CtaGroup.TWO)
             fbwd_ke.release()
-            fbwd_ve.release()
             fbwd_kte.release()
-        fbwd_tmem.relinquish_alloc_permit()
+{{clc_mma_nonleader}}        fbwd_tmem.relinquish_alloc_permit()
         _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
         fbwd_tmem.free(fbwd_tmem_ptr)
     if warp_idx < 4:
@@ -1982,7 +2208,27 @@ def emit_flash_bwd_2cta_device_body(
         cute.arch.cp_async_bulk_wait_group(0)
         _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)
 {compute_blocks}"""
-    return body  # noqa: RET504
+    if persistent:
+        body = body.replace(
+            "{clc_setup}", _fbwd_clc_setup(total_pairs * 2, 2, "_fbwd_cluster_vmnk")
+        ).replace(
+            "{clc_warps}",
+            "    if warp_idx == 15:\n        if fbwd_is_leader:\n"
+            + _fbwd_clc_scheduler(" " * 12, None)
+            + "        else:\n"
+            + _fbwd_clc_consume_only(" " * 12),
+        ).replace(
+            "{clc_mma_nonleader}",
+            "        if fbwd_rank != cutlass.Int32(0):\n" + _fbwd_clc_consume_only(" " * 12),
+        )
+        body = _fbwd2_wrap_persistent(body, plan, total_pairs)
+    else:
+        body = (
+            body.replace("{clc_setup}", "")
+            .replace("{clc_warps}", "")
+            .replace("{clc_mma_nonleader}", "")
+        )
+    return body
 
 
 # dS (bf16-packed, 64 words per compute warpgroup) sits in its OWN dP column
@@ -2190,9 +2436,16 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
     # still slower than the non-persistent launch (d128 +0.5%, d128-causal and
     # s4k-b8 +8%: static round-robin tiles, no inter-tile overlap), so the
     # autotuner is expected to keep picking 0.
-    persistent = (
-        bool(df.config.config.get("cute_flash_bwd_persistent", 0)) and not two_cta
-    )
+    persistent = bool(df.config.config.get("cute_flash_bwd_persistent", 0))
+    # Persistent tiles at head_dim 64 double-buffer K/V (the next tile's
+    # operands land while this tile runs; the epilogue staging keeps its own
+    # slot), paid for by 3-deep instead of 4-deep Q/dO rings.
+    kv_stage = 2 if (persistent and d == 64) else 1
+    if "HELION_FBWD_KV_STAGE" in os.environ:  # experiment override
+        kv_stage = int(os.environ["HELION_FBWD_KV_STAGE"])
+    if kv_stage == 2:
+        q_stage = 3
+        do_stage = 3
 
     emit_flash_module_statements(cg)
 
@@ -2213,6 +2466,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
         "total_kv_rows": plan.total_kv_rows,
         "q_stage": q_stage,
         "do_stage": do_stage,
+        "kv_stage": kv_stage,
         "two_cta": two_cta,
         "persistent": persistent,
         # "fa4" makes the launcher pass min_blocks_per_mp=1; without it ptxas
@@ -2237,6 +2491,8 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
             io_dtype=io_dtype_str,
             scale2_expr=scale2_expr,
             out_scale_expr=out_scale_expr,
+            persistent=persistent,
+            total_pairs=plan.total_kv_rows // 256,
         )
     else:
         body_src = emit_flash_bwd_device_body(
@@ -2246,6 +2502,7 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
             out_scale_expr=out_scale_expr,
             q_stage=q_stage,
             do_stage=do_stage,
+            kv_stage=kv_stage,
             persistent=persistent,
             total_tiles=total_tiles,
         )
