@@ -5,10 +5,12 @@ from itertools import zip_longest
 from typing import TYPE_CHECKING
 
 import torch
+from torch._dynamo.source import TensorPropertySource
 
 from .. import exc
 from .._compat import min_dot_size
 from .._compiler.compile_environment import CompileEnvironment
+from .._compiler.compile_environment import _is_supported_tensor_input_source
 from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
@@ -438,7 +440,17 @@ def _plan_cute_tcgen05_search_candidate(
                 guards_complete = False
                 continue
             for symbol in dynamic_symbols:
-                if env.shape_env.var_to_sources.get(symbol):
+                sources = env.shape_env.var_to_sources.get(symbol)
+                # The runtime builds guards from the first source. A traced
+                # global (e.g. an AOT module's tile extent) has a source too,
+                # but cannot be extracted from the kernel's arguments.
+                if sources and (
+                    _is_supported_tensor_input_source(sources[0])
+                    or (
+                        isinstance(sources[0], TensorPropertySource)
+                        and _is_supported_tensor_input_source(sources[0].base)
+                    )
+                ):
                     required_specialized_vars.add(symbol)
                 else:
                     guards_complete = False

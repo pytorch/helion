@@ -1176,23 +1176,11 @@ def _destroy_vllm() -> None:
     destroy_distributed_environment()
 
 
-def _prepare_vllm_attention_state() -> str | None:
-    """Start backend selection from a clean cache and return its old override."""
+def _clear_vllm_attention_cache() -> None:
+    """Keep backend selection scoped to this temporary vLLM configuration."""
     from vllm.v1.attention import selector
-    from vllm.v1.attention.backends import utils
-
-    previous_layout = utils._KV_CACHE_LAYOUT_OVERRIDE
-    selector._cached_get_attn_backend.cache_clear()
-    return previous_layout
-
-
-def _restore_vllm_attention_state(previous_layout: str | None) -> None:
-    """Undo the process-global state changed by vLLM backend selection."""
-    from vllm.v1.attention import selector
-    from vllm.v1.attention.backends import utils
 
     selector._cached_get_attn_backend.cache_clear()
-    utils.set_kv_cache_layout(previous_layout)
 
 
 def _initialize_vllm(model_path: Path) -> tuple[object, object, object, object]:
@@ -1268,13 +1256,13 @@ def _copy_and_process_vllm_weights(
         process_weights_after_loading(wrapper, model_config, torch.device("cuda"))
 
 
-def _make_vllm_cache(canonical_cache: torch.Tensor, cache_layout: str) -> torch.Tensor:
+def _make_vllm_cache(
+    canonical_cache: torch.Tensor, physical_order: tuple[int, ...]
+) -> torch.Tensor:
+    """Pack this single-layer cache while retaining its logical BHNC view."""
     logical_cache = canonical_cache.permute(0, 2, 1, 3)
-    if cache_layout == "NHD":
-        return logical_cache
-    if cache_layout == "HND":
-        return logical_cache.contiguous()
-    raise ValueError(f"unsupported vLLM KV-cache layout: {cache_layout}")
+    inverse_order = tuple(physical_order.index(axis) for axis in range(4))
+    return logical_cache.permute(physical_order).contiguous().permute(inverse_order)
 
 
 def _make_attention_metadata(
@@ -1290,8 +1278,6 @@ def _make_attention_metadata(
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
         seq_lens=seq_lens,
         seq_lens_cpu_upper_bound=torch.tensor([CONTEXT], dtype=torch.int32),
-        _seq_lens_cpu=torch.tensor([CONTEXT], dtype=torch.int32),
-        _num_computed_tokens_cpu=torch.tensor([CONTEXT - 1], dtype=torch.int32),
         num_reqs=1,
         num_actual_tokens=1,
         max_query_len=1,
@@ -1333,9 +1319,10 @@ def _make_vllm_call(
 ]:
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
-    from vllm.v1.attention.backends.utils import get_kv_cache_layout
+    from vllm.v1.attention.backends.utils import get_supported_kv_cache_layouts
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
-    previous_layout = _prepare_vllm_attention_state()
+    _clear_vllm_attention_cache()
     model_directory = tempfile.TemporaryDirectory(prefix="qwen3-8b-fp8-")
     model_path = Path(model_directory.name)
     (model_path / "config.json").write_text(json.dumps(QWEN3_8B_FP8_CONFIG))
@@ -1381,12 +1368,21 @@ def _make_vllm_call(
         attention = wrapper.layer.self_attn.attn
         layer_name = "model.layers.0.self_attn.attn"
         with set_current_vllm_config(vllm_config):
-            cache_layout = get_kv_cache_layout()
+            supported_layouts = get_supported_kv_cache_layouts(
+                [attention.get_attn_backend()]
+            )
+            cache_layout = resolve_kv_cache_layout(
+                vllm_config,
+                [[layout.name for layout in supported_layouts]],
+                [attention.get_kv_cache_spec(vllm_config)],
+            )
         vllm_tensors = {
             "hidden_states": tensors["hidden_states"],
             "residual": tensors["residual"].clone(),
             "position": tensors["position"],
-            "kv_cache": _make_vllm_cache(tensors["kv_cache"].clone(), cache_layout),
+            "kv_cache": _make_vllm_cache(
+                tensors["kv_cache"].clone(), cache_layout.layer_view_order
+            ),
             "block_table": tensors["block_table"],
             "slot_mapping": tensors["slot_mapping"],
         }
@@ -1401,7 +1397,7 @@ def _make_vllm_call(
                 _destroy_vllm()
         finally:
             try:
-                _restore_vllm_attention_state(previous_layout)
+                _clear_vllm_attention_cache()
             finally:
                 model_directory.cleanup()
         raise
@@ -1424,7 +1420,7 @@ def _make_vllm_call(
             _destroy_vllm()
         finally:
             try:
-                _restore_vllm_attention_state(previous_layout)
+                _clear_vllm_attention_cache()
             finally:
                 model_directory.cleanup()
 
