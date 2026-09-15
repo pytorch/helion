@@ -36,6 +36,20 @@ def _flydsl_minimum_expr(a: str, b: str) -> str:
     return f"(-((-({a})).maximumf((-({b})))))"
 
 
+def _looped_tc(chunk: int, v: int) -> int:
+    """thread_count = 64*W from (chunk, V): chunk // V rounded to whole warps,
+    clamped to [64, 1024]. V is clamped up to 4 (flydsl loads are >=128-bit;
+    V=1/2 waste bandwidth, and the unset default V=1 -> V=4 preserves the 1-warp
+    behavior at chunk=256).
+
+    Single source of truth for both the launcher block dim
+    (``_flydsl_looped_thread_count``) and the codegen thread_count
+    (``looped_reduction_thread_count``) so the two cannot diverge.
+    """
+    _v = max(4, v)
+    return max(64, min(1024, (chunk // _v // 64) * 64))
+
+
 def _has_user_tiled_reduction(env: CompileEnvironment) -> bool:
     """Whether the kernel has an explicit ``hl.tile(n)`` reduction.
 
@@ -151,13 +165,14 @@ class FlyDSLBackend(Backend):
 
     @staticmethod
     def _flydsl_looped_thread_count(config: Config, bm: int) -> int | None:
-        """thread_count (= 64*W) for the whole-row looped reduction, else None.
+        """Launcher block dim (= 64*W) for the whole-row looped reduction, else
+        None.
 
         W>1 (cross-wave smem fold via ``_flydsl_bsum``) requires one row per block
-        (bm==1). thread_count = chunk // V, clamped to [64, 1024] and rounded to
-        whole warps; V comes from the shared ``cute_vector_widths`` knob. Kept in
-        sync with the ``looped_reduction_thread_count`` override (which the
-        reduction strategy calls) so the launcher block dim matches codegen.
+        (bm==1). Reads reduction_loops[0]/cute_vector_widths[0] (slot 0); flydsl
+        supports a single rolled reduction dim, so slot 0 IS the reduction block
+        and this agrees with ``looped_reduction_thread_count`` (which indexes per
+        block). Both delegate the arithmetic to ``_looped_tc``.
         """
         if bm != 1:
             return None
@@ -165,11 +180,8 @@ class FlyDSLBackend(Backend):
         if not rl or rl[0] is None:
             return None
         vw = cast("list[int]", config.config.get("cute_vector_widths", []) or [])
-        # flydsl loads are >=128-bit (V>=4); matches the strategy's clamp so the
-        # default (unset) preserves the 1-warp behavior at chunk=256.
-        v = max(4, int(vw[0]) if vw else 1)
-        chunk = int(rl[0])
-        return max(64, min(1024, (chunk // v // 64) * 64))
+        v = int(vw[0]) if vw else 1
+        return _looped_tc(int(rl[0]), v)
 
     def wrap_reduction_accumulator(
         self,
@@ -212,12 +224,8 @@ class FlyDSLBackend(Backend):
         if _bm != 1:
             return 64
         _vw = cast("list[int]", config.config.get("cute_vector_widths", []) or [])
-        # flydsl loads are >=128-bit (V>=4); V=1/2 would waste bandwidth, so
-        # clamp up. Default (unset -> 1) becomes V=4 = the 1-warp behavior at
-        # chunk=256; W>1 comes from larger chunks (chunk = 64*W*V).
-        _v = max(4, config_spec.cute_vector_widths.config_get(_vw, block_index, 1) or 1)
-        _tc = (block_size // _v // 64) * 64
-        return max(64, min(1024, _tc))
+        _v = config_spec.cute_vector_widths.config_get(_vw, block_index, 1) or 1
+        return _looped_tc(block_size, int(_v))
 
     @property
     def library_imports(self) -> dict[str, str]:
