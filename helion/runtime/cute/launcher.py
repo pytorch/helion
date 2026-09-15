@@ -953,7 +953,6 @@ def _append_cute_wrapper_plan(
         q_stage = plan_int("q_stage")
         do_stage = plan_int("do_stage")
         kv_stage = plan_int("kv_stage", 1)
-        bwd_persistent = bool(plan.get("persistent"))
         epi_stages = hd // 64 * kv_stage
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
