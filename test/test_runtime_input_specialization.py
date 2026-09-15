@@ -38,6 +38,7 @@ from helion._compiler.device_ir import _finalize_cute_tcgen05_search_planning
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
+from helion.language.constexpr import ConstExpr
 from helion.language.matmul_ops import _plan_cute_tcgen05_search_candidate
 from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
 from helion.runtime.kernel import BoundKernel
@@ -279,6 +280,31 @@ class TestCuteRuntimeInputSpecialization(unittest.TestCase):
 
 
 class TestRuntimeInputSpecialization(unittest.TestCase):
+    def test_tensor_alias_key_flat_and_structured_arguments(self) -> None:
+        @dataclasses.dataclass
+        class Inputs:
+            first: torch.Tensor
+            second: torch.Tensor
+
+        x = torch.randn(4, 8)
+        y = torch.nn.Parameter(torch.randn(4, 8))
+        cases = (
+            ((), None),
+            ((x,), None),
+            ((x, y, 1e-5, None), None),
+            ((x, x.view_as(x)), None),
+            ((x, ConstExpr(x), y), None),
+            ((x, 1e-5, x, y), (0, 0, 1)),
+            (([x, x],), (0, 0)),
+            ((x, [y, x]), (0, 1, 0)),
+            (({"b": y, "a": x}, x), (0, 1, 0)),
+            (({"a": x, "b": y}, x), (0, 1, 0)),
+            ((Inputs(x, y), x), (0, 1, 0)),
+        )
+        for index, (args, expected) in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertEqual(_input_tensor_aliases(args), expected)
+
     def test_set_config_rejects_post_bind_realignment(self) -> None:
         source = LocalSource("value", is_input=True)
         specialization = RuntimeInputSpecialization(
