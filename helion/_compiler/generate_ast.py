@@ -173,6 +173,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._statement_owner_fx_node: Node | None = None
+        self._codegen_results_by_owner_node_id: dict[int, object] = {}
         self.resident_prep_lowering_stack: list[
             dict[tuple[int, str], ResidentPrepLowering]
         ] = []
@@ -446,19 +447,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.device_function.cute_state.chunk_recurrence_plan = None
         raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
 
-    def add_statement(self, stmt: ast.AST | str | None) -> None:
+    def append_statement(
+        self,
+        body: list[ast.AST],
+        stmt: ast.AST | str | None,
+    ) -> None:
+        """Append a statement while preserving its exact FX owner."""
+
         if stmt is None:
             return
         if isinstance(stmt, str):
             stmt = statement_from_string(stmt)
-        self.statements_stack[-1].append(stmt)
+        body.append(stmt)
         owner_node = self._statement_owner_fx_node
         if owner_node is not None and self._track_statement_owners:
             self._statements_by_owner_node_id.setdefault(id(owner_node), []).append(
-                (self.statements_stack[-1], stmt)
+                (body, stmt)
             )
         self._record_statement_thread_references([stmt])
-        self._record_tcgen05_owned_statement(stmt)
+        if body is self.statements_stack[-1]:
+            self._record_tcgen05_owned_statement(stmt)
+
+    def add_statement(self, stmt: ast.AST | str | None) -> None:
+        self.append_statement(self.statements_stack[-1], stmt)
 
     def remove_statements_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
         """Remove statements emitted earlier for exactly these FX nodes."""
@@ -467,6 +478,94 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             for body, stmt in entries:
                 with contextlib.suppress(ValueError):
                     body.remove(stmt)
+
+    def statements_owned_by_node(
+        self, node: Node
+    ) -> tuple[tuple[list[ast.AST], ast.AST], ...]:
+        """Return exact statement/container pairs recorded for one FX node."""
+
+        return tuple(self._statements_by_owner_node_id.get(id(node), ()))
+
+    def replace_owned_statement_span(
+        self,
+        body: list[ast.AST],
+        nodes: tuple[Node, ...],
+        replacement: tuple[ast.AST, ...],
+    ) -> bool:
+        """Atomically replace one contiguous, exactly-owned statement span.
+
+        The method performs every ownership and contiguity check before
+        changing ``body`` or the owner index.  This gives late CuTe rewrites a
+        fail-closed commit point after constructing and validating detached
+        replacement AST.
+        """
+
+        if not nodes or len(set(nodes)) != len(nodes):
+            return False
+        if any(not isinstance(statement, ast.stmt) for statement in replacement):
+            return False
+        source_ast_ids = {
+            id(child)
+            for statement in body
+            for child in ast.walk(statement)
+            if isinstance(child, (ast.stmt, ast.expr))
+        }
+        replacement_ast_ids = {
+            id(child)
+            for statement in replacement
+            for child in ast.walk(statement)
+            if isinstance(child, (ast.stmt, ast.expr))
+        }
+        if source_ast_ids & replacement_ast_ids:
+            return False
+        positions = {id(statement): index for index, statement in enumerate(body)}
+        if len(positions) != len(body):
+            return False
+        claimed: list[ast.AST] = []
+        for node in nodes:
+            entries = self.statements_owned_by_node(node)
+            if not entries or any(owner_body is not body for owner_body, _ in entries):
+                return False
+            claimed.extend(statement for _, statement in entries)
+        claimed_ids = [id(statement) for statement in claimed]
+        if len(claimed_ids) != len(set(claimed_ids)) or any(
+            statement_id not in positions for statement_id in claimed_ids
+        ):
+            return False
+        first = min(positions[statement_id] for statement_id in claimed_ids)
+        last = max(positions[statement_id] for statement_id in claimed_ids)
+        if {id(statement) for statement in body[first : last + 1]} != set(claimed_ids):
+            return False
+
+        referenced_dims = getattr(self, "referenced_thread_block_dims", None)
+        previous_referenced_dims = (
+            list(referenced_dims) if isinstance(referenced_dims, list) else None
+        )
+        try:
+            self._record_statement_thread_references(list(replacement))
+        except Exception:
+            if previous_referenced_dims is not None and isinstance(
+                referenced_dims, list
+            ):
+                referenced_dims[:] = previous_referenced_dims
+            raise
+        body[first : last + 1] = replacement
+        for node in nodes:
+            self._statements_by_owner_node_id.pop(id(node), None)
+        return True
+
+    def record_codegen_result(self, node: Node, result: object) -> None:
+        """Record the final result returned for an FX node without mutating metadata."""
+
+        self._codegen_results_by_owner_node_id[id(node)] = result
+
+    def codegen_result_for_node(self, node: Node) -> tuple[bool, object]:
+        """Return the final generated result for ``node``, if it was lowered."""
+
+        key = id(node)
+        if key not in self._codegen_results_by_owner_node_id:
+            return False, None
+        return True, self._codegen_results_by_owner_node_id[key]
 
     def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
         owner_node = self._statement_owner_fx_node
