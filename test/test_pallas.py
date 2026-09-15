@@ -4688,6 +4688,27 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_attention_folded_dot_lhs_cast_correctness(self) -> None:
+        """Folding an f32-to-bf16 dot cast preserves attention results."""
+        query = torch.randn(1, 1, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+        key = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, device=DEVICE)
+        val = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, device=DEVICE)
+        args = (query, key, val)
+        common_config = {
+            "block_sizes": [1, 128, 128],
+            "pallas_loop_type": "emit_pipeline",
+            "pallas_pre_broadcast": True,
+            "pallas_use_low_level_scheduler": True,
+        }
+        _, expected = code_and_output(pallas_attention, args, **common_config)
+        _, result = code_and_output(
+            pallas_attention,
+            args,
+            **common_config,
+            pallas_fold_dot_lhs_cast=True,
+        )
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=2e-3)
+
     def test_attention_fori_loop_correctness(self) -> None:
         """Fori attention buffers K/V while loop-invariant Q remains unchanged."""
         query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)

@@ -19,6 +19,7 @@ import torch
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..aten_lowering import AtenLowering
@@ -271,6 +272,30 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
     lhs_ndim = lhs_node_arg.meta["val"].ndim
+
+    # Mosaic can fold a narrowing conversion of the left operand into the dot.
+    # Keeping the producer in f32 avoids materializing a separate converted
+    # tile.  This is opt-in because different TPU schedules can make a
+    # materialized low-precision tile preferable.
+    if ctx.cg.device_function.config.get("pallas_fold_dot_lhs_cast", False):
+        cast_node = lhs_node_arg
+        if cast_node.target is _mask_to and isinstance(cast_node.args[0], Node):
+            candidate = cast_node.args[0]
+            candidate_ast = _env_arg(ctx, candidate)
+            if isinstance(candidate_ast, ast.AST) and ast.dump(lhs) == ast.dump(
+                candidate_ast
+            ):
+                cast_node = candidate
+        if (
+            cast_node.target is torch.ops.prims.convert_element_type.default
+            and cast_node.args[1] == rhs_dtype
+            and isinstance(cast_node.args[0], Node)
+            and cast_node.args[0].meta["val"].dtype == torch.float32
+            and rhs_dtype in (torch.bfloat16, torch.float16)
+        ):
+            lhs = _env_arg(ctx, cast_node.args[0])
+            assert isinstance(lhs, ast.AST)
+
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
