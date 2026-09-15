@@ -1,13 +1,15 @@
-"""Unit tests for the flydsl backend's W=1 whole-row reduction.
+"""Unit tests for the flydsl backend's whole-row reduction (W=1 and W>1).
 
-Covers single-wavefront (W=1) reductions on top of the minimal elementwise
-backend: the reduction loop lowers to a runtime ``range()`` (scf.for), warp
-shuffle folds (sum/max/min), whole-row (``:``) and explicit ``hl.tile(n)``
-reductions, column-tail masking, fp32, multi-row blocks (bm>1), the persistent
-(non-looped) fallback, and autotuning over the reduction knobs.
+Covers single-wavefront (W=1) and cross-wavefront (W>1) reductions plus the
+fp16 V=8 (128-bit BufferCopy) knob on top of the minimal elementwise backend:
+the reduction loop lowers to a runtime ``range()`` (scf.for), warp shuffle folds
+(sum/max/min), cross-warp block reduce via shared memory when a row spans W
+wavefronts (W = (chunk // V) // 64), whole-row (``:``) and explicit
+``hl.tile(n)`` reductions, column-tail masking (W=1 and W>1), fp32, multi-row
+blocks (bm>1), the persistent (non-looped) fallback, and autotuning over the
+reduction knobs.
 
-Cross-wavefront (W>1), fp16 V=8, and constexpr register-caching land in
-follow-up PRs.
+Constexpr register-caching lands in a follow-up PR.
 
 flydsl is AMD/ROCm-only and experimental, so the whole module is skipped when
 it is not importable.
@@ -107,12 +109,10 @@ def ref_softmax(x: torch.Tensor) -> torch.Tensor:
     return torch.softmax(x.float(), dim=-1).to(x.dtype)
 
 
-def _tol(dt: torch.dtype) -> dict[str, float]:
-    return (
-        {"rtol": 1e-2, "atol": 1e-2}
-        if dt == torch.float16
-        else {"rtol": 1e-4, "atol": 1e-4}
-    )
+def _tol(dt: torch.dtype) -> tuple[float, float]:
+    # (rtol, atol) passed as explicit kwargs; a **dict unpack trips type checkers
+    # because assert_close also takes bool/str kwargs a dict[str, float] can't type.
+    return (1e-2, 1e-2) if dt == torch.float16 else (1e-4, 1e-4)
 
 
 @onlyBackends(["flydsl"])
@@ -121,13 +121,19 @@ class TestFlydslReduction(TestCase):
         x = torch.randn(m, n, device=DEVICE, dtype=dt)
         w = torch.randn(n, device=DEVICE, dtype=dt)
         code, (out, _) = code_and_output(rms_norm_fwd, (x, w, 1e-5), **cfg)
-        torch.testing.assert_close(out.float(), ref_rms(x, w).float(), **_tol(dt))
+        _rtol, _atol = _tol(dt)
+        torch.testing.assert_close(
+            out.float(), ref_rms(x, w).float(), rtol=_rtol, atol=_atol
+        )
         return code
 
     def _softmax(self, m: int, n: int, dt: torch.dtype, **cfg: object) -> str:
         x = torch.randn(m, n, device=DEVICE, dtype=dt)
         code, out = code_and_output(softmax_decomposed, (x,), **cfg)
-        torch.testing.assert_close(out.float(), ref_softmax(x).float(), **_tol(dt))
+        _rtol, _atol = _tol(dt)
+        torch.testing.assert_close(
+            out.float(), ref_softmax(x).float(), rtol=_rtol, atol=_atol
+        )
         return code
 
     def test_reduction_lowers_to_runtime_scf_for(self) -> None:
@@ -182,6 +188,121 @@ class TestFlydslReduction(TestCase):
             x = torch.randn(8, n, device=DEVICE, dtype=torch.float32)
             _, out = code_and_output(tiled_sum, (x,), block_sizes=[1, 256])
             torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-3, atol=1e-3)
+
+    def test_cross_wavefront_thread_count(self) -> None:
+        # W = (chunk // V) // 64 -> num_threads = 64*W. Cover V=4 and V=8 so the
+        # (chunk, V) -> W mapping is locked on both vector widths.
+        cases = (
+            (1, 256, 4),
+            (2, 512, 4),
+            (4, 1024, 4),
+            (8, 2048, 4),
+            (1, 512, 8),
+            (2, 1024, 8),
+            (4, 2048, 8),
+        )
+        for w, chunk, v in cases:
+            code = self._rms(
+                8,
+                16384,
+                torch.float16,
+                block_sizes=[1],
+                reduction_loops=[chunk],
+                cute_vector_widths=[v],
+            )
+            self.assertIn(f"_num_threads={64 * w}", code)
+
+    def test_column_tail_w_gt_1(self) -> None:
+        # N not a multiple of the chunk (64*W*V) across multiple chunks.
+        for n in (1000, 6244):
+            self._rms(
+                8,
+                n,
+                torch.float16,
+                block_sizes=[1],
+                reduction_loops=[512],
+                cute_vector_widths=[4],
+            )
+            self._softmax(
+                8,
+                n,
+                torch.float16,
+                block_sizes=[1],
+                reduction_loops=[512],
+                cute_vector_widths=[4],
+            )
+
+    def test_fp16_v8_uses_128bit_copy(self) -> None:
+        code = self._rms(
+            8,
+            4096,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[512],
+            cute_vector_widths=[8],
+        )
+        self.assertIn("BufferCopy128b", code)
+
+    def test_fp16_v8_w_gt_1(self) -> None:
+        # V=8 AND W>1 together: chunk=1024, V=8 -> W = 1024//8//64 = 2, so the
+        # 128-bit copy and the cross-wave smem block reduce must BOTH engage
+        # (the combination this PR exists for; the V=8 tests above are W=1).
+        code = self._rms(
+            8,
+            16384,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[1024],
+            cute_vector_widths=[8],
+        )
+        self.assertIn("_num_threads=128", code)  # W=2
+        self.assertIn("BufferCopy128b", code)  # V=8
+        self.assertIn("_flydsl_bsum", code)  # smem block reduce engaged
+
+    def test_fp32_v8_rejected(self) -> None:
+        # fp32 V=8 = 256-bit copy: unrepresentable, must raise cleanly.
+        x = torch.randn(8, 4096, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(4096, device=DEVICE, dtype=torch.float32)
+        with self.assertRaises(helion.exc.BackendUnsupported):
+            code_and_output(
+                rms_norm_fwd,
+                (x, w, 1e-5),
+                block_sizes=[1],
+                reduction_loops=[512],
+                cute_vector_widths=[8],
+            )
+
+    def test_fp32_reduction(self) -> None:
+        self._rms(
+            8,
+            4096,
+            torch.float32,
+            block_sizes=[1],
+            reduction_loops=[1024],
+            cute_vector_widths=[4],
+        )
+
+    def test_softmax_cross_wavefront(self) -> None:
+        for chunk in (512, 2048):
+            self._softmax(
+                8,
+                16384,
+                torch.float16,
+                block_sizes=[1],
+                reduction_loops=[chunk],
+                cute_vector_widths=[4],
+            )
+
+    def test_softmax_fp16_v8(self) -> None:
+        code = self._softmax(
+            8,
+            4096,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[512],
+            cute_vector_widths=[8],
+        )
+        self.assertIn("BufferCopy128b", code)
 
     def test_autotune_selects_valid_config(self) -> None:
         # The flydsl autotune enumerates (block_sizes, reduction_loops) and

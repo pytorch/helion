@@ -689,6 +689,23 @@ class Backend(abc.ABC):
         """
         return self.full_expr(shape_dims, value_expr, dtype)
 
+    def looped_reduction_thread_count(
+        self,
+        *,
+        requested: int,
+        block_size: int,
+        block_index: int,
+        config: Config,
+        config_spec: ConfigSpec,
+    ) -> int | None:
+        """Backend override for the per-block thread count of a looped whole-row
+        reduction.
+
+        Return None to keep the default (``requested``). Tile-level backends
+        return None.
+        """
+        return None
+
     def wrap_reduction_accumulator(
         self,
         acc_full: str,
