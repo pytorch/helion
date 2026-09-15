@@ -1126,6 +1126,18 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                     )
                 )
+                if env.backend_name == "flydsl":
+                    # FlyDSL shares the CuTe per-thread vector-width knob to pick
+                    # V (elems/thread). Register the rdim slot so the autotuner
+                    # can set ``cute_vector_widths`` for a rolled reduction. cute
+                    # already registers this slot in its own block above, so this
+                    # is flydsl-only to avoid a duplicate slot for the same rdim.
+                    env.config_spec.cute_vector_widths.append(
+                        CuteVectorWidthSpec(
+                            block_id=rdim.block_id,
+                            size_hint=rdim.size_hint(),
+                        )
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed
