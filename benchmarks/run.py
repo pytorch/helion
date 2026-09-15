@@ -2194,6 +2194,15 @@ def main() -> None:
 
     # Check and setup tritonbench if needed
     check_and_setup_tritonbench()
+    if torch.version.hip is not None:
+        from benchmarks.rocm_utils import do_bench_cudagraph_with_cache_clear
+        from tritonbench.components.do_bench import (  # pyrefly: ignore [missing-import]
+            run as bench_timers,
+        )
+
+        bench_timers._do_bench_cudagraph_with_cache_clear = (
+            do_bench_cudagraph_with_cache_clear
+        )
 
     # Store input-shard info for later processing
     input_shard_info = None

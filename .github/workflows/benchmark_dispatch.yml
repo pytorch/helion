@@ -183,8 +183,8 @@ jobs:
     with:
       runner: linux.rocm.gpu.ecosystem.mi350.1
       python-version: "3.12"
-      image: rocm/dev-ubuntu-24.04:7.1.1-complete
-      runtime-version: rocm7.1
+      image: rocm/dev-ubuntu-24.04:7.2.4-complete
+      runtime-version: rocm7.2
       # Benchmark workloads can retain many ROCm modules; Welford 8192 has
       # exhausted the container's default limit with 1002 open HSACO files.
       container-options: --device=/dev/kfd --device=/dev/dri --ulimit nofile=65536:65536
