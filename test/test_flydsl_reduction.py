@@ -190,15 +190,25 @@ class TestFlydslReduction(TestCase):
             torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-3, atol=1e-3)
 
     def test_cross_wavefront_thread_count(self) -> None:
-        # W = (chunk // V) // 64 -> num_threads = 64*W. V pinned to 4.
-        for w, chunk in ((1, 256), (2, 512), (4, 1024), (8, 2048)):
+        # W = (chunk // V) // 64 -> num_threads = 64*W. Cover V=4 and V=8 so the
+        # (chunk, V) -> W mapping is locked on both vector widths.
+        cases = (
+            (1, 256, 4),
+            (2, 512, 4),
+            (4, 1024, 4),
+            (8, 2048, 4),
+            (1, 512, 8),
+            (2, 1024, 8),
+            (4, 2048, 8),
+        )
+        for w, chunk, v in cases:
             code = self._rms(
                 8,
                 16384,
                 torch.float16,
                 block_sizes=[1],
                 reduction_loops=[chunk],
-                cute_vector_widths=[4],
+                cute_vector_widths=[v],
             )
             self.assertIn(f"_num_threads={64 * w}", code)
 
@@ -232,6 +242,22 @@ class TestFlydslReduction(TestCase):
             cute_vector_widths=[8],
         )
         self.assertIn("BufferCopy128b", code)
+
+    def test_fp16_v8_w_gt_1(self) -> None:
+        # V=8 AND W>1 together: chunk=1024, V=8 -> W = 1024//8//64 = 2, so the
+        # 128-bit copy and the cross-wave smem block reduce must BOTH engage
+        # (the combination this PR exists for; the V=8 tests above are W=1).
+        code = self._rms(
+            8,
+            16384,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[1024],
+            cute_vector_widths=[8],
+        )
+        self.assertIn("_num_threads=128", code)  # W=2
+        self.assertIn("BufferCopy128b", code)  # V=8
+        self.assertIn("_flydsl_bsum", code)  # smem block reduce engaged
 
     def test_fp32_v8_rejected(self) -> None:
         # fp32 V=8 = 256-bit copy: unrepresentable, must raise cleanly.
