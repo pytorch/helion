@@ -242,6 +242,35 @@ class TestTritonQuantizedOps(RefEagerTestDisabled, TestCase):
         self.assertIn("[fp4_qword_", code)
         self.assertIn("=h,=h", code)
 
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="Packed BF16 conversion requires Blackwell"
+    )
+    def test_load_bfloat16_x16_to_float16(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def bf16_to_f16_lanes(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                (offsets.size(0), 16), dtype=torch.float16, device=x.device
+            )
+            for tile in hl.tile(offsets.size(0), block_size=4):
+                lanes = hl.load_bfloat16_x16_to_float16(
+                    x,
+                    offsets[tile],
+                    extra_mask=tile.index < offsets.size(0),
+                )
+                for i in hl.static_range(16):
+                    out[tile, i] = lanes[i]
+            return out
+
+        values = torch.randn(32, dtype=torch.bfloat16, device=DEVICE)
+        offsets = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(bf16_to_f16_lanes, (values, offsets))
+
+        torch.testing.assert_close(result, values.view(2, 16).to(torch.float16))
+        self.assertIn("tl.pointer_type(tl.uint64)", code)
+        self.assertIn("[bf16_qword_", code)
+        self.assertIn("cvt.rn.f16.bf16", code)
+
 
 if __name__ == "__main__":
     unittest.main()

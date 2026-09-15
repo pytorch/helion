@@ -765,7 +765,7 @@ def shrink_block_sizes_for_numel_constraints(
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
-VALID_CROSS_LOOP_SCHEDULES = ("barrier", "static_pipeline")
+VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
@@ -833,7 +833,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | _BACKEND_STRATEGY_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
-        "cross_loop_schedule",
+        "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
@@ -873,7 +873,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_multi_buffers",
         "range_flattens",
         "static_ranges",
-        "cross_loop_schedule",
+        "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
@@ -1150,7 +1150,7 @@ class ConfigSpec:
         self.has_symbolic_or_data_dependent_bounds: bool = False
         # Populated only after DeviceIR proves that this kernel contains an
         # implicit cross-root dependency supported by the CUDA Triton backend.
-        self.cross_loop_schedule: EnumFragment | None = None
+        self.cross_loop_pipeline: EnumFragment | None = None
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -2311,20 +2311,20 @@ class ConfigSpec:
 
     def supports_config_key(self, key: str) -> bool:
         if (
-            key == "cross_loop_schedule"
+            key == "cross_loop_pipeline"
             and self.device is not None
             and self.device.type != "cuda"
         ):
             return False
         return self.backend.supports_config_key(key)
 
-    def enable_cross_loop_schedule(self) -> None:
-        """Expose the compiler-owned cross-loop scheduling dimension."""
-        if not self.supports_config_key("cross_loop_schedule"):
+    def enable_cross_loop_pipeline(self) -> None:
+        """Expose the compiler-owned cross-loop execution dimension."""
+        if not self.supports_config_key("cross_loop_pipeline"):
             raise InvalidConfig(
-                f"cross_loop_schedule is not supported by backend {self.backend_name!r}"
+                f"cross_loop_pipeline is not supported by backend {self.backend_name!r}"
             )
-        self.cross_loop_schedule = EnumFragment(VALID_CROSS_LOOP_SCHEDULES)
+        self.cross_loop_pipeline = EnumFragment(VALID_CROSS_LOOP_PIPELINES)
 
     def enable_cute_async_load_pipeline(self) -> None:
         """Expose the narrow CuTe async state-load search dimensions."""
@@ -2569,6 +2569,29 @@ class ConfigSpec:
             self.normalize(config.config, _fix_invalid=_fix_invalid)
             return
 
+        # ``cross_loop_schedule`` was the public name before static and dynamic
+        # dispatch shared one pipeline policy.  Accept old configs only at this
+        # boundary, then keep ``cross_loop_pipeline`` as the sole internal key.
+        if "cross_loop_schedule" in config:
+            legacy_value = config.pop("cross_loop_schedule")
+            legacy_pipeline = {
+                "barrier": "barrier",
+                "static_pipeline": "static",
+            }.get(legacy_value)
+            if legacy_pipeline is None:
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        "cross_loop_schedule must be one of "
+                        "('barrier', 'static_pipeline')"
+                    )
+            elif "cross_loop_pipeline" not in config:
+                config["cross_loop_pipeline"] = legacy_pipeline
+            elif config["cross_loop_pipeline"] != legacy_pipeline and not _fix_invalid:
+                raise InvalidConfig(
+                    "cross_loop_schedule and cross_loop_pipeline select "
+                    "conflicting execution policies"
+                )
+
         for name in (
             "block_size",
             "loop_order",
@@ -2596,15 +2619,15 @@ class ConfigSpec:
                     config[names] = [value]
 
         if (
-            "cross_loop_schedule" in config
-            and self.cross_loop_schedule is None
-            and self.supports_config_key("cross_loop_schedule")
+            "cross_loop_pipeline" in config
+            and self.cross_loop_pipeline is None
+            and self.supports_config_key("cross_loop_pipeline")
         ):
             if _fix_invalid:
-                config.pop("cross_loop_schedule")
+                config.pop("cross_loop_pipeline", None)
             else:
                 raise InvalidConfig(
-                    "cross_loop_schedule is available only for kernels "
+                    "cross_loop_pipeline is available only for kernels "
                     "with compiler-inferred cross-loop dependencies"
                 )
 
@@ -2989,22 +3012,22 @@ class ConfigSpec:
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
-        cross_loop_schedule_fragment = self.cross_loop_schedule
-        if cross_loop_schedule_fragment is not None:
-            cross_loop_schedule = config.setdefault(
-                "cross_loop_schedule",
-                cross_loop_schedule_fragment.default(),
+        cross_loop_pipeline_fragment = self.cross_loop_pipeline
+        if cross_loop_pipeline_fragment is not None:
+            cross_loop_pipeline = config.setdefault(
+                "cross_loop_pipeline",
+                cross_loop_pipeline_fragment.default(),
             )
-            if cross_loop_schedule not in cross_loop_schedule_fragment.choices:
+            if cross_loop_pipeline not in cross_loop_pipeline_fragment.choices:
                 if _fix_invalid:
-                    config["cross_loop_schedule"] = (
-                        cross_loop_schedule_fragment.default()
+                    config["cross_loop_pipeline"] = (
+                        cross_loop_pipeline_fragment.default()
                     )
                 else:
                     raise InvalidConfig(
-                        "cross_loop_schedule must be one of "
-                        f"{cross_loop_schedule_fragment.choices!r}, got "
-                        f"{cross_loop_schedule!r}"
+                        "cross_loop_pipeline must be one of "
+                        f"{cross_loop_pipeline_fragment.choices!r}, got "
+                        f"{cross_loop_pipeline!r}"
                     )
         recurrence_dv_fragment = self.cute_chunk_recurrence_dv_partitions
         if recurrence_dv_fragment is not None:
@@ -3222,17 +3245,19 @@ class ConfigSpec:
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
 
         if self.supports_config_key("num_sm_multiplier"):
-            # Validate num_sm_multiplier is a power of two in range
+            # Validate num_sm_multiplier is a power of two in range.
             if "num_sm_multiplier" in config:
                 val = config["num_sm_multiplier"]
                 if (
                     not isinstance(val, int)
                     or val < MIN_NUM_SM_MULTIPLIER
                     or val > MAX_NUM_SM_MULTIPLIER
-                    or (val & (val - 1)) != 0  # not a power of two
+                    or (val & (val - 1)) != 0
                 ):
                     raise InvalidConfig(
-                        f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
+                        f"Invalid value for 'num_sm_multiplier': {val!r} must be "
+                        f"a power of two between {MIN_NUM_SM_MULTIPLIER} and "
+                        f"{MAX_NUM_SM_MULTIPLIER}"
                     )
             else:
                 config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
@@ -3921,8 +3946,8 @@ class ConfigSpec:
             )
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
-        if self.cross_loop_schedule is not None:
-            fields["cross_loop_schedule"] = self.cross_loop_schedule
+        if self.cross_loop_pipeline is not None:
+            fields["cross_loop_pipeline"] = self.cross_loop_pipeline
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
             fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):
