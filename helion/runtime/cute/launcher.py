@@ -938,6 +938,7 @@ def _append_cute_wrapper_plan(
         tk = plan_int("total_kv_rows")
         q_stage = plan_int("q_stage")
         do_stage = plan_int("do_stage")
+        bwd_persistent = bool(plan.get("persistent"))
         dtype = str(plan.get("dtype", "cutlass.Float16"))
         assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
         bw = "cutlass.utils.blackwell_helpers"
@@ -981,6 +982,9 @@ def _append_cute_wrapper_plan(
             f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
         ]
         body.extend(f"    {line}" for line in fbwd_lines)
+        if bwd_persistent:
+            assert num_sm is not None and num_sm > 0
+            body.append(f"    grid_x = cutlass.Int32({min(tk // 128, num_sm)})")
         call_args.extend(
             [
                 "_fbwd_ss_mma",
