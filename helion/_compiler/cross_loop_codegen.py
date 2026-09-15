@@ -6,6 +6,10 @@ from typing import cast
 
 import sympy
 import torch
+from torch.utils._sympy.functions import CeilDiv
+from torch.utils._sympy.functions import FloorDiv
+from torch.utils._sympy.functions import Max as SymbolicMax
+from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
 from .ast_extension import ExtendedAST
@@ -16,6 +20,8 @@ from .compile_environment import CompileEnvironment
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
 from .cross_loop_scheduler import ReadinessProducer
+from .cross_loop_scheduler import WorkerScheduleSegment
+from .cross_loop_scheduler import _root_schedule_traversal
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -25,6 +31,7 @@ from .program_id import typed_program_id
 from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
+from .tile_dependency import _memoized_exact_converse
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_coordinate_domains
 from .tile_dependency import nested_logical_axes
@@ -34,6 +41,7 @@ from .tile_strategy import L2GroupingProgramIDs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
 
     from .device_function import DeviceFunction
     from .program_id import ForEachProgramID
@@ -192,19 +200,6 @@ def _clone_opaque_statements_with_loop_segments(
     return cloned
 
 
-def _phase_root_ranges(owner: ForEachProgramID) -> list[tuple[int, int]]:
-    result: list[tuple[int, int]] = []
-    begin = 0
-    for index in range(1, len(owner.case_phases) + 1):
-        if (
-            index == len(owner.case_phases)
-            or owner.case_phases[index] != owner.case_phases[index - 1]
-        ):
-            result.append((begin, index))
-            begin = index
-    return result
-
-
 def _extract_case_bodies(
     owner: ForEachProgramID,
     base_body: list[ast.stmt],
@@ -236,13 +231,13 @@ def _static_case_axes(
     owner: ForEachProgramID,
     root: int,
     device_function: DeviceFunction,
-) -> list[tuple[int, int]] | None:
+) -> list[tuple[int | sympy.Expr, int]] | None:
     env = CompileEnvironment.current()
     task_families = HostFunction.current().device_ir.task_families
     if root >= len(task_families):
         return None
     task_family = task_families[root]
-    result: list[tuple[int, int]] = []
+    result: list[tuple[int | sympy.Expr, int]] = []
     for info in _case_pid_info(owner.cases[root]):
         logical_axis = task_family.axis(info.block_id)
         if logical_axis is None:
@@ -253,9 +248,11 @@ def _static_case_axes(
         if isinstance(numel_expr, int):
             numel = numel_expr
         elif isinstance(numel_expr, torch.SymInt):
-            numel = int(env.size_hint(numel_expr))
+            numel = numel_expr._sympy_()
         elif getattr(numel_expr, "is_number", False):
             numel = int(numel_expr)
+        elif isinstance(numel_expr, sympy.Expr):
+            numel = numel_expr
         else:
             return None
         try:
@@ -274,14 +271,25 @@ def _static_case_geometry(
     owner: ForEachProgramID,
     root: int,
     device_function: DeviceFunction,
-) -> tuple[tuple[int, ...], dict[int, int], dict[int, int]] | None:
+) -> (
+    tuple[
+        tuple[int, ...],
+        dict[int, int | sympy.Expr],
+        dict[int, int],
+    ]
+    | None
+):
     axes = _static_case_axes(owner, root, device_function)
     if axes is None:
         return None
     infos = _case_pid_info(owner.cases[root])
     axis_order = tuple(info.block_id for info in infos)
-    axis_counts = {
-        info.block_id: (numel + block - 1) // block
+    axis_counts: dict[int, int | sympy.Expr] = {
+        info.block_id: (
+            (numel + block - 1) // block
+            if isinstance(numel, int)
+            else cast("sympy.Expr", CeilDiv(numel, block))
+        )
         for info, (numel, block) in zip(infos, axes, strict=True)
     }
     block_sizes = {
@@ -312,13 +320,21 @@ def _static_block_axis_geometry(
 def _effective_l2_group_size(
     case: ProgramIDs,
     axis_order: tuple[int, ...],
-    axis_counts: dict[int, int],
+    axis_counts: dict[int, int | sympy.Expr],
 ) -> int | None:
     """Return the nontrivial L2 grouping applied by one root's PID task order."""
     if not isinstance(case, L2GroupingProgramIDs) or len(axis_order) < 2:
         return None
     first_axis, second_axis = axis_order[:2]
-    if axis_counts[second_axis] == 1 or case.group_size >= axis_counts[first_axis]:
+    first_count = axis_counts[first_axis]
+    second_count = axis_counts[second_axis]
+    if not isinstance(first_count, int | sympy.Integer) or not isinstance(
+        second_count, int | sympy.Integer
+    ):
+        return None
+    first_count = int(first_count)
+    second_count = int(second_count)
+    if second_count == 1 or case.group_size >= first_count:
         return None
     return case.group_size
 
@@ -326,7 +342,9 @@ def _effective_l2_group_size(
 def _root_task_orders(
     owner: ForEachProgramID,
     root_domains: tuple[CoordinateDomain, ...],
-    case_geometries: tuple[tuple[tuple[int, ...], dict[int, int], dict[int, int]], ...],
+    case_geometries: tuple[
+        tuple[tuple[int, ...], dict[int, int | sympy.Expr], dict[int, int]], ...
+    ],
 ) -> tuple[CoordinateRelation, ...] | None:
     """Bind each logical root domain to its configured PID task order."""
     if len(root_domains) != len(case_geometries):
@@ -336,9 +354,13 @@ def _root_task_orders(
         zip(root_domains, case_geometries, strict=True)
     ):
         pid_axis_order, axis_counts, block_sizes = geometry
+        if domain.parameter_symbols and isinstance(
+            owner.cases[root], L2GroupingProgramIDs
+        ):
+            return None
         if (
             set(domain.axis_order) != set(pid_axis_order)
-            or domain.axis_counts
+            or domain.axis_count_expressions
             != {axis: axis_counts[axis] for axis in domain.axis_order}
             or domain.block_sizes
             != {axis: block_sizes[axis] for axis in domain.axis_order}
@@ -414,8 +436,7 @@ def _wait_for_dependencies(
 def _emit_final_arrival_continuation(
     *,
     counter: str,
-    epoch: str,
-    expected_arrivals: int,
+    target: str,
     previous: str,
     continuation_body: list[ast.stmt],
 ) -> list[ast.stmt]:
@@ -426,10 +447,7 @@ def _emit_final_arrival_continuation(
         ),
         create(
             ast.If,
-            test=expr_from_string(
-                f"{previous} == tl.cast({epoch}, tl.uint32) * "
-                f"tl.cast({expected_arrivals}, tl.uint32) - 1"
-            ),
+            test=expr_from_string(f"{previous} == {target} - 1"),
             body=continuation_body,
             orelse=[],
         ),
@@ -513,6 +531,31 @@ def _outline_opaque_tile_body(
     )
 
 
+def _triton_root_requires_kernel_scope(
+    body: list[ast.stmt],
+    target_device_capability: tuple[int, int] | None,
+) -> bool:
+    """Return whether a Triton root may allocate kernel-scoped resources.
+
+    Blackwell lowers sufficiently large ``tl.dot`` operations through tensor
+    memory.  Triton's tensor-memory allocation must remain in the kernel body;
+    placing the operation in an outlined device function fails during lowering.
+    Conservatively keep every Blackwell dot root in kernel scope because the
+    eventual tensor-memory choice is made after Helion emits its AST.
+    """
+    if target_device_capability is None or target_device_capability[0] < 10:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.func.attr in {"dot", "dot_scaled"}
+        for statement in body
+        for node in ast.walk(statement)
+    )
+
+
 def emit_cross_loop_schedule(
     owner: ForEachProgramID,
     strategy: PersistentProgramIDs,
@@ -525,12 +568,12 @@ def emit_cross_loop_schedule(
     corresponding counters. The targets are epoch-scaled, so fixed CUDA
     Graph arguments need neither a reset kernel nor a host-side epoch update.
     """
-    schedule = device_function.config.cross_loop_schedule
-    if schedule == "barrier":
+    pipeline = device_function.config.cross_loop_pipeline
+    if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
-    if schedule != "static_pipeline":
-        raise exc.InvalidConfig(f"unknown cross_loop_schedule value {schedule!r}")
+    if pipeline != "static":
+        raise exc.InvalidConfig(f"unknown cross_loop_pipeline value {pipeline!r}")
 
     configured_case_geometries = tuple(
         _static_case_geometry(owner, root, device_function)
@@ -538,7 +581,7 @@ def emit_cross_loop_schedule(
     )
     if any(geometry is None for geometry in configured_case_geometries):
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' requires concrete "
+            f"cross_loop_pipeline={pipeline!r} requires representable "
             "top-level task counts"
         )
     case_geometries = tuple(
@@ -556,6 +599,14 @@ def emit_cross_loop_schedule(
     )
     case_bodies = _extract_case_bodies(owner, base_body)
     opaque_case_fingerprints = tuple(_ast_fingerprint(body) for body in case_bodies)
+    target_device_capability = (
+        CompileEnvironment.current().config_spec.target_device_capability
+    )
+    kernel_scope_roots = frozenset(
+        root
+        for root, body in enumerate(case_bodies)
+        if _triton_root_requires_kernel_scope(body, target_device_capability)
+    )
     dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
     assert dependency_graph is not None
     indexing = device_function.config.get("indexing", ())
@@ -587,7 +638,7 @@ def emit_cross_loop_schedule(
     configured_worker_count = CompileEnvironment.current().config_spec.num_sm * cast(
         "int", device_function.config.get("num_sm_multiplier", 1)
     )
-    root_axis_geometry: dict[int, tuple[int, int]] = {}
+    root_axis_geometry: dict[int, tuple[int | sympy.Expr, int]] = {}
     for _axis_order, axis_counts, block_sizes in case_geometries:
         for block_id, task_count in axis_counts.items():
             geometry = (task_count, block_sizes[block_id])
@@ -596,7 +647,7 @@ def emit_cross_loop_schedule(
                 raise AssertionError(
                     f"inconsistent configured geometry for block axis {block_id}"
                 )
-    axis_geometry: dict[int, tuple[int, int]] = {}
+    axis_geometry: dict[int, tuple[int | sympy.Expr, int]] = {}
     for block_id in range(len(CompileEnvironment.current().block_sizes)):
         geometry = root_axis_geometry.get(block_id)
         if geometry is None:
@@ -609,16 +660,11 @@ def emit_cross_loop_schedule(
     )
     if any(domain is None for domain in configured_root_domains):
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' requires static root domains"
+            f"cross_loop_pipeline={pipeline!r} requires representable root domains"
         )
     root_domains = tuple(
         domain for domain in configured_root_domains if domain is not None
     )
-    case_offsets: list[int] = []
-    running_offset = 0
-    for domain in root_domains:
-        case_offsets.append(running_offset)
-        running_offset += domain.size
     root_task_orders = _root_task_orders(
         owner,
         root_domains,
@@ -626,7 +672,7 @@ def emit_cross_loop_schedule(
     )
     if root_task_orders is None:
         raise exc.InvalidConfig(
-            "cross_loop_schedule='static_pipeline' requires a "
+            f"cross_loop_pipeline={pipeline!r} requires a "
             "representable root PID task order"
         )
     static_pipeline_plan = build_static_pipeline_plan(
@@ -635,9 +681,22 @@ def emit_cross_loop_schedule(
         site_domains=site_domains,
         worker_count=configured_worker_count,
         publishable_site_ids=publishable_site_ids,
+        continuation_ineligible_roots=kernel_scope_roots,
+        prove_nonnegative=CompileEnvironment.current().known_nonnegative,
     )
-    root_barrier_edges = static_pipeline_plan.root_barrier_edges
+    if static_pipeline_plan.root_task_orders != root_task_orders:
+        raise AssertionError("pipeline plan changed the configured root task orders")
+    root_task_orders = static_pipeline_plan.root_task_orders
+    # StaticPipelinePlan accepts only a fixed physical task universe.  Convert
+    # task-family offsets only after that invariant has been established.
+    case_offsets: list[int] = []
+    running_offset = 0
+    for domain in root_domains:
+        case_offsets.append(running_offset)
+        running_offset += domain.size
+    case_offset_strings = [str(offset) for offset in case_offsets]
     all_readiness_counter_plans = static_pipeline_plan.readiness_counters
+    root_barrier_edges = static_pipeline_plan.root_barrier_edges
     nested_loop_counter_plans = tuple(
         plan
         for plan in all_readiness_counter_plans
@@ -655,32 +714,18 @@ def emit_cross_loop_schedule(
         )
     )
     launch_worker_count = static_pipeline_plan.worker_schedule.worker_count
-
-    active_worker_counts_by_root = {
-        root: len(static_pipeline_plan.worker_schedule.workers_for_root(root))
-        for root in range(len(root_domains))
+    root_barrier_producer_roots = sorted(
+        {producer for producer, _consumer in root_barrier_edges}
+    )
+    # Publication support and arrival counts were derived and validated when
+    # the selected plan was frozen.  Codegen only renders those facts.
+    root_publication_plans = {
+        root: publication_plan
+        for root, publication_plan in enumerate(
+            static_pipeline_plan.root_barrier_publication_plans
+        )
+        if publication_plan is not None
     }
-    continuation_task_count_by_root: dict[int, int] = {}
-    for plan in readiness_counter_plans:
-        readiness_consumer = plan.continuation_consumer
-        if readiness_consumer is None:
-            continue
-        if not readiness_consumer.keys_by_consumer.is_total_function():
-            raise AssertionError(
-                "a final-arrival continuation must cover its complete root"
-            )
-        continuation_task_count_by_root[readiness_consumer.consumer_root] = (
-            readiness_consumer.keys_by_consumer.source_domain.size
-        )
-
-    def root_barrier_arrival_count(root: int) -> int:
-        return active_worker_counts_by_root[root] + continuation_task_count_by_root.get(
-            root, 0
-        )
-
-    # Reject grids that cannot residently fit when the device is otherwise
-    # idle. Concurrent-stream residency remains an explicit unresolved
-    # contract for this non-cooperative static lowering.
     device_function.triton_minimum_resident_programs = strategy.grid_size_expr
     device_function.preamble.extend(strategy._persistent_setup_statements(total_expr))
     readiness_counter_offsets: dict[ReadinessCounterPlan, int] = {}
@@ -689,9 +734,6 @@ def emit_cross_loop_schedule(
     for plan in all_readiness_counter_plans:
         readiness_counter_offsets[plan] = readiness_counter_count
         readiness_counter_count += plan.readiness_key_count * readiness_counter_stride
-    root_barrier_producer_roots = sorted(
-        {producer for producer, _consumer in root_barrier_edges}
-    )
     root_barrier_indices = {
         root: index for index, root in enumerate(root_barrier_producer_roots)
     }
@@ -699,7 +741,7 @@ def emit_cross_loop_schedule(
 
     def reserve_state(count: int) -> int | None:
         nonlocal state_count
-        if not count:
+        if count == 0:
             return None
         state_count = (
             (state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
@@ -710,11 +752,12 @@ def emit_cross_loop_schedule(
         state_count += count
         return offset
 
-    readiness_counter_state_offset = reserve_state(readiness_counter_count)
-    root_barrier_state_offset = reserve_state(
+    root_barrier_count = (
         len(root_barrier_producer_roots) * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
-    static_state_base = str(
+    readiness_counter_state_offset = reserve_state(readiness_counter_count)
+    root_barrier_state_offset = reserve_state(root_barrier_count)
+    counter_state_base = str(
         (launch_worker_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
         // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
@@ -722,29 +765,21 @@ def emit_cross_loop_schedule(
     state_arg = _register_cross_loop_state(
         device_function,
         name_hint="tile_dependency_state",
-        numel=f"{static_state_base} + {state_count}",
+        numel=(f"{counter_state_base} + {state_count}"),
         dtype=_CROSS_LOOP_COUNTER_DTYPE,
     )
 
     def state_section(offset: int | None) -> str | None:
         if offset is None:
             return None
-        return f"{state_arg} + ({static_state_base}) + {offset}"
+        return f"{state_arg} + ({counter_state_base}) + {offset}"
 
-    epoch_arg = state_arg
     readiness_counter_arg = state_section(readiness_counter_state_offset)
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
-    phase_root_ranges = _phase_root_ranges(owner)
     result: list[ast.stmt] = [
-        statement_from_string(f"{epoch_var} = tl.load({epoch_arg} + {worker}) + 1")
+        statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
     ]
-    continuation_roots = {
-        continuation_consumer.consumer_root
-        for plan in readiness_counter_plans
-        if (continuation_consumer := plan.continuation_consumer) is not None
-    }
-
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
         consumer: tuple(
             sorted(
@@ -764,7 +799,8 @@ def emit_cross_loop_schedule(
         )
 
     def root_barrier_dependency(root: int) -> tuple[str, str]:
-        arrivals = root_barrier_arrival_count(root)
+        publication_plan = root_publication_plans[root]
+        arrivals = int(publication_plan.real_arrival_count)
         return (
             root_barrier_counter(root),
             f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)",
@@ -780,7 +816,8 @@ def emit_cross_loop_schedule(
         if root not in root_barrier_indices:
             return []
         barrier_counter = root_barrier_counter(root)
-        arrivals = root_barrier_arrival_count(root)
+        publication_plan = root_publication_plans[root]
+        arrivals = int(publication_plan.real_arrival_count)
         result = [_publication_sync(device_function)]
         if arrivals == 1:
             result.append(
@@ -798,7 +835,7 @@ def emit_cross_loop_schedule(
         return result
 
     root_pid_axis_orders = [geometry[0] for geometry in case_geometries]
-    root_axis_counts = [domain.axis_counts for domain in root_domains]
+    root_axis_counts = [domain.axis_count_expressions for domain in root_domains]
     root_counters_by_producer: dict[
         int,
         list[
@@ -832,14 +869,21 @@ def emit_cross_loop_schedule(
         for readiness_producers in producer_counters_by_site.values()
         for _plan, readiness_producer in readiness_producers
     }
-    scheduled_task_roots = {
-        root
-        for root, task_order in enumerate(root_task_orders)
-        if any(
-            segment.task_order != task_order
-            for segment in static_pipeline_plan.worker_schedule.segments_for_root(root)
-        )
-    }
+    root_schedule_traversals = {}
+    scheduled_task_roots: set[int] = set()
+    for segment in static_pipeline_plan.worker_schedule.segments:
+        reference_task_order = root_task_orders[segment.root]
+        if segment.task_order == reference_task_order:
+            continue
+        traversal = _root_schedule_traversal(segment, reference_task_order)
+        if traversal is None:
+            raise exc.InvalidConfig(
+                f"cross_loop_pipeline={pipeline!r} cannot render the "
+                f"configured traversal for root {segment.root}"
+            )
+        if not traversal.matches_reference:
+            root_schedule_traversals[segment.root] = traversal
+            scheduled_task_roots.add(segment.root)
     readiness_consumers_by_root: dict[
         int,
         list[tuple[ReadinessCounterPlan, ReadinessConsumer]],
@@ -868,48 +912,146 @@ def emit_cross_loop_schedule(
     def flat_task_coordinates(
         task: str,
         axis_order: tuple[int, ...],
-        counts: dict[int, int],
+        counts: Mapping[int, int | sympy.Expr],
     ) -> dict[int, str]:
         coordinates: dict[int, str] = {}
-        multiplier = 1
+        multiplier: int | sympy.Expr = 1
         for block_id in axis_order:
             count = counts[block_id]
+            count_text = (
+                str(count)
+                if isinstance(count, int)
+                else device_function.sympy_expr(count)
+            )
+            multiplier_text = (
+                str(multiplier)
+                if isinstance(multiplier, int)
+                else device_function.sympy_expr(multiplier)
+            )
             if count == 1:
                 coordinates[block_id] = "0"
             elif multiplier == 1:
-                coordinates[block_id] = f"(({task}) % {count})"
+                coordinates[block_id] = f"(({task}) % ({count_text}))"
             else:
-                coordinates[block_id] = f"((({task}) // {multiplier}) % {count})"
-            multiplier *= counts[block_id]
+                coordinates[block_id] = (
+                    f"((({task}) // ({multiplier_text})) % ({count_text}))"
+                )
+            multiplier = cast(
+                "sympy.Expr",
+                sympy.Mul(sympy.sympify(multiplier), sympy.sympify(count)),
+            )
         return coordinates
 
     def flat_task_from_coordinates(
         coordinates: dict[int, str],
         axis_order: tuple[int, ...],
-        counts: dict[int, int],
+        counts: Mapping[int, int | sympy.Expr],
     ) -> str:
         """Flatten logical coordinates in one declared axis order."""
         terms: list[str] = []
-        multiplier = 1
+        multiplier: int | sympy.Expr = 1
         for axis in axis_order:
             count = counts[axis]
             if count != 1:
                 coordinate = coordinates[axis]
+                multiplier_text = (
+                    str(multiplier)
+                    if isinstance(multiplier, int)
+                    else device_function.sympy_expr(multiplier)
+                )
                 terms.append(
                     f"({coordinate})"
                     if multiplier == 1
-                    else f"({coordinate}) * {multiplier}"
+                    else f"({coordinate}) * {multiplier_text}"
                 )
-            multiplier *= count
+            multiplier = cast(
+                "sympy.Expr",
+                sympy.Mul(sympy.sympify(multiplier), sympy.sympify(count)),
+            )
         return " + ".join(terms) or "0"
 
     def relation_expression(
         expression: sympy.Expr,
         coordinates: dict[int, str],
+        *,
+        nonempty_domain: CoordinateDomain | None = None,
     ) -> str:
         """Render the restricted coordinate-relation expression grammar."""
+
+        def render(child: sympy.Expr) -> str:
+            return relation_expression(
+                child,
+                coordinates,
+                nonempty_domain=nonempty_domain,
+            )
+
+        def positive_when_domain_nonempty(divisor: sympy.Expr) -> bool:
+            if divisor.is_positive is True:
+                return True
+            if (
+                nonempty_domain is None
+                or divisor.is_nonnegative is not True
+                or not divisor.free_symbols <= nonempty_domain.parameter_symbols
+            ):
+                return False
+            domain_size = sympy.sympify(nonempty_domain.size_expr)
+            quotient = sympy.cancel(domain_size / divisor)
+            return (
+                quotient.is_integer is True
+                and quotient.is_nonnegative is True
+                and sympy.simplify(domain_size - divisor * quotient) == 0
+            )
+
+        def floor_division(
+            numerator: sympy.Expr,
+            denominator: sympy.Expr,
+        ) -> str:
+            if denominator.is_integer is not True or not (
+                positive_when_domain_nonempty(denominator)
+            ):
+                raise AssertionError(
+                    "logical floor division requires a proved positive divisor"
+                )
+            numerator_text = render(numerator)
+            if isinstance(denominator, sympy.Integer):
+                divisor = str(int(denominator))
+            else:
+                # ``nonempty_domain`` proves this factor is positive at every
+                # executed point. Clamping only defines the inactive empty-
+                # domain case, which the surrounding schedule never executes.
+                denominator_text = render(denominator)
+                divisor = f"tl.maximum(({denominator_text}), 1)"
+            if numerator.is_nonnegative is True:
+                return f"(({numerator_text}) // {divisor})"
+            # Triton integer division truncates toward zero. First remove the
+            # Euclidean remainder so the dividend is exactly divisible; this
+            # preserves mathematical floor for either sign.
+            signed_remainder = f"(({numerator_text}) % ({divisor}))"
+            remainder = f"((({signed_remainder}) + {divisor}) % {divisor})"
+            return f"((({numerator_text}) - ({remainder})) // {divisor})"
+
         if isinstance(expression, sympy.Integer):
             return str(int(expression))
+        if expression.func in (sympy.Min, sympy.Max, SymbolicMin, SymbolicMax):
+            function = (
+                "tl.minimum"
+                if expression.func in (sympy.Min, SymbolicMin)
+                else "tl.maximum"
+            )
+            rendered = render(cast("sympy.Expr", expression.args[0]))
+            for argument in expression.args[1:]:
+                rendered = (
+                    f"{function}(({rendered}), "
+                    f"({render(cast('sympy.Expr', argument))}))"
+                )
+            return rendered
+        coordinate_symbols = frozenset(
+            coordinate_axis_symbol(axis) for axis in coordinates
+        )
+        if expression.free_symbols and expression.free_symbols.isdisjoint(
+            coordinate_symbols
+        ):
+            return f"({device_function.sympy_expr(expression)})"
         if isinstance(expression, sympy.Symbol):
             axis = next(
                 (
@@ -919,50 +1061,44 @@ def emit_cross_loop_schedule(
                 ),
                 None,
             )
-            if axis is None:
-                raise AssertionError(f"unknown coordinate-relation symbol {expression}")
-            return f"({coordinates[axis]})"
+            if axis is not None:
+                return f"({coordinates[axis]})"
+            return f"({device_function.sympy_expr(expression)})"
         if isinstance(expression, sympy.Add):
             return " + ".join(
-                f"({relation_expression(cast('sympy.Expr', term), coordinates)})"
+                f"({render(cast('sympy.Expr', term))})"
                 for term in expression.as_ordered_terms()
             )
         if isinstance(expression, sympy.Mul):
             return " * ".join(
-                f"({relation_expression(factor, coordinates)})"
-                for factor in expression.as_ordered_factors()
+                f"({render(factor)})" for factor in expression.as_ordered_factors()
             )
+        if expression.func in (FloorDiv, CeilDiv):
+            numerator, denominator = map(sympy.sympify, expression.args)
+            if expression.func is FloorDiv:
+                return floor_division(numerator, denominator)
+            return f"(-({floor_division(-numerator, denominator)}))"
         if expression.func in (sympy.floor, sympy.ceiling):
             numerator, denominator = sympy.fraction(sympy.together(expression.args[0]))
-            if not isinstance(denominator, sympy.Integer) or denominator <= 0:
-                raise AssertionError(
-                    "logical floor/ceiling requires a positive static divisor"
-                )
-            numerator_expr = relation_expression(numerator, coordinates)
             if expression.func == sympy.floor:
-                return f"(({numerator_expr}) // {int(denominator)})"
-            return f"(-((-({numerator_expr})) // {int(denominator)}))"
-        if expression.func in (sympy.Min, sympy.Max):
-            function = "tl.minimum" if expression.func == sympy.Min else "tl.maximum"
-            rendered = relation_expression(
-                cast("sympy.Expr", expression.args[0]), coordinates
-            )
-            for argument in expression.args[1:]:
-                rendered = (
-                    f"{function}(({rendered}), "
-                    f"({relation_expression(cast('sympy.Expr', argument), coordinates)}))"
-                )
-            return rendered
+                return floor_division(numerator, denominator)
+            return f"(-({floor_division(-numerator, denominator)}))"
         if isinstance(expression, sympy.Mod):
             numerator, denominator = expression.args
             if not isinstance(denominator, sympy.Integer) or denominator <= 0:
                 raise AssertionError(
                     "logical modulo requires a positive static divisor"
                 )
-            return (
-                f"(({relation_expression(cast('sympy.Expr', numerator), coordinates)}) % "
-                f"{int(denominator)})"
-            )
+            numerator_text = render(cast("sympy.Expr", numerator))
+            signed_remainder = f"(({numerator_text}) % {int(denominator)})"
+            if numerator.is_nonnegative is True:
+                return signed_remainder
+            # SymPy's Mod is Euclidean for a positive divisor, whereas Triton
+            # lowers ``%`` on signed integers as a signed remainder.  Preserve
+            # the relation's semantics when affine simplification has removed
+            # a positive multiple of the divisor from a potentially negative
+            # numerator (for example, a wrapped worker cohort).
+            return f"((({signed_remainder}) + {int(denominator)}) % {int(denominator)})"
         if isinstance(expression, sympy.Rational):
             if expression.q == 1:
                 return str(expression.p)
@@ -972,28 +1108,48 @@ def emit_cross_loop_schedule(
         )
 
     def relation_source_membership(
-        bounds: tuple[tuple[int, int, int, int], ...],
+        bounds: tuple[tuple[int, int | sympy.Expr, int | sympy.Expr, int], ...],
         coordinates: dict[int, str],
     ) -> str:
         conditions: list[str] = []
         for axis, begin, end, step in bounds:
             coordinate = coordinates[axis]
+            begin_text = relation_expression(sympy.sympify(begin), coordinates)
+            end_text = relation_expression(sympy.sympify(end), coordinates)
             conditions.extend(
                 (
-                    f"({coordinate}) >= {begin}",
-                    f"({coordinate}) < {end}",
+                    f"({coordinate}) >= {begin_text}",
+                    f"({coordinate}) < {end_text}",
                 )
             )
             if step != 1:
-                conditions.append(f"(({coordinate}) - {begin}) % {step} == 0")
+                conditions.append(f"(({coordinate}) - {begin_text}) % {step} == 0")
         return " and ".join(conditions) or "True"
 
     def relation_point_coordinates(
         relation: CoordinateRelation,
         source_coordinates: dict[int, str],
+        *,
+        allow_exact_partial: bool = False,
     ) -> tuple[dict[int, str], str]:
         """Render an at-most-one-valued relation without task tables."""
-        canonical = relation.canonical_single_valued()
+        # A finalized worker schedule has already proved every segment to be
+        # an exact at-most-one-valued map.  Preserve that proof boundary:
+        # canonicalizing its symbolic packed boxes again is both redundant and
+        # can make code generation scale with nested Min/Max expression size.
+        if allow_exact_partial:
+            inverse = _memoized_exact_converse(relation)
+            if (
+                not relation.is_single_valued()
+                or inverse is None
+                or not inverse.is_single_valued()
+            ):
+                raise AssertionError(
+                    "raw relation rendering requires a proved partial bijection"
+                )
+            canonical = relation
+        else:
+            canonical = relation.canonical_single_valued()
         if canonical is None or not canonical.pieces:
             raise AssertionError("event relation is not single-valued")
         memberships: list[str] = []
@@ -1014,12 +1170,25 @@ def emit_cross_loop_schedule(
                     != 1
                 ):
                     raise AssertionError("event relation target is not one point")
-                value = relation_expression(begin, source_coordinates)
+                value = relation_expression(
+                    begin,
+                    source_coordinates,
+                    nonempty_domain=(
+                        relation.target_domain if allow_exact_partial else None
+                    ),
+                )
                 piece_values[axis] = value
+                target_count = relation_expression(
+                    sympy.sympify(canonical.target_domain.axis_count_expressions[axis]),
+                    source_coordinates,
+                    nonempty_domain=(
+                        relation.target_domain if allow_exact_partial else None
+                    ),
+                )
                 target_memberships.extend(
                     (
                         f"({value}) >= 0",
-                        f"({value}) < {canonical.target_domain.axis_counts[axis]}",
+                        f"({value}) < {target_count}",
                     )
                 )
             membership = " and ".join((source_membership, *target_memberships))
@@ -1057,7 +1226,7 @@ def emit_cross_loop_schedule(
             flat_task_from_coordinates(
                 target_coordinates,
                 relation.target_domain.axis_order,
-                relation.target_domain.axis_counts,
+                relation.target_domain.axis_count_expressions,
             ),
             membership,
         )
@@ -1165,6 +1334,75 @@ def emit_cross_loop_schedule(
                 "nested loop lowering currently requires one loop axis"
             )
         (nested_axis,) = nested_axes
+        nested_symbol = coordinate_axis_symbol(nested_axis)
+        requires_iteration_membership_guard = (
+            not readiness_consumer.keys_by_consumer.has_total_source()
+        ) or any(
+            nested_symbol in sympy.sympify(expression).free_symbols
+            for piece in readiness_consumer.keys_by_consumer.pieces
+            for _axis, begin, end, _step in piece.target_ranges
+            for expression in (begin, end)
+        )
+        if requires_iteration_membership_guard:
+            scheduled = False
+
+            def rewrite(loop: ast.For) -> list[ast.stmt] | None:
+                nonlocal scheduled
+                if tile_dependency_site_id(loop) != readiness_consumer.consumer_site_id:
+                    return None
+                if scheduled:
+                    raise AssertionError(
+                        "one dependency site must identify one lowered loop"
+                    )
+                if (
+                    not isinstance(loop.target, ast.Name)
+                    or not isinstance(loop.iter, ast.Call)
+                    or len(loop.iter.args) < 2
+                ):
+                    raise AssertionError(
+                        "nested loop wait requires one range-like loop axis"
+                    )
+                begin = ast.unparse(loop.iter.args[0])
+                step = (
+                    ast.unparse(loop.iter.args[2]) if len(loop.iter.args) >= 3 else "1"
+                )
+                site_coordinates = {
+                    **consumer_coordinates,
+                    nested_axis: f"(({loop.target.id}) - ({begin})) // ({step})",
+                }
+                readiness_key, membership = relation_flat_target(
+                    readiness_consumer.keys_by_consumer,
+                    site_coordinates,
+                )
+                waits = _wait_for_counter(
+                    device_function=device_function,
+                    counter=readiness_counter(plan, readiness_key),
+                    target=readiness_target(plan, readiness_key),
+                    prefix="tile_dependency_nested_loop_wait",
+                )
+                cloned = cast("ast.For", _clone_ast_value(loop))
+                if membership == "True":
+                    cloned.body = [*waits, *cloned.body]
+                elif membership != "False":
+                    cloned.body = [
+                        create(
+                            ast.If,
+                            test=expr_from_string(membership),
+                            body=waits,
+                            orelse=[],
+                        ),
+                        *cloned.body,
+                    ]
+                scheduled = True
+                return [cloned]
+
+            rewritten = _clone_opaque_statements_with_loop_rewrite(body, rewrite)
+            if not scheduled:
+                raise AssertionError(
+                    f"missing dependency site {readiness_consumer.consumer_site_id}"
+                )
+            return rewritten
+
         boundaries = tuple(
             sorted(
                 {
@@ -1195,10 +1433,7 @@ def emit_cross_loop_schedule(
                     _wait_for_counter(
                         device_function=device_function,
                         counter=readiness_counter(plan, readiness_key),
-                        target=(
-                            f"tl.cast({epoch_var}, tl.uint32) * "
-                            f"tl.cast({readiness_expected_arrivals(plan, readiness_key)}, tl.uint32)"
-                        ),
+                        target=readiness_target(plan, readiness_key),
                         prefix="tile_dependency_nested_loop_wait",
                     )
                 )
@@ -1215,8 +1450,9 @@ def emit_cross_loop_schedule(
         readiness_key: str,
     ) -> str:
         assert readiness_counter_arg is not None
+        offset = readiness_counter_offsets[plan]
         return (
-            f"{readiness_counter_arg} + {readiness_counter_offsets[plan]} + "
+            f"{readiness_counter_arg} + {offset} + "
             f"({readiness_key}) * {readiness_counter_stride}"
         )
 
@@ -1230,7 +1466,7 @@ def emit_cross_loop_schedule(
         readiness_key_coordinates = flat_task_coordinates(
             readiness_key,
             plan.readiness_key_domain.axis_order,
-            plan.readiness_key_domain.axis_counts,
+            plan.readiness_key_domain.axis_count_expressions,
         )
         expressions: list[str] = []
         for readiness_producer in plan.producers:
@@ -1243,6 +1479,13 @@ def emit_cross_loop_schedule(
             )
             expressions.append(values[cardinality.target_domain.axis_order[0]])
         return " + ".join(f"({expression})" for expression in expressions)
+
+    def readiness_target(
+        plan: ReadinessCounterPlan,
+        readiness_key: str,
+    ) -> str:
+        arrivals = readiness_expected_arrivals(plan, readiness_key)
+        return f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)"
 
     def emit_readiness_arrival_for_key(
         plan: ReadinessCounterPlan,
@@ -1261,7 +1504,7 @@ def emit_cross_loop_schedule(
             return [
                 statement_from_string(
                     f"tl.atomic_add({counter}, 1, sem='release', scope='gpu')"
-                )
+                ),
             ]
 
         converse_consumer = continuation_consumer.keys_by_consumer.converse()
@@ -1275,7 +1518,7 @@ def emit_cross_loop_schedule(
             readiness_key_coordinates = flat_task_coordinates(
                 readiness_key,
                 plan.readiness_key_domain.axis_order,
-                plan.readiness_key_domain.axis_counts,
+                plan.readiness_key_domain.axis_count_expressions,
             )
             consumer_coordinates, _membership = relation_point_coordinates(
                 converse_consumer,
@@ -1298,7 +1541,7 @@ def emit_cross_loop_schedule(
             root_axis_counts[continuation_root],
         )
         consumer_logical_pid = (
-            f"{case_offsets[continuation_root]} + "
+            f"{case_offset_strings[continuation_root]} + "
             f"{pid_task_for_logical_coordinates(continuation_root, consumer_coordinates)}"
         )
         consumer_extra_arguments = (consumer_task,)
@@ -1346,8 +1589,7 @@ def emit_cross_loop_schedule(
             *assignments,
             *_emit_final_arrival_continuation(
                 counter=arrival_counter,
-                epoch=epoch_var,
-                expected_arrivals=expected_arrivals,
+                target=readiness_target(plan, readiness_key),
                 previous=previous,
                 continuation_body=last_arrival_body,
             ),
@@ -1481,54 +1723,43 @@ def emit_cross_loop_schedule(
         """Map one root-local task-order index to its logical task ID."""
         if root not in scheduled_task_roots:
             return None
-        worker_schedule = static_pipeline_plan.worker_schedule
-        root_domain = root_domains[root]
-        assignment = worker_schedule.dense_assignment(root)
-        if (
-            assignment is None
-            or assignment[0] != 0
-            or assignment[1] != worker_schedule.worker_count
-            or assignment[3] != root_domain.size
-        ):
-            raise AssertionError(
-                f"root {root} does not occupy one contiguous schedule interval"
-            )
-        dispatch_offset = assignment[2]
-        segments = sorted(
-            worker_schedule.segments_for_root(root),
-            key=lambda segment: segment.dispatch_offset,
-        )
-
-        expression = ""
-        for segment in reversed(segments):
-            task_order_begin = segment.dispatch_offset - dispatch_offset
-            task_order_delta = f"(({task_order_index}) - {task_order_begin})"
-            membership = (
-                f"({task_order_delta}) >= 0 and "
-                f"({task_order_delta}) < {segment.task_count}"
-            )
+        traversal = root_schedule_traversals.get(root)
+        if traversal is None:
+            raise AssertionError("scheduled root has no authoritative traversal")
+        forward = traversal.scheduled_ordinal_to_logical_task
+        if forward is not None:
             task_order_coordinates = flat_task_coordinates(
-                task_order_delta,
-                segment.task_order.source_domain.axis_order,
-                segment.task_order.source_domain.axis_counts,
+                task_order_index,
+                forward.source_domain.axis_order,
+                forward.source_domain.axis_count_expressions,
             )
-            task_coordinates, relation_membership = relation_point_coordinates(
-                segment.task_order,
+            task_coordinates, membership = relation_point_coordinates(
+                forward,
                 task_order_coordinates,
             )
-            if relation_membership != "True":
-                membership = f"({membership}) and ({relation_membership})"
-            segment_task = logical_task_from_coordinates(
-                root,
-                task_coordinates,
-            )
-            if not expression:
-                expression = segment_task
-                continue
-            expression = f"tl.where({membership}, {segment_task}, {expression})"
-        if not expression:
-            raise AssertionError(f"root {root} has no static schedule")
-        return expression
+            if membership != "True":
+                raise AssertionError(
+                    "proved root traversal is not total during codegen"
+                )
+            return logical_task_from_coordinates(root, task_coordinates)
+
+        # Some existing PID permutations have no single representable flattened
+        # relation. Render the sole authoritative local order directly; its
+        # caller already bounds ``task_order_index`` to this root's task count.
+        segment = static_pipeline_plan.worker_schedule.segment_for_root(root)
+        if segment is None:
+            raise AssertionError(f"root {root} has no certified traversal")
+        logical_order = segment.task_order
+        task_order_coordinates = flat_task_coordinates(
+            task_order_index,
+            logical_order.source_domain.axis_order,
+            logical_order.source_domain.axis_count_expressions,
+        )
+        task_coordinates, _membership = relation_point_coordinates(
+            logical_order,
+            task_order_coordinates,
+        )
+        return logical_task_from_coordinates(root, task_coordinates)
 
     def scheduled_root_task_body(
         root: int,
@@ -1575,7 +1806,7 @@ def emit_cross_loop_schedule(
                 ]
             )
             scheduled_pid_task = pid_task
-            scheduled_logical_pid = f"{case_offsets[root]} + {pid_task}"
+            scheduled_logical_pid = f"{case_offset_strings[root]} + {pid_task}"
         if scheduled_coordinates is None:
             scheduled_coordinates = logical_coordinates_for_pid_task(
                 root, scheduled_pid_task
@@ -1596,9 +1827,9 @@ def emit_cross_loop_schedule(
                     incoming_readiness_counter,
                     readiness_key,
                 ),
-                target=(
-                    f"tl.cast({epoch_var}, tl.uint32) * "
-                    f"tl.cast({readiness_expected_arrivals(incoming_readiness_counter, readiness_key)}, tl.uint32)"
+                target=readiness_target(
+                    incoming_readiness_counter,
+                    readiness_key,
                 ),
                 prefix="tile_dependency_readiness_wait",
             )
@@ -1637,32 +1868,37 @@ def emit_cross_loop_schedule(
                     scheduled_root_body,
                     scheduled_coordinates,
                 )
-            opaque_call = _outline_cross_loop_region(
-                device_function,
-                name_hint=f"tile_dependency_root_{root}",
-                body=[
-                    statement_from_string(
-                        f"{owner.shared_pid_var} = {scheduled_logical_pid}"
-                    ),
-                    *scheduled_root_body,
-                ],
-                extra_argument_names=extra_argument_names,
-            )
-        else:
-            opaque_call = _outline_opaque_tile_body(
-                owner,
-                device_function,
-                root=root,
-                logical_pid=scheduled_logical_pid,
-                body=body_with_nested_loop_publications(
-                    root,
-                    case_bodies[root],
-                    scheduled_coordinates,
+            tile_body = [
+                statement_from_string(
+                    f"{owner.shared_pid_var} = {scheduled_logical_pid}"
                 ),
-                extra_argument_names=extra_argument_names,
-                noinline=force_noinline,
+                *scheduled_root_body,
+            ]
+        else:
+            tile_body = [
+                statement_from_string(
+                    f"{owner.shared_pid_var} = {scheduled_logical_pid}"
+                ),
+                *_clone_opaque_statements(
+                    body_with_nested_loop_publications(
+                        root,
+                        case_bodies[root],
+                        scheduled_coordinates,
+                    )
+                ),
+            ]
+        if root in kernel_scope_roots:
+            body.extend(tile_body)
+        else:
+            body.append(
+                _outline_cross_loop_region(
+                    device_function,
+                    name_hint=f"tile_dependency_root_{root}",
+                    body=tile_body,
+                    extra_argument_names=extra_argument_names,
+                    noinline=force_noinline,
+                )
             )
-        body.append(opaque_call)
         if producer_counters:
             has_task_scheduling = True
             body.append(_publication_sync(device_function))
@@ -1674,88 +1910,101 @@ def emit_cross_loop_schedule(
                     scheduled_coordinates,
                 )
             )
-        if not has_task_scheduling:
+        if not has_task_scheduling or root in kernel_scope_roots:
             return body
+        # A root used at one schedule occurrence with entry-only bookkeeping
+        # has no duplicated call site to protect.  Let Triton inline that thin
+        # wrapper just as it does for a root-barrier wait surrounding the same
+        # body.  A root-barrier publication is emitted by the caller after the
+        # task dispatch, so it does not require an outlining boundary.  Repeated
+        # roots and roots that publish per-task counters or splice nested work
+        # retain the noinline boundary that limits code growth and live-range
+        # coupling across schedule occurrences.
+        root_segment = static_pipeline_plan.worker_schedule.segment_for_root(root)
+        is_single_trip_occurrence = (
+            root_segment is not None and root_segment.task_count <= launch_worker_count
+        )
+        scheduled_wrapper_noinline = (
+            not is_single_trip_occurrence
+            or bool(producer_counters)
+            or root in nested_producer_roots
+        )
         return [
             _outline_cross_loop_region(
                 device_function,
                 name_hint=f"tile_dependency_root_{root}_scheduled_task",
                 body=body,
                 extra_argument_names=extra_argument_names,
-                noinline=True,
+                noinline=scheduled_wrapper_noinline,
             )
         ]
 
-    dense_assignment_by_root: dict[int, tuple[int, int, int]] = {}
-    for root, root_domain in enumerate(root_domains):
-        assignment = static_pipeline_plan.worker_schedule.dense_assignment(root)
-        if assignment is None:
-            if static_pipeline_plan.worker_schedule.segments_for_root(root):
-                raise exc.InvalidConfig(
-                    "cross_loop_schedule='static_pipeline' cannot lower "
-                    f"root {root}'s non-dense worker assignment"
-                )
-            continue
-        worker_begin, worker_count, dispatch_offset, task_count = assignment
-        if task_count != root_domain.size or dispatch_offset % worker_count:
-            raise exc.InvalidConfig(
-                "cross_loop_schedule='static_pipeline' does not "
-                f"support root {root}'s worker assignment"
-            )
-        dense_assignment_by_root[root] = (
-            worker_begin,
-            worker_count,
-            root_domain.size,
-        )
+    shared_scheduled_task_body_by_root: dict[int, list[ast.stmt]] = {}
 
-    def static_root_body(root: int) -> list[ast.stmt]:
-        if root in continuation_roots:
-            return []
-        assignment = dense_assignment_by_root.get(root)
-        if assignment is None:
-            return []
-        worker_begin, worker_count, task_count = assignment
-        task_dispatch: list[ast.stmt]
-        if task_count == 1:
-            task_dispatch = scheduled_root_task_body(
-                root,
-                "0",
-                str(case_offsets[root]),
-                (epoch_var,),
-                force_noinline=True,
+    def shared_scheduled_task_body(root: int) -> list[ast.stmt]:
+        """Build one reusable task executor for every occurrence of a root."""
+        body = shared_scheduled_task_body_by_root.get(root)
+        if body is None:
+            root_local_pid_task = (
+                f"({strategy.virtual_pid_var}) - {case_offset_strings[root]}"
             )
-        else:
-            root_local_pid_task = f"({strategy.virtual_pid_var}) - {case_offsets[root]}"
-            task_dispatch = [
-                create(
-                    ast.For,
-                    target=create(
-                        ast.Name,
-                        id=strategy.virtual_pid_var,
-                        ctx=ast.Store(),
-                    ),
-                    iter=expr_from_string(
-                        f"tl.range((({worker}) - {worker_begin}) + "
-                        f"({case_offsets[root]}), "
-                        f"({case_offsets[root] + task_count}), {worker_count})"
-                    ),
-                    body=scheduled_root_task_body(
-                        root,
-                        root_local_pid_task,
-                        strategy.virtual_pid_var,
-                        (strategy.virtual_pid_var,),
-                    ),
-                    orelse=[],
-                    type_comment=None,
-                )
-            ]
+            body = scheduled_root_task_body(
+                root,
+                root_local_pid_task,
+                strategy.virtual_pid_var,
+                (strategy.virtual_pid_var,),
+            )
+            shared_scheduled_task_body_by_root[root] = body
+        return _clone_opaque_statements(body)
+
+    def static_segment_body(
+        segment: WorkerScheduleSegment,
+    ) -> list[ast.stmt]:
+        """Lower one root-local order at its derived padded static position."""
+        root = segment.root
+        execution_plan = root_publication_plans.get(root)
+        publication_workers = (
+            () if execution_plan is None else execution_plan.participant_intervals
+        )
+        if root in root_barrier_indices and not publication_workers:
+            raise AssertionError("resident root has no barrier publication support")
+        task_count_value = segment.task_count
+        active_worker_count = min(launch_worker_count, task_count_value)
+        segment_workers = ((0, active_worker_count),)
+        if publication_workers and publication_workers != segment_workers:
+            raise AssertionError(
+                "static publication support disagrees with resident workers"
+            )
+        segment_membership = (
+            f"({worker}) == 0"
+            if active_worker_count == 1
+            else f"(({worker}) >= 0 and ({worker}) < {active_worker_count})"
+        )
+        segment_begin = case_offsets[root]
+        segment_end = segment_begin + task_count_value
+        task_dispatch = [
+            create(
+                ast.For,
+                target=create(
+                    ast.Name,
+                    id=strategy.virtual_pid_var,
+                    ctx=ast.Store(),
+                ),
+                iter=expr_from_string(
+                    f"tl.range((({worker}) - 0) + ({segment_begin}), "
+                    f"({segment_end}), "
+                    f"{active_worker_count})"
+                ),
+                body=shared_scheduled_task_body(root),
+                orelse=[],
+                type_comment=None,
+            )
+        ]
         incoming_roots = root_barrier_incoming.get(root, ())
-        publishes_root_barrier = root in root_barrier_indices
         if (
-            worker_begin == 0
-            and worker_count == launch_worker_count
-            and not incoming_roots
-            and not publishes_root_barrier
+            not incoming_roots
+            and not publication_workers
+            and segment_workers == ((0, launch_worker_count),)
         ):
             return task_dispatch
 
@@ -1765,30 +2014,21 @@ def emit_cross_loop_schedule(
             prefix="tile_dependency_root_barrier_wait",
         )
         active_body.extend(task_dispatch)
-        if publishes_root_barrier:
+        if publication_workers:
             active_body.extend(root_barrier_publication(root))
-        condition = (
-            f"({worker}) == {worker_begin}"
-            if worker_count == 1
-            else (
-                f"({worker}) >= {worker_begin} and "
-                f"({worker}) < {worker_begin + worker_count}"
-            )
-        )
         return [
             create(
                 ast.If,
-                test=expr_from_string(condition),
+                test=expr_from_string(segment_membership),
                 body=active_body,
                 orelse=[],
             )
         ]
 
-    for root_begin, root_end in phase_root_ranges:
-        for root in range(root_begin, root_end):
-            result.extend(static_root_body(root))
+    for segment in static_pipeline_plan.worker_schedule.segments:
+        result.extend(static_segment_body(segment))
     result.append(
-        statement_from_string(f"tl.store({epoch_arg} + {worker}, {epoch_var})")
+        statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
     )
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)
