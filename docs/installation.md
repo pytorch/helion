@@ -67,8 +67,8 @@ Helion supports PyTorch 2.9 or later. To install the current stable release:
 # CUDA 13.0
 pip install "torch==2.13.*" --index-url https://download.pytorch.org/whl/cu130
 
-# ROCm 7.2
-pip install "torch==2.13.*" --index-url https://download.pytorch.org/whl/rocm7.2
+# ROCm 10.0
+pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/rocm10.0
 ```
 see [PyTorch installation instructions](https://pytorch.org/get-started/locally/) for other options.
 
