@@ -6,6 +6,7 @@ import math
 import pytest
 import torch
 
+from helion._testing import DEVICE
 from helion.autotuner.benchmarking import interleaved_bench
 
 pytestmark = pytest.mark.skipif(
@@ -18,7 +19,7 @@ def test_interleaved_bench_large_repeat() -> None:
     # This many live events crashed final autotune verification on ROCm 7.2.
     # An uneven repeat also exercises the last partially filled event batch.
     repeat = 20003
-    counters = torch.zeros((8, 1024), device="cuda")
+    counters = torch.zeros((8, 1024), device=DEVICE)
     functions = [functools.partial(row.add_, 1) for row in counters]
     timings = interleaved_bench(functions, repeat=repeat)
     assert len(timings) == len(functions)
@@ -31,7 +32,7 @@ def test_cold_cache_cudagraph_timing() -> None:
     pytest.importorskip("tritonbench.components.do_bench.run")
     from benchmarks.rocm_utils import do_bench_cudagraph_with_cache_clear
 
-    a = torch.randn((1024, 1024), device="cuda", dtype=torch.float16)
+    a = torch.randn((1024, 1024), device=DEVICE, dtype=torch.float16)
     b = torch.randn_like(a)
     output = torch.empty_like(a)
     expected = a @ b
