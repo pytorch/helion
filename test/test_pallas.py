@@ -29,6 +29,7 @@ from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
+from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
@@ -4687,6 +4688,37 @@ class TestPallas(TestCase):
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_folded_dot_lhs_cast_correctness(self) -> None:
+        """Folding an f32-to-bf16 dot cast preserves attention results."""
+        query = torch.randn(1, 1, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+        key = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, device=DEVICE)
+        val = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, device=DEVICE)
+        args = (query, key, val)
+        common_config = {
+            "block_sizes": [1, 128, 128],
+            "pallas_loop_type": "emit_pipeline",
+            "pallas_pre_broadcast": True,
+            "pallas_use_low_level_scheduler": True,
+        }
+        bound = pallas_attention.bind(args)
+        field = bound.config_spec._flat_fields()["pallas_fold_dot_lhs_cast"]
+        self.assertIsInstance(field, BooleanFragment)
+        assert isinstance(field, BooleanFragment)
+        self.assertEqual(field.search_values(), [False, True])
+        pointwise = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        pointwise_fields = pallas_inner_loop_add.bind(
+            (pointwise, pointwise)
+        ).config_spec._flat_fields()
+        self.assertNotIn("pallas_fold_dot_lhs_cast", pointwise_fields)
+        _, expected = code_and_output(pallas_attention, args, **common_config)
+        _, result = code_and_output(
+            pallas_attention,
+            args,
+            **common_config,
+            pallas_fold_dot_lhs_cast=True,
+        )
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=2e-3)
 
     def test_attention_fori_loop_correctness(self) -> None:
         """Fori attention buffers K/V while loop-invariant Q remains unchanged."""
