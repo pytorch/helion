@@ -31,6 +31,7 @@ T = TypeVar("T")
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
 _MIRRORED_BENCH_MAX_SWEEPS = 64
+_ROCM_INTERLEAVED_EVENT_PAIRS = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,11 +293,21 @@ def interleaved_bench(
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     if max_total_ms is not None:
         repeat = min(repeat, _interleaved_repeat_cap(fns, clear_cache, max_total_ms))
+    # Large finalist passes can create hundreds of thousands of live HIP events
+    # and crash in hipEventCreateWithFlags. Reuse a bounded set after collecting
+    # each batch's timings, preserving the full sample count and interleaving.
+    batch_size = repeat
+    if torch.version.hip is not None:
+        batch_size = min(
+            repeat, max(1, _ROCM_INTERLEAVED_EVENT_PAIRS // max(1, len(fns)))
+        )
     start_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
+        [di.Event(enable_timing=True) for _ in range(batch_size)]
+        for _ in range(len(fns))
     ]
     end_events = [
-        [di.Event(enable_timing=True) for _ in range(repeat)] for _ in range(len(fns))
+        [di.Event(enable_timing=True) for _ in range(batch_size)]
+        for _ in range(len(fns))
     ]
 
     di.synchronize()
@@ -312,23 +323,23 @@ def interleaved_bench(
         description=desc,
         enabled=desc is not None,
     )
+    timings: list[list[float]] = [[] for _ in fns]
     for i in iterator:
+        slot = i % batch_size
         for j in range(len(benchmark_functions)):
             clear_cache()
-            start_events[j][i].record()
+            start_events[j][slot].record()
             benchmark_functions[j]()
-            end_events[j][i].record()
-    di.synchronize()
+            end_events[j][slot].record()
+        if slot + 1 == batch_size or i + 1 == repeat:
+            di.synchronize()
+            for j in range(len(fns)):
+                timings[j].extend(
+                    start_events[j][k].elapsed_time(end_events[j][k])
+                    for k in range(slot + 1)
+                )
 
-    return [
-        statistics.median(
-            [
-                s.elapsed_time(e)
-                for s, e in zip(start_events[j], end_events[j], strict=True)
-            ]
-        )
-        for j in range(len(fns))
-    ]
+    return [statistics.median(samples) for samples in timings]
 
 
 def interleaved_bench_generic(
