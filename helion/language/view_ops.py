@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 
 from .. import exc
@@ -17,6 +18,91 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["join", "split", "subscript"]
+
+
+def _split_dim(tensor: torch.Tensor, dim: int, op: str) -> tuple[int, int]:
+    if type(dim) is not int or not -tensor.ndim <= dim < tensor.ndim:
+        raise exc.UnsupportedSplitConfiguration(
+            op=op, requirement="a constant dim within the input rank"
+        )
+    dim %= tensor.ndim
+    size = tensor.shape[dim]
+    if isinstance(size, torch.SymInt):
+        env = CompileEnvironment.current()
+        expr = env.specialize_expr(env.shape_env.simplify(size._sympy_()))
+        block_id = env.resolve_block_id(size)
+        if not isinstance(expr, sympy.Integer) and block_id is not None:
+            block = env.block_sizes[block_id]
+            if block.reduction:
+                # A full-axis load has a block symbol even when its logical
+                # extent is constant. Do not use the extent of a tiled axis.
+                expr = env.specialize_expr(env.shape_env.simplify(block.numel))
+        if not isinstance(expr, sympy.Integer):
+            raise exc.UnsupportedSplitConfiguration(
+                op=op, requirement="a compile-time constant split dimension size"
+            )
+        size = int(expr)
+    return dim, size
+
+
+def _unbind_two(
+    tensor: torch.Tensor, dim: int, op: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    env = CompileEnvironment.current()
+    if env.backend_name != "triton":
+        raise exc.BackendUnsupported(env.backend_name, f"{op} device lowering")
+    if dim != tensor.ndim - 1:
+        order = [i for i in range(tensor.ndim) if i != dim] + [dim]
+        tensor = tensor.permute(order)
+    return split(tensor)
+
+
+@_decorators.device_func_replacement(torch.unbind)
+@_decorators.device_func_replacement(torch.Tensor.unbind)
+def _torch_unbind(
+    input: torch.Tensor,  # noqa: A002  Match PyTorch's input keyword.
+    dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lower a size-two unbind to a permutation and hl.split."""
+    dim, size = _split_dim(input, dim, "torch.unbind")
+    if size != 2:
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.unbind", requirement="a split dimension of size 2"
+        )
+    shape = list(input.shape)
+    shape[dim] = size
+    return _unbind_two(input.reshape(shape), dim, "torch.unbind")
+
+
+@_decorators.device_func_replacement(torch.chunk)
+@_decorators.device_func_replacement(torch.Tensor.chunk)
+def _torch_chunk(
+    input: torch.Tensor,  # noqa: A002  Match PyTorch's input keyword.
+    chunks: int,
+    dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lower two equal, contiguous chunks through a size-two unbind."""
+    if type(chunks) is not int or chunks != 2:
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.chunk", requirement="chunks=2"
+        )
+    dim, size = _split_dim(input, dim, "torch.chunk")
+    if size == 0 or size % 2:
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.chunk", requirement="a positive even split dimension size"
+        )
+    if CompileEnvironment.current().backend.pad_factory_tensors_to_power_of_2 and (
+        size & (size - 1)
+    ):
+        # Reshaping a padded axis into [2, size // 2] would split at the
+        # padded midpoint instead of the logical midpoint.
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.chunk",
+            requirement="a power-of-two split dimension size on this backend",
+        )
+    shape = list(input.shape)
+    shape[dim : dim + 1] = [2, size // 2]
+    return _unbind_two(input.reshape(shape), dim, "torch.chunk")
 
 
 @_decorators.api(tiles_as_sizes=True)

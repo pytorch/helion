@@ -12,10 +12,12 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotTriton
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 from helion.autotuner.external import _FakeEnv
+from helion.autotuner.finite_search import FiniteSearch
 from helion.exc import InvalidConfig
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -345,73 +347,178 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 torch_nonzero_in_device_code, (torch.randn(2, 2, device=DEVICE),)
             )
 
-    def test_torch_chunk_device_error(self):
-        """Test that torch.chunk raises error in device loops and suggests hl.split()."""
-
+    @skipIfNotTriton("torch.chunk lowering is Triton-only")
+    def test_torch_chunk_unsupported_configuration(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
-        def kernel_with_chunk(q: torch.Tensor) -> torch.Tensor:
-            _, _, M, D = q.shape
-            D = hl.specialize(D)
-            M = hl.specialize(M)
-            q = q.reshape(-1, D)
-            total_rows = q.shape[0]
-            block_m = hl.register_block_size(M)
-            result = hl.zeros([total_rows, D])
-            for tile_m in hl.tile(total_rows, block_size=block_m):
-                acc = hl.zeros([tile_m, D])
+        def fn(
+            x: torch.Tensor,
+            chunks: hl.constexpr,
+            dim: hl.constexpr,
+            use_method: hl.constexpr,
+        ) -> torch.Tensor:
+            n, d = x.shape
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                values = hl.zeros([tile, d])
+                if use_method:
+                    a, b = values.chunk(chunks, dim=dim)
+                else:
+                    a, b = torch.chunk(values, chunks, dim=dim)
+                out[tile, :] = values + a.sum() + b.sum()
+            return out
 
-                for _tile_n in hl.tile(M, block_size=block_m):
-                    acc = torch.stack(torch.chunk(acc, 2, dim=-1), dim=-2).reshape(
-                        acc.shape
-                    )
-                    acc = acc + 0
+        cases = [
+            (64, 3, -1, "chunks=2"),
+            (64, 1, -1, "chunks=2"),
+            (64, 0, -1, "chunks=2"),
+            (64, True, -1, "chunks=2"),
+            (5, 2, -1, "positive even"),
+            (0, 2, -1, "positive even"),
+            (6, 2, -1, "power-of-two"),
+            (64, 2, 2, "constant dim"),
+            (64, 2, -3, "constant dim"),
+            (64, 2, True, "constant dim"),
+            (64, 2, 0, "compile-time constant"),
+        ]
+        for d, chunks, dim, message in cases:
+            x = torch.empty((65, d), device=DEVICE)
+            for use_method in (False, True):
+                with (
+                    self.subTest(d=d, chunks=chunks, dim=dim, use_method=use_method),
+                    self.assertRaisesRegex(
+                        helion.exc.UnsupportedSplitConfiguration, message
+                    ),
+                ):
+                    fn.bind((x, chunks, dim, use_method))
 
-                result[tile_m, :] = acc
-
-            return result
-
-        with self.assertRaisesRegex(
-            helion.exc.UnsupportedSplitOperation,
-            r"torch\.chunk is not supported in Helion device loops.*hl\.split\(\)",
-        ):
-            code_and_output(
-                kernel_with_chunk,
-                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
-            )
-
-    def test_torch_unbind_device_error(self):
-        """Test that torch.unbind raises error in device loops and suggests hl.split()."""
-
+    @skipIfNotTriton("torch.unbind lowering is Triton-only")
+    def test_torch_unbind_unsupported_configuration(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
-        def kernel_with_unbind(q: torch.Tensor) -> torch.Tensor:
-            _, _, M, D = q.shape
-            D = hl.specialize(D)
-            M = hl.specialize(M)
-            q = q.reshape(-1, D)
-            total_rows = q.shape[0]
-            block_m = hl.register_block_size(M)
-            result = hl.zeros([total_rows, D])
-            for tile_m in hl.tile(total_rows, block_size=block_m):
-                acc = hl.zeros([tile_m, D])
+        def fn(
+            x: torch.Tensor, dim: hl.constexpr, use_method: hl.constexpr
+        ) -> torch.Tensor:
+            n, d = x.shape
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                values = hl.zeros([tile, d])
+                if use_method:
+                    a, b = values.unbind(dim=dim)
+                else:
+                    a, b = torch.unbind(values, dim=dim)
+                out[tile, :] = values + a.sum() + b.sum()
+            return out
 
-                for _tile_n in hl.tile(M, block_size=block_m):
-                    reshaped = acc.reshape(tile_m, 2, D // 2)
-                    acc0, acc1 = torch.unbind(reshaped, dim=1)
-                    acc = torch.stack((acc0, acc1), dim=1).reshape(tile_m, D)
-                    acc = acc + 0
-
-                result[tile_m, :] = acc
-
-            return result
-
-        with self.assertRaisesRegex(
-            helion.exc.UnsupportedSplitOperation,
-            r"torch\.unbind is not supported in Helion device loops.*hl\.split\(\)",
+        for d, dim, message in (
+            (3, -1, "size 2"),
+            (1, -1, "size 2"),
+            (0, -1, "size 2"),
+            (2, 2, "constant dim"),
+            (2, -3, "constant dim"),
+            (2, True, "constant dim"),
+            (2, 0, "compile-time constant"),
         ):
-            code_and_output(
-                kernel_with_unbind,
-                (torch.randn(1, 1, 128, 128, device=DEVICE, dtype=torch.bfloat16),),
-            )
+            x = torch.empty((65, d), device=DEVICE)
+            for use_method in (False, True):
+                with (
+                    self.subTest(d=d, dim=dim, use_method=use_method),
+                    self.assertRaisesRegex(
+                        helion.exc.UnsupportedSplitConfiguration, message
+                    ),
+                ):
+                    fn.bind((x, dim, use_method))
+
+    @onlyBackends(["cute"])
+    def test_torch_chunk_unbind_unsupported_backend(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def fn(
+            x: torch.Tensor, use_chunk: hl.constexpr, use_method: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                values = hl.zeros([tile, 2])
+                if use_chunk:
+                    if use_method:
+                        a, b = values.chunk(2, dim=-1)
+                    else:
+                        a, b = torch.chunk(values, 2, dim=-1)
+                else:
+                    if use_method:
+                        a, b = values.unbind(dim=-1)
+                    else:
+                        a, b = torch.unbind(values, dim=-1)
+                out[tile, :] = values + a.sum() + b.sum()
+            return out
+
+        x = torch.empty((32, 2), device=DEVICE)
+        for use_chunk in (False, True):
+            for use_method in (False, True):
+                with (
+                    self.subTest(use_chunk=use_chunk, use_method=use_method),
+                    self.assertRaisesRegex(
+                        helion.exc.BackendUnsupported, "device lowering"
+                    ),
+                ):
+                    fn.bind((x, use_chunk, use_method))
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.chunk lowering is Triton-only")
+    def test_torch_chunk_unbind_reject_flattened_multi_axis_tiles(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def chunk_fn(x: torch.Tensor) -> torch.Tensor:
+            m, n, d = x.shape
+            out = torch.empty((m, n, d // 2), device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                left, right = torch.chunk(x[tile_m, tile_n, :], 2, dim=-1)
+                out[tile_m, tile_n, :] = left + 2 * right
+            return out
+
+        x = torch.empty((4, 8, 64), device=DEVICE)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "torch.permute does not support rank-compacted tile inputs",
+        ):
+            code_and_output(chunk_fn, (x,), block_sizes=[2, 8], flatten_loops=[True])
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.chunk lowering is Triton-only")
+    def test_torch_chunk_autotune_skips_flattened_candidate(self):
+        @helion.kernel(
+            static_shapes=True,
+            autotune_effort="none",
+            configs=[
+                helion.Config(block_sizes=[2, 8], flatten_loops=[True]),
+                helion.Config(block_sizes=[2, 8], flatten_loops=[False]),
+            ],
+        )
+        def chunk_fn(x: torch.Tensor) -> torch.Tensor:
+            m, n, d = x.shape
+            out = torch.empty((m, n, d // 2), device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                left, right = torch.chunk(x[tile_m, tile_n, :], 2, dim=-1)
+                out[tile_m, tile_n, :] = left + 2 * right
+            return out
+
+        x = torch.arange(4 * 8 * 64, device=DEVICE, dtype=torch.float32).reshape(
+            4, 8, 64
+        )
+        bound = chunk_fn.bind((x,))
+        compiled_configs: list[helion.Config] = []
+        original_compile_config = bound.compile_config
+
+        def compile_config(config, **kwargs):
+            compiled_configs.append(config)
+            return original_compile_config(config, **kwargs)
+
+        with mock.patch.object(bound, "compile_config", side_effect=compile_config):
+            search = FiniteSearch(bound, (x,), configs=chunk_fn.configs)
+            best = search.autotune()
+
+        result = bound.compile_config(best)(x)
+        expected = x[..., :32] + 2 * x[..., 32:]
+        torch.testing.assert_close(result, expected)
+        self.assertIn(chunk_fn.configs[0], compiled_configs)
+        self.assertIn(chunk_fn.configs[1], compiled_configs)
+        self.assertFalse(best.flatten_loops[0])
 
     def test_torch_split_device_error(self):
         """Test that torch.split raises error in device loops and suggests hl.split()."""
