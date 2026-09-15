@@ -43,6 +43,7 @@ import torch
 
 from ..compile_environment import CompileEnvironment
 from ._mlir_compat import ir
+from .affine_recurrence_primitives import store_u32x4_if_valid as _store_u32x4_if_valid
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _GeneratedCodeTemplate
 from .fx_matcher import _xyz_grid_fits
@@ -75,6 +76,9 @@ _DECAY_TANH_POLY_COEFFICIENTS = (
 # Bump whenever an imported rank-1 ``dsl_user_op`` changes.  CuTe's compiled
 # launcher hashes generated source, not the Python bodies behind its imports.
 _RANK1_HELPER_ABI_VERSION = 4
+
+# Compatibility name used by the generated single- and fixed-token paths.
+rank1_store_u32x4_if_valid = _store_u32x4_if_valid
 
 
 @dsl_user_op
@@ -367,45 +371,6 @@ def rank1_load_u32x4_if_valid(
         llvm.extractvalue(u32, result, [index], loc=loc, ip=ip) for index in range(4)
     ]
     return vector.from_elements(ir.VectorType.get([4], u32), values, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def rank1_store_u32x4_if_valid(
-    ptr: object,
-    value0: object,
-    value1: object,
-    value2: object,
-    value3: object,
-    state_index: object,
-    state_size: object,
-    *,
-    loc: ir.Location | None = None,
-    ip: ir.InsertionPoint | None = None,
-) -> None:
-    """Store a state vector only when its slot is in range."""
-
-    address = cast("Any", ptr).toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
-    values = [
-        cutlass.Uint32(value).ir_value(loc=loc, ip=ip)
-        for value in (value0, value1, value2, value3)
-    ]
-    index = cutlass.Int64(state_index).ir_value(loc=loc, ip=ip)
-    size = cutlass.Int64(state_size).ir_value(loc=loc, ip=ip)
-    llvm.inline_asm(
-        None,
-        [address, *values, index, size],
-        (
-            "{ .reg .pred valid; "
-            "setp.lt.u64 valid, $5, $6; "
-            "@valid st.global.L1::no_allocate.v4.u32 [$0], {$1, $2, $3, $4}; }"
-        ),
-        "l,r,r,r,r,l,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op
