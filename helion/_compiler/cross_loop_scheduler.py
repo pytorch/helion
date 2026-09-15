@@ -319,7 +319,9 @@ def _flat_task_order_relation(
             axis for axis in task_order.source_domain.axis_order if axis != varying_axis
         )
         fixed_count = math.prod(len(range(*bounds[axis])) for axis in fixed_axes)
-        if fixed_count > tile_dependency._MAX_RELATION_PIECES - len(flattened_pieces):
+        if not tile_dependency._relation_piece_count_is_within_budget(
+            fixed_count + len(flattened_pieces)
+        ):
             return None
         varying_begin, varying_end, varying_step = bounds[varying_axis]
         varying_values = range(varying_begin, varying_end, varying_step)
@@ -809,7 +811,7 @@ def _packed_root_major_task_order_relation(
 
 def _worker_schedule_piece_budget_is_valid(piece_count: int) -> bool:
     """Apply the one aggregate relation budget used by every schedule."""
-    return piece_count <= tile_dependency._MAX_RELATION_PIECES and (
+    return tile_dependency._relation_piece_count_is_within_budget(piece_count) and (
         tile_dependency._relation_product_is_within_budget(
             piece_count,
             piece_count,
@@ -1944,7 +1946,7 @@ def _merge_relations_by_root(
         pieces: dict[_CoordinateRelationPiece, None] = {}
         for relation in group:
             pieces.update(dict.fromkeys(relation.pieces))
-            if len(pieces) > tile_dependency._MAX_RELATION_PIECES:
+            if not tile_dependency._relation_piece_count_is_within_budget(len(pieces)):
                 return None
         union = CoordinateRelation(
             source_domain=first.source_domain,
@@ -1965,7 +1967,9 @@ def _merge_relations_by_root(
                     converse_fits = False
                     break
                 converse_pieces.update(dict.fromkeys(converse.pieces))
-                if len(converse_pieces) > tile_dependency._MAX_RELATION_PIECES:
+                if not tile_dependency._relation_piece_count_is_within_budget(
+                    len(converse_pieces)
+                ):
                     converse_fits = False
                     break
             if converse_fits:
@@ -5488,7 +5492,9 @@ def _consumer_major_producer_order(
             or task_order.target_domain != task_domain
             or task_order.source_domain.size != task_domain.size
             or not task_order.is_total_function()
-            or len(task_order.pieces) > tile_dependency._MAX_RELATION_PIECES
+            or not tile_dependency._relation_piece_count_is_within_budget(
+                len(task_order.pieces)
+            )
         ):
             return None
         ordinal = _logical_task_to_order_ordinal(task_order, ordinal_domain)
@@ -5799,7 +5805,7 @@ def _relation_may_be_nonempty(
     is returned only for support proved empty for the whole guard.  Unsupported
     clipping declines instead of sampling a convenient nonempty shape.
     """
-    if len(relation.pieces) > tile_dependency._MAX_RELATION_PIECES:
+    if not tile_dependency._relation_piece_count_is_within_budget(len(relation.pieces)):
         return None
     domain_bounds = tuple(
         (

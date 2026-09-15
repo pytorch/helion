@@ -50,6 +50,13 @@ AffineSubscriptRange = tuple[
 ]
 
 
+def _relation_piece_count_is_within_budget(piece_count: int) -> bool:
+    """Check retained relation size against the shared structural budget."""
+    if piece_count < 0:
+        raise ValueError("relation piece count must be nonnegative")
+    return piece_count <= _MAX_RELATION_PIECES
+
+
 def _relation_product_is_within_budget(*factor_sizes: int) -> bool:
     """Check a prospective Cartesian product without forming it."""
     product_size = 1
