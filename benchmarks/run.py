@@ -201,10 +201,8 @@ def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> No
     if Operator in _PATCHED_ROPE_OPERATOR_CLASSES:
         return
 
-    input_cache: dict[tuple[str, torch.dtype, int, int, int, int], _RopeInput] = {}
     operator_module = cast("Any", sys.modules[Operator.__module__])
     original_rotary_embedding = operator_module.LlamaRotaryEmbedding
-    original_prepare_input = Operator.prepare_input
 
     def llama_rotary_embedding(*args: object, **kwargs: object) -> torch.nn.Module:
         # pyrefly: ignore [missing-import]
@@ -215,68 +213,81 @@ def patch_rope_tritonbench_inputs(operator_name: str, Operator: type[Any]) -> No
             args = args[1:]
         return original_rotary_embedding(*args, **kwargs)
 
-    def prepare_input(
-        self: object, hidden_size: int, seq_length: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # TritonBench's RoPE operator creates fresh random inputs inside each
-        # implementation method. Cache per-shape inputs so accuracy compares all
-        # implementations against the baseline using the same q/k/cos/sin tensors.
-        key = (
-            str(self.device),  # pyrefly: ignore [missing-attribute]
-            self.dtype,  # pyrefly: ignore [missing-attribute]
-            self.num_q_heads,  # pyrefly: ignore [missing-attribute]
-            self.num_kv_heads,  # pyrefly: ignore [missing-attribute]
-            hidden_size,
-            seq_length,
-        )
-        if key not in input_cache:
-            q, k, cos, sin, pos_ids = original_prepare_input(
-                self, hidden_size, seq_length
-            )
-            q.retain_grad()
-            k.retain_grad()
-            input_cache[key] = (
-                q,
-                k,
-                cos,
-                sin,
-                pos_ids,
-                self.dq,  # pyrefly: ignore [missing-attribute]
-                self.dk,  # pyrefly: ignore [missing-attribute]
-            )
-
-        q, k, cos, sin, pos_ids, dq, dk = input_cache[key]
-        self.q = q  # pyrefly: ignore [missing-attribute]
-        self.k = k  # pyrefly: ignore [missing-attribute]
-        self.dq = dq  # pyrefly: ignore [missing-attribute]
-        self.dk = dk  # pyrefly: ignore [missing-attribute]
-        return q, k, cos, sin, pos_ids
-
-    def get_bwd_fn(
-        self: object, fwd_fn: Callable[[], object]
-    ) -> Callable[[], list[torch.Tensor]]:
-        q = self.q  # pyrefly: ignore [missing-attribute]
-        k = self.k  # pyrefly: ignore [missing-attribute]
-        dq = self.dq  # pyrefly: ignore [missing-attribute]
-        dk = self.dk  # pyrefly: ignore [missing-attribute]
-        state: dict[str, object] = {}
-
-        def bwd_fn() -> list[torch.Tensor]:
-            if q.grad is not None:
-                q.grad = None
-            if k.grad is not None:
-                k.grad = None
-            if "outputs" not in state:
-                state["outputs"] = fwd_fn()
-            outputs = cast("tuple[torch.Tensor, torch.Tensor]", state["outputs"])
-            torch.autograd.backward(outputs, (dq, dk), retain_graph=True)
-            return [q, k]
-
-        return bwd_fn
-
     operator_module.LlamaRotaryEmbedding = llama_rotary_embedding
-    Operator.prepare_input = prepare_input
-    Operator.get_bwd_fn = get_bwd_fn
+
+    if hasattr(Operator, "prepare_input"):
+        # TritonBench before meta-pytorch/tritonbench@3f34a4e ("Yield input
+        # tensors from get_input_iter for rope (#1214)"): each
+        # @register_benchmark variant calls prepare_input(hidden_size,
+        # seq_length) itself, which creates fresh random inputs on every
+        # call. Cache per-shape so accuracy compares all implementations
+        # against the baseline using the same q/k/cos/sin tensors, and
+        # provide get_bwd_fn so backward benchmarks reuse fixed dq/dk
+        # gradients instead of the base BenchmarkOperator's default.
+        input_cache: dict[tuple[str, torch.dtype, int, int, int, int], _RopeInput] = {}
+        original_prepare_input = Operator.prepare_input
+
+        def prepare_input(
+            self: object, hidden_size: int, seq_length: int
+        ) -> tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        ]:
+            key = (
+                str(self.device),  # pyrefly: ignore [missing-attribute]
+                self.dtype,  # pyrefly: ignore [missing-attribute]
+                self.num_q_heads,  # pyrefly: ignore [missing-attribute]
+                self.num_kv_heads,  # pyrefly: ignore [missing-attribute]
+                hidden_size,
+                seq_length,
+            )
+            if key not in input_cache:
+                q, k, cos, sin, pos_ids = original_prepare_input(
+                    self, hidden_size, seq_length
+                )
+                q.retain_grad()
+                k.retain_grad()
+                input_cache[key] = (
+                    q,
+                    k,
+                    cos,
+                    sin,
+                    pos_ids,
+                    self.dq,  # pyrefly: ignore [missing-attribute]
+                    self.dk,  # pyrefly: ignore [missing-attribute]
+                )
+
+            q, k, cos, sin, pos_ids, dq, dk = input_cache[key]
+            self.q = q  # pyrefly: ignore [missing-attribute]
+            self.k = k  # pyrefly: ignore [missing-attribute]
+            self.dq = dq  # pyrefly: ignore [missing-attribute]
+            self.dk = dk  # pyrefly: ignore [missing-attribute]
+            return q, k, cos, sin, pos_ids
+
+        def get_bwd_fn(
+            self: object, fwd_fn: Callable[[], object]
+        ) -> Callable[[], list[torch.Tensor]]:
+            q = self.q  # pyrefly: ignore [missing-attribute]
+            k = self.k  # pyrefly: ignore [missing-attribute]
+            dq = self.dq  # pyrefly: ignore [missing-attribute]
+            dk = self.dk  # pyrefly: ignore [missing-attribute]
+            state: dict[str, object] = {}
+
+            def bwd_fn() -> list[torch.Tensor]:
+                if q.grad is not None:
+                    q.grad = None
+                if k.grad is not None:
+                    k.grad = None
+                if "outputs" not in state:
+                    state["outputs"] = fwd_fn()
+                outputs = cast("tuple[torch.Tensor, torch.Tensor]", state["outputs"])
+                torch.autograd.backward(outputs, (dq, dk), retain_graph=True)
+                return [q, k]
+
+            return bwd_fn
+
+        Operator.prepare_input = prepare_input
+        Operator.get_bwd_fn = get_bwd_fn
+
     _PATCHED_ROPE_OPERATOR_CLASSES.add(Operator)
 
 
