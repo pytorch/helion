@@ -234,6 +234,29 @@ class TestCache(RefEagerTestDisabled, TestCase):
         )
         os.environ.pop(_backend_cache_dir_env(), None)
 
+    def test_warm_start_finds_entry_written_by_put(self):
+        """A .best_config written by put() is found by _find_similar_cached_configs.
+
+        Static-shape tensor args put ``torch.Size`` into the specialization key;
+        the FROM_BEST_AVAILABLE lookup must serialize the live key the same way
+        put() did, or the warm start silently never matches.
+        """
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+
+        kernel.reset()
+        kernel.settings.autotuner_fn = LocalAutotuneCache[BasicSearch]
+        kernel(*args_a)
+        self.assertEqual(counters["autotune"]["cache_put"], 1)
+
+        bound = kernel.bind(args_a)
+        entries = BasicSearch(bound, args_a)._find_similar_cached_configs(
+            max_configs=10
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertIn("torch.Size(", entries[0].specialization_key)
+        self.assertEqual(entries[0].config, bound.config_spec.default_config())
+
     @parametrize(
         "name",
         ("add", "matmul", "welford", "list_tensor", "list_tensor_different_shapes"),
