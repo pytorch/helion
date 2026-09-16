@@ -463,6 +463,38 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertEqual(len(first_hashes), 1)
         self.assertIn("runtime_metadata", code)
 
+    def test_fixed_capacity_specialization_reuses_existing_buckets(self) -> None:
+        first_x = torch.arange(65, device=DEVICE, dtype=torch.float32)
+        first_metadata = torch.zeros_like(first_x)
+        first = fixed_capacity_runtime_metadata_chain.bind(
+            (first_x, first_metadata)
+        )
+
+        same_capacity = fixed_capacity_runtime_metadata_chain.bind(
+            (torch.ones_like(first_x), torch.ones_like(first_metadata))
+        )
+        self.assertIs(first, same_capacity)
+
+        second_x = torch.arange(97, device=DEVICE, dtype=torch.float32)
+        second_capacity = fixed_capacity_runtime_metadata_chain.bind(
+            (second_x, torch.zeros_like(second_x))
+        )
+        self.assertIsNot(first, second_capacity)
+
+        strided_storage = torch.arange(130, device=DEVICE, dtype=torch.float32)
+        strided_x = strided_storage[::2]
+        strided_metadata = torch.zeros_like(strided_storage)[::2]
+        different_stride = fixed_capacity_runtime_metadata_chain.bind(
+            (strided_x, strided_metadata)
+        )
+        self.assertIsNot(first, different_stride)
+        self.assertIs(
+            first,
+            fixed_capacity_runtime_metadata_chain.bind(
+                (torch.full_like(first_x, 2), torch.full_like(first_metadata, 3))
+            ),
+        )
+
     def test_matmul_chain_allows_reused_accumulator_name(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
         b = torch.eye(16, device=DEVICE)

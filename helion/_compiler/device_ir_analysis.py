@@ -35,7 +35,7 @@ from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
-from .tile_dependency import _relation_piece_count_is_within_budget
+from .tile_dependency import _relation_product_is_within_budget
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -429,7 +429,7 @@ def _broadcast_shape(
             return None
         result.append(max(left_size, right_size))
     shape = tuple(reversed(result))
-    return shape if _relation_piece_count_is_within_budget(math.prod(shape)) else None
+    return shape if _relation_product_is_within_budget(math.prod(shape)) else None
 
 
 def _broadcast_only_index_shape(
@@ -541,7 +541,7 @@ def _affine_subscript_ranges(
                 and isinstance(step, int)
                 and length >= 0
                 and step > 0
-                and _relation_piece_count_is_within_budget(length)
+                and _relation_product_is_within_budget(length)
             ):
                 result = _AffineIndexTensor(
                     (length,),
@@ -561,7 +561,7 @@ def _affine_subscript_ranges(
                 info is not None
                 and extent is not None
                 and isinstance(info.offset, int)
-                and _relation_piece_count_is_within_budget(extent)
+                and _relation_product_is_within_budget(extent)
             ):
                 result = _AffineIndexTensor(
                     (extent,),

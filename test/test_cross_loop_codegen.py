@@ -24,6 +24,7 @@ from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_sco
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import Incidence
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
@@ -713,15 +714,16 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, (x + 1) * 2)
                 self.assertIn("tile_dependency_readiness_wait", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
-                # Both roots underfill the launch cohort. Their static local
-                # strands use only the participating prefix width; padded wave
-                # placement must not leak the launch-wide stride into codegen.
+                num_workers = torch.cuda.get_device_properties(
+                    DEVICE
+                ).multi_processor_count
                 self.assertIn(
-                    "tl.range(tl.program_id(0) - 0 + 0, 2, 2)",
+                    f"tl.range(tl.program_id(0) - 0 + 0, 2, {num_workers})",
                     code,
                 )
                 self.assertIn(
-                    "tl.range(tl.program_id(0) - 0 + 2, 10, 8)",
+                    "tl.range(tl.program_id(0) - 0 "
+                    f"+ {num_workers}, {num_workers + 8}, {num_workers})",
                     code,
                 )
                 if expected_range_option is not None:
@@ -735,7 +737,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         with mock.patch.object(
             cross_loop_scheduler,
             "_compact_nested_loop_counters_for_schedule",
-            side_effect=lambda _graph, _schedule, exact, **_kwargs: exact,
+            side_effect=lambda _graph, _schedule, exact, *_args, **_kwargs: exact,
         ):
             code, out = code_and_output(
                 nested_load_store_chain,
@@ -778,7 +780,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 for consumer in counter.consumers:
                     relation = consumer.keys_by_consumer
                     nested_axes = cross_loop_scheduler.nested_logical_axes(
-                        plan.root_task_orders[consumer.consumer_root].target_domain,
+                        plan.root_domains[consumer.consumer_root],
                         relation.source_domain,
                     )
                     if replacement is not None or len(nested_axes) != 1:
@@ -810,7 +812,12 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     consumers.append(
                         dataclasses.replace(
                             consumer,
-                            keys_by_consumer=replacement,
+                            incidence=Incidence._from_constructed(
+                                consumer.incidence.items_by_key,
+                                keys_by_item=replacement,
+                                count_by_key=consumer.incidence.count_by_key,
+                                grouped_items=consumer.incidence.grouped_items,
+                            ),
                         )
                     )
                 replaced_counters.append(
@@ -1081,7 +1088,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             torch.testing.assert_close(tmp, x + launch + 1)
             torch.testing.assert_close(out, (x[:64] + launch + 1) * 2)
         self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("< 4", code)
+        self.assertIn("// 2 < 2", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1299,23 +1306,51 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x[32:] + 1) * 2)
         self.assertIn("tile_dependency_root_barrier", code)
+        worker_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+        padded_second_root_base = -(-254 // worker_count) * worker_count
+        self.assertIn(
+            f"pid_shared = 254 + (virtual_pid - {padded_second_root_base})",
+            code,
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_specialized_quotient_retains_static_task_geometry(self) -> None:
         x = torch.arange(4, device=DEVICE, dtype=torch.float32)
-        code, out = code_and_output(
-            specialized_quotient_chain,
-            (x, 8, 2),
-            pid_type="persistent_blocked",
-            cross_loop_pipeline="static",
-            num_sm_multiplier=1,
-            num_warps=1,
-        )
+        codes: list[str] = []
+        cache_keys: list[str | None] = []
+        cubin_hashes: set[str] = set()
+        bounds = []
+        for numerator, denominator in ((8, 2), (12, 3)):
+            code, out = code_and_output(
+                specialized_quotient_chain,
+                (x, numerator, denominator),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            bound = specialized_quotient_chain.bind((x, numerator, denominator))
+            config, compiled = next(iter(bound._compile_cache.items()))
+            triton_kernel = compiled.__globals__[f"_helion_{bound.kernel.name}"]
+            cubin_hashes.update(
+                compiled_kernel.hash
+                for cache_tuple in triton_kernel.device_caches.values()
+                for compiled_kernel in cache_tuple[0].values()
+                if getattr(compiled_kernel, "hash", None) is not None
+            )
+            codes.append(code)
+            cache_keys.append(bound.backend_cache_key(config))
+            bounds.append(bound)
+            torch.testing.assert_close(out, (x + 1) * 2)
+            self.assertIn("tile_dependency_continuation_task", code)
+            self.assertNotIn("tile_dependency_root_barrier", code)
 
-        torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_continuation_task", code)
-        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertIsNot(bounds[0], bounds[1])
+        self.assertEqual(codes[0], codes[1])
+        self.assertIsNotNone(cache_keys[0])
+        self.assertEqual(cache_keys[0], cache_keys[1])
+        self.assertEqual(len(cubin_hashes), 1)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1538,15 +1573,20 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                             for access in dependency_graph.accesses
                         )
                     )
-                    downstream_edges = dependency_graph.edges_between(1, 2)
+                    downstream_edges = tuple(
+                        edge
+                        for edge in dependency_graph.edges
+                        if edge.producer_root == 1 and edge.consumer_root == 2
+                    )
                     self.assertEqual(len(downstream_edges), 2)
                     nested_site_ids = {
                         site.site_id
                         for edge in downstream_edges
                         for dependency in edge.access_dependencies
-                        for site in dependency_graph.sites_for_access(
+                        for site_id in dependency_graph.site_ids_by_access[
                             dependency.consumer_access_id
-                        )
+                        ]
+                        for site in (dependency_graph.execution_sites[site_id],)
                         if not site.is_root
                     }
                     self.assertEqual(len(nested_site_ids), 1)
