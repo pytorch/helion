@@ -13,6 +13,7 @@ import os
 import sys
 from typing import TYPE_CHECKING
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -110,6 +111,40 @@ def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
         changed[index] = value + 1
         with pytest.raises(ValueError):
             key(*changed)
+
+
+@pytest.mark.parametrize(
+    ("physical_order", "expected_stride"),
+    [
+        ((0, 1, 2, 3), (256, 128, 8, 1)),  # BHNC
+        ((0, 2, 1, 3), (256, 8, 16, 1)),  # BNHC
+        ((1, 0, 2, 3), (128, 384, 8, 1)),  # HBNC
+    ],
+)
+def test_qwen3_cache_layout_and_reset(
+    physical_order: tuple[int, ...], expected_stride: tuple[int, ...]
+) -> None:
+    module = _import_pretuned_kernel_module("qwen3_decode_layer")
+    canonical = torch.arange(3 * 16 * 2 * 8, device=DEVICE).reshape(3, 16, 2, 8)
+    cache = module._make_vllm_cache(canonical.clone(), physical_order)
+    assert cache.stride() == expected_stride
+    torch.testing.assert_close(cache, canonical.permute(0, 2, 1, 3))
+
+    residual = torch.randn(1, 8, device=DEVICE)
+    initial_residual = residual.clone()
+    tensors = {
+        "kv_cache": cache,
+        "slot_mapping": torch.tensor([21], device=DEVICE),
+        "residual": residual,
+    }
+    reset = module._make_reset(tensors, vllm_layout=True)
+    for _ in range(2):
+        module._cache_slot(tensors, vllm_layout=True).fill_(-1)
+        residual.zero_()
+        assert (cache[1, :, 5] == -1).all()
+        reset()
+        torch.testing.assert_close(cache, canonical.permute(0, 2, 1, 3))
+        torch.testing.assert_close(residual, initial_residual)
 
 
 def test_pre_captured_graph_sweep_passes_resets(
@@ -577,6 +612,34 @@ class TestPretunedKernelsCorrectness(TestCase):
 @onlyBackends(["cute"])
 @skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
 class TestPretunedCuteCodegen(TestCase):
+    def test_grouped_gemm_deepgemm_aot_global_tile_extent(self) -> None:
+        """Exercise the AOT module's TILE_M source, not a literal tile extent."""
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("grouped_gemm_deepgemm is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("grouped_gemm_deepgemm")
+        a = torch.randn(672, 512, dtype=torch.bfloat16, device=DEVICE)
+        b = torch.randn(2, 128, 512, dtype=torch.bfloat16, device=DEVICE)
+        worklist = torch.tensor(
+            [[0, 0, 193, 224], [1, 224, 257, 448]],
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        args = (a, b, worklist)
+        expected = module._reference(*args)
+        with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="tcgen05"):
+            bound = module.grouped_gemm_deepgemm.bind(args)
+            bound.env.config_spec.cute_tcgen05_search_enabled = True
+            actual = bound(*args)
+            torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+            with helion.runtime.cute_cuda_graph() as graph:
+                actual = bound(*args)
+            actual.fill_(13)
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+            self.assertEqual(torch.count_nonzero(actual[193:224]).item(), 0)
+            self.assertEqual(torch.count_nonzero(actual[481:]).item(), 0)
+
     def _run_tcgen05_fragment_epilogue_correctness(self, name: str) -> None:
         if not is_cuda() or torch.cuda.get_device_capability() < (10, 0):
             self.skipTest(f"{name} requires tcgen05 support (SM100+).")

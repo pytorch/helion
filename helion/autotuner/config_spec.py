@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from .._compat import _regs_per_block
 from .._compat import device_num_sm
+from .._compat import get_triton_version
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -910,6 +911,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         *_BACKEND_DIAGNOSTIC_CONFIG_KEYS,
         *_BACKEND_STRATEGY_CONFIG_KEYS,
         *FLASH_CONFIG_KEYS,
+        "cute_flash_bwd_persistent",
+        "cute_flash_bwd_two_cta",
+        "cute_flash_bwd_exp2_f32",
     ]
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
@@ -1200,6 +1204,12 @@ class ConfigSpec:
         # not rediscover the unavailable flash path for a 128x128 candidate.
         self.cute_attention_generic_fallback_enabled: bool = False
         self._cute_attention_generic_fallback_block_size_targets: dict[int, int] = {}
+        # CuTe flash-attention BACKWARD surface: set when the fused
+        # backward-attention detector fires (see cute_flash_bwd.py). Pins the
+        # (kv_tile, q_tile) block sizes to the 128x128 flash envelope.
+        self.cute_flash_bwd_search_enabled: bool = False
+        self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
+        self._cute_flash_bwd_two_cta_allowed: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
@@ -1917,6 +1927,27 @@ class ConfigSpec:
             choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
         )
 
+    def enable_cute_flash_bwd_search(
+        self,
+        *,
+        block_size_targets: Mapping[int, int],
+        two_cta_allowed: bool = False,
+    ) -> None:
+        """Enable the CuTe flash-attention BACKWARD surface.
+
+        Pins the (kv_tile, q_tile) block sizes to the 128x128 envelope the
+        fused backward emitter supports. ``two_cta_allowed`` opens the
+        ``cute_flash_bwd_two_cta`` knob (cluster-of-2 tcgen05 family) when the
+        problem shape supports 256-row cluster KV tiles.
+        """
+        self.cute_flash_bwd_search_enabled = True
+        self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
+        self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
+        for block_id, target in block_size_targets.items():
+            spec = self.block_sizes.block_id_lookup(block_id)
+            spec.autotuner_min = target
+            spec.max_size = target
+
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
     ) -> None:
@@ -2555,6 +2586,42 @@ class ConfigSpec:
         self.normalize(normalized)
         return normalized
 
+    def _normalize_amd_mfma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        if (
+            config.get("matrix_instr_nonkdim") != 32
+            or self.backend_name != "triton"
+            or torch.version.hip is None
+            or not (3, 4) <= get_triton_version().release < (3, 8)
+        ):
+            return
+        properties = torch.cuda.get_device_properties(self.device)
+        arch = properties.gcnArchName  # pyrefly: ignore [missing-attribute]
+        if arch.split(":")[0] != "gfx950":
+            return
+
+        block_sizes = cast("list[int]", config["block_sizes"])
+        for fact in self.matmul_facts:
+            n = (
+                self.block_sizes.config_get(block_sizes, fact.n_block_id, fact.static_n)
+                if fact.n_block_id is not None
+                else fact.static_n
+            )
+            if n is None or n >= 16:
+                continue
+            # Triton 3.4-3.7 lack triton-lang/triton#10305 (fixed in 3.8):
+            # MFMA32's wide-store epilogue corrupts the compiler heap for N < 16.
+            # Automatic instruction selection avoids that layout.
+            if fix_invalid:
+                config["matrix_instr_nonkdim"] = 0
+                return
+            raise InvalidConfig(
+                "matrix_instr_nonkdim=32 with a matmul N tile smaller than 16 "
+                "can crash Triton 3.4-3.7 on gfx950; use matrix_instr_nonkdim=0 "
+                "or 16, or an N tile of at least 16"
+            )
+
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
     ) -> None:
@@ -2989,6 +3056,7 @@ class ConfigSpec:
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
+        self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
         cross_loop_schedule_fragment = self.cross_loop_schedule
         if cross_loop_schedule_fragment is not None:
             cross_loop_schedule = config.setdefault(
@@ -3712,6 +3780,12 @@ class ConfigSpec:
                         pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )
+            elif self.cute_flash_bwd_search_enabled:
+                fields["cute_flash_bwd_persistent"] = EnumFragment(choices=(0, 1))
+                fields["cute_flash_bwd_two_cta"] = EnumFragment(
+                    choices=(0, 1) if self._cute_flash_bwd_two_cta_allowed else (0,)
+                )
+                fields["cute_flash_bwd_exp2_f32"] = EnumFragment(choices=(0, 1))
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path

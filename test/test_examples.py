@@ -444,7 +444,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 128, 128, 256],
         )
 
-    @skipIfNotCUDA()
+    @onlyBackends(["triton", "pallas"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -463,6 +463,11 @@ class TestExamples(RefEagerTestBase, TestCase):
         scale_b = torch.tensor(1.0, device=DEVICE)
         expected = mod.reference_fp8_gemm_pytorch(x_fp8, y_fp8, scale_a, scale_b)
 
+        # Pallas tiles the K reduction, so a tiny fraction of outputs can land
+        # on the other side of a bf16 rounding boundary vs PyTorch's full-K dot.
+        max_mismatch_pct = 0.03 if _get_backend() == "pallas" else None
+        max_mismatched_abs_diff = 1.0 if max_mismatch_pct is not None else None
+
         check_example(
             "fp8_gemm",
             args,
@@ -470,6 +475,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 16, 32],
             num_warps=4,
             num_stages=3,
+            max_mismatch_pct=max_mismatch_pct,
+            max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
     def test_template_via_closure0(self):

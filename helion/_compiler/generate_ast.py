@@ -369,6 +369,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def _try_codegen_attention_flash_root(self) -> bool:
         cute_state = self.device_function.cute_state
+        if cute_state.attention_flash_bwd_block_ids is not None:
+            from .cute.cute_flash_bwd import codegen_attention_flash_bwd
+
+            if codegen_attention_flash_bwd(self):
+                return True
+            cute_state.attention_flash_bwd_block_ids = None
+            cute_state.attention_flash_bwd_match = None
+            raise exc.BackendUnsupported(
+                "cute", "flash attention backward failed late validation"
+            )
         if cute_state.attention_flash_block_ids is None:
             return False
 
@@ -1639,6 +1649,7 @@ def generate_ast(
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
+                    "helion_flash_bwd",
                 }
                 for plan in codegen.cute_wrapper_plans
             )
@@ -1701,6 +1712,11 @@ def generate_ast(
                         "o_name",
                         "out_name",
                         "state_name",
+                        "do_name",
+                        "delta_name",
+                        "dq_name",
+                        "dk_name",
+                        "dv_name",
                         "lse_name",
                         "bias_name",
                         "alibi_name",

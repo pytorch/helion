@@ -2950,6 +2950,23 @@ def _attention_softmax_pattern_head_dim(
     return AttentionSoftmaxPattern(score_plan=score_plan, io_dtype=operand_dtype)
 
 
+def _flash_block_sizes_reachable(
+    env: CompileEnvironment, targets: dict[int, int]
+) -> bool:
+    """True when every block id's fragment range can reach its flash target."""
+    from ..autotuner.config_fragment import BlockSizeFragment
+
+    if set(env.config_spec.block_sizes.valid_block_ids()) != set(targets):
+        return False
+    for block_id, target in targets.items():
+        block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
+        fragment = block_spec._fragment(env.config_spec)
+        assert isinstance(fragment, BlockSizeFragment)
+        if not fragment.low <= target <= fragment.high:
+            return False
+    return True
+
+
 def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | None:
     """Config-independent flash detector for the autotune search surface.
 
@@ -2960,7 +2977,6 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
     strict prevents the autotuner from benchmarking configs that can only fall
     back to the scalar path after the flash knobs have been added.
     """
-    from ..autotuner.config_fragment import BlockSizeFragment
     from .compile_environment import CompileEnvironment
     from .device_ir import ForLoopGraphInfo
 
@@ -2976,15 +2992,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
     env = CompileEnvironment.current()
 
     def block_sizes_reachable(targets: dict[int, int]) -> bool:
-        if set(env.config_spec.block_sizes.valid_block_ids()) != set(targets):
-            return False
-        for block_id, target in targets.items():
-            block_spec = env.config_spec.block_sizes.block_id_lookup(block_id)
-            fragment = block_spec._fragment(env.config_spec)
-            assert isinstance(fragment, BlockSizeFragment)
-            if not fragment.low <= target <= fragment.high:
-                return False
-        return True
+        return _flash_block_sizes_reachable(env, targets)
 
     flash_surface: FlashSearchSurface | None = None
     generic_fallback_required = False
