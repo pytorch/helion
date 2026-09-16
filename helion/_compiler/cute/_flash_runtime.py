@@ -244,6 +244,10 @@ def flash_bwd_shared_storage(
         dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
+        dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # both compute warpgroups' dK/dV TMA stores done (K/V buffers free)
+        epi_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
         sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
@@ -450,6 +454,8 @@ def flash_bwd_2cta_shared_storage(
         dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
+        dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         ds_cluster_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]

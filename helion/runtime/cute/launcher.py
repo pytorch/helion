@@ -883,6 +883,9 @@ def _append_cute_wrapper_plan(
             "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
             f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
             f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {hd // 64})",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
         ]
         body.extend(f"    {line}" for line in fbwd_lines)
         call_args.extend(
@@ -922,6 +925,11 @@ def _append_cute_wrapper_plan(
                 "_fbwd_dqsl",
                 "_fbwd_mdK",
                 "_fbwd_mdV",
+                "_fbwd_epil",
+                "_fbwd_tma_dv",
+                "_fbwd_mdVt",
+                "_fbwd_tma_dk",
+                "_fbwd_mdKt",
             ]
         )
         return
@@ -989,6 +997,9 @@ def _append_cute_wrapper_plan(
             "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
             f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
             f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {hd // 64})",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
         ]
         body.extend(f"    {line}" for line in fbwd_lines)
         if bwd_persistent:
@@ -1026,6 +1037,11 @@ def _append_cute_wrapper_plan(
                 "_fbwd_dqsl",
                 "_fbwd_mdK",
                 "_fbwd_mdV",
+                "_fbwd_epil",
+                "_fbwd_tma_dv",
+                "_fbwd_mdVt",
+                "_fbwd_tma_dk",
+                "_fbwd_mdKt",
             ]
         )
         return
