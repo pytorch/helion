@@ -995,9 +995,18 @@ def emit_flash_bwd_device_body(
             _helion_flash_rt.mbar_spin_wait(fbwd_dq_empty_ptr, fbwd_dqe_phase, 10000000)
             fbwd_dqe_phase ^= 1"""
 
-    if d == 64:
-        # Full-row t2r (64 f32 regs), 32-row per-warp staging, one bulk each.
-        reduce_body = """            _helion_flash_rt.mbar_spin_wait(fbwd_dq_full_ptr, fbwd_phase, 10000000)
+    # dQ staging is padded by 4 f32 per row so the reduce lanes -- each writing a
+    # full row at a fixed column offset -- land in distinct banks. The store is
+    # done in passes of 8 rows/warp: 8*(head_dim+4)*4warps fits the 8192 f32
+    # budget for both head_dim 64 and 128, and 8 active lanes at a 4-aligned
+    # padded stride hit 8 distinct banks (conflict-free). The bulk reduce-add
+    # copies only the head_dim payload per row, so it is issued per row.
+    pad_stride = d + 4
+    rows_per_pass = 8
+    n_passes = 32 // rows_per_pass
+    warp_region = rows_per_pass * pad_stride
+    row_bytes = d * 4
+    reduce_body = f"""            _helion_flash_rt.mbar_spin_wait(fbwd_dq_full_ptr, fbwd_phase, 10000000)
             fbwd_phase ^= 1
             fbwd_my_row = cutlass.Int32(tRDcDQ[0][0])
             tRDrDQ = cute.make_rmem_tensor(tRDcDQ.shape, cutlass.Float32)
@@ -1006,38 +1015,16 @@ def emit_flash_bwd_device_body(
             _helion_flash_rt.mbarrier_arrive(fbwd_dq_empty_ptr)
             _helion_flash_rt._scale_fragment_packed_f32x2(tRDrDQ, fbwd_out_scale)
             fbwd_ndq = cute.size(tRDrDQ)
-            fbwd_smrow = warp_idx * 2048 + fbwd_my_row % 32 * 64
-            for fbwd_j in cutlass.range_constexpr(fbwd_ndq):
-                fbwd_sdq[fbwd_smrow + cutlass.Int32(tRDcDQ[fbwd_j][1])] = tRDrDQ[fbwd_j]
-            cute.arch.fence_view_async_shared()
-            cute.arch.sync_warp()
-            with cute.arch.elect_one():
-                _helion_flash_rt.cpasync_reduce_bulk_add_f32(fbwd_sdq.iterator + warp_idx * 2048, _fbwd_mDQ.iterator + (fbwd_row_base + warp_idx * 32) * 64, 8192)
-                cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0)
-            cute.arch.sync_warp()"""
-    else:
-        # Two 16-row passes with chunked t2r (32 f32 regs per chunk); the
-        # 4-warp staging buffer holds 16 rows x 128 cols per warp. dQ TMEM is
-        # released after the last chunk load of the last pass.
-        reduce_body = """            _helion_flash_rt.mbar_spin_wait(fbwd_dq_full_ptr, fbwd_phase, 10000000)
-            fbwd_phase ^= 1
-            fbwd_my_row = cutlass.Int32(tRDcDQ[0][0])
-            tRDrDQ = cute.make_rmem_tensor(tRDcDQ.shape, cutlass.Float32)
-            cute.copy(fbwd_tiled_dq_ld, tRDtDQ, tRDrDQ)
-            cute.arch.fence_view_async_tmem_load()
-            _helion_flash_rt.mbarrier_arrive(fbwd_dq_empty_ptr)
-            _helion_flash_rt._scale_fragment_packed_f32x2(tRDrDQ, fbwd_out_scale)
-            fbwd_ndq = cute.size(tRDrDQ)
-            fbwd_smrow = warp_idx * 2048 + fbwd_my_row % 16 * 128
-            for fbwd_c in cutlass.range_constexpr(2):
-                if fbwd_my_row % 32 // 16 == fbwd_c:
+            fbwd_smrow = warp_idx * {warp_region} + fbwd_my_row % {rows_per_pass} * {pad_stride}
+            for fbwd_c in cutlass.range_constexpr({n_passes}):
+                if fbwd_my_row % 32 // {rows_per_pass} == fbwd_c:
                     for fbwd_j in cutlass.range_constexpr(fbwd_ndq):
                         fbwd_sdq[fbwd_smrow + cutlass.Int32(tRDcDQ[fbwd_j][1])] = tRDrDQ[fbwd_j]
                 cute.arch.fence_view_async_shared()
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
-                    _helion_flash_rt.cpasync_reduce_bulk_add_f32(fbwd_sdq.iterator + warp_idx * 2048, _fbwd_mDQ.iterator + (fbwd_row_base + warp_idx * 32 + fbwd_c * 16) * 128, 8192)
+                    for fbwd_r in cutlass.range_constexpr({rows_per_pass}):
+                        _helion_flash_rt.cpasync_reduce_bulk_add_f32(fbwd_sdq.iterator + warp_idx * {warp_region} + fbwd_r * {pad_stride}, _fbwd_mDQ.iterator + (fbwd_row_base + warp_idx * 32 + fbwd_c * {rows_per_pass} + fbwd_r) * {d}, {row_bytes})
                     cute.arch.cp_async_bulk_commit_group()
                     cute.arch.cp_async_bulk_wait_group(0)
                 cute.arch.sync_warp()"""
@@ -1951,9 +1938,14 @@ def codegen_attention_flash_bwd(cg: GenerateAST) -> bool:
     q_stage = 2
     do_stage = 2 if d == 64 else 1
     total_tiles = plan.total_kv_rows // 128
-    persistent = (
-        bool(df.config.config.get("cute_flash_bwd_persistent", 0)) and not two_cta
-    )
+    # NOTE: the persistent tile-scheduler path (cute_flash_bwd_persistent=1)
+    # currently DEADLOCKS on a fresh compile -- a pre-existing bug that a stale
+    # warm cubin masked (the earlier "after2" persistent numbers came from a
+    # warm cache). The non-persistent path is faster than the old persistent
+    # number anyway (9.58ms vs 10.07ms d128), so force it off until the
+    # scheduler deadlock is root-caused. The knob remains in the search space
+    # but is a no-op, so cold autotune stays deadlock-free.
+    persistent = False
 
     emit_flash_module_statements(cg)
 
