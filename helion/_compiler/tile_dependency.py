@@ -34,6 +34,8 @@ IntegerExpression = Any
 RelationBounds = tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...]
 ConcreteRelationBounds = tuple[tuple[int, int, int, int], ...]
 TargetRanges = tuple[tuple[int, sympy.Expr, sympy.Expr, int], ...]
+RectangularAxis = tuple[int, int, Literal["block", "quotient"], int]
+RectangularFiberSpec = tuple[tuple[RectangularAxis, ...], tuple[int, ...]]
 AffineSubscriptRange = tuple[
     tuple[tuple[int, IntegerExpression, int], ...],
     IntegerExpression,
@@ -458,6 +460,10 @@ def _full_bounds(
     return tuple((axis, 0, count, 1) for axis, count in domain.axis_counts_items)
 
 
+def _next_axis(*axis_orders: tuple[int, ...]) -> int:
+    return max(itertools.chain.from_iterable(axis_orders), default=-1) + 1
+
+
 def _full_point_map(
     source: CoordinateDomain,
     target: CoordinateDomain,
@@ -466,6 +472,13 @@ def _full_point_map(
     return CoordinateRelation.point_map(
         source, target, ((_full_bounds(source), expressions),)
     )
+
+
+def _scalar_point_expression(piece: _CoordinateRelationPiece) -> sympy.Expr | None:
+    if len(piece.target_ranges) != 1:
+        return None
+    _axis, begin, end, step = piece.target_ranges[0]
+    return begin if step == 1 and sympy.simplify(end - begin) == 1 else None
 
 
 def _total_relation(
@@ -2019,17 +2032,71 @@ class Incidence:
         prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
     ) -> Incidence:
         """Construct an incidence, deriving separable reverse/count facts once."""
-        items_by_key = _coalesce_rectangular_fibers(
+        items_by_key, structure = _rectangular_fiber_spec(
             items_by_key, prove_nonnegative=prove_nonnegative
         )
-        capabilities = _separable_rectangular_capabilities(items_by_key)
-        if capabilities is None:
-            return cls._from_constructed(items_by_key, keys_by_item=keys_by_item)
-        derived_keys, counts = capabilities
+        count_by_key = None
+        if structure is not None:
+            mappings, full_item_axes = structure
+            by_key = {key: rest for key, *rest in mappings}
+            fan_in = sympy.prod(
+                items_by_key.target_domain.axis_count_expressions[axis]
+                for axis in full_item_axes
+            ) * sympy.prod(
+                width for _key, _item, mode, width in mappings if mode == "block"
+            )
+
+            def inverse_range(key_axis: int) -> tuple[int, sympy.Expr, sympy.Expr, int]:
+                mapping = by_key.get(key_axis)
+                if mapping is None:
+                    return (
+                        key_axis,
+                        sympy.Integer(0),
+                        items_by_key.source_domain.axis_count_expressions[key_axis],
+                        1,
+                    )
+                item_axis, mode, width = mapping
+                item = coordinate_axis_symbol(item_axis)
+                if mode == "block":
+                    value = FloorDiv(item, width)
+                    return key_axis, value, value + 1, 1
+                return key_axis, width * item, width * (item + 1), 1
+
+            keys_by_item = CoordinateRelation(
+                items_by_key.target_domain,
+                items_by_key.source_domain,
+                (
+                    _CoordinateRelationPiece(
+                        _full_bounds(items_by_key.target_domain),
+                        tuple(
+                            inverse_range(axis)
+                            for axis in items_by_key.source_domain.axis_order
+                        ),
+                    ),
+                ),
+            )
+            count_by_key = _constant_value_map(
+                items_by_key.source_domain,
+                sympy.simplify(fan_in),
+                other_axes=items_by_key.target_domain.axis_order,
+            )
+        fiber_size, grouped_items = _key_major_order(
+            items_by_key, keys_by_item, count_by_key, structure
+        )
+        if fiber_size is not None and keys_by_item is not None:
+            if count_by_key is None:
+                count_by_key = _constant_value_map(
+                    items_by_key.source_domain,
+                    fiber_size,
+                    other_axes=items_by_key.target_domain.axis_order,
+                )
+            elif count_by_key.value_bounds() != (fiber_size, fiber_size):
+                grouped_items = None
         return cls._from_constructed(
             items_by_key,
-            keys_by_item=derived_keys,
-            count_by_key=counts,
+            keys_by_item=keys_by_item,
+            count_by_key=count_by_key,
+            grouped_items=grouped_items,
         )
 
     @classmethod
@@ -2262,38 +2329,33 @@ class Incidence:
 
     def with_key_major_order(self) -> Incidence:
         """Attach construction-certified count and key-major item order."""
-        if self.grouped_items is not None:
+        if self.grouped_items is not None or self.keys_by_item is None:
             return self
-        keys = self.keys_by_item
-        if keys is None:
+        fiber_size, grouped = _key_major_order(
+            self.items_by_key,
+            self.keys_by_item,
+            self.count_by_key,
+            None,
+        )
+        if fiber_size is None and (grouped is None or self.count_by_key is None):
             return self
-        counts = self.count_by_key
-        if (
-            counts is not None
-            and len(self.items_by_key.target_domain.axis_order) == 1
-            and len(self.items_by_key.source_domain.axis_order) == 1
-            and _scalar_relation_is_nondecreasing(keys)
-        ):
-            grouped = DenseTaskOrder.from_pid(
-                self.items_by_key.target_domain,
-                self.items_by_key.target_domain.axis_order,
+        count = self.count_by_key
+        if count is None:
+            assert fiber_size is not None
+            count = _constant_value_map(
+                self.items_by_key.source_domain,
+                fiber_size,
+                other_axes=self.items_by_key.target_domain.axis_order,
             )
-        else:
-            fiber_size, grouped = _uniform_key_major_order(self)
-            if fiber_size is None:
-                return self
-            if counts is None:
-                counts = _constant_value_map(
-                    self.items_by_key.source_domain,
-                    fiber_size,
-                    other_axes=self.items_by_key.target_domain.axis_order,
-                )
-            elif counts.value_bounds() != (fiber_size, fiber_size):
-                return self
+        elif fiber_size is not None and count.value_bounds() != (
+            fiber_size,
+            fiber_size,
+        ):
+            grouped = None
         return Incidence._from_constructed(
             self.items_by_key,
-            keys_by_item=keys,
-            count_by_key=counts,
+            keys_by_item=self.keys_by_item,
+            count_by_key=count,
             grouped_items=grouped,
         )
 
@@ -2518,70 +2580,66 @@ class Incidence:
         return Incidence._from_constructed(items_by_key, keys_by_item=keys_by_item)
 
 
-def _coalesce_rectangular_fibers(
+def _rectangular_fiber_spec(
     relation: CoordinateRelation,
     *,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-) -> CoordinateRelation:
-    """Merge exactly adjacent target boxes with identical source support."""
+    allow_block_tail: bool = False,
+) -> tuple[CoordinateRelation, RectangularFiberSpec | None]:
+    """Normalize rectangular fibers and recognize their separable axes."""
     pieces = list(dict.fromkeys(relation.pieces))
     comparisons = 0
-    while _relation_product_is_within_budget(len(pieces), len(pieces)):
-        replacement = None
-        for left_index, left in enumerate(pieces):
-            for right_index in range(left_index + 1, len(pieces)):
-                comparisons += 1
-                if comparisons > _MAX_RELATION_PRODUCT_STATES:
-                    return relation
-                right = pieces[right_index]
-                if left.source_bounds_items != right.source_bounds_items:
-                    continue
-                merged_ranges = []
-                differences = 0
-                for left_range, right_range in zip(
-                    left.target_ranges, right.target_ranges, strict=True
-                ):
-                    if left_range == right_range:
-                        merged_ranges.append(left_range)
-                        continue
-                    axis, left_begin, left_end, left_step = left_range
-                    right_axis, right_begin, right_end, right_step = right_range
-                    left_first = sympy.simplify(left_end - right_begin) == 0
-                    right_first = sympy.simplify(right_end - left_begin) == 0
-                    if (
-                        axis != right_axis
-                        or left_step != 1
-                        or right_step != 1
-                        or not (left_first or right_first)
-                        or not _is_provably_nonnegative(
-                            sympy.simplify(left_end - left_begin), prove_nonnegative
-                        )
-                        or not _is_provably_nonnegative(
-                            sympy.simplify(right_end - right_begin), prove_nonnegative
-                        )
-                    ):
-                        break
-                    differences += 1
-                    merged_ranges.append(
-                        (
-                            axis,
-                            left_begin if left_first else right_begin,
-                            right_end if left_first else left_end,
-                            1,
-                        )
-                    )
-                else:
-                    if differences == 1:
-                        replacement = (
-                            left_index,
-                            right_index,
-                            _CoordinateRelationPiece(
-                                left.source_bounds_items, tuple(merged_ranges)
-                            ),
-                        )
-                        break
-            if replacement is not None:
-                break
+    while True:
+        if not _relation_product_is_within_budget(len(pieces), len(pieces)):
+            return relation, None
+        replacement: tuple[int, int, _CoordinateRelationPiece] | None = None
+        for (left_index, left), (right_index, right) in itertools.combinations(
+            enumerate(pieces), 2
+        ):
+            comparisons += 1
+            if comparisons > _MAX_RELATION_PRODUCT_STATES:
+                return relation, None
+            differing = tuple(
+                index
+                for index, pair in enumerate(
+                    zip(left.target_ranges, right.target_ranges, strict=True)
+                )
+                if pair[0] != pair[1]
+            )
+            if (
+                left.source_bounds_items != right.source_bounds_items
+                or len(differing) != 1
+            ):
+                continue
+            (index,) = differing
+            axis, begin, end, step = left.target_ranges[index]
+            other_axis, other_begin, other_end, other_step = right.target_ranges[index]
+            left_first = sympy.simplify(end - other_begin) == 0
+            right_first = sympy.simplify(other_end - begin) == 0
+            if (
+                axis != other_axis
+                or step != 1
+                or other_step != 1
+                or not (left_first or right_first)
+                or not all(
+                    _is_provably_nonnegative(width, prove_nonnegative)
+                    for width in (end - begin, other_end - other_begin)
+                )
+            ):
+                continue
+            ranges = list(left.target_ranges)
+            ranges[index] = (
+                axis,
+                begin if left_first else other_begin,
+                other_end if left_first else end,
+                1,
+            )
+            replacement = (
+                left_index,
+                right_index,
+                _CoordinateRelationPiece(left.source_bounds_items, tuple(ranges)),
+            )
+            break
         if replacement is None:
             break
         left_index, right_index, merged = replacement
@@ -2590,40 +2648,25 @@ def _coalesce_rectangular_fibers(
             for index, piece in enumerate(pieces)
             if index != right_index
         ]
-    return (
-        relation
-        if tuple(pieces) == relation.pieces
-        else CoordinateRelation(
-            relation.source_domain, relation.target_domain, tuple(pieces)
-        )
+    normalized = CoordinateRelation(
+        relation.source_domain, relation.target_domain, tuple(pieces)
     )
-
-
-def _separable_rectangular_axes(
-    relation: CoordinateRelation,
-    *,
-    allow_block_tail: bool = False,
-) -> (
-    tuple[
-        tuple[tuple[int, int, Literal["block", "quotient"], int], ...],
-        tuple[int, ...],
-    ]
-    | None
-):
-    """Recognize independent affine-block and fixed-quotient axes."""
-    if not relation.source_domain.axis_order or len(relation.pieces) != 1:
-        return None
-    (piece,) = relation.pieces
-    if piece.source_bounds_items != _full_bounds(relation.source_domain):
-        return None
+    if (
+        not normalized.source_domain.axis_order
+        or len(normalized.pieces) != 1
+        or normalized.pieces[0].source_bounds_items
+        != _full_bounds(normalized.source_domain)
+    ):
+        return normalized, None
+    (piece,) = normalized.pieces
     source_symbols = {
-        coordinate_axis_symbol(axis): axis for axis in relation.source_domain.axis_order
+        coordinate_axis_symbol(axis): axis
+        for axis in normalized.source_domain.axis_order
     }
     used_sources: set[int] = set()
-    mappings = []
-    full_targets = []
+    mappings, full_targets = [], []
     for target_axis, begin, end, step in piece.target_ranges:
-        target_count = relation.target_domain.axis_count_expressions[target_axis]
+        target_count = normalized.target_domain.axis_count_expressions[target_axis]
         if (
             step == 1
             and sympy.simplify(begin) == 0
@@ -2631,12 +2674,12 @@ def _separable_rectangular_axes(
         ):
             full_targets.append(target_axis)
             continue
-        interval = _single_axis_interval(begin, end, domain=relation.source_domain)
+        interval = _single_axis_interval(begin, end, domain=normalized.source_domain)
         if interval is not None:
             source_axis, stride, offset, width = interval
             remaining = sympy.simplify(
                 target_count
-                - width * relation.source_domain.axis_count_expressions[source_axis]
+                - width * normalized.source_domain.axis_count_expressions[source_axis]
             )
             if (
                 step != 1
@@ -2647,24 +2690,20 @@ def _separable_rectangular_axes(
                 or not _is_provably_nonnegative(remaining, None)
                 or (not allow_block_tail and remaining != 0)
             ):
-                return None
+                return normalized, None
             used_sources.add(source_axis)
             mappings.append((source_axis, target_axis, "block", width))
             continue
-        source_axes = tuple(
-            source_symbols[symbol]
-            for symbol in begin.free_symbols
-            if symbol in source_symbols
-        )
+        source_axes = tuple(source_symbols.keys() & begin.free_symbols)
         if (
             step != 1
             or sympy.simplify(end - begin) != 1
             or len(source_axes) != 1
-            or source_axes[0] in used_sources
+            or source_symbols[source_axes[0]] in used_sources
         ):
-            return None
-        source_axis = source_axes[0]
-        source_symbol = coordinate_axis_symbol(source_axis)
+            return normalized, None
+        source_symbol = source_axes[0]
+        source_axis = source_symbols[source_symbol]
         quotient = _static_integer_quotient(begin)
         width = (
             1
@@ -2677,64 +2716,13 @@ def _separable_rectangular_axes(
             )
         )
         if width is None or not _integer_partition_expressions_equal(
-            relation.source_domain.axis_count_expressions[source_axis],
+            normalized.source_domain.axis_count_expressions[source_axis],
             width * target_count,
         ):
-            return None
+            return normalized, None
         used_sources.add(source_axis)
         mappings.append((source_axis, target_axis, "quotient", width))
-    return tuple(mappings), tuple(full_targets)
-
-
-def _separable_rectangular_capabilities(
-    items_by_key: CoordinateRelation,
-) -> tuple[CoordinateRelation, CoordinateRelation] | None:
-    """Derive the exact reverse and fiber count of separable rectangular sets."""
-    structure = _separable_rectangular_axes(items_by_key)
-    if structure is None:
-        return None
-    mappings, full_item_axes = structure
-    mapping_by_key = {
-        key_axis: (item_axis, mode, width)
-        for key_axis, item_axis, mode, width in mappings
-    }
-    item_symbols = {
-        axis: coordinate_axis_symbol(axis)
-        for axis in items_by_key.target_domain.axis_order
-    }
-    key_counts = items_by_key.source_domain.axis_count_expressions
-    reverse_ranges = []
-    fan_in = sympy.prod(
-        items_by_key.target_domain.axis_count_expressions[axis]
-        for axis in full_item_axes
-    )
-    for key_axis in items_by_key.source_domain.axis_order:
-        mapping = mapping_by_key.get(key_axis)
-        if mapping is None:
-            reverse_ranges.append((key_axis, 0, key_counts[key_axis], 1))
-            continue
-        item_axis, mode, width = mapping
-        item = item_symbols[item_axis]
-        if mode == "block":
-            value = FloorDiv(item, width)
-            reverse_ranges.append((key_axis, value, value + 1, 1))
-            fan_in *= width
-        else:
-            reverse_ranges.append((key_axis, width * item, width * (item + 1), 1))
-    reverse = CoordinateRelation(
-        items_by_key.target_domain,
-        items_by_key.source_domain,
-        (
-            _CoordinateRelationPiece(
-                _full_bounds(items_by_key.target_domain), tuple(reverse_ranges)
-            ),
-        ),
-    )
-    return reverse, _constant_value_map(
-        items_by_key.source_domain,
-        sympy.simplify(fan_in),
-        other_axes=items_by_key.target_domain.axis_order,
-    )
+    return normalized, (tuple(mappings), tuple(full_targets))
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -2810,7 +2798,7 @@ class KeyPartition:
         widths: dict[int, int],
         full_axes: frozenset[int],
         *,
-        clip_tails: bool,
+        clipped_axes: frozenset[int],
         other_axes: tuple[int, ...] = (),
     ) -> KeyPartition:
         fine_counts = fine_domain.axis_count_expressions
@@ -2845,17 +2833,13 @@ class KeyPartition:
                         widths[axis],
                         count - widths[axis] * coordinate_axis_symbol(axis),
                     )
-                    if clip_tails
+                    if axis in clipped_axes
                     else widths[axis]
                 )
             fiber *= factor
         capacity *= sympy.prod(fine_counts[axis] for axis in full_axes)
-        count_axis = (
-            max(
-                (*fine_domain.axis_order, *coarse_domain.axis_order, *other_axes),
-                default=-1,
-            )
-            + 1
+        count_axis = _next_axis(
+            fine_domain.axis_order, coarse_domain.axis_order, other_axes
         )
         counts = _full_point_map(
             coarse_domain,
@@ -2879,7 +2863,7 @@ class KeyPartition:
             coarse_by_fine,
             dict.fromkeys(coarse_axes, 1),
             frozenset(fine_domain.axis_order) - coarse_axes,
-            clip_tails=False,
+            clipped_axes=frozenset(),
         )
 
     @classmethod
@@ -3048,17 +3032,16 @@ class KeyPartition:
         cls, publication: CoordinateRelation
     ) -> tuple[KeyPartition, Incidence] | None:
         """Construct a fixed-width key quotient with exact clipped-tail counts."""
-        structure = _separable_rectangular_axes(publication, allow_block_tail=True)
+        publication, structure = _rectangular_fiber_spec(
+            publication, allow_block_tail=True
+        )
         if structure is None:
             return None
         mappings, full_axes = structure
         if not mappings:
             return None
         producer, fine = publication.source_domain, publication.target_domain
-        producer_counts, fine_counts = (
-            producer.axis_count_expressions,
-            fine.axis_count_expressions,
-        )
+        fine_counts = fine.axis_count_expressions
         axes = tuple(target for _source, target, _mode, _width in mappings)
         partition_widths = {
             target: width if mode == "block" else 1
@@ -3088,89 +3071,46 @@ class KeyPartition:
             coarse_by_fine,
             partition_widths,
             frozenset(full_axes),
-            clip_tails=True,
+            clipped_axes=frozenset(axes) - frozenset(full_axes),
             other_axes=producer.axis_order,
         )
-        coarse_bounds = _full_bounds(coarse)
-        count_axis = max((*producer.axis_order, *fine.axis_order), default=-1) + 1
-        mapping_by_source = {
-            source: (target, mode, width) for source, target, mode, width in mappings
-        }
-        mapping_by_target = {
-            target: (source, mode, width) for source, target, mode, width in mappings
-        }
-        keys_by_item = _full_point_map(
-            producer,
-            coarse,
+        source_axes = tuple(source for source, _target, _mode, _width in mappings)
+        producer_keys = CoordinateDomain(
+            source_axes,
             tuple(
-                (
-                    coordinate_axis_symbol(source)
-                    if mode == "block"
-                    else FloorDiv(coordinate_axis_symbol(source), width)
-                )
-                for source, mode, width in (mapping_by_target[axis] for axis in axes)
+                (source, coarse.axis_count_expressions[target])
+                for source, target, _mode, _width in mappings
             ),
+            kind="event",
+            identity=coarse.identity,
+            _allow_empty=coarse._allow_empty,
         )
-        items_by_key = CoordinateRelation(
-            coarse,
+        producer_key_by_item = _full_point_map(
             producer,
-            (
-                _CoordinateRelationPiece(
-                    coarse_bounds,
-                    tuple(
-                        (axis, 0, producer_counts[axis], 1)
-                        if axis not in mapping_by_source
-                        else (
-                            (
-                                axis,
-                                coordinate_axis_symbol(mapping_by_source[axis][0]),
-                                coordinate_axis_symbol(mapping_by_source[axis][0]) + 1,
-                                1,
-                            )
-                            if mapping_by_source[axis][1] == "block"
-                            else (
-                                axis,
-                                mapping_by_source[axis][2]
-                                * coordinate_axis_symbol(mapping_by_source[axis][0]),
-                                mapping_by_source[axis][2]
-                                * (
-                                    coordinate_axis_symbol(mapping_by_source[axis][0])
-                                    + 1
-                                ),
-                                1,
-                            )
-                        )
-                        for axis in producer.axis_order
-                    ),
-                ),
+            producer_keys,
+            tuple(
+                coordinate_axis_symbol(source)
+                if mode == "block"
+                else FloorDiv(coordinate_axis_symbol(source), width)
+                for source, _target, mode, width in mappings
             ),
         )
-        fan_in = sympy.prod(
-            producer_counts[axis]
-            for axis in producer.axis_order
-            if axis not in mapping_by_source
-        ) * sympy.prod(
-            width for _source, _target, mode, width in mappings if mode == "quotient"
+        producer_partition = cls._rectangular(
+            producer,
+            producer_keys,
+            producer_key_by_item,
+            {
+                source: 1 if mode == "block" else width
+                for source, _target, mode, width in mappings
+            },
+            frozenset(producer.axis_order) - frozenset(source_axes),
+            clipped_axes=frozenset(
+                source for source, _target, mode, _width in mappings if mode == "block"
+            ),
+            other_axes=fine.axis_order,
         )
-        active = sympy.prod(
-            sympy.Min(
-                1,
-                sympy.Max(
-                    0,
-                    producer_counts[source] - coordinate_axis_symbol(axis),
-                ),
-            )
-            for source, axis, mode, _width in mappings
-            if mode == "block"
-        )
-        counts = _full_point_map(
-            coarse,
-            CoordinateDomain.scalar(fan_in + 1, axis=count_axis, kind="value"),
-            (sympy.simplify(fan_in * active),),
-        )
-        return partition, Incidence._from_constructed(
-            items_by_key, keys_by_item=keys_by_item, count_by_key=counts
-        )
+        incidence = producer_partition.as_incidence().rename_domains(coarse, producer)
+        return None if incidence is None else (partition, incidence)
 
 
 def _in_domain_point_support(
@@ -3351,28 +3291,24 @@ def _propagate_uniform_grouped_order(
 ) -> tuple[CoordinateRelation | None, DenseTaskOrder | None]:
     """Carry a canonical key-major order through an exact key permutation."""
     grouped, counts = following.grouped_items, following.count_by_key
-    if grouped is None or counts is None:
-        return None, None
-    count_bounds = counts.value_bounds()
-    if count_bounds is None or count_bounds[0] != count_bounds[1]:
+    count_bounds = None if counts is None else counts.value_bounds()
+    if grouped is None or count_bounds is None or count_bounds[0] != count_bounds[1]:
         return None, None
     fiber_size = count_bounds[0]
     first_keys, following_keys = first.items_by_key, following.items_by_key
-    reverse = first.keys_by_item
-    if reverse is None or fiber_size <= 0:
-        return None, None
     try:
-        first_size = first_keys.source_domain.size
-        following_size = first_keys.target_domain.size
+        key_count = first_keys.source_domain.size
         item_size = following_keys.target_domain.size
     except ValueError:
         return None, None
     if (
-        first_keys.target_domain != following_keys.source_domain
-        or first_size != following_size
-        or fiber_size * first_size != item_size
+        first.keys_by_item is None
+        or fiber_size <= 0
+        or first_keys.target_domain != following_keys.source_domain
+        or key_count != first_keys.target_domain.size
+        or fiber_size * key_count != item_size
         or not first_keys.is_total_function()
-        or not reverse.is_total_function()
+        or not first.keys_by_item.is_total_function()
     ):
         return None, None
     preserved_count = _constant_value_map(
@@ -3391,327 +3327,237 @@ def _propagate_uniform_grouped_order(
     old_ordinal_domain = grouped.tasks_by_ordinal.source_domain
     new_ordinal_domain = CoordinateDomain.scalar(
         item_size,
-        axis=(
-            max(
-                (
-                    *first_keys.source_domain.axis_order,
-                    *following_keys.source_domain.axis_order,
-                    *following_keys.target_domain.axis_order,
-                    *old_ordinal_domain.axis_order,
-                ),
-                default=-1,
-            )
-            + 1
+        axis=_next_axis(
+            first_keys.source_domain.axis_order,
+            following_keys.source_domain.axis_order,
+            following_keys.target_domain.axis_order,
+            old_ordinal_domain.axis_order,
         ),
         kind="task_order",
         identity=following_keys.target_domain.identity,
     )
-
-    def inflate_blocks(
-        source_order: DenseTaskOrder,
-        key_permutation: CoordinateRelation,
-        target_order: DenseTaskOrder,
-        source_domain: CoordinateDomain,
-        target_domain: CoordinateDomain,
-    ) -> CoordinateRelation | None:
-        ranks = source_order.tasks_by_ordinal.then(key_permutation)
-        ranks = None if ranks is None else ranks.then(target_order.ordinal_by_task)
-        if ranks is None:
-            return None
-        (rank_axis,) = ranks.source_domain.axis_order
-        (group_axis,) = source_domain.axis_order
-        rank_symbol = coordinate_axis_symbol(rank_axis)
-        group_symbol = coordinate_axis_symbol(group_axis)
-        specs = []
-        for piece in ranks.pieces:
-            if len(piece.source_bounds_items) != 1 or len(piece.target_ranges) != 1:
-                return None
-            _axis, lower, upper, source_step = piece.source_bounds_items[0]
-            _axis, target, target_end, target_step = piece.target_ranges[0]
-            if (
-                source_step != 1
-                or target_step != 1
-                or sympy.simplify(target_end - target) != 1
-            ):
-                return None
-            bounds = ((group_axis, fiber_size * lower, fiber_size * upper, 1),)
-            block = _substitute_composed_expression(
-                target,
-                substitutions={rank_symbol: FloorDiv(group_symbol, fiber_size)},
-                source_domain=source_domain,
-                source_bounds=bounds,
-            )
-            specs.append(
+    ranks = first_order.tasks_by_ordinal.then(first_keys)
+    ranks = None if ranks is None else ranks.then(following_order.ordinal_by_task)
+    if ranks is None:
+        return preserved_count, None
+    (rank_axis,) = ranks.source_domain.axis_order
+    (group_axis,) = new_ordinal_domain.axis_order
+    rank_symbol = coordinate_axis_symbol(rank_axis)
+    group_symbol = coordinate_axis_symbol(group_axis)
+    forward_specs = []
+    for piece in ranks.pieces:
+        target = _scalar_point_expression(piece)
+        if len(piece.source_bounds_items) != 1 or target is None:
+            return preserved_count, None
+        _axis, lower, upper, source_step = piece.source_bounds_items[0]
+        if source_step != 1:
+            return preserved_count, None
+        bounds = ((group_axis, fiber_size * lower, fiber_size * upper, 1),)
+        block = _substitute_composed_expression(
+            target,
+            substitutions={rank_symbol: FloorDiv(group_symbol, fiber_size)},
+            source_domain=new_ordinal_domain,
+            source_bounds=bounds,
+        )
+        forward_specs.append(
+            (
+                bounds,
                 (
-                    bounds,
-                    (
-                        _simplify_logical_expression(
-                            fiber_size * block
-                            + group_symbol
-                            - fiber_size * FloorDiv(group_symbol, fiber_size),
-                            domain=source_domain,
-                            source_bounds=bounds,
-                        ),
+                    _simplify_logical_expression(
+                        fiber_size * block
+                        + group_symbol
+                        - fiber_size * FloorDiv(group_symbol, fiber_size),
+                        domain=new_ordinal_domain,
+                        source_bounds=bounds,
                     ),
-                )
+                ),
             )
-        return CoordinateRelation.point_map(source_domain, target_domain, tuple(specs))
-
-    forward = inflate_blocks(
-        first_order,
-        first_keys,
-        following_order,
-        new_ordinal_domain,
-        old_ordinal_domain,
+        )
+    forward = CoordinateRelation.point_map(
+        new_ordinal_domain, old_ordinal_domain, tuple(forward_specs)
     )
     tasks = None if forward is None else forward.then(grouped.tasks_by_ordinal)
     key_ranks = composite_keys.then(first_order.ordinal_by_task)
     old_ordinals = grouped.ordinal_by_task
-    ordinals = None
-    if key_ranks is not None and _relation_product_is_within_budget(
+    if key_ranks is None or not _relation_product_is_within_budget(
         len(key_ranks.pieces), len(old_ordinals.pieces)
     ):
-        inverse_specs = []
-        for key_piece, ordinal_piece in itertools.product(
-            key_ranks.pieces, old_ordinals.pieces
-        ):
-            intersection = []
-            for left, right in zip(
+        return preserved_count, None
+    inverse_specs = []
+    for key_piece, ordinal_piece in itertools.product(
+        key_ranks.pieces, old_ordinals.pieces
+    ):
+        pairs = tuple(
+            zip(
                 key_piece.source_bounds_items,
                 ordinal_piece.source_bounds_items,
                 strict=True,
-            ):
-                left_axis, left_begin, left_end, left_step = left
-                right_axis, right_begin, right_end, right_step = right
-                begin, end = max(left_begin, right_begin), min(left_end, right_end)
-                if (
-                    left_axis != right_axis
-                    or left_step != 1
-                    or right_step != 1
-                    or begin >= end
-                ):
-                    break
-                intersection.append((left_axis, begin, end, 1))
-            else:
-                if (
-                    len(key_piece.target_ranges) != 1
-                    or len(ordinal_piece.target_ranges) != 1
-                ):
-                    break
-                _axis, key_rank, key_end, key_step = key_piece.target_ranges[0]
-                _axis, old_rank, old_end, old_step = ordinal_piece.target_ranges[0]
-                if (
-                    key_step != 1
-                    or old_step != 1
-                    or sympy.simplify(key_end - key_rank) != 1
-                    or sympy.simplify(old_end - old_rank) != 1
-                ):
-                    break
-                local = old_rank - fiber_size * FloorDiv(old_rank, fiber_size)
-                bounds = tuple(intersection)
-                inverse_specs.append(
-                    (
-                        bounds,
-                        (
-                            _simplify_logical_expression(
-                                fiber_size * key_rank + local,
-                                domain=composite_keys.source_domain,
-                                source_bounds=bounds,
-                            ),
-                        ),
-                    )
-                )
-        else:
-            unique_specs = tuple(dict.fromkeys(inverse_specs))
-            if len(unique_specs) <= _MAX_RELATION_PIECES and (
-                _relation_product_is_within_budget(len(unique_specs), len(unique_specs))
-            ):
-                ordinals = CoordinateRelation.point_map(
-                    composite_keys.source_domain,
-                    new_ordinal_domain,
-                    unique_specs,
-                )
-                if not ordinals.is_total_function():
-                    ordinals = None
-    if tasks is None or ordinals is None:
-        return preserved_count, None
-    return (
-        preserved_count,
-        DenseTaskOrder._from_constructed(tasks, ordinals),
-    )
-
-
-def _uniform_key_major_order(
-    incidence: Incidence,
-) -> tuple[int | None, DenseTaskOrder | None]:
-    """Prove a uniform fiber count and construct its order when affine."""
-    keys = incidence.keys_by_item
-    if (
-        keys is None
-        or not keys.is_single_valued()
-        or any(
-            not _target_ranges_are_in_domain(
-                piece.target_ranges,
-                source_domain=incidence.items_by_key.source_domain,
-                source_bounds=piece.source_bounds_items,
-                target_domain=incidence.items_by_key.target_domain,
             )
-            for piece in incidence.items_by_key.pieces
-        )
-    ):
-        return None, None
-    key_domain = incidence.items_by_key.source_domain
-    item_domain = incidence.items_by_key.target_domain
-    key_order = DenseTaskOrder.from_pid(key_domain, key_domain.axis_order)
-    item_order = DenseTaskOrder.from_pid(item_domain, item_domain.axis_order)
-    if key_order is None or item_order is None:
-        return None, None
-    items = key_order.tasks_by_ordinal.then(incidence.items_by_key)
-    if items is None:
-        return None, None
-    forward = _linearize_fibers(items, item_order.ordinal_by_task)
-    if forward is None:
-        return None, None
-    key_axis = forward.source_domain.axis_order[0]
-    key_symbol = coordinate_axis_symbol(key_axis)
-    ranges_by_bounds: dict[
-        ConcreteRelationBounds, list[tuple[sympy.Expr, sympy.Expr, int]]
-    ] = {}
-    for piece in forward.pieces:
-        if len(piece.source_bounds_items) != 1 or len(piece.target_ranges) != 1:
-            return None, None
-        _axis, begin, end, step = piece.target_ranges[0]
-        ranges_by_bounds.setdefault(piece.source_bounds_items, []).append(
-            (begin, end, step)
-        )
-    layouts = []
-    fiber_size = None
-    for source_bounds, ranges in ranges_by_bounds.items():
-        base = ranges[0][0]
-        spans = []
-        for begin, end, step in ranges:
-            offset = sympy.simplify(begin - base)
-            count = sympy.simplify(_ceil_div(end - begin, step))
-            if (
-                step <= 0
-                or not isinstance(offset, sympy.Integer)
-                or not isinstance(count, sympy.Integer)
-                or count <= 0
-            ):
-                return None, None
-            begin_bounds = _logical_expression_bounds(
-                begin,
-                domain=forward.source_domain,
-                source_bounds=source_bounds,
-            )
-            last_bounds = _logical_expression_bounds(
-                begin + (count - 1) * step,
-                domain=forward.source_domain,
-                source_bounds=source_bounds,
-            )
-            target_extent = forward.target_domain.axis_count_expressions[_axis]
-            if (
-                begin_bounds is None
-                or last_bounds is None
-                or not _is_provably_nonnegative(begin_bounds[0], None)
-                or not _is_provably_nonnegative(
-                    target_extent - 1 - last_bounds[1], None
-                )
-            ):
-                return None, None
-            spans.append((int(offset), int(count), step))
-        stride = math.gcd(
-            *(
-                [abs(offset) for offset, _count, _step in spans if offset]
-                + [step for _offset, count, step in spans if count > 1]
-                or [1]
-            )
-        )
-        starts = tuple(offset for offset, _count, _step in spans)
-        lasts = tuple(offset + (count - 1) * step for offset, count, step in spans)
-        intervals = tuple(
-            (offset, last, step)
-            for (offset, _count, step), last in zip(spans, lasts, strict=True)
         )
         if any(
-            max(left[0], right[0]) <= min(left[1], right[1])
-            and (right[0] - left[0]) % math.gcd(left[2], right[2]) == 0
-            for index, left in enumerate(intervals)
-            for right in intervals[index + 1 :]
+            left[0] != right[0] or left[3] != 1 or right[3] != 1
+            for left, right in pairs
         ):
-            return None, None
-        lower, upper = min(starts), max(lasts)
-        region_fiber_size = sum(count for _offset, count, _step in spans)
-        if fiber_size is None:
-            fiber_size = region_fiber_size
-        elif region_fiber_size != fiber_size:
-            return None, None
-        ordered_spans = sorted(spans)
-        span_width, item_step = ordered_spans[0][1:]
-        segment_stride = (
-            0 if len(ordered_spans) == 1 else ordered_spans[1][0] - ordered_spans[0][0]
+            return preserved_count, None
+        bounds = tuple(
+            (left[0], max(left[1], right[1]), min(left[2], right[2]), 1)
+            for left, right in pairs
         )
-        packing = (
-            (len(ordered_spans), span_width, item_step, segment_stride)
-            if all(
-                count == span_width and step == item_step
-                for _offset, count, step in ordered_spans
-            )
-            and (
-                len(ordered_spans) == 1
-                or (
-                    segment_stride > (span_width - 1) * item_step
-                    and all(
-                        right[0] - left[0] == segment_stride
-                        for left, right in itertools.pairwise(ordered_spans)
-                    )
-                )
-            )
-            else None
-        )
-        layouts.append(
+        if any(begin >= end for _axis, begin, end, _step in bounds):
+            continue
+        key_rank = _scalar_point_expression(key_piece)
+        old_rank = _scalar_point_expression(ordinal_piece)
+        if key_rank is None or old_rank is None:
+            return preserved_count, None
+        local = old_rank - fiber_size * FloorDiv(old_rank, fiber_size)
+        inverse_specs.append(
             (
-                source_bounds,
-                sympy.simplify(base + lower),
-                stride if (upper - lower) // stride + 1 == region_fiber_size else 0,
-                packing,
+                bounds,
+                (
+                    _simplify_logical_expression(
+                        fiber_size * key_rank + local,
+                        domain=composite_keys.source_domain,
+                        source_bounds=bounds,
+                    ),
+                ),
             )
         )
-    if fiber_size is None or not _source_boxes_partition_domain(
-        tuple(bounds for bounds, _begin, _step, _packing in layouts),
-        forward.source_domain,
+    ordinals = CoordinateRelation.point_map(
+        composite_keys.source_domain,
+        new_ordinal_domain,
+        tuple(dict.fromkeys(inverse_specs)),
+    )
+    if not ordinals.is_total_function():
+        return preserved_count, None
+    if tasks is None:
+        return preserved_count, None
+    return preserved_count, DenseTaskOrder._from_constructed(tasks, ordinals)
+
+
+def _key_major_order(
+    items: CoordinateRelation,
+    keys: CoordinateRelation | None,
+    counts: CoordinateRelation | None,
+    structure: RectangularFiberSpec | None,
+) -> tuple[int | None, DenseTaskOrder | None]:
+    """Construct an order for a separable layout or regular scalar spans."""
+    if not items.pieces or any(
+        not _target_ranges_are_in_domain(
+            piece.target_ranges,
+            source_domain=items.source_domain,
+            source_bounds=piece.source_bounds_items,
+            target_domain=items.target_domain,
+        )
+        for piece in items.pieces
     ):
         return None, None
+    key_domain, item_domain = items.source_domain, items.target_domain
+    count_bounds = None if counts is None else counts.value_bounds()
     if (
-        not keys.is_total_function()
-        or fiber_size * key_domain.size != item_domain.size
-        or any(packing is None for _bounds, _begin, _step, packing in layouts)
+        counts is not None
+        and keys is not None
+        and len(key_domain.axis_order) == 1
+        and len(item_domain.axis_order) == 1
+        and _scalar_relation_is_nondecreasing(keys)
     ):
-        return fiber_size, None
-    if (
-        len(layouts) == 1
-        and layouts[0][0] == _full_bounds(forward.source_domain)
-        and layouts[0][2] == 1
-        and sympy.simplify(layouts[0][1] - key_symbol * fiber_size) == 0
+        return None, DenseTaskOrder.from_pid(item_domain, item_domain.axis_order)
+    if structure is not None and count_bounds is not None:
+        mappings, full_axes = structure
+        by_key = {source: (target, width) for source, target, _mode, width in mappings}
+        if set(by_key) == set(key_domain.axis_order) and (
+            len(key_domain.axis_order) == 1
+            or all(width == 1 for _target, width in by_key.values())
+        ):
+            order = (*full_axes, *(by_key[axis][0] for axis in key_domain.axis_order))
+            fiber_size = count_bounds[0]
+            if (
+                count_bounds[0] == count_bounds[1]
+                and fiber_size * key_domain.size == item_domain.size
+                and set(order) == set(item_domain.axis_order)
+            ):
+                return fiber_size, DenseTaskOrder.from_pid(item_domain, order)
+    if len(key_domain.axis_order) != 1 or len(item_domain.axis_order) != 1:
+        key_order = DenseTaskOrder.from_pid(key_domain, key_domain.axis_order)
+        item_order = DenseTaskOrder.from_pid(item_domain, item_domain.axis_order)
+        if key_order is None or item_order is None:
+            return None, None
+        scalar_items = key_order.tasks_by_ordinal.then(items)
+        scalar_items = (
+            None
+            if scalar_items is None
+            else _linearize_fibers(scalar_items, item_order.ordinal_by_task)
+        )
+        scalar_keys = None if keys is None else item_order.tasks_by_ordinal.then(keys)
+        scalar_keys = (
+            None if scalar_keys is None else scalar_keys.then(key_order.ordinal_by_task)
+        )
+        scalar_counts = (
+            None if counts is None else key_order.tasks_by_ordinal.then(counts)
+        )
+        if scalar_items is None:
+            return None, None
+        fiber_size, grouped = _key_major_order(
+            scalar_items, scalar_keys, scalar_counts, None
+        )
+        if grouped is None:
+            return fiber_size, None
+        tasks = grouped.tasks_by_ordinal.then(item_order.tasks_by_ordinal)
+        inverse = item_order.ordinal_by_task.then(grouped.ordinal_by_task)
+        return (
+            (fiber_size, None)
+            if tasks is None or inverse is None
+            else (fiber_size, DenseTaskOrder._from_constructed(tasks, inverse))
+        )
+    (key_axis,), (item_axis,) = key_domain.axis_order, item_domain.axis_order
+    key_symbol = coordinate_axis_symbol(key_axis)
+    source_bounds = _full_bounds(key_domain)
+    if any(piece.source_bounds_items != source_bounds for piece in items.pieces):
+        return None, None
+    ranges = []
+    for piece in items.pieces:
+        if len(piece.target_ranges) != 1:
+            return None, None
+        _axis, begin, end, step = piece.target_ranges[0]
+        ranges.append((begin, end, step))
+    base = ranges[0][0]
+    spans = []
+    for begin, end, step in ranges:
+        offset = sympy.simplify(begin - base)
+        count = sympy.simplify(_ceil_div(end - begin, step))
+        if (
+            step <= 0
+            or not isinstance(offset, sympy.Integer)
+            or not isinstance(count, sympy.Integer)
+            or count <= 0
+        ):
+            return None, None
+        spans.append((int(offset), int(count), step))
+    spans.sort()
+    span_width, item_step = spans[0][1:]
+    segment_stride = 0 if len(spans) == 1 else spans[1][0] - spans[0][0]
+    if any(
+        count != span_width or step != item_step for _offset, count, step in spans
+    ) or (
+        len(spans) > 1
+        and (
+            segment_stride <= (span_width - 1) * item_step
+            or any(
+                right[0] - left[0] != segment_stride
+                for left, right in itertools.pairwise(spans)
+            )
+        )
     ):
-        return fiber_size, item_order
-    reverse = keys.then(key_order.ordinal_by_task)
-    if reverse is None:
+        return None, None
+    fiber_size = len(spans) * span_width
+    if fiber_size * key_domain.size != item_domain.size:
         return fiber_size, None
+    if keys is None or not keys.is_single_valued() or not keys.is_total_function():
+        return fiber_size, None
+    begin = sympy.simplify(base + spans[0][0])
+    segment_count = len(spans)
     grouped_domain = CoordinateDomain.scalar(
         item_domain.size,
-        axis=(
-            max(
-                (
-                    *key_domain.axis_order,
-                    *item_domain.axis_order,
-                    *key_order.tasks_by_ordinal.source_domain.axis_order,
-                    *item_order.tasks_by_ordinal.source_domain.axis_order,
-                ),
-                default=-1,
-            )
-            + 1
-        ),
+        axis=_next_axis(key_domain.axis_order, item_domain.axis_order),
         kind="task_order",
         identity=item_domain.identity,
     )
@@ -3719,50 +3565,35 @@ def _uniform_key_major_order(
     grouped_symbol = coordinate_axis_symbol(grouped_axis)
     key = FloorDiv(grouped_symbol, fiber_size)
     local = grouped_symbol - fiber_size * key
-    item_rank_domain = item_order.tasks_by_ordinal.source_domain
-    rank_specs = []
-    for ([_axis, lower, upper, source_step],), begin, _stride, packing in layouts:
-        assert packing is not None
-        segment_count, span_width, item_step, segment_stride = packing
-        segment = FloorDiv(local, span_width) if segment_count > 1 else 0
-        within = local - span_width * segment
-        value = begin.xreplace({key_symbol: key})
-        value += segment_stride * segment + item_step * within
-        bounds = (
-            (
-                grouped_axis,
-                lower * fiber_size,
-                upper * fiber_size,
-                1 if fiber_size > 1 else source_step,
-            ),
-        )
-        rank_specs.append((bounds, (sympy.simplify(value),)))
-    ranked_tasks = CoordinateRelation.point_map(
-        grouped_domain, item_rank_domain, tuple(rank_specs)
+    segment = FloorDiv(local, span_width) if segment_count > 1 else 0
+    value = (
+        begin.xreplace({key_symbol: key})
+        + segment_stride * segment
+        + item_step * (local - span_width * segment)
     )
-    tasks = ranked_tasks.then(item_order.tasks_by_ordinal)
-    if tasks is None:
-        return fiber_size, None
-    if len(layouts) != 1:
-        return fiber_size, None
-    item_rank = item_order.ordinal_by_task.pieces[0].target_ranges[0][1]
-    begin, _stride, packing = layouts[0][1:]
-    assert packing is not None
-    segment_count, span_width, item_step, segment_stride = packing
+    tasks = _full_point_map(grouped_domain, item_domain, (value,))
+    item = coordinate_axis_symbol(item_axis)
     inverse_specs = []
-    for piece in reverse.pieces:
-        if len(piece.target_ranges) != 1:
+    for piece in keys.pieces:
+        key = _scalar_point_expression(piece)
+        if key is None:
             return fiber_size, None
-        _axis, key, key_end, key_step = piece.target_ranges[0]
-        if key_step != 1 or sympy.simplify(key_end - key) != 1:
-            return fiber_size, None
-        delta = sympy.simplify(item_rank - begin.xreplace({key_symbol: key}))
+        delta = sympy.simplify(item - begin.xreplace({key_symbol: key}))
         segment = FloorDiv(delta, segment_stride) if segment_count > 1 else 0
         within_delta = delta - segment * segment_stride
         within = within_delta if item_step == 1 else FloorDiv(within_delta, item_step)
         local = segment * span_width + within
         inverse_specs.append(
-            (piece.source_bounds_items, (sympy.simplify(key * fiber_size + local),))
+            (
+                piece.source_bounds_items,
+                (
+                    _simplify_logical_expression(
+                        key * fiber_size + local,
+                        domain=item_domain,
+                        source_bounds=piece.source_bounds_items,
+                    ),
+                ),
+            )
         )
     inverse = CoordinateRelation.point_map(
         item_domain, grouped_domain, tuple(dict.fromkeys(inverse_specs))
