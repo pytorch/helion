@@ -256,14 +256,12 @@ def flash_bwd_shared_storage(
         sK: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
         sV: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
         sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
-        # Per-warp staging chunks for the bulk dQ reduce: 4 warps x 8KB. The
-        # reduce stages 8 rows per pass at a (head_dim + 4) padded stride: the
-        # +4 f32 pushes the row stride off the 32-bank alignment so the 8 active
-        # lanes (writing different rows at the same column offset) land in
-        # distinct banks (unpadded head_dim strides are bank-aligned -> heavy
-        # conflict). 8 rows x (head_dim+4) x 4 warps fits the 8192 budget for
-        # both head_dim 64 and 128; the 4-f32 tail per row is unused and the
-        # per-row bulk copies only the head_dim payload to row-major dQ.
+        # dQ drain staging for the 2D TMA tensor reduce-add: 8 x (32 x 32) fp32
+        # boxes in the canonical SWIZZLE_128B epilogue layout (4KB each, 1KB
+        # aligned), a 2-deep ring per reduce warp. Each lane owns one dQ row
+        # and stores a 32-column chunk as 8 x 16B; the swizzle keeps the 8
+        # lanes of a quarter-warp in distinct 16B bank groups, and one
+        # cp.reduce.async.bulk.tensor per box adds it into row-major dQ.
         sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 8192], 1024]
 
     return SharedStorage

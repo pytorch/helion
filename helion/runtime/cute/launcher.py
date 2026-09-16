@@ -978,6 +978,9 @@ def _append_cute_wrapper_plan(
             f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
             f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 8)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
             f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
             f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
         ]
@@ -1012,6 +1015,9 @@ def _append_cute_wrapper_plan(
                 "_fbwd_mLSE",
                 "_fbwd_mDelta",
                 "_fbwd_mDQ",
+                "_fbwd_tma_dq",
+                "_fbwd_mDQt",
+                "_fbwd_dqsl",
                 "_fbwd_mdK",
                 "_fbwd_mdV",
             ]
