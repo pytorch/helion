@@ -913,6 +913,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         *FLASH_CONFIG_KEYS,
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
+        "cute_flash_bwd_exp2_f32",
     ]
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
@@ -3784,6 +3785,7 @@ class ConfigSpec:
                 fields["cute_flash_bwd_two_cta"] = EnumFragment(
                     choices=(0, 1) if self._cute_flash_bwd_two_cta_allowed else (0,)
                 )
+                fields["cute_flash_bwd_exp2_f32"] = EnumFragment(choices=(0, 1))
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path
