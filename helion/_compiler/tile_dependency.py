@@ -1776,10 +1776,11 @@ def _scalar_relation_is_nondecreasing(relation: CoordinateRelation) -> bool:
         len(relation.source_domain.axis_order) != 1
         or len(relation.target_domain.axis_order) != 1
         or len(relation.pieces) > _MAX_RELATION_PIECES
-        or not relation.is_total_function()
     ):
         return False
     try:
+        if not relation.is_total_function():
+            return False
         extent = relation.source_domain.size
         (source_axis,) = relation.source_domain.axis_order
 
@@ -3453,14 +3454,6 @@ def _key_major_order(
         return None, None
     key_domain, item_domain = items.source_domain, items.target_domain
     count_bounds = None if counts is None else counts.value_bounds()
-    if (
-        counts is not None
-        and keys is not None
-        and len(key_domain.axis_order) == 1
-        and len(item_domain.axis_order) == 1
-        and _scalar_relation_is_nondecreasing(keys)
-    ):
-        return None, DenseTaskOrder.from_pid(item_domain, item_domain.axis_order)
     if structure is not None and count_bounds is not None:
         mappings, full_axes = structure
         by_key = {source: (target, width) for source, target, _mode, width in mappings}
@@ -3472,10 +3465,20 @@ def _key_major_order(
             fiber_size = count_bounds[0]
             if (
                 count_bounds[0] == count_bounds[1]
-                and fiber_size * key_domain.size == item_domain.size
+                and _integer_partition_expressions_equal(
+                    fiber_size * key_domain.size_expr, item_domain.size_expr
+                )
                 and set(order) == set(item_domain.axis_order)
             ):
                 return fiber_size, DenseTaskOrder.from_pid(item_domain, order)
+    if (
+        counts is not None
+        and keys is not None
+        and len(key_domain.axis_order) == 1
+        and len(item_domain.axis_order) == 1
+        and _scalar_relation_is_nondecreasing(keys)
+    ):
+        return None, DenseTaskOrder.from_pid(item_domain, item_domain.axis_order)
     if len(key_domain.axis_order) != 1 or len(item_domain.axis_order) != 1:
         key_order = DenseTaskOrder.from_pid(key_domain, key_domain.axis_order)
         item_order = DenseTaskOrder.from_pid(item_domain, item_domain.axis_order)
@@ -3549,7 +3552,13 @@ def _key_major_order(
     ):
         return None, None
     fiber_size = len(spans) * span_width
-    if fiber_size * key_domain.size != item_domain.size:
+    if not _integer_partition_expressions_equal(
+        fiber_size * key_domain.size_expr, item_domain.size_expr
+    ):
+        return fiber_size, None
+    try:
+        _ = key_domain.size, item_domain.size
+    except ValueError:
         return fiber_size, None
     if keys is None or not keys.is_single_valued() or not keys.is_total_function():
         return fiber_size, None

@@ -1993,6 +1993,49 @@ class TestTileDependency(TestCase):
             (frozenset((3,)),) * 2,
         )
 
+    def test_symbolic_uniform_fibers_keep_count_without_dense_order(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        keys = CoordinateDomain((0,), ((0, batch),), kind="event")
+        items = CoordinateDomain((1,), ((1, 2 * batch),), kind="site")
+        key = coordinate_axis_symbol(0)
+        incidence = Incidence.from_fibers(
+            CoordinateRelation(
+                keys,
+                items,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, batch, 1),),
+                        ((1, 2 * key, 2 * key + 2, 1),),
+                    ),
+                ),
+            )
+        )
+        assert incidence.count_by_key is not None
+        self.assertEqual(incidence.count_by_key.value_bounds(), (2, 2))
+        self.assertIsNone(incidence.grouped_items)
+
+        item = coordinate_axis_symbol(1)
+        reflected = Incidence.from_fibers(
+            CoordinateRelation(
+                keys,
+                items,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, batch, 1),),
+                        ((1, 2 * (batch - 1 - key), 2 * (batch - key), 1),),
+                    ),
+                ),
+            ),
+            keys_by_item=CoordinateRelation.point_map(
+                items,
+                keys,
+                (((((1, 0, 2 * batch, 1),), (batch - 1 - FloorDiv(item, 2),))),),
+            ),
+        )
+        assert reflected.count_by_key is not None
+        self.assertEqual(reflected.count_by_key.value_bounds(), (2, 2))
+        self.assertIsNone(reflected.grouped_items)
+
     def test_key_major_order_declines_unproved_alternating_order(self) -> None:
         keys = CoordinateDomain.scalar(2, kind="event")
         items = CoordinateDomain.scalar(6, axis=1)
