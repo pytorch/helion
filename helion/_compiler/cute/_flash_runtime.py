@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import functools
 from functools import partial
 from itertools import starmap
+import os
 from typing import Any
 from typing import cast
 
@@ -294,6 +295,68 @@ def cpasync_reduce_bulk_add_f32(
     )
 
 
+# exp2 emulation (FA4 forward's trick): 2^x = 2^floor(x) * p(frac(x)) with a
+# degree-3 minimax polynomial on [0, 1) evaluated on the FMA pipe (packed
+# f32x2) and the exponent folded in with an integer add, so part of the
+# softmax leaves the 16-lane/clk XU (MUFU) pipe. Relative error ~1e-4, well
+# below the bf16 rounding of P. Every ``FBWD_EX2_EMU_EVERY``-th pair uses it
+# (0 = all MUFU).
+FBWD_EX2_EMU_EVERY = int(os.environ.get("HELION_FBWD_EX2_EMU", "0"))
+_POLY_EX2_3 = (
+    1.0,
+    0.695146143436431884765625,
+    0.227564394474029541015625,
+    0.077119089663028717041015625,
+)
+
+
+@dsl_user_op
+def combine_int_frac_ex2(
+    x_rounded: Float32, frac_ex2: Float32, *, loc: object = None, ip: object = None
+) -> Float32:
+    """2^floor * frac_ex2: add the 8-bit integer floor (low bits of the
+    round-down-biased value) straight into the exponent field."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                Float32(x_rounded).ir_value(loc=loc, ip=ip),
+                Float32(frac_ex2).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .s32 xr, fe, xe, o;\n\t"
+            "mov.b32 xr, $1;\n\t"
+            "mov.b32 fe, $2;\n\t"
+            "shl.b32 xe, xr, 23;\n\t"
+            "add.s32 o, xe, fe;\n\t"
+            "mov.b32 $0, o;\n\t"
+            "}\n",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+def ex2_emulation_packed(x: Float32, y: Float32) -> tuple[Float32, Float32]:
+    """Two exp2 values via range reduction + degree-3 polynomial (x, y <= 0)."""
+    fp32_round_int = float(2**23 + 2**22)
+    xc = cute.arch.fmax(x, Float32(-127.0))
+    yc = cute.arch.fmax(y, Float32(-127.0))
+    xr, yr = cute.arch.add_packed_f32x2(
+        (xc, yc), (fp32_round_int, fp32_round_int), rnd="rm"
+    )
+    xb, yb = cute.arch.sub_packed_f32x2((xr, yr), (fp32_round_int, fp32_round_int))
+    xf, yf = cute.arch.sub_packed_f32x2((xc, yc), (xb, yb))
+    px, py = (Float32(_POLY_EX2_3[3]), Float32(_POLY_EX2_3[3]))
+    for c in (_POLY_EX2_3[2], _POLY_EX2_3[1], _POLY_EX2_3[0]):
+        px, py = cute.arch.fma_packed_f32x2(
+            (px, py), (xf, yf), (Float32(c), Float32(c))
+        )
+    return combine_int_frac_ex2(xr, px), combine_int_frac_ex2(yr, py)
+
+
 def fbwd_p_pairs_packed(
     frg: cute.Tensor,
     lse_frg: cute.Tensor,
@@ -318,7 +381,10 @@ def fbwd_p_pairs_packed(
             (scale2, scale2),
             (-lse_any[2 * v], -lse_any[2 * v + 1]),
         )
-        a, b = exp2_approx_f16x2_to_f32(a, b)
+        if FBWD_EX2_EMU_EVERY and (col_base // 2 + v) % FBWD_EX2_EMU_EVERY == 0:
+            a, b = ex2_emulation_packed(a, b)
+        else:
+            a, b = exp2_approx_f16x2_to_f32(a, b)
         if mask_lim is not None:
             ka = cutlass.Boolean(cutlass.Int32(col_base + 2 * v) >= mask_lim)
             kb = cutlass.Boolean(cutlass.Int32(col_base + 2 * v + 1) >= mask_lim)
@@ -388,6 +454,10 @@ def flash_bwd_2cta_shared_storage(
         ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
+        # MMA operand start addresses, re-read with ld.volatile every
+        # iteration so ptxas cannot hoist the per-k descriptors (see
+        # ``ld_volatile_shared_u32``).
+        mma_base: cute.struct.MemRange[cutlass.Int32, 8]
         sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
         sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
         sQ: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
@@ -402,6 +472,63 @@ def flash_bwd_2cta_shared_storage(
         sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 4096], 1024]
 
     return SharedStorage
+
+
+@dsl_user_op
+def ld_volatile_shared_u32(
+    smem_ptr: cute.Pointer,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """``ld.volatile.shared.b32``: a loop-variant read of a stable smem word.
+
+    The MMA warp stores each operand's smem-descriptor start address once and
+    re-reads it here at the top of every iteration. With single-stage operand
+    buffers the start addresses are loop-invariant, and ptxas hoists all the
+    per-k-tile 64-bit descriptors (8-16 per gemm, 10 gemm sites) out of the
+    loop into registers, spilling the 104-register MMA warp to local memory.
+    A volatile load cannot be hoisted, so the descriptors are re-formed per
+    iteration with uniform adds instead.
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32],
+            "ld.volatile.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cp_async_ca_4(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """One 4-byte ``cp.async.ca.shared.global`` (LDGSTS) copy.
+
+    Used to stage the next iteration's LSE/Delta rows into the free parity
+    slot without a register or an exposed load latency; pair with
+    ``cute.arch.cp_async_commit_group`` / ``cp_async_wait_group``.
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [smem_ptr_i32, gmem_ptr.llvm_ptr],
+        "cp.async.ca.shared.global [$0], [$1], 4;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 @dsl_user_op

@@ -912,6 +912,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         *_BACKEND_STRATEGY_CONFIG_KEYS,
         *FLASH_CONFIG_KEYS,
         "cute_flash_bwd_persistent",
+        "cute_flash_bwd_two_cta",
     ]
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
@@ -1207,6 +1208,7 @@ class ConfigSpec:
         # (kv_tile, q_tile) block sizes to the 128x128 flash envelope.
         self.cute_flash_bwd_search_enabled: bool = False
         self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
+        self._cute_flash_bwd_two_cta_allowed: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
@@ -1928,14 +1930,18 @@ class ConfigSpec:
         self,
         *,
         block_size_targets: Mapping[int, int],
+        two_cta_allowed: bool = False,
     ) -> None:
         """Enable the CuTe flash-attention BACKWARD surface.
 
         Pins the (kv_tile, q_tile) block sizes to the 128x128 envelope the
-        fused backward emitter supports.
+        fused backward emitter supports. ``two_cta_allowed`` opens the
+        ``cute_flash_bwd_two_cta`` knob (cluster-of-2 tcgen05 family) when the
+        problem shape supports 256-row cluster KV tiles.
         """
         self.cute_flash_bwd_search_enabled = True
         self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
+        self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = target
@@ -3775,6 +3781,9 @@ class ConfigSpec:
                 )
             elif self.cute_flash_bwd_search_enabled:
                 fields["cute_flash_bwd_persistent"] = EnumFragment(choices=(0, 1))
+                fields["cute_flash_bwd_two_cta"] = EnumFragment(
+                    choices=(0, 1) if self._cute_flash_bwd_two_cta_allowed else (0,)
+                )
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path
