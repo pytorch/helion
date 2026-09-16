@@ -18,7 +18,6 @@ import random
 import re
 import sys
 import time
-import types
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Literal
@@ -29,7 +28,6 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 from torch.utils._pytree import tree_flatten
-from torch.utils._pytree import tree_map_only
 
 from .. import exc
 from .._compat import extract_device
@@ -190,18 +188,6 @@ class _AutotunableKernel(Protocol):
 _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
 
-class _CodeSentinel:
-    """Stable stand-in for types.CodeType so spec key comparison is repr-independent."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:
-        return "<code>"
-
-
-_CODE_SENTINEL = _CodeSentinel()
-
-
 def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
     """Return user-provided autotune seed configs from settings as concrete Configs."""
     from ..runtime.config import Config
@@ -309,14 +295,11 @@ def _autotune_search_acf_cache_policy(paths: Sequence[str]) -> tuple[object, ...
     return tuple({"path": path, "sha256": _file_sha256(path)} for path in paths)
 
 
-def _normalize_spec_key(key: object) -> object:
-    """Replace types.CodeType with a stable sentinel in a spec key tree."""
-    return tree_map_only(types.CodeType, lambda _: _CODE_SENTINEL, key)
-
-
 def _normalize_spec_key_str(s: str) -> str:
     """Normalize a specialization_key string for cache comparison.
 
+    Applied to both the ``str()`` that put() stores and the ``str()`` of the
+    live key, so the two sides can only differ where this function differs.
     Replaces code object repr strings with a stable '<code>' sentinel,
     allowing FROM_BEST_AVAILABLE to match function arguments based
     on their closure values only, ignoring code object identity.
@@ -993,7 +976,10 @@ class BaseSearch(BaseAutotuner):
         ):
             return hardware, None
         spec_key = inner_kernel._base_specialization_key(self.args)
-        specialization_key = str(_normalize_spec_key(spec_key))
+        # Compare in the exact form put() stores: str() of the raw key.
+        # Normalizing the key as an object tree is not equivalent: pytree
+        # rebuilds torch.Size as a plain tuple, which reprs differently.
+        specialization_key = _normalize_spec_key_str(str(spec_key))
 
         return hardware, specialization_key
 
