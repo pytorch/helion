@@ -212,6 +212,187 @@ def flash_fa4_shared_storage(
     return SharedStorage
 
 
+@functools.cache
+def flash_bwd_shared_storage(
+    head_dim: int,
+    q_stage: int,
+    do_stage: int,
+    dtype: object = cutlass.Float16,
+) -> type:
+    """SharedStorage for the fused attention-BACKWARD kernel (1-CTA).
+
+    512 threads / 16 warps: 4 dQ-reduce warps, 2 compute warpgroups, one MMA
+    warp, one load warp. K/V are single-stage (one KV tile per CTA); Q/dO are
+    ``q_stage``/``do_stage``-deep TMA rings over the inner Q-tile loop. sdS is
+    the dS staging buffer consumed by the dK and dQ MMAs (two major-mode views
+    over the same bytes); sdQaccum stages the row-major fp32 dQ tile for the
+    ``cp.reduce.async.bulk`` global add. sLSE/sDelta are parity-double-buffered
+    per-warpgroup column stagings of the base-2 LSE and delta row vectors.
+    """
+
+    @cute.struct
+    class SharedStorage:
+        q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
+        do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, do_stage * 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        s_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dp_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_holding_buf: cutlass.Int32
+        sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sQ: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
+        ]
+        sdO: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * do_stage], 1024
+        ]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sV: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
+        # Per-warp staging chunks for the bulk dQ reduce: 4 warps x 8KB
+        # (32 rows x 64 cols at head_dim 64, 16 rows x 128 cols at 128).
+        sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 8192], 1024]
+
+    return SharedStorage
+
+
+@dsl_user_op
+def cpasync_reduce_bulk_add_f32(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: int,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Bulk-group async global reduce-add (f32) from a contiguous smem chunk.
+
+    Ported from flash-attention main's ``copy_utils.cpasync_reduce_bulk_add_f32``
+    (the dQaccum accumulation primitive). Pair with
+    ``cute.arch.cp_async_bulk_commit_group`` / ``cp_async_bulk_wait_group``.
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, smem_ptr_i32, cutlass.Int32(store_bytes).ir_value()],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def fbwd_p_pairs_stub(
+    frg: cute.Tensor,
+    lse_frg: cute.Tensor,
+    off: int,
+    cnt: int,
+    scale2: Float32,
+    mask_lim: object = None,
+    col_base: int = 0,
+) -> None:
+    frg_any = cast("Any", frg)
+    for v in range(cnt):
+        frg_any[off + v] = Float32(0.001)
+
+
+def fbwd_ds_pairs_stub(
+    dp_frg: cute.Tensor,
+    p_frg: cute.Tensor,
+    p_off: int,
+    dlt_frg: cute.Tensor,
+    cnt: int,
+) -> None:
+    dp_any = cast("Any", dp_frg)
+    for v in range(cnt):
+        dp_any[v] = Float32(0.001)
+
+
+def fbwd_p_pairs_packed(
+    frg: cute.Tensor,
+    lse_frg: cute.Tensor,
+    off: int,
+    cnt: int,
+    scale2: Float32,
+    mask_lim: object = None,
+    col_base: int = 0,
+) -> None:
+    """In-place P = exp2(s * scale2 - lse[col]) over one chunk, packed pairs.
+
+    Mirrors flash-attention main's backward softmax recompute
+    (fma_packed_f32x2 + two fastmath exp2 per f32 pair). ``mask_lim`` (when
+    not None) applies the causal keep-threshold ``col >= mask_lim`` with
+    ``col = col_base + pair index`` (columns are the static fragment order).
+    """
+    frg_any = cast("Any", frg)
+    lse_any = cast("Any", lse_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.fma_packed_f32x2(
+            (frg_any[off + 2 * v], frg_any[off + 2 * v + 1]),
+            (scale2, scale2),
+            (-lse_any[2 * v], -lse_any[2 * v + 1]),
+        )
+        a, b = exp2_approx_f16x2_to_f32(a, b)
+        if mask_lim is not None:
+            ka = cutlass.Boolean(cutlass.Int32(col_base + 2 * v) >= mask_lim)
+            kb = cutlass.Boolean(cutlass.Int32(col_base + 2 * v + 1) >= mask_lim)
+            a = Float32(cutlass.select_(ka, a, Float32(0.0)))
+            b = Float32(cutlass.select_(kb, b, Float32(0.0)))
+        frg_any[off + 2 * v] = a
+        frg_any[off + 2 * v + 1] = b
+
+
+def fbwd_ds_pairs_packed(
+    dp_frg: cute.Tensor,
+    p_frg: cute.Tensor,
+    p_off: int,
+    dlt_frg: cute.Tensor,
+    cnt: int,
+) -> None:
+    """In-place dS = P * (dP - delta[col]) over one chunk, packed pairs."""
+    dp_any = cast("Any", dp_frg)
+    p_any = cast("Any", p_frg)
+    dlt_any = cast("Any", dlt_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.sub_packed_f32x2(
+            (dp_any[2 * v], dp_any[2 * v + 1]),
+            (dlt_any[2 * v], dlt_any[2 * v + 1]),
+        )
+        a, b = cute.arch.mul_packed_f32x2(
+            (p_any[p_off + 2 * v], p_any[p_off + 2 * v + 1]), (a, b)
+        )
+        dp_any[2 * v] = a
+        dp_any[2 * v + 1] = b
+
+
+@dsl_user_op
+def red_global_add_f32(
+    gmem_ptr: cute.Pointer,
+    val: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Fire-and-forget scalar global reduce-add (no result, no scoreboard)."""
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, Float32(val).ir_value(loc=loc, ip=ip)],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def mbar_spin_wait(
     mbar_ptr: object, phase: object, wait_hint: int = 10_000_000
 ) -> None:
