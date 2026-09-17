@@ -78,6 +78,7 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
@@ -407,6 +408,7 @@ class CuteTcgen05Config:
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        self.fragment_aux_kernel_detected: bool = False
         # True when the kernel feeds a matmul an operand sourced from a load
         # whose dtype is not a tcgen05-native MMA dtype (e.g. an int16 tensor
         # cast to bf16, ``w.to(bfloat16)``). Such an operand cannot be TMA-staged
@@ -1146,6 +1148,7 @@ class CuteTcgen05Config:
         return (
             self._aux_tma_edge_search_enabled()
             or self._aux_tma_full_tile_search_enabled()
+            or self.fragment_aux_kernel_detected
         )
 
     def _aux_tma_seed_config(self, c_input_seed: Config) -> Config | None:
@@ -1153,6 +1156,61 @@ class CuteTcgen05Config:
             return None
         seed_config: dict[str, Any] = dict(c_input_seed.config)
         seed_config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_TMA
+        return Config(**seed_config)
+
+    def _fragment_aux_tma_seed_config(self) -> Config | None:
+        """Seed the one-CTA producer for a candidate fragment host-load path.
+
+        ``fragment_aux_kernel_detected`` intentionally over-approximates at
+        pre-codegen time. The exact locality proof remains config-specific and
+        rejects this seed later when no rank-2 host tensor is stageable.
+        """
+        if (
+            not self.fragment_aux_kernel_detected
+            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+        ):
+            return None
+        fragments = self._matmul_block_fragments()
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+
+        def select(fragment: BlockSizeFragment, choices: tuple[int, ...]) -> int | None:
+            return next(
+                (value for value in choices if fragment.low <= value <= fragment.high),
+                None,
+            )
+
+        bm = select(bm_fragment, (128,))
+        bn = select(bn_fragment, (128, 64))
+        bk = select(bk_fragment, (128, 64, 32, 16))
+        if bm is None or bn is None or bk is None:
+            return None
+        block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+        if block_sizes is None:
+            return None
+        seed_config: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            "l2_groupings": [1],
+            "num_stages": 2,
+            "num_warps": 8,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            TCGEN05_STRATEGY_CONFIG_KEY: (
+                Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+            ),
+            TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+            TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY: (
+                TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+            ),
+        }
         return Config(**seed_config)
 
     def _clc_persistence_seed_config(self, base_seed: Config) -> Config | None:
@@ -1344,6 +1402,9 @@ class CuteTcgen05Config:
             m_pair_cn2_seed_config: dict[str, Any] = dict(plain_m_pair_seed.config)
             m_pair_cn2_seed_config["tcgen05_cluster_n"] = 2
             seeds.append(Config(**m_pair_cn2_seed_config))
+        fragment_aux_tma_seed = self._fragment_aux_tma_seed_config()
+        if fragment_aux_tma_seed is not None:
+            seeds.append(fragment_aux_tma_seed)
         c_input_seed = self._c_input_seed_config()
         if c_input_seed is not None:
             seeds.append(c_input_seed)
@@ -2357,7 +2418,11 @@ class CuteTcgen05Config:
         elif strategy == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value:
             if scheduler_warps != 1:
                 config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
-        if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
+        if (
+            type(ab_stages) is int
+            and ab_stages >= 3
+            and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1
+        ):
             config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
     def _fix_aux_tma_search_config(self, config: dict[str, object]) -> None:
@@ -2365,6 +2430,17 @@ class CuteTcgen05Config:
             return
         if not self._aux_tma_search_enabled():
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+            return
+        if self.fragment_aux_kernel_detected and not (
+            self._aux_tma_edge_search_enabled()
+            or self._aux_tma_full_tile_search_enabled()
+        ):
+            if (
+                not self._is_with_scheduler_c_input_config(config)
+                or config.get("tcgen05_cluster_m") != 1
+                or config.get("tcgen05_cluster_n") != 1
+            ):
+                config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
             return
         # Aux-TMA is kept when the projected cluster_m=2 candidate matches either
         # the validated edge+K-tail shape or the cycle-46 full-tile shape, and

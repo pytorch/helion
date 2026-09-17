@@ -27,6 +27,7 @@ from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .cute.tcgen05_constants import Tcgen05AuxStagingScope
 from .cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -5191,9 +5192,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
            scheduler warp can run ahead. The defensive no-post-L2
            fallback keeps the release at the bottom because that path
            still reads the scheduler SMEM mailbox in the aux setup.
-        4. Per output tile, build the per-CTA aux GMEM region:
-           ``cute.local_tile(host_aux, (bm_per_cta, bn),
-           (tile_m, tile_n))`` where
+        4. Per output tile, build the per-CTA aux GMEM region with
+           ``cute.local_tile(host_aux, producer_tile_shape,
+           (tile_m, tile_n))``. Ordinary epilogue-subtile descriptors use
+           ``producer_tile_shape = (bm_per_cta, bn)``; fragment descriptors
+           may carry a smaller proportional source tile. Here
            ``bm_per_cta = bm // cluster_m`` under
            ``use_2cta_instrs`` (otherwise ``bm``). For rank-1
            trailing-axis broadcast aux the M extent is also
@@ -5243,7 +5246,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
         c_input_aux_tensor_descriptors = plan.c_input_aux_tensor_descriptors
         assert c_input_aux_tensor_descriptors, (
-            "C-input role-local while requires non-empty exact-shape aux "
+            "C-input role-local while requires non-empty stageable aux "
             "descriptors (producer-body split gate must be open)"
         )
         sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
@@ -5339,8 +5342,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             self._tcgen05_work_tile_slot(layout, i) for i in range(len(self.pid_info))
         ]
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
-        sched_coord_0 = coord_terms[0] if len(coord_terms) > 0 else "cutlass.Int32(0)"
-        sched_coord_1 = coord_terms[1] if len(coord_terms) > 1 else "cutlass.Int32(0)"
+        matrix_m_axis = plan.output_rank - 2
+        matrix_n_axis = plan.output_rank - 1
+        assert 0 <= matrix_m_axis < matrix_n_axis < len(coord_terms)
+        sched_coord_0 = coord_terms[matrix_m_axis]
+        sched_coord_1 = coord_terms[matrix_n_axis]
+        tile_offset_m = f"tile_offset_{matrix_m_axis}"
+        tile_offset_n = f"tile_offset_{matrix_n_axis}"
 
         # M / N tile coords for the cooperative copy. Each CTA's
         # C-input warp loads only its own per-CTA portion of the
@@ -5403,7 +5411,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # baseline at ``l2_grp=[1]`` cannot regress silently.
         synthetic_reads_for_l2 = [
             statement_from_string(
-                "_tcgen05_aux_l2_anchor = tile_offset_0 + tile_offset_1"
+                f"_tcgen05_aux_l2_anchor = {tile_offset_m} + {tile_offset_n}"
             )
         ]
         l2_dependency_stmts: list[ast.stmt] = []
@@ -5416,8 +5424,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             _, writes = _stmt_name_uses(stmt)
             l2_dependency_writes.update(writes)
         has_post_l2_coords = (
-            "tile_offset_0" in l2_dependency_writes
-            and "tile_offset_1" in l2_dependency_writes
+            tile_offset_m in l2_dependency_writes
+            and tile_offset_n in l2_dependency_writes
         )
         # ``peer_m`` is this CTA's rank along the M axis of the cluster:
         # ``block_idx_in_cluster() % cluster_m``. The modulo is load-bearing
@@ -5448,8 +5456,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # ``l2_grp=[g>1]`` because L2 remap is non-identity,
             # and under ``cluster_n=2`` because the raw
             # rank-in-cluster ≠ peer_m.
-            m_source = f"(tile_offset_0 // cutlass.Int32({bm}))"
-            n_source = f"(tile_offset_1 // cutlass.Int32({bn}))"
+            m_source = f"({tile_offset_m} // cutlass.Int32({bm}))"
+            n_source = f"({tile_offset_n} // cutlass.Int32({bn}))"
             if is_two_cta:
                 tile_m_expr = (
                     f"({m_source}) * cutlass.Int32({cluster_m}) + {peer_m_expr}"
@@ -5532,6 +5540,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_producer_state_name = aux_pipeline_plan.producer_state
         aux_rings = aux_pipeline_plan.rings
         aux_epi_tile_var = aux_pipeline_plan.epi_tile_var
+        aux_staging_scope = aux_pipeline_plan.staging_scope
         aux_tma_barrier_var = (
             device_function.new_var("tcgen05_aux_tma_barrier")
             if aux_use_tma_load
@@ -5541,13 +5550,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_full_tile_var = device_function.new_var("tcgen05_aux_full_tile")
         aux_shape = c_input_aux_tensor_descriptors[0].host_tensor_val.shape
         assert len(aux_shape) == 2, (
-            "C-input staged aux descriptors must be exact-shape rank-2 tensors"
+            "C-input staged aux descriptors must be rank-2 tensors"
         )
         aux_m_size = int(aux_shape[0])
         aux_n_size = int(aux_shape[1])
         if has_post_l2_coords:
-            aux_m_start_expr = "tile_offset_0"
-            aux_n_start_expr = "tile_offset_1"
+            aux_m_start_expr = tile_offset_m
+            aux_n_start_expr = tile_offset_n
         else:
             if is_two_cta:
                 aux_m_tile_expr = f"({sched_coord_0} // cutlass.Int32({cluster_m}))"
@@ -5565,8 +5574,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         env_backend = CompileEnvironment.current().backend
 
         # Per-descriptor partitioning that runs once per output tile:
-        # builds the source 2-D GMEM tensor, slices the per-output-
-        # tile ``(bm, bn)`` region, and flat-divides it into
+        # builds the source 2-D GMEM tensor, slices its per-output-tile
+        # source region, and flat-divides ordinary descriptors into
         # epi-tile-sized subtiles. The subtile-loop body further
         # slices one subtile of GMEM and one stage of SMEM per
         # iteration. Each per-descriptor partition uses fresh AST
@@ -5583,6 +5592,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         for desc_idx, (desc, ring) in enumerate(
             zip(c_input_aux_tensor_descriptors, aux_rings, strict=True)  # type: ignore[arg-type]
         ):
+            if aux_staging_scope is Tcgen05AuxStagingScope.OUTPUT_TILE:
+                assert desc.staging_tile_shape is not None, (
+                    "output-tile auxiliary descriptor is missing its staging tile shape"
+                )
+                producer_tile_m, producer_tile_n = desc.staging_tile_shape
+            else:
+                producer_tile_m, producer_tile_n = bm_per_cta, bn
             aux_tensor_name = device_function.tensor_arg(desc.host_tensor_val).name
             aux_dtype_str = env_backend.dtype_str(desc.host_tensor_val.dtype)
             dtype_bits = desc.host_tensor_val.dtype.itemsize * 8
@@ -5624,8 +5640,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             tma_smem_part_var = ""
             tma_gmem_part_var = ""
             setup: list[ast.stmt] = []
-            # Build the source 2-D GMEM tensor. Exact-shape rank-2
-            # aux passes through ``aux_tensor`` directly; rank-1
+            # Build the source 2-D GMEM tensor. Rank-2 aux passes through
+            # ``aux_tensor`` directly; output-tile fragment descriptors may use
+            # a proportional per-output-tile extent. Rank-1
             # trailing-axis broadcast aux builds a stride-0-on-M
             # view with M-extent ``bm_per_cta`` and N-extent = the
             # rank-1 size. Under cluster_m=2 ``use_2cta_instrs``
@@ -5647,7 +5664,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         ),
                         statement_from_string(
                             f"{gmem_aux_tile_var} = cute.local_tile("
-                            f"{gmem_aux_view_var}, ({bm_per_cta}, {bn}), "
+                            f"{gmem_aux_view_var}, "
+                            f"({producer_tile_m}, {producer_tile_n}), "
                             f"({tile_m_var}, {tile_n_var}))"
                         ),
                     ]
@@ -5684,19 +5702,36 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # flat ``subtile_count`` extent (matches the consumer's
             # post-``group_modes`` shape used inside
             # ``_aux_subtile_load_source``).
-            setup.extend(
-                [
-                    statement_from_string(
-                        f"{gmem_aux_subtiles_var} = cute.flat_divide("
-                        f"{gmem_aux_tile_var}, {aux_epi_tile_var})"
-                    ),
-                    statement_from_string(
-                        f"{gmem_subtiles_grouped_var} = cute.group_modes("
-                        f"{gmem_aux_subtiles_var}, 2, "
-                        f"cute.rank({gmem_aux_subtiles_var}))"
-                    ),
-                ]
-            )
+            if aux_staging_scope is Tcgen05AuxStagingScope.OUTPUT_TILE:
+                setup.extend(
+                    [
+                        statement_from_string(
+                            f"{gmem_aux_subtiles_var} = cute.make_tensor("
+                            f"{gmem_aux_tile_var}.iterator, cute.append("
+                            f"{gmem_aux_tile_var}.layout, "
+                            "cute.make_layout(1, stride=0)))"
+                        ),
+                        statement_from_string(
+                            f"{gmem_subtiles_grouped_var} = cute.group_modes("
+                            f"{gmem_aux_subtiles_var}, 2, "
+                            f"cute.rank({gmem_aux_subtiles_var}))"
+                        ),
+                    ]
+                )
+            else:
+                setup.extend(
+                    [
+                        statement_from_string(
+                            f"{gmem_aux_subtiles_var} = cute.flat_divide("
+                            f"{gmem_aux_tile_var}, {aux_epi_tile_var})"
+                        ),
+                        statement_from_string(
+                            f"{gmem_subtiles_grouped_var} = cute.group_modes("
+                            f"{gmem_aux_subtiles_var}, 2, "
+                            f"cute.rank({gmem_aux_subtiles_var}))"
+                        ),
+                    ]
+                )
             if aux_use_tma_load:
                 tma_smem_part_var = device_function.new_var(
                     f"tcgen05_aux_tma_smem_part_{desc_idx}"
@@ -5815,10 +5850,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             for block in per_descriptor_setup_blocks:
                 lines.extend(block)
 
-            # Determine the subtile count from any descriptor's
-            # grouped tensor (all descriptors share the same
-            # subtile axis because they're all sliced from the
-            # same ``(bm, bn)`` region with the same ``epi_tile``).
+            # Determine the subtile count from any descriptor's grouped tensor.
+            # Ordinary descriptors share the same ``(bm, bn)`` region and
+            # ``epi_tile``; output-tile fragment descriptors each expose one
+            # singleton staged-region position even when their tile shapes differ.
             # Use the first descriptor's grouped name — pulled
             # from ``per_descriptor_grouped_names`` so the
             # ``device_function.new_var`` namespace suffix
@@ -6556,7 +6591,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
         # Cycle-94 merge gate: the store warp is the aux residual producer when
         # there is a store warp, NO C-input warp, and a single-store-value
-        # exact-shape aux ring exists. In that case the aux GMEM->SMEM producer
+        # stageable aux ring exists. In that case the aux GMEM->SMEM producer
         # body is injected into the (widened) epilogue role-local while on the
         # store warp rather than emitted as a standalone C-input role-local
         # while (which would be a second per-warp sched consumer). The standalone
