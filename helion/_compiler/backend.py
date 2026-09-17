@@ -706,6 +706,22 @@ class Backend(abc.ABC):
         """
         return None
 
+    def register_reduction_loop_config_slots(
+        self,
+        env: CompileEnvironment,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        """Register backend-specific config-spec slots for a rollable reduction dim.
+
+        Called once per rollable rdim during device_ir analysis, after the shared
+        ``ReductionLoopSpec`` has been appended. Default: no-op. Backends that need
+        additional tuning knobs per reduction block (e.g. flydsl's
+        ``cute_vector_widths``) override this instead of adding a name-check in
+        device_ir.
+        """
+        return None
+
     def wrap_reduction_accumulator(
         self,
         acc_full: str,

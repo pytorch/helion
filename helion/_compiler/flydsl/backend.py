@@ -227,6 +227,23 @@ class FlyDSLBackend(Backend):
         _v = config_spec.cute_vector_widths.config_get(_vw, block_index, 1) or 1
         return _looped_tc(block_size, int(_v))
 
+    def register_reduction_loop_config_slots(
+        self,
+        env: CompileEnvironment,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        # FlyDSL shares the CuTe per-thread vector-width knob to pick V
+        # (elems/thread). Register the rdim slot here so the autotuner can set
+        # ``cute_vector_widths`` for a rolled reduction. cute registers its own
+        # slot in its own analysis block (device_ir.py), so this override is
+        # flydsl-only and avoids a duplicate slot for the same rdim.
+        from ...autotuner.config_spec import CuteVectorWidthSpec
+
+        env.config_spec.cute_vector_widths.append(
+            CuteVectorWidthSpec(block_id=block_id, size_hint=size_hint)
+        )
+
     @property
     def library_imports(self) -> dict[str, str]:
         return {
