@@ -466,9 +466,7 @@ class TestTritonTileDependencyLowering(TestCase):
     def test_fixed_capacity_specialization_reuses_existing_buckets(self) -> None:
         first_x = torch.arange(65, device=DEVICE, dtype=torch.float32)
         first_metadata = torch.zeros_like(first_x)
-        first = fixed_capacity_runtime_metadata_chain.bind(
-            (first_x, first_metadata)
-        )
+        first = fixed_capacity_runtime_metadata_chain.bind((first_x, first_metadata))
 
         same_capacity = fixed_capacity_runtime_metadata_chain.bind(
             (torch.ones_like(first_x), torch.ones_like(first_metadata))

@@ -72,7 +72,13 @@ def _positive_integer_shift_is_nonnegative(expression: sympy.Expr) -> bool:
     """Prove a small polynomial nonnegative over positive integer symbols."""
     positive_symbols = tuple(
         sorted(
-            (s for s in expression.free_symbols if s.is_integer and s.is_positive),
+            (
+                symbol
+                for symbol in expression.free_symbols
+                if isinstance(symbol, sympy.Symbol)
+                and symbol.is_integer  # pyrefly: ignore [missing-attribute]
+                and symbol.is_positive  # pyrefly: ignore [missing-attribute]
+            ),
             key=str,
         )
     )
@@ -87,10 +93,13 @@ def _positive_integer_shift_is_nonnegative(expression: sympy.Expr) -> bool:
             return 2 if node in positive else 1
         if isinstance(node, sympy.Add):
             bounds = tuple(expansion_bound(child) for child in node.args)
+            if any(bound is None for bound in bounds):
+                return None
+            concrete_bounds = cast("tuple[int, ...]", bounds)
             return (
                 None
-                if None in bounds or sum(bounds) > _MAX_RELATION_PRODUCT_STATES
-                else sum(bounds)
+                if sum(concrete_bounds) > _MAX_RELATION_PRODUCT_STATES
+                else sum(concrete_bounds)
             )
         if isinstance(node, sympy.Mul):
             product = 1
@@ -119,6 +128,7 @@ def _positive_integer_shift_is_nonnegative(expression: sympy.Expr) -> bool:
     )
     shifted = sympy.expand(
         expression.xreplace(
+            # pyrefly: ignore [unsupported-operation]
             dict(zip(positive_symbols, (s + 1 for s in shifted_symbols), strict=True))
         )
     )
@@ -161,9 +171,11 @@ def _is_provably_nonnegative(
                 SymbolicMin,
             ):
                 continue
+            # pyrefly: ignore [unsupported-operation]
             remainder = sympy.simplify(expression - term)
             if any(
                 _is_provably_nonnegative(
+                    # pyrefly: ignore [unsupported-operation]
                     sympy.simplify(remainder + coefficient * argument),
                     prove_nonnegative,
                 )
@@ -173,13 +185,14 @@ def _is_provably_nonnegative(
         for term in expression.args:
             coefficient, primitive = term.as_coeff_Mul()
             quotient = _static_integer_quotient(cast("sympy.Expr", primitive))
+            # pyrefly: ignore [unsupported-operation]
             remainder = sympy.simplify(expression - term)
             if (
                 coefficient == 1
                 and quotient is not None
                 and isinstance(remainder, sympy.Integer)
                 and _is_provably_nonnegative(
-                    sympy.simplify(quotient[0] + remainder * quotient[1]),
+                    sympy.simplify(quotient[0] + remainder * quotient[1]),  # pyrefly: ignore [unsupported-operation]
                     prove_nonnegative,
                 )
             ):
@@ -193,12 +206,13 @@ def _is_provably_nonnegative(
         quotient_simplified = _simplify_integer_quotients(expression)
         if (
             quotient_simplified != expression
-            and quotient_simplified.is_nonnegative is True
+            and quotient_simplified.is_nonnegative is True  # pyrefly: ignore [missing-attribute]
         ):
             return True
     if _positive_integer_shift_is_nonnegative(expression):
         return True
     interval = _analyze_integer_expression(expression)[1]
+    # pyrefly: ignore [missing-attribute]
     return (interval is not None and interval[0].is_nonnegative is True) or (
         prove_nonnegative is not None and prove_nonnegative(expression)
     )
@@ -244,6 +258,7 @@ def _analyze_integer_expression(
             return None
         _base, divisor, offset = parsed
         result = sympy.Integer(0 if offset.is_zero is True else 1)
+        # pyrefly: ignore [unsupported-operation]
         exact = offset.is_zero is True or sympy.simplify(offset - divisor) == 0
         return (result, result) if exact else (sympy.Integer(0), sympy.Integer(1))
 
@@ -254,7 +269,10 @@ def _analyze_integer_expression(
         if None in intervals:
             return None
         concrete = cast("tuple[tuple[sympy.Expr, sympy.Expr], ...]", intervals)
-        return tuple(operation(*(item[side] for item in concrete)) for side in (0, 1))
+        return (
+            operation(*(item[0] for item in concrete)),
+            operation(*(item[1] for item in concrete)),
+        )
 
     def bounds(value: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
         value = cast("sympy.Expr", sympy.sympify(value))
@@ -281,24 +299,41 @@ def _analyze_integer_expression(
                 return None
             child = bounds(cast("sympy.Expr", dividend)) if logical else None
             if child is not None:
+                # pyrefly: ignore [unsupported-operation]
                 quotients = tuple(sympy.floor(item / modulus) for item in child)
-                if sympy.simplify(quotients[0] - quotients[1]) == 0:
-                    return tuple(
-                        sympy.simplify(item - quotients[0] * modulus) for item in child
+                if sympy.simplify(quotients[0] - quotients[1]) == 0:  # pyrefly: ignore [unsupported-operation]
+                    return (
+                        sympy.simplify(child[0] - quotients[0] * modulus),  # pyrefly: ignore [unsupported-operation]
+                        sympy.simplify(child[1] - quotients[0] * modulus),  # pyrefly: ignore [unsupported-operation]
                     )
             return sympy.Integer(0), modulus - 1
         if logical and value.func in (sympy.floor, sympy.ceiling):
             child = bounds(cast("sympy.Expr", value.args[0]))
-            return None if child is None else tuple(map(value.func, child))
+            return (
+                None
+                if child is None
+                else (
+                    cast("sympy.Expr", value.func(child[0])),
+                    cast("sympy.Expr", value.func(child[1])),
+                )
+            )
         quotient = _static_integer_quotient(value)
         if quotient is not None:
             if (child := bounds(quotient[0])) is None:
                 return None
-            return tuple(
-                FloorDiv(item, quotient[1])
-                if logical
-                else sympy.floor(item / quotient[1])
-                for item in child
+            return (
+                cast(
+                    "sympy.Expr",
+                    FloorDiv(child[0], quotient[1])
+                    if logical
+                    else sympy.floor(child[0] / quotient[1]),  # pyrefly: ignore [unsupported-operation]
+                ),
+                cast(
+                    "sympy.Expr",
+                    FloorDiv(child[1], quotient[1])
+                    if logical
+                    else sympy.floor(child[1] / quotient[1]),  # pyrefly: ignore [unsupported-operation]
+                ),
             )
         if isinstance(value, sympy.Add):
             if logical:
@@ -310,10 +345,11 @@ def _analyze_integer_expression(
                 term = terms.pop(0)
                 interval = None
                 for index, other in enumerate(terms):
+                    # pyrefly: ignore [unsupported-operation]
                     interval = quotient_bounds(sympy.simplify(term + other))
                     if (
                         interval is None
-                        and (reverse := quotient_bounds(sympy.simplify(-term - other)))
+                        and (reverse := quotient_bounds(sympy.simplify(-term - other)))  # pyrefly: ignore [unsupported-operation]
                         is not None
                     ):
                         interval = -reverse[1], -reverse[0]
@@ -324,8 +360,9 @@ def _analyze_integer_expression(
                 if interval is None:
                     return None
                 intervals.append(interval)
-            return tuple(
-                sympy.Add(*(item[side] for item in intervals)) for side in (0, 1)
+            return (
+                cast("sympy.Expr", sympy.Add(*(item[0] for item in intervals))),
+                cast("sympy.Expr", sympy.Add(*(item[1] for item in intervals))),
             )
         if isinstance(value, sympy.Mul):
             if not logical:
@@ -380,6 +417,7 @@ def _analyze_integer_expression(
             if children
             else value
         )
+        rebuilt = cast("sympy.Expr", rebuilt)
         interval = bounds(rebuilt)
         if interval is not None and sympy.simplify(interval[1] - interval[0]) == 0:  # pyrefly: ignore[unsupported-operation]
             return sympy.simplify(interval[0])
@@ -387,10 +425,11 @@ def _analyze_integer_expression(
             child = bounds(cast("sympy.Expr", children[0]))
             in_range = (
                 child is not None
-                and children[1].is_integer is True
+                and children[1].is_integer is True  # pyrefly: ignore [missing-attribute]
                 and _is_provably_nonnegative(child[0], None)
                 and _is_provably_nonnegative(
-                    sympy.simplify(children[1] - 1 - child[1]), None
+                    sympy.simplify(children[1] - 1 - child[1]),  # pyrefly: ignore [unsupported-operation]
+                    None,  # pyrefly: ignore [unsupported-operation]
                 )
             )
             return cast("sympy.Expr", children[0]) if in_range else rebuilt
@@ -407,6 +446,7 @@ def _analyze_integer_expression(
         )
         for index, child in enumerate(children):
             if all(
+                # pyrefly: ignore [bad-argument-type]
                 operation(concrete[index][side], other[1 - side])
                 for other_index, other in enumerate(concrete)
                 if other_index != index
@@ -613,6 +653,7 @@ def _scalar_point_expression(piece: _CoordinateRelationPiece) -> sympy.Expr | No
     if len(piece.target_ranges) != 1:
         return None
     _axis, begin, end, step = piece.target_ranges[0]
+    # pyrefly: ignore [unsupported-operation]
     return begin if step == 1 and sympy.simplify(end - begin) == 1 else None
 
 
@@ -735,6 +776,7 @@ class CoordinateRelation:
         if offset < 0:
             raise ValueError("scalar floor division offset must be nonnegative")
         size = source_domain.size
+        # pyrefly: ignore [unsupported-operation]
         value_count = offset + _ceil_div(size, divisor)
         if target_domain is None:
             target_domain = CoordinateDomain.scalar(
@@ -747,7 +789,7 @@ class CoordinateRelation:
         return _full_point_map(
             source_domain,
             target_domain,
-            (offset + FloorDiv(source, divisor),),
+            (offset + FloorDiv(source, divisor),),  # pyrefly: ignore [bad-argument-type, unsupported-operation]
         )
 
     @classmethod
@@ -824,6 +866,7 @@ class CoordinateRelation:
         pieces = []
         for piece in self.pieces:
             if any(
+                # pyrefly: ignore [unsupported-operation]
                 step != 1 or sympy.simplify(end - begin) != 1
                 for _axis, begin, end, step in (
                     piece.source_bounds_items + piece.target_ranges
@@ -831,6 +874,7 @@ class CoordinateRelation:
             ):
                 return None
             source_bounds = tuple(
+                # pyrefly: ignore [unsupported-operation]
                 (axis, value, value + 1, 1)
                 for axis, begin, _end, _step in piece.target_ranges
                 if (
@@ -841,7 +885,7 @@ class CoordinateRelation:
                     )
                 ).free_symbols
                 <= parameters
-                and value.is_integer is True
+                and value.is_integer is True  # pyrefly: ignore [missing-attribute]
             )
             if len(source_bounds) != len(piece.target_ranges):
                 return None
@@ -1156,11 +1200,11 @@ class CoordinateRelation:
                     if source_count == count
                     and source_axis not in (source for _target, source in retained_axes)
                     and sympy.simplify(  # pyrefly: ignore[unsupported-operation]
-                        begin - coordinate_axis_symbol(source_axis)
+                        begin - coordinate_axis_symbol(source_axis)  # pyrefly: ignore [unsupported-operation]
                     )
                     == 0
                     and sympy.simplify(  # pyrefly: ignore[unsupported-operation]
-                        end - coordinate_axis_symbol(source_axis) - 1
+                        end - coordinate_axis_symbol(source_axis) - 1  # pyrefly: ignore [unsupported-operation]
                     )
                     == 0
                 ),
@@ -1332,6 +1376,7 @@ class CoordinateRelation:
         ):
             return None
         ambient_count = ambient_domain.axis_count_expressions[ambient_axis]
+        # pyrefly: ignore [unsupported-operation]
         substitutions = {source: ambient - offset}
         pieces = []
         for piece in self.pieces:
@@ -1418,14 +1463,14 @@ class CoordinateRelation:
             or (
                 bounds := _analyze_integer_expression(
                     _simplify_integer_quotients(
-                        _normalize_integer_rounding(end)
+                        _normalize_integer_rounding(end)  # pyrefly: ignore [unsupported-operation]
                         - _normalize_integer_rounding(begin)
                     )
                 )[1]
             )
             is None
             or not _is_provably_nonnegative(bounds[0], None)
-            or not _is_provably_nonnegative(1 - bounds[1], None)
+            or not _is_provably_nonnegative(1 - bounds[1], None)  # pyrefly: ignore [unsupported-operation]
             for target_ranges in normalized_targets
             for _axis, begin, end, step in target_ranges
         ):
@@ -1478,6 +1523,7 @@ class CoordinateRelation:
                 ):
                     width = _simplify_integer_quotients(
                         sympy.simplify(
+                            # pyrefly: ignore [unsupported-operation]
                             _normalize_integer_rounding(left_range[2])
                             - _normalize_integer_rounding(left_range[1])
                             + _normalize_integer_rounding(right_range[2])
@@ -1488,11 +1534,13 @@ class CoordinateRelation:
                         width, domain=self.source_domain, source_bounds=overlap
                     )
                     if bounds is None or not _is_provably_nonnegative(
-                        1 - bounds[1], None
+                        1 - bounds[1],  # pyrefly: ignore [unsupported-operation]
+                        None,  # pyrefly: ignore [unsupported-operation]
                     ):
                         bounds = _analyze_integer_expression(width)[1]
                     if bounds is not None and _is_provably_nonnegative(
-                        1 - bounds[1], None
+                        1 - bounds[1],  # pyrefly: ignore [unsupported-operation]
+                        None,  # pyrefly: ignore [unsupported-operation]
                     ):
                         break
                 else:
@@ -1510,7 +1558,7 @@ class CoordinateRelation:
             self.source_domain,
         ) and all(
             all(
-                step == 1 and sympy.simplify(end - begin) == 1
+                step == 1 and sympy.simplify(end - begin) == 1  # pyrefly: ignore [unsupported-operation]
                 for _axis, begin, end, step in piece.target_ranges
             )
             and _target_ranges_are_valid(
@@ -1583,13 +1631,17 @@ class CoordinateRelation:
                 _axis, _begin, end, step = piece.target_ranges[0]
                 if step != 1:
                     return None
+                # pyrefly: ignore [unsupported-operation]
                 maxima.append(sympy.simplify(end - 1))
             if not maxima:
                 continue
             maximum = sympy.Max(*maxima)
             result.append(
                 _CoordinateRelationPiece(
-                    bounds, ((value_axis, maximum, maximum + 1, 1),)
+                    # pyrefly: ignore [unsupported-operation]
+                    bounds,
+                    # pyrefly: ignore [unsupported-operation]
+                    ((value_axis, maximum, maximum + 1, 1),),
                 )
             )
         return CoordinateRelation(
@@ -1695,17 +1747,19 @@ class CoordinateRelation:
             if (
                 left_step != right_step
                 or left_step != 1
-                or sympy.simplify(left_end - left_value) != 1
-                or sympy.simplify(right_end - right_value) != 1
+                or sympy.simplify(left_end - left_value) != 1  # pyrefly: ignore [unsupported-operation]
+                or sympy.simplify(right_end - right_value) != 1  # pyrefly: ignore [unsupported-operation]
             ):
                 return False
             difference = _logical_expression_bounds(
+                # pyrefly: ignore [unsupported-operation]
                 sympy.simplify(left_value - right_value),
                 domain=left.source_domain,
                 source_bounds=bounds,
             )
             if difference is None or not _is_provably_nonnegative(
-                sympy.simplify(-difference[1] - 1), None
+                sympy.simplify(-difference[1] - 1),  # pyrefly: ignore [unsupported-operation]
+                None,  # pyrefly: ignore [unsupported-operation]
             ):
                 return False
         return bool(cells)
@@ -1858,7 +1912,7 @@ def _scalar_relation_is_nondecreasing(relation: CoordinateRelation) -> bool:
             or begin >= end
             or source_step != 1
             or target_step != 1
-            or sympy.simplify(value_end - value) != 1
+            or sympy.simplify(value_end - value) != 1  # pyrefly: ignore [unsupported-operation]
             or (previous_last is not None and first < previous_last)
             or (
                 end - begin > 1
@@ -1936,9 +1990,11 @@ class DenseTaskOrder:
         coordinates = {}
         for axis in pid_axis_order:
             strides[axis] = stride
+            # pyrefly: ignore [unsupported-operation]
             coordinates[axis] = sympy.Mod(FloorDiv(ordinal, stride), counts[axis])
             stride *= counts[axis]
         inverse_expression = sum(
+            # pyrefly: ignore [unsupported-operation]
             (coordinate_axis_symbol(axis) * strides[axis] for axis in pid_axis_order),
             sympy.Integer(0),
         )
@@ -1957,11 +2013,15 @@ class DenseTaskOrder:
             group = min(l2_group_size, first_count)
             span = group * second_count
             inner = sympy.Mod(ordinal, first_count * second_count)
+            # pyrefly: ignore [unsupported-operation]
             coordinates[first_axis] = FloorDiv(inner, span) * group + sympy.Mod(
-                inner, group
+                inner,
+                group,
             )
+            # pyrefly: ignore [unsupported-operation]
             coordinates[second_axis] = sympy.Mod(FloorDiv(inner, group), second_count)
             for axis in outer_axes:
+                # pyrefly: ignore [unsupported-operation]
                 coordinates[axis] = sympy.Mod(
                     FloorDiv(ordinal, strides[axis]), counts[axis]
                 )
@@ -1970,9 +2030,11 @@ class DenseTaskOrder:
                 coordinate_axis_symbol(second_axis),
             )
             inner_inverse = (
+                # pyrefly: ignore [unsupported-operation]
                 FloorDiv(first, group) * span + second * group + sympy.Mod(first, group)
             )
             outer_offset = sum(
+                # pyrefly: ignore [unsupported-operation]
                 (coordinate_axis_symbol(axis) * strides[axis] for axis in outer_axes),
                 sympy.Integer(0),
             )
@@ -1987,13 +2049,15 @@ class DenseTaskOrder:
                 full = first_count - tail
                 tail_begin = full * second_count
                 selector = FloorDiv(inner, tail_begin)
+                # pyrefly: ignore [unsupported-operation]
                 tail_first = full + sympy.Mod(inner - tail_begin, tail)
+                # pyrefly: ignore [unsupported-operation]
                 tail_second = FloorDiv(inner - tail_begin, tail)
                 coordinates[first_axis] += selector * (
-                    tail_first - coordinates[first_axis]
+                    tail_first - coordinates[first_axis]  # pyrefly: ignore [unsupported-operation]
                 )
                 coordinates[second_axis] += selector * (
-                    tail_second - coordinates[second_axis]
+                    tail_second - coordinates[second_axis]  # pyrefly: ignore [unsupported-operation]
                 )
 
                 def bounds(begin: int, end: int) -> ConcreteRelationBounds:
@@ -2007,6 +2071,7 @@ class DenseTaskOrder:
                         for axis in logical_domain.axis_order
                     )
 
+                # pyrefly: ignore [unsupported-operation]
                 tail_inverse = tail_begin + second * tail + first - full
                 inverse_pieces = (
                     (bounds(0, full), (inner_inverse + outer_offset,)),
@@ -2084,7 +2149,10 @@ class Incidence:
         count_by_key = None
         if structure is not None:
             mappings, full_item_axes = structure
-            by_key = {key: rest for key, *rest in mappings}
+            by_key = {
+                key_axis: (item_axis, mode, width)
+                for key_axis, item_axis, mode, width in mappings
+            }
             fan_in = sympy.prod(
                 items_by_key.target_domain.axis_count_expressions[axis]
                 for axis in full_item_axes
@@ -2105,7 +2173,8 @@ class Incidence:
                 item = coordinate_axis_symbol(item_axis)
                 if mode == "block":
                     value = FloorDiv(item, width)
-                    return key_axis, value, value + 1, 1
+                    return key_axis, value, value + 1, 1  # pyrefly: ignore [bad-return, unsupported-operation]
+                # pyrefly: ignore [unsupported-operation]
                 return key_axis, width * item, width * (item + 1), 1
 
             keys_by_item = CoordinateRelation(
@@ -2217,6 +2286,7 @@ class Incidence:
         items = _full_point_map(
             key_domain,
             item_domain,
+            # pyrefly: ignore [bad-argument-type]
             tuple(
                 coordinate_axis_symbol(axis)
                 if axis in key_counts
@@ -2318,6 +2388,7 @@ class Incidence:
                         tuple(
                             (
                                 piece.source_bounds_items,
+                                # pyrefly: ignore [unsupported-operation]
                                 (factor * piece.target_ranges[0][1],),
                             )
                             for piece in partition_counts.pieces
@@ -2467,6 +2538,7 @@ class Incidence:
                 _CoordinateRelationPiece(
                     piece.source_bounds_items,
                     tuple(
+                        # pyrefly: ignore [unsupported-operation]
                         (ambient_axis, begin + offset, end + offset, step)
                         for _axis, begin, end, step in piece.target_ranges
                     ),
@@ -2548,6 +2620,7 @@ class Incidence:
                 period = modulus // gcd * key_step
                 first = worker + modulus * multiplier
                 if first < begin:
+                    # pyrefly: ignore [unsupported-operation]
                     first += _ceil_div(begin - first, period) * period
                 if first >= end:
                     continue
@@ -2564,7 +2637,7 @@ class Incidence:
                         for expression in (start, stop)
                     )
                     if None in bounds or any(
-                        sympy.simplify(value[1] - value[0]) != 0
+                        sympy.simplify(value[1] - value[0]) != 0  # pyrefly: ignore [unsupported-operation]
                         for value in bounds
                         if value is not None
                     ):
@@ -2636,7 +2709,9 @@ def _rectangular_fiber_spec(
             (index,) = differing
             axis, begin, end, step = left.target_ranges[index]
             other_axis, other_begin, other_end, other_step = right.target_ranges[index]
+            # pyrefly: ignore [unsupported-operation]
             left_first = sympy.simplify(end - other_begin) == 0
+            # pyrefly: ignore [unsupported-operation]
             right_first = sympy.simplify(other_end - begin) == 0
             if (
                 axis != other_axis
@@ -2645,7 +2720,7 @@ def _rectangular_fiber_spec(
                 or not (left_first or right_first)
                 or not all(
                     _is_provably_nonnegative(width, prove_nonnegative)
-                    for width in (end - begin, other_end - other_begin)
+                    for width in (end - begin, other_end - other_begin)  # pyrefly: ignore [unsupported-operation]
                 )
             ):
                 continue
@@ -2721,7 +2796,7 @@ def _rectangular_fiber_spec(
         source_axes = tuple(source_symbols.keys() & begin.free_symbols)
         if (
             step != 1
-            or sympy.simplify(end - begin) != 1
+            or sympy.simplify(end - begin) != 1  # pyrefly: ignore [unsupported-operation]
             or len(source_axes) != 1
             or source_symbols[source_axes[0]] in used_sources
         ):
@@ -2731,11 +2806,11 @@ def _rectangular_fiber_spec(
         quotient = _static_integer_quotient(begin)
         width = (
             1
-            if sympy.simplify(begin - source_symbol) == 0
+            if sympy.simplify(begin - source_symbol) == 0  # pyrefly: ignore [unsupported-operation]
             else (
                 quotient[1]
                 if quotient is not None
-                and sympy.simplify(quotient[0] - source_symbol) == 0
+                and sympy.simplify(quotient[0] - source_symbol) == 0  # pyrefly: ignore [unsupported-operation]
                 else None
             )
         )
@@ -2843,13 +2918,14 @@ class KeyPartition:
             (
                 _CoordinateRelationPiece(
                     _full_bounds(coarse_domain),
+                    # pyrefly: ignore [bad-argument-type]
                     tuple(
                         (axis, 0, fine_counts[axis], 1)
                         if axis in full_axes
                         else (
                             axis,
-                            widths[axis] * coordinate_axis_symbol(axis),
-                            widths[axis] * (coordinate_axis_symbol(axis) + 1),
+                            widths[axis] * coordinate_axis_symbol(axis),  # pyrefly: ignore [unsupported-operation]
+                            widths[axis] * (coordinate_axis_symbol(axis) + 1),  # pyrefly: ignore [unsupported-operation]
                             1,
                         )
                         for axis in fine_domain.axis_order
@@ -2862,15 +2938,17 @@ class KeyPartition:
             if axis in full_axes:
                 factor = count
             else:
+                # pyrefly: ignore [unsupported-operation]
                 capacity *= widths[axis]
                 factor = (
                     sympy.Min(
                         widths[axis],
-                        count - widths[axis] * coordinate_axis_symbol(axis),
+                        count - widths[axis] * coordinate_axis_symbol(axis),  # pyrefly: ignore [unsupported-operation]
                     )
                     if axis in clipped_axes
                     else widths[axis]
                 )
+            # pyrefly: ignore [unsupported-operation]
             fiber *= factor
         capacity *= sympy.prod(fine_counts[axis] for axis in full_axes)
         count_axis = _next_axis(
@@ -2952,13 +3030,14 @@ class KeyPartition:
             tuple(
                 _CoordinateRelationPiece(
                     stage_bounds(stage),
+                    # pyrefly: ignore [bad-argument-type]
                     tuple(
                         (axis, begin, end, 1)
                         if axis == segmented_axis
                         else (
                             axis,
                             coordinate_axis_symbol(outer_axes[axis]),
-                            coordinate_axis_symbol(outer_axes[axis]) + 1,
+                            coordinate_axis_symbol(outer_axes[axis]) + 1,  # pyrefly: ignore [unsupported-operation]
                             1,
                         )
                         for axis in fine_domain.axis_order
@@ -2970,6 +3049,7 @@ class KeyPartition:
         coarse_by_fine = CoordinateRelation.point_map(
             fine_domain,
             coarse_domain,
+            # pyrefly: ignore [bad-argument-type]
             tuple(
                 (
                     tuple(
@@ -2991,6 +3071,7 @@ class KeyPartition:
                 axis=count_axis,
                 kind="value",
             ),
+            # pyrefly: ignore [bad-argument-type]
             tuple(
                 (stage_bounds(stage), (end - begin,))
                 for stage, (begin, end) in enumerate(segments)
@@ -3031,6 +3112,7 @@ class KeyPartition:
         coarse_by_fine = _full_point_map(
             fine,
             coarse,
+            # pyrefly: ignore [bad-argument-type]
             tuple(
                 FloorDiv(coordinate_axis_symbol(axis), partition_widths[axis])
                 for axis in axes
@@ -3059,6 +3141,7 @@ class KeyPartition:
         producer_key_by_item = _full_point_map(
             producer,
             producer_keys,
+            # pyrefly: ignore [bad-argument-type]
             tuple(
                 coordinate_axis_symbol(source)
                 if mode == "block"
@@ -3098,6 +3181,7 @@ def _in_domain_point_support(
         axis: [begin, end, step] for axis, begin, end, step in piece.source_bounds_items
     }
     for target_axis, begin, end, step in piece.target_ranges:
+        # pyrefly: ignore [unsupported-operation]
         if step != 1 or sympy.simplify(end - begin) != 1:
             return None
         if not begin.free_symbols:
@@ -3110,13 +3194,15 @@ def _in_domain_point_support(
         value_bounds = _logical_expression_bounds(
             begin,
             domain=source_domain,
+            # pyrefly: ignore [bad-argument-type]
             source_bounds=tuple((axis, *values) for axis, values in bounds.items()),
         )
         if (
             value_bounds is not None
             and _is_provably_nonnegative(value_bounds[0], None)
             and _is_provably_nonnegative(
-                target_counts[target_axis] - value_bounds[1] - 1, None
+                target_counts[target_axis] - value_bounds[1] - 1,  # pyrefly: ignore [unsupported-operation]
+                None,  # pyrefly: ignore [unsupported-operation]
             )
         ):
             continue
@@ -3150,6 +3236,7 @@ def _in_domain_point_support(
             upper,
         )
         bounds[source_axis] = [first, upper, period]
+    # pyrefly: ignore [bad-return]
     return tuple((axis, *bounds[axis]) for axis in source_domain.axis_order)
 
 
@@ -3165,6 +3252,7 @@ def _dense_point_fiber_inverse(
     expressions = tuple(
         (axis, _simplify_logical_expression(begin, source, bounds))
         for axis, begin, end, step in piece.target_ranges
+        # pyrefly: ignore [unsupported-operation]
         if step == 1 and sympy.simplify(end - begin) == 1
     )
     varying = tuple(pair for pair in expressions if pair[1].free_symbols)
@@ -3172,7 +3260,7 @@ def _dense_point_fiber_inverse(
         len(expressions) != len(piece.target_ranges)
         or len(varying) != 1
         or not _target_ranges_are_valid(
-            tuple((axis, value, value + 1, 1) for axis, value in expressions),
+            tuple((axis, value, value + 1, 1) for axis, value in expressions),  # pyrefly: ignore [unsupported-operation]
             source_domain=source,
             source_bounds=bounds,
             target_domain=target_domain,
@@ -3205,7 +3293,7 @@ def _dense_point_fiber_inverse(
         not active
         or order is None
         or ordinal is None
-        or sympy.simplify(expression - offset - ordinal)
+        or sympy.simplify(expression - offset - ordinal)  # pyrefly: ignore [unsupported-operation]
         or any(
             axis != varying_axis and not isinstance(value, sympy.Integer)
             for axis, value in expressions
@@ -3221,9 +3309,10 @@ def _dense_point_fiber_inverse(
                 tuple(
                     (axis, offset, offset + order.task_count, 1)
                     if axis == varying_axis
-                    else (axis, value, value + 1, 1)
+                    else (axis, value, value + 1, 1)  # pyrefly: ignore [unsupported-operation]
                     for axis, value in expressions
                 ),
+                # pyrefly: ignore [unsupported-operation]
                 (target - offset,),
             ),
         ),
@@ -3275,7 +3364,7 @@ def _source_boxes_partition_domain(
         return False
     return (
         sum(
-            math.prod(_ceil_div(end - begin, step) for _axis, begin, end, step in box)
+            math.prod(_ceil_div(end - begin, step) for _axis, begin, end, step in box)  # pyrefly: ignore [no-matching-overload]
             for box in boxes
         )
         == domain.size
@@ -3314,7 +3403,8 @@ def _key_major_order(
             if (
                 count_bounds[0] == count_bounds[1]
                 and _integer_partition_expressions_equal(
-                    fiber_size * key_domain.size_expr, item_domain.size_expr
+                    fiber_size * key_domain.size_expr,  # pyrefly: ignore [unsupported-operation]
+                    item_domain.size_expr,  # pyrefly: ignore [unsupported-operation]
                 )
                 and set(order) == set(item_domain.axis_order)
             ):
@@ -3373,7 +3463,9 @@ def _key_major_order(
     base = ranges[0][0]
     spans = []
     for begin, end, step in ranges:
+        # pyrefly: ignore [unsupported-operation]
         offset = sympy.simplify(begin - base)
+        # pyrefly: ignore [unsupported-operation]
         count = sympy.simplify(_ceil_div(end - begin, step))
         if (
             step <= 0
@@ -3401,7 +3493,9 @@ def _key_major_order(
         return None, None
     fiber_size = len(spans) * span_width
     if not _integer_partition_expressions_equal(
-        fiber_size * key_domain.size_expr, item_domain.size_expr
+        # pyrefly: ignore [unsupported-operation]
+        fiber_size * key_domain.size_expr,
+        item_domain.size_expr,
     ):
         return fiber_size, None
     try:
@@ -3410,6 +3504,7 @@ def _key_major_order(
         return fiber_size, None
     if keys is None or not keys.is_total_function():
         return fiber_size, None
+    # pyrefly: ignore [unsupported-operation]
     begin = sympy.simplify(base + spans[0][0])
     segment_count = len(spans)
     grouped_domain = CoordinateDomain.scalar(
@@ -3421,12 +3516,14 @@ def _key_major_order(
     grouped_axis = grouped_domain.axis_order[0]
     grouped_symbol = coordinate_axis_symbol(grouped_axis)
     key = FloorDiv(grouped_symbol, fiber_size)
+    # pyrefly: ignore [unsupported-operation]
     local = grouped_symbol - fiber_size * key
     segment = FloorDiv(local, span_width) if segment_count > 1 else 0
     value = (
         begin.xreplace({key_symbol: key})
+        # pyrefly: ignore [unsupported-operation]
         + segment_stride * segment
-        + item_step * (local - span_width * segment)
+        + item_step * (local - span_width * segment)  # pyrefly: ignore [unsupported-operation]
     )
     tasks = _full_point_map(grouped_domain, item_domain, (value,))
     item = coordinate_axis_symbol(item_axis)
@@ -3437,14 +3534,17 @@ def _key_major_order(
             return fiber_size, None
         delta = sympy.simplify(item - begin.xreplace({key_symbol: key}))
         segment = FloorDiv(delta, segment_stride) if segment_count > 1 else 0
+        # pyrefly: ignore [unsupported-operation]
         within_delta = delta - segment * segment_stride
         within = within_delta if item_step == 1 else FloorDiv(within_delta, item_step)
+        # pyrefly: ignore [unsupported-operation]
         local = segment * span_width + within
         inverse_specs.append(
             (
                 piece.source_bounds_items,
                 (
                     _simplify_logical_expression(
+                        # pyrefly: ignore [unsupported-operation]
                         key * fiber_size + local,
                         domain=item_domain,
                         source_bounds=piece.source_bounds_items,
@@ -3555,6 +3655,7 @@ def _target_ranges_are_valid(
     for axis, begin, end, step in target_ranges:
         if step <= 0 or (clipped and step != 1):
             return False
+        # pyrefly: ignore [unsupported-operation]
         count = sympy.simplify(_ceil_div(end - begin, step))
         bounds = tuple(
             _logical_expression_bounds(
@@ -3572,13 +3673,13 @@ def _target_ranges_are_valid(
         checks = (
             (
                 target_domain.axis_count_expressions[axis] - 1 - first[1],
-                middle[0] - 1,
-                last[0] - 1,
+                middle[0] - 1,  # pyrefly: ignore [unsupported-operation]
+                last[0] - 1,  # pyrefly: ignore [unsupported-operation]
             )
             if clipped
             else (
                 first[0],
-                middle[0] - 1,
+                middle[0] - 1,  # pyrefly: ignore [unsupported-operation]
                 target_domain.axis_count_expressions[axis] - 1 - last[1],
             )
         )
@@ -3710,6 +3811,7 @@ def _linearize_fibers(
         return None
     target_axis, expression, end, step = order_piece.target_ranges[0]
     affine = _static_affine_coefficients(expression, domain=incidence.target_domain)
+    # pyrefly: ignore [unsupported-operation]
     if step != 1 or sympy.simplify(end - expression) != 1 or affine is None:
         return None
     coefficients, offset = affine
@@ -3718,6 +3820,7 @@ def _linearize_fibers(
         start = sympy.Integer(offset)
         ranked = []
         for axis, begin, stop, axis_step in piece.target_ranges:
+            # pyrefly: ignore [unsupported-operation]
             extent = sympy.simplify(_ceil_div(stop - begin, axis_step))
             if (
                 extent.free_symbols
@@ -3726,6 +3829,7 @@ def _linearize_fibers(
             ):
                 return None
             ranked.append((coefficients[axis], axis_step, int(extent), begin))
+            # pyrefly: ignore [unsupported-operation]
             start += coefficients[axis] * begin
         varying = sorted(
             (coefficient * axis_step, extent)
@@ -3768,6 +3872,7 @@ def _single_axis_floor_point(
     if len(expression.free_symbols) != 1:
         return None
     (symbol,) = expression.free_symbols
+    # pyrefly: ignore [bad-argument-type]
     axis = source_symbols.get(symbol)
     if axis is None:
         return None
@@ -3785,7 +3890,7 @@ def _single_axis_floor_point(
         if quotient is None
         else _static_affine_coefficients(quotient[0], domain=domain)
     )
-    output_offset = sympy.simplify(expression - floor_term)
+    output_offset = sympy.simplify(expression - floor_term)  # pyrefly: ignore [unsupported-operation]
     if (
         quotient is None
         or affine is None
@@ -3815,7 +3920,9 @@ def _point_expression_preimage(
     if isinstance(expression, sympy.Mod) and upper == lower + 1:
         dividend, modulus = expression.args
         affine = _single_axis_interval(
+            # pyrefly: ignore [bad-argument-type]
             dividend,
+            # pyrefly: ignore [bad-argument-type, unsupported-operation]
             dividend + 1,
             domain=domain,  # pyrefly: ignore[unsupported-operation]
         )
@@ -3854,6 +3961,7 @@ def _point_expression_preimage(
         ):
             stride = -int(coefficient)
             constant = int(offset)
+            # pyrefly: ignore [bad-return]
             return (
                 axis,
                 _ceil_div(constant - upper + 1, stride),
@@ -3867,6 +3975,7 @@ def _point_expression_preimage(
     )
     if affine is not None:
         axis, stride, offset, _width = affine
+        # pyrefly: ignore [bad-return]
         return (
             axis,
             _ceil_div(lower - offset, stride),
@@ -3880,6 +3989,7 @@ def _point_expression_preimage(
     if floor_point is None:
         return None
     axis, stride, offset, divisor, output_offset = floor_point
+    # pyrefly: ignore [bad-return]
     return (
         axis,
         _ceil_div(divisor * (lower - output_offset) - offset, stride),
@@ -4061,24 +4171,28 @@ def _normalize_integer_rounding(expression: sympy.Expr) -> sympy.Expr:
         return expression
     numerator, denominator = sympy.fraction(sympy.together(expression.args[0]))
     if (
+        # pyrefly: ignore [missing-attribute]
         numerator.is_integer is not True
-        or denominator.is_integer is not True
+        or denominator.is_integer is not True  # pyrefly: ignore [missing-attribute]
         or denominator.free_symbols
         or int(denominator) <= 0
     ):
         return expression
     divisor = int(denominator)
     if expression.func == sympy.ceiling:
+        # pyrefly: ignore [unsupported-operation]
         numerator = sympy.expand(numerator + divisor - 1)
     integer_part: sympy.Expr = sympy.Integer(0)
     remainder: sympy.Expr = sympy.Integer(0)
     for term in sympy.Add.make_args(sympy.expand(numerator)):
+        # pyrefly: ignore [missing-attribute]
         coefficient, primitive = term.as_coeff_Mul()
         if coefficient.is_Integer and primitive.is_integer is True:
             quotient, residue = divmod(int(coefficient), divisor)
             integer_part += quotient * primitive
             remainder += residue * primitive
         else:
+            # pyrefly: ignore [unsupported-operation]
             remainder += term
     return sympy.simplify(
         integer_part + sympy.floor(remainder / divisor)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
@@ -4097,9 +4211,10 @@ def _static_integer_quotient(
     else:
         return None
     if (
+        # pyrefly: ignore [missing-attribute]
         numerator.is_integer is not True
         or denominator.free_symbols
-        or denominator.is_integer is not True
+        or denominator.is_integer is not True  # pyrefly: ignore [missing-attribute]
         or int(denominator) <= 0
     ):
         return None
@@ -4116,6 +4231,7 @@ def _static_quotient_difference(
     positive: tuple[sympy.Expr, int] | None = None
     negative: tuple[sympy.Expr, int] | None = None
     for term in terms:
+        # pyrefly: ignore [missing-attribute]
         coefficient, primitive = term.as_coeff_Mul()
         quotient = _static_integer_quotient(cast("sympy.Expr", primitive))
         if quotient is None:
@@ -4129,6 +4245,7 @@ def _static_quotient_difference(
     if positive is None or negative is None or positive[1] != negative[1]:
         return None
     base, denominator = negative
+    # pyrefly: ignore [unsupported-operation]
     offset = sympy.simplify(positive[0] - base)
     if (
         offset.is_integer is not True
@@ -4145,27 +4262,29 @@ def _exact_quotient_remainder_replacement(expression: sympy.Expr) -> sympy.Expr 
         return None
     terms = expression.args
     for modulo_index, term in enumerate(terms):
+        # pyrefly: ignore [missing-attribute]
         coefficient, modulo = term.as_coeff_Mul()
         if not isinstance(modulo, sympy.Mod) or len(modulo.args) != 2:
             continue
         dividend, modulus = modulo.args
         if (
             not coefficient.is_number
-            or not dividend.is_integer
+            or not dividend.is_integer  # pyrefly: ignore [missing-attribute]
             or modulus.free_symbols
-            or not modulus.is_integer
-            or not modulus.is_positive
+            or not modulus.is_integer  # pyrefly: ignore [missing-attribute]
+            or not modulus.is_positive  # pyrefly: ignore [missing-attribute]
         ):
             continue
         for quotient_index, candidate in enumerate(terms):
+            # pyrefly: ignore [missing-attribute]
             candidate_coefficient, primitive = candidate.as_coeff_Mul()
             quotient = _static_integer_quotient(cast("sympy.Expr", primitive))
             if (
                 quotient_index == modulo_index
                 or quotient is None
-                or quotient[1] != int(modulus)
+                or quotient[1] != int(modulus)  # pyrefly: ignore [bad-argument-type]
                 or sympy.simplify(candidate_coefficient - coefficient * modulus) != 0
-                or sympy.simplify(sympy.Mod(quotient[0], modulus) - modulo) != 0
+                or sympy.simplify(sympy.Mod(quotient[0], modulus) - modulo) != 0  # pyrefly: ignore [unsupported-operation]
             ):
                 continue
             return sympy.Add(
@@ -4183,6 +4302,7 @@ def _simplify_integer_quotients(expression: sympy.Expr) -> sympy.Expr:
     """Apply the exact Euclidean identities needed by relation constructors."""
     result = sympy.sympify(expression).xreplace(
         {
+            # pyrefly: ignore [unsupported-operation]
             node: sympy.floor(numerator / divisor)
             for node in sympy.preorder_traversal(expression)
             if (quotient := _static_integer_quotient(cast("sympy.Expr", node)))
@@ -4209,7 +4329,7 @@ def _simplify_integer_quotients(expression: sympy.Expr) -> sympy.Expr:
                     if (
                         right_coefficient == -left_coefficient
                         and difference is not None
-                        and sympy.simplify(difference[2] - difference[1]) == 0
+                        and sympy.simplify(difference[2] - difference[1]) == 0  # pyrefly: ignore [unsupported-operation]
                     ):
                         replacement = sympy.Add(
                             *(
@@ -4253,7 +4373,8 @@ def _ceil_div(
 ) -> sympy.Expr:
     """Return exact integer ceil division for concrete or symbolic numerators."""
     return _normalize_integer_rounding(
-        -FloorDiv(-sympy.sympify(numerator), denominator)
+        # pyrefly: ignore [bad-argument-type]
+        -FloorDiv(-sympy.sympify(numerator), denominator)  # pyrefly: ignore [unsupported-operation]
     )
 
 
@@ -4755,6 +4876,7 @@ def _access_interval_expression(
         )
         if offset is None or extent is None or (offset < 0 and size.free_symbols):
             return None
+        # pyrefly: ignore [unsupported-operation]
         normalized_offset = sympy.sympify(offset if offset >= 0 else size + offset)
         if (
             normalized_offset.is_nonnegative is not True
@@ -4806,13 +4928,18 @@ def _access_layout(
         linear_span = sympy.simplify(
             1
             + sum(
-                (size - 1) * stride for size, stride in zip(shape, strides, strict=True)
+                (size - 1) * stride  # pyrefly: ignore [unsupported-operation]
+                for size, stride in zip(shape, strides, strict=True)  # pyrefly: ignore [unsupported-operation]
             )
         )
     dimensions = None
     if len(shape) == len(strides) and _layout_is_injective((shape, strides, offset)):
         dimensions = tuple(
-            index for index, size in enumerate(shape) if sympy.simplify(size - 1) != 0
+            # pyrefly: ignore [unsupported-operation]
+            index
+            for index, size in enumerate(shape)
+            # pyrefly: ignore [unsupported-operation]
+            if sympy.simplify(size - 1) != 0
         )
     positions = {
         dimension: index for index, dimension in enumerate(access.subscript_dims)
@@ -4858,6 +4985,7 @@ def _symbolic_access_map(
         relation = CoordinateRelation(
             source_domain,
             allocation_domain,
+            # pyrefly: ignore [bad-argument-type]
             (_CoordinateRelationPiece(source_bounds, tuple(ranges)),),
         )
         return relation, None
@@ -4879,6 +5007,7 @@ def _symbolic_access_map(
                 raw_begin, description="affine subscript offset"
             )
             offset_width = sympy.simplify(
+                # pyrefly: ignore [unsupported-operation]
                 _integer_expression(raw_end, description="affine subscript offset")
                 - offset_begin
             )
@@ -4904,12 +5033,13 @@ def _symbolic_access_map(
             for axis, coefficient, divisor in terms:
                 coordinate = coordinate_axis_symbol(axis)
                 index += coefficient * (
-                    coordinate if divisor == 1 else sympy.floor(coordinate / divisor)
+                    coordinate if divisor == 1 else sympy.floor(coordinate / divisor)  # pyrefly: ignore [unsupported-operation]
                 )
             first = _logical_expression_bounds(
                 index, domain=source_domain, source_bounds=source_bounds
             )
             last = _logical_expression_bounds(
+                # pyrefly: ignore [unsupported-operation]
                 index + offset_width - offset_step,
                 domain=source_domain,
                 source_bounds=source_bounds,
@@ -4919,10 +5049,12 @@ def _symbolic_access_map(
                 or last is None
                 or not _is_provably_nonnegative(first[0], prove_nonnegative)
                 or not _is_provably_nonnegative(
-                    sympy.simplify(shape[0] - 1 - last[1]), prove_nonnegative
+                    sympy.simplify(shape[0] - 1 - last[1]),  # pyrefly: ignore [unsupported-operation]
+                    prove_nonnegative,  # pyrefly: ignore [unsupported-operation]
                 )
             ):
                 return None
+            # pyrefly: ignore [unsupported-operation]
             address = storage_offset + index * stride
             pieces.append(
                 _CoordinateRelationPiece(
@@ -4953,6 +5085,7 @@ def _symbolic_access_map(
         if interval is None:
             return None
         begin, end = interval
+        # pyrefly: ignore [unsupported-operation]
         width = sympy.simplify(end - begin)
         if not _is_provably_nonnegative(width - 1, prove_nonnegative):
             return None
@@ -4979,15 +5112,21 @@ def _symbolic_access_map(
     remaining = {index for index, width in enumerate(widths) if width != 1}
     while remaining:
         matches = tuple(
-            index for index in remaining if sympy.simplify(strides[index] - span) == 0
+            # pyrefly: ignore [unsupported-operation]
+            index
+            for index in remaining
+            # pyrefly: ignore [unsupported-operation]
+            if sympy.simplify(strides[index] - span) == 0
         )
         if len(matches) != 1:
             return None
         dimension = matches[0]
+        # pyrefly: ignore [unsupported-operation]
         span *= widths[dimension]
         remaining.remove(dimension)
+    # pyrefly: ignore [unsupported-operation]
     begin = storage_offset + sum(
-        interval[0] * stride
+        interval[0] * stride  # pyrefly: ignore [unsupported-operation]
         for interval, stride in zip(intervals, strides, strict=True)
     )
     relation = CoordinateRelation(
@@ -5016,11 +5155,13 @@ def _symbolic_access_map(
             matches = tuple(
                 axis
                 for axis in remaining
+                # pyrefly: ignore [unsupported-operation]
                 if sympy.simplify(coefficients[axis] - dense_span) == 0
             )
             if len(matches) != 1:
                 break
             axis = matches[0]
+            # pyrefly: ignore [unsupported-operation]
             strides_by_axis.append((axis, sympy.simplify(dense_span / int(span))))
             dense_span = sympy.simplify(dense_span * counts[axis])
             remaining.remove(axis)
@@ -5075,13 +5216,21 @@ def _rectangular_overlap_sources(
             ):
                 continue
             interval = _single_axis_interval(
-                owner_begin, owner_end, domain=owner.source_domain
+                # pyrefly: ignore [bad-argument-type]
+                owner_begin,
+                # pyrefly: ignore [bad-argument-type]
+                owner_end,
+                domain=owner.source_domain,
             )
             if interval is None:
                 return None
             owner_axis, stride, offset, width = interval
             query_interval = _single_axis_interval(
-                query_begin, query_end, domain=query.source_domain
+                # pyrefly: ignore [bad-argument-type]
+                query_begin,
+                # pyrefly: ignore [bad-argument-type]
+                query_end,
+                domain=query.source_domain,
             )
             if query_interval is not None:
                 _, query_stride, query_offset, query_width = query_interval
@@ -5091,13 +5240,16 @@ def _rectangular_overlap_sources(
                     and stride % query_width == 0
                     and (query_offset - offset) % query_width == 0
                 ):
+                    # pyrefly: ignore [unsupported-operation]
                     value = sympy.floor((query_begin - offset) / stride)
                     lower[owner_axis].append(value)
-                    upper[owner_axis].append(value + 1)
+                    upper[owner_axis].append(value + 1)  # pyrefly: ignore [unsupported-operation]
                     continue
             lower[owner_axis].append(
+                # pyrefly: ignore [unsupported-operation]
                 sympy.floor((query_begin - offset - width) / stride) + 1
             )
+            # pyrefly: ignore [unsupported-operation]
             upper[owner_axis].append(sympy.ceiling((query_end - offset) / stride))
         pieces.append(
             _CoordinateRelationPiece(
@@ -5137,7 +5289,9 @@ def _dense_overlap_sources(
             return None
         _axis, begin, end, step = piece.target_ranges[0]
         begin_delta, end_delta = (
+            # pyrefly: ignore [unsupported-operation]
             sympy.simplify(begin - offset),
+            # pyrefly: ignore [unsupported-operation]
             sympy.simplify(end - offset),
         )
         first_bounds = _logical_expression_bounds(
@@ -5157,7 +5311,8 @@ def _dense_overlap_sources(
             or not isinstance(width_expression, sympy.Integer)
             or not _is_provably_nonnegative(first_bounds[0], prove_nonnegative)
             or not _is_provably_nonnegative(
-                sympy.simplify(dense_span - 1 - last_bounds[1]), prove_nonnegative
+                sympy.simplify(dense_span - 1 - last_bounds[1]),  # pyrefly: ignore [unsupported-operation]
+                prove_nonnegative,  # pyrefly: ignore [unsupported-operation]
             )
         ):
             return None
@@ -5191,8 +5346,10 @@ def _dense_overlap_sources(
             count = counts[axis]
             coordinate: sympy.Expr = sympy.Integer(0)
             if sympy.simplify(count - 1) != 0:
+                # pyrefly: ignore [bad-assignment]
                 coordinate = sympy.Mod(
-                    sympy.floor(first_ordinal / tile_strides[axis]), count
+                    sympy.floor(first_ordinal / tile_strides[axis]),  # pyrefly: ignore [unsupported-operation]
+                    count,
                 )
                 for _ in range(2):
                     coordinate = _simplify_logical_expression(
@@ -5214,6 +5371,7 @@ def _dense_overlap_sources(
                 )
             ):
                 return None
+            # pyrefly: ignore [unsupported-operation]
             ranges.append((axis, coordinate, coordinate + extent, 1))
         pieces.append(
             _CoordinateRelationPiece(piece.source_bounds_items, tuple(ranges))
@@ -5322,6 +5480,7 @@ def _symbolic_dependency_incidence(
         span = layout[3]
         if span is None or not _is_provably_nonnegative(offset, prove_nonnegative):
             return None
+        # pyrefly: ignore [unsupported-operation]
         end = sympy.simplify(offset + span)
         if end.is_zero is True:
             end = sympy.Integer(1)
@@ -5378,6 +5537,7 @@ def _coordinate_domain_for_axes(
             count,
             description="coordinate-domain axis count",
         )
+        # pyrefly: ignore [missing-attribute]
         if count_expression.is_nonnegative is not True or block_size <= 0:
             return None
         if count_expression.is_zero is True:
@@ -5731,6 +5891,7 @@ def _layout_is_injective(
         (
             (stride, size)
             for size, stride in zip(shape, strides, strict=True)
+            # pyrefly: ignore [unsupported-operation]
             if sympy.simplify(size - 1) != 0
         ),
         key=operator.itemgetter(0),
@@ -5738,6 +5899,7 @@ def _layout_is_injective(
     for stride, size in active_dimensions:
         if not _is_provably_nonnegative(sympy.Integer(stride) - span, None):
             return False
+        # pyrefly: ignore [unsupported-operation]
         span += stride * (size - 1)
     return True
 

@@ -243,10 +243,11 @@ def _static_case_axes(
         numel_expr = logical_axis.extent
         if isinstance(numel_expr, str) or numel_expr is None:
             return None
+        numel: int | sympy.Expr
         if isinstance(numel_expr, int):
             numel = numel_expr
         elif isinstance(numel_expr, torch.SymInt):
-            numel = numel_expr._sympy_()
+            numel = cast("sympy.Expr", numel_expr._sympy_())
         elif getattr(numel_expr, "is_number", False):
             numel = int(numel_expr)
         elif isinstance(numel_expr, sympy.Expr):
@@ -290,7 +291,7 @@ def _static_case_geometry(
         info.block_id: (
             (numel + block - 1) // block
             if isinstance(numel, int)
-            else cast("sympy.Expr", CeilDiv(numel, block))
+            else cast("sympy.Expr", CeilDiv(numel, sympy.Integer(block)))
         )
         for info, (numel, block) in zip(infos, axes, strict=True)
     }
@@ -965,11 +966,11 @@ def emit_cross_loop_schedule(
             )
 
         def positive_when_domain_nonempty(divisor: sympy.Expr) -> bool:
-            if divisor.is_positive is True:
+            if divisor.is_positive is True:  # pyrefly: ignore[missing-attribute]
                 return True
             if (
                 nonempty_domain is None
-                or divisor.is_nonnegative is not True
+                or divisor.is_nonnegative is not True  # pyrefly: ignore[missing-attribute]
                 or not divisor.free_symbols <= nonempty_domain.parameter_symbols
             ):
                 return False
@@ -985,7 +986,7 @@ def emit_cross_loop_schedule(
             numerator: sympy.Expr,
             denominator: sympy.Expr,
         ) -> str:
-            if denominator.is_integer is not True or not (
+            if denominator.is_integer is not True or not (  # pyrefly: ignore[missing-attribute]
                 positive_when_domain_nonempty(denominator)
             ):
                 raise AssertionError(
@@ -1000,7 +1001,7 @@ def emit_cross_loop_schedule(
                 # domain case, which the surrounding schedule never executes.
                 denominator_text = render(denominator)
                 divisor = f"tl.maximum(({denominator_text}), 1)"
-            if numerator.is_nonnegative is True:
+            if numerator.is_nonnegative is True:  # pyrefly: ignore[missing-attribute]
                 return f"(({numerator_text}) // {divisor})"
             # Triton integer division truncates toward zero. First remove the
             # Euclidean remainder so the dividend is exactly divisible; this
@@ -1070,7 +1071,7 @@ def emit_cross_loop_schedule(
                 )
             numerator_text = render(cast("sympy.Expr", numerator))
             signed_remainder = f"(({numerator_text}) % {int(denominator)})"
-            if numerator.is_nonnegative is True:
+            if numerator.is_nonnegative is True:  # pyrefly: ignore[missing-attribute]
                 return signed_remainder
             # SymPy's Mod is Euclidean for a positive divisor, whereas Triton
             # lowers ``%`` on signed integers as a signed remainder.  Preserve
@@ -1782,7 +1783,7 @@ def emit_cross_loop_schedule(
         )
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = segment_begin + task_count_value
-        task_dispatch = [
+        task_dispatch: list[ast.stmt] = [
             create(
                 ast.For,
                 target=create(

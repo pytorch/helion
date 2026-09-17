@@ -733,6 +733,7 @@ class CompileEnvironment:
         }
         if result_storage in argument_storages:
             return
+        is_exact = False
         if factory is torch.empty:
             is_exact = True
         elif factory is torch.empty_like:

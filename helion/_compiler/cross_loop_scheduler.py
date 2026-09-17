@@ -24,6 +24,8 @@ from .tile_dependency import nested_logical_axes
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import sympy
+
     _StaticProducerResolver = Callable[
         [tuple["ReadinessProducer", ...]], tuple[tuple[int, Incidence], ...] | None
     ]
@@ -937,6 +939,7 @@ def _compact_nested_loop_counters_for_schedule(
         if split is None:
             result.append(plan)
             continue
+        assert frontier is not None
         compact = _segmented_nested_loop_counter(
             readiness_graph,
             event,
@@ -1495,7 +1498,10 @@ def _assign_final_arrival_continuations(
     result: list[ReadinessCounterPlan] = []
     for plan in readiness_counters:
         event_id = plan.readiness_key_domain.identity
-        if event_id is not None and not 0 <= event_id < len(readiness_graph.events):
+        if event_id is None:
+            result.append(plan)
+            continue
+        if not 0 <= event_id < len(readiness_graph.events):
             return None
         matches = tuple(
             (index, (event_id, consumer.consumer_id))
@@ -1712,7 +1718,7 @@ def _build_readiness_events(
     root_domains: tuple[CoordinateDomain, ...],
     site_domains: tuple[CoordinateDomain | None, ...],
     publishable_site_ids: frozenset[int] | None = None,
-    prove_nonnegative: Callable[[object], bool] | None = None,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
     charge: Callable[[int], bool],
 ) -> tuple[ReadinessEvent, ...]:
     """Build canonical readiness events from the dependency graph."""
@@ -2839,7 +2845,7 @@ def build_static_pipeline_plan(
     worker_count: int,
     publishable_site_ids: frozenset[int] | None = None,
     continuation_ineligible_roots: frozenset[int] = frozenset(),
-    prove_nonnegative: Callable[[object], bool] | None = None,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
     charge = _new_relation_work_budget()

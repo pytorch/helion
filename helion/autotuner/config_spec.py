@@ -2641,10 +2641,14 @@ class ConfigSpec:
         # internal key.
         if "cross_loop_schedule" in config:
             legacy_value = config.pop("cross_loop_schedule")
-            legacy_pipeline = {
-                "barrier": "barrier",
-                "static_pipeline": "static",
-            }.get(legacy_value)
+            legacy_pipeline = (
+                {
+                    "barrier": "barrier",
+                    "static_pipeline": "static",
+                }.get(legacy_value)
+                if isinstance(legacy_value, str)
+                else None
+            )
             if legacy_pipeline is None:
                 if not _fix_invalid:
                     raise InvalidConfig(

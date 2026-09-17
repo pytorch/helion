@@ -6,6 +6,7 @@ import logging
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
 import sympy
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .tile_dependency import AffineSubscriptRange
+    from .tile_dependency import IntegerExpression
     from .tile_dependency import TileAccess
 
 
@@ -336,10 +338,10 @@ class _AffineIndexScalar:
     unshifted scalar ``tile.id // divisor``.
     """
 
-    coefficients: tuple[tuple[int, int | sympy.Expr, int], ...]
-    offset: int | sympy.Expr
+    coefficients: tuple[tuple[int, IntegerExpression, int], ...]
+    offset: IntegerExpression
 
-    def scaled(self, factor: int | sympy.Expr) -> _AffineIndexScalar:
+    def scaled(self, factor: IntegerExpression) -> _AffineIndexScalar:
         return _AffineIndexScalar(
             tuple(
                 (axis, sympy.simplify(coefficient * factor), divisor)
@@ -627,7 +629,9 @@ def _affine_subscript_ranges(
             left = evaluate(args[0])
             right = evaluate(args[1])
 
-            def scalar_factor(value: _AffineIndexTensor | None) -> sympy.Expr | None:
+            def scalar_factor(
+                value: _AffineIndexTensor | None,
+            ) -> IntegerExpression | None:
                 if (
                     value is None
                     or value.shape
@@ -702,8 +706,8 @@ def _affine_subscript_ranges(
     if affine is None or not affine.values:
         return None
     offsets_by_coefficients: dict[
-        tuple[tuple[int, int | sympy.Expr, int], ...],
-        set[sympy.Expr],
+        tuple[tuple[int, IntegerExpression, int], ...],
+        set[IntegerExpression],
     ] = {}
     for value in affine.values:
         if any(
@@ -735,7 +739,7 @@ def _affine_subscript_ranges(
             for axis, coefficient, divisor in item[0]
         ),
     ):
-        offsets_by_symbolic_base: dict[sympy.Expr, set[int]] = {}
+        offsets_by_symbolic_base: dict[Any, set[int]] = {}
         for offset in offset_set:
             constant, symbolic_base = sympy.expand(offset).as_coeff_Add()
             if not isinstance(constant, sympy.Integer):
