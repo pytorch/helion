@@ -1236,6 +1236,8 @@ class CoordinateRelation:
 
     def is_single_valued(self) -> bool:
         """Return whether every source instance maps to at most one target."""
+        if not _relation_product_is_within_budget(len(self.pieces), len(self.pieces)):
+            return False
         normalized_targets = tuple(
             tuple(
                 (
@@ -3354,7 +3356,7 @@ def _key_major_order(
         _ = key_domain.size, item_domain.size
     except ValueError:
         return fiber_size, None
-    if keys is None or not keys.is_single_valued() or not keys.is_total_function():
+    if keys is None or not keys.is_total_function():
         return fiber_size, None
     begin = sympy.simplify(base + spans[0][0])
     segment_count = len(spans)
