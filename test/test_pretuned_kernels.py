@@ -224,8 +224,8 @@ def test_gpt_oss_moe_uses_existing_tuning_surface() -> None:
 
     assert module.gpt_oss_moe.settings.static_shapes
     assert heuristic.CONFIG["cross_loop_pipeline"] == "static"
-    assert heuristic.CONFIG["num_sm_multiplier"] == 16
-    assert heuristic.CONFIG["maxnreg"] == 128
+    assert heuristic.CONFIG["num_sm_multiplier"] == 11
+    assert heuristic.CONFIG["maxnreg"] == 256
     assert set(heuristic.CONFIG["load_eviction_policies"]) == {"last"}
     source = inspect.getsource(module.gpt_oss_moe.fn)
     assert "semantic_dependency" not in source
@@ -282,7 +282,7 @@ def test_deepseek_v3_moe_fp8_uses_existing_tuning_surface() -> None:
 
     assert module.deepseek_v3_moe_fp8.settings.static_shapes
     assert heuristic.CONFIG["cross_loop_pipeline"] == "dynamic"
-    assert heuristic.CONFIG["num_sm_multiplier"] == 1
+    assert heuristic.CONFIG["num_sm_multiplier"] == 3
     assert heuristic.CONFIG["num_warps"] == 1
     assert heuristic.CONFIG["maxnreg"] is None
     source = inspect.getsource(module.deepseek_v3_moe_fp8.fn)

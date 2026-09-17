@@ -3317,17 +3317,18 @@ class ConfigSpec:
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
 
         if self.supports_config_key("num_sm_multiplier"):
-            # Validate num_sm_multiplier is a power of two in range
+            # The default autotuning domain remains powers of two, while an
+            # explicitly selected configuration may use an intermediate worker
+            # count when occupancy has a narrow optimum.
             if "num_sm_multiplier" in config:
                 val = config["num_sm_multiplier"]
                 if (
                     not isinstance(val, int)
                     or val < MIN_NUM_SM_MULTIPLIER
                     or val > MAX_NUM_SM_MULTIPLIER
-                    or (val & (val - 1)) != 0  # not a power of two
                 ):
                     raise InvalidConfig(
-                        f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
+                        f"Invalid value for 'num_sm_multiplier': {val!r} must be an integer between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
                     )
             else:
                 config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
