@@ -2524,8 +2524,10 @@ def _rectangular_fiber_spec(
         target_count = normalized.target_domain.axis_count_expressions[target_axis]
         if (
             step == 1
-            and sympy.simplify(begin) == 0
-            and _integer_partition_expressions_equal(end, target_count)
+            and _is_provably_nonnegative(-begin, prove_nonnegative)
+            and _is_provably_nonnegative(
+                sympy.simplify(end - target_count), prove_nonnegative
+            )
         ):
             full_targets.append(target_axis)
             continue
@@ -2598,25 +2600,36 @@ class KeyPartition:
         )
 
     def rekey_fine(self, fine_keys: Incidence) -> KeyPartition | None:
-        """Replace fine coordinates through a supplied complete bijection."""
+        """Pull a partition back through a total fine-key incidence."""
         reverse = fine_keys.reversed()
         if (
             reverse is None
             or fine_keys.items_by_key.target_domain
             != self.coarse_key_by_fine_key.source_domain
-            or fine_keys.items_by_key.source_domain.size
-            != fine_keys.items_by_key.target_domain.size
             or not fine_keys.items_by_key.is_total_function()
-            or not fine_keys.keys_by_item.is_total_function()
         ):
             return None
         composed = self.as_incidence().then(reverse)
-        if composed is None or composed.keys_by_item is None:
+        bijective = (
+            _integer_partition_expressions_equal(
+                fine_keys.items_by_key.source_domain.size_expr,
+                fine_keys.items_by_key.target_domain.size_expr,
+            )
+            and reverse.items_by_key.is_total_function()
+        )
+        count = (
+            self.fine_key_count_by_coarse_key
+            if bijective
+            else None
+            if composed is None
+            else composed.count_by_key
+        )
+        if composed is None or composed.keys_by_item is None or count is None:
             return None
         return KeyPartition._from_constructed(
             composed.items_by_key,
             composed.keys_by_item,
-            self.fine_key_count_by_coarse_key,
+            count,
         )
 
     @classmethod
@@ -3042,6 +3055,8 @@ def _source_boxes_partition_domain(
         return False
     if not domain.axis_order:
         return boxes == ((),)
+    if boxes == (_full_bounds(domain),):
+        return True
     counts = domain.axis_counts
     if any(
         tuple(axis for axis, _begin, _end, _step in box) != domain.axis_order

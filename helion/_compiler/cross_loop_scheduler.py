@@ -367,6 +367,44 @@ class ReadinessCounterPlan:
         bounds = _arrival_count_bounds(self.producers)
         return None if bounds is None or bounds[0] != bounds[1] else bounds[0]
 
+    def is_root_barrier_equivalent(
+        self,
+        root_domains: tuple[CoordinateDomain, ...],
+        charge: Callable[[int], bool],
+    ) -> bool:
+        """Return whether this counter is exactly a set of root barriers."""
+        if (
+            self.continuation_consumer_index is not None
+            or self.readiness_key_count != 1
+            or len(self.producers) != 1
+        ):
+            return False
+        producer = self.producers[0]
+        producer_domain = root_domains[producer.producer_root]
+        count = producer.incidence.count_by_key
+        if (
+            producer.producer_site_id is not None
+            or producer.incidence.items_by_key.target_domain != producer_domain
+            or count is None
+            or count.value_bounds() != (producer_domain.size, producer_domain.size)
+            or any(
+                consumer.consumer_site_id is not None
+                or consumer.consumer_root <= producer.producer_root
+                or consumer.incidence.items_by_key.target_domain
+                != root_domains[consumer.consumer_root]
+                for consumer in self.consumers
+            )
+        ):
+            return False
+        return charge(
+            sum(
+                len(consumer.keys_by_consumer.pieces) ** 2
+                for consumer in self.consumers
+            )
+        ) and all(
+            consumer.keys_by_consumer.is_total_function() for consumer in self.consumers
+        )
+
 
 def _emitted_final_arrival_continuations(
     readiness_graph: ReadinessGraph,
@@ -686,19 +724,38 @@ def _segmented_nested_loop_counter(
     if segment_partition is None or reduced_consumers is None:
         return None
     segment_incidence = segment_partition.as_incidence()
-    if reduced_consumers.keys_by_item is None or not charge(
-        1
-        + len(segment_incidence.items_by_key.pieces)
-        * len(reduced_consumers.keys_by_item.pieces)
+    root_projection = KeyPartition.projection(domain, reduced_domain)
+    reduced_keys = reduced_consumers.keys_by_item
+    if (
+        reduced_keys is None
+        or root_projection is None
+        or not charge(
+            1
+            + len(reduced_consumers.items_by_key.pieces) ** 2
+            + len(reduced_keys.pieces) ** 2
+            + len(segment_incidence.items_by_key.pieces)
+            * (
+                len(reduced_keys.pieces)
+                + len(root_projection.fine_keys_by_coarse_key.pieces)
+            )
+            + len(segment_partition.coarse_key_by_fine_key.pieces)
+            * (
+                len(reduced_consumers.items_by_key.pieces)
+                + len(root_projection.coarse_key_by_fine_key.pieces)
+            )
+        )
+        or not reduced_keys.has_total_source()
     ):
         return None
     partition = segment_partition.rekey_fine(reduced_consumers)
-    if partition is None:
+    consumer_incidence = segment_incidence.then(root_projection.as_incidence())
+    if partition is None or consumer_incidence is None:
         return None
     selected_consumer = dataclasses.replace(readiness_consumer, consumer_id=0)
     lowered = _coarsen_event(
         ReadinessEvent(event.producers, (selected_consumer,)),
         partition,
+        known_consumer_incidences={0: consumer_incidence},
         charge=charge,
     )
     if lowered is None:
@@ -1512,10 +1569,12 @@ def _coarsen_event(
     partition: KeyPartition,
     *,
     known_incidences: dict[int, Incidence] | None = None,
+    known_consumer_incidences: dict[int, Incidence] | None = None,
     charge: Callable[[int], bool],
 ) -> tuple[tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]] | None:
     """Coarsen every event arm through one certified key partition."""
     known_incidences = known_incidences or {}
+    known_consumer_incidences = known_consumer_incidences or {}
     if (
         partition.coarse_key_by_fine_key.source_domain != event.readiness_key_domain
         or partition.coarse_key_by_fine_key.target_domain.identity != event.event_id
@@ -1526,7 +1585,11 @@ def _coarsen_event(
         producer.incidence
         for index, producer in enumerate(event.producers)
         if index not in known_incidences
-    ) + tuple(consumer.incidence for consumer in event.consumers)
+    ) + tuple(
+        consumer.incidence
+        for index, consumer in enumerate(event.consumers)
+        if index not in known_consumer_incidences
+    )
     if not charge(
         sum(
             1
@@ -1558,8 +1621,10 @@ def _coarsen_event(
             return None
         producers.append(lowered)
     consumers: list[ReadinessConsumer] = []
-    for consumer in event.consumers:
-        incidence = consumer.incidence.coarsen(partition)
+    for index, consumer in enumerate(event.consumers):
+        incidence = known_consumer_incidences.get(index) or consumer.incidence.coarsen(
+            partition
+        )
         if incidence is None:
             return None
         consumers.append(dataclasses.replace(consumer, incidence=incidence))
@@ -1669,11 +1734,14 @@ def choose_readiness_counters(
             consumers=tuple(retained_consumers),
             continuation_consumer_index=continuation_consumer_index,
         )
-        if _supports_emitted_counter_plan_lowering(
+        if not _supports_emitted_counter_plan_lowering(
             candidate,
             readiness_graph.root_domains,
         ):
-            selected.append(candidate)
+            continue
+        if candidate.is_root_barrier_equivalent(readiness_graph.root_domains, charge):
+            continue
+        selected.append(candidate)
     selected_continuation_count = sum(
         counter_plan.continuation_consumer_index is not None
         for counter_plan in selected

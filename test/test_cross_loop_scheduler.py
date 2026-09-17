@@ -892,6 +892,84 @@ class TestCrossLoopScheduler(TestCase):
                 frozenset((obligation,)),
             )
 
+    def test_nested_entry_pulls_back_many_to_one_tail_partition(self) -> None:
+        producer_root = _domain((10, 5, 1), (11, 4, 1), identity=0)
+        consumer_root = _domain((21, 4, 1), identity=1)
+        consumer_site = _domain((21, 4, 1), (22, 2, 1), identity=7)
+        keys = _domain((0, 5), (1, 4), kind="event", identity=0)
+        slot = coordinate_axis_symbol(21)
+        nested = coordinate_axis_symbol(22)
+        key_row = coordinate_axis_symbol(0)
+        key_slot = coordinate_axis_symbol(1)
+        keys_by_consumer = CoordinateRelation(
+            consumer_site,
+            keys,
+            (
+                _CoordinateRelationPiece(
+                    ((21, 0, 4, 1), (22, 0, 2, 1)),
+                    ((0, 3 * nested, 3 * (nested + 1), 1), (1, slot, slot + 1, 1)),
+                ),
+            ),
+        )
+        consumers_by_key = CoordinateRelation.point_map(
+            keys,
+            consumer_site,
+            (
+                (((0, 0, 3, 1), (1, 0, 4, 1)), (key_slot, sympy.Integer(0))),
+                (((0, 3, 5, 1), (1, 0, 4, 1)), (key_slot, sympy.Integer(1))),
+            ),
+        )
+        event = ReadinessEvent(
+            (
+                _producer(
+                    0,
+                    _full_point_map(
+                        keys,
+                        producer_root,
+                        key_row,
+                        key_slot,
+                    ),
+                ),
+            ),
+            (
+                _consumer(
+                    1,
+                    keys_by_consumer,
+                    consumers_by_key=consumers_by_key,
+                    site_id=7,
+                ),
+            ),
+        )
+        graph = ReadinessGraph((producer_root, consumer_root), (event,))
+
+        counter = _segmented_nested_loop_counter(
+            graph,
+            event,
+            event.consumers[0],
+            None,
+            cross_loop_scheduler._new_relation_work_budget(),
+        )
+
+        self.assertIsNotNone(counter)
+        assert counter is not None
+        self.assertEqual(counter.readiness_key_count, 4)
+        self.assertEqual(counter.uniform_arrival_count(), 5)
+        plan = _plan(
+            (producer_root, consumer_root),
+            20,
+            counters=(counter,),
+        )
+        self.assertEqual(
+            cross_loop_scheduler.nested_wait_placement(
+                consumer_root, counter.consumers[0]
+            ),
+            (22, (0,)),
+        )
+        self.assertEqual(
+            cross_loop_scheduler._without_wave_dominated_nested_counters(plan),
+            (counter,),
+        )
+
     def test_nested_counter_admission_uses_emitted_wait_count(self) -> None:
         producer_root = _domain((10, 2, 1), identity=0)
         consumer_root = _domain((20, 3, 1), identity=1)
@@ -968,6 +1046,122 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(
             cross_loop_scheduler._without_wave_dominated_nested_counters(hoisted_plan),
             (hoisted,),
+        )
+
+    def test_coarsened_whole_root_event_uses_barrier(self) -> None:
+        producer_root = _domain((10, 1, 1), identity=0)
+        consumer_root = _domain((20, 6, 1), identity=1)
+        keys = CoordinateDomain.scalar(4, kind="event", identity=0)
+        producer_items = CoordinateRelation(
+            keys,
+            producer_root,
+            (_CoordinateRelationPiece(((0, 0, 4, 1),), ((10, 0, 1, 1),)),),
+        )
+        base_incidence = _incidence(producer_items, grouped=True)
+        publication = CoordinateRelation(
+            producer_root,
+            keys,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 1, 1),),
+                    (
+                        (
+                            0,
+                            4 * coordinate_axis_symbol(10),
+                            4 * (coordinate_axis_symbol(10) + 1),
+                            1,
+                        ),
+                    ),
+                ),
+            ),
+        )
+        producer = ReadinessProducer(
+            producer_root=0,
+            incidence=Incidence._from_constructed(
+                producer_items,
+                keys_by_item=publication,
+                count_by_key=base_incidence.count_by_key,
+                grouped_items=base_incidence.grouped_items,
+            ),
+        )
+        self.assertIsNotNone(KeyPartition.from_fixed_width_publication(publication))
+
+        def consumer(end: int) -> ReadinessConsumer:
+            return _consumer(
+                1,
+                CoordinateRelation(
+                    consumer_root,
+                    keys,
+                    (_CoordinateRelationPiece(((20, 0, end, 1),), ((0, 0, 4, 1),)),),
+                ),
+                consumers_by_key=CoordinateRelation(
+                    keys,
+                    consumer_root,
+                    (_CoordinateRelationPiece(((0, 0, 4, 1),), ((20, 0, end, 1),)),),
+                ),
+                obligations=frozenset(((0, None, None),)),
+            )
+
+        def selected(end: int) -> tuple[ReadinessCounterPlan, ...]:
+            graph = ReadinessGraph(
+                (producer_root, consumer_root),
+                (ReadinessEvent((producer,), (consumer(end),)),),
+            )
+            return choose_readiness_counters(
+                graph,
+                (),
+                charge=cross_loop_scheduler._new_relation_work_budget(),
+            )
+
+        with mock.patch.object(
+            ReadinessCounterPlan,
+            "is_root_barrier_equivalent",
+            return_value=False,
+        ):
+            self.assertEqual(len(selected(6)), 1)
+        self.assertEqual(selected(6), ())
+
+        coarse_keys = CoordinateDomain.scalar(1, kind="event", identity=0)
+        coarse_producer = _producer(
+            0,
+            CoordinateRelation(
+                coarse_keys,
+                producer_root,
+                (_CoordinateRelationPiece(((0, 0, 1, 1),), ((10, 0, 1, 1),)),),
+            ),
+        )
+        full_consumer = ReadinessConsumer(
+            consumer_root=1,
+            incidence=Incidence.complete(coarse_keys, consumer_root),
+            consumer_id=0,
+        )
+        counter = ReadinessCounterPlan((coarse_producer,), (full_consumer,))
+        roots = (producer_root, consumer_root)
+        charge = cross_loop_scheduler._new_relation_work_budget()
+        self.assertTrue(counter.is_root_barrier_equivalent(roots, charge))
+        partial_consumer = _consumer(
+            1,
+            CoordinateRelation.point_map(
+                consumer_root,
+                coarse_keys,
+                (((((20, 0, 3, 1),), (sympy.Integer(0),))),),
+            ),
+        )
+        self.assertFalse(
+            dataclasses.replace(
+                counter, consumers=(partial_consumer,)
+            ).is_root_barrier_equivalent(roots, charge)
+        )
+        self.assertFalse(
+            dataclasses.replace(
+                counter,
+                consumers=(dataclasses.replace(full_consumer, consumer_site_id=7),),
+            ).is_root_barrier_equivalent(roots, charge)
+        )
+        self.assertFalse(
+            dataclasses.replace(
+                counter, continuation_consumer_index=0
+            ).is_root_barrier_equivalent(roots, charge)
         )
 
     def test_two_producer_nested_frontier_uses_shared_wave_domain(self) -> None:

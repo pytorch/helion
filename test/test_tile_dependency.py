@@ -1993,6 +1993,63 @@ class TestTileDependency(TestCase):
             (frozenset((3,)),) * 2,
         )
 
+    def test_rectangular_fibers_recognize_only_full_clipped_axes(self) -> None:
+        keys = CoordinateDomain.scalar(1, kind="event")
+        items = CoordinateDomain.scalar(5, axis=1)
+        for begin, end, step, expected_count in (
+            (-1, 6, 1, 5),
+            (1, 6, 1, None),
+            (0, 4, 1, None),
+            (0, 6, 2, None),
+        ):
+            with self.subTest(begin=begin, end=end, step=step):
+                incidence = Incidence.from_fibers(
+                    CoordinateRelation(
+                        keys,
+                        items,
+                        (
+                            _CoordinateRelationPiece(
+                                ((0, 0, 1, 1),),
+                                ((1, begin, end, step),),
+                            ),
+                        ),
+                    )
+                )
+                if expected_count is None:
+                    self.assertIsNone(incidence.count_by_key)
+                else:
+                    assert incidence.count_by_key is not None
+                    self.assertEqual(
+                        incidence.count_by_key.value_bounds(),
+                        (expected_count, expected_count),
+                    )
+
+        extent = sympy.Symbol("extent", integer=True, positive=True)
+        symbolic = Incidence.from_fibers(
+            CoordinateRelation(
+                keys,
+                CoordinateDomain((1,), ((1, extent),)),
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 1, 1),),
+                        ((1, -1, extent + 1, 1),),
+                    ),
+                ),
+            )
+        )
+        assert symbolic.count_by_key is not None
+        self.assertEqual(
+            symbolic.count_by_key.pieces[0].target_ranges[0][1:3],
+            (extent, extent + 1),
+        )
+        symbolic_domain = CoordinateDomain((2,), ((2, extent),), kind="event")
+        identity = CoordinateRelation.identity(symbolic_domain, symbolic_domain)
+        partition = KeyPartition.projection(symbolic_domain, symbolic_domain)
+        assert partition is not None
+        self.assertIsNotNone(
+            partition.rekey_fine(Incidence.from_fibers(identity, keys_by_item=identity))
+        )
+
     def test_symbolic_uniform_fibers_keep_count_without_dense_order(self) -> None:
         batch = sympy.Symbol("batch", integer=True, positive=True)
         keys = CoordinateDomain((0,), ((0, batch),), kind="event")

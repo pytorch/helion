@@ -981,10 +981,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     self.assertNotIn("tile_dependency_root_barrier", code)
                     self.assertUsesExactReadiness(code)
                 else:
-                    self.assertTrue(
-                        "tile_dependency_readiness_wait" in code
-                        or "tile_dependency_root_barrier_wait" in code
-                    )
+                    self.assertIn("tile_dependency_root_barrier_wait", code)
+                    self.assertNotIn("tile_dependency_readiness_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1063,10 +1061,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertTrue(
-            "tile_dependency_readiness_wait" in code
-            or "tile_dependency_root_barrier_wait" in code
-        )
+        self.assertIn("tile_dependency_root_barrier_wait", code)
+        self.assertNotIn("tile_dependency_readiness_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
