@@ -1057,6 +1057,87 @@ class TestCrossLoopScheduler(TestCase):
             (hoisted,),
         )
 
+    def test_nested_counter_admission_counts_clipped_uniform_fanout(self) -> None:
+        producer_root = _domain((10, 2, 1), identity=0)
+        consumer_root = _domain((20, 3, 1), identity=1)
+        consumer_site = _domain((20, 3, 1), (21, 2, 1), identity=7)
+
+        def counter(
+            consumer_pairs: tuple[tuple[int, int], ...], key_count: int
+        ) -> ReadinessCounterPlan:
+            keys = CoordinateDomain.scalar(key_count, kind="event", identity=0)
+            producer_pairs = (
+                ((0, 0), (0, 1))
+                if key_count == 1
+                else tuple((key, key) for key in range(key_count))
+            )
+            consumer = _consumer(
+                1,
+                _point_relation(consumer_site, keys, consumer_pairs),
+                site_id=7,
+            )
+            return ReadinessCounterPlan(
+                (_producer(0, _point_relation(keys, producer_root, producer_pairs)),),
+                (consumer,),
+            )
+
+        expensive = counter(((0, 0), (1, 0), (3, 0), (4, 0)), 1)
+        useful = counter(((0, 0), (3, 0)), 1)
+        nonuniform = counter(((0, 0), (3, 0), (1, 1)), 2)
+        count = expensive.consumers[0].incidence.count_by_key
+        assert count is not None
+        self.assertEqual(count.value_bounds(), (4, 4))
+        self.assertEqual(
+            cross_loop_scheduler.nested_wait_placement(
+                consumer_root, expensive.consumers[0]
+            ),
+            (21, None),
+        )
+        self.assertEqual(
+            cross_loop_scheduler._without_wave_dominated_nested_counters(
+                _plan((producer_root, consumer_root), 4, counters=(expensive,))
+            ),
+            (),
+        )
+        for retained in (useful, nonuniform):
+            self.assertEqual(
+                cross_loop_scheduler._without_wave_dominated_nested_counters(
+                    _plan((producer_root, consumer_root), 4, counters=(retained,))
+                ),
+                (retained,),
+            )
+
+    def test_nested_counter_admission_derives_missing_consumer_count(self) -> None:
+        producer_root = _domain((10, 2, 1), identity=0)
+        consumer_root = _domain(identity=1)
+        keys = CoordinateDomain.scalar(1, kind="event", identity=0)
+        consumer_site = CoordinateDomain.scalar(6, axis=21, kind="site", identity=7)
+        consumers_by_key = CoordinateRelation(
+            keys,
+            consumer_site,
+            (_CoordinateRelationPiece(((0, 0, 1, 1),), ((21, 1, 5, 1),)),),
+        )
+        keys_by_consumer = CoordinateRelation.point_map(
+            consumer_site,
+            keys,
+            (((((21, 1, 5, 1),), (sympy.Integer(0),))),),
+        )
+        incidence = Incidence._from_constructed(
+            consumers_by_key, keys_by_item=keys_by_consumer
+        )
+        self.assertIsNone(incidence.count_by_key)
+        derived = incidence.with_key_major_order().count_by_key
+        assert derived is not None
+        self.assertEqual(derived.value_bounds(), (4, 4))
+        counter = ReadinessCounterPlan(
+            (_producer(0, _point_relation(keys, producer_root, ((0, 0), (0, 1)))),),
+            (ReadinessConsumer(1, incidence, 0, consumer_site_id=7),),
+        )
+        plan = _plan((producer_root, consumer_root), 4, counters=(counter,))
+        self.assertEqual(
+            cross_loop_scheduler._without_wave_dominated_nested_counters(plan), ()
+        )
+
     def test_coarsened_whole_root_event_uses_barrier(self) -> None:
         producer_root = _domain((10, 1, 1), identity=0)
         consumer_root = _domain((20, 6, 1), identity=1)

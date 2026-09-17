@@ -1066,27 +1066,31 @@ def _without_wave_dominated_nested_counters(
             retained.append(counter)
             continue
         producer, consumer = counter.producers[0], counter.consumers[0]
-        producer_tasks = plan.root_domains[producer.producer_root].size
         consumer_domain = plan.root_domains[consumer.consumer_root]
         arrivals = counter.uniform_arrival_count()
-        placement = nested_wait_placement(consumer_domain, consumer)
-        segment_starts = None if placement is None else placement[1]
-        acquires = (
-            consumer_domain.size * len(segment_starts)
-            if segment_starts is not None
-            else consumer.keys_by_consumer.source_domain.size
-            if placement is not None and consumer.keys_by_consumer.has_total_source()
-            else None
-        )
         if (
             producer.producer_site_id is not None
             or consumer.consumer_site_id is None
             or producer.producer_root >= consumer.consumer_root
             or producer.producer_root in plan.continuation_roots
-            or producer_tasks > plan.worker_count
+            or plan.root_domains[producer.producer_root].size > plan.worker_count
             or arrivals is None
-            or acquires is None
         ):
+            retained.append(counter)
+            continue
+        placement = nested_wait_placement(consumer_domain, consumer)
+        incidence = consumer.incidence
+        counts = incidence.count_by_key or incidence.with_key_major_order().count_by_key
+        bounds = None if counts is None else counts.value_bounds()
+        acquires = None
+        if placement is not None:
+            if (segment_starts := placement[1]) is not None:
+                acquires = consumer_domain.size * len(segment_starts)
+            elif bounds is not None and bounds[0] == bounds[1]:
+                acquires = counter.readiness_key_domain.size * bounds[0]
+            elif consumer.keys_by_consumer.has_total_source():
+                acquires = consumer.keys_by_consumer.source_domain.size
+        if acquires is None:
             retained.append(counter)
             continue
         counter_work = (counter.readiness_key_domain.size * arrivals, acquires)
@@ -1094,12 +1098,8 @@ def _without_wave_dominated_nested_counters(
             plan.root_barrier_arrival_count(producer.producer_root),
             min(plan.worker_count, consumer_domain.size),
         )
-        if not (
-            barrier_work != counter_work
-            and all(
-                left <= right
-                for left, right in zip(barrier_work, counter_work, strict=True)
-            )
+        if barrier_work == counter_work or any(
+            left > right for left, right in zip(barrier_work, counter_work, strict=True)
         ):
             retained.append(counter)
     return tuple(retained)
