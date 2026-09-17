@@ -23,8 +23,8 @@ CONFIG = {
     "indexing": ["pointer"] * 26,
     "pid_type": "persistent_blocked",
     "cross_loop_pipeline": "static",
-    "num_sm_multiplier": 16,
-    "maxnreg": 128,
+    "num_sm_multiplier": 11,
+    "maxnreg": 256,
     "atomic_indexing": [],
 }
 
