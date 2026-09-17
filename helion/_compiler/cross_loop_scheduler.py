@@ -1075,7 +1075,7 @@ class StaticPipelinePlan:
 
 
 def _without_wave_dominated_nested_counters(
-    plan: StaticPipelinePlan,
+    plan: StaticPipelinePlan, dispatch_mode: CrossLoopDispatchMode
 ) -> tuple[ReadinessCounterPlan, ...]:
     """Prefer a barrier when a one-wave producer has strictly cheaper sync."""
     retained = []
@@ -1114,7 +1114,9 @@ def _without_wave_dominated_nested_counters(
         counter_work = (counter.readiness_key_domain.size * arrivals, acquires)
         barrier_work = (
             plan.root_barrier_arrival_count(producer.producer_root),
-            min(plan.worker_count, consumer_domain.size),
+            consumer_domain.size
+            if dispatch_mode == "dynamic"
+            else min(plan.worker_count, consumer_domain.size),
         )
         if barrier_work == counter_work or any(
             left > right for left, right in zip(barrier_work, counter_work, strict=True)
@@ -2976,7 +2978,9 @@ def build_static_pipeline_plan(
             "admit a progress-safe all-resident cross-loop schedule"
         )
 
-    cheaper_counters = _without_wave_dominated_nested_counters(all_resident_plan)
+    cheaper_counters = _without_wave_dominated_nested_counters(
+        all_resident_plan, cross_loop_dispatch_mode
+    )
     if cheaper_counters != all_resident_plan.readiness_counters:
         with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
             cheaper_counters, cheaper_barriers, cheaper_plan = finalize_plan(

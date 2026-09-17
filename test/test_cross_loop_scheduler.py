@@ -1035,7 +1035,9 @@ class TestCrossLoopScheduler(TestCase):
             (22, (0,)),
         )
         self.assertEqual(
-            cross_loop_scheduler._without_wave_dominated_nested_counters(plan),
+            cross_loop_scheduler._without_wave_dominated_nested_counters(
+                plan, "static"
+            ),
             (counter,),
         )
 
@@ -1097,11 +1099,15 @@ class TestCrossLoopScheduler(TestCase):
         hoisted_plan = _plan((producer_root, consumer_root), 4, counters=(hoisted,))
 
         self.assertEqual(
-            cross_loop_scheduler._without_wave_dominated_nested_counters(repeated_plan),
+            cross_loop_scheduler._without_wave_dominated_nested_counters(
+                repeated_plan, "static"
+            ),
             (),
         )
         self.assertEqual(
-            cross_loop_scheduler._without_wave_dominated_nested_counters(hoisted_plan),
+            cross_loop_scheduler._without_wave_dominated_nested_counters(
+                hoisted_plan, "static"
+            ),
             (hoisted,),
         )
 
@@ -1111,7 +1117,9 @@ class TestCrossLoopScheduler(TestCase):
         consumer_site = _domain((20, 3, 1), (21, 2, 1), identity=7)
 
         def counter(
-            consumer_pairs: tuple[tuple[int, int], ...], key_count: int
+            consumer_pairs: tuple[tuple[int, int], ...],
+            key_count: int,
+            site: CoordinateDomain = consumer_site,
         ) -> ReadinessCounterPlan:
             keys = CoordinateDomain.scalar(key_count, kind="event", identity=0)
             producer_pairs = (
@@ -1119,11 +1127,8 @@ class TestCrossLoopScheduler(TestCase):
                 if key_count == 1
                 else tuple((key, key) for key in range(key_count))
             )
-            consumer = _consumer(
-                1,
-                _point_relation(consumer_site, keys, consumer_pairs),
-                site_id=7,
-            )
+            keys_by_consumer = _point_relation(site, keys, consumer_pairs)
+            consumer = _consumer(1, keys_by_consumer, site_id=7)
             return ReadinessCounterPlan(
                 (_producer(0, _point_relation(keys, producer_root, producer_pairs)),),
                 (consumer,),
@@ -1143,17 +1148,42 @@ class TestCrossLoopScheduler(TestCase):
         )
         self.assertEqual(
             cross_loop_scheduler._without_wave_dominated_nested_counters(
-                _plan((producer_root, consumer_root), 4, counters=(expensive,))
+                _plan((producer_root, consumer_root), 4, counters=(expensive,)),
+                "static",
             ),
             (),
         )
         for retained in (useful, nonuniform):
             self.assertEqual(
                 cross_loop_scheduler._without_wave_dominated_nested_counters(
-                    _plan((producer_root, consumer_root), 4, counters=(retained,))
+                    _plan((producer_root, consumer_root), 4, counters=(retained,)),
+                    "static",
                 ),
                 (retained,),
             )
+
+        large_consumer_root = _domain((20, 6, 1), identity=1)
+        large_consumer_site = _domain((20, 6, 1), (21, 2, 1), identity=7)
+        dynamic_sensitive = counter(
+            tuple((consumer, 0) for consumer in range(6)), 1, large_consumer_site
+        )
+        large_plan = _plan(
+            (producer_root, large_consumer_root),
+            4,
+            counters=(dynamic_sensitive,),
+        )
+        self.assertEqual(
+            cross_loop_scheduler._without_wave_dominated_nested_counters(
+                large_plan, "static"
+            ),
+            (),
+        )
+        self.assertEqual(
+            cross_loop_scheduler._without_wave_dominated_nested_counters(
+                large_plan, "dynamic"
+            ),
+            (dynamic_sensitive,),
+        )
 
     def test_nested_counter_admission_derives_missing_consumer_count(self) -> None:
         producer_root = _domain((10, 2, 1), identity=0)
@@ -1183,7 +1213,10 @@ class TestCrossLoopScheduler(TestCase):
         )
         plan = _plan((producer_root, consumer_root), 4, counters=(counter,))
         self.assertEqual(
-            cross_loop_scheduler._without_wave_dominated_nested_counters(plan), ()
+            cross_loop_scheduler._without_wave_dominated_nested_counters(
+                plan, "static"
+            ),
+            (),
         )
 
     def test_coarsened_whole_root_event_uses_barrier(self) -> None:
