@@ -17,6 +17,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_scheduler import CrossLoopDispatchMode
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
 from .cross_loop_scheduler import ReadinessProducer
@@ -574,7 +575,7 @@ def emit_cross_loop_schedule(
     if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
-    if pipeline != "static":
+    if pipeline not in ("static", "dynamic"):
         raise exc.InvalidConfig(f"unknown cross_loop_pipeline value {pipeline!r}")
 
     configured_case_geometries = tuple(
@@ -685,6 +686,7 @@ def emit_cross_loop_schedule(
         publishable_site_ids=publishable_site_ids,
         continuation_ineligible_roots=kernel_scope_roots,
         prove_nonnegative=CompileEnvironment.current().known_nonnegative,
+        cross_loop_dispatch_mode=cast("CrossLoopDispatchMode", pipeline),
     )
     # StaticPipelinePlan accepts only a fixed physical task universe.  Convert
     # task-family offsets only after that invariant has been established.
@@ -716,8 +718,25 @@ def emit_cross_loop_schedule(
     root_barrier_producer_roots = sorted(
         {producer for producer, _consumer in root_barrier_edges}
     )
-    device_function.triton_minimum_resident_programs = strategy.grid_size_expr
+    if static_pipeline_plan.dispatch_mode != pipeline:
+        raise AssertionError("pipeline plan disagrees with configured dispatch mode")
+    uses_packet_dispatch = pipeline == "dynamic"
+    packet_ranges: list[tuple[int, int, int]] = []
+    packet_count = 0
+    for root in static_pipeline_plan.resident_roots:
+        packet_begin = packet_count
+        packet_count += static_pipeline_plan.execution_orders[root].task_count
+        packet_ranges.append((root, packet_begin, packet_count))
+    if packet_count <= 0:
+        raise AssertionError("dynamic packet stream requires at least one task")
+
+    # Static ownership requires every worker to be simultaneously resident.
+    # Dynamic packets rely on monotone admission and exact readiness instead.
+    if not uses_packet_dispatch:
+        device_function.triton_minimum_resident_programs = strategy.grid_size_expr
     device_function.preamble.extend(strategy._persistent_setup_statements(total_expr))
+    if uses_packet_dispatch:
+        strategy.grid_size_expr = str(packet_count)
     readiness_counter_offsets: dict[ReadinessCounterPlan, int] = {}
     readiness_counter_count = 0
     readiness_counter_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
@@ -749,29 +768,73 @@ def emit_cross_loop_schedule(
     )
     readiness_counter_state_offset = reserve_state(readiness_counter_count)
     root_barrier_state_offset = reserve_state(root_barrier_count)
+    epoch_state_count = launch_worker_count if not uses_packet_dispatch else 0
     counter_state_base = str(
-        (launch_worker_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
+        (epoch_state_count + _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS - 1)
         // _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
         * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
-    state_arg = _register_cross_loop_state(
-        device_function,
-        name_hint="tile_dependency_state",
-        numel=(f"{counter_state_base} + {state_count}"),
-        dtype=_CROSS_LOOP_COUNTER_DTYPE,
+    state_arg = (
+        _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_state",
+            numel=(f"{counter_state_base} + {state_count}"),
+            dtype=_CROSS_LOOP_COUNTER_DTYPE,
+        )
+        if epoch_state_count or state_count
+        else None
+    )
+    dispatch_ticket_arg = (
+        _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_dispatch_ticket",
+            numel="1",
+            dtype=torch.uint64,
+        )
+        if uses_packet_dispatch
+        else None
     )
 
     def state_section(offset: int | None) -> str | None:
         if offset is None:
             return None
+        if state_arg is None:
+            raise AssertionError("uint32 cross-loop state was not allocated")
         return f"{state_arg} + ({counter_state_base}) + {offset}"
 
     readiness_counter_arg = state_section(readiness_counter_state_offset)
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
-    result: list[ast.stmt] = [
-        statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
-    ]
+    dispatch_ticket: str | None = None
+    if not uses_packet_dispatch:
+        assert state_arg is not None
+        result: list[ast.stmt] = [
+            statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
+        ]
+    else:
+        assert dispatch_ticket_arg is not None
+        raw_dispatch_ticket = device_function.new_var(
+            "tile_dependency_raw_dispatch_ticket", dce=False
+        )
+        dispatch_ticket = device_function.new_var(
+            "tile_dependency_dispatch_ticket", dce=True
+        )
+        result = [
+            statement_from_string(
+                f"{raw_dispatch_ticket} = tl.atomic_add("
+                f"{dispatch_ticket_arg}, 1, sem='relaxed', scope='gpu')"
+            ),
+            statement_from_string(
+                f"{dispatch_ticket} = tl.cast("
+                f"{raw_dispatch_ticket} % tl.cast("
+                f"{packet_count}, tl.uint64), tl.int32)"
+            ),
+            statement_from_string(
+                f"{epoch_var} = tl.cast("
+                f"{raw_dispatch_ticket} // tl.cast("
+                f"{packet_count}, tl.uint64) + 1, tl.uint32)"
+            ),
+        ]
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
         consumer: tuple(
             sorted(
@@ -1832,11 +1895,89 @@ def emit_cross_loop_schedule(
             )
         ]
 
-    for root in static_pipeline_plan.resident_roots:
-        result.extend(static_root_body(root))
-    result.append(
-        statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
-    )
+    if not uses_packet_dispatch:
+        assert state_arg is not None
+        for root in static_pipeline_plan.resident_roots:
+            result.extend(static_root_body(root))
+        result.append(
+            statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
+        )
+    else:
+        assert dispatch_ticket is not None
+        packet_branches: list[tuple[int, bool, ast.stmt]] = []
+        for root, packet_begin, packet_end in packet_ranges:
+            local_task = f"({dispatch_ticket} - {packet_begin})"
+            task_body = _wait_for_dependencies(
+                device_function=device_function,
+                dependencies=root_barrier_input_dependencies(root),
+                prefix="tile_dependency_root_barrier_wait",
+            )
+            task_body.extend(
+                scheduled_root_task_body(
+                    root,
+                    local_task,
+                    f"{case_offsets[root]} + {local_task}",
+                    (dispatch_ticket,),
+                )
+            )
+            task_body.extend(root_barrier_publication(root))
+            packet_branches.append(
+                (
+                    packet_begin,
+                    root in kernel_scope_roots,
+                    create(
+                        ast.If,
+                        test=expr_from_string(
+                            f"{dispatch_ticket} >= {packet_begin} and "
+                            f"{dispatch_ticket} < {packet_end}"
+                        ),
+                        body=task_body,
+                        orelse=[],
+                    ),
+                )
+            )
+
+        # Kernel-scoped TMEM work cannot cross a Triton helper boundary. Keep
+        # that prefix inline, while outlining one helper-safe suffix so its
+        # register live ranges do not couple to the kernel-scoped roots.
+        last_kernel_scope_branch = next(
+            (
+                index
+                for index in reversed(range(len(packet_branches)))
+                if packet_branches[index][1]
+            ),
+            None,
+        )
+        if last_kernel_scope_branch is not None and last_kernel_scope_branch + 1 < len(
+            packet_branches
+        ):
+            result.extend(
+                branch
+                for _begin, _requires_kernel_scope, branch in packet_branches[
+                    : last_kernel_scope_branch + 1
+                ]
+            )
+            suffix = packet_branches[last_kernel_scope_branch + 1 :]
+            suffix_begin = suffix[0][0]
+            helper_call = _outline_cross_loop_region(
+                device_function,
+                name_hint="tile_dependency_packet_dispatch",
+                body=[branch for _begin, _requires_kernel_scope, branch in suffix],
+                extra_argument_names=(dispatch_ticket, epoch_var),
+                noinline=True,
+            )
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"{dispatch_ticket} >= {suffix_begin}"),
+                    body=[helper_call],
+                    orelse=[],
+                )
+            )
+        else:
+            result.extend(
+                branch for _begin, _requires_kernel_scope, branch in packet_branches
+            )
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)
         != opaque_case_fingerprints
