@@ -263,15 +263,15 @@ def _analyze_integer_expression(
         return (result, result) if exact else (sympy.Integer(0), sympy.Integer(1))
 
     def combine(
-        values: tuple[sympy.Basic, ...], operation: Callable[..., sympy.Expr]
+        values: tuple[sympy.Basic, ...], operation: Callable[..., object]
     ) -> tuple[sympy.Expr, sympy.Expr] | None:
         intervals = tuple(bounds(cast("sympy.Expr", value)) for value in values)
         if None in intervals:
             return None
         concrete = cast("tuple[tuple[sympy.Expr, sympy.Expr], ...]", intervals)
         return (
-            operation(*(item[0] for item in concrete)),
-            operation(*(item[1] for item in concrete)),
+            cast("sympy.Expr", operation(*(item[0] for item in concrete))),
+            cast("sympy.Expr", operation(*(item[1] for item in concrete))),
         )
 
     def bounds(value: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
