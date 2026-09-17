@@ -574,6 +574,27 @@ def _full_bounds(
     return tuple((axis, 0, count, 1) for axis, count in domain.axis_counts_items)
 
 
+def _domain_contains_axes(
+    domain: CoordinateDomain, contained: CoordinateDomain
+) -> bool:
+    counts = domain.axis_count_expressions
+    return all(
+        axis in counts and sympy.simplify(counts[axis] - count) == 0
+        for axis, count in contained.axis_counts_items
+    )
+
+
+def _positional_axis_renaming(
+    current: CoordinateDomain, replacement: CoordinateDomain
+) -> dict[int, int] | None:
+    if len(current.axis_order) != len(replacement.axis_order) or any(
+        sympy.simplify(left - right) != 0
+        for left, right in zip(current.shape_expr, replacement.shape_expr, strict=True)
+    ):
+        return None
+    return dict(zip(current.axis_order, replacement.axis_order, strict=True))
+
+
 def _next_axis(*axis_orders: tuple[int, ...]) -> int:
     return max(itertools.chain.from_iterable(axis_orders), default=-1) + 1
 
@@ -782,12 +803,7 @@ class CoordinateRelation:
         target_domain: CoordinateDomain,
     ) -> CoordinateRelation | None:
         """Project a domain onto a coordinate-compatible subdomain."""
-        source_counts = source_domain.axis_count_expressions
-        if any(
-            axis not in source_counts
-            or sympy.simplify(source_counts[axis] - count) != 0
-            for axis, count in target_domain.axis_counts_items
-        ):
+        if not _domain_contains_axes(source_domain, target_domain):
             return None
         return _full_point_map(
             source_domain,
@@ -799,16 +815,9 @@ class CoordinateRelation:
         self, target_domain: CoordinateDomain
     ) -> CoordinateRelation | None:
         """Rename target axes positionally without changing coordinates."""
-        old_axes = self.target_domain.axis_order
-        new_axes = target_domain.axis_order
-        if len(old_axes) != len(new_axes) or any(
-            sympy.simplify(left - right) != 0
-            for left, right in zip(
-                self.target_domain.shape_expr, target_domain.shape_expr, strict=True
-            )
-        ):
+        renamed_axes = _positional_axis_renaming(self.target_domain, target_domain)
+        if renamed_axes is None:
             return None
-        renamed_axes = dict(zip(old_axes, new_axes, strict=True))
         return CoordinateRelation(
             self.source_domain,
             target_domain,
@@ -828,19 +837,12 @@ class CoordinateRelation:
         self, source_domain: CoordinateDomain
     ) -> CoordinateRelation | None:
         """Rename source axes positionally without changing coordinates."""
-        old_axes = self.source_domain.axis_order
-        new_axes = source_domain.axis_order
-        if len(old_axes) != len(new_axes) or any(
-            sympy.simplify(left - right) != 0
-            for left, right in zip(
-                self.source_domain.shape_expr, source_domain.shape_expr, strict=True
-            )
-        ):
+        renamed_axes = _positional_axis_renaming(self.source_domain, source_domain)
+        if renamed_axes is None:
             return None
-        renamed_axes = dict(zip(old_axes, new_axes, strict=True))
         substitutions = {
             coordinate_axis_symbol(axis): coordinate_axis_symbol(renamed_axes[axis])
-            for axis in old_axes
+            for axis in self.source_domain.axis_order
         }
         return CoordinateRelation(
             source_domain,
@@ -871,12 +873,7 @@ class CoordinateRelation:
         target_domain: CoordinateDomain,
     ) -> CoordinateRelation | None:
         """Existentially drop target axes while preserving the remaining map."""
-        current_counts = self.target_domain.axis_count_expressions
-        if any(
-            axis not in current_counts
-            or sympy.simplify(current_counts[axis] - count) != 0
-            for axis, count in target_domain.axis_counts_items
-        ):
+        if not _domain_contains_axes(self.target_domain, target_domain):
             return None
         retained_axes = frozenset(target_domain.axis_order)
         return CoordinateRelation(
@@ -901,10 +898,8 @@ class CoordinateRelation:
     ) -> CoordinateRelation | None:
         """Union dropped source axes when their images remain rectilinear."""
         current_counts = self.source_domain.axis_count_expressions
-        if len(self.pieces) > _MAX_RELATION_PIECES or any(
-            axis not in current_counts
-            or sympy.simplify(current_counts[axis] - count) != 0
-            for axis, count in source_domain.axis_counts_items
+        if len(self.pieces) > _MAX_RELATION_PIECES or not _domain_contains_axes(
+            self.source_domain, source_domain
         ):
             return None
         retained_axes = frozenset(source_domain.axis_order)
@@ -1022,21 +1017,12 @@ class CoordinateRelation:
                     tuple(target_ranges),
                 )
             )
-        unique_pieces = tuple(dict.fromkeys(pieces))
-        return (
-            None
-            if len(unique_pieces) > _MAX_RELATION_PIECES
-            else CoordinateRelation(source_domain, self.target_domain, unique_pieces)
-        )
+        return CoordinateRelation(source_domain, self.target_domain, tuple(pieces))
 
     def lift_source(self, source_domain: CoordinateDomain) -> CoordinateRelation | None:
         """Add unused source axes without changing any related target set."""
         source_counts = source_domain.axis_count_expressions
-        if any(
-            axis not in source_counts
-            or sympy.simplify(source_counts[axis] - count) != 0
-            for axis, count in self.source_domain.axis_counts_items
-        ):
+        if not _domain_contains_axes(source_domain, self.source_domain):
             return None
         current_axes = frozenset(self.source_domain.axis_order)
         pieces = []
@@ -1056,9 +1042,7 @@ class CoordinateRelation:
                     piece.target_ranges,
                 )
             )
-        return CoordinateRelation(
-            source_domain, self.target_domain, tuple(dict.fromkeys(pieces))
-        )
+        return CoordinateRelation(source_domain, self.target_domain, tuple(pieces))
 
     def then(self, following: CoordinateRelation) -> CoordinateRelation | None:
         """Compose supported point/projection relations without enumeration."""
@@ -1307,9 +1291,7 @@ class CoordinateRelation:
                     ),
                 )
             )
-        return CoordinateRelation(
-            ambient_domain, self.target_domain, tuple(dict.fromkeys(pieces))
-        )
+        return CoordinateRelation(ambient_domain, self.target_domain, tuple(pieces))
 
     def is_total(self) -> bool:
         """Return whether one canonical piece covers the complete product."""
@@ -2140,12 +2122,9 @@ class Incidence:
             key_domain.axis_count_expressions,
             item_domain.axis_count_expressions,
         )
-        if any(
-            axis not in item_counts or sympy.simplify(count - item_counts[axis]) != 0
-            for axis, count in key_counts.items()
-        ) or set(fixed_coordinates) != set(item_domain.axis_order) - set(
-            key_domain.axis_order
-        ):
+        if not _domain_contains_axes(item_domain, key_domain) or set(
+            fixed_coordinates
+        ) != set(item_domain.axis_order) - set(key_domain.axis_order):
             return None
         if any(
             not 0 <= value < item_domain.axis_counts[axis]
@@ -3132,7 +3111,7 @@ def _transpose_projection_or_singletons(
             _CoordinateRelationPiece(tuple(source_bounds), piece.source_bounds_items)
         )
     return CoordinateRelation(
-        relation.target_domain, relation.source_domain, tuple(dict.fromkeys(pieces))
+        relation.target_domain, relation.source_domain, tuple(pieces)
     )
 
 
@@ -3960,7 +3939,7 @@ def _compose_point_relations(
     return CoordinateRelation(
         source_domain=first.source_domain,
         target_domain=following.target_domain,
-        pieces=tuple(dict.fromkeys(pieces)),
+        pieces=tuple(pieces),
     )
 
 
@@ -5037,9 +5016,7 @@ def _rectangular_overlap_sources(
                 ),
             )
         )
-    return CoordinateRelation(
-        query.source_domain, owner.source_domain, tuple(dict.fromkeys(pieces))
-    )
+    return CoordinateRelation(query.source_domain, owner.source_domain, tuple(pieces))
 
 
 def _dense_overlap_sources(
@@ -5143,7 +5120,7 @@ def _dense_overlap_sources(
     return CoordinateRelation(
         query.source_domain,
         relation.source_domain,
-        tuple(dict.fromkeys(pieces)),
+        tuple(pieces),
     )
 
 
