@@ -496,6 +496,22 @@ class TestCrossLoopScheduler(TestCase):
         domain = _domain((10, task_count, 1), identity=0)
         self.assertIsNone(DenseTaskOrder.from_pid(domain, domain.axis_order))
 
+    def test_large_fixed_capacity_schedule_remains_structural(self) -> None:
+        task_count = 50_000_000
+        graph = _dependency_graph([[10]])
+        domain = _domain((10, task_count, 1), identity=0)
+        order = _dense(domain)
+        plan = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=(order,),
+            site_domains=(),
+            worker_count=148,
+        )
+
+        self.assertEqual(plan.execution_orders[0].task_count, task_count)
+        self.assertLessEqual(len(plan.execution_orders[0].tasks_by_ordinal.pieces), 2)
+        self.assertEqual(plan.root_barrier_arrival_count(0), 148)
+
     def test_configured_orders_require_unique_root_identities(self) -> None:
         graph = _dependency_graph([[10], [20]])
         roots = (
