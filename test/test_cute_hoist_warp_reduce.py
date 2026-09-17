@@ -109,3 +109,57 @@ class TestCuteHoistWarpReduce(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # No hoist accumulator names (no V-loop to hoist out of).
         self.assertNotIn("_helion_vfold_acc_", code)
+
+
+@helion.kernel(backend="cute")
+def _four_cluster_sums(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    m, n = x.shape
+    hl.specialize(n)
+    a = torch.empty((m,), device=x.device, dtype=torch.float32)
+    b = torch.empty_like(a)
+    c = torch.empty_like(a)
+    d = torch.empty_like(a)
+    for row in hl.tile(m):
+        xx = x[row, :]
+        yy = y[row, :]
+        sa = xx.sum(-1)
+        sb = yy.sum(-1)
+        sc = (xx * yy).sum(-1)
+        sd = (xx * xx).sum(-1)
+        a[row] = sa
+        b[row] = sb
+        c[row] = sc
+        d[row] = sd
+    return a, b, c, d
+
+
+@onlyBackends(["cute"])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0),
+    reason="thread-block clusters require SM90 or newer",
+)
+@pytest.mark.parametrize("cluster,threads", [(2, 128), (8, 128), (8, 256)])
+@pytest.mark.parametrize("offset", [0, 4])
+def test_packed_cluster_sums_match_torch(
+    cluster: int, threads: int, offset: int
+) -> None:
+    """Every statistic survives packing, including 16-byte-only aligned inputs."""
+    x = torch.randn(7 * 8192 + offset, device=DEVICE)[offset:].reshape(7, 8192)
+    y = torch.randn_like(x)
+    bound = _four_cluster_sums.bind((x, y))
+    cfg = helion.Config(
+        block_sizes=[1],
+        num_threads=[1, threads],
+        cute_vector_widths=[8, 1],
+        cute_lane_layouts=["strided", "blocked"],
+        cute_cluster_n=cluster,
+        cute_reduction_reloads=["register"],
+    )
+    code = bound.to_code(cfg)
+    assert "_cute_grouped_reduce_cluster_sum4(" in code
+    if offset:
+        assert "cute.arch.load(x.iterator" not in code
+    got = bound.compile_config(cfg)(x, y)
+    want = (x.sum(-1), y.sum(-1), (x * y).sum(-1), (x * x).sum(-1))
+    for actual, expected in zip(got, want, strict=True):
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)

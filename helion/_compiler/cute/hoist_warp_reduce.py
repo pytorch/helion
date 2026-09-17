@@ -1096,6 +1096,7 @@ def validate_cluster_reduce_placement(
                         and sub.func.id
                         in (
                             "_cute_grouped_reduce_cluster",
+                            "_cute_grouped_reduce_cluster_sum4",
                             "_cute_grouped_reduce_cluster_online_pair",
                         )
                     ):
