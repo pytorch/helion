@@ -624,7 +624,7 @@ class TestCrossLoopScheduler(TestCase):
             (),
         )
 
-    def test_root_local_preparation_orders_continuation_producers_atomically(
+    def test_root_local_preparation_keeps_order_without_composed_grouping(
         self,
     ) -> None:
         producer = _domain((10, 2, 1), (11, 2, 1), identity=0)
@@ -668,11 +668,10 @@ class TestCrossLoopScheduler(TestCase):
         )
 
         self.assertEqual(baseline.execution_orders[0], _dense(producer, (10, 11)))
-        expected = _dense(producer, (11, 10))
         actual = prepared.execution_orders[0]
         self.assertEqual(
             _relation_pairs(actual.ordinal_by_task),
-            _relation_pairs(expected.ordinal_by_task),
+            _relation_pairs(baseline.execution_orders[0].ordinal_by_task),
         )
         self.assertEqual(prepared.body_orders, baseline.body_orders)
 
@@ -706,17 +705,9 @@ class TestCrossLoopScheduler(TestCase):
             excluded_roots=frozenset((1,)),
             charge=cross_loop_scheduler._new_relation_work_budget(),
         )
-        reflected_ordinal_domain = reflected.execution_orders[
-            0
-        ].ordinal_by_task.target_domain
-        reflected_order = _full_point_map(
-            producer,
-            reflected_ordinal_domain,
-            2 - 2 * coordinate_axis_symbol(10) + coordinate_axis_symbol(11),
-        )
         self.assertEqual(
             _relation_pairs(reflected.execution_orders[0].ordinal_by_task),
-            _relation_pairs(reflected_order),
+            _relation_pairs(baseline.execution_orders[0].ordinal_by_task),
         )
         self.assertEqual(reflected.body_orders, baseline.body_orders)
 
@@ -940,9 +931,7 @@ class TestCrossLoopScheduler(TestCase):
                         ((0, 0, keys.size, 1),),
                         (
                             (20, 0, 3, 1),
-                            (21, key, key + 1, 1)
-                            if per_iteration
-                            else (21, 0, 2, 1),
+                            (21, key, key + 1, 1) if per_iteration else (21, 0, 2, 1),
                         ),
                     ),
                 ),
@@ -957,12 +946,8 @@ class TestCrossLoopScheduler(TestCase):
 
         repeated = counter(per_iteration=True)
         hoisted = counter(per_iteration=False)
-        repeated_plan = _plan(
-            (producer_root, consumer_root), 4, counters=(repeated,)
-        )
-        hoisted_plan = _plan(
-            (producer_root, consumer_root), 4, counters=(hoisted,)
-        )
+        repeated_plan = _plan((producer_root, consumer_root), 4, counters=(repeated,))
+        hoisted_plan = _plan((producer_root, consumer_root), 4, counters=(hoisted,))
 
         self.assertEqual(
             cross_loop_scheduler._nested_counter_acquire_count(
@@ -977,9 +962,7 @@ class TestCrossLoopScheduler(TestCase):
             3,
         )
         self.assertEqual(
-            cross_loop_scheduler._without_wave_dominated_nested_counters(
-                repeated_plan
-            ),
+            cross_loop_scheduler._without_wave_dominated_nested_counters(repeated_plan),
             (),
         )
         self.assertEqual(
