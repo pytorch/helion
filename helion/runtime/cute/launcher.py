@@ -815,6 +815,234 @@ def _append_cute_wrapper_plan(
         elif epi_stg:
             call_args.append("_flash_osl")
         return
+    if kind == "helion_flash_bwd" and plan.get("two_cta"):
+        # 2-CTA cluster variant (FA4 SM100 backward layout): all M-widened
+        # tiled_mmas are CtaGroup.TWO; Q/dO get separate natural- and
+        # transposed-orientation half loads; Kt spans the 256-row cluster KV
+        # tile; sdS is the exchanged dQ A operand.
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        do_idx = plan_int("do_idx")
+        lse_idx = plan_int("lse_idx")
+        delta_idx = plan_int("delta_idx")
+        dq_idx = plan_int("dq_idx")
+        dk_idx = plan_int("dk_idx")
+        dv_idx = plan_int("dv_idx")
+        hd = plan_int("head_dim")
+        tq = plan_int("total_q_rows")
+        tk = plan_int("total_kv_rows")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        bw = "cutlass.utils.blackwell_helpers"
+        ssd = f"(256, 128, {hd})"
+        tsd = f"(256, {hd}, 128)"
+        dqd = f"(128, {hd}, 256)"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        majmn = "cute.nvgpu.OperandMajorMode.MN"
+        cg2 = "cute.nvgpu.tcgen05.CtaGroup.TWO"
+        sel = "cute.select"
+        q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
+        k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+        q_dsb = f"cute.make_layout(({hd}, {tq}, 1), stride=(1, {hd}, {tq * hd}))"
+        k_dsb = f"cute.make_layout(({hd}, {tk}, 1), stride=(1, {hd}, {tk * hd}))"
+        fbwd_lines = [
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_mQT = cute.make_tensor(arg{q_idx}.iterator, {q_dsb})",
+            f"_fbwd_mdOT = cute.make_tensor(arg{do_idx}.iterator, {q_dsb})",
+            f"_fbwd_mKT = cute.make_tensor(arg{k_idx}.iterator, {k_dsb})",
+            f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg2}, (256, 128))",
+            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg2}, (256, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg2}, (128, {hd}))",
+            "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((2, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
+            f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, 1)",
+            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_ktl = {bw}.make_smem_layout_b(_fbwd_dq_mma, {dqd}, {dtype}, 1)",
+            f"_fbwd_dssl = {bw}.make_smem_layout_a(_fbwd_dq_mma, {dqd}, {dtype}, 1)",
+            f"_fbwd_op2 = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg2})",
+            f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op2, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_dot, _fbwd_mdOtN = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do2, _fbwd_mdOtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mdOT, {sel}(_fbwd_dotl, mode=[0, 1, 2]), {tsd}, _fbwd_ts_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_qt, _fbwd_mQtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mQT, {sel}(_fbwd_qtl, mode=[0, 1, 2]), {tsd}, _fbwd_ts_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_kt, _fbwd_mKtT = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op2, _fbwd_mKT, {sel}(_fbwd_ktl, mode=[0, 1, 2]), {dqd}, _fbwd_dq_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 4)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {hd // 64})",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+        ]
+        body.extend(f"    {line}" for line in fbwd_lines)
+        call_args.extend(
+            [
+                "_fbwd_ss_mma",
+                "_fbwd_ts_mma",
+                "_fbwd_dq_mma",
+                "_fbwd_cluster_vmnk",
+                "_fbwd_tma_q",
+                "_fbwd_mQt",
+                "_fbwd_tma_k",
+                "_fbwd_mKt",
+                "_fbwd_tma_v",
+                "_fbwd_mVt",
+                "_fbwd_tma_dot",
+                "_fbwd_mdOtN",
+                "_fbwd_tma_do2",
+                "_fbwd_mdOtT",
+                "_fbwd_tma_qt",
+                "_fbwd_mQtT",
+                "_fbwd_tma_kt",
+                "_fbwd_mKtT",
+                "_fbwd_qsl",
+                "_fbwd_ksl",
+                "_fbwd_vsl",
+                "_fbwd_dosl",
+                "_fbwd_ptl",
+                "_fbwd_dotl",
+                "_fbwd_qtl",
+                "_fbwd_ktl",
+                "_fbwd_dssl",
+                "_fbwd_mLSE",
+                "_fbwd_mDelta",
+                "_fbwd_mDQ",
+                "_fbwd_tma_dq",
+                "_fbwd_mDQt",
+                "_fbwd_dqsl",
+                "_fbwd_mdK",
+                "_fbwd_mdV",
+                "_fbwd_epil",
+                "_fbwd_tma_dv",
+                "_fbwd_mdVt",
+                "_fbwd_tma_dk",
+                "_fbwd_mdKt",
+            ]
+        )
+        return
+    if kind == "helion_flash_bwd":
+        # Fused tcgen05 attention-backward host setup: four tiled_mmas (S/dP
+        # smem-smem, dV tmem-A, dK smem K-major, dQ smem MN-major), TMA atoms
+        # for K/V (per-CTA single tiles) and Q/dO (inner-loop rings), plus the
+        # raw fp32 LSE/delta/dq views and the dK/dV output views.
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        do_idx = plan_int("do_idx")
+        lse_idx = plan_int("lse_idx")
+        delta_idx = plan_int("delta_idx")
+        dq_idx = plan_int("dq_idx")
+        dk_idx = plan_int("dk_idx")
+        dv_idx = plan_int("dv_idx")
+        hd = plan_int("head_dim")
+        tq = plan_int("total_q_rows")
+        tk = plan_int("total_kv_rows")
+        q_stage = plan_int("q_stage")
+        do_stage = plan_int("do_stage")
+        kv_stage = plan_int("kv_stage", 1)
+        epi_stages = hd // 64 * kv_stage
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16")
+        bw = "cutlass.utils.blackwell_helpers"
+        ssd = f"(128, 128, {hd})"
+        tsd = f"(128, {hd}, 128)"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        majmn = "cute.nvgpu.OperandMajorMode.MN"
+        cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        sel = "cute.select"
+        q_sdb = f"cute.make_layout(({tq}, {hd}, 1), stride=({hd}, 1, {tq * hd}))"
+        k_sdb = f"cute.make_layout(({tk}, {hd}, 1), stride=({hd}, 1, {tk * hd}))"
+        fbwd_lines = [
+            f"_fbwd_mQ = cute.make_tensor(arg{q_idx}.iterator, {q_sdb})",
+            f"_fbwd_mK = cute.make_tensor(arg{k_idx}.iterator, {k_sdb})",
+            f"_fbwd_mV = cute.make_tensor(arg{v_idx}.iterator, {k_sdb})",
+            f"_fbwd_mdO = cute.make_tensor(arg{do_idx}.iterator, {q_sdb})",
+            f"_fbwd_ss_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, (128, 128))",
+            f"_fbwd_ts_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            f"_fbwd_dsk_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            f"_fbwd_dq_mma = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majmn}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}))",
+            "_fbwd_cluster_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (_fbwd_ss_mma.thr_id.shape,))",
+            f"_fbwd_ksl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
+            f"_fbwd_vsl = {bw}.make_smem_layout_a(_fbwd_ss_mma, {ssd}, {dtype}, {kv_stage})",
+            f"_fbwd_qsl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {q_stage})",
+            f"_fbwd_dosl = {bw}.make_smem_layout_b(_fbwd_ss_mma, {ssd}, {dtype}, {do_stage})",
+            f"_fbwd_ptl = {bw}.make_smem_layout_a(_fbwd_ts_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_dotl = {bw}.make_smem_layout_b(_fbwd_ts_mma, {tsd}, {dtype}, {do_stage})",
+            f"_fbwd_qtl = {bw}.make_smem_layout_b(_fbwd_dsk_mma, {tsd}, {dtype}, {q_stage})",
+            f"_fbwd_dsnk = {bw}.make_smem_layout_a(_fbwd_dsk_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_dssl = {bw}.make_smem_layout_a(_fbwd_dq_mma, {tsd}, {dtype}, 1)",
+            f"_fbwd_ktl = {bw}.make_smem_layout_b(_fbwd_dq_mma, {tsd}, {dtype}, {kv_stage})",
+            "_fbwd_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cute.nvgpu.tcgen05.CtaGroup.ONE)",
+            f"_fbwd_tma_k, _fbwd_mKt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mK, {sel}(_fbwd_ksl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_v, _fbwd_mVt = cute.nvgpu.make_tiled_tma_atom_A(_fbwd_op, _fbwd_mV, {sel}(_fbwd_vsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_q, _fbwd_mQt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mQ, {sel}(_fbwd_qsl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_tma_do, _fbwd_mdOt = cute.nvgpu.make_tiled_tma_atom_B(_fbwd_op, _fbwd_mdO, {sel}(_fbwd_dosl, mode=[0, 1, 2]), {ssd}, _fbwd_ss_mma, _fbwd_cluster_vmnk.shape)",
+            f"_fbwd_mLSE = cute.make_tensor(arg{lse_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDelta = cute.make_tensor(arg{delta_idx}.iterator, cute.make_layout(({tq},)))",
+            f"_fbwd_mDQ = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq * hd},)))",
+            f"_fbwd_mDQ2 = cute.make_tensor(arg{dq_idx}.iterator, cute.make_layout(({tq}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_dqsl = {bw}.make_smem_layout_epi(cutlass.Float32, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (32, 32), 8)",
+            "_fbwd_tma_dq, _fbwd_mDQt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyReduceBulkTensorTileS2GOp(), _fbwd_mDQ2, cute.select(_fbwd_dqsl, mode=[0, 1]), (32, 32))",
+            f"_fbwd_mdK = cute.make_tensor(arg{dk_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_mdV = cute.make_tensor(arg{dv_idx}.iterator, cute.make_layout(({tk}, {hd}), stride=({hd}, 1)))",
+            f"_fbwd_epil = {bw}.make_smem_layout_epi({dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, (128, 64), {epi_stages})",
+            "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+            "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
+        ]
+        body.extend(f"    {line}" for line in fbwd_lines)
+        call_args.extend(
+            [
+                "_fbwd_ss_mma",
+                "_fbwd_ts_mma",
+                "_fbwd_dsk_mma",
+                "_fbwd_dq_mma",
+                "_fbwd_tma_q",
+                "_fbwd_mQt",
+                "_fbwd_tma_k",
+                "_fbwd_mKt",
+                "_fbwd_tma_v",
+                "_fbwd_mVt",
+                "_fbwd_tma_do",
+                "_fbwd_mdOt",
+                "_fbwd_qsl",
+                "_fbwd_ksl",
+                "_fbwd_vsl",
+                "_fbwd_dosl",
+                "_fbwd_ptl",
+                "_fbwd_qtl",
+                "_fbwd_dotl",
+                "_fbwd_ktl",
+                "_fbwd_dssl",
+                "_fbwd_dsnk",
+                "_fbwd_mLSE",
+                "_fbwd_mDelta",
+                "_fbwd_mDQ",
+                "_fbwd_tma_dq",
+                "_fbwd_mDQt",
+                "_fbwd_dqsl",
+                "_fbwd_mdK",
+                "_fbwd_mdV",
+                "_fbwd_epil",
+                "_fbwd_tma_dv",
+                "_fbwd_mdVt",
+                "_fbwd_tma_dk",
+                "_fbwd_mdKt",
+            ]
+        )
+        return
     if kind == "tcgen05_d_tma":
         d_idx = plan_int("d_idx")
         bm = plan_int("bm")

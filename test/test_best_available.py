@@ -753,6 +753,103 @@ class TestCacheMatching(unittest.TestCase):
             self.assertEqual(len(entries), 1)
             self.assertEqual(entries[0].config.config["block_sizes"], [64, 128])
 
+    def test_find_similar_matches_torch_size_in_spec_key(self):
+        """FROM_BEST_AVAILABLE matches an entry whose spec key holds a torch.Size.
+
+        put() stores ``str()`` of the raw key, and static-shape tensor args put
+        ``torch.Size([...])`` in it.  The lookup must serialize the live key the
+        same way: normalizing it as an object tree turned ``torch.Size`` into a
+        plain tuple, so no tensor kernel ever matched its own cache entries.
+        """
+        fingerprint = (("block_sizes", 2, 1, 1),)
+        fp_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+
+        # Same shape as _concrete_tensor_key for a static-shape torch.Tensor arg
+        base_spec_key = (
+            (torch.float16, torch.Size([2, 32, 64]), (2048, 64, 1), frozenset()),
+            "cuda",
+            False,
+        )
+        self.assertIn("torch.Size(", str(base_spec_key))
+
+        with tempfile.TemporaryDirectory() as cache_dir:
+            self._write_best_config(
+                cache_dir,
+                "torch_size.best_config",
+                hardware="NVIDIA GeForce RTX 4090",
+                spec_key=str(base_spec_key),
+                source_hash="hash1",
+                config_dict={"block_sizes": [64, 128], "num_warps": 4},
+                config_spec_hash=fp_hash,
+                flat_config=[64, 128, 4],
+            )
+
+            mock_search = MagicMock()
+            mock_search._skip_cache = False
+            mock_search.settings = MagicMock()
+            mock_search.settings.autotune_best_available_max_cache_scan = 500
+            mock_search.args = [torch.tensor([1.0], device=DEVICE)]
+            mock_search.config_spec = MagicMock()
+            mock_search.config_spec.cache_fingerprint_hash = MagicMock(
+                return_value=fp_hash
+            )
+            mock_kernel = MagicMock()
+            mock_kernel._base_specialization_key = MagicMock(return_value=base_spec_key)
+            mock_search.kernel.kernel = mock_kernel
+
+            # Use the REAL _get_current_hardware_and_specialization
+            mock_search._get_current_hardware_and_specialization = lambda: (
+                PopulationBasedSearch._get_current_hardware_and_specialization(
+                    mock_search
+                )
+            )
+
+            with (
+                patch(
+                    "helion.autotuner.local_cache.get_helion_cache_dir",
+                    return_value=Path(cache_dir),
+                ),
+                patch(
+                    "helion.autotuner.base_search.get_device_name",
+                    return_value="NVIDIA GeForce RTX 4090",
+                ),
+            ):
+                entries = PopulationBasedSearch._find_similar_cached_configs(
+                    mock_search, max_configs=10
+                )
+
+            self.assertEqual(len(entries), 1)
+            self.assertEqual(entries[0].config.config["block_sizes"], [64, 128])
+
+    def test_current_spec_key_is_normalized_str_of_live_key(self):
+        """The live key is compared in exactly the form put() stores it."""
+
+        def epilogue():
+            pass
+
+        base_spec_key = (
+            (torch.float32, torch.Size([16]), (1,), frozenset()),
+            epilogue.__code__,
+        )
+        mock_search = MagicMock()
+        mock_search.args = [torch.tensor([1.0], device=DEVICE)]
+        mock_search.kernel.kernel._base_specialization_key = MagicMock(
+            return_value=base_spec_key
+        )
+
+        with patch("helion.autotuner.base_search.get_device_name", return_value="hw"):
+            hardware, current = (
+                PopulationBasedSearch._get_current_hardware_and_specialization(
+                    mock_search
+                )
+            )
+
+        self.assertEqual(hardware, "hw")
+        self.assertEqual(current, _normalize_spec_key_str(str(base_spec_key)))
+        self.assertIn("torch.Size([16])", current)
+        self.assertIn("<code>", current)
+        self.assertNotIn("<code object", current)
+
 
 def _make_entry_json(
     hardware: str,

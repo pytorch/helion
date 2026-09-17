@@ -14383,6 +14383,7 @@ class TestCuteLowerings(unittest.TestCase):
             ],
             config_spec=SimpleNamespace(
                 cute_attention_generic_fallback_enabled=False,
+                cute_flash_bwd_search_enabled=False,
                 num_threads=SimpleNamespace(config_get=lambda *args: 0),
                 loop_orders=SimpleNamespace(config_get=lambda *args: None),
                 l2_groupings=SimpleNamespace(config_get=lambda *args: 1),

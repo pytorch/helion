@@ -480,6 +480,55 @@ def _attention_loop_shape(
     return bm, bn, pattern.score_plan
 
 
+def _detect_attention_bwd_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    config: Config,
+) -> bool:
+    """True when the inner Q loop belongs to the fused backward-attention body.
+
+    Gated on the bwd search surface flag (set at DeviceIR time by
+    ``detect_flash_bwd_search_surface``) plus the validated config envelope
+    (flat pid, no reorderings, 128x128 block sizes).
+    """
+    from ..compile_environment import CompileEnvironment
+    from ..host_function import HostFunction
+    from .cute_flash_bwd import match_attention_bwd
+
+    env = CompileEnvironment.current()
+    if not env.config_spec.cute_flash_bwd_search_enabled:
+        return False
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
+        return False
+    root_block_id = device_ir.grid_block_ids[0][0]
+    if len(block_ids) != 1 or block_ids[0] == root_block_id:
+        return False
+    if config.pid_type != "flat":
+        return False
+    if any(grouping != 1 for grouping in config.l2_groupings):
+        return False
+    if any(order != [*range(len(order))] for order in config.loop_orders):
+        return False
+    if any(thread_count != 0 for thread_count in config.num_threads):
+        return False
+    cute_vector_widths = config.config.get("cute_vector_widths", [])
+    if isinstance(cute_vector_widths, list) and any(
+        width != 1 for width in cute_vector_widths
+    ):
+        return False
+    bm = env.block_sizes[block_ids[0]].from_config(config)
+    bn = env.block_sizes[root_block_id].from_config(config)
+    if bm != 128 or bn != 128:
+        return False
+    match = match_attention_bwd(device_ir)
+    if match is None:
+        return False
+    fn.cute_state.attention_flash_bwd_match = match
+    return True
+
+
 def _detect_attention_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -1967,7 +2016,10 @@ class CuteBackend(Backend):
         # or 256 threads (Stage-4 warp-spec producer/consumer split). The custom
         # flash codegen owns the whole device body, so the SIMT thread-axis
         # heuristics below do not apply.
-        if device_function.cute_state.attention_flash_block_ids is not None:
+        if (
+            device_function.cute_state.attention_flash_block_ids is not None
+            or device_function.cute_state.attention_flash_bwd_block_ids is not None
+        ):
             flash_threads = device_function.cute_state.attention_flash_threads
             return launcher_args_with_compile_options(f"block=({flash_threads}, 1, 1)")
 
@@ -2640,6 +2692,15 @@ class CuteBackend(Backend):
                     # whole device body; the FX-graph statement walk is bypassed.
                     mma_mode = True
                     fn.cute_state.attention_flash_block_ids = list(block_ids)
+                elif _detect_attention_bwd_mma_loop(
+                    fn,
+                    block_ids,
+                    config=config,
+                ):
+                    # Fused tcgen05 attention BACKWARD: the dedicated bwd
+                    # codegen emits the whole device body.
+                    mma_mode = True
+                    fn.cute_state.attention_flash_bwd_block_ids = list(block_ids)
                 else:
                     mma_mode = _detect_specialized_mma_loop(
                         fn,
