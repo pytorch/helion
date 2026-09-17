@@ -79,6 +79,11 @@ class FlashCausalSeedTemplate(str, enum.Enum):
     """Versioned causal seed implementation families."""
 
     DEGREE2_V1 = "degree2_v1"
+    # Resident-softmax seed family. DEGREE2_V1 pins the degree-2 compound exp2
+    # packet, which is legal only at FP16/hd64; the resident lowering replaces
+    # exp2_packet with "1x1"/xu anyway (see _flash_resident_softmax_config), so
+    # a resident seed does not need that packet and is not hd64-bound.
+    RESIDENT_V1 = "resident_v1"
 
 
 class FlashTuningDType(str, enum.Enum):
@@ -325,10 +330,22 @@ class FlashCausalTuningPolicy:
         if self.e2e_offset < 0 or self.e2e_offset0 < 0:
             raise ValueError("causal end-to-end offsets must be nonnegative")
         if type(self.seed_template) is not FlashCausalSeedTemplate or (
-            self.seed_template is not FlashCausalSeedTemplate.DEGREE2_V1
+            self.seed_template
+            not in (
+                FlashCausalSeedTemplate.DEGREE2_V1,
+                FlashCausalSeedTemplate.RESIDENT_V1,
+            )
         ):
             raise ValueError(
                 f"unsupported causal seed template: {self.seed_template!r}"
+            )
+        if (
+            self.seed_template is FlashCausalSeedTemplate.RESIDENT_V1
+            and self.softmax_lowering is FlashSoftmaxLowering.STANDARD
+        ):
+            raise ValueError(
+                "the resident causal seed template requires a resident "
+                "softmax lowering"
             )
         if type(self.softmax_lowering) is not FlashSoftmaxLowering or (
             self.softmax_lowering
@@ -362,8 +379,9 @@ class FlashCausalTuningPolicy:
     @property
     def requires_fp16_hd64(self) -> bool:
         """Whether this policy's seed template is limited to FP16/hd64."""
-        # DEGREE2_V1 is currently the only implemented causal seed template and
-        # its emitter is specialized to the FP16/head-dim-64 workload.
+        # DEGREE2_V1's emitter pins the degree-2 compound exp2 packet, which is
+        # specialized to the FP16/head-dim-64 workload. RESIDENT_V1 emits only
+        # head-dim-agnostic values, so it carries no such restriction.
         return self.seed_template is FlashCausalSeedTemplate.DEGREE2_V1
 
 
