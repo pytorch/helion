@@ -26,6 +26,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
@@ -3257,6 +3258,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertEqual(len(add_one._bound_kernels), 1)
 
     @onlyBackends(["triton"])
+    @skipIfRocm("ROCm exposes an unrelated cross-loop dependency in this codegen test")
     @skipIfRefEager("Test checks generated Triton code")
     def test_dynamic_internal_strides_remain_literal(self):
         @helion.kernel(
