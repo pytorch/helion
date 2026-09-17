@@ -811,6 +811,45 @@ class CoordinateRelation:
             tuple(coordinate_axis_symbol(axis) for axis in target_domain.axis_order),
         )
 
+    def converse(self) -> CoordinateRelation | None:
+        """Return an exact construction-supported relational inverse."""
+        source = self.source_domain
+        projection = KeyPartition.projection(self.target_domain, source)
+        if projection is not None and projection.fine_keys_by_coarse_key == self:
+            return projection.coarse_key_by_fine_key
+        dense_inverse = _dense_point_fiber_inverse(self)
+        if dense_inverse is not None:
+            return dense_inverse
+        parameters = source.parameter_symbols | self.target_domain.parameter_symbols
+        pieces = []
+        for piece in self.pieces:
+            if any(
+                step != 1 or sympy.simplify(end - begin) != 1
+                for _axis, begin, end, step in (
+                    piece.source_bounds_items + piece.target_ranges
+                )
+            ):
+                return None
+            source_bounds = tuple(
+                (axis, value, value + 1, 1)
+                for axis, begin, _end, _step in piece.target_ranges
+                if (
+                    value := _simplify_logical_expression(
+                        begin,
+                        domain=source,
+                        source_bounds=piece.source_bounds_items,
+                    )
+                ).free_symbols
+                <= parameters
+                and value.is_integer is True
+            )
+            if len(source_bounds) != len(piece.target_ranges):
+                return None
+            pieces.append(
+                _CoordinateRelationPiece(source_bounds, piece.source_bounds_items)
+            )
+        return CoordinateRelation(self.target_domain, source, tuple(pieces))
+
     def rename_target_axes(
         self, target_domain: CoordinateDomain
     ) -> CoordinateRelation | None:
@@ -872,10 +911,25 @@ class CoordinateRelation:
         self,
         target_domain: CoordinateDomain,
     ) -> CoordinateRelation | None:
-        """Existentially drop target axes while preserving the remaining map."""
+        """Drop target axes only when their clipped fibers stay nonempty."""
         if not _domain_contains_axes(self.target_domain, target_domain):
             return None
         retained_axes = frozenset(target_domain.axis_order)
+        if any(
+            not _target_ranges_are_valid(
+                tuple(
+                    target_range
+                    for target_range in piece.target_ranges
+                    if target_range[0] not in retained_axes
+                ),
+                source_domain=self.source_domain,
+                source_bounds=piece.source_bounds_items,
+                target_domain=self.target_domain,
+                clipped=True,
+            )
+            for piece in self.pieces
+        ):
+            return None
         return CoordinateRelation(
             self.source_domain,
             target_domain,
@@ -897,16 +951,21 @@ class CoordinateRelation:
         source_domain: CoordinateDomain,
     ) -> CoordinateRelation | None:
         """Union dropped source axes when their images remain rectilinear."""
-        current_counts = self.source_domain.axis_count_expressions
-        if len(self.pieces) > _MAX_RELATION_PIECES or not _domain_contains_axes(
-            self.source_domain, source_domain
+        source = self.source_domain
+        current_counts = source.axis_count_expressions
+        retained_axes = frozenset(source_domain.axis_order)
+        dropped_axes = frozenset(source.axis_order) - retained_axes
+        if (
+            len(self.pieces) > _MAX_RELATION_PIECES
+            or not _domain_contains_axes(source, source_domain)
+            or any(
+                not _is_provably_nonnegative(current_counts[axis] - 1, None)
+                for axis in dropped_axes
+            )
         ):
             return None
-        retained_axes = frozenset(source_domain.axis_order)
-        dropped_axes = frozenset(self.source_domain.axis_order) - retained_axes
-        symbols = {
-            coordinate_axis_symbol(axis): axis for axis in self.source_domain.axis_order
-        }
+        symbols = {coordinate_axis_symbol(axis): axis for axis in source.axis_order}
+        parameters = source.parameter_symbols | self.target_domain.parameter_symbols
         pieces: list[_CoordinateRelationPiece] = []
         for piece in self.pieces:
             source_bounds = {
@@ -918,19 +977,19 @@ class CoordinateRelation:
             for target_axis, begin, end, target_step in piece.target_ranges:
                 begin = _simplify_logical_expression(
                     begin,
-                    domain=self.source_domain,
+                    domain=source,
                     source_bounds=piece.source_bounds_items,
                 )
                 end = _simplify_logical_expression(
                     end,
-                    domain=self.source_domain,
+                    domain=source,
                     source_bounds=piece.source_bounds_items,
                 )
                 free_symbols = begin.free_symbols | end.free_symbols
-                if not free_symbols <= symbols.keys():
+                if not free_symbols <= symbols.keys() | parameters:
                     return None
                 eliminated_axes = {
-                    symbols[symbol] for symbol in free_symbols
+                    symbols[symbol] for symbol in free_symbols if symbol in symbols
                 } & dropped_axes
                 if not eliminated_axes:
                     target_ranges.append((target_axis, begin, end, target_step))
@@ -1170,25 +1229,33 @@ class CoordinateRelation:
 
     def source_axes_affecting_targets(self) -> tuple[int, ...] | None:
         """Return source axes that can change the related target set."""
+        source = self.source_domain
         symbols: dict[sympy.Basic, int] = {
-            coordinate_axis_symbol(axis): axis for axis in self.source_domain.axis_order
+            coordinate_axis_symbol(axis): axis for axis in source.axis_order
         }
+        parameters = source.parameter_symbols | self.target_domain.parameter_symbols
         used: set[int] = set()
         full_source_bounds = {
-            axis: (0, self.source_domain.axis_count_expressions[axis], 1)
-            for axis in self.source_domain.axis_order
+            axis: (0, source.axis_count_expressions[axis], 1)
+            for axis in source.axis_order
         }
         for piece in self.pieces:
             for axis, begin, end, step in piece.source_bounds_items:
                 if (begin, end, step) != full_source_bounds[axis]:
                     used.add(axis)
             for _axis, begin, end, _step in piece.target_ranges:
-                for symbol in begin.free_symbols | end.free_symbols:
-                    source_axis = symbols.get(symbol)
-                    if source_axis is None:
-                        return None
-                    used.add(source_axis)
-        return tuple(axis for axis in self.source_domain.axis_order if axis in used)
+                for expression in (begin, end):
+                    simplified = _simplify_logical_expression(
+                        expression,
+                        domain=source,
+                        source_bounds=piece.source_bounds_items,
+                    )
+                    for symbol in simplified.free_symbols:
+                        if symbol in symbols:
+                            used.add(symbols[symbol])
+                        elif symbol not in parameters:
+                            return None
+        return tuple(axis for axis in source.axis_order if axis in used)
 
     @classmethod
     def union_all(
@@ -2059,23 +2126,33 @@ class Incidence:
                 sympy.simplify(fan_in),
                 other_axes=items_by_key.target_domain.axis_order,
             )
-        fiber_size, grouped_items = _key_major_order(
+        if keys_by_item is None:
+            keys_by_item = items_by_key.converse()
+        return cls._attach_key_major_order(
             items_by_key, keys_by_item, count_by_key, structure
         )
-        if fiber_size is not None and keys_by_item is not None:
-            if count_by_key is None:
-                count_by_key = _constant_value_map(
-                    items_by_key.source_domain,
+
+    @classmethod
+    def _attach_key_major_order(
+        cls,
+        items: CoordinateRelation,
+        keys: CoordinateRelation | None,
+        count: CoordinateRelation | None,
+        structure: RectangularFiberSpec | None,
+    ) -> Incidence:
+        """Attach uniform count and order facts proved from paired fibers."""
+        fiber_size, grouped = _key_major_order(items, keys, count, structure)
+        if fiber_size is not None and keys is not None:
+            if count is None:
+                count = _constant_value_map(
+                    items.source_domain,
                     fiber_size,
-                    other_axes=items_by_key.target_domain.axis_order,
+                    other_axes=items.target_domain.axis_order,
                 )
-            elif count_by_key.value_bounds() != (fiber_size, fiber_size):
-                grouped_items = None
+            elif count.value_bounds() != (fiber_size, fiber_size):
+                grouped = None
         return cls._from_constructed(
-            items_by_key,
-            keys_by_item=keys_by_item,
-            count_by_key=count_by_key,
-            grouped_items=grouped_items,
+            items, keys_by_item=keys, count_by_key=count, grouped_items=grouped
         )
 
     @classmethod
@@ -2206,46 +2283,66 @@ class Incidence:
             != partition.coarse_key_by_fine_key.source_domain
         ):
             return None
+
         fine = self if self.count_by_key is not None else self.with_key_major_order()
         count_bounds = (
             None if fine.count_by_key is None else fine.count_by_key.value_bounds()
         )
         composed = partition.as_incidence().then(fine)
         if (
-            composed is None
-            or count_bounds is None
-            or count_bounds[0] != count_bounds[1]
+            composed is not None
+            and count_bounds is not None
+            and count_bounds[0] == count_bounds[1]
         ):
-            return None
-        assert fine.keys_by_item is not None
-        partition_counts = partition.fine_key_count_by_coarse_key
-        if (
-            not fine.keys_by_item.is_single_valued()
-            and partition_counts.value_bounds() != (1, 1)
-        ):
-            derived = composed.with_key_major_order()
-            return derived if derived.count_by_key is not None else None
-        factor = count_bounds[0]
-        if factor == 1:
-            counts = partition_counts
-        else:
-            (axis,) = partition_counts.target_domain.axis_order
-            counts = CoordinateRelation.point_map(
-                partition_counts.source_domain,
-                CoordinateDomain.scalar(
-                    factor * (partition_counts.target_domain.size - 1) + 1,
-                    axis=axis,
-                    kind="value",
-                ),
-                tuple(
-                    (piece.source_bounds_items, (factor * piece.target_ranges[0][1],))
-                    for piece in partition_counts.pieces
-                ),
-            )
-        return Incidence._from_constructed(
-            composed.items_by_key,
-            keys_by_item=composed.keys_by_item,
-            count_by_key=counts,
+            assert fine.keys_by_item is not None
+            partition_counts = partition.fine_key_count_by_coarse_key
+            if (
+                not fine.keys_by_item.is_single_valued()
+                and partition_counts.value_bounds() != (1, 1)
+            ):
+                derived = composed.with_key_major_order()
+                if derived.count_by_key is not None:
+                    return derived
+            else:
+                factor = count_bounds[0]
+                counts = partition_counts
+                if factor != 1:
+                    (axis,) = partition_counts.target_domain.axis_order
+                    counts = CoordinateRelation.point_map(
+                        partition_counts.source_domain,
+                        CoordinateDomain.scalar(
+                            factor * (partition_counts.target_domain.size - 1) + 1,
+                            axis=axis,
+                            kind="value",
+                        ),
+                        tuple(
+                            (
+                                piece.source_bounds_items,
+                                (factor * piece.target_ranges[0][1],),
+                            )
+                            for piece in partition_counts.pieces
+                        ),
+                    )
+                return Incidence._from_constructed(
+                    composed.items_by_key,
+                    keys_by_item=composed.keys_by_item,
+                    count_by_key=counts,
+                )
+        coarse_domain = partition.coarse_key_by_fine_key.target_domain
+        projection = CoordinateRelation.projection(
+            self.items_by_key.source_domain, coarse_domain
+        )
+        affecting = self.items_by_key.source_axes_affecting_targets()
+        projected = (
+            self.items_by_key.project_source(coarse_domain)
+            if projection == partition.coarse_key_by_fine_key
+            and affecting is not None
+            and frozenset(affecting) <= frozenset(coarse_domain.axis_order)
+            else None
+        )
+        result = None if projected is None else Incidence.from_fibers(projected)
+        return (
+            result if result is not None and result.count_by_key is not None else None
         )
 
     def rename_domains(
@@ -2307,33 +2404,17 @@ class Incidence:
         """Attach construction-certified count and key-major item order."""
         if self.grouped_items is not None or self.keys_by_item is None:
             return self
-        fiber_size, grouped = _key_major_order(
+        result = Incidence._attach_key_major_order(
             self.items_by_key,
             self.keys_by_item,
             self.count_by_key,
             None,
         )
-        if fiber_size is None and (grouped is None or self.count_by_key is None):
-            return self
-        count = self.count_by_key
-        if count is None:
-            assert fiber_size is not None
-            count = _constant_value_map(
-                self.items_by_key.source_domain,
-                fiber_size,
-                other_axes=self.items_by_key.target_domain.axis_order,
-            )
-        elif fiber_size is not None and count.value_bounds() != (
-            fiber_size,
-            fiber_size,
+        if result.count_by_key is None or (
+            result.grouped_items is None and self.count_by_key is not None
         ):
-            grouped = None
-        return Incidence._from_constructed(
-            self.items_by_key,
-            keys_by_item=self.keys_by_item,
-            count_by_key=count,
-            grouped_items=grouped,
-        )
+            return self
+        return result
 
     def then(self, following: Incidence) -> Incidence | None:
         """Compose two paired incidences without rediscovering either reverse."""
@@ -2361,7 +2442,7 @@ class Incidence:
                     keys.target_domain, keys.target_domain
                 ).rename_target_axes(keys.source_domain)
                 if keys.is_positional_bijection()
-                else _transpose_projection_or_singletons(keys)
+                else keys.converse()
             )
         if items is None or keys is None:
             return None
@@ -3072,47 +3153,82 @@ def _in_domain_point_support(
     return tuple((axis, *bounds[axis]) for axis in source_domain.axis_order)
 
 
-def _transpose_projection_or_singletons(
+def _dense_point_fiber_inverse(
     relation: CoordinateRelation,
 ) -> CoordinateRelation | None:
-    """Transpose a coordinate projection or explicit singleton pair cells."""
-    projection = KeyPartition.projection(relation.target_domain, relation.source_domain)
-    if projection is not None and projection.fine_keys_by_coarse_key == relation:
-        return projection.coarse_key_by_fine_key
-    pieces = []
-    for piece in relation.pieces:
-        if any(
-            step != 1 or sympy.simplify(end - begin) != 1
-            for _axis, begin, end, step in piece.source_bounds_items
-        ):
-            return None
-        source_bounds = []
-        for axis, begin, end, step in piece.target_ranges:
-            bounds = _logical_expression_bounds(
-                begin,
-                domain=relation.source_domain,
-                source_bounds=piece.source_bounds_items,
-            )
-            if (
-                step != 1
-                or bounds is None
-                or sympy.simplify(bounds[1] - bounds[0]) != 0
-            ):
-                return None
-            end_bounds = _logical_expression_bounds(
-                end,
-                domain=relation.source_domain,
-                source_bounds=piece.source_bounds_items,
-            )
-            if end_bounds is None or sympy.simplify(end_bounds[0] - bounds[0]) != 1:
-                return None
-            source_bounds.append((axis, bounds[0], end_bounds[0], 1))
-        pieces.append(
-            _CoordinateRelationPiece(tuple(source_bounds), piece.source_bounds_items)
-        )
-    return CoordinateRelation(
-        relation.target_domain, relation.source_domain, tuple(pieces)
+    """Invert one dense mixed-radix point embedding on its exact support."""
+    source, target_domain = relation.source_domain, relation.target_domain
+    piece = relation.pieces[0] if len(relation.pieces) == 1 else None
+    if piece is None or piece.source_bounds_items != _full_bounds(source):
+        return None
+    bounds = piece.source_bounds_items
+    expressions = tuple(
+        (axis, _simplify_logical_expression(begin, source, bounds))
+        for axis, begin, end, step in piece.target_ranges
+        if step == 1 and sympy.simplify(end - begin) == 1
     )
+    varying = tuple(pair for pair in expressions if pair[1].free_symbols)
+    if (
+        len(expressions) != len(piece.target_ranges)
+        or len(varying) != 1
+        or not _target_ranges_are_valid(
+            tuple((axis, value, value + 1, 1) for axis, value in expressions),
+            source_domain=source,
+            source_bounds=bounds,
+            target_domain=target_domain,
+            clipped=False,
+        )
+    ):
+        return None
+    varying_axis, expression = varying[0]
+    affine = _static_affine_coefficients(expression, domain=source)
+    if affine is None:
+        return None
+    coefficients, offset = affine
+    active = tuple(
+        axis
+        for _value, axis in sorted(
+            (value, axis) for axis, value in coefficients.items() if value
+        )
+    )
+    order = DenseTaskOrder.from_pid(
+        source, active + tuple(axis for axis in source.axis_order if axis not in active)
+    )
+    ordinal = (
+        None
+        if order is None or not order.ordinal_by_task.pieces
+        else _simplify_logical_expression(
+            order.ordinal_by_task.pieces[0].target_ranges[0][1], source, bounds
+        )
+    )
+    if (
+        not active
+        or order is None
+        or ordinal is None
+        or sympy.simplify(expression - offset - ordinal)
+        or any(
+            axis != varying_axis and not isinstance(value, sympy.Integer)
+            for axis, value in expressions
+        )
+    ):
+        return None
+    target = coordinate_axis_symbol(varying_axis)
+    ordinal_by_target = CoordinateRelation.point_map(
+        target_domain,
+        order.tasks_by_ordinal.source_domain,
+        (
+            (
+                tuple(
+                    (axis, offset, offset + order.task_count, 1)
+                    if axis == varying_axis
+                    else (axis, value, value + 1, 1)
+                    for axis, value in expressions
+                ),
+                (target - offset,),
+            ),
+        ),
+    )
+    return ordinal_by_target.then(order.tasks_by_ordinal)
 
 
 def _source_bounds_are_disjoint(
@@ -3139,11 +3255,12 @@ def _source_boxes_partition_domain(
     """Prove that distinct concrete boxes partition a finite domain."""
     if not boxes or not _relation_product_is_within_budget(len(boxes), len(boxes)):
         return False
-    if not domain.axis_order:
-        return boxes == ((),)
     if boxes == (_full_bounds(domain),):
         return True
-    counts = domain.axis_counts
+    try:
+        counts = domain.axis_counts
+    except ValueError:
+        return False
     if any(
         tuple(axis for axis, _begin, _end, _step in box) != domain.axis_order
         or any(
@@ -3151,29 +3268,18 @@ def _source_boxes_partition_domain(
             for axis, begin, end, step in box
         )
         for box in boxes
+    ) or any(
+        not _source_bounds_are_disjoint(*pair)
+        for pair in itertools.combinations(boxes, 2)
     ):
         return False
-    if (
+    return (
         sum(
             math.prod(_ceil_div(end - begin, step) for _axis, begin, end, step in box)
             for box in boxes
         )
-        != domain.size
-    ):
-        return False
-
-    sweep_index = max(
-        range(len(domain.axis_order)),
-        key=lambda index: len({(box[index][1], box[index][2]) for box in boxes}),
+        == domain.size
     )
-    active: list[ConcreteRelationBounds] = []
-    for box in sorted(boxes, key=lambda item: item[sweep_index][1]):
-        begin = box[sweep_index][1]
-        active = [other for other in active if other[sweep_index][2] > begin]
-        if any(not _source_bounds_are_disjoint(other, box) for other in active):
-            return False
-        active.append(box)
-    return True
 
 
 def _key_major_order(
@@ -3653,49 +3759,45 @@ def _linearize_fibers(
 
 
 def _single_axis_floor_point(
-    begin: sympy.Expr,
-    end: sympy.Expr,
+    expression: sympy.Expr,
     *,
     domain: CoordinateDomain,
 ) -> tuple[int, int, int, int, int] | None:
     """Recognize ``floor((a * axis + b) / d) + c`` point mappings."""
-    if end != begin + 1 and sympy.simplify(end - begin) != 1:  # pyrefly: ignore[unsupported-operation]
-        return None
     source_symbols = {coordinate_axis_symbol(axis): axis for axis in domain.axis_order}
-    if len(begin.free_symbols) != 1:
+    if len(expression.free_symbols) != 1:
         return None
-    (symbol,) = begin.free_symbols
+    (symbol,) = expression.free_symbols
     axis = source_symbols.get(symbol)
     if axis is None:
         return None
     floor_terms = tuple(
         term
-        for term in sympy.Add.make_args(begin)
+        for term in sympy.Add.make_args(expression)
         if term.func in (sympy.floor, FloorDiv)
     )
     if len(floor_terms) != 1:
         return None
     (floor_term,) = floor_terms
-    output_offset = sympy.simplify(begin - floor_term)  # pyrefly: ignore[unsupported-operation]
-    if output_offset.free_symbols or output_offset.is_integer is not True:
-        return None
-    numerator, denominator = (
-        floor_term.args
-        if floor_term.func is FloorDiv
-        else sympy.fraction(sympy.together(floor_term.args[0]))
+    quotient = _static_integer_quotient(cast("sympy.Expr", floor_term))
+    affine = (
+        None
+        if quotient is None
+        else _static_affine_coefficients(quotient[0], domain=domain)
     )
-    numerator = sympy.expand(numerator)
-    stride = numerator.coeff(symbol)
-    offset = sympy.simplify(numerator - stride * symbol)
-    if any(
-        value.free_symbols or value.is_integer is not True
-        for value in (denominator, stride, offset)
+    output_offset = sympy.simplify(expression - floor_term)
+    if (
+        quotient is None
+        or affine is None
+        or output_offset.free_symbols
+        or output_offset.is_integer is not True
     ):
         return None
-    divisor, stride_value = int(denominator), int(stride)
-    if divisor <= 0 or stride_value <= 0:
+    coefficients, offset = affine
+    varying = tuple((key, value) for key, value in coefficients.items() if value)
+    if len(varying) != 1 or varying[0][0] != axis:
         return None
-    return axis, stride_value, int(offset), divisor, int(output_offset)
+    return axis, varying[0][1], offset, quotient[1], int(output_offset)
 
 
 def _point_expression_preimage(
@@ -3773,7 +3875,6 @@ def _point_expression_preimage(
         )
     floor_point = _single_axis_floor_point(
         expression,
-        expression + 1,  # pyrefly: ignore[unsupported-operation]
         domain=domain,
     )
     if floor_point is None:
@@ -5136,7 +5237,7 @@ def _access_incidence(
         items = _dense_overlap_sources(owner, query_relation, prove_nonnegative)
     if items is None:
         return None
-    keys = _transpose_projection_or_singletons(items)
+    keys = items.converse()
     if keys is None:
         keys = _rectangular_overlap_sources(query_relation, owner_relation)
     if keys is None:

@@ -31,7 +31,6 @@ from helion._compiler.tile_dependency import _access_layout
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_access_map
-from helion._compiler.tile_dependency import _transpose_projection_or_singletons
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
@@ -114,7 +113,7 @@ def _incidence(items_by_key: CoordinateRelation, *, grouped: bool = False) -> In
             for source, targets in enumerate(fibers)
         ),
     )
-    keys_by_item = _transpose_projection_or_singletons(items_by_key)
+    keys_by_item = items_by_key.converse()
     if keys_by_item is None:
         pairs = [
             (target, source)
@@ -1993,6 +1992,185 @@ class TestTileDependency(TestCase):
             (frozenset((3,)),) * 2,
         )
 
+    def test_dense_point_fibers_preserve_unused_source_axis(self) -> None:
+        consumers = CoordinateDomain(
+            (10, 11, 12), ((10, 3), (11, 4), (12, 2)), kind="site"
+        )
+        producers = CoordinateDomain((20, 21), ((20, 8), (21, 1)), kind="site")
+        group, query, child = map(coordinate_axis_symbol, consumers.axis_order)
+        begin = 1 + 2 * group + child + sympy.floor(query / 4)
+        relation = CoordinateRelation(
+            consumers,
+            producers,
+            (
+                _CoordinateRelationPiece(
+                    tuple(
+                        (axis, 0, consumers.axis_counts[axis], 1)
+                        for axis in consumers.axis_order
+                    ),
+                    (
+                        (
+                            20,
+                            begin,
+                            2 * group
+                            + child
+                            + sympy.ceiling(query / 4 + sympy.Rational(5, 4)),
+                            1,
+                        ),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        reduced = CoordinateDomain((10, 12), ((10, 3), (12, 2)), kind="event")
+        partition = KeyPartition.projection(consumers, reduced)
+        assert partition is not None
+        self.assertEqual(relation.source_axes_affecting_targets(), (10, 12))
+        self.assertIsNone(relation.converse())
+        incidence = Incidence._from_constructed(relation).coarsen(partition)
+        assert incidence is not None
+        assert incidence.count_by_key is not None
+        self.assertEqual(incidence.count_by_key.value_bounds(), (1, 1))
+        assert incidence.keys_by_item is not None
+        for producer in range(producers.size):
+            expected = frozenset()
+            if 1 <= producer < 7:
+                value = producer - 1
+                expected = frozenset(
+                    (_index(reduced, {10: value // 2, 12: value % 2}),)
+                )
+            self.assertEqual(_targets(incidence.keys_by_item, producer), expected)
+
+        gapped_producers = CoordinateDomain((20, 21), ((20, 9), (21, 1)), kind="site")
+        gapped = CoordinateRelation(
+            reduced,
+            gapped_producers,
+            (
+                _CoordinateRelationPiece(
+                    tuple(
+                        (axis, 0, reduced.axis_counts[axis], 1)
+                        for axis in reduced.axis_order
+                    ),
+                    (
+                        (20, 1 + 3 * group + child, 2 + 3 * group + child, 1),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(gapped.converse())
+
+        five_queries = CoordinateDomain(
+            (10, 11, 12), ((10, 3), (11, 5), (12, 2)), kind="site"
+        )
+        group, query, child = map(coordinate_axis_symbol, five_queries.axis_order)
+        nonconstant_quotient = CoordinateRelation(
+            five_queries,
+            producers,
+            (
+                _CoordinateRelationPiece(
+                    tuple(
+                        (axis, 0, five_queries.axis_counts[axis], 1)
+                        for axis in five_queries.axis_order
+                    ),
+                    (
+                        (
+                            20,
+                            1 + 2 * group + child + sympy.floor(query / 4),
+                            2 * group
+                            + child
+                            + sympy.ceiling(query / 4 + sympy.Rational(5, 4)),
+                            1,
+                        ),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(
+            nonconstant_quotient.source_axes_affecting_targets(), (10, 11, 12)
+        )
+        self.assertIsNone(nonconstant_quotient.converse())
+
+        conditional_support = CoordinateRelation(
+            consumers,
+            producers,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 3, 1), (11, 0, group, 1), (12, 0, 2, 1)),
+                    (
+                        (20, 1 + 2 * group + child, 2 + 2 * group + child, 1),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            Incidence._from_constructed(conditional_support).coarsen(partition)
+        )
+
+    def test_target_projection_does_not_widen_clipped_support(self) -> None:
+        producers = CoordinateDomain.scalar(4, axis=0, kind="site")
+        consumers = CoordinateDomain((1, 2), ((1, 1), (2, 4)), kind="event")
+        retained = CoordinateDomain.scalar(1, axis=1, kind="event")
+        producer = coordinate_axis_symbol(0)
+        reverse = CoordinateRelation(
+            producers,
+            consumers,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 4, 1),),
+                    ((1, 0, 1, 1), (2, 4 * producer - 12, 4 * producer - 8, 1)),
+                ),
+            ),
+        )
+        self.assertIsNone(reverse.project_target(retained))
+        forward = CoordinateRelation.point_map(
+            consumers,
+            producers,
+            (((((1, 0, 1, 1), (2, 0, 4, 1)), (3,))),),
+        )
+        count = CoordinateRelation.point_map(
+            consumers,
+            CoordinateDomain.scalar(2, axis=3, kind="value"),
+            (((((1, 0, 1, 1), (2, 0, 4, 1)), (1,))),),
+        )
+        partition = KeyPartition.projection(consumers, retained)
+        assert partition is not None
+        incidence = Incidence._from_constructed(
+            forward, keys_by_item=reverse, count_by_key=count
+        ).coarsen(partition)
+        assert incidence is not None
+        assert incidence.keys_by_item is not None
+        assert incidence.count_by_key is not None
+        self.assertEqual(_materialize(incidence.items_by_key), (frozenset((3,)),))
+        self.assertEqual(
+            _materialize(incidence.keys_by_item),
+            (frozenset(), frozenset(), frozenset(), frozenset((0,))),
+        )
+        self.assertEqual(incidence.count_by_key.value_bounds(), (1, 1))
+
+    def test_source_axes_ignore_known_domain_parameters(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, positive=True)
+        unknown = sympy.Symbol("unknown", integer=True, nonnegative=True)
+        source = CoordinateDomain.scalar(extent, axis=1, kind="site")
+        target = CoordinateDomain.scalar(extent, axis=2, kind="site")
+
+        def relation(value: sympy.Expr) -> CoordinateRelation:
+            return CoordinateRelation(
+                source,
+                target,
+                (
+                    _CoordinateRelationPiece(
+                        ((1, 0, extent, 1),),
+                        ((2, value, value + 1, 1),),
+                    ),
+                ),
+            )
+
+        self.assertEqual(relation(extent - 1).source_axes_affecting_targets(), ())
+        self.assertIsNone(relation(unknown).source_axes_affecting_targets())
+
     def test_rectangular_fibers_recognize_only_full_clipped_axes(self) -> None:
         keys = CoordinateDomain.scalar(1, kind="event")
         items = CoordinateDomain.scalar(5, axis=1)
@@ -2372,8 +2550,40 @@ class TestTileDependency(TestCase):
             True,
         )
         self.assertIn(extent, relation.source_domain.parameter_symbols)
+        self.assertTrue(relation.is_total_function())
         self.assertEqual(access.tensor_shape, (extent,))
         self.assertEqual(access, dataclasses.replace(access))
+
+        expanded_source = CoordinateDomain(
+            (10, 11), ((10, extent), (11, sympy.Integer(4))), identity=0
+        )
+        offset_relation = CoordinateRelation.point_map(
+            expanded_source,
+            CoordinateDomain.scalar(2 * extent, axis=20, kind="site", identity=1),
+            (
+                (
+                    ((10, 0, extent, 1), (11, 0, 4, 1)),
+                    (extent + coordinate,),
+                ),
+            ),
+        )
+        projected = offset_relation.project_source(source)
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertIn(extent, projected.pieces[0].target_ranges[0][1].free_symbols)
+
+        empty_source = CoordinateDomain(
+            (10, 11),
+            ((10, extent), (11, sympy.Integer(0))),
+            identity=0,
+            _allow_empty=True,
+        )
+        empty_relation = CoordinateRelation.point_map(
+            empty_source,
+            target,
+            (((((10, 0, extent, 1), (11, 0, 0, 1)), (coordinate,))),),
+        )
+        self.assertIsNone(empty_relation.project_source(source))
 
         tiled = TileAccess(
             1,
