@@ -1,6 +1,8 @@
 retryable_workflows:
   - "test"
+  - "Tests"
   - "benchmark"
+  - "Benchmark"
 retryable_step_names:
   - "Install PyTorch"
   - "Install Triton from source"
