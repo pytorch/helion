@@ -722,7 +722,9 @@ def emit_cross_loop_schedule(
     readiness_counter_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     for plan in all_readiness_counter_plans:
         readiness_counter_offsets[plan] = readiness_counter_count
-        readiness_counter_count += plan.readiness_key_count * readiness_counter_stride
+        readiness_counter_count += (
+            plan.readiness_key_domain.size * readiness_counter_stride
+        )
     root_barrier_indices = {
         root: index for index, root in enumerate(root_barrier_producer_roots)
     }
@@ -858,7 +860,8 @@ def emit_cross_loop_schedule(
     scheduled_task_roots = {
         root
         for root, order in enumerate(static_pipeline_plan.execution_orders)
-        if order.ordinal_by_task != static_pipeline_plan.body_pid_by_task[root]
+        if order.ordinal_by_task
+        != static_pipeline_plan.body_orders[root].ordinal_by_task
     }
     readiness_consumers_by_root: dict[
         int,
@@ -1133,9 +1136,7 @@ def emit_cross_loop_schedule(
             piece_values: dict[int, str] = {}
             for axis, begin, end, step in piece.target_ranges:
                 unit_width = step == 1 and (
-                    sympy.simplify(
-                        end - begin
-                    )  # pyrefly: ignore[unsupported-operation]
+                    sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
                     == 1
                 )
                 if not unit_width and not (
@@ -1424,7 +1425,7 @@ def emit_cross_loop_schedule(
             root_axis_counts[continuation_root],
         )
         consumer_body_pid, body_pid_membership = relation_flat_target(
-            static_pipeline_plan.body_pid_by_task[continuation_root],
+            static_pipeline_plan.body_orders[continuation_root].ordinal_by_task,
             consumer_coordinates,
             trusted_total_point_map=True,
         )
@@ -1639,7 +1640,7 @@ def emit_cross_loop_schedule(
                 "tile_dependency_scheduled_pid_task", dce=True
             )
             pid_task_expression, pid_membership = relation_flat_target(
-                static_pipeline_plan.body_pid_by_task[root],
+                static_pipeline_plan.body_orders[root].ordinal_by_task,
                 scheduled_coordinates,
                 trusted_total_point_map=True,
             )

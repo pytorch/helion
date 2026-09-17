@@ -221,9 +221,6 @@ class ReadinessGraph:
         ):
             raise ValueError("event IDs must be dense and source ordered")
 
-    def event(self, event_id: int) -> ReadinessEvent:
-        return self.events[event_id]
-
 
 def _supports_readiness_counter_lowering(
     readiness_producer: ReadinessProducer,
@@ -357,11 +354,6 @@ class ReadinessCounterPlan:
             return None
         return self.consumers[self.continuation_consumer_index]
 
-    @property
-    def readiness_key_count(self) -> int:
-        """Return the complete readiness-key count."""
-        return self.readiness_key_domain.size
-
     def uniform_arrival_count(self) -> int | None:
         """Return constant fan-in without enumerating readiness keys."""
         bounds = _arrival_count_bounds(self.producers)
@@ -375,7 +367,7 @@ class ReadinessCounterPlan:
         """Return whether this counter is exactly a set of root barriers."""
         if (
             self.continuation_consumer_index is not None
-            or self.readiness_key_count != 1
+            or self.readiness_key_domain.size != 1
             or len(self.producers) != 1
         ):
             return False
@@ -413,22 +405,17 @@ def _emitted_final_arrival_continuations(
     result: list[FinalArrivalContinuation] = []
     consumer_roots: set[int] = set()
     for plan in readiness_counters:
-        index = plan.continuation_consumer_index
-        if index is None:
+        if (consumer := plan.continuation_consumer) is None:
             continue
         event_id = plan.readiness_key_domain.identity
-        consumer_id = plan.consumers[index].consumer_id
         if event_id is None or not 0 <= event_id < len(readiness_graph.events):
             return None
-        continuation = FinalArrivalContinuation(event_id, consumer_id)
-        event = readiness_graph.event(continuation.event_id)
+        continuation = FinalArrivalContinuation(event_id, consumer.consumer_id)
+        event = readiness_graph.events[continuation.event_id]
         if not 0 <= continuation.consumer_index < len(event.consumers):
             return None
         consumer_root = event.consumers[continuation.consumer_index].consumer_root
-        if (
-            consumer_root != plan.consumers[index].consumer_root
-            or consumer_root in consumer_roots
-        ):
+        if consumer_root != consumer.consumer_root or consumer_root in consumer_roots:
             return None
         consumer_roots.add(consumer_root)
         result.append(continuation)
@@ -507,7 +494,7 @@ def _contract_static_producer_incidences(
         if not 0 <= continuation.event_id < len(readiness_graph.events):
             memo[key] = None
             return None
-        event = readiness_graph.event(continuation.event_id)
+        event = readiness_graph.events[continuation.event_id]
         if not 0 <= continuation.consumer_index < len(event.consumers):
             memo[key] = None
             return None
@@ -844,7 +831,7 @@ def _compact_nested_loop_counters_for_schedule(
         if event_id is None or not 0 <= event_id < len(readiness_graph.events):
             result.append(plan)
             continue
-        event = readiness_graph.event(event_id)
+        event = readiness_graph.events[event_id]
         if (
             not 0 <= consumer.consumer_id < len(event.consumers)
             or event.consumers[consumer.consumer_id] is not consumer
@@ -870,7 +857,8 @@ def _compact_nested_loop_counters_for_schedule(
             else _keys_by_consumer_root_task(readiness_graph, entry_consumer)
         )
         entry_is_smaller = (
-            entry is not None and plan.readiness_key_count > entry.readiness_key_count
+            entry is not None
+            and plan.readiness_key_domain.size > entry.readiness_key_domain.size
         )
         terminal_producers = (
             None if entry is None else static_producers(entry.producers)
@@ -960,9 +948,9 @@ def _compact_nested_loop_counters_for_schedule(
             compact is None
             or (
                 entry is not None
-                and compact.readiness_key_count == entry.readiness_key_count
+                and compact.readiness_key_domain.size == entry.readiness_key_domain.size
             )
-            or compact.readiness_key_count >= plan.readiness_key_count
+            or compact.readiness_key_domain.size >= plan.readiness_key_domain.size
             or compact.consumers[0].covered_obligations != consumer.covered_obligations
             or not _supports_emitted_counter_plan_lowering(
                 compact,
@@ -990,29 +978,22 @@ class StaticPipelinePlan:
             raise ValueError("worker_count must be positive")
         if len(self.execution_orders) != len(self.body_orders):
             raise ValueError("every root requires one execution and body order")
-        root_count = len(self.execution_orders)
         root_domains = self.root_domains
         if any(domain.size_expr.is_zero is True for domain in root_domains):
             raise ValueError("pipeline plan requires positive root capacity")
-        for root, (order, body_order) in enumerate(
-            zip(self.execution_orders, self.body_orders, strict=True)
+        if any(
+            body_order.tasks_by_ordinal.target_domain
+            != order.tasks_by_ordinal.target_domain
+            for order, body_order in zip(
+                self.execution_orders, self.body_orders, strict=True
+            )
         ):
-            if (
-                body_order.tasks_by_ordinal.target_domain
-                != order.tasks_by_ordinal.target_domain
-            ):
-                raise ValueError(
-                    f"body PID ABI for root {root} disagrees with its task domain"
-                )
-        for producer_root, consumer_root in self.root_barrier_edges:
-            if not (
-                0 <= producer_root < root_count and 0 <= consumer_root < root_count
-            ):
-                raise ValueError("root-barrier edge references an unknown root")
-            if producer_root >= consumer_root:
-                raise ValueError(
-                    "root-barrier edge must be a strict source-ordered dependency"
-                )
+            raise ValueError("body PID ABI disagrees with its task domain")
+        if any(
+            not 0 <= producer_root < consumer_root < len(self.execution_orders)
+            for producer_root, consumer_root in self.root_barrier_edges
+        ):
+            raise ValueError("root-barrier edge must reference source-ordered roots")
 
         continuation_roots: list[int] = []
         for counter in self.readiness_counters:
@@ -1021,9 +1002,8 @@ class StaticPipelinePlan:
                 root_domains,
             ):
                 raise ValueError("readiness counter has no fixed exact lowering")
-            for consumer_index, consumer in enumerate(counter.consumers):
-                if consumer_index == counter.continuation_consumer_index:
-                    continuation_roots.append(consumer.consumer_root)
+            if (consumer := counter.continuation_consumer) is not None:
+                continuation_roots.append(consumer.consumer_root)
         if len(set(continuation_roots)) != len(continuation_roots):
             raise ValueError("one root cannot have multiple continuation owners")
 
@@ -1032,10 +1012,6 @@ class StaticPipelinePlan:
         return tuple(
             order.tasks_by_ordinal.target_domain for order in self.execution_orders
         )
-
-    @property
-    def body_pid_by_task(self) -> tuple[CoordinateRelation, ...]:
-        return tuple(order.ordinal_by_task for order in self.body_orders)
 
     @cached_property
     def continuation_roots(self) -> frozenset[int]:
@@ -1063,9 +1039,7 @@ class StaticPipelinePlan:
 
     @property
     def static_slot_count(self) -> int:
-        return sum(
-            self._padded_task_count(root) for root in range(len(self.execution_orders))
-        )
+        return self.static_base(len(self.execution_orders))
 
     @cached_property
     def wave_domain(self) -> CoordinateDomain:
@@ -1076,37 +1050,10 @@ class StaticPipelinePlan:
 
     def root_barrier_arrival_count(self, root: int) -> int:
         """Return the exact number of physical publishers for one root."""
-        continuation = next(
-            (
-                consumer
-                for counter in self.readiness_counters
-                if (consumer := counter.continuation_consumer) is not None
-                and consumer.consumer_root == root
-            ),
-            None,
-        )
-        if continuation is not None:
-            return continuation.keys_by_consumer.source_domain.size
-        return min(self.worker_count, self.execution_orders[root].task_count)
-
-
-def _nested_counter_acquire_count(
-    plan: StaticPipelinePlan, consumer: ReadinessConsumer
-) -> int | None:
-    """Count waits emitted by the shared nested-loop placement policy."""
-    placement = nested_wait_placement(
-        plan.root_domains[consumer.consumer_root], consumer
-    )
-    if placement is None:
-        return None
-    _nested_axis, segment_starts = placement
-    if segment_starts is not None:
-        return plan.root_domains[consumer.consumer_root].size * len(segment_starts)
-    return (
-        consumer.keys_by_consumer.source_domain.size
-        if consumer.keys_by_consumer.has_total_source()
-        else None
-    )
+        tasks = self.execution_orders[root].task_count
+        if root in self.continuation_roots:
+            return tasks
+        return min(self.worker_count, tasks)
 
 
 def _without_wave_dominated_nested_counters(
@@ -1120,8 +1067,17 @@ def _without_wave_dominated_nested_counters(
             continue
         producer, consumer = counter.producers[0], counter.consumers[0]
         producer_tasks = plan.root_domains[producer.producer_root].size
+        consumer_domain = plan.root_domains[consumer.consumer_root]
         arrivals = counter.uniform_arrival_count()
-        acquires = _nested_counter_acquire_count(plan, consumer)
+        placement = nested_wait_placement(consumer_domain, consumer)
+        segment_starts = None if placement is None else placement[1]
+        acquires = (
+            consumer_domain.size * len(segment_starts)
+            if segment_starts is not None
+            else consumer.keys_by_consumer.source_domain.size
+            if placement is not None and consumer.keys_by_consumer.has_total_source()
+            else None
+        )
         if (
             producer.producer_site_id is not None
             or consumer.consumer_site_id is None
@@ -1133,13 +1089,10 @@ def _without_wave_dominated_nested_counters(
         ):
             retained.append(counter)
             continue
-        counter_work = (counter.readiness_key_count * arrivals, acquires)
+        counter_work = (counter.readiness_key_domain.size * arrivals, acquires)
         barrier_work = (
             plan.root_barrier_arrival_count(producer.producer_root),
-            min(
-                plan.worker_count,
-                plan.root_domains[consumer.consumer_root].size,
-            ),
+            min(plan.worker_count, consumer_domain.size),
         )
         if not (
             barrier_work != counter_work
@@ -1494,7 +1447,7 @@ def choose_final_arrival_continuations(
     virtual_supports: list[CoordinateRelation] = []
     for continuation in candidates:
         consumer_root = (
-            readiness_graph.event(continuation.event_id)
+            readiness_graph.events[continuation.event_id]
             .consumers[continuation.consumer_index]
             .consumer_root
         )
@@ -2242,7 +2195,7 @@ def derive_final_arrival_continuations(
             or any(producer.producer_site_id is not None for producer in plan.producers)
         ):
             continue
-        if len(readiness_graph.event(event_id).consumers) != 1:
+        if len(readiness_graph.events[event_id].consumers) != 1:
             continue
         (readiness_consumer,) = plan.consumers
         if readiness_consumer.consumer_site_id is not None:
@@ -2268,16 +2221,15 @@ def _task_step_relations(
     charge: Callable[[int], bool],
 ) -> tuple[CoordinateRelation | None, ...] | None:
     """Return logical-task-to-wave functions from schedule converses."""
-    result: list[CoordinateRelation | None] = []
-    for root in range(len(pipeline_plan.execution_orders)):
-        if root in pipeline_plan.continuation_roots:
-            result.append(None)
-            continue
-        task_steps = _root_task_wave_relation(pipeline_plan, root, charge)
-        if task_steps is None:
-            return None
-        result.append(task_steps)
-    return tuple(result)
+    result = tuple(
+        _root_task_wave_relation(pipeline_plan, root, charge)
+        for root in range(len(pipeline_plan.execution_orders))
+    )
+    if sum(relation is None for relation in result) != len(
+        pipeline_plan.continuation_roots
+    ):
+        return None
+    return result
 
 
 def _keys_by_consumer_root_task(
@@ -2630,7 +2582,7 @@ def _supports_emitted_counter_plan_lowering(
     """Return whether a counter has one exact supported concrete lowering."""
     try:
         if (
-            plan.readiness_key_count <= 0
+            plan.readiness_key_domain.size <= 0
             or _arrival_count_bounds(plan.producers) is None
         ):
             return False
@@ -2659,12 +2611,9 @@ def _supports_emitted_counter_plan_lowering(
             )
         )
 
-    continuation_index = plan.continuation_consumer_index
-    if not plan.consumers or (
-        continuation_index is not None
-        and not 0 <= continuation_index < len(plan.consumers)
-    ):
+    if not plan.consumers:
         return False
+    continuation_index = plan.continuation_consumer_index
     for producer in plan.producers:
         if not endpoint_has_supported_domain(
             producer.producer_root,
@@ -2841,43 +2790,32 @@ def _try_finalize_pipeline_proposal(
             static_producers,
             charge,
         )
-        for emitted_counters in dict.fromkeys((compact_counters, readiness_counters)):
-            if (
-                _covered_obligations(emitted_counters) != exact_covered_obligations
-                or any(
-                    not _supports_emitted_counter_plan_lowering(
-                        plan, readiness_graph.root_domains
-                    )
-                    for plan in emitted_counters
-                )
-                or _emitted_final_arrival_continuations(
-                    readiness_graph,
-                    emitted_counters,
-                )
-                != emitted_continuations
-                or (
-                    emitted_counters != readiness_counters
-                    and not _schedule_is_progress_safe(
-                        dataclasses.replace(
-                            candidate,
-                            readiness_counters=emitted_counters,
-                        ),
-                        readiness_graph,
-                        obligations_by_root_pair,
-                        continuation_by_root,
-                        static_producers,
-                        charge,
-                    )
-                )
-            ):
-                continue
-            try:
-                return dataclasses.replace(
-                    candidate, readiness_counters=emitted_counters
-                )
-            except (ValueError, exc.CrossLoopSchedulingError):
-                continue
-        return None
+        if compact_counters == readiness_counters:
+            return candidate
+        try:
+            compact_candidate = dataclasses.replace(
+                candidate, readiness_counters=compact_counters
+            )
+        except (ValueError, exc.CrossLoopSchedulingError):
+            return candidate
+        if (
+            _covered_obligations(compact_counters) != exact_covered_obligations
+            or _emitted_final_arrival_continuations(
+                readiness_graph,
+                compact_counters,
+            )
+            != emitted_continuations
+            or not _schedule_is_progress_safe(
+                compact_candidate,
+                readiness_graph,
+                obligations_by_root_pair,
+                continuation_by_root,
+                static_producers,
+                charge,
+            )
+        ):
+            return candidate
+        return compact_candidate
 
     baseline = finalize(ownership_base)
     if baseline is None:
@@ -2939,6 +2877,35 @@ def build_static_pipeline_plan(
         ),
     )
     obligations_by_root_pair = dependency_graph.obligations_by_root_pair()
+
+    def try_plan(
+        counters: tuple[ReadinessCounterPlan, ...],
+        barriers: frozenset[tuple[int, int]],
+    ) -> StaticPipelinePlan | None:
+        return _try_finalize_pipeline_proposal(
+            readiness_graph=readiness_graph,
+            obligations_by_root_pair=obligations_by_root_pair,
+            configured_orders=root_task_orders,
+            worker_count=worker_count,
+            readiness_counters=counters,
+            root_barrier_edges=barriers,
+            charge=charge,
+        )
+
+    def finalize_plan(
+        counters: tuple[ReadinessCounterPlan, ...],
+    ) -> tuple[
+        tuple[ReadinessCounterPlan, ...],
+        frozenset[tuple[int, int]],
+        StaticPipelinePlan | None,
+    ]:
+        counters, barriers = _finalize_emitted_synchronization(
+            readiness_graph=readiness_graph,
+            obligations_by_root_pair=obligations_by_root_pair,
+            readiness_counters=counters,
+        )
+        return counters, barriers, try_plan(counters, barriers)
+
     nested_loop_counters = collect_nested_loop_scheduling_counters(
         readiness_graph, charge
     )
@@ -2954,45 +2921,21 @@ def build_static_pipeline_plan(
         *nested_loop_counters,
     )
     try:
-        all_resident_counters, all_resident_barriers = (
-            _finalize_emitted_synchronization(
-                readiness_graph=readiness_graph,
-                obligations_by_root_pair=obligations_by_root_pair,
-                readiness_counters=all_resident_candidate_counters,
-            )
+        all_resident_counters, all_resident_barriers, all_resident_plan = finalize_plan(
+            all_resident_candidate_counters
         )
     except (ValueError, exc.CrossLoopSchedulingError) as error:
         raise exc.InvalidConfig(
             f"the num_sm_multiplier grid of {worker_count} workers does not "
             "admit complete cross-loop synchronization"
         ) from error
-    all_resident_plan = _try_finalize_pipeline_proposal(
-        readiness_graph=readiness_graph,
-        obligations_by_root_pair=obligations_by_root_pair,
-        configured_orders=root_task_orders,
-        worker_count=worker_count,
-        readiness_counters=all_resident_counters,
-        root_barrier_edges=all_resident_barriers,
-        charge=charge,
-    )
     if all_resident_plan is None and all_resident_counters:
         with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
-            all_resident_counters, all_resident_barriers = (
-                _finalize_emitted_synchronization(
-                    readiness_graph=readiness_graph,
-                    obligations_by_root_pair=obligations_by_root_pair,
-                    readiness_counters=(),
-                )
-            )
-            all_resident_plan = _try_finalize_pipeline_proposal(
-                readiness_graph=readiness_graph,
-                obligations_by_root_pair=obligations_by_root_pair,
-                configured_orders=root_task_orders,
-                worker_count=worker_count,
-                readiness_counters=all_resident_counters,
-                root_barrier_edges=all_resident_barriers,
-                charge=charge,
-            )
+            (
+                all_resident_counters,
+                all_resident_barriers,
+                all_resident_plan,
+            ) = finalize_plan(())
     if all_resident_plan is None:
         raise exc.InvalidConfig(
             f"the num_sm_multiplier grid of {worker_count} workers does not "
@@ -3002,19 +2945,8 @@ def build_static_pipeline_plan(
     cheaper_counters = _without_wave_dominated_nested_counters(all_resident_plan)
     if cheaper_counters != all_resident_plan.readiness_counters:
         with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
-            cheaper_counters, cheaper_barriers = _finalize_emitted_synchronization(
-                readiness_graph=readiness_graph,
-                obligations_by_root_pair=obligations_by_root_pair,
-                readiness_counters=cheaper_counters,
-            )
-            cheaper_plan = _try_finalize_pipeline_proposal(
-                readiness_graph=readiness_graph,
-                obligations_by_root_pair=obligations_by_root_pair,
-                configured_orders=root_task_orders,
-                worker_count=worker_count,
-                readiness_counters=cheaper_counters,
-                root_barrier_edges=cheaper_barriers,
-                charge=charge,
+            cheaper_counters, cheaper_barriers, cheaper_plan = finalize_plan(
+                cheaper_counters
             )
             if cheaper_plan is not None:
                 all_resident_counters = cheaper_counters
@@ -3044,14 +2976,9 @@ def build_static_pipeline_plan(
     )
     proposal = all_resident_plan
     if continuations and continuation_counters is not None:
-        candidate = _try_finalize_pipeline_proposal(
-            readiness_graph=readiness_graph,
-            obligations_by_root_pair=obligations_by_root_pair,
-            configured_orders=root_task_orders,
-            worker_count=worker_count,
-            readiness_counters=continuation_counters,
-            root_barrier_edges=all_resident_barriers,
-            charge=charge,
+        candidate = try_plan(
+            continuation_counters,
+            all_resident_barriers,
         )
         final_continuations = (
             None

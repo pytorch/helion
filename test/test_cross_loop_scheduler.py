@@ -453,8 +453,12 @@ class TestCrossLoopScheduler(TestCase):
             body_orders=(configured,),
         )
 
-        self.assertEqual(plan.body_pid_by_task, (configured.ordinal_by_task,))
-        self.assertNotEqual(plan.body_pid_by_task[0], execution.ordinal_by_task)
+        self.assertEqual(
+            plan.body_orders[0].ordinal_by_task, configured.ordinal_by_task
+        )
+        self.assertNotEqual(
+            plan.body_orders[0].ordinal_by_task, execution.ordinal_by_task
+        )
 
     def test_symbolic_counter_map_with_concrete_capacity_is_allowed(self) -> None:
         roots = (
@@ -882,7 +886,8 @@ class TestCrossLoopScheduler(TestCase):
         self.assertIsNotNone(segmented)
         assert entry is not None and segmented is not None
         self.assertEqual(
-            (entry.readiness_key_count, segmented.readiness_key_count), (2, 4)
+            (entry.readiness_key_domain.size, segmented.readiness_key_domain.size),
+            (2, 4),
         )
         for counter in (entry, segmented):
             self.assertEqual(counter.readiness_key_domain.identity, event.event_id)
@@ -952,7 +957,7 @@ class TestCrossLoopScheduler(TestCase):
 
         self.assertIsNotNone(counter)
         assert counter is not None
-        self.assertEqual(counter.readiness_key_count, 4)
+        self.assertEqual(counter.readiness_key_domain.size, 4)
         self.assertEqual(counter.uniform_arrival_count(), 5)
         plan = _plan(
             (producer_root, consumer_root),
@@ -1027,18 +1032,6 @@ class TestCrossLoopScheduler(TestCase):
         repeated_plan = _plan((producer_root, consumer_root), 4, counters=(repeated,))
         hoisted_plan = _plan((producer_root, consumer_root), 4, counters=(hoisted,))
 
-        self.assertEqual(
-            cross_loop_scheduler._nested_counter_acquire_count(
-                repeated_plan, repeated.consumers[0]
-            ),
-            6,
-        )
-        self.assertEqual(
-            cross_loop_scheduler._nested_counter_acquire_count(
-                hoisted_plan, hoisted.consumers[0]
-            ),
-            3,
-        )
         self.assertEqual(
             cross_loop_scheduler._without_wave_dominated_nested_counters(repeated_plan),
             (),
