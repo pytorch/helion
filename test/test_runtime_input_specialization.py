@@ -45,6 +45,7 @@ from helion._compiler.variable_origin import ArgumentOrigin
 from helion._compiler.variable_origin import NameOrigin
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 import helion.language as hl
 from helion.language.constexpr import ConstExpr
@@ -933,6 +934,8 @@ class TestLayoutProvenance(unittest.TestCase):
             for dim in range(tensor.ndim)
         )
 
+    @onlyBackends(["triton"])
+    @skipIfRefEager("compiled HostFunction metadata is unavailable in ref eager mode")
     def test_kernel_trace_does_not_mark_torch_empty_out_as_fresh(self) -> None:
         @helion.kernel(
             autotune_effort="none",

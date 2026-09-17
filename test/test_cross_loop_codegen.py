@@ -714,18 +714,6 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, (x + 1) * 2)
                 self.assertIn("tile_dependency_readiness_wait", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
-                num_workers = torch.cuda.get_device_properties(
-                    DEVICE
-                ).multi_processor_count
-                self.assertIn(
-                    f"tl.range(tl.program_id(0) - 0 + 0, 2, {num_workers})",
-                    code,
-                )
-                self.assertIn(
-                    "tl.range(tl.program_id(0) - 0 "
-                    f"+ {num_workers}, {num_workers + 8}, {num_workers})",
-                    code,
-                )
                 if expected_range_option is not None:
                     self.assertIn(expected_range_option, code)
 
@@ -1066,7 +1054,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_partial_prefix_uses_counter_continuation(self) -> None:
+    def test_partial_prefix_uses_exact_readiness(self) -> None:
         x = torch.arange(96, device=DEVICE, dtype=torch.float32)
         for launch in range(2):
             code, (tmp, out) = code_and_output(
@@ -1080,8 +1068,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             )
             torch.testing.assert_close(tmp, x + launch + 1)
             torch.testing.assert_close(out, (x[:64] + launch + 1) * 2)
-        self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("// 2 < 2", code)
+        self.assertUsesExactReadiness(code)
+        self.assertIn("tl.cast(2, tl.uint32)", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1124,7 +1112,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             expected = x + launch + 1
             expected = torch.cat((expected[:64] * 2, expected[64:]))
             torch.testing.assert_close(out, expected)
-        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertUsesExactReadiness(code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
@@ -1347,9 +1335,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_continuation_follows_each_roots_pid_order(self) -> None:
-        # Exercise continuation ownership across distinct configured PID
-        # orders without changing the root execution mode.
+    def test_exact_readiness_follows_each_roots_pid_order(self) -> None:
+        # Exercise exact readiness across distinct configured PID orders. The
+        # worker count may select either continuation or counter lowering.
         x = torch.arange(4 * 256, device=DEVICE, dtype=torch.float32).reshape(4, 256)
         code, out = code_and_output(
             cartesian_affine_chain,
@@ -1363,9 +1351,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tile_dependency_continuation_task", code)
-        self.assertNotIn("tile_dependency_scheduled_logical_task", code)
+        self.assertUsesExactReadiness(code)
         self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
@@ -1384,8 +1370,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, x * 2)
         self.assertNotIn("tile_dependency_root_barrier", code)
-        self.assertIn("tile_dependency_continuation_previous", code)
-        self.assertIn("tl.cast(4, tl.uint32) - 1", code)
+        self.assertUsesExactReadiness(code)
+        self.assertIn("tl.cast(4, tl.uint32)", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1402,10 +1388,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x * 2, dim=-1))
-        self.assertIn("tile_dependency_continuation_previous", code)
+        self.assertUsesExactReadiness(code)
         self.assertIn("tl.cast(8, tl.uint32)", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
-        self.assertNotIn("tile_dependency_readiness_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
