@@ -198,7 +198,7 @@ def _is_provably_nonnegative(
             return True
     if _positive_integer_shift_is_nonnegative(expression):
         return True
-    interval = _bounded_parameter_expression_interval(expression)
+    interval = _analyze_integer_expression(expression)[1]
     return (interval is not None and interval[0].is_nonnegative is True) or (
         prove_nonnegative is not None and prove_nonnegative(expression)
     )
@@ -225,93 +225,197 @@ def _concrete_integer(value: IntegerExpression, *, description: str) -> int:
     return int(expression)
 
 
-def _bounded_parameter_expression_interval(
+def _analyze_integer_expression(
     expression: sympy.Expr,
-) -> tuple[sympy.Expr, sympy.Expr] | None:
-    """Bound the small integer grammar used by symbolic layout expressions."""
-    expression = sympy.sympify(expression)
-    if expression.is_number:
-        return expression, expression
-    difference = _static_quotient_difference(expression)
-    if difference is not None:
-        _base, divisor, offset = difference
+    domain: CoordinateDomain | None = None,
+    source_bounds: RelationBounds = (),
+    simplify: bool = False,
+) -> tuple[sympy.Expr, tuple[sympy.Expr, sympy.Expr] | None]:
+    """Rewrite and bound the integer grammar used by relation expressions."""
+    logical = domain is not None
+    parameters = domain.parameter_symbols if domain is not None else frozenset()
+    coordinates = {
+        coordinate_axis_symbol(axis): (begin, end, step)
+        for axis, begin, end, step in source_bounds
+    }
+
+    def quotient_bounds(value: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
+        if (parsed := _static_quotient_difference(value)) is None:
+            return None
+        _base, divisor, offset = parsed
+        result = sympy.Integer(0 if offset.is_zero is True else 1)
         exact = offset.is_zero is True or sympy.simplify(offset - divisor) == 0
-        value = sympy.Integer(0 if offset.is_zero is True else 1)
-        return (value, value) if exact else (sympy.Integer(0), sympy.Integer(1))
-    if isinstance(expression, sympy.Mod) and len(expression.args) == 2:
-        modulus = expression.args[1]
-        if not modulus.free_symbols and modulus.is_integer and modulus.is_positive:
-            return sympy.Integer(0), modulus - 1
-        return None
-    quotient = _static_integer_quotient(expression)
-    if quotient is not None:
-        interval = _bounded_parameter_expression_interval(quotient[0])
-        return (
-            None
-            if interval is None
-            else tuple(sympy.floor(value / quotient[1]) for value in interval)
-        )
-    if isinstance(expression, sympy.Add):
-        collapsed = _exact_quotient_remainder_replacement(expression)
-        if collapsed is not None:
-            return _bounded_parameter_expression_interval(sympy.simplify(collapsed))
-        terms, intervals, used = expression.args, [], set()
-        for index, term in enumerate(terms):
-            if index in used:
-                continue
-            pair_interval = None
-            for other_index, other in enumerate(terms[index + 1 :], index + 1):
-                if other_index in used:
-                    continue
-                pair = _static_quotient_difference(sympy.simplify(term + other))
-                sign = 1
-                if pair is None:
-                    pair = _static_quotient_difference(sympy.simplify(-term - other))
-                    sign = -1
-                if pair is None:
-                    continue
-                _base, divisor, offset = pair
-                exact = offset.is_zero is True or sympy.simplify(offset - divisor) == 0
-                value = 0 if offset.is_zero is True else 1
-                pair_interval = (
-                    (sign * value, sign * value)
-                    if exact
-                    else ((0, 1) if sign > 0 else (-1, 0))
-                )
-                used.add(other_index)
-                break
-            used.add(index)
-            intervals.append(
-                pair_interval or _bounded_parameter_expression_interval(term)
+        return (result, result) if exact else (sympy.Integer(0), sympy.Integer(1))
+
+    def combine(
+        values: tuple[sympy.Basic, ...], operation: Callable[..., sympy.Expr]
+    ) -> tuple[sympy.Expr, sympy.Expr] | None:
+        intervals = tuple(bounds(cast("sympy.Expr", value)) for value in values)
+        if None in intervals:
+            return None
+        concrete = cast("tuple[tuple[sympy.Expr, sympy.Expr], ...]", intervals)
+        return tuple(operation(*(item[side] for item in concrete)) for side in (0, 1))
+
+    def bounds(value: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
+        value = cast("sympy.Expr", sympy.sympify(value))
+        symbols = value.free_symbols
+        if value.is_number or (
+            logical
+            and symbols
+            and symbols.isdisjoint(coordinates)
+            and symbols <= parameters
+        ):
+            return value, value
+        if not logical and (interval := quotient_bounds(value)) is not None:
+            return interval
+        if isinstance(value, sympy.Symbol):
+            if (coordinate := coordinates.get(value)) is None:
+                return None
+            begin, end, step = coordinate
+            return sympy.sympify(begin), sympy.sympify(
+                begin + (end - begin - 1) // step * step
             )
-        if None in intervals:
-            return None
-        return tuple(
-            sympy.Add(*(interval[side] for interval in intervals)) for side in (0, 1)
-        )
-    if isinstance(expression, sympy.Mul):
-        result = (sympy.Integer(1), sympy.Integer(1))
-        for child in expression.args:
-            interval = _bounded_parameter_expression_interval(child)
-            if interval is None:
+        if isinstance(value, sympy.Mod) and len(value.args) == 2:
+            dividend, modulus = value.args
+            if not isinstance(modulus, sympy.Integer) or modulus <= 0:
                 return None
-            products = tuple(sympy.simplify(a * b) for a in result for b in interval)
-            if any(not value.is_number for value in products):
+            child = bounds(cast("sympy.Expr", dividend)) if logical else None
+            if child is not None:
+                quotients = tuple(sympy.floor(item / modulus) for item in child)
+                if sympy.simplify(quotients[0] - quotients[1]) == 0:
+                    return tuple(
+                        sympy.simplify(item - quotients[0] * modulus) for item in child
+                    )
+            return sympy.Integer(0), modulus - 1
+        if logical and value.func in (sympy.floor, sympy.ceiling):
+            child = bounds(cast("sympy.Expr", value.args[0]))
+            return None if child is None else tuple(map(value.func, child))
+        quotient = _static_integer_quotient(value)
+        if quotient is not None:
+            if (child := bounds(quotient[0])) is None:
                 return None
-            result = min(products), max(products)
-        return result
-    if expression.func in (sympy.Min, sympy.Max, SymbolicMin, SymbolicMax):
-        intervals = tuple(
-            _bounded_parameter_expression_interval(cast("sympy.Expr", child))
-            for child in expression.args
+            return tuple(
+                FloorDiv(item, quotient[1])
+                if logical
+                else sympy.floor(item / quotient[1])
+                for item in child
+            )
+        if isinstance(value, sympy.Add):
+            if logical:
+                return combine(value.args, sympy.Add)
+            if (collapsed := _exact_quotient_remainder_replacement(value)) is not None:
+                return bounds(sympy.simplify(collapsed))
+            terms, intervals = list(value.args), []
+            while terms:
+                term = terms.pop(0)
+                interval = None
+                for index, other in enumerate(terms):
+                    interval = quotient_bounds(sympy.simplify(term + other))
+                    if (
+                        interval is None
+                        and (reverse := quotient_bounds(sympy.simplify(-term - other)))
+                        is not None
+                    ):
+                        interval = -reverse[1], -reverse[0]
+                    if interval is not None:
+                        terms.pop(index)
+                        break
+                interval = interval or bounds(cast("sympy.Expr", term))
+                if interval is None:
+                    return None
+                intervals.append(interval)
+            return tuple(
+                sympy.Add(*(item[side] for item in intervals)) for side in (0, 1)
+            )
+        if isinstance(value, sympy.Mul):
+            if not logical:
+                result = (sympy.Integer(1), sympy.Integer(1))
+                for item in value.args:
+                    interval = bounds(cast("sympy.Expr", item))
+                    if interval is None:
+                        return None
+                    products = tuple(
+                        sympy.simplify(a * b) for a in result for b in interval
+                    )
+                    if any(not product.is_number for product in products):
+                        return None
+                    result = min(products), max(products)
+                return result
+            varying = tuple(
+                item for item in value.args if item.free_symbols & coordinates.keys()
+            )
+            constant = sympy.prod(
+                item
+                for item in value.args
+                if not item.free_symbols & coordinates.keys()
+            )
+            child = (
+                bounds(cast("sympy.Expr", varying[0])) if len(varying) == 1 else None
+            )
+            if child is None or not (
+                not constant.free_symbols - parameters
+                and (constant.is_nonnegative or constant.is_nonpositive)
+            ):
+                return None
+            result = constant * child[0], constant * child[1]
+            return result if constant.is_nonnegative else result[::-1]
+        if value.func in (sympy.Min, sympy.Max, SymbolicMin, SymbolicMax):
+            operation = (
+                value.func
+                if logical
+                else (lambda *items: min(items))
+                if value.func in (sympy.Min, SymbolicMin)
+                else (lambda *items: max(items))
+            )
+            return combine(value.args, operation)
+        return None
+
+    def rewrite(value: sympy.Expr) -> sympy.Expr:
+        value = cast("sympy.Expr", sympy.sympify(value))
+        children = tuple(rewrite(cast("sympy.Expr", child)) for child in value.args)
+        rebuilt = (
+            sympy.Mod(*children, evaluate=False)
+            if value.func is sympy.Mod
+            else value.func(*children)
+            if children
+            else value
         )
+        interval = bounds(rebuilt)
+        if interval is not None and sympy.simplify(interval[1] - interval[0]) == 0:  # pyrefly: ignore[unsupported-operation]
+            return sympy.simplify(interval[0])
+        if rebuilt.func is sympy.Mod and len(children) == 2:
+            child = bounds(cast("sympy.Expr", children[0]))
+            in_range = (
+                child is not None
+                and children[1].is_integer is True
+                and _is_provably_nonnegative(child[0], None)
+                and _is_provably_nonnegative(
+                    sympy.simplify(children[1] - 1 - child[1]), None
+                )
+            )
+            return cast("sympy.Expr", children[0]) if in_range else rebuilt
+        if rebuilt.has(sympy.Mod):
+            return rebuilt
+        if rebuilt.func not in (sympy.Min, sympy.Max):
+            return sympy.simplify(rebuilt)
+        intervals = tuple(bounds(cast("sympy.Expr", child)) for child in children)
         if None in intervals:
-            return None
-        operation = min if expression.func in (sympy.Min, SymbolicMin) else max
-        return tuple(
-            operation(interval[side] for interval in intervals) for side in (0, 1)
+            return rebuilt
+        concrete = cast("tuple[tuple[sympy.Expr, sympy.Expr], ...]", intervals)
+        side, operation = (
+            (1, operator.le) if rebuilt.func == sympy.Min else (0, operator.ge)
         )
-    return None
+        for index, child in enumerate(children):
+            if all(
+                operation(concrete[index][side], other[1 - side])
+                for other_index, other in enumerate(concrete)
+                if other_index != index
+            ):
+                return cast("sympy.Expr", child)
+        return rebuilt
+
+    root = cast("sympy.Expr", sympy.sympify(expression))
+    return (rewrite(root) if simplify else root), bounds(root)
 
 
 class TileDependencyKind(enum.Enum):
@@ -1141,11 +1245,12 @@ class CoordinateRelation:
         if not self.pieces:
             return True
         for piece in self.pieces:
-            if _target_box_is_nonempty_for_all_sources(
+            if _target_ranges_are_valid(
                 piece.target_ranges,
                 source_domain=self.source_domain,
                 source_bounds=piece.source_bounds_items,
                 target_domain=self.target_domain,
+                clipped=True,
             ):
                 return False
         return None
@@ -1223,11 +1328,12 @@ class CoordinateRelation:
         return all(
             any(
                 _source_box_covers(piece.source_bounds_items, bounds)
-                and _target_box_is_nonempty_for_all_sources(
+                and _target_ranges_are_valid(
                     piece.target_ranges,
                     source_domain=self.source_domain,
                     source_bounds=bounds,
                     target_domain=self.target_domain,
+                    clipped=True,
                 )
                 for piece in self.pieces
             )
@@ -1261,12 +1367,12 @@ class CoordinateRelation:
         if any(
             step != 1
             or (
-                bounds := _bounded_parameter_expression_interval(
+                bounds := _analyze_integer_expression(
                     _simplify_integer_quotients(
                         _normalize_integer_rounding(end)
                         - _normalize_integer_rounding(begin)
                     )
-                )
+                )[1]
             )
             is None
             or not _is_provably_nonnegative(bounds[0], None)
@@ -1335,7 +1441,7 @@ class CoordinateRelation:
                     if bounds is None or not _is_provably_nonnegative(
                         1 - bounds[1], None
                     ):
-                        bounds = _bounded_parameter_expression_interval(width)
+                        bounds = _analyze_integer_expression(width)[1]
                     if bounds is not None and _is_provably_nonnegative(
                         1 - bounds[1], None
                     ):
@@ -1358,11 +1464,12 @@ class CoordinateRelation:
                 step == 1 and sympy.simplify(end - begin) == 1
                 for _axis, begin, end, step in piece.target_ranges
             )
-            and _target_ranges_are_in_domain(
+            and _target_ranges_are_valid(
                 piece.target_ranges,
                 source_domain=self.source_domain,
                 source_bounds=piece.source_bounds_items,
                 target_domain=self.target_domain,
+                clipped=False,
             )
             for piece in self.pieces
         ):
@@ -3098,11 +3205,12 @@ def _key_major_order(
 ) -> tuple[int | None, DenseTaskOrder | None]:
     """Construct an order for a separable layout or regular scalar spans."""
     if not items.pieces or any(
-        not _target_ranges_are_in_domain(
+        not _target_ranges_are_valid(
             piece.target_ranges,
             source_domain=items.source_domain,
             source_bounds=piece.source_bounds_items,
             target_domain=items.target_domain,
+            clipped=False,
         )
         for piece in items.pieces
     ):
@@ -3337,269 +3445,59 @@ def _relation_source_cells(
 
 def _logical_expression_bounds(
     expression: sympy.Expr,
-    *,
     domain: CoordinateDomain,
     source_bounds: RelationBounds,
-    symbol_substitutions: dict[sympy.Basic, sympy.Expr] | None = None,
-    parameter_symbols: frozenset[sympy.Symbol] | None = None,
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
-    """Bound the affine/floor/mod/min/max grammar over one source box."""
-    parameters = (
-        domain.parameter_symbols if parameter_symbols is None else parameter_symbols
-    )
-    expression = cast(
-        "sympy.Expr",
-        sympy.sympify(expression).xreplace(symbol_substitutions or {}),
-    )
-    coordinates = {
-        coordinate_axis_symbol(axis): (begin, end, step)
-        for axis, begin, end, step in source_bounds
-    }
-
-    def visit(value: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
-        value = cast("sympy.Expr", sympy.sympify(value))
-        if value.is_number or (
-            value.free_symbols
-            and not value.free_symbols & coordinates.keys()
-            and value.free_symbols <= parameters
-        ):
-            return value, value
-        if isinstance(value, sympy.Symbol):
-            bounds = coordinates.get(value)
-            if bounds is None:
-                return None
-            begin, end, step = bounds
-            return sympy.sympify(begin), sympy.sympify(
-                begin + (end - begin - 1) // step * step
-            )
-        if isinstance(value, sympy.Add):
-            children = tuple(visit(cast("sympy.Expr", child)) for child in value.args)
-            if None in children:
-                return None
-            return tuple(
-                sympy.Add(*(child[side] for child in children)) for side in (0, 1)
-            )
-        if isinstance(value, sympy.Mul):
-            constant, varying = sympy.Integer(1), []
-            for child in value.args:
-                if child.free_symbols & coordinates.keys():
-                    varying.append(child)
-                elif child.free_symbols - parameters:
-                    return None
-                else:
-                    constant *= child
-            if len(varying) != 1 or not constant.is_real:
-                return None
-            child = visit(cast("sympy.Expr", varying[0]))
-            if child is None or (
-                not constant.is_nonnegative and not constant.is_nonpositive
-            ):
-                return None
-            result = constant * child[0], constant * child[1]
-            return result if constant.is_nonnegative else result[::-1]
-        if value.func in (sympy.floor, sympy.ceiling):
-            child = visit(cast("sympy.Expr", value.args[0]))
-            return (
-                None if child is None else (value.func(child[0]), value.func(child[1]))
-            )
-        if value.func is FloorDiv:
-            numerator, divisor = value.args
-            if (
-                divisor.free_symbols
-                or not divisor.is_integer
-                or not divisor.is_positive
-            ):
-                return None
-            child = visit(cast("sympy.Expr", numerator))
-            return (
-                None
-                if child is None
-                else (FloorDiv(child[0], divisor), FloorDiv(child[1], divisor))
-            )
-        if value.func in (sympy.Min, sympy.Max, SymbolicMin, SymbolicMax):
-            children = tuple(visit(cast("sympy.Expr", child)) for child in value.args)
-            if None in children:
-                return None
-            return tuple(
-                value.func(*(child[side] for child in children)) for side in (0, 1)
-            )
-        if isinstance(value, sympy.Mod):
-            dividend, modulus = value.args
-            if not isinstance(modulus, sympy.Integer) or modulus <= 0:
-                return None
-            child = visit(cast("sympy.Expr", dividend))
-            if child is not None:
-                lower, upper = (sympy.floor(bound / modulus) for bound in child)
-                if sympy.simplify(lower - upper) == 0:
-                    return tuple(
-                        sympy.simplify(bound - lower * modulus) for bound in child
-                    )
-            return sympy.Integer(0), modulus - 1
-        return None
-
-    return visit(expression)
+    return _analyze_integer_expression(expression, domain, source_bounds)[1]
 
 
 def _simplify_logical_expression(
     expression: sympy.Expr,
-    *,
     domain: CoordinateDomain,
     source_bounds: ConcreteRelationBounds,
 ) -> sympy.Expr:
-    """Simplify min/max expressions using the relation source bounds."""
-    if not expression.args:
-        bounds = _logical_expression_bounds(
-            expression,
-            domain=domain,
-            source_bounds=source_bounds,
-        )
-        if bounds is not None and sympy.simplify(bounds[1] - bounds[0]) == 0:  # pyrefly: ignore[unsupported-operation]
-            return sympy.simplify(bounds[0])
-        return expression
-    children = tuple(
-        _simplify_logical_expression(
-            child,
-            domain=domain,
-            source_bounds=source_bounds,
-        )
-        if isinstance(child, sympy.Expr)
-        else child
-        for child in expression.args
-    )
-    rebuilt = (
-        sympy.Mod(*children, evaluate=False)
-        if expression.func is sympy.Mod
-        else expression.func(*children)
-    )
-    bounds = _logical_expression_bounds(
-        rebuilt,
-        domain=domain,
-        source_bounds=source_bounds,
-    )
-    if bounds is not None and sympy.simplify(bounds[1] - bounds[0]) == 0:  # pyrefly: ignore[unsupported-operation]
-        return sympy.simplify(bounds[0])
-    if rebuilt.func == sympy.Mod and len(children) == 2:
-        modulus = children[1]
-        dividend_bounds = _logical_expression_bounds(
-            cast("sympy.Expr", children[0]),
-            domain=domain,
-            source_bounds=source_bounds,
-        )
-        if (
-            modulus.is_integer is True
-            and dividend_bounds is not None
-            and _is_provably_nonnegative(dividend_bounds[0], None)
-            and _is_provably_nonnegative(
-                sympy.simplify(modulus - 1 - dividend_bounds[1]), None
-            )
-        ):
-            return cast("sympy.Expr", children[0])
-        return rebuilt
-    if rebuilt.has(sympy.Mod):
-        return rebuilt
-    if rebuilt.func not in (sympy.Min, sympy.Max):
-        return sympy.simplify(rebuilt)
-    child_bounds = tuple(
-        _logical_expression_bounds(
-            cast("sympy.Expr", child),
-            domain=domain,
-            source_bounds=source_bounds,
-        )
-        for child in children
-    )
-    if any(bounds is None for bounds in child_bounds):
-        return rebuilt
-    concrete = tuple(bounds for bounds in child_bounds if bounds is not None)
-    for index, child in enumerate(children):
-        if rebuilt.func == sympy.Min and all(
-            concrete[index][1] <= other[0]  # pyrefly: ignore[unsupported-operation]
-            for other_index, other in enumerate(concrete)
-            if other_index != index
-        ):
-            return cast("sympy.Expr", child)
-        if rebuilt.func == sympy.Max and all(
-            concrete[index][0] >= other[1]  # pyrefly: ignore[unsupported-operation]
-            for other_index, other in enumerate(concrete)
-            if other_index != index
-        ):
-            return cast("sympy.Expr", child)
-    return rebuilt
+    return _analyze_integer_expression(expression, domain, source_bounds, True)[0]
 
 
-def _target_box_is_nonempty_for_all_sources(
+def _target_ranges_are_valid(
     target_ranges: TargetRanges,
     *,
     source_domain: CoordinateDomain,
     source_bounds: ConcreteRelationBounds,
     target_domain: CoordinateDomain,
+    clipped: bool,
 ) -> bool:
-    """Prove that a clipped target box is nonempty for every source point."""
     for axis, begin, end, step in target_ranges:
-        if step != 1:
-            return False
-        begin_bounds = _logical_expression_bounds(
-            begin,
-            domain=source_domain,
-            source_bounds=source_bounds,
-        )
-        end_bounds = _logical_expression_bounds(
-            end,
-            domain=source_domain,
-            source_bounds=source_bounds,
-        )
-        width_bounds = _logical_expression_bounds(
-            end - begin,  # pyrefly: ignore[unsupported-operation]
-            domain=source_domain,
-            source_bounds=source_bounds,
-        )
-        if (
-            begin_bounds is None
-            or end_bounds is None
-            or width_bounds is None
-            or not _is_provably_nonnegative(
-                target_domain.axis_count_expressions[axis] - 1 - begin_bounds[1],
-                None,
-            )
-            or not _is_provably_nonnegative(end_bounds[0] - 1, None)
-            or not _is_provably_nonnegative(width_bounds[0] - 1, None)
-        ):
-            return False
-    return True
-
-
-def _target_ranges_are_in_domain(
-    target_ranges: TargetRanges,
-    *,
-    source_domain: CoordinateDomain,
-    source_bounds: ConcreteRelationBounds,
-    target_domain: CoordinateDomain,
-) -> bool:
-    """Prove that every point in a target box lies inside its typed domain."""
-    for axis, begin, end, step in target_ranges:
-        if step <= 0:
+        if step <= 0 or (clipped and step != 1):
             return False
         count = sympy.simplify(_ceil_div(end - begin, step))
-        begin_bounds = _logical_expression_bounds(
-            begin, domain=source_domain, source_bounds=source_bounds
-        )
-        count_bounds = _logical_expression_bounds(
-            count, domain=source_domain, source_bounds=source_bounds
-        )
-        last_bounds = _logical_expression_bounds(
-            begin + (count - 1) * step,
-            domain=source_domain,
-            source_bounds=source_bounds,
-        )
-        if begin_bounds is None or count_bounds is None or last_bounds is None:
-            return False
-        if not all(
-            _is_provably_nonnegative(value, None)
-            for value in (
-                begin_bounds[0],
-                count_bounds[0] - 1,
-                target_domain.axis_count_expressions[axis] - 1 - last_bounds[1],
+        bounds = tuple(
+            _logical_expression_bounds(
+                expression, domain=source_domain, source_bounds=source_bounds
             )
-        ):
+            for expression in (
+                (begin, end, end - begin)  # pyrefly: ignore[unsupported-operation]
+                if clipped
+                else (begin, count, begin + (count - 1) * step)
+            )
+        )
+        if None in bounds:
+            return False
+        first, middle, last = cast("tuple[tuple[sympy.Expr, sympy.Expr], ...]", bounds)
+        checks = (
+            (
+                target_domain.axis_count_expressions[axis] - 1 - first[1],
+                middle[0] - 1,
+                last[0] - 1,
+            )
+            if clipped
+            else (
+                first[0],
+                middle[0] - 1,
+                target_domain.axis_count_expressions[axis] - 1 - last[1],
+            )
+        )
+        if not all(_is_provably_nonnegative(value, None) for value in checks):
             return False
     return True
 
@@ -3918,22 +3816,14 @@ def _substitute_composed_expression(
     source_bounds: ConcreteRelationBounds,
 ) -> sympy.Expr:
     """Substitute a point map, simplifying only bounded piecewise operators."""
-    bounds = _logical_expression_bounds(
-        expression,
-        domain=source_domain,
-        source_bounds=source_bounds,
-        symbol_substitutions=substitutions,
+    result = cast("sympy.Expr", expression.xreplace(substitutions))
+    rewritten, bounds = _analyze_integer_expression(
+        result,
+        source_domain,
+        source_bounds,
+        result.has(sympy.Mod, sympy.Min, sympy.Max),
     )
-    if bounds is not None and bounds[0] == bounds[1]:
-        return bounds[0]
-    result = expression.xreplace(substitutions)
-    if result.has(sympy.Mod, sympy.Min, sympy.Max):
-        return _simplify_logical_expression(
-            result,
-            domain=source_domain,
-            source_bounds=source_bounds,
-        )
-    return result
+    return bounds[0] if bounds is not None and bounds[0] == bounds[1] else rewritten
 
 
 def _compose_point_relations(
