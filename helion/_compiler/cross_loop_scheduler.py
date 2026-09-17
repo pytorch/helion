@@ -1358,11 +1358,7 @@ def _continuation_dominance_owner(
         slot_incidences.append(shifted)
     combined = Incidence.union_all(tuple(slot_incidences))
     last_owners = (
-        None
-        if combined is None
-        else combined.last_item_per_partition(
-            KeyPartition.scalar_mod(slot_domain, plan.worker_count)
-        )
+        None if combined is None else combined.last_item_by_residue(plan.worker_count)
     )
     shifted_owners = (
         None

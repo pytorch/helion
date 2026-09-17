@@ -1942,8 +1942,7 @@ class TestTileDependency(TestCase):
             key, item, (((((0, 0, 4, 1),), (coordinate,))),)
         )
         incidence = _incidence(relation, grouped=True)
-        partition = KeyPartition.scalar_mod(item, 2)
-        for value in (order, incidence, partition):
+        for value in (order, incidence):
             with self.assertRaises(TypeError):
                 dataclasses.replace(value)
             self.assertEqual(copy.deepcopy(value), value)
@@ -2278,10 +2277,8 @@ class TestTileDependency(TestCase):
             ),
         )
         incidence = _incidence(items)
-        self.assertIsNone(
-            incidence.last_item_per_partition(KeyPartition.scalar_mod(slots, 2))
-        )
-        owners = incidence.last_item_per_partition(KeyPartition.scalar_mod(slots, 4))
+        self.assertIsNone(incidence.last_item_by_residue(2))
+        owners = incidence.last_item_by_residue(4)
         self.assertIsNotNone(owners)
         assert owners is not None and owners.keys_by_item is not None
         self.assertEqual(

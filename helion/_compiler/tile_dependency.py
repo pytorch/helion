@@ -497,7 +497,7 @@ def _constant_value_map(
     *,
     other_axes: tuple[int, ...] = (),
 ) -> CoordinateRelation:
-    axis = max((*domain.axis_order, *other_axes), default=-1) + 1
+    axis = _next_axis(domain.axis_order, other_axes)
     value = sympy.sympify(value)
     return _full_point_map(
         domain, CoordinateDomain.scalar(value + 1, axis=axis, kind="value"), (value,)
@@ -2455,101 +2455,72 @@ class Incidence:
         )
         return None if items is None else cls.from_fibers(items, keys_by_item=keys)
 
-    def last_item_per_partition(self, partition: KeyPartition) -> Incidence | None:
-        """Bundle each fiber's greatest present item with its unique key."""
+    def last_item_by_residue(self, modulus: int) -> Incidence | None:
+        """Map each occupied residue class to its greatest item and unique key."""
         keys = self.keys_by_item
-        fibers = partition.fine_keys_by_coarse_key
-        if (
-            keys is None
-            or keys.source_domain != fibers.target_domain
-            or len(keys.source_domain.axis_order) != 1
-            or len(fibers.source_domain.axis_order) != 1
-        ):
+        if keys is None or len(keys.source_domain.axis_order) != 1 or modulus <= 0:
             return None
         item_axis = keys.source_domain.axis_order[0]
-        fiber_axis = fibers.source_domain.axis_order[0]
         try:
-            fiber_count = fibers.source_domain.size
+            item_count = keys.source_domain.size
         except ValueError:
             return None
-        if fiber_count > _MAX_RELATION_PIECES:
+        worker_count = min(modulus, item_count)
+        if worker_count > _MAX_RELATION_PIECES:
             return None
-
-        def integer(expression: sympy.Expr, coordinate: int) -> int | None:
-            value = sympy.simplify(
-                expression.xreplace({coordinate_axis_symbol(fiber_axis): coordinate})
-            )
-            return int(value) if isinstance(value, sympy.Integer) else None
-
         result = []
-        for fiber in range(fiber_count):
+        for worker in range(worker_count):
             candidates = []
-            for fiber_piece in fibers.pieces:
-                if not all(
-                    begin <= fiber < end and (fiber - begin) % step == 0
-                    for _axis, begin, end, step in fiber_piece.source_bounds_items
-                ):
-                    continue
-                _axis, begin, end, fiber_step = fiber_piece.target_ranges[0]
-                begin_value, end_value = integer(begin, fiber), integer(end, fiber)
-                if begin_value is None or end_value is None:
+            for key_piece in keys.pieces:
+                support = _in_domain_point_support(
+                    key_piece, keys.source_domain, keys.target_domain
+                )
+                if support is None:
                     return None
-                for key_piece in keys.pieces:
-                    support = _in_domain_point_support(
-                        key_piece, keys.source_domain, keys.target_domain
+                _axis, key_begin, key_end, key_step = support[0]
+                try:
+                    begin, end = int(key_begin), int(key_end)
+                except TypeError:
+                    return None
+                gcd = math.gcd(modulus, key_step)
+                difference = begin - worker
+                if difference % gcd:
+                    continue
+                reduced_modulus = key_step // gcd
+                multiplier = (
+                    0
+                    if reduced_modulus == 1
+                    else difference
+                    // gcd
+                    * pow(modulus // gcd, -1, reduced_modulus)
+                    % reduced_modulus
+                )
+                period = modulus // gcd * key_step
+                first = worker + modulus * multiplier
+                if first < begin:
+                    first += _ceil_div(begin - first, period) * period
+                if first >= end:
+                    continue
+                last = first + (end - 1 - first) // period * period
+                intersection = ((item_axis, last, last + 1, 1),)
+                target = []
+                for axis, start, stop, step in key_piece.target_ranges:
+                    bounds = tuple(
+                        _logical_expression_bounds(
+                            expression,
+                            domain=keys.source_domain,
+                            source_bounds=intersection,
+                        )
+                        for expression in (start, stop)
                     )
-                    if support is None:
+                    if None in bounds or any(
+                        sympy.simplify(value[1] - value[0]) != 0
+                        for value in bounds
+                        if value is not None
+                    ):
                         return None
-                    _axis, key_begin, key_end, key_step = support[0]
-                    try:
-                        lower, upper = (
-                            max(begin_value, int(key_begin)),
-                            min(end_value, int(key_end)),
-                        )
-                    except TypeError:
-                        return None
-                    key_begin = int(key_begin)
-                    gcd = math.gcd(fiber_step, key_step)
-                    difference = key_begin - begin_value
-                    if difference % gcd:
-                        continue
-                    reduced_modulus = key_step // gcd
-                    multiplier = (
-                        0
-                        if reduced_modulus == 1
-                        else (
-                            difference
-                            // gcd
-                            * pow(fiber_step // gcd, -1, reduced_modulus)
-                        )
-                        % reduced_modulus
-                    )
-                    period = fiber_step // gcd * key_step
-                    first = begin_value + fiber_step * multiplier
-                    if first < lower:
-                        first += _ceil_div(lower - first, period) * period
-                    if first >= upper:
-                        continue
-                    last = first + (upper - 1 - first) // period * period
-                    target = []
-                    intersection = ((item_axis, first, last + 1, period),)
-                    for axis, start, stop, step in key_piece.target_ranges:
-                        bounds = tuple(
-                            _logical_expression_bounds(
-                                expression,
-                                domain=keys.source_domain,
-                                source_bounds=intersection,
-                            )
-                            for expression in (start, stop)
-                        )
-                        if None in bounds or any(
-                            sympy.simplify(value[1] - value[0]) != 0
-                            for value in bounds
-                            if value is not None
-                        ):
-                            return None
-                        target.append((axis, bounds[0][0], bounds[1][0], step))  # type: ignore[index]
-                    candidates.append((last, tuple(target)))
+                    target.append((axis, bounds[0][0], bounds[1][0], step))  # type: ignore[index]
+                candidates.append((last, tuple(target)))
             if not candidates:
                 continue
             all_targets = {target for _value, target in candidates}
@@ -2949,9 +2920,7 @@ class KeyPartition:
                 for stage, (begin, end) in enumerate(segments)
             ),
         )
-        count_axis = (
-            max((*fine_domain.axis_order, *coarse_domain.axis_order), default=-1) + 1
-        )
+        count_axis = _next_axis(fine_domain.axis_order, coarse_domain.axis_order)
         counts = CoordinateRelation.point_map(
             coarse_domain,
             CoordinateDomain.scalar(
@@ -2963,68 +2932,6 @@ class KeyPartition:
                 (stage_bounds(stage), (end - begin,))
                 for stage, (begin, end) in enumerate(segments)
             ),
-        )
-        return cls._from_constructed(fine_by_coarse, coarse_by_fine, counts)
-
-    @classmethod
-    def scalar_mod(
-        cls,
-        source_domain: CoordinateDomain,
-        modulus: int,
-        *,
-        target_domain: CoordinateDomain | None = None,
-    ) -> KeyPartition:
-        """Partition scalar slots by residue without inverse rediscovery."""
-        if modulus <= 0 or len(source_domain.axis_order) != 1:
-            raise ValueError("scalar modulo requires a positive modulus")
-        coarse_domain = target_domain or CoordinateDomain.scalar(
-            modulus, kind="worker", identity=source_domain.identity
-        )
-        if len(coarse_domain.axis_order) != 1 or coarse_domain.size < modulus:
-            raise ValueError("scalar-modulo target domain is too small")
-        fine_count, coarse_count = source_domain.size, coarse_domain.size
-        fine_axis = source_domain.axis_order[0]
-        coarse_axis = coarse_domain.axis_order[0]
-        coarse = coordinate_axis_symbol(coarse_axis)
-        fine = coordinate_axis_symbol(fine_axis)
-        coarse_by_fine = _full_point_map(
-            source_domain,
-            coarse_domain,
-            (sympy.Mod(fine, modulus),),
-        )
-        active = min(fine_count, modulus)
-        fine_by_coarse = CoordinateRelation(
-            coarse_domain,
-            source_domain,
-            ()
-            if active == 0
-            else (
-                _CoordinateRelationPiece(
-                    ((coarse_axis, 0, active, 1),),
-                    ((fine_axis, coarse, fine_count, modulus),),
-                ),
-            ),
-        )
-        count_axis = (
-            max((*source_domain.axis_order, *coarse_domain.axis_order), default=-1) + 1
-        )
-        count_domain = CoordinateDomain.scalar(
-            _ceil_div(fine_count, modulus) + 1, axis=count_axis, kind="value"
-        )
-        count_pieces = []
-        if active:
-            count_pieces.append(
-                (
-                    ((coarse_axis, 0, active, 1),),
-                    (FloorDiv(fine_count - 1 - coarse, modulus) + 1,),
-                )
-            )
-        if active < coarse_count:
-            count_pieces.append(
-                (((coarse_axis, active, coarse_count, 1),), (sympy.Integer(0),))
-            )
-        counts = CoordinateRelation.point_map(
-            coarse_domain, count_domain, tuple(count_pieces)
         )
         return cls._from_constructed(fine_by_coarse, coarse_by_fine, counts)
 
@@ -4011,35 +3918,21 @@ def _single_axis_interval(
     domain: CoordinateDomain,
 ) -> tuple[int, int, int, int] | None:
     """Recognize ``[stride * axis + offset, ... + width)`` exactly."""
-    source_symbols: dict[sympy.Basic, int] = {
-        coordinate_axis_symbol(axis): axis for axis in domain.axis_order
-    }
-    used_symbols = begin.free_symbols | end.free_symbols
-    if len(used_symbols) != 1:
-        return None
-    (symbol,) = used_symbols
-    axis = source_symbols.get(symbol)
-    if axis is None:
-        return None
-    expanded_begin = sympy.expand(begin)
-    stride_expression = expanded_begin.coeff(symbol)
-    offset_expression = sympy.simplify(expanded_begin - stride_expression * symbol)
+    affine = _static_affine_coefficients(begin, domain=domain)
     width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
     if (
-        stride_expression.free_symbols
-        or offset_expression.free_symbols
+        affine is None
         or width_expression.free_symbols
-        or stride_expression.is_integer is not True
-        or offset_expression.is_integer is not True
         or width_expression.is_integer is not True
     ):
         return None
-    stride = int(stride_expression)
-    offset = int(offset_expression)
-    width = int(width_expression)
-    if stride <= 0 or width <= 0:
+    coefficients, offset = affine
+    varying = tuple((axis, value) for axis, value in coefficients.items() if value)
+    if len(varying) != 1:
         return None
-    return axis, stride, offset, width
+    axis, stride = varying[0]
+    width = int(width_expression)
+    return (axis, stride, offset, width) if width > 0 else None
 
 
 def _static_affine_coefficients(
