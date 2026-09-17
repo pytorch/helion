@@ -26,7 +26,7 @@ CONFIG = {
         [0, 1],
     ],
     "maxnreg": None,
-    "num_sm_multiplier": 1,
+    "num_sm_multiplier": 3,
     "num_stages": 1,
     "num_warps": 1,
     "pid_type": "persistent_blocked",
