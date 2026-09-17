@@ -4,6 +4,7 @@ import dataclasses
 import itertools
 from typing import Any
 from typing import Literal
+from typing import cast
 from unittest import mock
 
 import sympy
@@ -315,6 +316,7 @@ def _plan(
     barriers: frozenset[tuple[int, int]] = frozenset(),
     execution_orders: tuple[DenseTaskOrder, ...] | None = None,
     body_orders: tuple[DenseTaskOrder, ...] | None = None,
+    dispatch_mode: cross_loop_scheduler.CrossLoopDispatchMode = "static",
 ) -> StaticPipelinePlan:
     orders = execution_orders or tuple(_dense(domain) for domain in root_domains)
     return StaticPipelinePlan(
@@ -323,6 +325,7 @@ def _plan(
         body_orders=body_orders if body_orders is not None else orders,
         readiness_counters=counters,
         root_barrier_edges=barriers,
+        dispatch_mode=dispatch_mode,
     )
 
 
@@ -394,6 +397,46 @@ def _configured_readiness_graph(
 
 
 class TestCrossLoopScheduler(TestCase):
+    def test_dispatch_mode_changes_only_physical_root_ownership(self) -> None:
+        roots = tuple(
+            _domain((axis, count, 1), identity=root)
+            for root, (axis, count) in enumerate(((10, 5), (20, 3)))
+        )
+        static = _plan(roots, 4, barriers=frozenset(((0, 1),)))
+        dynamic = dataclasses.replace(static, dispatch_mode="dynamic")
+
+        self.assertEqual(static.execution_orders, dynamic.execution_orders)
+        self.assertEqual(static.readiness_counters, dynamic.readiness_counters)
+        self.assertEqual(static.root_barrier_arrival_count(0), 4)
+        self.assertEqual(dynamic.root_barrier_arrival_count(0), 5)
+        with self.assertRaisesRegex(ValueError, "invalid cross-loop dispatch mode"):
+            dataclasses.replace(static, dispatch_mode=cast("Any", "invalid"))
+
+    def test_dynamic_dispatch_rejects_same_root_inter_task_wait(self) -> None:
+        root = _domain((10, 2, 1), identity=0)
+        keys = CoordinateDomain.scalar(1, kind="event", identity=0)
+        event = ReadinessEvent(
+            (_producer(0, _point_pairs(keys, root, ((0, 0),))),),
+            (_consumer(0, _point_pairs(root, keys, ((1, 0),))),),
+        )
+        counter = ReadinessCounterPlan(event.producers, event.consumers)
+        graph = ReadinessGraph((root,), (event,))
+        static = _plan((root,), 1, counters=(counter,))
+        dynamic = dataclasses.replace(static, dispatch_mode="dynamic")
+
+        def is_safe(plan: StaticPipelinePlan) -> bool:
+            return cross_loop_scheduler._schedule_is_progress_safe(
+                plan,
+                graph,
+                (),
+                {},
+                _static_producers,
+                cross_loop_scheduler._new_relation_work_budget(),
+            )
+
+        self.assertTrue(is_safe(static))
+        self.assertFalse(is_safe(dynamic))
+
     def test_static_geometry_uses_all_root_padded_prefixes(self) -> None:
         roots = tuple(
             _domain((axis, count, 1), identity=root)
@@ -501,16 +544,21 @@ class TestCrossLoopScheduler(TestCase):
         graph = _dependency_graph([[10]])
         domain = _domain((10, task_count, 1), identity=0)
         order = _dense(domain)
-        plan = build_static_pipeline_plan(
-            dependency_graph=graph,
-            root_task_orders=(order,),
-            site_domains=(),
-            worker_count=148,
-        )
-
-        self.assertEqual(plan.execution_orders[0].task_count, task_count)
-        self.assertLessEqual(len(plan.execution_orders[0].tasks_by_ordinal.pieces), 2)
-        self.assertEqual(plan.root_barrier_arrival_count(0), 148)
+        for mode in ("static", "dynamic"):
+            with self.subTest(mode=mode):
+                plan = build_static_pipeline_plan(
+                    dependency_graph=graph,
+                    root_task_orders=(order,),
+                    site_domains=(),
+                    worker_count=148,
+                    cross_loop_dispatch_mode=mode,
+                )
+                self.assertEqual(plan.execution_orders[0].task_count, task_count)
+                self.assertLessEqual(
+                    len(plan.execution_orders[0].tasks_by_ordinal.pieces), 2
+                )
+                expected_arrivals = 148 if mode == "static" else task_count
+                self.assertEqual(plan.root_barrier_arrival_count(0), expected_arrivals)
 
     def test_configured_orders_require_unique_root_identities(self) -> None:
         graph = _dependency_graph([[10], [20]])
@@ -1362,6 +1410,17 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(plan.readiness_counters, ())
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
 
+        dynamic = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=tuple(_dense(root) for root in root_domains),
+            site_domains=sites,
+            worker_count=2,
+            cross_loop_dispatch_mode="dynamic",
+        )
+        self.assertEqual(dynamic.dispatch_mode, "dynamic")
+        self.assertEqual(dynamic.root_barrier_edges, plan.root_barrier_edges)
+        self.assertEqual(dynamic.root_barrier_arrival_count(0), 4)
+
     def test_exhausted_relation_budget_uses_root_barrier(self) -> None:
         graph = _dependency_graph(
             [[10], [20]],
@@ -1385,43 +1444,54 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(plan.root_barrier_edges, frozenset(((0, 1),)))
 
     def test_relation_budget_degrades_monotonically_to_root_barrier(self) -> None:
-        exact_counter_seen = False
-        for index, budget in enumerate((0, 1, 2, 4, 8, 12, 16)):
-            with self.subTest(budget=budget):
-                producer_axis = 100 + 2 * index
+        budgets = (0, 1, 2, 4, 8, 12, 16, 32, 64, 128, 192)
+        for mode_index, mode in enumerate(("static", "dynamic")):
+            exact_counter_seen = False
+            for index, budget in enumerate(budgets):
+                producer_axis = 100 + 100 * mode_index + 2 * index
                 consumer_axis = producer_axis + 1
-                graph = _dependency_graph(
-                    [[producer_axis], [consumer_axis]],
-                    _access(root=0, kind="store", block_id=producer_axis),
-                    _access(root=1, kind="load", block_id=consumer_axis),
-                )
-                roots, sites = instantiate_coordinate_domains(
-                    graph,
-                    axis_geometry={
-                        producer_axis: (4, 16),
-                        consumer_axis: (4, 16),
-                    },
-                )
-                assert all(root is not None for root in roots)
-                root_domains = tuple(root for root in roots if root is not None)
-                with mock.patch.object(
-                    cross_loop_scheduler,
-                    "_MAX_SYMBOLIC_RELATION_WORK",
-                    budget,
-                ):
-                    plan = build_static_pipeline_plan(
-                        dependency_graph=graph,
-                        root_task_orders=tuple(_dense(root) for root in root_domains),
-                        site_domains=sites,
-                        worker_count=4,
+                with self.subTest(mode=mode, budget=budget):
+                    graph = _dependency_graph(
+                        [[producer_axis], [consumer_axis]],
+                        _access(root=0, kind="store", block_id=producer_axis),
+                        _access(root=1, kind="load", block_id=consumer_axis),
                     )
+                    roots, sites = instantiate_coordinate_domains(
+                        graph,
+                        axis_geometry={
+                            producer_axis: (4, 16),
+                            consumer_axis: (4, 16),
+                        },
+                    )
+                    assert all(root is not None for root in roots)
+                    root_domains = tuple(root for root in roots if root is not None)
+                    with mock.patch.object(
+                        cross_loop_scheduler,
+                        "_MAX_SYMBOLIC_RELATION_WORK",
+                        budget,
+                    ):
+                        plan = build_static_pipeline_plan(
+                            dependency_graph=graph,
+                            root_task_orders=tuple(
+                                _dense(root) for root in root_domains
+                            ),
+                            site_domains=sites,
+                            worker_count=4,
+                            cross_loop_dispatch_mode=mode,
+                        )
 
-                outcome = (bool(plan.readiness_counters), bool(plan.root_barrier_edges))
-                self.assertIn(outcome, ((False, True), (True, False)))
-                if outcome[0]:
-                    exact_counter_seen = True
-                else:
-                    self.assertFalse(exact_counter_seen)
+                    self.assertEqual(plan.dispatch_mode, mode)
+                    outcome = (
+                        bool(plan.readiness_counters),
+                        bool(plan.root_barrier_edges),
+                    )
+                    self.assertIn(outcome, ((False, True), (True, False)))
+                    if outcome[0]:
+                        exact_counter_seen = True
+                    else:
+                        self.assertFalse(exact_counter_seen)
+                    if mode == "dynamic":
+                        self.assertEqual(plan.root_barrier_arrival_count(0), 4)
 
     def test_multi_producer_join_uses_one_readiness_event(self) -> None:
         graph = _dependency_graph(

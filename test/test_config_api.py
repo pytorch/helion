@@ -167,7 +167,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
-            "cross_loop_pipeline": st.sampled_from(["barrier", "static"]),
+            "cross_loop_pipeline": st.sampled_from(["barrier", "static", "dynamic"]),
             "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
             "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
             "cute_chunk_prepare_schedule": st.sampled_from(
@@ -448,8 +448,8 @@ class TestConfigAPI(TestCase):
 
         self.assertEqual(helion.Config().cross_loop_pipeline, "barrier")
         self.assertEqual(
-            helion.Config(cross_loop_pipeline="static").cross_loop_pipeline,
-            "static",
+            helion.Config(cross_loop_pipeline="dynamic").cross_loop_pipeline,
+            "dynamic",
         )
 
         with patch("helion._compat.is_hip", return_value=False):
@@ -467,20 +467,20 @@ class TestConfigAPI(TestCase):
             self.assertIsInstance(field, EnumFragment)
             assert isinstance(field, EnumFragment)
             self.assertIs(field, spec.cross_loop_pipeline)
-            self.assertEqual(field.choices, ("barrier", "static"))
+            self.assertEqual(field.choices, ("barrier", "static", "dynamic"))
             self.assertEqual(
                 spec.default_config()["cross_loop_pipeline"],
                 "barrier",
             )
 
-            static_config = spec.default_config()
-            static_config.config["cross_loop_pipeline"] = "static"
-            spec.normalize(static_config)
+            dynamic_config = spec.default_config()
+            dynamic_config.config["cross_loop_pipeline"] = "dynamic"
+            spec.normalize(dynamic_config)
             generation = ConfigGeneration(spec)
-            round_trip = generation.unflatten(generation.flatten(static_config))
+            round_trip = generation.unflatten(generation.flatten(dynamic_config))
             self.assertEqual(
                 round_trip["cross_loop_pipeline"],
-                "static",
+                "dynamic",
             )
 
             with self.assertRaisesRegex(
@@ -521,7 +521,7 @@ class TestConfigAPI(TestCase):
                     helion.Config.from_dict(
                         {
                             "cross_loop_schedule": "static_pipeline",
-                            "cross_loop_pipeline": "barrier",
+                            "cross_loop_pipeline": "dynamic",
                         }
                     )
                 )

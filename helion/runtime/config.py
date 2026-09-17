@@ -16,7 +16,7 @@ PidTypeLiteral = Literal[
     "persistent_blocked",
     "persistent_interleaved",
 ]
-CrossLoopPipelineLiteral = Literal["barrier", "static"]
+CrossLoopPipelineLiteral = Literal["barrier", "static", "dynamic"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
@@ -111,9 +111,10 @@ class Config(Mapping[str, object]):
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
             cross_loop_pipeline: Execution strategy for kernels with
                 compiler-inferred cross-loop dependencies. ``"barrier"`` uses
-                grid synchronization; ``"static"`` executes the
-                compiler-derived dependency schedule with fixed worker
-                ownership. Unsupported kernels reject this field.
+                grid synchronization. ``"static"`` and ``"dynamic"`` execute
+                the same compiler-derived dependency schedule with fixed worker
+                ownership or one-shot packet dispatch, respectively.
+                Unsupported kernels reject this field.
             num_sm_multiplier: Multiplier for the number of SMs in persistent
                 kernels (1, 2, 4, 8).
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
