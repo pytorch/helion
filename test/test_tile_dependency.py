@@ -27,9 +27,10 @@ from helion._compiler.tile_dependency import TaskFamily
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
+from helion._compiler.tile_dependency import _access_layout
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.tile_dependency import _simplify_logical_expression
-from helion._compiler.tile_dependency import _symbolic_linear_access_relation
+from helion._compiler.tile_dependency import _symbolic_access_map
 from helion._compiler.tile_dependency import _transpose_projection_or_singletons
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
@@ -2340,11 +2341,12 @@ class TestTileDependency(TestCase):
         allocation = CoordinateDomain(
             (-1,), ((-1, 16 * extent),), kind="allocation", identity=0
         )
-        linear = _symbolic_linear_access_relation(
+        linear_map = _symbolic_access_map(
             tiled,
+            layout=_access_layout(tiled, None),
             source_domain=CoordinateDomain((10,), ((10, 1),), ((10, 16),)),
             allocation_domain=allocation,
         )
-        self.assertIsNotNone(linear)
-        assert linear is not None
+        assert linear_map is not None
+        linear, _codec = linear_map
         self.assertIn(extent, linear.target_domain.parameter_symbols)

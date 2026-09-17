@@ -42,6 +42,16 @@ AffineSubscriptRange = tuple[
     IntegerExpression,
     int,
 ]
+_AccessLayout = tuple[
+    tuple[sympy.Expr, ...],
+    tuple[sympy.Expr, ...],
+    sympy.Expr,
+    sympy.Expr | None,
+    tuple[int, ...] | None,
+    dict[int, int] | None,
+]
+_DenseAccessCodec = tuple[int, int, sympy.Expr, tuple[tuple[int, sympy.Expr], ...]]
+_AccessMap = tuple["CoordinateRelation", _DenseAccessCodec | None]
 
 
 def _relation_product_is_within_budget(*factor_sizes: int) -> bool:
@@ -1589,129 +1599,6 @@ class CoordinateRelation:
             else:
                 upper = middle
         return upper
-
-    def overlapping_sources(
-        self,
-        other: CoordinateRelation,
-        *,
-        prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-    ) -> CoordinateRelation | None:
-        """Relate ``other`` sources to ``self`` sources by target overlap."""
-        if self.target_domain != other.target_domain:
-            return None
-        target_counts = self.source_domain.axis_count_expressions
-        pieces: list[_CoordinateRelationPiece] = []
-        for producer_piece in self.pieces:
-            full_producer_bounds = _full_bounds(self.source_domain)
-            if producer_piece.source_bounds_items != full_producer_bounds:
-                return None
-            producer_ranges = {
-                axis: (begin, end, step)
-                for axis, begin, end, step in producer_piece.target_ranges
-            }
-            for consumer_piece in other.pieces:
-                consumer_ranges = {
-                    axis: (begin, end, step)
-                    for axis, begin, end, step in consumer_piece.target_ranges
-                }
-                lower_bounds: dict[int, list[sympy.Expr]] = {
-                    axis: [] for axis in self.source_domain.axis_order
-                }
-                upper_bounds: dict[int, list[sympy.Expr]] = {
-                    axis: [] for axis in self.source_domain.axis_order
-                }
-                for allocation_axis in self.target_domain.axis_order:
-                    producer_range = producer_ranges[allocation_axis]
-                    consumer_range = consumer_ranges[allocation_axis]
-                    if producer_range[2] != 1 or consumer_range[2] != 1:
-                        return None
-                    producer_begin, producer_end, _ = producer_range
-                    consumer_begin, consumer_end, _ = consumer_range
-                    allocation_count = self.target_domain.axis_count_expressions[
-                        allocation_axis
-                    ]
-                    if (
-                        sympy.simplify(producer_begin) == 0
-                        and sympy.simplify(producer_end - allocation_count)  # pyrefly: ignore[unsupported-operation]
-                        == 0
-                    ):
-                        continue
-                    producer_interval = _single_axis_interval(
-                        producer_begin,
-                        producer_end,
-                        domain=self.source_domain,
-                    )
-                    if producer_interval is None:
-                        return None
-                    producer_axis, stride, offset, width = producer_interval
-                    consumer_interval = _single_axis_interval(
-                        consumer_begin,
-                        consumer_end,
-                        domain=other.source_domain,
-                    )
-                    if consumer_interval is not None:
-                        (
-                            _consumer_axis,
-                            consumer_stride,
-                            consumer_offset,
-                            consumer_width,
-                        ) = consumer_interval
-                        if (
-                            width == stride
-                            and consumer_width == consumer_stride
-                            and stride % consumer_width == 0
-                            and (consumer_offset - offset) % consumer_width == 0
-                        ):
-                            target_begin = cast(
-                                "sympy.Expr",
-                                sympy.floor(  # pyrefly: ignore[bad-argument-type]
-                                    (consumer_begin - offset) / stride  # pyrefly: ignore[unsupported-operation]
-                                ),
-                            )
-                            lower_bounds[producer_axis].append(target_begin)
-                            upper_bounds[producer_axis].append(
-                                target_begin + 1  # pyrefly: ignore[unsupported-operation]
-                            )
-                            continue
-                    lower_bounds[producer_axis].append(
-                        sympy.floor((consumer_begin - offset - width) / stride)  # pyrefly: ignore[unsupported-operation]
-                        + 1  # pyrefly: ignore[unsupported-operation]
-                    )
-                    upper_bounds[producer_axis].append(
-                        cast(
-                            "sympy.Expr",
-                            sympy.ceiling(  # pyrefly: ignore[bad-argument-type]
-                                (consumer_end - offset) / stride  # pyrefly: ignore[unsupported-operation]
-                            ),
-                        )
-                    )
-                pieces.append(
-                    _CoordinateRelationPiece(
-                        source_bounds_items=consumer_piece.source_bounds_items,
-                        target_ranges=tuple(
-                            (
-                                axis,
-                                (
-                                    sympy.Max(*lower_bounds[axis])
-                                    if lower_bounds[axis]
-                                    else sympy.Integer(0)
-                                ),
-                                (
-                                    sympy.Min(*upper_bounds[axis])
-                                    if upper_bounds[axis]
-                                    else sympy.Integer(target_counts[axis])
-                                ),
-                                1,
-                            )
-                            for axis in self.source_domain.axis_order
-                        ),
-                    )
-                )
-        return CoordinateRelation(
-            source_domain=other.source_domain,
-            target_domain=self.source_domain,
-            pieces=tuple(dict.fromkeys(pieces)),
-        )
 
 
 def _expression_is_nondecreasing_in(
@@ -4905,8 +4792,12 @@ def _access_region(
     if len(shape) != len(strides) or any(size < 0 for size in shape):
         return AllocationRegion(None, False)
 
-    position_by_dim = _access_positions_by_dimension(access)
-    if position_by_dim is None:
+    position_by_dim = {
+        dimension: position for position, dimension in enumerate(access.subscript_dims)
+    }
+    if len(position_by_dim) != len(access.subscript_dims) or any(
+        not 0 <= dimension < len(shape) for dimension in position_by_dim
+    ):
         return AllocationRegion(None, False)
 
     bounds: list[tuple[int, int]] = []
@@ -4997,15 +4888,6 @@ def _access_region(
     )
 
 
-def _access_positions_by_dimension(access: TileAccess) -> dict[int, int] | None:
-    result: dict[int, int] = {}
-    for position, dimension in enumerate(access.subscript_dims):
-        if dimension in result or not 0 <= dimension < len(access.tensor_shape):
-            return None
-        result[dimension] = position
-    return result
-
-
 def _access_interval_expression(
     access: TileAccess,
     *,
@@ -5030,37 +4912,27 @@ def _access_interval_expression(
         return None
     axis = access.subscript_affine_block_ids[position]
     offset = access.subscript_offsets[position]
-    if axis is None and access.subscript_is_scalar[position]:
-        if offset is None:
-            return None
-        if offset < 0 and size.free_symbols:
-            return None
-        normalized_offset = sympy.sympify(offset if offset >= 0 else size + offset)
-        if (
-            normalized_offset.is_nonnegative is not True
-            or (size - normalized_offset - 1).is_nonnegative is not True
-        ):
-            return None
-        return normalized_offset, normalized_offset + 1
     if axis is None:
-        static_extent = (
-            access.subscript_static_extents[position]
-            if position < len(access.subscript_static_extents)
-            else None
+        extent = (
+            1
+            if access.subscript_is_scalar[position]
+            else (
+                access.subscript_static_extents[position]
+                if position < len(access.subscript_static_extents)
+                else None
+            )
         )
-        if offset is None or static_extent is None:
-            return None
-        if offset < 0 and size.free_symbols:
+        if offset is None or extent is None or (offset < 0 and size.free_symbols):
             return None
         normalized_offset = sympy.sympify(offset if offset >= 0 else size + offset)
         if (
             normalized_offset.is_nonnegative is not True
-            or (size - normalized_offset - static_extent).is_nonnegative is not True
+            or (size - normalized_offset - extent).is_nonnegative is not True
         ):
             return None
-        return normalized_offset, normalized_offset + static_extent
+        return normalized_offset, normalized_offset + extent
     counts = domain.axis_count_expressions
-    if axis is None or offset is None or axis not in counts:
+    if offset is None or axis not in counts:
         return None
     scale = access.subscript_index_scales[position]
     if scale != 1:
@@ -5080,294 +4952,179 @@ def _access_interval_expression(
     return begin, begin + block_size
 
 
-def _symbolic_coordinate_access_relation(
+def _access_layout(
     access: TileAccess,
-    *,
-    source_domain: CoordinateDomain,
-    allocation_domain: CoordinateDomain,
-    tensor_dimensions: tuple[int, ...],
-) -> CoordinateRelation | None:
-    """Map one access site to its exact allocation-coordinate footprint."""
-    if (
-        not access.layout_is_symbolically_exact
-        or access.has_explicit_mask
-        or allocation_domain.kind != "allocation"
-        or allocation_domain.identity != access.allocation_id
-        or allocation_domain.shape_expr
-        != tuple(access.tensor_shape[index] for index in tensor_dimensions)
-    ):
-        return None
-    positions = _access_positions_by_dimension(access)
-    if positions is None:
-        return None
-    target_ranges: list[tuple[int, sympy.Expr, sympy.Expr, int]] = []
-    for allocation_axis, tensor_dimension in zip(
-        allocation_domain.axis_order,
-        tensor_dimensions,
-        strict=True,
-    ):
-        position = positions.get(tensor_dimension)
-        interval = (
-            (
-                sympy.Integer(0),
-                _integer_expression(
-                    access.tensor_shape[tensor_dimension],
-                    description="access shape",
-                ),
-            )
-            if position is None
-            else _access_interval_expression(
-                access,
-                position=position,
-                domain=source_domain,
-            )
-        )
-        if interval is None:
-            return None
-        begin, end = interval
-        target_ranges.append((allocation_axis, begin, end, 1))
-    return CoordinateRelation(
-        source_domain=source_domain,
-        target_domain=allocation_domain,
-        pieces=(
-            _CoordinateRelationPiece(
-                source_bounds_items=_full_bounds(source_domain),
-                target_ranges=tuple(target_ranges),
-            ),
-        ),
-    )
-
-
-def _allocation_storage_size(
-    access: TileAccess,
-    *,
-    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-) -> sympy.Expr | None:
-    """Return a symbolic upper bound for addresses in one exact strided view."""
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+) -> _AccessLayout:
     shape = tuple(
-        _integer_expression(size, description="access shape")
-        for size in access.tensor_shape
+        _integer_expression(value, description="access shape")
+        for value in access.tensor_shape
     )
     strides = tuple(
-        _integer_expression(stride, description="access stride")
-        for stride in access.tensor_strides
+        _integer_expression(value, description="access stride")
+        for value in access.tensor_strides
     )
-    storage_offset = _integer_expression(
-        access.storage_offset,
-        description="access storage offset",
+    offset = _integer_expression(
+        access.storage_offset, description="access storage offset"
     )
-    if (
-        len(shape) != len(strides)
-        or not _is_provably_nonnegative(storage_offset, prove_nonnegative)
-        or any(not _is_provably_nonnegative(size, prove_nonnegative) for size in shape)
-        or any(
-            not _is_provably_nonnegative(stride, prove_nonnegative)
-            for stride in strides
-        )
+    linear_span = None
+    if len(shape) == len(strides) and all(
+        _is_provably_nonnegative(value, prove_nonnegative)
+        for value in (*shape, *strides)
     ):
-        return None
-    address_span = sympy.simplify(
-        storage_offset
-        + 1
-        + sum(
-            (size - 1) * stride
-            for size, stride in zip(
-                shape,
-                strides,
-                strict=True,
+        linear_span = sympy.simplify(
+            1
+            + sum(
+                (size - 1) * stride for size, stride in zip(shape, strides, strict=True)
             )
         )
-    )
-    if address_span.is_zero is True:
-        # A concrete empty view has no accessed address. A one-element domain
-        # is a harmless carrier because its source relation is empty.
-        return sympy.Integer(1)
-    if _is_provably_nonnegative(address_span, prove_nonnegative):
-        return address_span
-    return sympy.simplify(sympy.Max(1, address_span))
+    dimensions = None
+    if len(shape) == len(strides) and _layout_is_injective((shape, strides, offset)):
+        dimensions = tuple(
+            index for index, size in enumerate(shape) if sympy.simplify(size - 1) != 0
+        )
+    positions = {
+        dimension: index for index, dimension in enumerate(access.subscript_dims)
+    }
+    if len(positions) != len(access.subscript_dims) or any(
+        not 0 <= dimension < len(shape) for dimension in positions
+    ):
+        positions = None
+    return shape, strides, offset, linear_span, dimensions, positions
 
 
-def _normalized_coordinate_layout(
-    access: TileAccess,
-) -> (
-    tuple[
-        tuple[int, ...],
-        tuple[tuple[sympy.Expr, sympy.Expr], ...],
-    ]
-    | None
-):
-    """Return non-size-one dimensions and their allocation geometry."""
-    shape = tuple(
-        _integer_expression(size, description="access shape")
-        for size in access.tensor_shape
-    )
-    strides = tuple(
-        _integer_expression(stride, description="access stride")
-        for stride in access.tensor_strides
-    )
-    storage_offset = _integer_expression(
-        access.storage_offset,
-        description="access storage offset",
-    )
-    layout = (shape, strides, storage_offset)
-    if not _layout_is_injective(layout):
-        return None
-    dimensions = tuple(
-        dimension
-        for dimension, size in enumerate(shape)
-        if sympy.simplify(size - 1) != 0
-    )
-    return dimensions, tuple(
-        (shape[dimension], strides[dimension]) for dimension in dimensions
-    )
-
-
-def _symbolic_linear_access_relation(
+def _symbolic_access_map(
     access: TileAccess,
     *,
+    layout: _AccessLayout,
     source_domain: CoordinateDomain,
     allocation_domain: CoordinateDomain,
+    storage_offset: sympy.Expr | None = None,
+    tensor_dimensions: tuple[int, ...] | None = None,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-) -> CoordinateRelation | None:
-    """Map a provably contiguous view tile to linear allocation addresses."""
-    if (
-        not access.layout_is_symbolically_exact
-        or access.has_explicit_mask
-        or allocation_domain.kind != "allocation"
-        or allocation_domain.identity != access.allocation_id
-        or allocation_domain.axis_order != (_ALLOCATION_ADDRESS_AXIS,)
-    ):
-        return None
-    positions = _access_positions_by_dimension(access)
+) -> _AccessMap | None:
+    positions = layout[5]
     if positions is None:
         return None
+    shape, strides = layout[:2]
+    source_bounds = _full_bounds(source_domain)
+    if tensor_dimensions is not None:
+        ranges = []
+        for allocation_axis, dimension in zip(
+            allocation_domain.axis_order, tensor_dimensions, strict=True
+        ):
+            position = positions.get(dimension)
+            interval = (
+                (sympy.Integer(0), shape[dimension])
+                if position is None
+                else _access_interval_expression(
+                    access, position=position, domain=source_domain
+                )
+            )
+            if interval is None:
+                return None
+            ranges.append((allocation_axis, *interval, 1))
+        relation = CoordinateRelation(
+            source_domain,
+            allocation_domain,
+            (_CoordinateRelationPiece(source_bounds, tuple(ranges)),),
+        )
+        return relation, None
+    if storage_offset is None:
+        storage_offset = layout[2]
 
     if (
-        len(access.tensor_shape) == 1
+        len(shape) == 1
         and access.subscript_dims == (0,)
         and access.affine_subscript_ranges is not None
     ):
-        (stride,) = access.tensor_strides
+        (stride,) = strides
         if not isinstance(stride, sympy.Integer) or int(stride) <= 0:
             return None
-        stride_value = int(stride)
-        source_counts = source_domain.axis_count_expressions
-        source_bounds = tuple(
-            (axis, 0, source_counts[axis], 1) for axis in source_domain.axis_order
-        )
         pieces: list[_CoordinateRelationPiece] = []
-        for (
-            coordinate_terms,
-            offset_begin,
-            offset_end,
-            offset_step,
-        ) in access.affine_subscript_ranges:
-            offset_begin_expression = _integer_expression(
-                offset_begin,
-                description="affine subscript offset",
-            )
-            offset_end_expression = _integer_expression(
-                offset_end,
-                description="affine subscript offset",
+        counts = source_domain.axis_count_expressions
+        for terms, raw_begin, raw_end, offset_step in access.affine_subscript_ranges:
+            offset_begin = _integer_expression(
+                raw_begin, description="affine subscript offset"
             )
             offset_width = sympy.simplify(
-                offset_end_expression - offset_begin_expression
+                _integer_expression(raw_end, description="affine subscript offset")
+                - offset_begin
             )
             if (
                 offset_step <= 0
                 or not isinstance(offset_width, sympy.Integer)
                 or int(offset_width) <= 0
                 or int(offset_width) % offset_step != 0
-                or len(
-                    {
-                        (axis, divisor)
-                        for axis, _coefficient, divisor in coordinate_terms
-                    }
-                )
-                != len(coordinate_terms)
+                or len({(axis, divisor) for axis, _value, divisor in terms})
+                != len(terms)
                 or any(
-                    axis not in source_counts
+                    axis not in counts
+                    or divisor <= 0
                     or not _is_provably_nonnegative(
-                        _integer_expression(
-                            coefficient,
-                            description="affine subscript coefficient",
-                        ),
+                        _integer_expression(value, description="affine coefficient"),
                         prove_nonnegative,
                     )
-                    or divisor <= 0
-                    for axis, coefficient, divisor in coordinate_terms
+                    for axis, value, divisor in terms
                 )
             ):
                 return None
-            index_begin = offset_begin_expression
-            for axis, coefficient, divisor in coordinate_terms:
+            index = offset_begin
+            for axis, coefficient, divisor in terms:
                 coordinate = coordinate_axis_symbol(axis)
-                quotient = (
-                    coordinate if divisor == 1 else sympy.floor(coordinate / divisor)  # pyrefly: ignore[bad-argument-type, unsupported-operation]
+                index += coefficient * (
+                    coordinate if divisor == 1 else sympy.floor(coordinate / divisor)
                 )
-                index_begin += coefficient * quotient  # pyrefly: ignore[unsupported-operation]
-            first_index_bounds = _logical_expression_bounds(
-                index_begin,
+            first = _logical_expression_bounds(
+                index, domain=source_domain, source_bounds=source_bounds
+            )
+            last = _logical_expression_bounds(
+                index + offset_width - offset_step,
                 domain=source_domain,
                 source_bounds=source_bounds,
             )
-            last_index_bounds = _logical_expression_bounds(
-                index_begin + offset_width - offset_step,
-                domain=source_domain,
-                source_bounds=source_bounds,
-            )
-            if first_index_bounds is None or last_index_bounds is None:
+            if (
+                first is None
+                or last is None
+                or not _is_provably_nonnegative(first[0], prove_nonnegative)
+                or not _is_provably_nonnegative(
+                    sympy.simplify(shape[0] - 1 - last[1]), prove_nonnegative
+                )
+            ):
                 return None
-            minimum_index = first_index_bounds[0]
-            maximum_index = last_index_bounds[1]
-            remaining = sympy.simplify(  # pyrefly: ignore[unsupported-operation]
-                access.tensor_shape[0] - 1 - maximum_index
-            )
-            if not _is_provably_nonnegative(
-                minimum_index, prove_nonnegative
-            ) or not _is_provably_nonnegative(remaining, prove_nonnegative):
-                return None
-            address_begin = access.storage_offset + index_begin * stride_value  # pyrefly: ignore[unsupported-operation]
+            address = storage_offset + index * stride
             pieces.append(
                 _CoordinateRelationPiece(
-                    source_bounds_items=source_bounds,
-                    target_ranges=(
+                    source_bounds,
+                    (
                         (
                             _ALLOCATION_ADDRESS_AXIS,
-                            address_begin,
-                            address_begin + offset_width * stride_value,
-                            offset_step * stride_value,
+                            address,
+                            address + offset_width * stride,
+                            offset_step * int(stride),
                         ),
                     ),
                 )
             )
-        return CoordinateRelation(
-            source_domain=source_domain,
-            target_domain=allocation_domain,
-            pieces=tuple(pieces),
-        )
+        return CoordinateRelation(source_domain, allocation_domain, tuple(pieces)), None
 
     intervals: list[tuple[sympy.Expr, sympy.Expr]] = []
     widths: list[sympy.Expr] = []
-    for tensor_dimension, size in enumerate(access.tensor_shape):
-        position = positions.get(tensor_dimension)
+    for dimension, size in enumerate(shape):
+        position = positions.get(dimension)
         interval = (
             (sympy.Integer(0), size)
             if position is None
             else _access_interval_expression(
-                access,
-                position=position,
-                domain=source_domain,
+                access, position=position, domain=source_domain
             )
         )
         if interval is None:
             return None
         begin, end = interval
-        width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
-        if not _is_provably_nonnegative(width_expression - 1, prove_nonnegative):
+        width = sympy.simplify(end - begin)
+        if not _is_provably_nonnegative(width - 1, prove_nonnegative):
             return None
-        width = cast("sympy.Expr", width_expression)
-
         if position is not None and not access.subscript_is_full_slice[position]:
             axis = access.subscript_affine_block_ids[position]
             offset = access.subscript_offsets[position]
@@ -5380,250 +5137,284 @@ def _symbolic_linear_access_relation(
                     + offset
                     + width
                 )
-                remaining = sympy.simplify(size - final_end)
                 if offset < 0 or not _is_provably_nonnegative(
-                    remaining, prove_nonnegative
+                    sympy.simplify(size - final_end), prove_nonnegative
                 ):
                     return None
         intervals.append(interval)
         widths.append(width)
 
-    contiguous_span: sympy.Expr = sympy.Integer(1)
-    remaining_dimensions = {
-        tensor_dimension
-        for tensor_dimension in range(len(access.tensor_shape))
-        if widths[tensor_dimension] != 1
-    }
-    while remaining_dimensions:
-        candidates = tuple(
-            tensor_dimension
-            for tensor_dimension in remaining_dimensions
-            if sympy.simplify(access.tensor_strides[tensor_dimension] - contiguous_span)
-            == 0
+    span: sympy.Expr = sympy.Integer(1)
+    remaining = {index for index, width in enumerate(widths) if width != 1}
+    while remaining:
+        matches = tuple(
+            index for index in remaining if sympy.simplify(strides[index] - span) == 0
         )
-        if len(candidates) != 1:
+        if len(matches) != 1:
             return None
-        (tensor_dimension,) = candidates
-        width = widths[tensor_dimension]
-        contiguous_span *= width
-        remaining_dimensions.remove(tensor_dimension)
-
-    begin = _integer_expression(
-        access.storage_offset,
-        description="access storage offset",
+        dimension = matches[0]
+        span *= widths[dimension]
+        remaining.remove(dimension)
+    begin = storage_offset + sum(
+        interval[0] * stride
+        for interval, stride in zip(intervals, strides, strict=True)
     )
-    for (dimension_begin, _dimension_end), stride in zip(
-        intervals,
-        access.tensor_strides,
-        strict=True,
-    ):
-        begin += dimension_begin * stride  # pyrefly: ignore[unsupported-operation]
-    return CoordinateRelation(
-        source_domain=source_domain,
-        target_domain=allocation_domain,
-        pieces=(
+    relation = CoordinateRelation(
+        source_domain,
+        allocation_domain,
+        (
             _CoordinateRelationPiece(
-                source_bounds_items=_full_bounds(source_domain),
-                target_ranges=(
-                    (
-                        _ALLOCATION_ADDRESS_AXIS,
-                        begin,
-                        begin + contiguous_span,  # pyrefly: ignore[unsupported-operation]
-                        1,
-                    ),
-                ),
+                source_bounds,
+                ((_ALLOCATION_ADDRESS_AXIS, begin, begin + span, 1),),
             ),
         ),
     )
-
-
-def _dense_linear_overlap_relation(
-    producer_relation: CoordinateRelation,
-    consumer_relation: CoordinateRelation,
-    *,
-    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
-) -> CoordinateRelation | None:
-    """Map exact linear-view accesses back to a dense producer task grid."""
-    if (
-        producer_relation.target_domain != consumer_relation.target_domain
-        or producer_relation.target_domain.axis_order != (_ALLOCATION_ADDRESS_AXIS,)
-        or len(producer_relation.pieces) != 1
-    ):
-        return None
-    producer_domain = producer_relation.source_domain
-    producer_counts = producer_domain.axis_count_expressions
-    producer_piece = producer_relation.pieces[0]
-    if (
-        producer_piece.source_bounds_items != _full_bounds(producer_domain)
-        or len(producer_piece.target_ranges) != 1
-    ):
-        return None
-    _axis, producer_begin, producer_end, producer_step = producer_piece.target_ranges[0]
-    producer_width_expr = sympy.simplify(producer_end - producer_begin)
-    affine = _static_affine_coefficients(producer_begin, domain=producer_domain)
-    if (
-        producer_step != 1
-        or affine is None
-        or not isinstance(producer_width_expr, sympy.Integer)
-    ):
-        return None
-    coefficients, producer_offset = affine
-    producer_width = int(producer_width_expr)
-    if producer_width <= 0:
-        return None
-    remaining_axes = {
-        axis
-        for axis in producer_domain.axis_order
-        if sympy.simplify(producer_counts[axis] - 1) != 0
-    }
-    active_axes: list[int] = []
-    dense_span: sympy.Expr = sympy.Integer(producer_width)
-    tile_strides: dict[int, sympy.Expr] = {}
-    while remaining_axes:
-        matching_axes = tuple(
+    codec = None
+    affine = _static_affine_coefficients(begin, domain=source_domain)
+    if isinstance(span, sympy.Integer) and int(span) > 0 and affine is not None:
+        coefficients, offset = affine
+        counts = source_domain.axis_count_expressions
+        remaining = {
             axis
-            for axis in remaining_axes
-            if sympy.simplify(coefficients[axis] - dense_span) == 0
+            for axis in source_domain.axis_order
+            if sympy.simplify(counts[axis] - 1) != 0
+        }
+        dense_span: sympy.Expr = span
+        strides_by_axis: list[tuple[int, sympy.Expr]] = []
+        while remaining:
+            matches = tuple(
+                axis
+                for axis in remaining
+                if sympy.simplify(coefficients[axis] - dense_span) == 0
+            )
+            if len(matches) != 1:
+                break
+            axis = matches[0]
+            strides_by_axis.append((axis, sympy.simplify(dense_span / int(span))))
+            dense_span = sympy.simplify(dense_span * counts[axis])
+            remaining.remove(axis)
+        else:
+            singleton_axes = set(source_domain.axis_order) - {
+                axis for axis, _stride in strides_by_axis
+            }
+            allocation_count = allocation_domain.axis_count_expressions[
+                _ALLOCATION_ADDRESS_AXIS
+            ]
+            if (
+                all(coefficients[axis] == 0 for axis in singleton_axes)
+                and _is_provably_nonnegative(sympy.Integer(offset), prove_nonnegative)
+                and _is_provably_nonnegative(
+                    sympy.simplify(allocation_count - offset - dense_span),
+                    prove_nonnegative,
+                )
+            ):
+                codec = offset, int(span), dense_span, tuple(strides_by_axis)
+    return relation, codec
+
+
+def _rectangular_overlap_sources(
+    owner: CoordinateRelation,
+    query: CoordinateRelation,
+) -> CoordinateRelation | None:
+    if (
+        owner.target_domain != query.target_domain
+        or not _relation_product_is_within_budget(len(owner.pieces), len(query.pieces))
+        or any(
+            piece.source_bounds_items != _full_bounds(owner.source_domain)
+            for piece in owner.pieces
         )
-        if len(matching_axes) != 1:
-            return None
-        (axis,) = matching_axes
-        active_axes.append(axis)
-        tile_stride = sympy.simplify(dense_span / producer_width)
-        if tile_stride.is_integer is not True:
-            return None
-        tile_strides[axis] = tile_stride
-        dense_span = sympy.simplify(dense_span * producer_counts[axis])
-        remaining_axes.remove(axis)
-    if any(
-        coefficients[axis] != 0
-        for axis in producer_domain.axis_order
-        if sympy.simplify(producer_counts[axis] - 1) == 0
     ):
         return None
-    allocation_count = producer_relation.target_domain.axis_count_expressions[
-        _ALLOCATION_ADDRESS_AXIS
-    ]
-    remaining_allocation = sympy.simplify(
-        allocation_count - producer_offset - dense_span
-    )
-    if not _is_provably_nonnegative(
-        sympy.sympify(producer_offset), prove_nonnegative
-    ) or not _is_provably_nonnegative(remaining_allocation, prove_nonnegative):
-        return None
-
+    owner_counts = owner.source_domain.axis_count_expressions
+    allocation_counts = owner.target_domain.axis_count_expressions
     pieces: list[_CoordinateRelationPiece] = []
-    for consumer_piece in consumer_relation.pieces:
-        if len(consumer_piece.target_ranges) != 1:
+    for owner_piece, query_piece in itertools.product(owner.pieces, query.pieces):
+        owner_ranges = {axis: values for axis, *values in owner_piece.target_ranges}
+        query_ranges = {axis: values for axis, *values in query_piece.target_ranges}
+        lower = {axis: [] for axis in owner.source_domain.axis_order}
+        upper = {axis: [] for axis in owner.source_domain.axis_order}
+        for allocation_axis in owner.target_domain.axis_order:
+            owner_begin, owner_end, owner_step = owner_ranges[allocation_axis]
+            query_begin, query_end, query_step = query_ranges[allocation_axis]
+            if owner_step != 1 or query_step != 1:
+                return None
+            if (
+                sympy.simplify(owner_begin) == 0
+                and sympy.simplify(owner_end - allocation_counts[allocation_axis]) == 0
+            ):
+                continue
+            interval = _single_axis_interval(
+                owner_begin, owner_end, domain=owner.source_domain
+            )
+            if interval is None:
+                return None
+            owner_axis, stride, offset, width = interval
+            query_interval = _single_axis_interval(
+                query_begin, query_end, domain=query.source_domain
+            )
+            if query_interval is not None:
+                _, query_stride, query_offset, query_width = query_interval
+                if (
+                    width == stride
+                    and query_width == query_stride
+                    and stride % query_width == 0
+                    and (query_offset - offset) % query_width == 0
+                ):
+                    value = sympy.floor((query_begin - offset) / stride)
+                    lower[owner_axis].append(value)
+                    upper[owner_axis].append(value + 1)
+                    continue
+            lower[owner_axis].append(
+                sympy.floor((query_begin - offset - width) / stride) + 1
+            )
+            upper[owner_axis].append(sympy.ceiling((query_end - offset) / stride))
+        pieces.append(
+            _CoordinateRelationPiece(
+                query_piece.source_bounds_items,
+                tuple(
+                    (
+                        axis,
+                        sympy.Max(*lower[axis]) if lower[axis] else sympy.Integer(0),
+                        (
+                            sympy.Min(*upper[axis])
+                            if upper[axis]
+                            else sympy.sympify(owner_counts[axis])
+                        ),
+                        1,
+                    )
+                    for axis in owner.source_domain.axis_order
+                ),
+            )
+        )
+    return CoordinateRelation(
+        query.source_domain, owner.source_domain, tuple(dict.fromkeys(pieces))
+    )
+
+
+def _dense_overlap_sources(
+    owner: _AccessMap,
+    query: CoordinateRelation,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+) -> CoordinateRelation | None:
+    relation, codec = owner
+    if codec is None or relation.target_domain != query.target_domain:
+        return None
+    offset, tile_width, dense_span, stride_items = codec
+    tile_strides = dict(stride_items)
+    counts = relation.source_domain.axis_count_expressions
+    pieces: list[_CoordinateRelationPiece] = []
+    for piece in query.pieces:
+        if len(piece.target_ranges) != 1:
             return None
-        _axis, consumer_begin, consumer_end, consumer_step = (
-            consumer_piece.target_ranges[0]
+        _axis, begin, end, step = piece.target_ranges[0]
+        begin_delta, end_delta = (
+            sympy.simplify(begin - offset),
+            sympy.simplify(end - offset),
         )
-        begin_delta = sympy.simplify(consumer_begin - producer_offset)
-        end_delta = sympy.simplify(consumer_end - producer_offset)
-        begin_bounds = _logical_expression_bounds(
+        first_bounds = _logical_expression_bounds(
             begin_delta,
-            domain=consumer_relation.source_domain,
-            source_bounds=consumer_piece.source_bounds_items,
+            domain=query.source_domain,
+            source_bounds=piece.source_bounds_items,
         )
-        last_address = sympy.simplify(end_delta - consumer_step)
         last_bounds = _logical_expression_bounds(
-            last_address,
-            domain=consumer_relation.source_domain,
-            source_bounds=consumer_piece.source_bounds_items,
+            sympy.simplify(end_delta - step),
+            domain=query.source_domain,
+            source_bounds=piece.source_bounds_items,
         )
-        width_expr = sympy.simplify(end_delta - begin_delta)
+        width_expression = sympy.simplify(end_delta - begin_delta)
         if (
-            begin_bounds is None
+            first_bounds is None
             or last_bounds is None
-            or not _is_provably_nonnegative(begin_bounds[0], prove_nonnegative)
+            or not isinstance(width_expression, sympy.Integer)
+            or not _is_provably_nonnegative(first_bounds[0], prove_nonnegative)
             or not _is_provably_nonnegative(
                 sympy.simplify(dense_span - 1 - last_bounds[1]), prove_nonnegative
             )
-            or not isinstance(width_expr, sympy.Integer)
         ):
             return None
-        width = int(width_expr)
-        if width <= 0:
-            return None
-
-        first_ordinal = sympy.floor(begin_delta / producer_width)
+        width = int(width_expression)
+        first_ordinal = sympy.floor(begin_delta / tile_width)
         if (
-            consumer_step == 1
-            and width <= producer_width
-            and producer_width % width == 0
+            0 < width <= tile_width
+            and step == 1
+            and tile_width % width == 0
             and sympy.simplify(sympy.Mod(begin_delta, width)) == 0
         ):
-            ordinal_count = 1
-            ordinal_step = 1
+            ordinal_count, ordinal_step = 1, 1
         elif (
-            consumer_step >= producer_width
-            and consumer_step % producer_width == 0
-            and width % consumer_step == 0
+            step >= tile_width
+            and step % tile_width == 0
+            and width > 0
+            and width % step == 0
         ):
-            ordinal_count = width // consumer_step
-            ordinal_step = consumer_step // producer_width
+            ordinal_count, ordinal_step = width // step, step // tile_width
         else:
             return None
-
         varying_axis = None
         if ordinal_count > 1:
             varying_axis = next(
-                (axis for axis in active_axes if tile_strides[axis] == ordinal_step),
-                None,
+                (axis for axis, stride in stride_items if stride == ordinal_step), None
             )
             if varying_axis is None:
                 return None
-
-        target_ranges: dict[int, tuple[sympy.Expr, sympy.Expr, int]] = {}
-        for axis in producer_domain.axis_order:
-            producer_count = producer_counts[axis]
-            if sympy.simplify(producer_count - 1) == 0:
-                coordinate: sympy.Expr = sympy.Integer(0)
-            else:
-                tile_stride = tile_strides[axis]
-                coordinate = cast(
-                    "sympy.Expr",
-                    sympy.Mod(sympy.floor(first_ordinal / tile_stride), producer_count),
+        ranges = []
+        for axis in relation.source_domain.axis_order:
+            count = counts[axis]
+            coordinate: sympy.Expr = sympy.Integer(0)
+            if sympy.simplify(count - 1) != 0:
+                coordinate = sympy.Mod(
+                    sympy.floor(first_ordinal / tile_strides[axis]), count
                 )
                 for _ in range(2):
                     coordinate = _simplify_logical_expression(
                         coordinate,
-                        domain=consumer_relation.source_domain,
-                        source_bounds=consumer_piece.source_bounds_items,
+                        domain=query.source_domain,
+                        source_bounds=piece.source_bounds_items,
                     )
-            count = ordinal_count if axis == varying_axis else 1
-            coordinate_bounds = _logical_expression_bounds(
+            extent = ordinal_count if axis == varying_axis else 1
+            bounds = _logical_expression_bounds(
                 coordinate,
-                domain=consumer_relation.source_domain,
-                source_bounds=consumer_piece.source_bounds_items,
+                domain=query.source_domain,
+                source_bounds=piece.source_bounds_items,
             )
             if (
-                coordinate_bounds is None
-                or not _is_provably_nonnegative(coordinate_bounds[0], prove_nonnegative)
+                bounds is None
+                or not _is_provably_nonnegative(bounds[0], prove_nonnegative)
                 or not _is_provably_nonnegative(
-                    sympy.simplify(producer_count - count - coordinate_bounds[1]),
-                    prove_nonnegative,
+                    sympy.simplify(count - extent - bounds[1]), prove_nonnegative
                 )
             ):
                 return None
-            target_ranges[axis] = (
-                coordinate,
-                coordinate + count,
-                1,
-            )
+            ranges.append((axis, coordinate, coordinate + extent, 1))
         pieces.append(
-            _CoordinateRelationPiece(
-                source_bounds_items=consumer_piece.source_bounds_items,
-                target_ranges=tuple(
-                    (axis, *target_ranges[axis]) for axis in producer_domain.axis_order
-                ),
-            )
+            _CoordinateRelationPiece(piece.source_bounds_items, tuple(ranges))
         )
     return CoordinateRelation(
-        source_domain=consumer_relation.source_domain,
-        target_domain=producer_domain,
-        pieces=tuple(dict.fromkeys(pieces)),
+        query.source_domain,
+        relation.source_domain,
+        tuple(dict.fromkeys(pieces)),
+    )
+
+
+def _access_incidence(
+    owner: _AccessMap,
+    query: _AccessMap,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+) -> Incidence | None:
+    owner_relation, _ = owner
+    query_relation, _ = query
+    items = _rectangular_overlap_sources(owner_relation, query_relation)
+    if items is None:
+        items = _dense_overlap_sources(owner, query_relation, prove_nonnegative)
+    if items is None:
+        return None
+    keys = _transpose_projection_or_singletons(items)
+    if keys is None:
+        keys = _rectangular_overlap_sources(query_relation, owner_relation)
+    if keys is None:
+        keys = _dense_overlap_sources(query, owner_relation, prove_nonnegative)
+    return Incidence.from_fibers(
+        items, keys_by_item=keys, prove_nonnegative=prove_nonnegative
     )
 
 
@@ -5635,155 +5426,112 @@ def _symbolic_dependency_incidence(
     consumer_domain: CoordinateDomain,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> Incidence | None:
-    """Compose two site-to-allocation maps into exact producer dependencies."""
     if (
         not producer_access.layout_is_symbolically_exact
         or not consumer_access.layout_is_symbolically_exact
+        or producer_access.has_explicit_mask
+        or consumer_access.has_explicit_mask
+        or producer_access.allocation_id != consumer_access.allocation_id
     ):
         return None
-    producer_layout = _normalized_coordinate_layout(producer_access)
-    consumer_layout = _normalized_coordinate_layout(consumer_access)
-    if (
-        producer_layout is not None
-        and consumer_layout is not None
-        and producer_layout[1] == consumer_layout[1]
-        and producer_access.storage_offset == consumer_access.storage_offset
-    ):
-        producer_dimensions, normalized_layout = producer_layout
-        consumer_dimensions, _ = consumer_layout
-        coordinate_domain = CoordinateDomain(
-            axis_order=tuple(range(len(normalized_layout))),
-            axis_counts_items=tuple(
-                (axis, size) for axis, (size, _stride) in enumerate(normalized_layout)
-            ),
-            kind="allocation",
-            identity=producer_access.allocation_id,
+    producer_layout = _access_layout(producer_access, prove_nonnegative)
+    consumer_layout = _access_layout(consumer_access, prove_nonnegative)
+    producer_dimensions, consumer_dimensions = producer_layout[4], consumer_layout[4]
+    if producer_dimensions is not None and consumer_dimensions is not None:
+        producer_geometry = tuple(
+            (producer_layout[0][axis], producer_layout[1][axis])
+            for axis in producer_dimensions
         )
-        producer_relation = _symbolic_coordinate_access_relation(
-            producer_access,
-            source_domain=producer_domain,
-            allocation_domain=coordinate_domain,
-            tensor_dimensions=producer_dimensions,
+        consumer_geometry = tuple(
+            (consumer_layout[0][axis], consumer_layout[1][axis])
+            for axis in consumer_dimensions
         )
-        consumer_relation = _symbolic_coordinate_access_relation(
-            consumer_access,
-            source_domain=consumer_domain,
-            allocation_domain=coordinate_domain,
-            tensor_dimensions=consumer_dimensions,
-        )
-        if producer_relation is not None and consumer_relation is not None:
-            items_by_key = producer_relation.overlapping_sources(
-                consumer_relation,
-                prove_nonnegative=prove_nonnegative,
+        if (
+            producer_geometry == consumer_geometry
+            and producer_access.storage_offset == consumer_access.storage_offset
+        ):
+            coordinate_domain = CoordinateDomain(
+                tuple(range(len(producer_geometry))),
+                tuple(
+                    (axis, size)
+                    for axis, (size, _stride) in enumerate(producer_geometry)
+                ),
+                kind="allocation",
+                identity=producer_access.allocation_id,
             )
-            if items_by_key is not None:
-                keys_by_item = _transpose_projection_or_singletons(items_by_key)
-                if keys_by_item is None:
-                    keys_by_item = consumer_relation.overlapping_sources(
-                        producer_relation,
-                        prove_nonnegative=prove_nonnegative,
-                    )
-                return Incidence.from_fibers(
-                    items_by_key,
-                    keys_by_item=keys_by_item,
-                    prove_nonnegative=prove_nonnegative,
+            producer_map = _symbolic_access_map(
+                producer_access,
+                layout=producer_layout,
+                source_domain=producer_domain,
+                allocation_domain=coordinate_domain,
+                tensor_dimensions=producer_dimensions,
+            )
+            consumer_map = _symbolic_access_map(
+                consumer_access,
+                layout=consumer_layout,
+                source_domain=consumer_domain,
+                allocation_domain=coordinate_domain,
+                tensor_dimensions=consumer_dimensions,
+            )
+            if producer_map is not None and consumer_map is not None:
+                incidence = _access_incidence(
+                    producer_map, consumer_map, prove_nonnegative
                 )
+                if incidence is not None:
+                    return incidence
 
-    # The allocation's absolute storage origin is irrelevant when both views
-    # begin at the same exact offset.  Normalize that common translation before
-    # the linear fallback: otherwise a host-backed runtime offset appears as a
-    # second free symbol beside the task coordinate and prevents the affine
-    # interval recognizer from seeing an ordinary dense reshape.  Unequal view
-    # offsets retain their original coordinates and conservative behavior.
-    linear_producer_access = producer_access
-    linear_consumer_access = consumer_access
-    if _integer_partition_expressions_equal(
-        producer_access.storage_offset,
-        consumer_access.storage_offset,
-    ):
-        linear_producer_access = dataclasses.replace(
-            producer_access,
-            storage_offset=sympy.Integer(0),
-        )
-        linear_consumer_access = dataclasses.replace(
-            consumer_access,
-            storage_offset=sympy.Integer(0),
-        )
-    producer_storage_size = _allocation_storage_size(
-        linear_producer_access,
-        prove_nonnegative=prove_nonnegative,
+    common_offset = _integer_partition_expressions_equal(
+        producer_access.storage_offset, consumer_access.storage_offset
     )
-    consumer_storage_size = _allocation_storage_size(
-        linear_consumer_access,
-        prove_nonnegative=prove_nonnegative,
-    )
-    if producer_storage_size is None or consumer_storage_size is None:
-        return None
-    storage_size_delta = sympy.simplify(producer_storage_size - consumer_storage_size)
-    if storage_size_delta == 0 or _is_provably_nonnegative(
-        storage_size_delta, prove_nonnegative
+    producer_offset = sympy.Integer(0) if common_offset else producer_layout[2]
+    consumer_offset = sympy.Integer(0) if common_offset else consumer_layout[2]
+    storage_sizes = []
+    for layout, offset in (
+        (producer_layout, producer_offset),
+        (consumer_layout, consumer_offset),
     ):
-        allocation_storage_size = producer_storage_size
-    elif _is_provably_nonnegative(-storage_size_delta, prove_nonnegative):
-        allocation_storage_size = consumer_storage_size
+        span = layout[3]
+        if span is None or not _is_provably_nonnegative(offset, prove_nonnegative):
+            return None
+        end = sympy.simplify(offset + span)
+        if end.is_zero is True:
+            end = sympy.Integer(1)
+        elif not _is_provably_nonnegative(end, prove_nonnegative):
+            end = sympy.simplify(sympy.Max(1, end))
+        storage_sizes.append(end)
+    producer_size, consumer_size = storage_sizes
+    delta = sympy.simplify(producer_size - consumer_size)
+    if delta == 0 or _is_provably_nonnegative(delta, prove_nonnegative):
+        allocation_size = producer_size
+    elif _is_provably_nonnegative(-delta, prove_nonnegative):
+        allocation_size = consumer_size
     else:
-        allocation_storage_size = sympy.simplify(
-            sympy.Max(producer_storage_size, consumer_storage_size)
-        )
-    linear_domain = CoordinateDomain(
-        axis_order=(_ALLOCATION_ADDRESS_AXIS,),
-        axis_counts_items=(
-            (
-                _ALLOCATION_ADDRESS_AXIS,
-                allocation_storage_size,
-            ),
-        ),
+        allocation_size = sympy.simplify(sympy.Max(producer_size, consumer_size))
+    allocation_domain = CoordinateDomain(
+        (_ALLOCATION_ADDRESS_AXIS,),
+        ((_ALLOCATION_ADDRESS_AXIS, allocation_size),),
         kind="allocation",
         identity=producer_access.allocation_id,
     )
-    producer_relation = _symbolic_linear_access_relation(
-        linear_producer_access,
+    producer_map = _symbolic_access_map(
+        producer_access,
+        layout=producer_layout,
+        storage_offset=producer_offset,
         source_domain=producer_domain,
-        allocation_domain=linear_domain,
+        allocation_domain=allocation_domain,
         prove_nonnegative=prove_nonnegative,
     )
-    consumer_relation = _symbolic_linear_access_relation(
-        linear_consumer_access,
+    consumer_map = _symbolic_access_map(
+        consumer_access,
+        layout=consumer_layout,
+        storage_offset=consumer_offset,
         source_domain=consumer_domain,
-        allocation_domain=linear_domain,
+        allocation_domain=allocation_domain,
         prove_nonnegative=prove_nonnegative,
     )
-    if producer_relation is None or consumer_relation is None:
+    if producer_map is None or consumer_map is None:
         return None
-    items_by_key = producer_relation.overlapping_sources(
-        consumer_relation,
-        prove_nonnegative=prove_nonnegative,
-    )
-    if items_by_key is None:
-        items_by_key = _dense_linear_overlap_relation(
-            producer_relation,
-            consumer_relation,
-            prove_nonnegative=prove_nonnegative,
-        )
-    if items_by_key is None:
-        return None
-    keys_by_item = _transpose_projection_or_singletons(items_by_key)
-    if keys_by_item is None:
-        keys_by_item = consumer_relation.overlapping_sources(
-            producer_relation,
-            prove_nonnegative=prove_nonnegative,
-        )
-    if keys_by_item is None:
-        keys_by_item = _dense_linear_overlap_relation(
-            consumer_relation,
-            producer_relation,
-            prove_nonnegative=prove_nonnegative,
-        )
-    return Incidence.from_fibers(
-        items_by_key,
-        keys_by_item=keys_by_item,
-        prove_nonnegative=prove_nonnegative,
-    )
+    return _access_incidence(producer_map, consumer_map, prove_nonnegative)
 
 
 def _coordinate_domain_for_axes(
