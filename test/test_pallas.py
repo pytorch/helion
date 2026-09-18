@@ -486,6 +486,20 @@ def pallas_jagged_segment_add(x: torch.Tensor, offsets: torch.Tensor) -> torch.T
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_jagged_row_slab_add(
+    x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+) -> torch.Tensor:
+    """Dynamic token ranges over contiguous ``[token, head, dim]`` slabs."""
+    out = torch.empty_like(x)
+    for group in hl.grid(starts.size(0)):
+        start = starts[group]
+        end = ends[group]
+        for tile in hl.tile(start, end):
+            out[tile, :, :] = x[tile, :, :] + group + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_add_3d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Kernel with an outer grid loop and a 2D inner device loop."""
     b, m, n = x.size()
@@ -5651,6 +5665,35 @@ class TestPallas(TestCase):
         self.assertIn("pipeline_mode=pl.Buffered", code)
         self.assertIn("_hbm_arg_indices=[1]", code)
         self.assertNotIn("pltpu.make_async_copy", code)
+
+    @skipIfPallasInterpret(
+        "dynamic pl.ds / pl.BoundedSlice BlockSpecs require a real TPU"
+    )
+    def test_emit_pipeline_row_slab_load_store_clamp(self) -> None:
+        """Short row-slab DMAs zero input tails and clamp output writeback."""
+        x = torch.randn(25, 4, 128, device=DEVICE, dtype=torch.float32)
+        # Process the upper segment first. An unclamped write by the second
+        # segment would overwrite rows [10, 16), making the bug observable.
+        starts = torch.tensor([10, 0], device=DEVICE, dtype=torch.int32)
+        ends = torch.tensor([25, 10], device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(
+            pallas_jagged_row_slab_add,
+            (x, starts, ends),
+            block_sizes=[16],
+            pallas_loop_type="emit_pipeline",
+        )
+
+        self.assertIn("pltpu.emit_pipeline", code)
+        self.assertIn("out_specs=pl.BlockSpec((pl.BoundedSlice", code)
+        self.assertIn("jnp.clip(25 -", code)
+        self.assertIn("jnp.minimum", code)
+        self.assertIn("jnp.where", code)
+        self.assertNotIn("_ds_pad_dims=", code)
+
+        expected = torch.empty_like(x)
+        expected[10:25] = x[10:25] + 1.0
+        expected[0:10] = x[0:10] + 2.0
+        torch.testing.assert_close(result, expected)
 
     def test_tile_id_per_block_accumulator(self) -> None:
         """Writing to ``out[tile.id, :]`` stores one row per outer grid iter.

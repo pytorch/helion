@@ -4076,6 +4076,11 @@ class EmitPipelineLoopState(DeviceLoopOrGridState):
     _deferred_physical_mask_bounds: dict[torch.fx.Node, dict[int, tuple[str, ...]]] = (
         dataclasses.field(default_factory=dict)
     )
+    # Per load node and block id, physical tensor bounds used to zero lanes left
+    # stale by a shortened input DMA before the loaded value is consumed.
+    _eager_physical_mask_bounds: dict[torch.fx.Node, dict[int, tuple[str, ...]]] = (
+        dataclasses.field(default_factory=dict)
+    )
     # Clean-region branches prove these physical bounds all-true for this tile.
     _proven_physical_mask_block_ids: set[int] = dataclasses.field(default_factory=set)
 

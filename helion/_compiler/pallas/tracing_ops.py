@@ -1848,16 +1848,17 @@ def _pipeline_load_physical_mask_plan(
     tensor: torch.Tensor,
     block_id: int,
     dma_dim_expr: str,
+    *,
+    mask_at_load: bool = False,
 ) -> dict[torch.fx.Node, set[str]] | None:
-    """Plan downstream physical masks for a shortened pipeline transfer.
+    """Plan zero masks for a shortened pipeline transfer.
 
-    A short ``BoundedSlice`` DMA can leave the unused VMEM tail stale.  Reuse
-    ``defer_pallas_load_masks``'s dataflow proof, but fail closed on nested
-    control flow, aliases with an unknown access shape, non-plain tile patterns,
-    and bounds that are not the ordered packed-offset idiom.  Every load must
-    defer this tile mask to a downstream ``_mask_to(_, 0)``; its ``jnp.where``
-    is extended with the backing tensor's physical bound so it also clears stale
-    NaN/Inf tails when the logical packed offset exceeds the tensor extent.
+    A short ``BoundedSlice`` DMA can leave the unused VMEM tail stale. Packed
+    worklist loads reuse ``defer_pallas_load_masks``'s dataflow proof and clear
+    the tail at a downstream ``_mask_to(_, 0)``. Row-slab loads pass
+    ``mask_at_load=True`` and clear the tail immediately, before arbitrary use.
+    Both paths fail closed on nested control flow, aliases with an unknown access
+    shape, and non-plain tile patterns.
     """
     from ...language.memory_ops import load
     from ..node_masking import PALLAS_DEFERRED_MASK_CONSUMERS_META
@@ -1869,12 +1870,14 @@ def _pipeline_load_physical_mask_plan(
 
     if _graph_has_nested_device_control_flow(graph):
         return None
-    if not _pipeline_load_has_packed_worklist_bound(tensor, block_id):
+    if not mask_at_load and not _pipeline_load_has_packed_worklist_bound(
+        tensor, block_id
+    ):
         return None
 
-    relevant = False
     graph_nodes = {node.name: node for node in graph.nodes}
     physical_masks: dict[torch.fx.Node, set[str]] = {}
+    relevant = False
     for node in graph.nodes:
         if node.op == "call_function" and _is_distributed_op_target(node.target):
             return None
@@ -1891,10 +1894,9 @@ def _pipeline_load_physical_mask_plan(
             continue
         if access.tensor is not tensor:
             # A distinct view gets its own pipeline argument and BlockSpec, so
-            # its physical extent belongs only on its own downstream masks.
-            # Still reject writes through any alias of this input: remapping
-            # one view to a private DMA scratch would otherwise split accesses
-            # that must observe the same backing allocation.
+            # its physical extent belongs only on its own masks. Still reject
+            # writes through an alias: remapping one view to private DMA scratch
+            # would split accesses that must observe the same backing allocation.
             if access.kind is not MemoryAccessKind.LOAD:
                 return None
             continue
@@ -1917,13 +1919,19 @@ def _pipeline_load_physical_mask_plan(
         if len(block_tensor_dims) != 1:
             return None
         relevant = True
-        if block_id not in (node.meta.get("pallas_deferred_mask_block_ids") or ()):
-            return None
 
         access_dim_expr = _tensor_dim_size_expr(
             access.tensor.shape[block_tensor_dims[0]], state
         )
         if access_dim_expr is None:
+            return None
+        if mask_at_load:
+            physical_masks.setdefault(node, set()).update(
+                (dma_dim_expr, access_dim_expr)
+            )
+            continue
+
+        if block_id not in (node.meta.get("pallas_deferred_mask_block_ids") or ()):
             return None
         consumers = node.meta.get(PALLAS_DEFERRED_MASK_CONSUMERS_META)
         if not isinstance(consumers, dict):
@@ -3420,7 +3428,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     # Pipelined tensors flow through emit_pipeline's per-iter Buffered
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
-    all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
+    all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
         loop_window.loaded,
         loop_window.stored,
         block_ids,
@@ -3428,6 +3436,17 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         env,
         state,
     )
+    row_slab_load_ids = {
+        id(fake)
+        for (fake, sub_meta, direction), vmem_shape in zip(
+            all_tensor_info, vmem_shapes, strict=True
+        )
+        if direction == "load"
+        and not is_tpu_dma_aligned_shape(vmem_shape, fake.dtype)
+        and _is_supported_contiguous_row_slab_dma(
+            fake, sub_meta, block_ids, vmem_shape, env, state
+        )
+    }
 
     # Build in_specs and out_specs
     in_tensors: list[tuple[torch.Tensor, str]] = []
@@ -3438,6 +3457,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     pipeline_in_args: list[str] = []
     pipeline_out_args: list[str] = []
     deferred_physical_mask_bounds: dict[torch.fx.Node, dict[int, set[str]]] = {}
+    eager_physical_mask_bounds: dict[torch.fx.Node, dict[int, set[str]]] = {}
     clean_physical_mask_bounds: dict[int, set[str]] = {}
 
     # Map outer grid block_ids to program_id variable names.
@@ -3538,35 +3558,65 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         f"* ({pipeline_iter_step_expr})"
                     )
                     is_carry = bid in state.device_function.carry_tiles
+                    candidate_dim_expr = _tensor_dim_size_expr(dim_size, state)
                     dim_expr = None
                     physical_mask_plan = None
-                    if not is_store and not is_carry:
-                        candidate_dim_expr = _tensor_dim_size_expr(dim_size, state)
-                        if candidate_dim_expr is not None:
-                            physical_mask_plan = _pipeline_load_physical_mask_plan(
+                    eager_mask_plan = None
+                    if (
+                        not is_store
+                        and not is_carry
+                        and candidate_dim_expr is not None
+                    ):
+                        physical_mask_plan = _pipeline_load_physical_mask_plan(
+                            state,
+                            graph_info.graph,
+                            fake,
+                            bid,
+                            candidate_dim_expr,
+                        )
+                        if (
+                            physical_mask_plan is None
+                            and id(fake) in row_slab_load_ids
+                        ):
+                            eager_mask_plan = _pipeline_load_physical_mask_plan(
                                 state,
                                 graph_info.graph,
                                 fake,
                                 bid,
                                 candidate_dim_expr,
+                                mask_at_load=True,
                             )
-                            if physical_mask_plan is not None:
-                                dim_expr = candidate_dim_expr
+                        if (
+                            physical_mask_plan is not None
+                            or eager_mask_plan is not None
+                        ):
+                            dim_expr = candidate_dim_expr
                     if is_store and not is_carry:
-                        # Clamp the store extent to min(block, end - offset) so a
-                        # short final tile writes only its valid rows
-                        # [begin, end) instead of overrunning into the next
-                        # sub-range (which would corrupt it under cross-iteration
-                        # double-buffering, and is wasteful for large blocks).
+                        # Clamp the store to both the logical loop end and the
+                        # physical tensor extent so a short final tile cannot
+                        # overrun the next packed sub-range or the allocation.
                         #
                         # For ordered carry tiles (`bid in [...].carry_tiles`),
                         # clamping is skipped: fixed sublane-aligned windows are
                         # required for carry propagation, and zeroing/masking of
                         # unowned rows is safely handled by the ordered carry logic.
-                        size_expr = (
-                            f"jnp.minimum({pipeline_slice_size_expr}, "
-                            f"({loop_window.end_exprs[bid_idx]}) - ({start_expr}))"
-                        )
+                        if candidate_dim_expr is not None:
+                            size_expr = (
+                                f"jnp.clip(jnp.minimum("
+                                f"{loop_window.end_exprs[bid_idx]}, "
+                                f"{candidate_dim_expr}) - ({start_expr}), 0, "
+                                f"{pipeline_slice_size_expr})"
+                            )
+                            start_expr = (
+                                f"jnp.minimum(({start_expr}), ({candidate_dim_expr}))"
+                            )
+                            clamped_to_tensor = True
+                        else:
+                            size_expr = (
+                                f"jnp.minimum({pipeline_slice_size_expr}, "
+                                f"({loop_window.end_exprs[bid_idx]}) - "
+                                f"({start_expr}))"
+                            )
                     elif not is_store and dim_expr is not None:
                         # Clamp the LOAD extent to the backing tensor instead of
                         # padding the tensor host-side.  A full-block read at a
@@ -3577,25 +3627,33 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         # the index map pick the transfer SIZE is the same trick
                         # ``_compact_window_block_spec`` already uses for the
                         # outer worklist windows; a short transfer just leaves the
-                        # tail of the block stale instead of zero.  This arm is
-                        # admitted only when ``defer_pallas_load_masks`` proved
-                        # every use reaches a downstream ``_mask_to(_, 0)``. The
-                        # lowering adds this tensor's physical extent to that
-                        # select, clearing stale NaN/Inf even when packed logical
-                        # offsets extend beyond the backing allocation.
+                        # tail of the block stale instead of zero. The lowering
+                        # clears that tail either at each row-slab load or at a
+                        # downstream ``_mask_to(_, 0)`` proven by
+                        # ``defer_pallas_load_masks``.
                         size_expr = (
                             f"jnp.clip(({dim_expr}) - ({start_expr}), 0, "
                             f"{pipeline_slice_size_expr})"
                         )
                         start_expr = f"jnp.minimum(({start_expr}), ({dim_expr}))"
-                        assert physical_mask_plan is not None
-                        for mask_node, bounds in physical_mask_plan.items():
-                            deferred_physical_mask_bounds.setdefault(
-                                mask_node, {}
-                            ).setdefault(bid, set()).update(bounds)
-                            clean_physical_mask_bounds.setdefault(bid, set()).update(
-                                bounds
-                            )
+                        if physical_mask_plan is not None:
+                            for mask_node, bounds in physical_mask_plan.items():
+                                deferred_physical_mask_bounds.setdefault(
+                                    mask_node, {}
+                                ).setdefault(bid, set()).update(bounds)
+                        if eager_mask_plan is not None:
+                            for load_node, bounds in eager_mask_plan.items():
+                                eager_physical_mask_bounds.setdefault(
+                                    load_node, {}
+                                ).setdefault(bid, set()).update(bounds)
+                        mask_plans = (physical_mask_plan, eager_mask_plan)
+                        for mask_plan in mask_plans:
+                            if mask_plan is None:
+                                continue
+                            for bounds in mask_plan.values():
+                                clean_physical_mask_bounds.setdefault(
+                                    bid, set()
+                                ).update(bounds)
                         clamped_to_tensor = True
                     else:
                         size_expr = pipeline_slice_size_expr
@@ -3926,6 +3984,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             node: {bid: tuple(sorted(bounds)) for bid, bounds in by_block.items()}
             for node, by_block in deferred_physical_mask_bounds.items()
         },
+        _eager_physical_mask_bounds={
+            node: {bid: tuple(sorted(bounds)) for bid, bounds in by_block.items()}
+            for node, by_block in eager_physical_mask_bounds.items()
+        },
     )
 
     # For loop-carried state, remap args to scratch reads inside the body.
@@ -4036,9 +4098,10 @@ def _is_supported_contiguous_row_slab_dma(
     for row-slab layouts: rows are page-addressed and the full suffix is
     contiguous with an aligned lane dimension.
 
-    Keep this exception narrow: load-only caller, one dynamic-begin/end
-    current-loop row tile, only scalar-selected prefix dims, full-slice suffix,
-    no gathers/scatters/stores.
+    Keep this exception narrow: one dynamic-begin/end current-loop row tile,
+    only scalar-selected prefix dims, full-slice suffix, and no gathers or
+    scatters. The same contiguous row-slab DMA layout is valid for stores;
+    emit_pipeline's output BlockSpec clamps the final tile to the dynamic end.
     """
     if not fake.is_floating_point():
         return False
@@ -4089,7 +4152,6 @@ def _is_supported_contiguous_row_slab_dma(
 def _can_stream_inner_tile(
     fake: torch.Tensor,
     sub_meta: Sequence[object],
-    direction: str,
     block_ids: list[int],
     vmem_shape: tuple[int, ...],
     env: CompileEnvironment,
@@ -4098,8 +4160,6 @@ def _can_stream_inner_tile(
     """Return whether a loop-local tensor should use the inner streaming path."""
     if is_tpu_dma_aligned_shape(vmem_shape, fake.dtype):
         return True
-    if direction != "load":
-        return False
     return _is_supported_contiguous_row_slab_dma(
         fake, sub_meta, block_ids, vmem_shape, env, state
     )
@@ -4197,7 +4257,7 @@ def _classify_pipelined_tensors(
     in fori_loop, or ``pl.Buffered`` BlockSpec in emit_pipeline) when:
 
     * Its inner-block ``vmem_shape`` passes the standard TPU DMA alignment check,
-      or it is a load-only contiguous row-slab layout covered by
+      or it is a contiguous row-slab layout covered by
       ``_is_supported_contiguous_row_slab_dma``.
     * It is not also accessed at outer scope (i.e. in a root graph,
       between/before/after inner loops).  Pipelining replaces the tensor's
@@ -4295,7 +4355,7 @@ def _classify_pipelined_tensors(
             # classification below.
             continue
         if not _can_stream_inner_tile(
-            fake, sub_meta, direction, block_ids, vmem_shape, env, state
+            fake, sub_meta, block_ids, vmem_shape, env, state
         ):
             continue
         if id(fake) in outer_access_tensor_ids:
