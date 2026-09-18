@@ -3824,6 +3824,33 @@ class ConfigSpec:
             self.tensor_numel_constraints, block_sizes, min_sizes
         )
 
+    def shrink_block_sizes_once(self, config: helion.Config) -> helion.Config | None:
+        """Return a copy of *config* with its largest block size halved.
+
+        ``None`` once every block size sits at its minimum.  Used to back off a
+        config Helion chose itself after the backend compiler rejected it for a
+        hardware limit Helion cannot model (scratch space, shared memory,
+        register pressure).
+        """
+        block_sizes = config.config.get("block_sizes")
+        if not isinstance(block_sizes, list) or not block_sizes:
+            return None
+        best_idx: int | None = None
+        best_val = -1
+        for i, value in enumerate(block_sizes):
+            if not isinstance(value, int):
+                continue
+            if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
+                best_val = value
+                best_idx = i
+        if best_idx is None:
+            return None
+        shrunk = [*block_sizes]
+        shrunk[best_idx] //= 2
+        new_config = helion.Config.from_dict({**config.config, "block_sizes": shrunk})
+        self.normalize(new_config, _fix_invalid=True)
+        return new_config
+
     def iter_search_dimensions(
         self, value_limit: int = 100
     ) -> Iterator[SearchDimensionInfo]:
