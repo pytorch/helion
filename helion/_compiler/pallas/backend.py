@@ -311,6 +311,7 @@ class PallasBackend(Backend):
             "pallas_loop_type",
             "pallas_emit_pipeline_group_size",
             "pallas_use_low_level_scheduler",
+            "pallas_fold_dot_lhs_cast",
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
@@ -1513,7 +1514,13 @@ class PallasBackend(Backend):
         return self.build_launcher_name(device_fn.config)
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .aten_lowering import _has_foldable_dot_lhs_cast
         from .aten_lowering import cat_lowering_pallas
+
+        if _has_foldable_dot_lhs_cast(node):
+            from ..compile_environment import CompileEnvironment
+
+            CompileEnvironment.current().config_spec.pallas_fold_dot_lhs_cast_search_enabled = True
 
         if node.target is torch.ops.aten.cat.default:
             return cat_lowering_pallas

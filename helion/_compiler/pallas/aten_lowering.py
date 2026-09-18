@@ -19,6 +19,7 @@ import torch
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ...language._tracing_ops import _mask_to
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..aten_lowering import AtenLowering
@@ -52,6 +53,32 @@ if TYPE_CHECKING:
 
 
 cat_lowering_pallas = AtenLowering(target=torch.ops.aten.cat.default)
+
+
+def _has_foldable_dot_lhs_cast(node: Node) -> bool:
+    """Whether ``node`` directly narrows an f32 left dot operand to rhs dtype."""
+    if node.target in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default):
+        lhs_arg_index = 0
+    elif node.target in (
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.baddbmm.default,
+    ):
+        lhs_arg_index = 1
+    else:
+        return False
+    lhs = node.args[lhs_arg_index]
+    rhs = node.args[lhs_arg_index + 1]
+    if not isinstance(lhs, Node) or not isinstance(rhs, Node):
+        return False
+    if lhs.target is not torch.ops.prims.convert_element_type.default:
+        return False
+    source = lhs.args[0]
+    return (
+        isinstance(source, Node)
+        and source.meta["val"].dtype == torch.float32
+        and lhs.args[1] == rhs.meta["val"].dtype
+        and rhs.meta["val"].dtype in (torch.bfloat16, torch.float16)
+    )
 
 
 @cat_lowering_pallas.register_codegen("pallas")
@@ -271,6 +298,29 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
     lhs_dtype = lhs_node_arg.meta["val"].dtype
     rhs_dtype = rhs_node_arg.meta["val"].dtype
     lhs_ndim = lhs_node_arg.meta["val"].ndim
+
+    # Mosaic can apply TPU's default input precision when the dot consumes the
+    # f32 producer directly. This remains tunable because removing the explicit
+    # conversion is not faster for every TPU schedule.
+    if ctx.cg.device_function.config.get("pallas_fold_dot_lhs_cast", False):
+        cast_node = lhs_node_arg
+        if cast_node.target is _mask_to and isinstance(cast_node.args[0], Node):
+            candidate = cast_node.args[0]
+            candidate_ast = _env_arg(ctx, candidate)
+            if isinstance(candidate_ast, ast.AST) and ast.dump(lhs) == ast.dump(
+                candidate_ast
+            ):
+                cast_node = candidate
+        if (
+            cast_node.target is torch.ops.prims.convert_element_type.default
+            and cast_node.args[1] == rhs_dtype
+            and isinstance(cast_node.args[0], Node)
+            and cast_node.args[0].meta["val"].dtype == torch.float32
+            and rhs_dtype in (torch.bfloat16, torch.float16)
+        ):
+            lhs = _env_arg(ctx, cast_node.args[0])
+            assert isinstance(lhs, ast.AST)
+
     need_f32_acc = _needs_f32_accumulator(lhs_dtype, rhs_dtype)
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
 
