@@ -4,20 +4,90 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import math
 import unittest
+from unittest.mock import Mock
 from unittest.mock import patch
 
 import pytest
 import torch
+from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
 from helion._compiler.cute.layout import LayoutTag
 from helion._compiler.cute.layout import ThreadLayout
 from helion._compiler.cute.layout_propagation import META_KEY
+from helion._compiler.cute.layout_rules import _layout_from_tensor_strides
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 import helion.language as hl
 from helion.language import reduce_ops
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize(
+    "shape,tile_shape,transpose",
+    [
+        ((4096,), (256,), False),
+        ((128, 512), (16, 64), False),
+        ((512, 128), (16, 64), True),
+    ],
+)
+def test_stride_layout_covers_configured_tile(
+    shape: tuple[int, ...], tile_shape: tuple[int, ...], transpose: bool
+) -> None:
+    """A load's thread/value mapping covers its tile, not its backing tensor."""
+    tensor = torch.empty(shape)
+    if transpose:
+        tensor = tensor.t()
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["val"] = tensor
+    shape_env = ShapeEnv()
+    indices = [graph.placeholder(f"tile_{i}") for i in range(tensor.ndim)]
+    for index in indices:
+        index.meta["val"] = shape_env.create_unbacked_symint()
+    load = graph.call_function(hl.load, args=(source, indices))
+
+    block_ids = {str(index.meta["val"]): i for i, index in enumerate(indices)}
+    env = Mock()
+    env.get_block_id.side_effect = lambda size: block_ids.get(str(size))
+    env.block_sizes = [Mock(from_config=Mock(return_value=n)) for n in tile_shape]
+    strategy = Mock(
+        strategies=[Mock(fn=Mock(config=helion.Config(block_sizes=list(tile_shape))))],
+        thread_block_dims=Mock(return_value=(32, 1, 1)),
+    )
+    with patch(
+        "helion._compiler.cute.layout_rules.CompileEnvironment.current",
+        return_value=env,
+    ):
+        layout = _layout_from_tensor_strides(
+            load, tile_strategy=strategy, tag=LayoutTag.COALESCED
+        )
+
+    assert layout is not None
+    assert layout.tile_numel() == math.prod(tile_shape)
+    assert layout.num_threads() == (16 if transpose else 32)
+
+
+@onlyBackends(["cute"])
+@pytest.mark.parametrize("index_shape", [(32,), (4, 8)])
+def test_gather_layout_is_not_inferred_from_source_strides(
+    index_shape: tuple[int, ...],
+) -> None:
+    """Gather indices can repeat or rearrange source elements in any rank."""
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["val"] = torch.empty(4096)
+    index = graph.placeholder("index")
+    index.meta["val"] = torch.arange(32).reshape(index_shape) // 4
+    load = graph.call_function(hl.load, args=(source, [index]))
+    strategy = Mock(thread_block_dims=Mock(return_value=(32, 1, 1)))
+    with patch("helion._compiler.cute.layout_rules.CompileEnvironment.current"):
+        layout = _layout_from_tensor_strides(
+            load, tile_strategy=strategy, tag=LayoutTag.COALESCED
+        )
+    assert layout is None
 
 
 @helion.kernel(
