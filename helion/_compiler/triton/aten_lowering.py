@@ -19,6 +19,7 @@ from torch._inductor.utils import triton_type
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ... import exc
 from ..._utils import next_power_of_2
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -94,6 +95,18 @@ def codegen_permute(ctx: LoweringContext, node: Node) -> object:
     # pyrefly: ignore [not-iterable]
     dims = [*dims]
     assert {*dims} == {*range(len(dims))}, dims
+    input_node = node.args[0]
+    assert isinstance(input_node, Node)
+    input_val = input_node.meta["val"]
+    assert isinstance(input_val, torch.Tensor)
+    physical_rank = len(
+        ctx.cg.device_function.tile_strategy.shape_dims(input_val.shape)
+    )
+    if physical_rank != len(dims):
+        raise exc.InvalidConfig(
+            "torch.permute does not support rank-compacted tile inputs. "
+            "Disable flatten_loops for the affected tile axes."
+        )
     return expr_from_string(
         f"tl.permute({{tensor}}, {dims!r})",
         tensor=tensor,
@@ -120,11 +133,52 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     idx = ctx.cg.device_function.new_var("stack_idx")
     ctx.cg.add_statement(statement_from_string(f"{idx} = tl.arange(0, {padded_size})"))
 
-    # Broadcast index to target dimension shape
-    # e.g., dim=0: [:, None, None], dim=1: [None, :, None], dim=2: [None, None, :]
-    bidx = ctx.cg.device_function.new_var("broadcast_idx")
+    # Map the logical stack axis to its position after tile compaction.
+    input_node = tensors[0]
+    assert isinstance(input_node, Node)
+    input_val = input_node.meta["val"]
+    assert isinstance(input_val, torch.Tensor)
+    output_val = node.meta["val"]
+    assert isinstance(output_val, torch.Tensor)
     assert isinstance(dim, int)
-    pattern = "[" + ", ".join(["None"] * dim + [":"] + ["None"] * max(0, 2 - dim)) + "]"
+    dim = cast("int", dim)
+    logical_rank = input_val.ndim
+    assert 0 <= dim < logical_rank + 1 or -logical_rank - 1 <= dim < 0
+    if dim < 0:
+        dim += logical_rank + 1
+    tile_strategy = ctx.cg.device_function.tile_strategy
+    input_compacted = tile_strategy._compact_shape(input_val.shape)
+    output_compacted = tile_strategy._compact_shape(output_val.shape)
+    new_axes = [
+        axis
+        for axis, compacted in enumerate(output_compacted)
+        if compacted.user_indices == [dim]
+    ]
+    shifted_input = [
+        [index if index < dim else index + 1 for index in compacted.user_indices]
+        for compacted in input_compacted
+    ]
+    remaining_output = [
+        compacted.user_indices
+        for axis, compacted in enumerate(output_compacted)
+        if axis not in new_axes
+    ]
+    if len(new_axes) != 1 or remaining_output != [*shifted_input]:
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.stack",
+            requirement="a stack axis representable by one physical dimension",
+        )
+    stack_dim = new_axes[0]
+    bidx = ctx.cg.device_function.new_var("broadcast_idx")
+    pattern = (
+        "["
+        + ", ".join(
+            ["None"] * stack_dim
+            + [":"]
+            + ["None"] * (len(output_compacted) - stack_dim - 1)
+        )
+        + "]"
+    )
     ctx.cg.add_statement(statement_from_string(f"{bidx} = {idx}{pattern}"))
 
     # Expand each input tensor along the stack dimension
@@ -132,7 +186,9 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     for var, tensor in zip(expanded, tensor_asts, strict=False):
         tensor_ast = cast("ast.AST", tensor)
         ctx.cg.add_statement(
-            statement_from_string(f"{var} = tl.expand_dims({{t}}, {dim})", t=tensor_ast)
+            statement_from_string(
+                f"{var} = tl.expand_dims({{t}}, {stack_dim})", t=tensor_ast
+            )
         )
 
     # Initialize result with zeros
