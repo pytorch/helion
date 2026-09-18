@@ -36,6 +36,21 @@ from helion._testing import skipIfRefEager
 import helion.language as hl
 
 
+def _generated_function(code: str, name: str) -> ast.FunctionDef:
+    matches = [
+        node
+        for node in ast.parse(code).body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    if len(matches) != 1:
+        raise AssertionError(f"expected one generated function {name!r}")
+    return matches[0]
+
+
+def _call_name(node: ast.Call) -> str | None:
+    return node.func.id if isinstance(node.func, ast.Name) else None
+
+
 @helion.kernel(
     static_shapes=True,
     autotune_effort="none",
@@ -738,20 +753,31 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             )
 
         torch.testing.assert_close(out, (x + 1) * 2 + 3)
-        lines = code.splitlines()
-        wait_index = next(
-            index
-            for index, line in enumerate(lines)
-            if "tile_dependency_nested_loop_wait =" in line
+        tree = ast.parse(code)
+        parents = {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        wait = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id.startswith("tile_dependency_nested_loop_wait")
+                for target in node.targets
+            )
         )
-        loop_index = max(
-            index
-            for index, line in enumerate(lines[:wait_index])
-            if line.startswith("    for ") and " in tl.range(" in line
+        parent = parents.get(wait)
+        while parent is not None and not isinstance(parent, ast.For):
+            parent = parents.get(parent)
+        self.assertIsInstance(parent, ast.For)
+        assert isinstance(parent, ast.For) and isinstance(parent.target, ast.Name)
+        self.assertIn(
+            parent.target.id,
+            {node.id for node in ast.walk(wait.value) if isinstance(node, ast.Name)},
         )
-        loop_target = lines[loop_index].strip().split()[1]
-        self.assertTrue(lines[wait_index].startswith("        "))
-        self.assertIn(loop_target, lines[wait_index])
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -897,24 +923,48 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2 + 3)
         self.assertIn("tile_dependency_root_barrier_wait", code)
-        self.assertIn(
-            "@triton.jit\ndef tile_dependency_root_1_scheduled_task",
-            code,
+        wrapper = _generated_function(code, "tile_dependency_root_1_scheduled_task")
+        self.assertTrue(
+            all(
+                not isinstance(decorator, ast.Call)
+                for decorator in wrapper.decorator_list
+            )
         )
-        self.assertNotIn(
-            "@triton.jit(noinline=True)\ndef tile_dependency_root_1_scheduled_task",
-            code,
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Name)
+                and node.id.startswith("tile_dependency_root_barrier")
+                for node in ast.walk(wrapper)
+            )
         )
-        wrapper_begin = code.index("def tile_dependency_root_1_scheduled_task")
-        wrapper_end = code.index("\n@triton.jit", wrapper_begin)
-        wrapper = code[wrapper_begin:wrapper_end]
-        self.assertNotIn("tile_dependency_root_barrier", wrapper)
-        kernel_begin = code.index("def _helion_nested_load_store_chain")
-        dispatch = code.index("tile_dependency_root_1_scheduled_task(", kernel_begin)
-        publication = code.index("sem='release', scope='gpu'", dispatch)
-        wait = code.index("tile_dependency_root_barrier_wait", publication)
-        self.assertLess(dispatch, publication)
-        self.assertLess(publication, wait)
+        kernel = _generated_function(code, "_helion_nested_load_store_chain")
+        dispatch = next(
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Call)
+            and _call_name(node) == "tile_dependency_root_1_scheduled_task"
+        )
+        publication = next(
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("atomic_")
+            and any(
+                keyword.arg == "sem"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "release"
+                for keyword in node.keywords
+            )
+        )
+        wait = next(
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.Name)
+            and node.id.startswith("tile_dependency_root_barrier_wait")
+        )
+        self.assertLess(dispatch.lineno, publication.lineno)
+        self.assertLess(publication.lineno, wait.lineno)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1289,10 +1339,31 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_root_barrier", code)
         worker_count = torch.cuda.get_device_properties(x.device).multi_processor_count
         padded_second_root_base = -(-254 // worker_count) * worker_count
-        self.assertIn(
-            f"pid_shared = 254 + (virtual_pid - {padded_second_root_base})",
-            code,
+        root = _generated_function(code, "tile_dependency_root_1")
+        pid_assignment = next(
+            node
+            for node in root.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "pid_shared"
+                for target in node.targets
+            )
         )
+        self.assertIn(
+            "virtual_pid",
+            {
+                node.id
+                for node in ast.walk(pid_assignment.value)
+                if isinstance(node, ast.Name)
+            },
+        )
+        constants = {
+            node.value
+            for node in ast.walk(pid_assignment.value)
+            if isinstance(node, ast.Constant) and isinstance(node.value, int)
+        }
+        self.assertIn(254, constants)
+        self.assertIn(padded_second_root_base, constants)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1429,15 +1500,29 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
+        kernel = _generated_function(code, "_helion_streamed_singleton_reduction")
         scheduled_calls = [
-            0 if "tile_dependency_root_0_scheduled_task(" in line else 1
-            for line in code.splitlines()
-            if "_scheduled_task(" in line and not line.lstrip().startswith("def ")
+            _call_name(call)
+            for call in sorted(
+                (
+                    node
+                    for node in ast.walk(kernel)
+                    if isinstance(node, ast.Call)
+                    and (_call_name(node) or "").endswith("_scheduled_task")
+                ),
+                key=lambda node: (node.lineno, node.col_offset),
+            )
         ]
         # A CTA-level rank cannot justify admitting a resident nested waiter
         # before a later producer wave.  Until the scheduler models internal
         # checkpoints for arbitrary resident roots, retain the baseline order.
-        self.assertEqual(scheduled_calls, [0, 1])
+        self.assertEqual(
+            scheduled_calls,
+            [
+                "tile_dependency_root_0_scheduled_task",
+                "tile_dependency_root_1_scheduled_task",
+            ],
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

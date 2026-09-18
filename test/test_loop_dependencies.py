@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import unittest
 
 import pytest
@@ -17,6 +18,18 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+
+
+def _generated_function(code: str, name: str) -> ast.FunctionDef | None:
+    """Return one generated top-level function without matching its signature."""
+    return next(
+        (
+            node
+            for node in ast.parse(code).body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ),
+        None,
+    )
 
 
 @helion.kernel(autotune_effort="none")
@@ -408,8 +421,17 @@ class TestTritonTileDependencyLowering(TestCase):
         )
         torch.testing.assert_close(output, (x + 1) * 2 - 3)
         self.assertNotIn("tl.atomic_", code)
-        self.assertIn("tile_dependency_root_1(tmp0, tmp1", code)
-        self.assertIn("tile_dependency_root_2(tmp1, out", code)
+        root_1 = _generated_function(code, "tile_dependency_root_1")
+        root_2 = _generated_function(code, "tile_dependency_root_2")
+        self.assertIsNotNone(root_1)
+        self.assertIsNotNone(root_2)
+        assert root_1 is not None and root_2 is not None
+        self.assertTrue(
+            {"tmp0", "tmp1"} <= {argument.arg for argument in root_1.args.args}
+        )
+        self.assertTrue(
+            {"tmp1", "out"} <= {argument.arg for argument in root_2.args.args}
+        )
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
         self.assertNotIn("launch_cooperative_grid=True", code)
@@ -532,11 +554,17 @@ class TestTritonTileDependencyLowering(TestCase):
 
         torch.testing.assert_close(output, a, atol=0, rtol=0)
         self.assertIn("b_desc = tl.make_tensor_descriptor", code)
+        outlined_root = _generated_function(code, "tile_dependency_root_0")
         if torch.cuda.get_device_capability(DEVICE)[0] >= 10:
             # Blackwell tensor-memory allocation must remain kernel-scoped.
-            self.assertNotIn("def tile_dependency_root_0(", code)
+            self.assertIsNone(outlined_root)
         else:
-            self.assertIn("def tile_dependency_root_0(a, tmp, b_desc):", code)
+            # Scheduler-owned arguments such as ``virtual_pid`` may also be
+            # threaded through the outlined root.  This test only requires the
+            # tensor descriptor itself to cross the outline boundary.
+            self.assertIsNotNone(outlined_root)
+            assert outlined_root is not None
+            self.assertIn("b_desc", {arg.arg for arg in outlined_root.args.args})
 
 
 if __name__ == "__main__":

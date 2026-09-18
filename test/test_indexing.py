@@ -3259,6 +3259,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
 
     @onlyBackends(["triton"])
     @skipIfRocm("ROCm exposes an unrelated cross-loop dependency in this codegen test")
+    @skipIfTileIR("TileIR does not support cross-loop persistent synchronization")
     @skipIfXPU("XPU exposes an unrelated cross-loop dependency in this codegen test")
     @skipIfRefEager("Test checks generated Triton code")
     def test_dynamic_internal_strides_remain_literal(self):
