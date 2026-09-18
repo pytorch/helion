@@ -304,6 +304,7 @@ def default_pallas_jax_launcher(
     _smem_arg_indices: list[int] | None = None,
     _pallas_interpret: bool | None = None,
     _collective_id: int | None = None,
+    _use_low_level_scheduler: bool = False,
     _uses_remote_copy: bool = False,
     **kwargs: object,
 ) -> object:
@@ -393,6 +394,7 @@ def default_pallas_jax_launcher(
         hbm_arg_indices=_hbm_arg_indices,
         smem_arg_indices=_smem_arg_indices,
         collective_id=_collective_id,
+        use_low_level_scheduler=_use_low_level_scheduler,
         interpret=interpret,
         compact=compact,
         orig_shapes=orig_shapes,

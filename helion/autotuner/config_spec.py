@@ -808,6 +808,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "pallas_worklist_grouping",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
+        "pallas_use_low_level_scheduler",
         "pallas_pre_broadcast",
         *CUTE_TCGEN05_TUNABLE_KEYS,
     }
@@ -856,6 +857,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
+        "pallas_use_low_level_scheduler",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -892,6 +894,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "store_cache_modifiers",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
+        "pallas_use_low_level_scheduler",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -3204,8 +3207,14 @@ class ConfigSpec:
                 raise InvalidConfig(
                     "pallas_emit_pipeline_group_size must be a positive integer"
                 )
+            use_low_level_scheduler = config.get("pallas_use_low_level_scheduler")
+            if use_low_level_scheduler is not None and not isinstance(
+                use_low_level_scheduler, bool
+            ):
+                raise InvalidConfig("pallas_use_low_level_scheduler must be a bool")
         else:
             config.pop("pallas_emit_pipeline_group_size", None)
+            config.pop("pallas_use_low_level_scheduler", None)
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
