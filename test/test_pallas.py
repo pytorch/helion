@@ -1243,6 +1243,49 @@ class TestPallas(TestCase):
             if "Ran out of memory in memory space vmem" in str(e):
                 self.fail(f"bfloat16 incorrectly threw VMEM OOM: {e}")
 
+    def test_estimate_pallas_vmem_bytes_excludes_hbm_specs(self) -> None:
+        """Both legacy and current JAX HBM BlockSpecs consume no VMEM."""
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from helion.runtime.pallas.launcher import _estimate_pallas_vmem_bytes
+
+        args = (
+            torch.empty(1, dtype=torch.float32),
+            torch.empty(1, dtype=torch.float32),
+        )
+        for memory_space in (pl.ANY, pltpu.HBM):
+            with self.subTest(memory_space=memory_space):
+                spec = pl.BlockSpec(
+                    block_shape=(2048, 4096), memory_space=memory_space
+                )
+                estimated = _estimate_pallas_vmem_bytes(
+                    pl,
+                    pltpu,
+                    [spec],
+                    spec,
+                    None,
+                    args,
+                    [0],
+                    [1],
+                    None,
+                )
+                self.assertEqual(estimated, 0)
+
+        vmem_spec = pl.BlockSpec(block_shape=(8, 128), memory_space=pltpu.VMEM)
+        estimated = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            [vmem_spec],
+            None,
+            None,
+            args,
+            [0],
+            [],
+            None,
+        )
+        self.assertEqual(estimated, 8 * 128 * 4 * 2)
+
     @xfailIfPallasInterpret(
         "torch.float8_e4m3fn has no JAX dtype mapping in interpret mode; "
         "conversion errors before the VMEM check fires"

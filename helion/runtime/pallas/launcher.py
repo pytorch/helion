@@ -362,14 +362,21 @@ def _estimate_pallas_vmem_bytes(
         itemsize = getattr(getattr(t, "dtype", None), "itemsize", None)
         return itemsize if itemsize is not None else 4
 
+    def _is_hbm_spec(spec: object) -> bool:
+        memory_space = getattr(spec, "memory_space", None)
+        # Older JAX represented HBM as pl.ANY. Newer JAX exposes a distinct
+        # pltpu.HBM value; neither consumes VMEM in the launched kernel.
+        any_space = getattr(pl, "ANY", None)
+        hbm_space = getattr(pltpu, "HBM", None)
+        return (any_space is not None and memory_space == any_space) or (
+            hbm_space is not None and memory_space == hbm_space
+        )
+
     if in_specs:
         for i, idx in enumerate(tensor_arg_indices):
             spec = in_specs[i]
             # pl.BlockSpec will have block_shape and memory_space.
-            # HBM is pl.ANY. We only count VMEM (which is not pl.ANY).
-            if spec is not None and getattr(spec, "memory_space", None) is not getattr(
-                pl, "ANY", None
-            ):
+            if spec is not None and not _is_hbm_spec(spec):
                 block_shape = getattr(spec, "block_shape", None)
                 if block_shape is not None:
                     numel = 1
@@ -384,9 +391,7 @@ def _estimate_pallas_vmem_bytes(
         for i, idx in enumerate(output_indices):
             if i < len(out_specs_list):
                 spec = out_specs_list[i]
-                if spec is not None and getattr(
-                    spec, "memory_space", None
-                ) is not getattr(pl, "ANY", None):
+                if spec is not None and not _is_hbm_spec(spec):
                     block_shape = getattr(spec, "block_shape", None)
                     if block_shape is not None:
                         numel = 1
