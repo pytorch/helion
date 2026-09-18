@@ -2894,7 +2894,16 @@ def _cute_vector_load_ctx(
             # not as the SymInt that identifies K. Resolve its static extent
             # back to the persistent reduction block.
             bid = env.resolve_block_id(idx.numel())
-            if bid is not None and _cute_lane_strategy(state, bid) is not None:
+            candidate = _cute_lane_strategy(state, bid) if bid is not None else None
+            # Matching the index tensor's extent identifies its lane axis,
+            # but does not prove contiguous addressing.  A gather such as
+            # x[tile.index // 64] has exactly the same extent as tile.index.
+            # Hoisting it at the raw lane base changes the address and can
+            # read beyond x.  Only direct lane indices support that rewrite.
+            index_var = getattr(candidate, "index_var", None)
+            if not callable(index_var) or index_exprs[expr_pos] != index_var(bid):
+                return None
+            if bid is not None and candidate is not None:
                 if tensor_dim == stride1_tensor_dim or inner_block_id is None:
                     inner_block_id = bid
                     lane_axis_pos = expr_pos

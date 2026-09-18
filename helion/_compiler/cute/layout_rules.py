@@ -383,7 +383,6 @@ def _layout_from_tensor_strides(
 
     env = CompileEnvironment.current()
     strides = fake_tensor.stride()
-    shape = fake_tensor.shape
 
     # Walk subscript, resolve each element, and collect active tile dims
     # with their tensor dimension index, size, and stride.
@@ -397,7 +396,23 @@ def _layout_from_tensor_strides(
         if tensor_dim >= len(strides):
             break
         if _is_active_tile_dim(k, env):
-            dim_info.append((tensor_dim, shape[tensor_dim], strides[tensor_dim]))
+            # Layouts describe the loaded/stored tile, not the backing tensor.
+            # A multidimensional gather does not have a single source axis
+            # whose stride describes the resulting logical tensor.
+            if isinstance(k, torch.Tensor):
+                # Tensor-valued indices are gathers. Their physical lane
+                # mapping is owned by the indexing strategy and cannot be
+                # inferred from backing tensor strides alone.
+                return None
+            tile_size = k
+            if isinstance(tile_size, torch.SymInt):
+                block_id = env.get_block_id(tile_size)
+                if block_id is None:
+                    return None
+                tile_size = env.block_sizes[block_id].from_config(
+                    tile_strategy.strategies[0].fn.config
+                )
+            dim_info.append((tensor_dim, tile_size, strides[tensor_dim]))
         tensor_dim += 1
 
     if not dim_info:
