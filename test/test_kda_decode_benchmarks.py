@@ -292,6 +292,8 @@ def test_packed_codegen_expectations_cover_claimed_rows(
                     "split_t1_codegen_abi_version = 1",
                     "split_t1_rank1_helper_abi_version = 4",
                 ),
+                (),
+                (),
             ),
         ),
         (
@@ -302,12 +304,20 @@ def test_packed_codegen_expectations_cover_claimed_rows(
                     "fixed_rank1_codegen_abi_version = 3",
                     "fixed_rank1_rank1_helper_abi_version = 4",
                 ),
+                (),
+                (),
             ),
         ),
     ),
 )
 def test_recurrent_codegen_expectations_cover_claimed_rows(
-    case_name: str, expected: tuple[str, tuple[str, ...]]
+    case_name: str,
+    expected: tuple[
+        str,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ],
 ) -> None:
     assert recurrent._helion_codegen_expectation(recurrent.CASES[case_name]) == expected
 
