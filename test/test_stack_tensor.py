@@ -10,7 +10,6 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-from helion._testing import xfailIfCute
 import helion.language as hl
 
 
@@ -273,7 +272,6 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
         for i, tensor in enumerate(tensor_list):
             assert tensor.eq(i).all().item()
 
-    @xfailIfCute("CuTe full-slice StackTensor load")
     def test_stack_load_ellipsis(self):
         @helion.kernel
         def stack_load_kernel(
