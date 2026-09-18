@@ -4082,6 +4082,8 @@ class ConfigSpec:
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
                     )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
+            if self.supports_config_key("pallas_emit_pipeline_group_size"):
+                fields["pallas_emit_pipeline_group_size"] = PowerOfTwoFragment(1, 16, 1)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
             if (
