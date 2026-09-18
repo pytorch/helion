@@ -111,11 +111,7 @@ def load_expr(
         result = _padded_value_for_load(state, tensor, subscript, parts, result)
     else:
         result = emit_vmem_scalar_load(tensor, active_name, parts, scalar_load)
-    mask_expr = _load_mask_expr(state, subscript, tensor)
-    if mask_expr is not None:
-        result = expr_from_string(
-            "{result} * ({mask})", result=result, mask=expr_from_string(mask_expr)
-        )
+    result = _apply_load_masks(state, subscript, tensor, result)
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
@@ -182,11 +178,7 @@ def _hbm_load_expr(
         state.codegen.add_statement(statement)
 
     result = expr_from_string(f"{resources.scratch}[...]")
-    mask_expr = _load_mask_expr(state, subscript, tensor)
-    if mask_expr is not None:
-        result = expr_from_string(
-            "{result} * ({mask})", result=result, mask=expr_from_string(mask_expr)
-        )
+    result = _apply_load_masks(state, subscript, tensor, result)
     for dim in none_dims:
         result = expr_from_string(
             f"jnp.expand_dims({{result}}, axis={dim})", result=result
@@ -276,18 +268,17 @@ def _load_mask_expr(
     state: CodegenState,
     subscript: list[object],
     tensor: torch.Tensor,
-) -> str | None:
-    """Build a mask expression for a Pallas load to zero out-of-bounds data.
+) -> tuple[str | None, bool]:
+    """Build a Pallas load mask and report whether it includes a physical bound.
 
     Iterates over the indexing patterns for this load.  For each TilePattern
     whose loop range does not match the tensor's dimension size (e.g.
     data-dependent bounds, constexpr sub-ranges), generates a mask term so
     that out-of-tile positions are zeroed.
 
-    Only applies to dimensions that are ds-padded (the ref is padded to a
-    multiple of block_size).  Grid/tile dimensions where BlockSpecs size the
-    ref to the actual remainder are not masked — a block-sized mask would
-    cause a shape mismatch against the smaller ref.
+    Logical masks apply to dimensions that are ds-padded. Shortened pipeline
+    DMAs additionally contribute physical bounds so their stale VMEM tail can
+    be cleared with ``where`` rather than multiplication.
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -298,7 +289,7 @@ def _load_mask_expr(
     assert state.fx_node is not None
     output_val = state.fx_node.meta.get("val")
     if not isinstance(output_val, torch.Tensor):
-        return None
+        return None, False
 
     indexing_patterns = _get_indexing_patterns(state, tensor)
     env = CompileEnvironment.current()
@@ -307,6 +298,7 @@ def _load_mask_expr(
     # ``defer_pallas_load_masks`` -- masked later in the consumer layout instead.
     deferred = state.fx_node.meta.get("pallas_deferred_mask_block_ids") or frozenset()
     mask_exprs: list[str] = []
+    has_physical_mask = False
     dtype_str: str | None = None
     out_dim = 0
     tensor_dim = 0
@@ -324,6 +316,7 @@ def _load_mask_expr(
 
         if isinstance(pattern, TilePattern):
             block_id = pattern.block_id
+            mask_terms: list[str] = []
             # Skip masking for size-1 (broadcast) dims: a single element is
             # always valid, and applying a block-sized mask would broadcast
             # the dim from 1 to block_size, causing shape mismatches.
@@ -335,17 +328,27 @@ def _load_mask_expr(
             ):
                 mask_var = state.codegen.mask_var(block_id)
                 if mask_var is not None:
-                    if dtype_str is None:
-                        dtype_str = env.backend.dtype_str(tensor.dtype)
-                    if env.is_jagged_tile(block_id):
-                        mask_shape = env.jagged_tile_mask_shapes[block_id]
-                        expand = state.tile_strategy.jagged_tile_expand_str(
-                            mask_shape, output_sizes
-                        )
-                    else:
-                        expand = state.tile_strategy.expand_str(output_sizes, out_dim)
-                    expr = f"({mask_var}.astype({dtype_str}){expand})"
-                    mask_exprs.append(expr)
+                    mask_terms.append(mask_var)
+            physical_bounds = _pipeline_eager_physical_mask_bounds(state, block_id)
+            if physical_bounds:
+                index_var = state.codegen.index_var(block_id)
+                mask_terms.extend(
+                    f"(({index_var}) < ({bound}))" for bound in physical_bounds
+                )
+                has_physical_mask = True
+            if mask_terms:
+                if dtype_str is None:
+                    dtype_str = env.backend.dtype_str(tensor.dtype)
+                if env.is_jagged_tile(block_id):
+                    mask_shape = env.jagged_tile_mask_shapes[block_id]
+                    expand = state.tile_strategy.jagged_tile_expand_str(
+                        mask_shape, output_sizes
+                    )
+                else:
+                    expand = state.tile_strategy.expand_str(output_sizes, out_dim)
+                mask = " & ".join(f"({term})" for term in mask_terms)
+                expr = f"(({mask}).astype({dtype_str}){expand})"
+                mask_exprs.append(expr)
 
         # TODO(dunfanlu): Do other patterns beside TilePattern require masking?
 
@@ -354,8 +357,57 @@ def _load_mask_expr(
         tensor_dim += 1
 
     if not mask_exprs:
-        return None
-    return "*".join(mask_exprs)
+        return None, has_physical_mask
+    return "*".join(mask_exprs), has_physical_mask
+
+
+def _pipeline_eager_physical_mask_bounds(
+    state: CodegenState, block_id: int
+) -> tuple[str, ...]:
+    """Physical bounds attached to this pipeline load node."""
+    from helion._compiler.tile_strategy import EmitPipelineLoopState
+
+    assert state.fx_node is not None
+    for loop in reversed(state.codegen.active_device_loops.get(block_id, ())):
+        if not isinstance(loop, EmitPipelineLoopState):
+            continue
+        if block_id in loop._proven_physical_mask_block_ids:
+            return ()
+        bounds = loop._eager_physical_mask_bounds.get(state.fx_node, {}).get(
+            block_id, ()
+        )
+        if bounds:
+            return bounds
+    return ()
+
+
+def _apply_load_masks(
+    state: CodegenState,
+    subscript: list[object],
+    tensor: torch.Tensor,
+    result: ast.AST,
+) -> ast.AST:
+    """Apply logical tile masks and zero stale shortened-DMA lanes."""
+    from helion._compiler.compile_environment import CompileEnvironment
+
+    mask, has_physical_mask = _load_mask_expr(state, subscript, tensor)
+    if mask is None:
+        return result
+    if not has_physical_mask:
+        return expr_from_string(
+            "{result} * ({mask})",
+            result=result,
+            mask=expr_from_string(mask),
+        )
+
+    backend = CompileEnvironment.current().backend
+    zero = expr_from_string(backend.full_expr([], "0", tensor.dtype))
+    return expr_from_string(
+        backend.where_expr("{mask}", "{result}", "{zero}"),
+        mask=expr_from_string(mask),
+        result=result,
+        zero=zero,
+    )
 
 
 def _iter_dma_scratch_loops(
