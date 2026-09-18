@@ -720,7 +720,7 @@ class Backend(abc.ABC):
         ``cute_vector_widths``) override this instead of adding a name-check in
         device_ir.
         """
-        return None
+        return
 
     def wrap_reduction_accumulator(
         self,

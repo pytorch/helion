@@ -867,7 +867,7 @@ class FlyDSLBackend(Backend):
                 statement_from_string(
                     f"""@fx.struct
 class _FlyDSLRedBuf:
-    s: fx.Array[fx.Float32, {_TOTAL}, 16]"""
+    s: fx.Array[fx.Float32, {_TOTAL}, 16]  # {_TOTAL} fp32 slots; 16 = alignment bytes"""
                 ),
                 statement_from_string(
                     "_flydsl_lds = fx.SharedAllocator().allocate(_FlyDSLRedBuf).peek()"

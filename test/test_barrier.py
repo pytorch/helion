@@ -263,6 +263,9 @@ class TestBarrier(RefEagerTestBase, TestCase):
         device_ir.add_root_graph(graph)
         original_graph_count = len(device_ir.graphs)
 
+        fake_backend = SimpleNamespace(
+            register_reduction_loop_config_slots=lambda *_: None
+        )
         fake_env = SimpleNamespace(
             block_sizes=[_FakeRDim()],
             config_spec=SimpleNamespace(
@@ -270,6 +273,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
                 reduction_loops=[],
             ),
             backend_name="triton",
+            backend=fake_backend,
         )
 
         # The fake roller adds an empty subgraph (only an output node), so the

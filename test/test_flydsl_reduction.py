@@ -155,6 +155,16 @@ class TestFlydslReduction(TestCase):
         for bm in (2, 4):
             self._rms(16, 512, torch.float16, block_sizes=[bm], reduction_loops=[256])
 
+    def test_multi_row_block_no_smem_reduce(self) -> None:
+        # bm>1 uses one warp per row (W=1), so the smem block reduce must NOT be
+        # emitted. Verifies the _flydsl_warps_per_row=1 guard holds for bm>1.
+        code = self._rms(
+            16, 4096, torch.float16, block_sizes=[2], reduction_loops=[256]
+        )
+        self.assertNotIn("_flydsl_bsum", code)
+        self.assertNotIn("_FlyDSLRedBuf", code)
+        self.assertIn("_flydsl_wsum", code)  # warp-only path still emitted
+
     def test_softmax_w1(self) -> None:
         # Whole-row softmax with a 64-lane chunk (W=1).
         self._softmax(8, 512, torch.float16, block_sizes=[1], reduction_loops=[256])
@@ -197,9 +207,11 @@ class TestFlydslReduction(TestCase):
             (2, 512, 4),
             (4, 1024, 4),
             (8, 2048, 4),
+            (16, 4096, 4),  # W=16: max warps/row, _FlyDSLRedBuf _TOTAL=17
             (1, 512, 8),
             (2, 1024, 8),
             (4, 2048, 8),
+            (8, 4096, 8),  # W=8 V=8: exercises fp16 128-bit copy at W>1
         )
         for w, chunk, v in cases:
             code = self._rms(
