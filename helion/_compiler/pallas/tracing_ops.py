@@ -3386,6 +3386,37 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     loop_window = _build_inner_loop_window(state, graph_info, block_ids, env)
 
+    # A pipeline stage can move several adjacent logical tiles in one DMA.
+    # The body still computes one original tile at a time from that larger
+    # buffer, which lets DMA granularity and compute granularity differ.
+    group_size = state.config.get("pallas_emit_pipeline_group_size", 1)
+    if type(group_size) is not int or group_size < 1:
+        raise InvalidConfig(
+            "pallas_emit_pipeline_group_size must be a positive integer"
+        )
+    if group_size > 1:
+        if len(block_ids) != 1:
+            raise InvalidConfig(
+                "grouped emit_pipeline staging currently requires one loop dimension"
+            )
+        block_size = state.device_function.resolved_block_size(block_ids[0])
+        begin_expr = loop_window.begin_exprs[0]
+        end_expr = loop_window.end_exprs[0]
+        if (
+            not isinstance(block_size, int)
+            or not _is_static_int(begin_expr)
+            or not _is_static_int(end_expr)
+            or loop_window.iter_step_exprs[0] != loop_window.slice_size_exprs[0]
+        ):
+            raise InvalidConfig(
+                "grouped emit_pipeline staging requires a fixed contiguous loop"
+            )
+        extent = int(end_expr) - int(begin_expr)
+        if extent % (block_size * group_size) != 0:
+            raise InvalidConfig(
+                "the grouped emit_pipeline stage must evenly divide the loop extent"
+            )
+
     # Pipelined tensors flow through emit_pipeline's per-iter Buffered
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
@@ -3455,8 +3486,18 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 # Inner pipeline dim -- tiled by pipeline grid
                 bid_idx = block_ids.index(bid)
                 slice_size_expr = loop_window.slice_size_exprs[bid_idx]
+                pipeline_slice_size_expr = (
+                    f"({slice_size_expr}) * {group_size}"
+                    if group_size > 1
+                    else slice_size_expr
+                )
                 begin_expr = loop_window.begin_exprs[bid_idx]
                 iter_step_expr = loop_window.iter_step_exprs[bid_idx]
+                pipeline_iter_step_expr = (
+                    f"({iter_step_expr}) * {group_size}"
+                    if group_size > 1
+                    else iter_step_expr
+                )
                 begin_is_zero = begin_expr == "0"
                 end_expr = loop_window.end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
@@ -3489,10 +3530,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     # ``pl.BoundedSlice`` block shape (required for ds-style
                     # index maps). Lifts the "emit_pipeline fails on unaligned
                     # dims" limitation so data-dependent tile loops can pipeline.
-                    block_shape_parts.append(f"pl.BoundedSlice({slice_size_expr})")
+                    block_shape_parts.append(
+                        f"pl.BoundedSlice({pipeline_slice_size_expr})"
+                    )
                     start_expr = (
                         f"({begin_expr}) + ({lambda_params[bid_idx]}) "
-                        f"* ({iter_step_expr})"
+                        f"* ({pipeline_iter_step_expr})"
                     )
                     is_carry = bid in state.device_function.carry_tiles
                     dim_expr = None
@@ -3521,7 +3564,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         # required for carry propagation, and zeroing/masking of
                         # unowned rows is safely handled by the ordered carry logic.
                         size_expr = (
-                            f"jnp.minimum({slice_size_expr}, "
+                            f"jnp.minimum({pipeline_slice_size_expr}, "
                             f"({loop_window.end_exprs[bid_idx]}) - ({start_expr}))"
                         )
                     elif not is_store and dim_expr is not None:
@@ -3542,7 +3585,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         # offsets extend beyond the backing allocation.
                         size_expr = (
                             f"jnp.clip(({dim_expr}) - ({start_expr}), 0, "
-                            f"{slice_size_expr})"
+                            f"{pipeline_slice_size_expr})"
                         )
                         start_expr = f"jnp.minimum(({start_expr}), ({dim_expr}))"
                         assert physical_mask_plan is not None
@@ -3555,7 +3598,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                             )
                         clamped_to_tensor = True
                     else:
-                        size_expr = slice_size_expr
+                        size_expr = pipeline_slice_size_expr
                     start_expr = _annotate_provable_sublane_alignment(
                         state, bid, start_expr
                     )
@@ -3563,7 +3606,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                 else:
                     # Static, from-zero loop: a block-aligned index is exact.
                     # Identical to the pre-existing codegen.
-                    block_shape_parts.append(slice_size_expr)
+                    block_shape_parts.append(pipeline_slice_size_expr)
                     if iter_step_expr == slice_size_expr:
                         lambda_parts.append(lambda_params[bid_idx])
                     else:
@@ -3757,6 +3800,25 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             "else _pipeline_indices.index"
         )
     ]
+    pipeline_index_exprs = [
+        f"_helion_compat_pipeline_indices[{i}]" for i in range(len(block_ids))
+    ]
+    compute_stmts: list[ast.AST] = body_stmts
+    pipeline_group_index = "_pipeline_group_index"
+    if group_size > 1:
+        group_loop = statement_from_string(
+            f"for {pipeline_group_index} in range({group_size}): pass"
+        )
+        assert isinstance(group_loop, ast.For)
+        group_loop.body = []
+        body_stmts.append(group_loop)
+        compute_stmts = cast("list[ast.AST]", group_loop.body)
+        pipeline_index_exprs = [
+            (
+                f"(_helion_compat_pipeline_indices[0] * {group_size} "
+                f"+ {pipeline_group_index})"
+            )
+        ]
 
     # Build block_id_to_info for the pipeline state
     block_id_to_info = _loop_dim_infos(
@@ -3772,21 +3834,19 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         loop_window.block_size_vars,
         loop_window.begin_exprs,
         loop_window.iter_step_exprs,
-        [f"_helion_compat_pipeline_indices[{i}]" for i in range(len(block_ids))],
+        pipeline_index_exprs,
         env,
-        body_stmts,
+        compute_stmts,
     )
-    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
         state,
         strategy,
         block_ids,
         loop_window.block_size_vars,
         env,
-        body_stmts,
-        # emit_pipeline passes indices as a single tuple arg
+        compute_stmts,
         offset_expr_fn=lambda i, bs: (
-            f"_helion_compat_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
+            f"({pipeline_index_exprs[i]}) * {bs} + jnp.arange({bs})"
         ),
     )
 
@@ -3809,25 +3869,50 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         len(pipelined_tensor_ids) < len(all_tensor_info) or uses_remote_copy
     )
     if any_non_pipelined:
-        _needs_explicit_indices = True
         for i, bid in enumerate(block_ids):
             offset_name = strategy.offset_var(bid)
-            body_stmts.append(
+            compute_stmts.append(
                 statement_from_string(
                     f"{offset_name} = ({loop_window.begin_exprs[i]}) + "
-                    f"(_helion_compat_pipeline_indices[{i}]) * "
+                    f"({pipeline_index_exprs[i]}) * "
                     f"({loop_window.iter_step_exprs[i]})"
                 )
             )
 
     # Build tensor_to_dma_scratch mapping
+    def _dma_scratch_ref(
+        fake: torch.Tensor,
+        sub_meta: Sequence[object],
+        ref_name: str,
+    ) -> str:
+        if group_size == 1:
+            return ref_name
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        parts = [
+            (
+                f"pl.ds({pipeline_group_index} * "
+                f"{loop_window.slice_size_exprs[0]}, "
+                f"{loop_window.slice_size_exprs[0]})"
+                if dim_to_bid.get(dim) == block_ids[0]
+                else ":"
+            )
+            for dim in range(fake.ndim)
+        ]
+        return f"{ref_name}.at[{', '.join(parts)}]"
+
     tensor_to_dma_scratch: dict[str, str] = {}
     idx = 0
-    for _fake, hbm_name in in_tensors:
-        tensor_to_dma_scratch[hbm_name] = body_params[idx]
+    for fake, hbm_name in in_tensors:
+        sub_meta = loop_window.loaded[id(fake)][2]
+        tensor_to_dma_scratch[hbm_name] = _dma_scratch_ref(
+            fake, sub_meta, body_params[idx]
+        )
         idx += 1
-    for _fake, hbm_name in out_tensors:
-        tensor_to_dma_scratch[hbm_name] = body_params[idx]
+    for fake, hbm_name in out_tensors:
+        sub_meta = loop_window.stored[id(fake)][2]
+        tensor_to_dma_scratch[hbm_name] = _dma_scratch_ref(
+            fake, sub_meta, body_params[idx]
+        )
         idx += 1
 
     # Create the pipeline loop state
@@ -3835,7 +3920,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
-        inner_statements=body_stmts,
+        inner_statements=compute_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _deferred_physical_mask_bounds={
             node: {bid: tuple(sorted(bounds)) for bid, bounds in by_block.items()}
@@ -3877,7 +3962,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             _emit_pipeline_clean_region(
                 state,
                 graph_info,
-                body_stmts,
+                compute_stmts,
                 clean_expr,
                 clean_block_ids,
                 body_args,
@@ -3897,7 +3982,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
 
     # Build the emit_pipeline call
-    grid_str = ", ".join(loop_window.grid_parts)
+    pipeline_grid_parts = [*loop_window.grid_parts]
+    if group_size > 1:
+        pipeline_grid_parts[0] = f"({pipeline_grid_parts[0]}) // {group_size}"
+    grid_str = ", ".join(pipeline_grid_parts)
     in_specs_str = ", ".join(in_specs) if in_specs else ""
     out_specs_str = ", ".join(out_specs) if out_specs else ""
 

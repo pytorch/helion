@@ -4603,6 +4603,73 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_attention_grouped_emit_pipeline_correctness(self) -> None:
+        """One DMA stage may contain several consecutive compute tiles."""
+        query = torch.randn(1, 1, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 1, 512, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 1, 512, 128, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+            pallas_emit_pipeline_group_size=4,
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_grouped_emit_pipeline_output_correctness(self) -> None:
+        """Grouped stages slice pipelined output buffers by compute tile."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            rows, columns = x.size()
+            out = torch.empty_like(x)
+            for tile_rows in hl.tile(rows):
+                for tile_columns in hl.tile(columns):
+                    out[tile_rows, tile_columns] = x[tile_rows, tile_columns] * 2.0
+            return out
+
+        x = torch.randn(128, 512, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            kernel,
+            (x,),
+            block_sizes=[128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_emit_pipeline_group_size=4,
+        )
+        torch.testing.assert_close(result, x * 2.0)
+
+    @skipIfPallasInterpret(
+        "a nonzero pipeline start uses pl.BoundedSlice, whose size is traced "
+        "by the HLO interpreter"
+    )
+    def test_grouped_emit_pipeline_static_offset_correctness(self) -> None:
+        """Grouped stages advance by a full DMA window from a nonzero start."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([1, x.size(1), x.size(2)], device=x.device)
+            for owner in hl.grid(1):
+                acc = hl.zeros([x.size(1), x.size(2)], dtype=torch.float32)
+                for rows in hl.tile(128, x.size(0)):
+                    acc = acc + x[rows, :, :].sum(dim=0)
+                out[owner, :, :] = acc
+            return out
+
+        x = torch.ones(1152, 8, 128, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            kernel,
+            (x,),
+            block_sizes=[128],
+            pallas_loop_type="emit_pipeline",
+            pallas_emit_pipeline_group_size=4,
+        )
+        torch.testing.assert_close(result, x[128:].sum(dim=0, keepdim=True))
+
     def test_attention_fori_loop_correctness(self) -> None:
         """Fori attention buffers K/V while loop-invariant Q remains unchanged."""
         query = torch.randn(2, 2, 128, 128, dtype=torch.float32, device=DEVICE)
