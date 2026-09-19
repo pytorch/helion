@@ -27,7 +27,7 @@ CuteAffineScanScheduleLiteral = Literal[
     "direct_m16n8_v1",
     "direct_m16n16_v1",
 ]
-NumSmMultiplierLiteral = Literal[1, 2, 4, 8]
+NumSmMultiplier = int
 MaxnregLiteral = Literal[32, 64, 128, 256] | None
 
 
@@ -68,7 +68,7 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
-        num_sm_multiplier: NumSmMultiplierLiteral | None = None,
+        num_sm_multiplier: NumSmMultiplier | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
@@ -125,8 +125,9 @@ class Config(Mapping[str, object]):
                 the same compiler-derived dependency schedule with fixed worker
                 ownership or one-shot packet dispatch, respectively.
                 Unsupported kernels reject this field.
-            num_sm_multiplier: Multiplier for the number of SMs in persistent
-                kernels (1, 2, 4, 8).
+            num_sm_multiplier: Positive integer multiplier for the number of SMs
+                in persistent kernels. The autotuner searches powers of two, but
+                explicit configurations may use intermediate values.
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
             maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
                 Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
