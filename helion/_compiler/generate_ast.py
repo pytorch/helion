@@ -1478,7 +1478,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
     def host_dead_code_elimination(self) -> None:
         dce_vars: OrderedSet[str] = OrderedSet()
         allow_compiler_shape_helpers = (
-            self.device_function.config.cross_loop_schedule == "static_pipeline"
+            self.device_function.config.cross_loop_pipeline != "barrier"
         )
         for stmt in self.host_statements:
             if (

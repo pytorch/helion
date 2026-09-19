@@ -887,12 +887,17 @@ class CallableType(LiteralType):
 
         try:
             with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
-                output_type = TypeInfo.from_example(
-                    _CheckForIndexCalls.retry_call(
-                        self.value, proxy_args, proxy_kwargs
-                    ),
-                    origin,
+                result = _CheckForIndexCalls.retry_call(
+                    self.value, proxy_args, proxy_kwargs
                 )
+                if origin.is_host():
+                    env.register_tensor_factory_layout(
+                        self.value,
+                        proxy_args,
+                        proxy_kwargs,
+                        result,
+                    )
+                output_type = TypeInfo.from_example(result, origin)
             output_type.tree_map(warn_wrong_device)
             if (
                 origin.is_host()

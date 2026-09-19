@@ -167,7 +167,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
-            "cross_loop_schedule": st.sampled_from(["barrier", "static_pipeline"]),
+            "cross_loop_pipeline": st.sampled_from(["barrier", "static"]),
             "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
             "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
             "cute_chunk_prepare_schedule": st.sampled_from(
@@ -219,7 +219,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "num_warps",
                     "num_stages",
                     "pid_type",
-                    "cross_loop_schedule",
+                    "cross_loop_pipeline",
                     "cute_chunk_recurrence_dv_partitions",
                     "cute_chunk_recurrence_register_cap",
                     "cute_chunk_prepare_schedule",
@@ -424,7 +424,7 @@ class TestConfigAPI(TestCase):
             "num_warps",
             "num_stages",
             "pid_type",
-            "cross_loop_schedule",
+            "cross_loop_pipeline",
             "indexing",
         }
         compiler_internal = {
@@ -443,44 +443,44 @@ class TestConfigAPI(TestCase):
         self.assertTrue(expected.issubset(kwonly))
         self.assertTrue(compiler_internal.isdisjoint(kwonly))
 
-    def test_cross_loop_schedule_is_an_admitted_triton_field(self) -> None:
+    def test_cross_loop_pipeline_is_an_admitted_triton_field(self) -> None:
         from helion.autotuner.config_generation import ConfigGeneration
 
-        self.assertEqual(helion.Config().cross_loop_schedule, "barrier")
+        self.assertEqual(helion.Config().cross_loop_pipeline, "barrier")
         self.assertEqual(
-            helion.Config(cross_loop_schedule="static_pipeline").cross_loop_schedule,
-            "static_pipeline",
+            helion.Config(cross_loop_pipeline="static").cross_loop_pipeline,
+            "static",
         )
 
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(backend=TritonBackend())
-            self.assertTrue(spec.supports_config_key("cross_loop_schedule"))
-            self.assertNotIn("cross_loop_schedule", spec._flat_fields())
+            self.assertTrue(spec.supports_config_key("cross_loop_pipeline"))
+            self.assertNotIn("cross_loop_pipeline", spec._flat_fields())
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "only for kernels with compiler-inferred cross-loop dependencies",
             ):
-                spec.normalize(helion.Config(cross_loop_schedule="barrier"))
+                spec.normalize(helion.Config(cross_loop_pipeline="barrier"))
 
-            spec.enable_cross_loop_schedule()
-            field = spec._flat_fields()["cross_loop_schedule"]
+            spec.enable_cross_loop_pipeline()
+            field = spec._flat_fields()["cross_loop_pipeline"]
             self.assertIsInstance(field, EnumFragment)
             assert isinstance(field, EnumFragment)
-            self.assertIs(field, spec.cross_loop_schedule)
-            self.assertEqual(field.choices, ("barrier", "static_pipeline"))
+            self.assertIs(field, spec.cross_loop_pipeline)
+            self.assertEqual(field.choices, ("barrier", "static"))
             self.assertEqual(
-                spec.default_config()["cross_loop_schedule"],
+                spec.default_config()["cross_loop_pipeline"],
                 "barrier",
             )
 
             static_config = spec.default_config()
-            static_config.config["cross_loop_schedule"] = "static_pipeline"
+            static_config.config["cross_loop_pipeline"] = "static"
             spec.normalize(static_config)
             generation = ConfigGeneration(spec)
             round_trip = generation.unflatten(generation.flatten(static_config))
             self.assertEqual(
-                round_trip["cross_loop_schedule"],
-                "static_pipeline",
+                round_trip["cross_loop_pipeline"],
+                "static",
             )
 
             with self.assertRaisesRegex(
@@ -488,27 +488,78 @@ class TestConfigAPI(TestCase):
                 "must be one of",
             ):
                 spec.normalize(
+                    helion.Config.from_dict({"cross_loop_pipeline": "unknown"})
+                )
+
+    def test_legacy_cross_loop_schedule_normalizes_to_pipeline(self) -> None:
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=TritonBackend())
+            spec.enable_cross_loop_pipeline()
+
+            barrier = helion.Config.from_dict({"cross_loop_schedule": "barrier"})
+            spec.normalize(barrier)
+            self.assertNotIn("cross_loop_schedule", barrier)
+            self.assertEqual(barrier["cross_loop_pipeline"], "barrier")
+
+            static = helion.Config.from_dict({"cross_loop_schedule": "static_pipeline"})
+            spec.normalize(static)
+            self.assertNotIn("cross_loop_schedule", static)
+            self.assertEqual(static["cross_loop_pipeline"], "static")
+
+            matching = helion.Config.from_dict(
+                {
+                    "cross_loop_schedule": "static_pipeline",
+                    "cross_loop_pipeline": "static",
+                }
+            )
+            spec.normalize(matching)
+            self.assertNotIn("cross_loop_schedule", matching)
+            self.assertEqual(matching["cross_loop_pipeline"], "static")
+
+            with self.assertRaisesRegex(exc.InvalidConfig, "conflicting"):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "cross_loop_schedule": "static_pipeline",
+                            "cross_loop_pipeline": "barrier",
+                        }
+                    )
+                )
+
+            with self.assertRaisesRegex(exc.InvalidConfig, "must be one of"):
+                spec.normalize(
                     helion.Config.from_dict({"cross_loop_schedule": "unknown"})
                 )
 
-    def test_cross_loop_schedule_is_not_supported_on_amd(self) -> None:
+    def test_legacy_cross_loop_schedule_keeps_dependency_gate(self) -> None:
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=TritonBackend())
+            with self.assertRaisesRegex(
+                exc.InvalidConfig,
+                "only for kernels with compiler-inferred cross-loop dependencies",
+            ):
+                spec.normalize(
+                    helion.Config.from_dict({"cross_loop_schedule": "static_pipeline"})
+                )
+
+    def test_cross_loop_pipeline_is_not_supported_on_amd(self) -> None:
         with patch("helion._compat.is_hip", return_value=True):
             spec = ConfigSpec(backend=TritonBackend())
-            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
                 "is not supported by backend",
             ):
-                spec.enable_cross_loop_schedule()
+                spec.enable_cross_loop_pipeline()
 
-    def test_cross_loop_schedule_is_not_supported_on_xpu(self) -> None:
+    def test_cross_loop_pipeline_is_not_supported_on_xpu(self) -> None:
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(
                 backend=TritonBackend(),
                 device=torch.device("xpu"),
                 num_sm=1,
             )
-            self.assertFalse(spec.supports_config_key("cross_loop_schedule"))
+            self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
 
     def test_cute_chunk_internal_config_mapping_serialization(self) -> None:
         from helion.autotuner.local_cache import parse_cache_entry
