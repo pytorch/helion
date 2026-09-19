@@ -55,7 +55,7 @@ from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
-from .._compiler.compile_environment import TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
 from .._compiler.compile_environment import _is_supported_tensor_input_source
@@ -2995,9 +2995,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ),
                 default=None,
             )
-            if descriptor_extent_cap is not None:
+            if descriptor_extent_cap is not None and self.env.device.type == "cuda":
                 descriptor_extent_cap = min(
-                    descriptor_extent_cap, TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    descriptor_extent_cap, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
                 )
         for source, guard in sorted(
             self.env.tensor_descriptor_layout_guards.items(),
@@ -3017,7 +3017,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
                 _extent_cap: int | None = (
-                    TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    (
+                        CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                        if self.env.device.type == "cuda"
+                        else None
+                    )
                     if guard.has_derived_block_extent
                     else descriptor_extent_cap
                 ),

@@ -206,6 +206,44 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertEqual(_tensor_descriptor_extent_class(128, 256), 128)
         self.assertEqual(_tensor_descriptor_extent_class(512, 256), 256)
 
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16],
+                indexing=["tensor_descriptor", "pointer"],
+                host_tensor_descriptors=True,
+            ),
+        )
+        def copy_scaled_tiles(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            tile_width = hl.register_block_size(16, 16)
+            for row, tile in hl.tile(
+                [x.size(0), x.size(1) // 2], block_size=[1, tile_width]
+            ):
+                index = tile.begin * 2 + hl.arange(tile_width * 2)
+                mask = index < x.size(1)
+                value = hl.load(x, [row.begin, index], extra_mask=mask)
+                hl.store(out, [row.begin, index], value, extra_mask=mask)
+            return out
+
+        large = torch.randn([4, 64], device=DEVICE)
+        large_code, large_result = code_and_output(copy_scaled_tiles, (large,))
+        torch.testing.assert_close(large_result, large)
+        self.assertIn("_helion_tensor_descriptor(", large_code)
+        large_bound = copy_scaled_tiles.bind((large,))
+
+        # The descriptor box is 2 * block_size = 32, not the raw block size
+        # of 16. A width-16 input must therefore enter a distinct cache class
+        # and compile the safe pointer fallback instead of replaying the
+        # width-64 descriptor kernel.
+        small = torch.randn([4, 16], device=DEVICE)
+        small_code, small_result = code_and_output(copy_scaled_tiles, (small,))
+        torch.testing.assert_close(small_result, small)
+        self.assertNotIn("_helion_tensor_descriptor(", small_code)
+        self.assertIsNot(large_bound, copy_scaled_tiles.bind((small,)))
+        self.assertEqual(len(copy_scaled_tiles._bound_kernels), 2)
+
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_infers_omitted_block_sizes(self):
         @helion.kernel(
