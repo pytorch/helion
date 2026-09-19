@@ -424,6 +424,50 @@ def kernel_list_comprehension_host_and_device(
 
 
 @helion.kernel(autotune_effort="none")
+def kernel_set_comprehension_dedup(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    result = torch.zeros_like(x)
+    unique = {n % 2 for n in [1, 2, 3, 4]}
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        for u in unique:
+            acc += x[tile_idx] * u
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_set_comprehension_symint(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    result = torch.zeros_like(x)
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        unique = {j % 2 for j in hl.static_range(4)}
+        for u in unique:
+            acc += x[tile_idx] * u
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
+def kernel_set_comprehension_host_and_device(
+    x: torch.Tensor,
+) -> torch.Tensor:
+    result = torch.zeros_like(x)
+    host_unique = {i * 2 for i in (1, 2, 3, 3)}
+    for tile_idx in hl.tile(result.size(0)):
+        acc = torch.zeros([tile_idx], dtype=torch.float32, device=result.device)
+        device_unique = {i + 1 for i in (0, 1, 1, 2)}
+        for h in host_unique:
+            for d in device_unique:
+                acc += x[tile_idx] * h * d
+        result[tile_idx] = acc
+    return result
+
+
+@helion.kernel(autotune_effort="none")
 def kernel_list_register_cache_layernorm(
     input_list: list[torch.Tensor],
     ln_eps: float = 1e-5,
@@ -846,6 +890,92 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         # should be x * (2 + 4 + 6 + 8) = x * 20
         expected = x * 20
         torch.testing.assert_close(result, expected)
+
+    def test_set_comprehension_dedup(self):
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_set_comprehension_dedup, (x,))
+
+        expected = x * 1
+        torch.testing.assert_close(result, expected)
+
+    def test_set_comprehension_symint(self):
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(kernel_set_comprehension_symint, (x,))
+
+        expected = x * 1
+        torch.testing.assert_close(result, expected)
+
+    def test_set_comprehension_host_and_device(self):
+        size = (16,)
+        x = torch.randn(size, device=DEVICE)
+
+        code, result = code_and_output(
+            kernel_set_comprehension_host_and_device, (x,)
+        )
+
+        expected = x * 72
+        torch.testing.assert_close(result, expected)
+
+    @skipIfRefEager("StatementNotSupported is not raised in ref eager mode")
+    def test_set_comprehension_multiple_generators_unsupported(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_set_multi_gen(x: torch.Tensor) -> torch.Tensor:
+            unique = {a + b for a in [1, 2] for b in [3, 4]}
+            out = torch.zeros_like(x)
+            for tile_idx in hl.tile(x.size(0)):
+                acc = torch.zeros([tile_idx], dtype=torch.float32, device=x.device)
+                for u in unique:
+                    acc += x[tile_idx] * u
+                out[tile_idx] = acc
+            return out
+
+        x = torch.ones((8,), device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.StatementNotSupported,
+            r"Set comprehensions with multiple generators are not supported",
+        ):
+            code_and_output(kernel_set_multi_gen, (x,))
+
+    @skipIfRefEager("StatementNotSupported is not raised in ref eager mode")
+    def test_set_comprehension_with_condition_unsupported(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_set_cond(x: torch.Tensor) -> torch.Tensor:
+            unique = {s for s in [1, 2, 3] if s > 1}
+            out = torch.zeros_like(x)
+            for tile_idx in hl.tile(x.size(0)):
+                acc = torch.zeros([tile_idx], dtype=torch.float32, device=x.device)
+                for u in unique:
+                    acc += x[tile_idx] * u
+                out[tile_idx] = acc
+            return out
+
+        x = torch.ones((8,), device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.StatementNotSupported,
+            r"Set comprehensions with conditions are not supported",
+        ):
+            code_and_output(kernel_set_cond, (x,))
+
+    @skipIfRefEager("StatementNotSupported is not raised in ref eager mode")
+    def test_set_comprehension_unhashable_unsupported(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_set_unhashable(x: torch.Tensor) -> torch.Tensor:
+            unique = {[s] for s in [1, 2]}  # noqa: F841
+            out = torch.zeros_like(x)
+            for tile_idx in hl.tile(x.size(0)):
+                out[tile_idx] = 0
+            return out
+
+        x = torch.ones((8,), device=DEVICE)
+        with self.assertRaisesRegex(
+            exc.StatementNotSupported,
+            r"Set comprehension elements must be hashable",
+        ):
+            code_and_output(kernel_set_unhashable, (x,))
 
     def test_list_comprehension_with_function(self):
         """Test list comprehension with expressions."""
