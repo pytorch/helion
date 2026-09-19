@@ -667,6 +667,13 @@ def load_measurements(
 # ============================================================================
 
 
+def _order_by_robustness(selected_indices: list[int], timings: np.ndarray) -> list[int]:
+    """Order configs so fallback tries robust configs first."""
+    return sorted(
+        selected_indices, key=lambda idx: int(np.sum(~np.isfinite(timings[:, idx])))
+    )
+
+
 def _select_config_subset_single(
     data: ShapeConfigData,
     target: PerformanceTarget,
@@ -770,7 +777,7 @@ def select_config_subset(
     if len(partitions) <= 1 and not uncoverable:
         selected, stats = _select_config_subset_single(data, target)
         stats["num_partitions"] = 1
-        return selected, stats
+        return _order_by_robustness(selected, data.timings), stats
 
     if target.verbose:
         print(
@@ -811,7 +818,7 @@ def select_config_subset(
         selected, _ = _select_config_subset_single(sub_data, target)
         all_selected.update(selected)
 
-    selected_indices = sorted(all_selected)
+    selected_indices = _order_by_robustness(sorted(all_selected), data.timings)
 
     # Compute global stats from merged result
     best_per_shape = np.min(data.timings, axis=1)

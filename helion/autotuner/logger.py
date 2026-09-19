@@ -553,31 +553,35 @@ def format_triton_compile_failure(
     )
 
 
+def _compile_error_re(messages: list[str]) -> re.Pattern[str]:
+    return re.compile("|".join(map(re.escape, messages)))
+
+
+# Errors occurring when requesting too many resources at kernel launch.
+_LAUNCH_ERRORS: list[str] = [
+    "out of resource: shared memory",  # Triton shared memory OOM
+    "exceeds triton maximum tensor numel",  # needs smaller config
+    "too many blocks in cooperative launch",  # CUDA cooperative launch limit
+    "too many resources requested for launch",  # Triton resource error
+]
+_LAUNCH_ERRORS_RE: re.Pattern[str] = _compile_error_re(_LAUNCH_ERRORS)
+
 # Common logic to decide how to surface Triton errors
-_EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = re.compile(
-    "|".join(
-        map(
-            re.escape,
-            [
-                "[CUDA]: invalid argument",  # CUDA Error
-                "PassManager::run failed",  # Triton Error
-                "TServiceRouterException",  # Remote compile failed
-                "triton.compiler.errors.CompilationError",  # Triton CompilationError
-                "out of resource: shared memory",  # Triton shared memory OOM
-                "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
-                "exceeds triton maximum tensor numel",  # needs smaller config
-                "failed to translate module to LLVM IR",  # Triton LLVM lowering failure
-                "Resource temporarily unavailable",  # LLVM Error
-                "too many blocks in cooperative launch",  # CUDA cooperative launch limit
-                "too many resources requested for launch",  # Triton resource error
-                "CUDA error: out of memory",  # CUDA runtime OOM during kernel execution
-                "CUDA out of memory",  # PyTorch torch.cuda.OutOfMemoryError
-                "[CUDA]: out of memory",  # Triton CUDA OOM
-                "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
-            ],
-        )
-    )
-)
+_EXPECTED_TRITON_ERRORS: list[str] = [
+    "[CUDA]: invalid argument",  # CUDA Error
+    "PassManager::run failed",  # Triton Error
+    "TServiceRouterException",  # Remote compile failed
+    "triton.compiler.errors.CompilationError",  # Triton CompilationError
+    "ZE_RESULT_ERROR_INVALID_KERNEL_NAME",  # Level Zero compile failed
+    "failed to translate module to LLVM IR",  # Triton LLVM lowering failure
+    "Resource temporarily unavailable",  # LLVM Error
+    "CUDA error: out of memory",  # CUDA runtime OOM during kernel execution
+    "CUDA out of memory",  # PyTorch torch.cuda.OutOfMemoryError
+    "[CUDA]: out of memory",  # Triton CUDA OOM
+    "Ran out of memory in memory space vmem",  # TPU VMEM OOM (caught by Helion or XLA)
+    *_LAUNCH_ERRORS,
+]
+_EXPECTED_TRITON_ERRORS_RE: re.Pattern[str] = _compile_error_re(_EXPECTED_TRITON_ERRORS)
 
 _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
     "|".join(
@@ -597,6 +601,11 @@ _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
 
 def match_unrecoverable_runtime_error(err: BaseException) -> bool:
     return bool(_UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(err)))
+
+
+def match_launch_resource_error(err: BaseException) -> bool:
+    """True if ``err`` is a launch-time failure that is safe to retry with another config."""
+    return isinstance(err, OutOfResources) or bool(_LAUNCH_ERRORS_RE.search(str(err)))
 
 
 def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "debug"]:
