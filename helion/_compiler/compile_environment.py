@@ -48,7 +48,9 @@ from .variable_origin import TensorSizeOrigin
 log = logging.getLogger(__name__)
 
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
-TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
+# CUDA TMA limits each box dimension to 256 elements. Other descriptor
+# backends have their own legality checks and must not inherit this cap.
+CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
 
 
 @dataclasses.dataclass(frozen=True)

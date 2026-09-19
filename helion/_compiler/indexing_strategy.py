@@ -19,7 +19,7 @@ from .._compat import fp8_block_ptr_padding_broken
 from .._compat import get_tensor_descriptor_fn_name
 from .._utils import next_power_of_2
 from .ast_extension import expr_from_string
-from .compile_environment import TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+from .compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .compile_environment import CompileEnvironment
 from .compile_environment import _symint_expr
 from .device_function import DeviceFunction
@@ -1196,7 +1196,10 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             if (
                 not isinstance(block_size, int)
                 or block_size <= 0
-                or block_size > TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                or (
+                    env.device.type == "cuda"
+                    and block_size > CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                )
                 or block_size & (block_size - 1) != 0
             ):
                 return False
