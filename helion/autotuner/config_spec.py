@@ -3396,7 +3396,7 @@ class ConfigSpec:
             if "num_sm_multiplier" in config:
                 val = config["num_sm_multiplier"]
                 if (
-                    not isinstance(val, int)
+                    type(val) is not int
                     or val < MIN_NUM_SM_MULTIPLIER
                     or val > MAX_NUM_SM_MULTIPLIER
                 ):

@@ -82,6 +82,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -339,6 +340,34 @@ class TestPallasLoadBufferCountConfig(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestConfigAPI(TestCase):
+    def test_num_sm_multiplier_explicit_values_and_search_space(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        for value in (1, 3, 128):
+            config = helion.Config(
+                pid_type="persistent_blocked", num_sm_multiplier=value
+            )
+            spec.normalize(config)
+            self.assertEqual(config.num_sm_multiplier, value)
+
+        for value in (0, 129, 3.0, True):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pid_type": "persistent_blocked",
+                            "num_sm_multiplier": value,
+                        }
+                    )
+                )
+
+        fragment = spec._flat_fields()["num_sm_multiplier"]
+        self.assertIsInstance(fragment, PowerOfTwoFragment)
+        assert isinstance(fragment, PowerOfTwoFragment)
+        self.assertEqual(
+            fragment.search_values(),
+            [1, 2, 4, 8, 16, 32, 64, 128],
+        )
+
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
 
