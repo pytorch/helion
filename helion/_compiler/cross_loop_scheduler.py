@@ -6,6 +6,7 @@ from functools import cached_property
 import heapq
 import itertools
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import cast
 
 from .. import exc
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 ObligationsByRootPair = tuple[
     tuple[tuple[int, int], frozenset[DependencyObligation]], ...
 ]
+CrossLoopDispatchMode = Literal["static", "dynamic"]
 _MAX_SYMBOLIC_RELATION_WORK = 2_000_000
 
 
@@ -878,11 +880,17 @@ def _compact_nested_loop_counters_for_schedule(
         root_order_precedes = active_roots is not None and all(
             root in scheduled_roots and root <= consumer_root for root in active_roots
         )
-        if entry_is_smaller and same_root_producer and not task_steps_computed:
+        if (
+            pipeline_plan.dispatch_mode == "static"
+            and entry_is_smaller
+            and same_root_producer
+            and not task_steps_computed
+        ):
             task_steps = _task_step_relations(pipeline_plan, charge)
             task_steps_computed = True
         same_root_rank_precedes = not same_root_producer or (
-            entry is not None
+            pipeline_plan.dispatch_mode == "static"
+            and entry is not None
             and entry_consumer is not None
             and entry_consumer_keys is not None
             and task_steps is not None
@@ -918,8 +926,12 @@ def _compact_nested_loop_counters_for_schedule(
             assert entry is not None
             result.append(entry)
             continue
-        if active_roots is not None and any(
-            root not in scheduled_roots for root in active_roots
+        # Segmented quotients are certified in static worker-wave rank. Dynamic
+        # packets retain the exact semantic counter unless the root-entry
+        # quotient above is proved solely by source-ordered root precedence.
+        if pipeline_plan.dispatch_mode == "dynamic" or (
+            active_roots is not None
+            and any(root not in scheduled_roots for root in active_roots)
         ):
             result.append(plan)
             continue
@@ -975,8 +987,11 @@ class StaticPipelinePlan:
     body_orders: tuple[DenseTaskOrder, ...]
     readiness_counters: tuple[ReadinessCounterPlan, ...]
     root_barrier_edges: frozenset[tuple[int, int]]
+    dispatch_mode: CrossLoopDispatchMode = "static"
 
     def __post_init__(self) -> None:
+        if self.dispatch_mode not in ("static", "dynamic"):
+            raise ValueError(f"invalid cross-loop dispatch mode {self.dispatch_mode!r}")
         if self.worker_count <= 0:
             raise ValueError("worker_count must be positive")
         if len(self.execution_orders) != len(self.body_orders):
@@ -1054,13 +1069,13 @@ class StaticPipelinePlan:
     def root_barrier_arrival_count(self, root: int) -> int:
         """Return the exact number of physical publishers for one root."""
         tasks = self.execution_orders[root].task_count
-        if root in self.continuation_roots:
+        if self.dispatch_mode == "dynamic" or root in self.continuation_roots:
             return tasks
         return min(self.worker_count, tasks)
 
 
 def _without_wave_dominated_nested_counters(
-    plan: StaticPipelinePlan,
+    plan: StaticPipelinePlan, dispatch_mode: CrossLoopDispatchMode
 ) -> tuple[ReadinessCounterPlan, ...]:
     """Prefer a barrier when a one-wave producer has strictly cheaper sync."""
     retained = []
@@ -1099,7 +1114,9 @@ def _without_wave_dominated_nested_counters(
         counter_work = (counter.readiness_key_domain.size * arrivals, acquires)
         barrier_work = (
             plan.root_barrier_arrival_count(producer.producer_root),
-            min(plan.worker_count, consumer_domain.size),
+            consumer_domain.size
+            if dispatch_mode == "dynamic"
+            else min(plan.worker_count, consumer_domain.size),
         )
         if barrier_work == counter_work or any(
             left > right for left, right in zip(barrier_work, counter_work, strict=True)
@@ -2469,7 +2486,7 @@ def _schedule_is_progress_safe(
     static_producers: _StaticProducerResolver,
     charge: Callable[[int], bool],
 ) -> bool:
-    """Prove cross-root order and same-root worker-rank progress."""
+    """Prove source-ordered roots and any static same-root worker precedence."""
     continuation_plans = {
         (plan.readiness_key_domain.identity, consumer.consumer_id): (plan, consumer)
         for plan in pipeline_plan.readiness_counters
@@ -2561,7 +2578,10 @@ def _schedule_is_progress_safe(
 
         if not same_root:
             continue
-        if plan is None:
+        # Dynamic tickets establish only source-ordered packet prefixes. A
+        # same-root inter-CTA wait therefore requires static ownership and its
+        # exact worker-rank proof.
+        if pipeline_plan.dispatch_mode != "static" or plan is None:
             return False
         assert consumer is not None
         consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
@@ -2723,6 +2743,7 @@ def _try_finalize_pipeline_proposal(
     worker_count: int,
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
+    dispatch_mode: CrossLoopDispatchMode,
     charge: Callable[[int], bool],
 ) -> StaticPipelinePlan | None:
     """Freeze one canonical placement, then lower its final counters."""
@@ -2773,6 +2794,7 @@ def _try_finalize_pipeline_proposal(
             body_orders=configured_orders,
             readiness_counters=readiness_counters,
             root_barrier_edges=root_barrier_edges,
+            dispatch_mode=dispatch_mode,
         )
     except (ValueError, exc.CrossLoopSchedulingError):
         return None
@@ -2846,8 +2868,13 @@ def build_static_pipeline_plan(
     publishable_site_ids: frozenset[int] | None = None,
     continuation_ineligible_roots: frozenset[int] = frozenset(),
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
+    cross_loop_dispatch_mode: CrossLoopDispatchMode = "static",
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
+    if cross_loop_dispatch_mode not in ("static", "dynamic"):
+        raise ValueError(
+            "cross-loop dispatch mode must be either 'static' or 'dynamic'"
+        )
     charge = _new_relation_work_budget()
     root_identities = tuple(
         order.tasks_by_ordinal.target_domain.identity for order in root_task_orders
@@ -2863,7 +2890,7 @@ def build_static_pipeline_plan(
         identity is not None for identity in root_identities
     ):
         raise exc.InvalidConfig(
-            "cross_loop_pipeline='static' requires a fixed task "
+            f"cross_loop_pipeline={cross_loop_dispatch_mode!r} requires a fixed task "
             "capacity and task order; specialize the schedule-affecting "
             "capacity while keeping symbolic layout maps and runtime metadata "
             "unspecialized"
@@ -2887,6 +2914,7 @@ def build_static_pipeline_plan(
     def try_plan(
         counters: tuple[ReadinessCounterPlan, ...],
         barriers: frozenset[tuple[int, int]],
+        dispatch_mode: CrossLoopDispatchMode = "static",
     ) -> StaticPipelinePlan | None:
         return _try_finalize_pipeline_proposal(
             readiness_graph=readiness_graph,
@@ -2895,11 +2923,13 @@ def build_static_pipeline_plan(
             worker_count=worker_count,
             readiness_counters=counters,
             root_barrier_edges=barriers,
+            dispatch_mode=dispatch_mode,
             charge=charge,
         )
 
     def finalize_plan(
         counters: tuple[ReadinessCounterPlan, ...],
+        dispatch_mode: CrossLoopDispatchMode = "static",
     ) -> tuple[
         tuple[ReadinessCounterPlan, ...],
         frozenset[tuple[int, int]],
@@ -2910,7 +2940,7 @@ def build_static_pipeline_plan(
             obligations_by_root_pair=obligations_by_root_pair,
             readiness_counters=counters,
         )
-        return counters, barriers, try_plan(counters, barriers)
+        return counters, barriers, try_plan(counters, barriers, dispatch_mode)
 
     nested_loop_counters = collect_nested_loop_scheduling_counters(
         readiness_graph, charge
@@ -2948,7 +2978,9 @@ def build_static_pipeline_plan(
             "admit a progress-safe all-resident cross-loop schedule"
         )
 
-    cheaper_counters = _without_wave_dominated_nested_counters(all_resident_plan)
+    cheaper_counters = _without_wave_dominated_nested_counters(
+        all_resident_plan, cross_loop_dispatch_mode
+    )
     if cheaper_counters != all_resident_plan.readiness_counters:
         with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
             cheaper_counters, cheaper_barriers, cheaper_plan = finalize_plan(
@@ -2981,10 +3013,18 @@ def build_static_pipeline_plan(
         continuations,
     )
     proposal = all_resident_plan
-    if continuations and continuation_counters is not None:
+    if cross_loop_dispatch_mode == "dynamic" or (
+        continuations and continuation_counters is not None
+    ):
+        candidate_counters = (
+            continuation_counters
+            if continuations and continuation_counters is not None
+            else all_resident_counters
+        )
         candidate = try_plan(
-            continuation_counters,
+            candidate_counters,
             all_resident_barriers,
+            cross_loop_dispatch_mode,
         )
         final_continuations = (
             None
@@ -3007,6 +3047,22 @@ def build_static_pipeline_plan(
             == final_continuations
         ):
             proposal = candidate
+    if cross_loop_dispatch_mode == "dynamic" and proposal.dispatch_mode != "dynamic":
+        # Continuation ownership is optional. Retry the identical dynamic
+        # packet stream with every root resident before rejecting the mode.
+        proposal = try_plan(
+            all_resident_counters,
+            all_resident_barriers,
+            "dynamic",
+        )
+        if proposal is None:
+            with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
+                _, _, proposal = finalize_plan((), "dynamic")
+        if proposal is None:
+            raise exc.InvalidConfig(
+                "the requested dynamic cross-loop pipeline does not admit a "
+                "progress-safe cross-loop schedule"
+            )
     return proposal
 
 

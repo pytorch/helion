@@ -766,7 +766,7 @@ def shrink_block_sizes_for_numel_constraints(
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
-VALID_CROSS_LOOP_PIPELINES = ("barrier", "static")
+VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
