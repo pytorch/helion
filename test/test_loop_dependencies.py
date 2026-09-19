@@ -208,6 +208,25 @@ def implicit_tile_dependency_matmul_chain(
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def grouped_store_flat_dense_load(x: torch.Tensor) -> torch.Tensor:
+    """Read grouped producer tiles through a flattened contiguous view."""
+    tmp = torch.empty_like(x)
+    flat = tmp.view(2, 16)
+    out = torch.empty((2, 4), dtype=x.dtype, device=x.device)
+    producer_groups = hl.register_block_size(2, 2)
+    consumer_groups = hl.register_block_size(4, 4)
+    for slot, group in hl.tile([2, 8], block_size=[1, producer_groups]):
+        tmp[slot, group, :] = x[slot, group, :] + 1
+    for slot, column in hl.tile([2, 4], block_size=[1, 1]):
+        accumulator = hl.zeros([slot, column], dtype=torch.float32)
+        for reduce_group in hl.tile(8, block_size=consumer_groups):
+            index = reduce_group.begin * 2 + hl.arange(consumer_groups * 2)
+            accumulator += torch.sum(flat[slot.begin, index])
+        out[slot, column] = accumulator
+    return out
+
+
 class TestTileDependencyAnalysis(TestCase):
     def test_tile_dependency_schedule_has_no_separate_public_object(self) -> None:
         self.assertFalse(hasattr(helion, "TileDependencySchedule"))
@@ -302,6 +321,24 @@ class TestTritonTileDependencyLowering(TestCase):
             bound.config_spec.default_config()["cross_loop_pipeline"],
             "barrier",
         )
+
+    def test_flat_dense_load_preserves_grouped_readiness(self) -> None:
+        x = torch.arange(32, device=DEVICE, dtype=torch.float32).reshape(2, 8, 2)
+        code, output = code_and_output(
+            grouped_store_flat_dense_load,
+            (x,),
+            block_sizes=[2, 4],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        torch.testing.assert_close(
+            output,
+            (x + 1).sum(dim=(1, 2), keepdim=True).expand(2, 1, 4).reshape(2, 4),
+        )
+        self.assertIn("tile_dependency_nested_loop_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier_wait", code)
 
     def test_implicit_dependency_defaults_to_grid_barrier(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
