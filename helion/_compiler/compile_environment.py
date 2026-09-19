@@ -124,24 +124,13 @@ def _is_supported_tensor_input_source(source: Source) -> bool:
     return False
 
 
-def _is_supported_tensor_descriptor_layout_guard_source(
-    source: Source,
-    root_values: typing.Mapping[str, object],
-) -> bool:
-    if isinstance(source, LocalSource):
-        return True
-    if isinstance(source, GetItemSource):
-        return (
-            isinstance(source.index, int)
-            and not source.index_is_slice
-            and _is_supported_tensor_descriptor_layout_guard_source(
-                source.base, root_values
-            )
-            and isinstance(
-                _replay_tensor_input_source(source.base, root_values), (list, tuple)
-            )
-        )
-    return False
+def _concrete_tensor_base_is_aligned(value: object) -> bool:
+    return (
+        isinstance(value, torch.Tensor)
+        and not isinstance(value, FakeTensor)
+        and type(value).__name__ != "FunctionalTensor"
+        and value.data_ptr() % 16 == 0
+    )
 
 
 def _replay_tensor_input_source(
@@ -411,6 +400,7 @@ class CompileEnvironment:
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
+        self.bound_tensor_descriptor_alignments: dict[Source, bool] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         # Immutable classifier outputs captured from the arguments that created
         # this BoundKernel.  Codegen may run later and obtain those arguments
@@ -597,11 +587,9 @@ class CompileEnvironment:
         memory_op_index: int | None = None,
         atomic_op_index: int | None = None,
     ) -> None:
-        """Specialize dynamic kernels on TD-relevant stride layout predicates."""
-        if self.settings.static_shapes:
-            return
+        """Specialize kernels on replayable tensor-descriptor predicates."""
         source = self.tensor_input_source(fake_tensor)
-        if source is None or not self._is_tensor_descriptor_layout_guard_source(source):
+        if source is None or not _is_supported_tensor_input_source(source):
             return
         guard = self.tensor_descriptor_layout_guards.setdefault(
             source,
@@ -616,22 +604,43 @@ class CompileEnvironment:
             guard.atomic_op_indices.add(atomic_op_index)
 
     def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
-        if self.settings.static_shapes:
-            return True
         source = self.tensor_input_source(fake_tensor)
         return (
             source is not None
-            and self._is_tensor_descriptor_layout_guard_source(source)
+            and _is_supported_tensor_input_source(source)
             and source in self.tensor_descriptor_layout_guards
         )
 
-    def _is_tensor_descriptor_layout_guard_source(self, source: Source) -> bool:
-        from .host_function import HostFunction
-
-        return _is_supported_tensor_descriptor_layout_guard_source(
-            source,
-            HostFunction.current().params.arguments,
+    def tensor_descriptor_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool:
+        """Whether a tensor descriptor can prove its runtime base is 16B aligned."""
+        source = self.tensor_input_source(fake_tensor)
+        if source in self.bound_tensor_descriptor_alignments:
+            return self.bound_tensor_descriptor_alignments[source]
+        runtime_value = self.runtime_value_for_tensor(fake_tensor)
+        if _concrete_tensor_base_is_aligned(runtime_value):
+            return True
+        if isinstance(runtime_value, torch.Tensor):
+            return False
+        if (
+            fake_tensor.untyped_storage()
+            not in self._symbolically_exact_layout_storages
+        ):
+            return False
+        storage_offset = fake_tensor.storage_offset()
+        return (
+            isinstance(storage_offset, int)
+            and (storage_offset * fake_tensor.element_size()) % 16 == 0
         )
+
+    def snapshot_tensor_descriptor_alignments(
+        self, root_values: typing.Mapping[str, object]
+    ) -> None:
+        """Capture descriptor base-alignment facts for this bound kernel."""
+        self.bound_tensor_descriptor_alignments = {
+            source: _concrete_tensor_base_is_aligned(value)
+            for source in self.tensor_descriptor_layout_guards
+            if (value := _replay_tensor_input_source(source, root_values)) is not None
+        }
 
     def tensor_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
         """Return a replayable source for a direct or container tensor input."""

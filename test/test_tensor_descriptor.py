@@ -7,6 +7,7 @@ import torch
 
 import helion
 from helion._compat import get_tensor_descriptor_fn_name
+from helion._compat import supports_host_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -18,12 +19,225 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessHostTensorDescriptor
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
 @onlyBackends(["triton"])
 class TestTensorDescriptor(RefEagerTestBase, TestCase):
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptors(self):
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(), block_size=[16, 16]):
+                out[tile] = x[tile] + 1
+            return out
+
+        x = torch.randn([32, 64], device=DEVICE)
+        code, result = code_and_output(
+            add_one,
+            (x,),
+            indexing="tensor_descriptor",
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x + 1)
+        self.assertIn("_helion_tensor_descriptor(", code)
+        self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def add_one_transposed(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(), block_size=[16, 16]):
+                out[tile] = x[tile] + 1
+            return out
+
+        transposed = torch.randn([32, 64], device=DEVICE).T
+        transposed_code, transposed_result = code_and_output(
+            add_one_transposed,
+            (transposed,),
+            indexing="tensor_descriptor",
+            host_tensor_descriptors=True,
+        )
+        torch.testing.assert_close(transposed_result, transposed + 1)
+        self.assertIn("_helion_tensor_descriptor(", transposed_code)
+        self.assertIn("tl.permute", transposed_code)
+        self.assertNotIn(get_tensor_descriptor_fn_name(), transposed_code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_packed_fp4_base(self):
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(), block_size=[16, 16]):
+                out[tile] = x[tile]
+            return out
+
+        raw = torch.randint(0, 256, [32, 64], device=DEVICE, dtype=torch.uint8)
+        x = raw.view(torch.float4_e2m1fn_x2)
+        code, result = code_and_output(
+            copy,
+            (x,),
+            indexing="tensor_descriptor",
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result.view(torch.uint8), raw)
+        self.assertIn(".view(torch.uint8)", code)
+        self.assertIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_host_tensor_descriptor_runtime_safety_classes(self):
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16, 16],
+                indexing=["tensor_descriptor", "pointer"],
+                host_tensor_descriptors=True,
+            ),
+        )
+        def copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+            return out
+
+        aligned = torch.randn([32, 64], device=DEVICE)
+        code, result = code_and_output(copy, (aligned,))
+        torch.testing.assert_close(result, aligned)
+        self.assertIn("_helion_tensor_descriptor(", code)
+        aligned_bound = copy.bind((aligned,))
+        self.assertEqual(len(copy._bound_kernels), 1)
+
+        # Both sizes exceed the largest configured descriptor block, so they
+        # share the same dynamic specialization.
+        same_class = torch.randn([63, 64], device=DEVICE)
+        torch.testing.assert_close(copy(same_class), same_class)
+        self.assertIs(aligned_bound, copy.bind((same_class,)))
+        self.assertEqual(len(copy._bound_kernels), 1)
+
+        # Crossing the block-size threshold recompiles and safely falls back.
+        too_small = torch.randn([8, 64], device=DEVICE)
+        small_code, small_result = code_and_output(copy, (too_small,))
+        torch.testing.assert_close(small_result, too_small)
+        self.assertNotIn("_helion_tensor_descriptor(", small_code)
+        self.assertEqual(len(copy._bound_kernels), 2)
+
+        empty = torch.empty([0, 64], device=DEVICE)
+        empty_code, empty_result = code_and_output(copy, (empty,))
+        torch.testing.assert_close(empty_result, empty)
+        self.assertNotIn("_helion_tensor_descriptor(", empty_code)
+        self.assertEqual(len(copy._bound_kernels), 3)
+
+        storage = torch.randn(32 * 64 + 1, device=DEVICE)
+        unaligned = storage[1:].view(32, 64)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+        # Exercise the prepared dispatch path before asking for its code.
+        torch.testing.assert_close(copy(aligned), aligned)
+        torch.testing.assert_close(copy(unaligned), unaligned)
+        unaligned_code, unaligned_result = code_and_output(copy, (unaligned,))
+        torch.testing.assert_close(unaligned_result, unaligned)
+        self.assertNotIn("_helion_tensor_descriptor(", unaligned_code)
+        self.assertEqual(len(copy._bound_kernels), 4)
+
+        @helion.kernel(
+            static_shapes=True,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16, 16],
+                indexing=["tensor_descriptor", "pointer"],
+                host_tensor_descriptors=True,
+            ),
+        )
+        def static_copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+            return out
+
+        static_code, static_result = code_and_output(static_copy, (aligned,))
+        torch.testing.assert_close(static_result, aligned)
+        self.assertIn("_helion_tensor_descriptor(", static_code)
+        static_unaligned_code, static_unaligned_result = code_and_output(
+            static_copy, (unaligned,)
+        )
+        torch.testing.assert_close(static_unaligned_result, unaligned)
+        self.assertNotIn("_helion_tensor_descriptor(", static_unaligned_code)
+        self.assertEqual(len(static_copy._bound_kernels), 2)
+
+        @helion.kernel(
+            static_shapes=True,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16, 16],
+                indexing=["tensor_descriptor", "pointer"],
+                host_tensor_descriptors=True,
+            ),
+        )
+        def static_dict_copy(xs: dict[str, torch.Tensor]) -> torch.Tensor:
+            x = xs["x"]
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+            return out
+
+        dict_code, dict_result = code_and_output(static_dict_copy, ({"x": aligned},))
+        torch.testing.assert_close(dict_result, aligned)
+        self.assertIn("_helion_tensor_descriptor(", dict_code)
+        dict_unaligned_code, dict_unaligned_result = code_and_output(
+            static_dict_copy, ({"x": unaligned},)
+        )
+        torch.testing.assert_close(dict_unaligned_result, unaligned)
+        self.assertNotIn("_helion_tensor_descriptor(", dict_unaligned_code)
+        self.assertEqual(len(static_dict_copy._bound_kernels), 2)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_infers_omitted_block_sizes(self):
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                indexing="tensor_descriptor",
+                host_tensor_descriptors=True,
+            ),
+        )
+        def copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(), block_size=[16, 16]):
+                out[tile] = x[tile]
+            return out
+
+        x = torch.randn([32, 64], device=DEVICE)
+        code, result = code_and_output(copy, (x,))
+        torch.testing.assert_close(result, x)
+        self.assertIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_dynamic_output_falls_back(self):
+        @helion.kernel(
+            static_shapes=False,
+            autotune_effort="none",
+            config=helion.Config(
+                block_sizes=[16, 16],
+                indexing="tensor_descriptor",
+                host_tensor_descriptors=True,
+            ),
+        )
+        def fill(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = 1.0
+            return out
+
+        x = torch.randn([32, 64], device=DEVICE)
+        code, result = code_and_output(fill, (x,))
+        torch.testing.assert_close(result, torch.ones_like(x))
+        self.assertNotIn("_helion_tensor_descriptor(", code)
+
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_permutation_when_stride_one_not_last(self):
         """Test that permutation is applied when stride==1 is not the last dimension."""
@@ -313,6 +527,27 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         ]
         # range_num_stages=4 is clamped to 0, so doesn't show up as num_stages in the tl.range call
         self.assertEqual(len(range_stage_values), 0)
+
+        if not supports_host_tensor_descriptor():
+            return
+
+        host_config = dict(jsd_forward_kernel.configs[0].config)
+        host_config["host_tensor_descriptors"] = True
+        host_code, (host_loss, _) = code_and_output(
+            jsd_forward_kernel,
+            (log_q, log_p),
+            **host_config,
+        )
+        torch.testing.assert_close(host_loss, baseline_loss, rtol=5e-2, atol=5e-3)
+        self.assertIn("_helion_tensor_descriptor(", host_code)
+        self.assertNotIn(get_tensor_descriptor_fn_name(), host_code)
+        host_range_stage_values = [
+            int(match)
+            for line in host_code.splitlines()
+            if "tl.range" in line
+            for match in re.findall(r"num_stages=(\d+)", line)
+        ]
+        self.assertIn(4, host_range_stage_values)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tiny_matmul_tile_fallback(self) -> None:
@@ -774,6 +1009,15 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIs(bound_aligned, copy_input.bind((x_aligned_3,)))
         self.assertEqual(len(copy_input._bound_kernels), 2)
 
+        storage = torch.randn(64 * 1024 + 1, device=DEVICE, dtype=HALF_DTYPE)
+        x_offset = storage[1:].view(64, 1024)
+        self.assertEqual(x_offset.stride(), x_aligned.stride())
+        self.assertNotEqual(x_offset.data_ptr() % 16, 0)
+        code_offset, result_offset = code_and_output(copy_input, (x_offset,))
+        torch.testing.assert_close(result_offset, x_offset)
+        self.assert_tensor_descriptor_not_used_for(code_offset, "x")
+        self.assertEqual(len(copy_input._bound_kernels), 3)
+
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_tensor_descriptor_container_inputs_static_and_dynamic(self):
         """List/tuple element source paths should preserve TD eligibility."""
@@ -835,8 +1079,8 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                 self.assertIn(get_tensor_descriptor_fn_name(), code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
-    def test_dynamic_tensor_descriptor_dict_input_falls_back_to_pointer(self):
-        """Unsupported container sources should not crash TD layout extraction."""
+    def test_dynamic_tensor_descriptor_dict_input_sources(self):
+        """Dictionary inputs participate in TD layout specialization."""
 
         @helion.kernel(
             static_shapes=False,
@@ -875,7 +1119,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         ):
             code, result = code_and_output(kernel, args)
             torch.testing.assert_close(result, x)
-            self.assertNotIn(get_tensor_descriptor_fn_name(), code)
+            self.assertIn(get_tensor_descriptor_fn_name(), code)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfRefEager("Test checks bound kernel specialization cache")

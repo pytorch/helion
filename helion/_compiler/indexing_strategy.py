@@ -955,6 +955,24 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             if dim != stride_one_dim and not is_aligned:
                 return False
 
+        if not env.tensor_descriptor_base_is_aligned(fake_tensor):
+            return False
+        has_layout_guard = env.has_tensor_descriptor_layout_guard(fake_tensor)
+
+        def is_dynamic(size: int | torch.SymInt) -> bool:
+            if isinstance(size, int):
+                return False
+            expression = _symint_expr(size)
+            if expression is None:
+                return True
+            expression = env.specialize_expr(env.shape_env.replace(expression))
+            return bool(expression.free_symbols)
+
+        if any(map(is_dynamic, fake_tensor.size())) and not has_layout_guard:
+            # A source-less dynamic allocation has no replayable extent
+            # classifier. Keep its descriptor access on pointer indexing.
+            return False
+
         def valid_block_size(
             block_size: int | torch.SymInt | None,
             stride: int | torch.SymInt,
