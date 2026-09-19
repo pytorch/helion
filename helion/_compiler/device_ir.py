@@ -2955,8 +2955,6 @@ def _register_atomic_tunables(atomic_count: int) -> None:
 
 def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
     env = CompileEnvironment.current()
-    if env.settings.static_shapes:
-        return
 
     from .._compat import supports_tensor_descriptor
     from ..language import atomic_ops

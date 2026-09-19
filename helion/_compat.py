@@ -229,6 +229,20 @@ if triton_is_available():
         )
 
     @functools.cache
+    def _supports_host_tensor_descriptor() -> bool:
+        """Whether this Triton install provides the host descriptor API."""
+        if torch.version.hip is not None or not (
+            hasattr(triton.language, "make_tensor_descriptor")
+            or hasattr(triton.language, "_experimental_make_tensor_descriptor")
+        ):
+            return False
+        try:
+            module = importlib.import_module("triton.tools.tensor_descriptor")
+        except ImportError:
+            return False
+        return getattr(module, "TensorDescriptor", None) is not None
+
+    @functools.cache
     def get_tensor_descriptor_fn_name() -> str:
         if hasattr(triton.language, "make_tensor_descriptor"):
             return "tl.make_tensor_descriptor"
@@ -323,6 +337,9 @@ else:
     def _supports_tensor_descriptor() -> bool:  # type: ignore[misc]
         return False
 
+    def _supports_host_tensor_descriptor() -> bool:  # type: ignore[misc]
+        return False
+
     def get_tensor_descriptor_fn_name() -> str:  # type: ignore[misc]
         return "tl.make_tensor_descriptor"
 
@@ -353,6 +370,11 @@ def get_triton_version() -> version.Version:
 def supports_tensor_descriptor() -> bool:
     # call private func we can patch in testing
     return _supports_tensor_descriptor()
+
+
+def supports_host_tensor_descriptor() -> bool:
+    # call private func we can patch in testing
+    return _supports_host_tensor_descriptor()
 
 
 def target_device_capability(

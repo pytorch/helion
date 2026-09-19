@@ -32,6 +32,13 @@ def prev_power_of_2(n: int) -> int:
     return 1 << (n.bit_length() - 1)
 
 
+def indexing_uses_tensor_descriptor(indexing: object) -> bool:
+    """Whether a scalar or per-operation indexing config selects descriptors."""
+    return indexing == "tensor_descriptor" or (
+        isinstance(indexing, (list, tuple)) and "tensor_descriptor" in indexing
+    )
+
+
 @functools.cache
 def triton_is_available() -> bool:
     """Return True if triton is installed and importable."""

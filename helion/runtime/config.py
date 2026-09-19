@@ -70,6 +70,7 @@ class Config(Mapping[str, object]):
         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral = None,
+        host_tensor_descriptors: bool | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
@@ -135,6 +136,9 @@ class Config(Mapping[str, object]):
                 Lower values allow higher occupancy but may hurt performance.
                 Used with persistent kernels to ensure multi-occupancy can be
                 achieved.
+            host_tensor_descriptors: Construct tensor descriptors once in the host
+                launcher instead of independently in every device program. This
+                only affects operations using tensor-descriptor indexing.
             indexing: Indexing strategy for load and store operations. Can be:
                 - A single strategy string (all loads/stores use this strategy):
                   indexing="block_ptr"  # backward compatible
@@ -188,6 +192,7 @@ class Config(Mapping[str, object]):
             "cross_loop_pipeline": cross_loop_pipeline,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
+            "host_tensor_descriptors": host_tensor_descriptors,
             "advanced_controls_file": advanced_controls_file,
             "epilogue_subtile": epilogue_subtile,
             "xcd_remap": xcd_remap,
@@ -357,6 +362,10 @@ class Config(Mapping[str, object]):
         from ..autotuner.config_spec import DEFAULT_MAXNREG
 
         return cast("int | None", self.config.get("maxnreg", DEFAULT_MAXNREG))
+
+    @property
+    def host_tensor_descriptors(self) -> bool:
+        return cast("bool", self.config.get("host_tensor_descriptors", False))
 
     @property
     def range_unroll_factors(self) -> list[int]:
