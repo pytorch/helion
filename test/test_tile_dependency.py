@@ -160,6 +160,7 @@ def _access(
     scalar: tuple[bool, ...] | None = None,
     full_slice: tuple[bool, ...] | None = None,
     static_extents: tuple[int | None, ...] | None = None,
+    dense_spans: tuple[tuple[int, int, int] | None, ...] | None = None,
     masked: bool = False,
     tensor_name: str = "tmp",
     storage_offset: int = 0,
@@ -184,6 +185,7 @@ def _access(
         has_explicit_mask=masked,
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
         subscript_static_extents=static_extents or (),
+        subscript_dense_spans=dense_spans or (),
         layout_is_symbolically_exact=layout_is_static,
     )
 
@@ -1514,6 +1516,82 @@ class TestTileDependency(TestCase):
         self.assertEqual(
             _root_producers_by_consumer(plan, root_domains),
             tuple(frozenset((task,)) for task in range(256)),
+        )
+
+    def test_dense_span_maps_flat_consumer_to_grouped_producers(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(8, 128, 8),
+                    strides=(1024, 8, 1),
+                    block_ids=(10, 11, None),
+                    scales=(1, 1, 1),
+                    offsets=(0, 0, 0),
+                    full_slice=(False, False, True),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(8, 1024),
+                    strides=(1024, 1),
+                    block_ids=(20, None),
+                    scales=(1, 1),
+                    offsets=(0, None),
+                    dense_spans=(None, (22, 8, 0)),
+                ),
+            ),
+            [[10, 11], [20, 21, 22]],
+        )
+        producer = CoordinateDomain((10, 11), ((10, 8), (11, 32)), ((10, 1), (11, 4)))
+        consumer = CoordinateDomain(
+            (20, 21, 22),
+            ((20, 8), (21, 2), (22, 4)),
+            ((20, 1), (21, 256), (22, 32)),
+        )
+        producers_by_consumer = _root_producers_by_consumer(plan, (producer, consumer))
+        self.assertIsNotNone(producers_by_consumer)
+        assert producers_by_consumer is not None
+        consumer_task = _index(consumer, {20: 3, 21: 1, 22: 2})
+        self.assertEqual(
+            producers_by_consumer[consumer_task],
+            frozenset(_index(producer, {10: 3, 11: group}) for group in range(16, 24)),
+        )
+
+    def test_dense_span_with_out_of_bounds_tail_falls_back(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(1024,),
+                    strides=(1,),
+                    block_ids=(10,),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(1024,),
+                    strides=(1,),
+                    block_ids=(None,),
+                    dense_spans=((20, 8, 16),),
+                ),
+            ),
+            [[10], [20]],
+        )
+        self.assertIsNone(
+            _root_producers_by_consumer(
+                plan,
+                (
+                    CoordinateDomain((10,), ((10, 32),), ((10, 32),)),
+                    CoordinateDomain((20,), ((20, 4),), ((20, 32),)),
+                ),
+            )
         )
 
     def test_nontrivial_reshape_still_falls_back_to_root(self) -> None:

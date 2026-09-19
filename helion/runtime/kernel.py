@@ -55,9 +55,9 @@ from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
+from .._compiler.compile_environment import TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.compile_environment import TensorDescriptorLayoutGuard
-from .._compiler.compile_environment import _concrete_tensor_base_is_aligned
+from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
 from .._compiler.compile_environment import _is_supported_tensor_input_source
 from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
@@ -106,8 +106,13 @@ def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> boo
     return False
 
 
-def _td_layout_guard_active_for_config(
-    guard: TensorDescriptorLayoutGuard, config: Config
+class _TensorDescriptorOperationGuard(Protocol):
+    memory_op_indices: set[int]
+    atomic_op_indices: set[int]
+
+
+def _td_guard_active_for_config(
+    guard: _TensorDescriptorOperationGuard, config: Config
 ) -> bool:
     return any(
         _indexing_config_uses_tensor_descriptor(config.indexing, index)
@@ -2885,6 +2890,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             not self.env.specialized_vars
             and not self.env.specialized_strides
             and not self.env.tensor_descriptor_layout_guards
+            and not self.env.tensor_descriptor_alignment_guards
             and not self.env.runtime_input_specializations
         ):
             return []
@@ -2989,11 +2995,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ),
                 default=None,
             )
+            if descriptor_extent_cap is not None:
+                descriptor_extent_cap = min(
+                    descriptor_extent_cap, TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                )
         for source, guard in sorted(
             self.env.tensor_descriptor_layout_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if implicit_config is not None and not _td_layout_guard_active_for_config(
+            if implicit_config is not None and not _td_guard_active_for_config(
                 guard, implicit_config
             ):
                 continue
@@ -3006,7 +3016,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
-                _extent_cap: int | None = descriptor_extent_cap,
+                _extent_cap: int | None = (
+                    TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    if guard.has_derived_block_extent
+                    else descriptor_extent_cap
+                ),
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
@@ -3021,20 +3035,36 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                         _tensor_descriptor_extent_class(int(size), _extent_cap)
                         for size in tensor.size()
                     ),
+                    all(int(size) < 2**31 for size in tensor.size()),
                 )
 
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(td_layout_extractor)
             )
 
+        for source, guard in sorted(
+            self.env.tensor_descriptor_alignment_guards.items(),
+            key=lambda item: repr(item[0]),
+        ):
+            if implicit_config is not None and not _td_guard_active_for_config(
+                guard, implicit_config
+            ):
+                continue
+            extract_tensor = make_extractor(source)
+
             def td_alignment_extractor(
                 args: Sequence[object],
                 _extract_tensor: Callable[
                     [Sequence[object]], Hashable
                 ] = extract_tensor,
+                _requires_zero_storage_offset: bool = (
+                    guard.requires_zero_storage_offset
+                ),
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
-                return _concrete_tensor_base_is_aligned(tensor)
+                return _concrete_tensor_satisfies_alignment_guard(
+                    tensor, _requires_zero_storage_offset
+                )
 
             # Prepared metadata guards do not cover base pointers.
             extractors.append(td_alignment_extractor)

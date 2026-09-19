@@ -196,6 +196,17 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertEqual(len(static_dict_copy._bound_kernels), 2)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_scaled_descriptor_extent_cache_classes(self):
+        from helion.runtime.kernel import _tensor_descriptor_extent_class
+
+        # A descriptor width can be a multiple of a raw configured block.
+        # Keep every CUDA-legal width distinct in the dynamic cache key.
+        self.assertEqual(_tensor_descriptor_extent_class(64, 256), 64)
+        self.assertEqual(_tensor_descriptor_extent_class(128, 256), 128)
+        self.assertEqual(_tensor_descriptor_extent_class(512, 256), 256)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_infers_omitted_block_sizes(self):
         @helion.kernel(
             static_shapes=False,
@@ -215,6 +226,230 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         code, result = code_and_output(copy, (x,))
         torch.testing.assert_close(result, x)
         self.assertIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_scalar_tensor_offset(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+        )
+        def select_plane(x: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+            _, rows, columns = x.shape
+            out = torch.empty((rows, columns), dtype=x.dtype, device=x.device)
+            for tile_expert in hl.tile(1, block_size=1):
+                expert = indices[tile_expert.begin]
+                for tile_m, tile_n in hl.tile([rows, columns], block_size=[16, 16]):
+                    out[tile_m, tile_n] = x[expert, tile_m, tile_n]
+            return out
+
+        x = torch.randn([4, 32, 64], device=DEVICE)
+        indices = torch.tensor([2], dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(
+            select_plane,
+            (x, indices),
+            indexing="tensor_descriptor",
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x[2])
+        self.assertIn("_helion_tensor_descriptor(", code)
+        self.assertIn(".load([tl.cast(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_contiguous_tensor_index(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_scaled_tiles(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            tile_width = hl.register_block_size(16, 16)
+            for row, tile in hl.tile([4, 32], block_size=[1, tile_width]):
+                index = tile.begin * 2 + hl.arange(tile_width * 2)
+                out[row.begin, index] = x[row.begin, index]
+            return out
+
+        x = torch.randn([4, 64], device=DEVICE)
+        code, result = code_and_output(
+            copy_scaled_tiles,
+            (x,),
+            block_sizes=[16],
+            indexing=["tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x)
+        self.assertEqual(code.count("_helion_tensor_descriptor("), 1)
+        self.assertTrue(
+            any(
+                guard.has_derived_block_extent
+                for guard in copy_scaled_tiles.bind(
+                    (x,)
+                ).env.tensor_descriptor_layout_guards.values()
+            )
+        )
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_contiguous_index_with_scalar_tensor_base(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gather_block(x: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([16], dtype=x.dtype, device=x.device)
+            for row in hl.tile(1, block_size=1):
+                lane = hl.arange(16)
+                index = base[()] + lane
+                out[lane] = x[row.begin, index]
+            return out
+
+        x = torch.randn([1, 64], device=DEVICE)
+        base = torch.tensor(16, dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(
+            gather_block,
+            (x, base),
+            indexing=["pointer", "tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x[0, 16:32])
+        self.assertEqual(code.count("_helion_tensor_descriptor("), 1)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_non_power_of_two_index_falls_back(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_scaled_tiles(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row, tile in hl.tile([4, 2], block_size=[1, 1]):
+                index = tile.begin * 48 + hl.arange(48)
+                out[row.begin, index] = x[row.begin, index]
+            return out
+
+        x = torch.randn([4, 96], device=DEVICE)
+        code, result = code_and_output(
+            copy_scaled_tiles,
+            (x,),
+            indexing=["tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x)
+        self.assertNotIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_oversized_index_falls_back(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_block(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row in hl.tile(1, block_size=1):
+                index = hl.arange(512)
+                out[row.begin, index] = x[row.begin, index]
+            return out
+
+        x = torch.randn([1, 512], device=DEVICE)
+        code, result = code_and_output(
+            copy_block,
+            (x,),
+            indexing=["tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x)
+        self.assertNotIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_multiple_tensor_indices_fall_back(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gather_diagonal(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([16, 16], dtype=x.dtype, device=x.device)
+            for _ in hl.tile(1, block_size=1):
+                row_index = hl.arange(16)
+                column_index = hl.arange(16)
+                out[row_index, column_index] = x[row_index, column_index]
+            return out
+
+        x = torch.randn([32, 32], device=DEVICE)
+        code, result = code_and_output(
+            gather_diagonal,
+            (x,),
+            indexing=["tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x[:16, :16])
+        self.assertNotIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_scaled_subtraction_falls_back(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gather_shifted(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([16], dtype=x.dtype, device=x.device)
+            for row in hl.tile(1, block_size=1):
+                lane = hl.arange(16)
+                index = torch.sub(lane, -16, alpha=2)
+                out[lane] = x[row.begin, index]
+            return out
+
+        x = torch.randn([1, 64], device=DEVICE)
+        code, result = code_and_output(
+            gather_shifted,
+            (x,),
+            indexing=["tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x[0, 32:48])
+        self.assertNotIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_host_tensor_descriptor_view_alignment_specialization(self):
+        def make_copy(indexing: str):
+            @helion.kernel(
+                autotune_effort="none",
+                static_shapes=True,
+                config=helion.Config(
+                    block_sizes=[16, 16],
+                    indexing=indexing,
+                    host_tensor_descriptors=True,
+                ),
+            )
+            def copy_view(x: torch.Tensor) -> torch.Tensor:
+                view = x.view(16, 128)
+                out = torch.empty_like(view)
+                for tile in hl.tile(view.size()):
+                    out[tile] = view[tile]
+                return out
+
+            return copy_view
+
+        aligned = torch.randn([32, 64], device=DEVICE)
+        storage = torch.randn(32 * 64 + 1, device=DEVICE)
+        unaligned = storage[1:].view(32, 64)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+        offset_storage = torch.randn(32 * 64 + 4, device=DEVICE)
+        aligned_offset = offset_storage[4:].view(32, 64)
+        self.assertEqual(aligned_offset.data_ptr() % 16, 0)
+        self.assertNotEqual(aligned_offset.storage_offset(), 0)
+
+        copy_view = make_copy("tensor_descriptor")
+        aligned_code, aligned_result = code_and_output(copy_view, (aligned,))
+        torch.testing.assert_close(aligned_result, aligned.view(16, 128))
+        self.assertIn("_helion_tensor_descriptor(view", aligned_code)
+        aligned_bound = copy_view.bind((aligned,))
+
+        unaligned_code, unaligned_result = code_and_output(copy_view, (unaligned,))
+        torch.testing.assert_close(unaligned_result, unaligned.view(16, 128))
+        self.assertNotIn("_helion_tensor_descriptor(view", unaligned_code)
+        self.assertIsNot(aligned_bound, copy_view.bind((unaligned,)))
+
+        aligned_offset_code, aligned_offset_result = code_and_output(
+            copy_view, (aligned_offset,)
+        )
+        torch.testing.assert_close(aligned_offset_result, aligned_offset.view(16, 128))
+        self.assertNotIn("_helion_tensor_descriptor(view", aligned_offset_code)
+        self.assertIsNot(aligned_bound, copy_view.bind((aligned_offset,)))
+
+        pointer_copy_view = make_copy("pointer")
+        pointer_bound = pointer_copy_view.bind((aligned,))
+        torch.testing.assert_close(
+            pointer_copy_view(unaligned), unaligned.view(16, 128)
+        )
+        self.assertIs(pointer_bound, pointer_copy_view.bind((unaligned,)))
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_dynamic_output_falls_back(self):
