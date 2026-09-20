@@ -64,7 +64,7 @@ KERNELS = [
     "gemma4_a4b_moe",
     "gpt_oss_moe",
     "flash_mla",
-    "deepseek_v3_moe_fp8",
+    "deepseek_v3_moe_nvfp4",
     # External grouped references compile substantial CuTe/DeepGEMM code.
     "grouped_gemm",
     "grouped_gemm_deepgemm",
