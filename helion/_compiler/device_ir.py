@@ -1126,6 +1126,9 @@ class DeviceIR:
                         size_hint=rdim.size_hint(),
                     )
                 )
+                env.backend.register_reduction_loop_config_slots(
+                    env, rdim.block_id, rdim.size_hint()
+                )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed
