@@ -92,7 +92,7 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
         "gemma4_a4b_moe",
         "gpt_oss_moe",
         "flash_mla",
-        "deepseek_v3_moe_fp8",
+        "deepseek_v3_moe_nvfp4",
     ),
 )
 def test_megakernel_aot_key_is_fixed_shape(name: str) -> None:
@@ -276,19 +276,22 @@ def test_flash_mla_uses_existing_tuning_surface() -> None:
     assert "608" not in source
 
 
-def test_deepseek_v3_moe_fp8_uses_existing_tuning_surface() -> None:
-    module = _import_pretuned_kernel_module("deepseek_v3_moe_fp8")
-    heuristic = _import_pretuned_heuristic("deepseek_v3_moe_fp8")
+def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
+    module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4")
+    heuristic = _import_pretuned_heuristic("deepseek_v3_moe_nvfp4")
 
-    assert module.deepseek_v3_moe_fp8.settings.static_shapes
+    assert module.deepseek_v3_moe_nvfp4.settings.static_shapes
     assert heuristic.CONFIG["cross_loop_pipeline"] == "dynamic"
-    assert heuristic.CONFIG["num_sm_multiplier"] == 3
-    assert heuristic.CONFIG["num_warps"] == 1
+    assert heuristic.CONFIG["num_sm_multiplier"] == 2
+    assert heuristic.CONFIG["num_warps"] == 4
     assert heuristic.CONFIG["maxnreg"] is None
-    source = inspect.getsource(module.deepseek_v3_moe_fp8.fn)
+    assert heuristic.CONFIG["host_tensor_descriptors"]
+    assert heuristic.CONFIG["indexing"].count("tensor_descriptor") == 4
+    source = inspect.getsource(module.deepseek_v3_moe_nvfp4.fn)
     assert "semantic_dependency" not in source
     assert "source_ticket" not in source
-    assert "__fp8_moe" not in source
+    assert "w13_tma" in source
+    assert "__deepseek" not in source
 
 
 def test_pre_captured_graph_sweep_passes_resets(
@@ -639,8 +642,8 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     "flash_mla": {
         "sm100": ExpectedPerf(helion_wins=3, total=4, geomean=1.00, wins_slack=3),
     },
-    "deepseek_v3_moe_fp8": {
-        "sm100": ExpectedPerf(helion_wins=1, total=1, geomean=1.00, wins_slack=1),
+    "deepseek_v3_moe_nvfp4": {
+        "sm100": ExpectedPerf(helion_wins=3, total=3, geomean=1.00, wins_slack=3),
     },
 }
 
@@ -655,14 +658,14 @@ _MATCHED_STANDALONE_GEOMEAN_FLOOR = {
     # Dynamic ticket assignment has shown substantial capture/predecessor
     # sensitivity. Keep this as a catastrophic-regression guard, not a claim
     # that one particular launch ordering is stable.
-    "deepseek_v3_moe_fp8": 0.75,
+    "deepseek_v3_moe_nvfp4": 0.80,
 }
 
 # The common expected-value/noise-band check gives the other SM100
-# megakernels a 0.90x production floor. DeepSeek FP8 has a wider observed
+# megakernels a 0.90x production floor. DeepSeek NVFP4 has a wider observed
 # distribution, so gate it explicitly and conservatively.
 _PRODUCTION_GEOMEAN_FLOOR = {
-    "deepseek_v3_moe_fp8": 0.80,
+    "deepseek_v3_moe_nvfp4": 0.80,
 }
 
 # Geomean must stay within this fraction below expected. Catches regressions
@@ -806,12 +809,12 @@ class TestPretunedKernelsCorrectness(TestCase):
         module.correctness_check()
 
     @pytest.mark.timeout(900)
-    def test_deepseek_v3_moe_fp8(self):
+    def test_deepseek_v3_moe_nvfp4(self):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
-            self.skipTest("deepseek_v3_moe_fp8 is pretuned for NVIDIA SM100.")
-        module = _import_pretuned_kernel_module("deepseek_v3_moe_fp8")
+            self.skipTest("deepseek_v3_moe_nvfp4 is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4")
         if not module.has_vllm():
-            self.skipTest("deepseek_v3_moe_fp8 correctness requires vLLM.")
+            self.skipTest("deepseek_v3_moe_nvfp4 correctness requires vLLM.")
         module.correctness_check()
 
 
@@ -1348,11 +1351,11 @@ class TestPretunedKernelsPerformance(TestCase):
         self._run_pretuned_kernel_perf("flash_mla")
 
     @pytest.mark.timeout(900)
-    def test_deepseek_v3_moe_fp8(self):
-        module = _import_pretuned_kernel_module("deepseek_v3_moe_fp8")
+    def test_deepseek_v3_moe_nvfp4(self):
+        module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4")
         if not module.has_vllm():
-            self.skipTest("deepseek_v3_moe_fp8 performance requires vLLM.")
-        self._run_pretuned_kernel_perf("deepseek_v3_moe_fp8")
+            self.skipTest("deepseek_v3_moe_nvfp4 performance requires vLLM.")
+        self._run_pretuned_kernel_perf("deepseek_v3_moe_nvfp4")
 
 
 if __name__ == "__main__":
