@@ -3381,7 +3381,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             )
             if device_ir.implicit_dependency_starts:
                 if env.device.type != "cuda" or not config_spec.supports_config_key(
-                    "cross_loop_schedule"
+                    "cross_loop_pipeline"
                 ):
                     edge = next(
                         edge
@@ -3397,7 +3397,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 env.require_persistent_blocked(reason)
-                config_spec.enable_cross_loop_schedule()
+                config_spec.enable_cross_loop_pipeline()
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()

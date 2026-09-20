@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import itertools
 import math
+import pickle
 from typing import Literal
 from unittest import mock
 
 import sympy
 import torch
+from torch.utils._sympy.functions import FloorDiv
 
 import helion
 from helion import exc
@@ -15,20 +18,25 @@ from helion._compiler.device_ir_analysis import DeviceIRAnalysis
 from helion._compiler.tile_dependency import AllocationRegion
 from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
+from helion._compiler.tile_dependency import DenseTaskOrder
 from helion._compiler.tile_dependency import ExecutionSite
+from helion._compiler.tile_dependency import Incidence
+from helion._compiler.tile_dependency import KeyPartition
 from helion._compiler.tile_dependency import TaskAxis
 from helion._compiler.tile_dependency import TaskFamily
 from helion._compiler.tile_dependency import TileAccess
 from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
+from helion._compiler.tile_dependency import _access_layout
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
+from helion._compiler.tile_dependency import _simplify_logical_expression
+from helion._compiler.tile_dependency import _symbolic_access_map
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
 from helion._compiler.tile_dependency import build_tile_dependency_graph
 from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import owner_roots_by_graph_id
-from helion._compiler.tile_dependency import pid_task_order
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
@@ -74,6 +82,70 @@ def _configured_domains(
     )
 
 
+def _incidence(items_by_key: CoordinateRelation, *, grouped: bool = False) -> Incidence:
+    """Materialize small fixtures into an explicit paired capability bundle."""
+    fibers = _materialize(items_by_key)
+    count_axis = (
+        max(
+            (
+                *items_by_key.source_domain.axis_order,
+                *items_by_key.target_domain.axis_order,
+            ),
+            default=-1,
+        )
+        + 1
+    )
+    count_by_key = CoordinateRelation.point_map(
+        items_by_key.source_domain,
+        CoordinateDomain.scalar(
+            max(map(len, fibers), default=0) + 1, axis=count_axis, kind="value"
+        ),
+        tuple(
+            (
+                tuple(
+                    (axis, value, value + 1, 1)
+                    for axis, value in _coordinates(
+                        items_by_key.source_domain, source
+                    ).items()
+                ),
+                (len(targets),),
+            )
+            for source, targets in enumerate(fibers)
+        ),
+    )
+    keys_by_item = items_by_key.converse()
+    if keys_by_item is None:
+        pairs = [
+            (target, source)
+            for source, targets in enumerate(fibers)
+            for target in targets
+        ]
+        if len({target for target, _source in pairs}) != len(pairs):
+            return Incidence._from_constructed(items_by_key)
+        keys_by_item = CoordinateRelation.point_map(
+            items_by_key.target_domain,
+            items_by_key.source_domain,
+            tuple(
+                (
+                    tuple(
+                        (axis, value, value + 1, 1)
+                        for axis, value in _coordinates(
+                            items_by_key.target_domain, target
+                        ).items()
+                    ),
+                    tuple(_coordinates(items_by_key.source_domain, source).values()),
+                )
+                for target, source in pairs
+            ),
+        )
+    incidence = Incidence._from_constructed(
+        items_by_key,
+        keys_by_item=keys_by_item,
+        count_by_key=count_by_key,
+    )
+    return incidence.with_key_major_order() if grouped else incidence
+
+
 def _access(
     access_id: int,
     *,
@@ -112,7 +184,7 @@ def _access(
         has_explicit_mask=masked,
         subscript_is_full_slice=full_slice or tuple(False for _ in block_ids),
         subscript_static_extents=static_extents or (),
-        layout_is_static=layout_is_static,
+        layout_is_symbolically_exact=layout_is_static,
     )
 
 
@@ -124,7 +196,7 @@ def _root_producers_by_consumer(
     axis_geometry = _axis_geometry(root_domains)
     configured_root_domains, site_domains = _configured_domains(plan, axis_geometry)
     relations = tuple(
-        dependency.producers_by_consumer
+        None if dependency.incidence is None else dependency.incidence.items_by_key
         for dependency in instantiate_symbolic_dependencies(
             plan,
             root_domains=configured_root_domains,
@@ -137,15 +209,100 @@ def _root_producers_by_consumer(
     if not relations or any(relation is None for relation in relations):
         return None
     concrete = tuple(relation for relation in relations if relation is not None)
-    result = concrete[0]
-    for relation in concrete[1:]:
-        union = result.union(relation)
-        if union is None:
-            return None
-        result = union
-    return result.materialize(
+    result = CoordinateRelation.union_all(concrete)
+    if result is None:
+        return None
+    return _materialize(
+        result,
         source_axis_order=root_domains[pair[1]].axis_order,
         target_axis_order=root_domains[pair[0]].axis_order,
+    )
+
+
+def _coordinates(
+    domain: CoordinateDomain,
+    index: int,
+    axis_order: tuple[int, ...] | None = None,
+) -> dict[int, int]:
+    order = axis_order or domain.axis_order
+    if not 0 <= index < domain.size:
+        raise ValueError("coordinate index is outside the domain")
+    result = {}
+    for axis in order:
+        count = domain.axis_counts[axis]
+        result[axis], index = index % count, index // count
+    return result
+
+
+def _index(
+    domain: CoordinateDomain,
+    coordinates: dict[int, int],
+    axis_order: tuple[int, ...] | None = None,
+) -> int:
+    result, stride = 0, 1
+    for axis in axis_order or domain.axis_order:
+        result += coordinates[axis] * stride
+        stride *= domain.axis_counts[axis]
+    return result
+
+
+def _targets(
+    relation: CoordinateRelation,
+    source_index: int,
+    *,
+    source_axis_order: tuple[int, ...] | None = None,
+    target_axis_order: tuple[int, ...] | None = None,
+) -> frozenset[int]:
+    source = _coordinates(relation.source_domain, source_index, source_axis_order)
+    substitutions = {
+        coordinate_axis_symbol(axis): sympy.Integer(value)
+        for axis, value in source.items()
+    }
+    result = set()
+    for piece in relation.pieces:
+        if not all(
+            int(begin) <= source[axis] < int(end)
+            and (source[axis] - int(begin)) % step == 0
+            for axis, begin, end, step in piece.source_bounds_items
+        ):
+            continue
+        ranges = []
+        for axis, begin, end, step in piece.target_ranges:
+            begin_value = int(begin.xreplace(substitutions))
+            end_value = int(end.xreplace(substitutions))
+            count = relation.target_domain.axis_counts[axis]
+            ranges.append(
+                tuple(
+                    value
+                    for value in range(begin_value, end_value, step)
+                    if 0 <= value < count
+                )
+            )
+        result.update(
+            _index(
+                relation.target_domain,
+                dict(zip(relation.target_domain.axis_order, point, strict=True)),
+                target_axis_order,
+            )
+            for point in itertools.product(*ranges)
+        )
+    return frozenset(result)
+
+
+def _materialize(
+    relation: CoordinateRelation,
+    *,
+    source_axis_order: tuple[int, ...] | None = None,
+    target_axis_order: tuple[int, ...] | None = None,
+) -> tuple[frozenset[int], ...]:
+    return tuple(
+        _targets(
+            relation,
+            index,
+            source_axis_order=source_axis_order,
+            target_axis_order=target_axis_order,
+        )
+        for index in range(relation.source_domain.size)
     )
 
 
@@ -160,7 +317,7 @@ def _symbolic_root_relation(
         site_domains=site_domains,
     )
     self_relations = tuple(
-        dependency.producers_by_consumer
+        None if dependency.incidence is None else dependency.incidence.items_by_key
         for dependency in dependencies
         if dependency.producer_root == 0 and dependency.consumer_root == 1
     )
@@ -221,14 +378,14 @@ class TestTileDependency(TestCase):
             ((10, 2), (20, 3)),
             ((10, 4), (20, 8)),
         )
-        self.assertEqual(domain.coordinates(3), {10: 1, 20: 1})
+        self.assertEqual(_coordinates(domain, 3), {10: 1, 20: 1})
         self.assertEqual(
-            domain.coordinates(3, linearization_order=(20, 10)),
+            _coordinates(domain, 3, (20, 10)),
             {10: 1, 20: 0},
         )
-        self.assertEqual(domain.index({10: 1, 20: 1}), 3)
+        self.assertEqual(_index(domain, {10: 1, 20: 1}), 3)
         self.assertEqual(
-            domain.index({10: 1, 20: 0}, linearization_order=(20, 10)),
+            _index(domain, {10: 1, 20: 0}, (20, 10)),
             3,
         )
 
@@ -273,7 +430,7 @@ class TestTileDependency(TestCase):
 
         self.assertEqual(renamed.source_domain, renamed_source)
         self.assertEqual(renamed.target_domain, renamed_target)
-        self.assertEqual(renamed.materialize(), relation.materialize())
+        self.assertEqual(_materialize(renamed), _materialize(relation))
         self.assertIsNone(
             relation.rename_source_axes(CoordinateDomain((0, 1), ((0, 2), (1, 4))))
         )
@@ -292,8 +449,8 @@ class TestTileDependency(TestCase):
         graph = dataclasses.replace(
             graph,
             execution_sites=(
-                ExecutionSite(0, 0, 0, (), None, "root", (), (10,), True, False),
-                ExecutionSite(1, 1, 1, (), None, "root", (), (20,), True, False),
+                ExecutionSite(0, 0, 0, (), None, "root", (10,), True, False),
+                ExecutionSite(1, 1, 1, (), None, "root", (20,), True, False),
             ),
             site_ids_by_access=((0,), (1,)),
         )
@@ -314,23 +471,23 @@ class TestTileDependency(TestCase):
             ((10, 5), (20, 3), (30, 2)),
             ((10, 1), (20, 1), (30, 1)),
         )
-        relation = pid_task_order(
+        dense = DenseTaskOrder.from_pid(
             domain,
             domain.axis_order,
             l2_group_size=2,
         )
+        assert dense is not None
+        relation = dense.tasks_by_ordinal
         one_outer_slice = (0, 1, 5, 6, 10, 11, 2, 3, 7, 8, 12, 13, 4, 9, 14)
         expected = (*one_outer_slice, *(task + 15 for task in one_outer_slice))
 
         self.assertEqual(
-            tuple(next(iter(targets)) for targets in relation.materialize()),
+            tuple(next(iter(targets)) for targets in _materialize(relation)),
             expected,
         )
-        converse = relation.converse()
-        self.assertIsNotNone(converse)
-        assert converse is not None
+        converse = dense.ordinal_by_task
         self.assertEqual(
-            tuple(next(iter(targets)) for targets in converse.materialize()),
+            tuple(next(iter(targets)) for targets in _materialize(converse)),
             tuple(expected.index(task) for task in range(len(expected))),
         )
 
@@ -340,17 +497,17 @@ class TestTileDependency(TestCase):
             ((10, 2), (20, 3), (30, 4)),
             ((10, 1), (20, 1), (30, 1)),
         )
-        task_order = pid_task_order(domain, (20, 10, 30))
+        dense = DenseTaskOrder.from_pid(domain, (20, 10, 30))
+        assert dense is not None
+        task_order = dense.tasks_by_ordinal
         pid_to_logical = tuple(
-            next(iter(targets)) for targets in task_order.materialize()
+            next(iter(targets)) for targets in _materialize(task_order)
         )
 
         self.assertEqual(sorted(pid_to_logical), list(range(domain.size)))
-        converse = task_order.converse()
-        self.assertIsNotNone(converse)
-        assert converse is not None
+        converse = dense.ordinal_by_task
         logical_to_pid = tuple(
-            next(iter(targets)) for targets in converse.materialize()
+            next(iter(targets)) for targets in _materialize(converse)
         )
         self.assertEqual(
             tuple(pid_to_logical[pid_task] for pid_task in logical_to_pid),
@@ -401,23 +558,51 @@ class TestTileDependency(TestCase):
                 )
                 assert consumer_to_key is not None
 
-                producers_by_key = dependency.factor_through(consumer_to_key)
+                producers_by_key = dependency.rename_source_axes(readiness_key_domain)
 
                 self.assertIsNotNone(producers_by_key)
                 assert producers_by_key is not None
                 self.assertEqual(len(producers_by_key.pieces), 2)
-                arrival_count_by_key = producers_by_key.target_count_by_source()
+                producer = coordinate_axis_symbol(10)
+                keys_by_producer = CoordinateRelation.point_map(
+                    producer_domain,
+                    readiness_key_domain,
+                    (
+                        (
+                            ((10, 0, slots * 256, 1),),
+                            (
+                                FloorDiv(producer, 256),
+                                sympy.Mod(FloorDiv(producer, 16), 8),
+                            ),
+                        ),
+                    ),
+                )
+                incidence = Incidence._from_constructed(
+                    producers_by_key,
+                    keys_by_item=keys_by_producer,
+                    count_by_key=CoordinateRelation.point_map(
+                        readiness_key_domain,
+                        CoordinateDomain.scalar(33, axis=22, kind="value"),
+                        ((bounds, (sympy.Integer(32),)),),
+                    ),
+                ).with_key_major_order()
+                arrival_count_by_key = incidence.count_by_key
                 self.assertIsNotNone(arrival_count_by_key)
                 assert arrival_count_by_key is not None
-                self.assertEqual(arrival_count_by_key.constant_value(), 32)
-                keys_by_producer = producers_by_key.converse()
-                self.assertIsNotNone(keys_by_producer)
-                assert keys_by_producer is not None
+                self.assertEqual(arrival_count_by_key.value_bounds(), (32, 32))
                 self.assertEqual(len(keys_by_producer.pieces), 1)
                 self.assertTrue(keys_by_producer.is_total_function())
                 for producer in (0, 15, 16, 127, 128, 255, slots * 256 - 1):
                     self.assertEqual(
-                        keys_by_producer.target_coordinates({10: producer}),
+                        frozenset(
+                            tuple(
+                                _coordinates(keys_by_producer.target_domain, target)[
+                                    axis
+                                ]
+                                for axis in keys_by_producer.target_domain.axis_order
+                            )
+                            for target in _targets(keys_by_producer, producer)
+                        ),
                         frozenset(
                             (
                                 (
@@ -450,85 +635,53 @@ class TestTileDependency(TestCase):
             ),
         )
 
-        arrival_count_by_key = producers_by_key.target_count_by_source()
-
-        self.assertIsNotNone(arrival_count_by_key)
-        assert arrival_count_by_key is not None
-        self.assertEqual(arrival_count_by_key.constant_value(), 16)
-        self.assertIsNone(producers_by_key.converse())
-
-    def test_mixed_radix_converse_matches_reversed_axis_relation(self) -> None:
-        source_domain = CoordinateDomain(
-            (21, 20),
-            ((21, 3), (20, 2)),
-            kind="site",
-        )
-        target_domain = CoordinateDomain((10,), ((10, 24),), kind="allocation")
-        inner = coordinate_axis_symbol(21)
-        outer = coordinate_axis_symbol(20)
-        begin = 2 * inner + 12 * outer
-        bounds = ((21, 0, 3, 1), (20, 0, 2, 1))
-        targets_by_source = CoordinateRelation(
-            source_domain,
-            target_domain,
-            (
-                _CoordinateRelationPiece(bounds, ((10, begin, begin + 2, 1),)),
-                _CoordinateRelationPiece(bounds, ((10, begin + 6, begin + 8, 1),)),
-            ),
-        )
-
-        sources_by_target = targets_by_source.converse()
-
-        self.assertIsNotNone(sources_by_target)
-        assert sources_by_target is not None
-        expected = {
-            target: frozenset(
-                source
-                for source, targets in enumerate(targets_by_source.materialize())
-                if target in targets
-            )
-            for target in range(target_domain.size)
-        }
-        self.assertEqual(
-            sources_by_target.materialize(),
-            tuple(expected[target] for target in range(target_domain.size)),
-        )
+        incidence = _incidence(producers_by_key)
+        assert incidence.count_by_key is not None
+        self.assertEqual(incidence.count_by_key.value_bounds(), (16, 16))
+        self.assertIsNotNone(incidence.keys_by_item)
 
     def test_target_enumeration_preserves_multi_piece_bijection(self) -> None:
         producer = CoordinateDomain((10,), ((10, 8),), identity=0)
         keys = CoordinateDomain((0,), ((0, 2),), kind="event", identity=0)
-        producer_to_key = CoordinateRelation.point_map(
-            producer,
+        converse = CoordinateRelation(
             keys,
+            producer,
             (
-                (((10, 0, 4, 1),), (sympy.Integer(0),)),
-                (((10, 4, 8, 1),), (sympy.Integer(1),)),
+                _CoordinateRelationPiece(((0, 0, 1, 1),), ((10, 0, 4, 1),)),
+                _CoordinateRelationPiece(((0, 1, 2, 1),), ((10, 4, 8, 1),)),
             ),
         )
-        converse = producer_to_key.converse()
-        self.assertIsNotNone(converse)
-        assert converse is not None
-        task_order = converse.enumerate_targets_by_source()
+        incidence = _incidence(converse, grouped=True)
+        task_order = incidence.grouped_items
         self.assertIsNotNone(task_order)
         assert task_order is not None
         self.assertEqual(
-            tuple(next(iter(targets)) for targets in task_order.materialize()),
+            tuple(
+                next(iter(targets))
+                for targets in _materialize(task_order.tasks_by_ordinal)
+            ),
             tuple(range(producer.size)),
         )
 
         tail_producer = CoordinateDomain((10,), ((10, 7),), identity=0)
-        tail_relation = CoordinateRelation.point_map(
-            tail_producer,
+        tail_converse = CoordinateRelation(
             keys,
+            tail_producer,
             (
-                (((10, 0, 4, 1),), (sympy.Integer(0),)),
-                (((10, 4, 7, 1),), (sympy.Integer(1),)),
+                _CoordinateRelationPiece(((0, 0, 1, 1),), ((10, 0, 4, 1),)),
+                _CoordinateRelationPiece(((0, 1, 2, 1),), ((10, 4, 7, 1),)),
             ),
         )
-        tail_converse = tail_relation.converse()
-        self.assertIsNotNone(tail_converse)
-        assert tail_converse is not None
-        self.assertIsNone(tail_converse.enumerate_targets_by_source())
+        tail_order = _incidence(tail_converse, grouped=True).grouped_items
+        self.assertIsNotNone(tail_order)
+        assert tail_order is not None
+        self.assertEqual(
+            tuple(
+                next(iter(targets))
+                for targets in _materialize(tail_order.tasks_by_ordinal)
+            ),
+            tuple(range(tail_producer.size)),
+        )
 
     def test_symbolic_dependency_preserves_unequal_tile_range(self) -> None:
         elements = 65_536
@@ -563,22 +716,22 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(relation)
         assert relation is not None
         self.assertEqual(len(relation.pieces), 1)
-        self.assertEqual(relation.targets(0), frozenset((0, 1)))
-        self.assertEqual(relation.targets(123), frozenset((246, 247)))
+        self.assertEqual(_targets(relation, 0), frozenset((0, 1)))
+        self.assertEqual(_targets(relation, 123), frozenset((246, 247)))
         self.assertEqual(
-            relation.targets(elements // 32 - 1),
+            _targets(relation, elements // 32 - 1),
             frozenset((elements // 16 - 2, elements // 16 - 1)),
         )
 
-        cardinality = relation.target_count_by_source()
+        cardinality = _incidence(relation).count_by_key
         self.assertIsNotNone(cardinality)
         assert cardinality is not None
         self.assertEqual(
-            cardinality.materialize(),
+            _materialize(cardinality),
             tuple(frozenset((2,)) for _ in range(elements // 32)),
         )
 
-    def test_symbolic_target_count_preserves_tail_pieces(self) -> None:
+    def test_symbolic_tail_relation_preserves_exact_pieces(self) -> None:
         elements = 65
         plan = build_tile_dependency_graph(
             (
@@ -611,13 +764,7 @@ class TestTileDependency(TestCase):
 
         self.assertIsNotNone(relation)
         assert relation is not None
-        cardinality = relation.target_count_by_source()
-        self.assertIsNotNone(cardinality)
-        assert cardinality is not None
-        self.assertEqual(
-            cardinality.materialize(),
-            tuple(frozenset((len(targets),)) for targets in relation.materialize()),
-        )
+        self.assertEqual(tuple(map(len, _materialize(relation))), (2, 2, 2))
 
     def test_symbolic_muse_group_widths_keep_affine_fan_in(self) -> None:
         producer_block = 256
@@ -656,9 +803,6 @@ class TestTileDependency(TestCase):
                 self.assertIsNotNone(relation)
                 assert relation is not None
                 self.assertLessEqual(len(relation.pieces), 3)
-                cardinality = relation.target_count_by_source()
-                self.assertIsNotNone(cardinality)
-                assert cardinality is not None
                 expected = tuple(
                     frozenset(
                         (
@@ -668,7 +812,10 @@ class TestTileDependency(TestCase):
                     )
                     for group in range(groups)
                 )
-                self.assertEqual(cardinality.materialize(), expected)
+                actual = tuple(
+                    frozenset((len(targets),)) for targets in _materialize(relation)
+                )
+                self.assertEqual(actual, expected)
                 if group_width == 1536:
                     self.assertEqual(set(expected), {frozenset((6,))})
                 else:
@@ -706,7 +853,7 @@ class TestTileDependency(TestCase):
 
         self.assertIsNotNone(relation)
         assert relation is not None
-        self.assertEqual(relation.materialize(), (frozenset((2, 3, 4, 5)),))
+        self.assertEqual(_materialize(relation), (frozenset((2, 3, 4, 5)),))
 
     def test_relation_coverage_preserves_stride_phase(self) -> None:
         source = CoordinateDomain((10,), ((10, 8),), identity=0)
@@ -733,10 +880,10 @@ class TestTileDependency(TestCase):
         )
 
         self.assertFalse(even_sources.covers(odd_sources))
-        source_union = even_sources.union(odd_sources)
+        source_union = CoordinateRelation.union_all((even_sources, odd_sources))
         self.assertIsNotNone(source_union)
         assert source_union is not None
-        self.assertEqual(source_union.materialize(), (frozenset((0,)),) * 8)
+        self.assertEqual(_materialize(source_union), (frozenset((0,)),) * 8)
 
         singleton = CoordinateDomain((20,), ((20, 1),), identity=1)
         even_targets = CoordinateRelation(
@@ -761,70 +908,10 @@ class TestTileDependency(TestCase):
         )
 
         self.assertFalse(even_targets.covers(odd_targets))
-        target_union = even_targets.union(odd_targets)
+        target_union = CoordinateRelation.union_all((even_targets, odd_targets))
         self.assertIsNotNone(target_union)
         assert target_union is not None
-        self.assertEqual(target_union.materialize(), (frozenset(range(8)),))
-
-    def test_symbolic_max_target_value_reduces_schedule_positions(self) -> None:
-        elements = 128
-        plan = build_tile_dependency_graph(
-            (
-                _access(
-                    0,
-                    root=0,
-                    allocation_id=0,
-                    kind="store",
-                    shape=(elements,),
-                    block_ids=(10,),
-                ),
-                _access(
-                    1,
-                    root=1,
-                    allocation_id=0,
-                    kind="load",
-                    shape=(elements,),
-                    block_ids=(20,),
-                ),
-            ),
-            [[10], [20]],
-        )
-        relation = _symbolic_root_relation(
-            plan,
-            {10: (8, 16), 20: (4, 32)},
-        )
-        self.assertIsNotNone(relation)
-        assert relation is not None
-        producer_axis = relation.target_domain.axis_order[0]
-        value_domain = CoordinateDomain(
-            (0,),
-            ((0, 4),),
-            kind="value",
-        )
-        worker_steps = CoordinateRelation.point_map(
-            relation.target_domain,
-            value_domain,
-            (
-                (
-                    ((producer_axis, 0, 8, 1),),
-                    (sympy.floor((coordinate_axis_symbol(producer_axis) + 3) / 4),),
-                ),
-            ),
-        )
-
-        maximum = relation.max_target_value_by_source(worker_steps)
-
-        self.assertIsNotNone(maximum)
-        assert maximum is not None
-        self.assertEqual(
-            maximum.materialize(),
-            tuple(
-                frozenset(
-                    (max(max(worker_steps.targets(task)) for task in producer_tasks),)
-                )
-                for producer_tasks in relation.materialize()
-            ),
-        )
+        self.assertEqual(_materialize(target_union), (frozenset(range(8)),))
 
     def test_out_of_domain_point_map_is_not_total(self) -> None:
         source = CoordinateDomain((10,), ((10, 6),), identity=0)
@@ -842,7 +929,7 @@ class TestTileDependency(TestCase):
 
         self.assertFalse(relation.has_total_source())
         self.assertFalse(relation.is_total_function())
-        self.assertEqual(relation.materialize()[-2:], (frozenset(), frozenset()))
+        self.assertEqual(_materialize(relation)[-2:], (frozenset(), frozenset()))
 
     def test_partitioned_total_function_avoids_global_canonicalization(self) -> None:
         source = CoordinateDomain((10,), ((10, 128),), identity=0)
@@ -919,7 +1006,7 @@ class TestTileDependency(TestCase):
                 self.assertIsNotNone(relation)
                 assert relation is not None
                 self.assertEqual(
-                    relation.materialize(),
+                    _materialize(relation),
                     _root_producers_by_consumer(plan, root_domains),
                 )
 
@@ -965,17 +1052,18 @@ class TestTileDependency(TestCase):
         consumer = relation.source_domain
         producer = relation.target_domain
         for consumer_task in range(consumer.size):
-            coordinates = consumer.coordinates(consumer_task)
+            coordinates = _coordinates(consumer, consumer_task)
             expected = frozenset(
-                producer.index(
+                _index(
+                    producer,
                     {
                         10: coordinates[20],
                         11: 2 * coordinates[21] + offset,
-                    }
+                    },
                 )
                 for offset in range(2)
             )
-            self.assertEqual(relation.targets(consumer_task), expected)
+            self.assertEqual(_targets(relation, consumer_task), expected)
 
     @skipIfNotCUDA()
     @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
@@ -1011,12 +1099,24 @@ class TestTileDependency(TestCase):
                 accesses,
                 device_ir=device_ir,
             )
-            self.assertTrue(dependency_graph.edges_between(0, 1))
+            self.assertTrue(
+                any(
+                    edge.producer_root == 0 and edge.consumer_root == 1
+                    for edge in dependency_graph.edges
+                )
+            )
             self.assertTrue(
                 all(
                     all(site.root == access.root for site in sites)
                     for access in dependency_graph.accesses
-                    for sites in (dependency_graph.sites_for_access(access.access_id),)
+                    for sites in (
+                        tuple(
+                            dependency_graph.execution_sites[site_id]
+                            for site_id in dependency_graph.site_ids_by_access[
+                                access.access_id
+                            ]
+                        ),
+                    )
                 )
             )
         finally:
@@ -1161,7 +1261,11 @@ class TestTileDependency(TestCase):
             [[0], [1], [2]],
         )
 
-        edge = plan.edges_between(1, 2)[0]
+        edge = next(
+            edge
+            for edge in plan.edges
+            if edge.producer_root == 1 and edge.consumer_root == 2
+        )
         self.assertEqual(edge.allocation_id, 0)
         self.assertEqual(
             edge.tensor_names,
@@ -1304,7 +1408,7 @@ class TestTileDependency(TestCase):
         consumer_task = 1 + 2 * 2
         (producer_task,) = relation[consumer_task]
         self.assertEqual(
-            root_domains[0].coordinates(producer_task),
+            _coordinates(root_domains[0], producer_task),
             {10: 1, 11: 2},
         )
 
@@ -1378,7 +1482,9 @@ class TestTileDependency(TestCase):
             CoordinateDomain((20,), ((20, 256),), ((20, 16),)),
         )
         relation = _root_producers_by_consumer(plan, root_domains)
-        self.assertIsNone(relation)
+        self.assertIsNotNone(relation)
+        assert relation is not None
+        self.assertTrue(all(len(producers) == 1 for producers in relation))
 
     def test_unequal_tiles_map_to_every_overlapping_producer(self) -> None:
         plan = build_tile_dependency_graph(
@@ -1496,7 +1602,7 @@ class TestTileDependency(TestCase):
         actual = _root_producers_by_consumer(plan, root_domains)
         assert actual is not None
         for consumer_task, producer_tasks in enumerate(actual):
-            coordinates = root_domains[1].coordinates(consumer_task)
+            coordinates = _coordinates(root_domains[1], consumer_task)
             batch = coordinates[20]
             group = coordinates[21]
             self.assertEqual(
@@ -1819,3 +1925,695 @@ class TestTileDependency(TestCase):
 
         self.assertEqual(len(plan.edges), 1)
         self.assertEqual(plan.edges[0].tensor_names, frozenset(("base", "view")))
+
+    def test_dense_qwen_order_and_capability_bundles(self) -> None:
+        tasks = CoordinateDomain((10, 20), ((10, 16), (20, 96)), identity=0)
+        order = DenseTaskOrder.from_pid(tasks, tasks.axis_order, l2_group_size=8)
+        assert order is not None
+        expected = {0: 0, 7: 7, 8: 16, 767: 1527, 768: 8, 1535: 1535}
+        for ordinal, task in expected.items():
+            self.assertEqual(_targets(order.tasks_by_ordinal, ordinal), {task})
+            self.assertEqual(_targets(order.ordinal_by_task, task), {ordinal})
+
+        key = CoordinateDomain((0,), ((0, 4),), kind="event", identity=2)
+        item = CoordinateDomain((1,), ((1, 4),), identity=3)
+        coordinate = coordinate_axis_symbol(0)
+        relation = CoordinateRelation.point_map(
+            key, item, (((((0, 0, 4, 1),), (coordinate,))),)
+        )
+        incidence = _incidence(relation, grouped=True)
+        for value in (order, incidence):
+            with self.assertRaises(TypeError):
+                dataclasses.replace(value)
+            self.assertEqual(copy.deepcopy(value), value)
+            self.assertEqual(pickle.loads(pickle.dumps(value)), value)
+
+    def test_grouped_incidence_requires_complete_unique_item_coverage(self) -> None:
+        keys = CoordinateDomain.scalar(2, kind="event")
+        items = CoordinateDomain.scalar(2, axis=1)
+        counts = CoordinateDomain.scalar(2, axis=2, kind="value")
+        items_by_key = CoordinateRelation.point_map(
+            keys,
+            items,
+            (((((0, 0, 1, 1),), (0,))), ((((0, 1, 2, 1),), (0,)))),
+        )
+        keys_by_item = CoordinateRelation(
+            items,
+            keys,
+            (_CoordinateRelationPiece(((1, 0, 1, 1),), ((0, 0, 2, 1),)),),
+        )
+        count_by_key = CoordinateRelation.point_map(
+            keys, counts, (((((0, 0, 2, 1),), (1,))),)
+        )
+        incidence = Incidence._from_constructed(
+            items_by_key, keys_by_item=keys_by_item, count_by_key=count_by_key
+        ).with_key_major_order()
+        self.assertIsNone(incidence.grouped_items)
+
+    def test_relation_construction_deduplicates_identical_pieces(self) -> None:
+        source = CoordinateDomain.scalar(2)
+        target = CoordinateDomain.scalar(3, axis=1)
+        piece = _CoordinateRelationPiece(
+            ((0, 0, 2, 1),),
+            ((1, 0, 3, 1),),
+        )
+        relation = CoordinateRelation(source, target, (piece, piece))
+        self.assertEqual(relation.pieces, (piece,))
+
+        incidence = Incidence.from_fibers(relation)
+        assert incidence.keys_by_item is not None
+        assert incidence.count_by_key is not None
+        self.assertEqual(
+            _materialize(incidence.keys_by_item),
+            (frozenset((0, 1)),) * 3,
+        )
+        self.assertEqual(
+            _materialize(incidence.count_by_key),
+            (frozenset((3,)),) * 2,
+        )
+
+    def test_dense_point_fibers_preserve_unused_source_axis(self) -> None:
+        consumers = CoordinateDomain(
+            (10, 11, 12), ((10, 3), (11, 4), (12, 2)), kind="site"
+        )
+        producers = CoordinateDomain((20, 21), ((20, 8), (21, 1)), kind="site")
+        group, query, child = map(coordinate_axis_symbol, consumers.axis_order)
+        begin = 1 + 2 * group + child + sympy.floor(query / 4)
+        relation = CoordinateRelation(
+            consumers,
+            producers,
+            (
+                _CoordinateRelationPiece(
+                    tuple(
+                        (axis, 0, consumers.axis_counts[axis], 1)
+                        for axis in consumers.axis_order
+                    ),
+                    (
+                        (
+                            20,
+                            begin,
+                            2 * group
+                            + child
+                            + sympy.ceiling(query / 4 + sympy.Rational(5, 4)),
+                            1,
+                        ),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        reduced = CoordinateDomain((10, 12), ((10, 3), (12, 2)), kind="event")
+        partition = KeyPartition.projection(consumers, reduced)
+        assert partition is not None
+        self.assertEqual(relation.source_axes_affecting_targets(), (10, 12))
+        self.assertIsNone(relation.converse())
+        incidence = Incidence._from_constructed(relation).coarsen(partition)
+        assert incidence is not None
+        assert incidence.count_by_key is not None
+        self.assertEqual(incidence.count_by_key.value_bounds(), (1, 1))
+        assert incidence.keys_by_item is not None
+        for producer in range(producers.size):
+            expected = frozenset()
+            if 1 <= producer < 7:
+                value = producer - 1
+                expected = frozenset(
+                    (_index(reduced, {10: value // 2, 12: value % 2}),)
+                )
+            self.assertEqual(_targets(incidence.keys_by_item, producer), expected)
+
+        gapped_producers = CoordinateDomain((20, 21), ((20, 9), (21, 1)), kind="site")
+        gapped = CoordinateRelation(
+            reduced,
+            gapped_producers,
+            (
+                _CoordinateRelationPiece(
+                    tuple(
+                        (axis, 0, reduced.axis_counts[axis], 1)
+                        for axis in reduced.axis_order
+                    ),
+                    (
+                        (20, 1 + 3 * group + child, 2 + 3 * group + child, 1),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(gapped.converse())
+
+        five_queries = CoordinateDomain(
+            (10, 11, 12), ((10, 3), (11, 5), (12, 2)), kind="site"
+        )
+        group, query, child = map(coordinate_axis_symbol, five_queries.axis_order)
+        nonconstant_quotient = CoordinateRelation(
+            five_queries,
+            producers,
+            (
+                _CoordinateRelationPiece(
+                    tuple(
+                        (axis, 0, five_queries.axis_counts[axis], 1)
+                        for axis in five_queries.axis_order
+                    ),
+                    (
+                        (
+                            20,
+                            1 + 2 * group + child + sympy.floor(query / 4),
+                            2 * group
+                            + child
+                            + sympy.ceiling(query / 4 + sympy.Rational(5, 4)),
+                            1,
+                        ),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertEqual(
+            nonconstant_quotient.source_axes_affecting_targets(), (10, 11, 12)
+        )
+        self.assertIsNone(nonconstant_quotient.converse())
+
+        conditional_support = CoordinateRelation(
+            consumers,
+            producers,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 3, 1), (11, 0, group, 1), (12, 0, 2, 1)),
+                    (
+                        (20, 1 + 2 * group + child, 2 + 2 * group + child, 1),
+                        (21, 0, 1, 1),
+                    ),
+                ),
+            ),
+        )
+        self.assertIsNone(
+            Incidence._from_constructed(conditional_support).coarsen(partition)
+        )
+
+    def test_target_projection_does_not_widen_clipped_support(self) -> None:
+        producers = CoordinateDomain.scalar(4, axis=0, kind="site")
+        consumers = CoordinateDomain((1, 2), ((1, 1), (2, 4)), kind="event")
+        retained = CoordinateDomain.scalar(1, axis=1, kind="event")
+        producer = coordinate_axis_symbol(0)
+        reverse = CoordinateRelation(
+            producers,
+            consumers,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 4, 1),),
+                    ((1, 0, 1, 1), (2, 4 * producer - 12, 4 * producer - 8, 1)),
+                ),
+            ),
+        )
+        self.assertIsNone(reverse.project_target(retained))
+        forward = CoordinateRelation.point_map(
+            consumers,
+            producers,
+            (((((1, 0, 1, 1), (2, 0, 4, 1)), (3,))),),
+        )
+        count = CoordinateRelation.point_map(
+            consumers,
+            CoordinateDomain.scalar(2, axis=3, kind="value"),
+            (((((1, 0, 1, 1), (2, 0, 4, 1)), (1,))),),
+        )
+        partition = KeyPartition.projection(consumers, retained)
+        assert partition is not None
+        incidence = Incidence._from_constructed(
+            forward, keys_by_item=reverse, count_by_key=count
+        ).coarsen(partition)
+        assert incidence is not None
+        assert incidence.keys_by_item is not None
+        assert incidence.count_by_key is not None
+        self.assertEqual(_materialize(incidence.items_by_key), (frozenset((3,)),))
+        self.assertEqual(
+            _materialize(incidence.keys_by_item),
+            (frozenset(), frozenset(), frozenset(), frozenset((0,))),
+        )
+        self.assertEqual(incidence.count_by_key.value_bounds(), (1, 1))
+
+    def test_source_axes_ignore_known_domain_parameters(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, positive=True)
+        unknown = sympy.Symbol("unknown", integer=True, nonnegative=True)
+        source = CoordinateDomain.scalar(extent, axis=1, kind="site")
+        target = CoordinateDomain.scalar(extent, axis=2, kind="site")
+
+        def relation(value: sympy.Expr) -> CoordinateRelation:
+            return CoordinateRelation(
+                source,
+                target,
+                (
+                    _CoordinateRelationPiece(
+                        ((1, 0, extent, 1),),
+                        ((2, value, value + 1, 1),),
+                    ),
+                ),
+            )
+
+        self.assertEqual(relation(extent - 1).source_axes_affecting_targets(), ())
+        self.assertIsNone(relation(unknown).source_axes_affecting_targets())
+
+    def test_rectangular_fibers_recognize_only_full_clipped_axes(self) -> None:
+        keys = CoordinateDomain.scalar(1, kind="event")
+        items = CoordinateDomain.scalar(5, axis=1)
+        for begin, end, step, expected_count in (
+            (-1, 6, 1, 5),
+            (1, 6, 1, None),
+            (0, 4, 1, None),
+            (0, 6, 2, None),
+        ):
+            with self.subTest(begin=begin, end=end, step=step):
+                incidence = Incidence.from_fibers(
+                    CoordinateRelation(
+                        keys,
+                        items,
+                        (
+                            _CoordinateRelationPiece(
+                                ((0, 0, 1, 1),),
+                                ((1, begin, end, step),),
+                            ),
+                        ),
+                    )
+                )
+                if expected_count is None:
+                    self.assertIsNone(incidence.count_by_key)
+                else:
+                    assert incidence.count_by_key is not None
+                    self.assertEqual(
+                        incidence.count_by_key.value_bounds(),
+                        (expected_count, expected_count),
+                    )
+
+        extent = sympy.Symbol("extent", integer=True, positive=True)
+        symbolic = Incidence.from_fibers(
+            CoordinateRelation(
+                keys,
+                CoordinateDomain((1,), ((1, extent),)),
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 1, 1),),
+                        ((1, -1, extent + 1, 1),),
+                    ),
+                ),
+            )
+        )
+        assert symbolic.count_by_key is not None
+        self.assertEqual(
+            symbolic.count_by_key.pieces[0].target_ranges[0][1:3],
+            (extent, extent + 1),
+        )
+        symbolic_domain = CoordinateDomain((2,), ((2, extent),), kind="event")
+        identity = CoordinateRelation.identity(symbolic_domain, symbolic_domain)
+        partition = KeyPartition.projection(symbolic_domain, symbolic_domain)
+        assert partition is not None
+        self.assertIsNotNone(
+            partition.rekey_fine(Incidence.from_fibers(identity, keys_by_item=identity))
+        )
+
+    def test_symbolic_uniform_fibers_keep_count_without_dense_order(self) -> None:
+        batch = sympy.Symbol("batch", integer=True, positive=True)
+        keys = CoordinateDomain((0,), ((0, batch),), kind="event")
+        items = CoordinateDomain((1,), ((1, 2 * batch),), kind="site")
+        key = coordinate_axis_symbol(0)
+        incidence = Incidence.from_fibers(
+            CoordinateRelation(
+                keys,
+                items,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, batch, 1),),
+                        ((1, 2 * key, 2 * key + 2, 1),),
+                    ),
+                ),
+            )
+        )
+        assert incidence.count_by_key is not None
+        self.assertEqual(incidence.count_by_key.value_bounds(), (2, 2))
+        self.assertIsNone(incidence.grouped_items)
+
+        item = coordinate_axis_symbol(1)
+        reflected = Incidence.from_fibers(
+            CoordinateRelation(
+                keys,
+                items,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, batch, 1),),
+                        ((1, 2 * (batch - 1 - key), 2 * (batch - key), 1),),
+                    ),
+                ),
+            ),
+            keys_by_item=CoordinateRelation.point_map(
+                items,
+                keys,
+                (((((1, 0, 2 * batch, 1),), (batch - 1 - FloorDiv(item, 2),))),),
+            ),
+        )
+        assert reflected.count_by_key is not None
+        self.assertEqual(reflected.count_by_key.value_bounds(), (2, 2))
+        self.assertIsNone(reflected.grouped_items)
+
+    def test_key_major_order_declines_unproved_alternating_order(self) -> None:
+        keys = CoordinateDomain.scalar(2, kind="event")
+        items = CoordinateDomain.scalar(6, axis=1)
+        counts = CoordinateDomain.scalar(4, axis=2, kind="value")
+        item = coordinate_axis_symbol(1)
+        compact_reverse = CoordinateRelation.point_map(
+            items,
+            keys,
+            (((((1, 0, 6, 1),), (1 - sympy.Mod(item, 2),))),),
+        )
+        explicit_reverse = CoordinateRelation.point_map(
+            items,
+            keys,
+            tuple(
+                ((((1, index, index + 1, 1),), (owner,)))
+                for index, owner in enumerate((1, 0, 1, 0, 1, 0))
+            ),
+        )
+        for keys_by_item in (compact_reverse, explicit_reverse):
+            with self.subTest(keys_by_item=keys_by_item):
+                incidence = Incidence._from_constructed(
+                    CoordinateRelation(
+                        keys,
+                        items,
+                        (
+                            _CoordinateRelationPiece(((0, 0, 1, 1),), ((1, 1, 6, 2),)),
+                            _CoordinateRelationPiece(((0, 1, 2, 1),), ((1, 0, 6, 2),)),
+                        ),
+                    ),
+                    keys_by_item=keys_by_item,
+                    count_by_key=CoordinateRelation.point_map(
+                        keys,
+                        counts,
+                        (((((0, 0, 2, 1),), (3,))),),
+                    ),
+                ).with_key_major_order()
+                self.assertIsNone(incidence.grouped_items)
+                assert incidence.count_by_key is not None
+                self.assertEqual(
+                    _materialize(incidence.count_by_key),
+                    (frozenset((3,)), frozenset((3,))),
+                )
+
+    def test_key_major_order_packs_uniform_disjoint_spans(self) -> None:
+        keys = CoordinateDomain.scalar(2, kind="event")
+        items = CoordinateDomain.scalar(8, axis=1)
+        key = coordinate_axis_symbol(0)
+        item = coordinate_axis_symbol(1)
+        incidence = Incidence._from_constructed(
+            CoordinateRelation(
+                keys,
+                items,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 2, 1),),
+                        ((1, 2 * key, 2 * key + 2, 1),),
+                    ),
+                    _CoordinateRelationPiece(
+                        ((0, 0, 2, 1),),
+                        ((1, 2 * key + 4, 2 * key + 6, 1),),
+                    ),
+                ),
+            ),
+            keys_by_item=CoordinateRelation.point_map(
+                items,
+                keys,
+                (
+                    (((1, 0, 4, 1),), (FloorDiv(item, 2),)),
+                    (((1, 4, 8, 1),), (FloorDiv(item - 4, 2),)),
+                ),
+            ),
+        ).with_key_major_order()
+        assert incidence.count_by_key is not None
+        assert incidence.grouped_items is not None
+        self.assertEqual(incidence.count_by_key.value_bounds(), (4, 4))
+        self.assertEqual(
+            tuple(
+                next(iter(values))
+                for values in _materialize(incidence.grouped_items.tasks_by_ordinal)
+            ),
+            (0, 1, 4, 5, 2, 3, 6, 7),
+        )
+
+    def test_uniform_count_rejects_out_of_domain_fibers(self) -> None:
+        keys = CoordinateDomain.scalar(1, kind="event")
+        items = CoordinateDomain.scalar(1, axis=1)
+        incidence = Incidence._from_constructed(
+            CoordinateRelation(
+                keys,
+                items,
+                (_CoordinateRelationPiece(((0, 0, 1, 1),), ((1, -1, 1, 1),)),),
+            ),
+            keys_by_item=CoordinateRelation.point_map(
+                items,
+                keys,
+                (((((1, 0, 1, 1),), (0,))),),
+            ),
+        ).with_key_major_order()
+        self.assertIsNone(incidence.count_by_key)
+        self.assertIsNone(incidence.grouped_items)
+
+        grid = CoordinateDomain((1, 2), ((1, 2), (2, 2)))
+        aliased_rank = Incidence._from_constructed(
+            CoordinateRelation(
+                keys,
+                grid,
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 1, 1),),
+                        ((1, 2, 3, 1), (2, 0, 1, 1)),
+                    ),
+                ),
+            ),
+            keys_by_item=CoordinateRelation(grid, keys, ()),
+        ).with_key_major_order()
+        self.assertIsNone(aliased_rank.count_by_key)
+        self.assertIsNone(aliased_rank.grouped_items)
+
+    def test_logical_simplification_preserves_nested_modulo(self) -> None:
+        domain = CoordinateDomain.scalar(6)
+        value = coordinate_axis_symbol(0)
+        expression = 1 + sympy.Mod(
+            4 * sympy.Mod(value, 3, evaluate=False), 6, evaluate=False
+        )
+        simplified = _simplify_logical_expression(
+            expression,
+            domain=domain,
+            source_bounds=((0, 0, 6, 1),),
+        )
+        self.assertEqual(
+            tuple(int(simplified.xreplace({value: index})) for index in range(6)),
+            (1, 5, 3, 1, 5, 3),
+        )
+
+    def test_relation_cartesian_work_declines_before_expansion(self) -> None:
+        scalar = CoordinateDomain.scalar(65)
+        points = CoordinateRelation.point_map(
+            scalar,
+            scalar,
+            tuple(((((0, value, value + 1, 1),), (value,))) for value in range(65)),
+        )
+        self.assertIsNone(points.then(points))
+
+        square = CoordinateDomain((0, 1), ((0, 65), (1, 65)))
+        value = CoordinateDomain.scalar(1, axis=2, kind="value")
+        pieces = tuple(
+            _CoordinateRelationPiece(bounds, ((2, 0, 1, 1),))
+            for axis in (0, 1)
+            for index in range(65)
+            for bounds in (
+                tuple(
+                    (coordinate_axis, index, index + 1, 1)
+                    if coordinate_axis == axis
+                    else (coordinate_axis, 0, 65, 1)
+                    for coordinate_axis in square.axis_order
+                ),
+            )
+        )
+        self.assertFalse(CoordinateRelation(square, value, pieces).has_total_source())
+
+    def test_fixed_width_partition_keeps_empty_tail_counts(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 4),), identity=0)
+        fine = CoordinateDomain((20,), ((20, 10),), kind="event", identity=7)
+        task = coordinate_axis_symbol(10)
+        publication = CoordinateRelation(
+            producer,
+            fine,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 4, 1),), ((20, 2 * task, 2 * task + 2, 1),)
+                ),
+            ),
+        )
+        result = KeyPartition.from_fixed_width_publication(publication)
+        assert result is not None
+        partition, incidence = result
+        self.assertEqual(partition.coarse_key_by_fine_key.target_domain.identity, 7)
+        assert incidence.count_by_key is not None
+        self.assertEqual(
+            _materialize(incidence.count_by_key),
+            (
+                frozenset((1,)),
+                frozenset((1,)),
+                frozenset((1,)),
+                frozenset((1,)),
+                frozenset((0,)),
+            ),
+        )
+
+    def test_separable_block_and_quotient_fibers_coarsen_exactly(self) -> None:
+        producers = CoordinateDomain((0, 1), ((0, 2), (1, 4)), identity=0)
+        fine_keys = CoordinateDomain(
+            (10, 11), ((10, 4), (11, 2)), kind="event", identity=7
+        )
+        producer0 = coordinate_axis_symbol(0)
+        producer1 = coordinate_axis_symbol(1)
+        publication = CoordinateRelation(
+            producers,
+            fine_keys,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 2, 1), (1, 0, 4, 1)),
+                    (
+                        (10, 2 * producer0, 2 * producer0 + 2, 1),
+                        (11, FloorDiv(producer1, 2), FloorDiv(producer1, 2) + 1, 1),
+                    ),
+                ),
+            ),
+        )
+
+        fine = Incidence.from_fibers(publication)
+        assert fine.keys_by_item is not None
+        assert fine.count_by_key is not None
+        self.assertEqual(fine.count_by_key.value_bounds(), (2, 2))
+        self.assertFalse(fine.keys_by_item.is_single_valued())
+
+        result = KeyPartition.from_fixed_width_publication(publication)
+        assert result is not None
+        partition, coarse = result
+        self.assertEqual(
+            partition.coarse_key_by_fine_key.target_domain.axis_counts_items,
+            ((10, sympy.Integer(2)), (11, sympy.Integer(2))),
+        )
+        assert coarse.keys_by_item is not None
+        assert coarse.count_by_key is not None
+        self.assertTrue(coarse.keys_by_item.is_single_valued())
+        self.assertEqual(coarse.count_by_key.value_bounds(), (2, 2))
+
+    def test_incidence_composition_rejects_cross_key_worker_fibers(self) -> None:
+        keys = CoordinateDomain((0,), ((0, 2),), kind="event", identity=0)
+        slots = CoordinateDomain((10,), ((10, 8),), identity=1)
+        key = coordinate_axis_symbol(0)
+        items = CoordinateRelation(
+            keys,
+            slots,
+            (
+                _CoordinateRelationPiece(
+                    ((0, 0, 2, 1),), ((10, 2 * key, 2 * key + 2, 1),)
+                ),
+            ),
+        )
+        incidence = _incidence(items)
+        self.assertIsNone(incidence.last_item_by_residue(2))
+        owners = incidence.last_item_by_residue(4)
+        self.assertIsNotNone(owners)
+        assert owners is not None and owners.keys_by_item is not None
+        self.assertEqual(
+            _materialize(owners.keys_by_item)[:4],
+            (frozenset((0,)), frozenset((0,)), frozenset((1,)), frozenset((1,))),
+        )
+
+    def test_symbolic_layout_and_relation_parameters_survive(self) -> None:
+        extent = sympy.Symbol("extent", integer=True, positive=True)
+        source = CoordinateDomain((10,), ((10, extent),), identity=0)
+        target = CoordinateDomain((20,), ((20, extent),), identity=1)
+        coordinate = coordinate_axis_symbol(10)
+        relation = CoordinateRelation.point_map(
+            source, target, (((((10, 0, extent, 1),), (coordinate,))),)
+        )
+        access = TileAccess(
+            0,
+            0,
+            0,
+            0,
+            0,
+            "load",
+            "x",
+            (extent,),
+            (1,),
+            0,
+            (0,),
+            (10,),
+            (1,),
+            (0,),
+            (False,),
+            False,
+            True,
+        )
+        self.assertIn(extent, relation.source_domain.parameter_symbols)
+        self.assertTrue(relation.is_total_function())
+        self.assertEqual(access.tensor_shape, (extent,))
+        self.assertEqual(access, dataclasses.replace(access))
+
+        expanded_source = CoordinateDomain(
+            (10, 11), ((10, extent), (11, sympy.Integer(4))), identity=0
+        )
+        offset_relation = CoordinateRelation.point_map(
+            expanded_source,
+            CoordinateDomain.scalar(2 * extent, axis=20, kind="site", identity=1),
+            (
+                (
+                    ((10, 0, extent, 1), (11, 0, 4, 1)),
+                    (extent + coordinate,),
+                ),
+            ),
+        )
+        projected = offset_relation.project_source(source)
+        self.assertIsNotNone(projected)
+        assert projected is not None
+        self.assertIn(extent, projected.pieces[0].target_ranges[0][1].free_symbols)
+
+        empty_source = CoordinateDomain(
+            (10, 11),
+            ((10, extent), (11, sympy.Integer(0))),
+            identity=0,
+            _allow_empty=True,
+        )
+        empty_relation = CoordinateRelation.point_map(
+            empty_source,
+            target,
+            (((((10, 0, extent, 1), (11, 0, 0, 1)), (coordinate,))),),
+        )
+        self.assertIsNone(empty_relation.project_source(source))
+
+        tiled = TileAccess(
+            1,
+            1,
+            0,
+            0,
+            0,
+            "load",
+            "x",
+            (extent, 16),
+            (16, 1),
+            0,
+            (1,),
+            (10,),
+            (1,),
+            (0,),
+            (False,),
+            False,
+            True,
+            subscript_is_full_slice=(False,),
+        )
+        allocation = CoordinateDomain(
+            (-1,), ((-1, 16 * extent),), kind="allocation", identity=0
+        )
+        linear_map = _symbolic_access_map(
+            tiled,
+            layout=_access_layout(tiled, None),
+            source_domain=CoordinateDomain((10,), ((10, 1),), ((10, 16),)),
+            allocation_domain=allocation,
+        )
+        assert linear_map is not None
+        linear, _codec = linear_map
+        self.assertIn(extent, linear.target_domain.parameter_symbols)

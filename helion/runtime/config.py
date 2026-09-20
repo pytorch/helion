@@ -16,7 +16,7 @@ PidTypeLiteral = Literal[
     "persistent_blocked",
     "persistent_interleaved",
 ]
-CrossLoopScheduleLiteral = Literal["barrier", "static_pipeline"]
+CrossLoopPipelineLiteral = Literal["barrier", "static"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
@@ -61,7 +61,7 @@ class Config(Mapping[str, object]):
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
-        cross_loop_schedule: CrossLoopScheduleLiteral | None = None,
+        cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
         num_sm_multiplier: NumSmMultiplierLiteral | None = None,
         maxnreg: MaxnregLiteral | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
@@ -109,10 +109,11 @@ class Config(Mapping[str, object]):
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
-            cross_loop_schedule: Synchronization strategy for kernels with
+            cross_loop_pipeline: Execution strategy for kernels with
                 compiler-inferred cross-loop dependencies. ``"barrier"`` uses
-                grid synchronization; ``"static_pipeline"`` uses the static
-                dependency schedule. Unsupported kernels reject this field.
+                grid synchronization; ``"static"`` executes the
+                compiler-derived dependency schedule with fixed worker
+                ownership. Unsupported kernels reject this field.
             num_sm_multiplier: Multiplier for the number of SMs in persistent
                 kernels (1, 2, 4, 8).
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
@@ -168,7 +169,7 @@ class Config(Mapping[str, object]):
             "indexing": indexing,
             "atomic_indexing": atomic_indexing,
             "pid_type": pid_type,
-            "cross_loop_schedule": cross_loop_schedule,
+            "cross_loop_pipeline": cross_loop_pipeline,
             "num_sm_multiplier": num_sm_multiplier,
             "maxnreg": maxnreg,
             "advanced_controls_file": advanced_controls_file,
@@ -317,10 +318,10 @@ class Config(Mapping[str, object]):
         return cast("PidTypeLiteral", self.config.get("pid_type", "flat"))
 
     @property
-    def cross_loop_schedule(self) -> CrossLoopScheduleLiteral:
+    def cross_loop_pipeline(self) -> CrossLoopPipelineLiteral:
         return cast(
-            "CrossLoopScheduleLiteral",
-            self.config.get("cross_loop_schedule", "barrier"),
+            "CrossLoopPipelineLiteral",
+            self.config.get("cross_loop_pipeline", "barrier"),
         )
 
     @property
