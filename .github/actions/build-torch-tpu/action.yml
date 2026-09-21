@@ -16,7 +16,7 @@ runs:
           --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/jax/simple/ \
           --find-links https://storage.googleapis.com/jax-releases/libtpu_releases.html \
           --pre \
-          'jax==0.11.1' 'jaxlib==0.11.1' 'libtpu==0.0.47' 'tpu-info==0.14.2' 'jaxtyping' 'frozendict' 'immutabledict'
+          'jax==0.11.2' 'jaxlib==0.11.2' 'libtpu==0.0.48' 'tpu-info==0.14.2' 'jaxtyping' 'frozendict' 'immutabledict'
         # Install Bazel
         if ! command -v bazel &> /dev/null; then
           sudo curl -L https://github.com/bazelbuild/bazelisk/releases/download/v1.27.0/bazelisk-linux-amd64 -o /usr/local/bin/bazel
@@ -54,6 +54,8 @@ runs:
           --config=helion_public_caching_readwrite \
           --config=local_torch \
           --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
+          --repo_env=HERMETIC_PYTHON_VERSION=3.12 \
+          --define PYTHON_VERSION=3.12 \
           --action_env=JAX_PLATFORMS=cpu
         uv pip install bazel-bin/ci/wheel/*.whl
         cd -

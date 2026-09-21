@@ -41,6 +41,8 @@ export TORCH_SOURCE=$(python -c "import torch; import os; print(os.path.dirname(
   --config=helion_public_caching_readonly \
   --config=local_torch \
   --repo_env=TORCH_SOURCE=$TORCH_SOURCE \
+  --repo_env=HERMETIC_PYTHON_VERSION=3.12 \
+  --define PYTHON_VERSION=3.12 \
   --action_env=JAX_PLATFORMS=cpu
 uv pip install bazel-bin/ci/wheel/*.whl
 cp bazel-bin/ci/wheel/*.whl "$DIST_DIR"
