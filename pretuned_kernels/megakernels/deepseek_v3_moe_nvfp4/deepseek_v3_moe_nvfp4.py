@@ -82,7 +82,7 @@ def _first_mma_column(value: torch.Tensor) -> torch.Tensor:
     return torch.sum(value * (column[None, :] == 0).to(torch.float32), dim=-1)
 
 
-@helion.aot_kernel(static_shapes=True, backend="triton")
+@helion.aot_kernel(static_shapes=False, backend="triton")
 def deepseek_v3_moe_nvfp4(
     hidden_input: torch.Tensor,
     router_weight: torch.Tensor,
@@ -106,6 +106,73 @@ def deepseek_v3_moe_nvfp4(
     topk_groups: int,
     routed_scale: float,
 ):
+    # The model geometry and layouts are part of this pretuned kernel's fixed
+    # contract. Tensor contents, including routing decisions, remain runtime
+    # data even though their metadata is specialized explicitly.
+    hl.specialize(hidden_input.size(0))
+    hl.specialize(hidden_input.size(1))
+    hl.specialize(router_weight.size(0))
+    hl.specialize(router_weight.size(1))
+    hl.specialize(correction_bias.size(0))
+    hl.specialize(w13.size(0))
+    hl.specialize(w13.size(1))
+    hl.specialize(w13.size(2))
+    hl.specialize(w13_scale.size(0))
+    hl.specialize(w13_scale.size(1))
+    hl.specialize(w13_scale.size(2))
+    hl.specialize(w2.size(0))
+    hl.specialize(w2.size(1))
+    hl.specialize(w2.size(2))
+    hl.specialize(w2_scale.size(0))
+    hl.specialize(w2_scale.size(1))
+    hl.specialize(w2_scale.size(2))
+    hl.specialize(shared_w13.size(0))
+    hl.specialize(shared_w13.size(1))
+    hl.specialize(shared_w13_scale.size(0))
+    hl.specialize(shared_w13_scale.size(1))
+    hl.specialize(shared_w2.size(0))
+    hl.specialize(shared_w2.size(1))
+    hl.specialize(shared_w2_scale.size(0))
+    hl.specialize(shared_w2_scale.size(1))
+    hl.specialize(alpha1.size(0))
+    hl.specialize(alpha2.size(0))
+    hl.specialize(shared_alpha1.size(0))
+    hl.specialize(shared_alpha2.size(0))
+    hl.specialize(input_global_scale.size(0))
+    hl.specialize(activation_global_scale.size(0))
+
+    hl.specialize(hidden_input.stride(0))
+    hl.specialize(hidden_input.stride(1))
+    hl.specialize(router_weight.stride(0))
+    hl.specialize(router_weight.stride(1))
+    hl.specialize(correction_bias.stride(0))
+    hl.specialize(w13.stride(0))
+    hl.specialize(w13.stride(1))
+    hl.specialize(w13.stride(2))
+    hl.specialize(w13_scale.stride(0))
+    hl.specialize(w13_scale.stride(1))
+    hl.specialize(w13_scale.stride(2))
+    hl.specialize(w2.stride(0))
+    hl.specialize(w2.stride(1))
+    hl.specialize(w2.stride(2))
+    hl.specialize(w2_scale.stride(0))
+    hl.specialize(w2_scale.stride(1))
+    hl.specialize(w2_scale.stride(2))
+    hl.specialize(shared_w13.stride(0))
+    hl.specialize(shared_w13.stride(1))
+    hl.specialize(shared_w13_scale.stride(0))
+    hl.specialize(shared_w13_scale.stride(1))
+    hl.specialize(shared_w2.stride(0))
+    hl.specialize(shared_w2.stride(1))
+    hl.specialize(shared_w2_scale.stride(0))
+    hl.specialize(shared_w2_scale.stride(1))
+    hl.specialize(alpha1.stride(0))
+    hl.specialize(alpha2.stride(0))
+    hl.specialize(shared_alpha1.stride(0))
+    hl.specialize(shared_alpha2.stride(0))
+    hl.specialize(input_global_scale.stride(0))
+    hl.specialize(activation_global_scale.stride(0))
+
     rows, hidden_size = hidden_input.shape
     experts, router_hidden = router_weight.shape
     assert hidden_size == router_hidden
