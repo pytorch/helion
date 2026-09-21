@@ -1492,6 +1492,14 @@ class GraphInterpreter(LoweringContext, Interpreter):
 
         return tuple(final_outputs)
 
+    def _record_final_codegen_result(self, node: Node, result: object) -> None:
+        """Expose normalized results to late CuTe rewrites without changing FX metadata."""
+
+        from .generate_ast import GenerateAST
+
+        if isinstance(self.cg, GenerateAST) and self.cg._track_statement_owners:
+            self.cg.record_codegen_result(node, result)
+
     def run_node(self, n: Node) -> object:
         if n.op == "call_function":
             with (
@@ -1531,11 +1539,15 @@ class GraphInterpreter(LoweringContext, Interpreter):
                             user for user in n.users if user.target == getitem
                         ]
                         if len(getitem_users) > 0:
-                            return self._collect_multi_outputs(n, result)
+                            result = self._collect_multi_outputs(n, result)
+                            self._record_final_codegen_result(n, result)
+                            return result
 
                     if result is None:
+                        self._record_final_codegen_result(n, None)
                         return None
                     if not isinstance(result, ast.AST):
+                        self._record_final_codegen_result(n, result)
                         return result
                     assert isinstance(result, ast.expr)
                     if len(n.users) > 0:
@@ -1563,9 +1575,11 @@ class GraphInterpreter(LoweringContext, Interpreter):
                                 self.cg.device_function.expr_to_var_info[expr] = (
                                     VarInfo(repr(result.value), n)
                                 )
+                        self._record_final_codegen_result(n, result)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
                         self.cg.add_statement(create(ast.Expr, value=result))
+                    self._record_final_codegen_result(n, None)
                     return None
                 except exc.Base:
                     raise
