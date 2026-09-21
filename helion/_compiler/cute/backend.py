@@ -32,6 +32,7 @@ from ..backend import _largest_divisor_at_most
 from ..backend import _loop_contains_matmul
 from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
+from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
@@ -961,9 +962,12 @@ class CuteBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
+        from ..device_ir import RootGraphInfo
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
+        from .direct_affine_candidate import discover_direct_affine_candidates
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .layout_propagation import plan_layouts
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
@@ -972,6 +976,36 @@ class CuteBackend(Backend):
         )
         from .view_subtile import annotate_view_subtiles
 
+        device_function = DeviceFunction.current()
+        direct_affine_requested = (
+            config.cute_affine_scan_schedule != DIRECT_AFFINE_ORDINARY_SCHEDULE
+        )
+        if direct_affine_requested:
+            direct_affine_candidates = discover_direct_affine_candidates(graphs)
+            device_function.cute_state.direct_affine_candidates = (
+                direct_affine_candidates
+            )
+            if not CompileEnvironment.current().settings.fast_math:
+                raise exc.BackendUnsupported(
+                    "cute", "direct affine scan requires fast_math=True"
+                )
+            root_graphs = tuple(
+                graph for graph in graphs if isinstance(graph, RootGraphInfo)
+            )
+            if (
+                len(direct_affine_candidates) != 1
+                or len(root_graphs) != 1
+                or direct_affine_candidates[0].graph_id != root_graphs[0].graph_id
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "direct affine scan requires one compatible single-root region",
+                )
+            annotate_view_subtiles(graphs, config)
+            plan_layouts(graphs, config, tile_strategy)
+            return
+
+        device_function.cute_state.direct_affine_candidates = ()
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
@@ -987,8 +1021,9 @@ class CuteBackend(Backend):
         )
         if split_t1_plan is not None:
             return
+
         plan_fixed_token_rank1_recurrence(graphs, tile_strategy)
-        if DeviceFunction.current().cute_state.fixed_token_rank1_plan is not None:
+        if device_function.cute_state.fixed_token_rank1_plan is not None:
             return
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
@@ -1005,6 +1040,7 @@ class CuteBackend(Backend):
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
+            or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
@@ -1904,6 +1940,7 @@ class CuteBackend(Backend):
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
+        from .thread_budget import check_thread_limit
 
         device_function = DeviceFunction.current()
         codegen = device_function.codegen
@@ -1977,6 +2014,12 @@ class CuteBackend(Backend):
                     f"cute_compile_options={' '.join(compile_options)!r}"
                 )
             return launcher_args
+
+        direct_affine_plan = device_function.cute_state.direct_affine_plan
+        if direct_affine_plan is not None:
+            x, y, z = direct_affine_plan.cta_shape
+            check_thread_limit(x * y * z, context=str(direct_affine_plan.cta_shape))
+            return launcher_args_with_compile_options(f"block=({x}, {y}, {z})")
 
         # The single-token rank-1 path owns the complete physical body.  The
         # original B1 schedule uses 256 threads while its batched schedule uses

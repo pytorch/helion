@@ -10,6 +10,7 @@ from typing import cast
 import pytest
 import torch
 
+from helion import exc
 from helion._compiler.ast_extension import create
 from helion._compiler.generate_ast import GenerateAST
 from helion._compiler.inductor_lowering import GraphInterpreter
@@ -197,3 +198,145 @@ def test_owned_span_replacement_rolls_back_thread_dimensions_on_error() -> None:
     assert body == [source]
     assert codegen.referenced_thread_block_dims == [1, 1, 1]
     assert codegen.statements_owned_by_node(node) == ((body, source),)
+
+
+def test_direct_affine_root_commit_installs_all_integration_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from helion._compiler.cute import direct_affine_lowering
+    from helion._compiler.cute import direct_affine_replay
+
+    codegen = _codegen()
+    root = SimpleNamespace(graph_id=7)
+    candidate = SimpleNamespace(graph_id=7)
+    plan = object()
+    module_import = ast.parse("import example_helper as helper").body[0]
+    replacement = ast.parse("result = helper.run()").body[0]
+    replay = object()
+    resolved = SimpleNamespace(
+        replay=replay,
+        plan=plan,
+        emission=SimpleNamespace(
+            module_statements=(module_import, module_import),
+            replacement_statements=(replacement,),
+        ),
+    )
+    codegen.current_root_graph_info = cast("Any", root)
+    codegen.module_statements = []
+    codegen.device_function.config = SimpleNamespace(
+        cute_affine_scan_schedule="direct_m16n8_v1"
+    )
+    codegen.device_function.cute_state.direct_affine_candidates = (candidate,)
+    codegen.device_function.cute_state.direct_affine_plan = None
+    codegen.device_function.has_barrier = False
+    original = create(ast.Pass)
+    body: list[ast.AST] = [original]
+
+    monkeypatch.setattr(
+        direct_affine_lowering,
+        "resolve_direct_affine_lowering",
+        lambda *args, **kwargs: resolved,
+    )
+
+    def replace(*args: object) -> bool:
+        body[:] = [replacement]
+        return True
+
+    monkeypatch.setattr(direct_affine_replay, "replace_direct_affine_replay", replace)
+
+    assert codegen._try_lower_direct_affine_root(cast("Any", object()), body)
+    assert body == [replacement]
+    assert codegen.module_statements == [module_import]
+    assert codegen.device_function.cute_state.direct_affine_plan is plan
+    assert codegen.device_function.has_barrier is True
+
+
+def test_direct_affine_root_rejects_failed_late_validation_without_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from helion._compiler.cute import direct_affine_lowering
+
+    codegen = _codegen()
+    root = SimpleNamespace(graph_id=7)
+    codegen.current_root_graph_info = cast("Any", root)
+    codegen.module_statements = []
+    codegen.device_function.config = SimpleNamespace(
+        cute_affine_scan_schedule="direct_m16n8_v1"
+    )
+    codegen.device_function.cute_state.direct_affine_candidates = (
+        SimpleNamespace(graph_id=7),
+    )
+    codegen.device_function.cute_state.direct_affine_plan = None
+    codegen.device_function.has_barrier = False
+    original = create(ast.Pass)
+    body: list[ast.AST] = [original]
+
+    monkeypatch.setattr(
+        direct_affine_lowering,
+        "resolve_direct_affine_lowering",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(exc.BackendUnsupported, match="failed late validation"):
+        codegen._try_lower_direct_affine_root(cast("Any", object()), body)
+
+    assert body == [original]
+    assert codegen.module_statements == []
+    assert codegen.device_function.cute_state.direct_affine_plan is None
+    assert codegen.device_function.has_barrier is False
+
+
+def test_direct_affine_root_rolls_back_splice_if_metadata_install_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from helion._compiler.cute import direct_affine_lowering
+    from helion._compiler.cute import direct_affine_replay
+
+    class FailingModuleStatements(list[ast.stmt]):
+        def extend(self, values: object) -> None:
+            super().extend(cast("Any", values))
+            raise RuntimeError("injected module install failure")
+
+    codegen = _codegen()
+    root = SimpleNamespace(graph_id=7)
+    candidate = SimpleNamespace(graph_id=7)
+    plan = object()
+    source = create(ast.Pass)
+    replacement = ast.parse("result = helper.run()").body[0]
+    resolved = SimpleNamespace(
+        replay=object(),
+        plan=plan,
+        emission=SimpleNamespace(
+            module_statements=(ast.parse("import example_helper as helper").body[0],),
+            replacement_statements=(replacement,),
+        ),
+    )
+    codegen.current_root_graph_info = cast("Any", root)
+    codegen.module_statements = FailingModuleStatements()
+    codegen.device_function.config = SimpleNamespace(
+        cute_affine_scan_schedule="direct_m16n8_v1"
+    )
+    codegen.device_function.cute_state.direct_affine_candidates = (candidate,)
+    codegen.device_function.cute_state.direct_affine_plan = None
+    codegen.device_function.has_barrier = False
+    body: list[ast.AST] = [source]
+
+    monkeypatch.setattr(
+        direct_affine_lowering,
+        "resolve_direct_affine_lowering",
+        lambda *args, **kwargs: resolved,
+    )
+
+    def replace(*args: object) -> bool:
+        body[:] = [replacement]
+        return True
+
+    monkeypatch.setattr(direct_affine_replay, "replace_direct_affine_replay", replace)
+
+    with pytest.raises(RuntimeError, match="injected module install failure"):
+        codegen._try_lower_direct_affine_root(cast("Any", object()), body)
+
+    assert body == [source]
+    assert codegen.module_statements == []
+    assert codegen.device_function.cute_state.direct_affine_plan is None
+    assert codegen.device_function.has_barrier is False

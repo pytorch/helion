@@ -162,6 +162,9 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "cute_async_store_policy": st.sampled_from(["default", "l2_evict_last"]),
             "cute_bf16x2_recurrence": st.booleans(),
             "cute_proven_bounds": st.booleans(),
+            "cute_affine_scan_schedule": st.sampled_from(
+                ["ordinary", "direct_m16n8_v1", "direct_m16n16_v1"]
+            ),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
@@ -216,6 +219,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "cute_async_store_policy",
                     "cute_bf16x2_recurrence",
                     "cute_proven_bounds",
+                    "cute_affine_scan_schedule",
                     "num_warps",
                     "num_stages",
                     "pid_type",
@@ -421,6 +425,7 @@ class TestConfigAPI(TestCase):
             "cute_async_store_policy",
             "cute_bf16x2_recurrence",
             "cute_proven_bounds",
+            "cute_affine_scan_schedule",
             "num_warps",
             "num_stages",
             "pid_type",

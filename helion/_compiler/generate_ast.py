@@ -26,6 +26,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .helper_function import CodegenInterface
@@ -456,6 +457,94 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         self.device_function.cute_state.chunk_recurrence_plan = None
         raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
+
+    def _try_lower_direct_affine_root(
+        self,
+        grid: DeviceGridState,
+        root_body: list[ast.AST],
+    ) -> bool:
+        """Replace one proven affine-scan root after ordinary CuTe lowering."""
+
+        if (
+            self.device_function.config.cute_affine_scan_schedule
+            == DIRECT_AFFINE_ORDINARY_SCHEDULE
+        ):
+            return False
+        root = self.current_root_graph_info
+        if root is None:
+            raise exc.BackendUnsupported(
+                "cute", "direct affine scan has no active root"
+            )
+        candidates = tuple(
+            candidate
+            for candidate in self.device_function.cute_state.direct_affine_candidates
+            if candidate.graph_id == root.graph_id
+        )
+        if len(candidates) != 1:
+            raise exc.BackendUnsupported(
+                "cute", "direct affine scan requires one candidate in its root"
+            )
+
+        from .cute.direct_affine_lowering import resolve_direct_affine_lowering
+        from .cute.direct_affine_replay import replace_direct_affine_replay
+
+        resolved = resolve_direct_affine_lowering(
+            candidates[0],
+            root,
+            self,
+            grid,
+            root_body,
+            name_prefix=self.device_function.new_var("_helion_direct_affine"),
+        )
+        if resolved is None:
+            raise exc.BackendUnsupported(
+                "cute", "direct affine scan failed late validation"
+            )
+
+        existing_module_statements = {
+            ast.dump(statement, include_attributes=False)
+            for statement in self.module_statements
+        }
+        module_additions: list[ast.stmt] = []
+        for statement in resolved.emission.module_statements:
+            key = ast.dump(statement, include_attributes=False)
+            if key not in existing_module_statements:
+                module_additions.append(statement)
+                existing_module_statements.add(key)
+
+        body_snapshot = tuple(root_body)
+        owner_snapshot = {
+            owner: list(entries)
+            for owner, entries in self._statements_by_owner_node_id.items()
+        }
+        thread_dims_snapshot = tuple(self.referenced_thread_block_dims)
+        module_snapshot = tuple(self.module_statements)
+        previous_plan = self.device_function.cute_state.direct_affine_plan
+        previous_has_barrier = self.device_function.has_barrier
+        try:
+            if not replace_direct_affine_replay(
+                resolved.replay,
+                root,
+                self,
+                root_body,
+                resolved.emission.replacement_statements,
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "direct affine scan failed late validation"
+                )
+            self.module_statements.extend(module_additions)
+            self.device_function.cute_state.direct_affine_plan = resolved.plan
+            self.device_function.has_barrier = True
+        except Exception:
+            root_body[:] = body_snapshot
+            self._statements_by_owner_node_id.clear()
+            self._statements_by_owner_node_id.update(owner_snapshot)
+            self.referenced_thread_block_dims[:] = thread_dims_snapshot
+            self.module_statements[:] = module_snapshot
+            self.device_function.cute_state.direct_affine_plan = previous_plan
+            self.device_function.has_barrier = previous_has_barrier
+            raise
+        return True
 
     def append_statement(
         self,
@@ -1331,7 +1420,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             wrapped_body: list[ast.AST] = []
                             with self.set_statements(wrapped_body):
                                 codegen_call_with_graph(self, root, [])
-                            if grid_state.has_lane_loops():
+                            if self._try_lower_direct_affine_root(
+                                grid_state, wrapped_body
+                            ):
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_prefix
+                                )
+                                self.statements_stack[-1].extend(wrapped_body)
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
+                            elif grid_state.has_lane_loops():
                                 self.statements_stack[-1].extend(
                                     grid_state.outer_prefix
                                 )

@@ -59,6 +59,10 @@ DEFAULT_CASES = (
     "t5-precomputed-n32-h16-hv32",
 )
 PINNED_FLASHINFER_SHA = "f67bc2ed555c1ad6a764ad68f7aa9622178e9eae"
+_DIRECT_AFFINE_CODEGEN_PROFILES = {
+    "direct_m16n8_v1": ("m16n8", "interleaved", "async", "state_first"),
+    "direct_m16n16_v1": ("m16n16", "role_major", "async", "state_first"),
+}
 
 
 @dataclass(frozen=True)
@@ -759,6 +763,43 @@ def _helion_codegen_expectation(
             (),
             (),
         )
+    if config is not None:
+        schedule_name = config.get("cute_affine_scan_schedule", "ordinary")
+        if not isinstance(schedule_name, str):
+            raise ValueError(
+                f"unexpected resolved direct-affine schedule: {schedule_name!r}"
+            )
+        if schedule_name != "ordinary":
+            try:
+                mma, coefficient_layout, state_ingress, phase_order = (
+                    _DIRECT_AFFINE_CODEGEN_PROFILES[schedule_name]
+                )
+            except KeyError as error:
+                raise ValueError(
+                    f"unexpected resolved direct-affine schedule: {schedule_name!r}"
+                ) from error
+            ingress_helper = (
+                "stage_state_tile8x8_async_bf16"
+                if state_ingress == "async"
+                else "direct_state_index"
+            )
+            plan_kind = (
+                f"direct-affine-{mma}-{coefficient_layout}-{state_ingress}-"
+                f"{phase_order}"
+            )
+            alias = r"_helion_direct_affine(?:_\d+)?_mma"
+            return (
+                plan_kind,
+                (),
+                (
+                    rf"import helion\._compiler\.cute\.short_affine_scan_mma as {alias}",
+                    rf".*{alias}\.{ingress_helper}\(.*",
+                    rf".*{alias}\.precompute_affine_from_buffers_bf16\(.*",
+                    rf".*{alias}\.project_retain_affine_{mma}_bf16\(.*",
+                    rf".*{alias}\.consume_affine_steps\(.*",
+                ),
+                (),
+            )
     fixed_token_expected = (
         case.use_gate_in_kernel
         and case.num_heads == case.num_value_heads
@@ -786,7 +827,10 @@ def _helion_codegen_expectation(
         "ordinary-cute",
         (),
         (),
-        (r".*fixed_rank1_codegen_abi_version.*",),
+        (
+            r".*fixed_rank1_codegen_abi_version.*",
+            r".*short_affine_scan_mma.*",
+        ),
     )
 
 
