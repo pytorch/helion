@@ -195,6 +195,110 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn("_helion_tensor_descriptor(", dict_unaligned_code)
         self.assertEqual(len(static_dict_copy._bound_kernels), 2)
 
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_unfixed_cuda_descriptor_extent_cache_caps_at_tma_limit(self):
+        @helion.kernel(
+            static_shapes=False,
+            disable_autotuner_heuristics=True,
+        )
+        def copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+            return out
+
+        inputs = [torch.randn([size, 64], device=DEVICE) for size in (512, 1024, 2048)]
+        first = copy.bind((inputs[0],))
+        for value in inputs[1:]:
+            self.assertIs(first, copy.bind((value,)))
+
+        # An empty explicit config list is still an unknown autotune space, so
+        # descriptor guards remain active below the CUDA extent ceiling.
+        smaller = torch.randn([128, 64], device=DEVICE)
+        self.assertIsNot(first, copy.bind((smaller,)))
+        self.assertEqual(len(copy._bound_kernels), 2)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_multiple_pointer_configs_skip_descriptor_guards(self):
+        @helion.kernel(
+            static_shapes=False,
+            disable_autotuner_heuristics=True,
+            configs=[
+                helion.Config(block_sizes=[16, 16], indexing="pointer"),
+                helion.Config(block_sizes=[32, 32], indexing="pointer"),
+            ],
+        )
+        def copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+            return out
+
+        aligned = torch.randn([512, 64], device=DEVICE)
+        storage = torch.randn(512 * 64 + 1, device=DEVICE)
+        unaligned = storage[1:].view(512, 64)
+        larger = torch.randn([1024, 64], device=DEVICE)
+        first = copy.bind((aligned,))
+        self.assertIs(first, copy.bind((unaligned,)))
+        self.assertIs(first, copy.bind((larger,)))
+        self.assertEqual(len(copy._bound_kernels), 1)
+
+        @helion.kernel(
+            static_shapes=False,
+            disable_autotuner_heuristics=True,
+            force_autotune=True,
+            configs=[
+                helion.Config(block_sizes=[16, 16], indexing="pointer"),
+                helion.Config(block_sizes=[32, 32], indexing="pointer"),
+            ],
+        )
+        def forced_copy(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile]
+            return out
+
+        # force_autotune can search outside the decorator configs, so those
+        # pointer-only entries cannot suppress descriptor safety guards.
+        forced_aligned = forced_copy.bind((aligned,))
+        self.assertIsNot(forced_aligned, forced_copy.bind((unaligned,)))
+        self.assertEqual(len(forced_copy._bound_kernels), 2)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks bound kernel specialization cache")
+    def test_multiple_configs_keep_atomic_descriptor_guards(self):
+        @helion.kernel(
+            static_shapes=False,
+            disable_autotuner_heuristics=True,
+            configs=[
+                helion.Config(
+                    block_sizes=[16, 16],
+                    indexing="pointer",
+                    atomic_indexing="pointer",
+                ),
+                helion.Config(
+                    block_sizes=[32, 32],
+                    indexing="pointer",
+                    atomic_indexing="tensor_descriptor",
+                ),
+            ],
+        )
+        def atomic_add(x: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+            for tile in hl.tile(x.size()):
+                hl.atomic_add(x, tile, value[tile])
+            return x
+
+        aligned = torch.zeros([512, 64], device=DEVICE)
+        storage = torch.zeros(512 * 64 + 1, device=DEVICE)
+        unaligned = storage[1:].view(512, 64)
+        value = torch.ones_like(aligned)
+
+        first = atomic_add.bind((aligned, value))
+        self.assertIsNot(first, atomic_add.bind((unaligned, value)))
+        self.assertEqual(len(atomic_add._bound_kernels), 2)
+
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     @skipIfRefEager("Test checks bound kernel specialization cache")
     def test_scaled_descriptor_extent_cache_classes(self):

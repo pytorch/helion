@@ -135,26 +135,28 @@ def _is_supported_tensor_input_source(source: Source) -> bool:
     return False
 
 
+def tensor_descriptor_runtime_alignment_signature(
+    value: object,
+) -> tuple[bool, bool]:
+    """Return the runtime alignment predicates used by descriptor codegen."""
+    if not isinstance(value, torch.Tensor) or type(value).__name__ in (
+        "FakeTensor",
+        "FunctionalTensor",
+    ):
+        return False, False
+    offset = value.storage_offset()
+    return value.data_ptr() % 16 == 0, isinstance(offset, int) and offset == 0
+
+
 def _concrete_tensor_base_is_aligned(value: object) -> bool:
-    return (
-        isinstance(value, torch.Tensor)
-        and not isinstance(value, FakeTensor)
-        and type(value).__name__ != "FunctionalTensor"
-        and value.data_ptr() % 16 == 0
-    )
+    return tensor_descriptor_runtime_alignment_signature(value)[0]
 
 
 def _concrete_tensor_satisfies_alignment_guard(
     value: object, requires_zero_storage_offset: bool
 ) -> bool:
-    return _concrete_tensor_base_is_aligned(value) and (
-        not requires_zero_storage_offset
-        or (
-            isinstance(value, torch.Tensor)
-            and isinstance((offset := value.storage_offset()), int)
-            and offset == 0
-        )
-    )
+    aligned, zero_storage_offset = tensor_descriptor_runtime_alignment_signature(value)
+    return aligned and (not requires_zero_storage_offset or zero_storage_offset)
 
 
 def _replay_tensor_input_source(

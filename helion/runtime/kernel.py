@@ -89,6 +89,7 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
@@ -2980,32 +2981,67 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 _PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
         implicit_config = self._fixed_config_for_td_layout_guards()
-        descriptor_extent_cap: int | None = None
+        candidate_configs: tuple[Config, ...] | None
         if implicit_config is not None:
+            candidate_configs = (implicit_config,)
+        elif not self.settings.force_autotune and len(self.kernel.configs) > 1:
+            candidate_configs = tuple(
+                self._normalized_config_copy(config) for config in self.kernel.configs
+            )
+        else:
+            candidate_configs = None
+
+        def guard_is_active(guard: _TensorDescriptorOperationGuard) -> bool:
+            return candidate_configs is None or any(
+                _td_guard_active_for_config(guard, config)
+                for config in candidate_configs
+            )
+
+        def descriptor_extent_cap(
+            guard: TensorDescriptorLayoutGuard,
+        ) -> int | None:
+            if guard.has_derived_block_extent:
+                return (
+                    CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    if self.env.device.type == "cuda"
+                    else None
+                )
+            if candidate_configs is None:
+                return (
+                    CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    if self.env.device.type == "cuda"
+                    else None
+                )
+            active_configs = tuple(
+                config
+                for config in candidate_configs
+                if _td_guard_active_for_config(guard, config)
+            )
             with self.env:
-                resolved_block_sizes = tuple(
-                    block_size.from_config(implicit_config)
+                resolved_block_sizes = (
+                    block_size.from_config(config)
+                    for config in active_configs
                     for block_size in self.env.block_sizes
                 )
-            descriptor_extent_cap = max(
-                (
-                    value
-                    for value in resolved_block_sizes
-                    if type(value) is int and value > 0 and value & (value - 1) == 0
-                ),
-                default=None,
-            )
-            if descriptor_extent_cap is not None and self.env.device.type == "cuda":
-                descriptor_extent_cap = min(
-                    descriptor_extent_cap, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                cap = max(
+                    (
+                        value
+                        for value in resolved_block_sizes
+                        if type(value) is int and value > 0 and value & (value - 1) == 0
+                    ),
+                    default=None,
                 )
+            if self.env.device.type != "cuda":
+                return cap
+            if cap is None:
+                return CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+            return min(cap, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE)
+
         for source, guard in sorted(
             self.env.tensor_descriptor_layout_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if implicit_config is not None and not _td_guard_active_for_config(
-                guard, implicit_config
-            ):
+            if not guard_is_active(guard):
                 continue
             extract_tensor = make_extractor(source)
 
@@ -3016,15 +3052,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
-                _extent_cap: int | None = (
-                    (
-                        CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
-                        if self.env.device.type == "cuda"
-                        else None
-                    )
-                    if guard.has_derived_block_extent
-                    else descriptor_extent_cap
-                ),
+                _extent_cap: int | None = descriptor_extent_cap(guard),
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
@@ -3050,9 +3078,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self.env.tensor_descriptor_alignment_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if implicit_config is not None and not _td_guard_active_for_config(
-                guard, implicit_config
-            ):
+            if not guard_is_active(guard):
                 continue
             extract_tensor = make_extractor(source)
 
