@@ -372,6 +372,10 @@ class TestConfigAPI(TestCase):
         with (
             patch("helion.autotuner.config_spec.supports_maxnreg", return_value=True),
             patch("helion.autotuner.config_spec._regs_per_block", return_value=65536),
+            patch(
+                "helion.autotuner.config_spec.warps_to_threads",
+                side_effect=lambda num_warps: num_warps * 32,
+            ),
         ):
             spec = ConfigSpec(backend=TritonBackend())
             for value in (1, 80, 100, 256):
