@@ -14,6 +14,8 @@ import torch
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
+from helion._compiler.cute.indexing import is_cute_direct_iota_index
+from helion._compiler.cute.indexing import is_cute_unit_stride_iota_index
 from helion._compiler.cute.layout import LayoutTag
 from helion._compiler.cute.layout import ThreadLayout
 from helion._compiler.cute.layout_propagation import META_KEY
@@ -22,6 +24,34 @@ from helion._testing import DEVICE
 from helion._testing import onlyBackends
 import helion.language as hl
 from helion.language import reduce_ops
+
+
+def test_unit_stride_iota_index_proof() -> None:
+    graph = torch.fx.Graph()
+    iota = graph.call_function(
+        torch.ops.prims.iota.default,
+        args=(32,),
+        kwargs={"start": 0, "step": 1, "dtype": torch.int32, "device": "cpu"},
+    )
+    shifted = graph.call_function(torch.ops.aten.add.Tensor, args=(iota, 4))
+    nonzero_start = graph.call_function(
+        torch.ops.prims.iota.default,
+        args=(32,),
+        kwargs={"start": 4, "step": 1, "dtype": torch.int32, "device": "cpu"},
+    )
+    gathered = graph.call_function(torch.ops.aten.div.Tensor, args=(iota, 4))
+    scaled = graph.call_function(
+        torch.ops.aten.add.Tensor, args=(4, iota), kwargs={"alpha": 2}
+    )
+
+    assert is_cute_direct_iota_index(iota)
+    assert is_cute_unit_stride_iota_index(iota)
+    assert not is_cute_direct_iota_index(shifted)
+    assert is_cute_unit_stride_iota_index(shifted)
+    assert not is_cute_direct_iota_index(nonzero_start)
+    assert is_cute_unit_stride_iota_index(nonzero_start)
+    assert not is_cute_unit_stride_iota_index(gathered)
+    assert not is_cute_unit_stride_iota_index(scaled)
 
 
 @onlyBackends(["cute"])

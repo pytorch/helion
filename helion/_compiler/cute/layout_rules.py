@@ -15,6 +15,7 @@ from ...language import _tracing_ops
 from ...language import memory_ops
 from ...language import reduce_ops
 from ..compile_environment import CompileEnvironment
+from .indexing import is_cute_unit_stride_iota_index
 from .layout import LayoutConstraint
 from .layout import LayoutTag
 from .layout import MatmulAxisModel
@@ -401,17 +402,29 @@ def _layout_from_tensor_strides(
             # whose stride describes the resulting logical tensor.
             if isinstance(k, torch.Tensor):
                 # Tensor-valued indices are gathers. Their physical lane
-                # mapping is owned by the indexing strategy and cannot be
-                # inferred from backing tensor strides alone.
-                return None
-            tile_size = k
-            if isinstance(tile_size, torch.SymInt):
-                block_id = env.get_block_id(tile_size)
+                # mapping is generally owned by the indexing strategy and
+                # cannot be inferred from backing tensor strides alone.  A
+                # direct unit-stride iota (optionally shifted by a scalar) is
+                # the exception: it preserves the source axis's ordering.
+                if not is_cute_unit_stride_iota_index(k_raw):
+                    return None
+                block_id = env.resolve_block_id(k.numel())
                 if block_id is None:
                     return None
                 tile_size = env.block_sizes[block_id].from_config(
                     tile_strategy.strategies[0].fn.config
                 )
+            else:
+                if not isinstance(k, torch.SymInt):
+                    return None
+                block_id = env.get_block_id(k)
+                if block_id is None:
+                    return None
+                tile_size = env.block_sizes[block_id].from_config(
+                    tile_strategy.strategies[0].fn.config
+                )
+            if not isinstance(tile_size, (int, torch.SymInt)):
+                return None
             dim_info.append((tensor_dim, tile_size, strides[tensor_dim]))
         tensor_dim += 1
 
