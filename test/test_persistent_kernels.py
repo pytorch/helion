@@ -1209,6 +1209,23 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 class TestNumSmMultiplier(RefEagerTestBase, TestCase):
     """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
 
+    @skipIfNotCUDA()
+    @skipIfRefEager("Compilation options are not used in ref eager mode")
+    def test_explicit_intermediate_maxnreg(self):
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+        code, result = code_and_output(
+            add_kernel,
+            args,
+            pid_type="persistent_blocked",
+            num_sm_multiplier=3,
+            maxnreg=100,
+        )
+        self.assertIn("maxnreg=100", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_blocked_grid_size(self):
         """Test that num_sm_multiplier affects grid size in blocked persistent kernels."""

@@ -368,6 +368,53 @@ class TestConfigAPI(TestCase):
             [1, 2, 4, 8, 16, 32, 64, 128],
         )
 
+    def test_maxnreg_explicit_values_and_search_space(self) -> None:
+        with (
+            patch("helion.autotuner.config_spec.supports_maxnreg", return_value=True),
+            patch("helion.autotuner.config_spec._regs_per_block", return_value=65536),
+        ):
+            spec = ConfigSpec(backend=TritonBackend())
+            for value in (1, 80, 100, 256):
+                config = helion.Config(pid_type="persistent_blocked", maxnreg=value)
+                spec.normalize(config)
+                self.assertEqual(config.maxnreg, value)
+
+            unlimited = helion.Config.from_dict(
+                {"pid_type": "persistent_blocked", "maxnreg": None}
+            )
+            spec.normalize(unlimited)
+            self.assertIsNone(unlimited.maxnreg)
+
+            for value in (0, 257, 32.0, True):
+                with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                    spec.normalize(
+                        helion.Config.from_dict(
+                            {"pid_type": "persistent_blocked", "maxnreg": value}
+                        )
+                    )
+
+            fragment = spec._flat_fields()["maxnreg"]
+            self.assertIsInstance(fragment, EnumFragment)
+            assert isinstance(fragment, EnumFragment)
+            self.assertEqual(fragment.search_values(), [None, 32, 64, 128, 256])
+
+            repaired = helion.Config(
+                pid_type="persistent_blocked", num_warps=32, maxnreg=100
+            )
+            spec.normalize(repaired, _fix_invalid=True)
+            self.assertEqual(repaired.maxnreg, 64)
+
+            round_trip = helion.Config.from_json(
+                helion.Config(
+                    pid_type="persistent_blocked",
+                    num_sm_multiplier=3,
+                    maxnreg=100,
+                ).to_json()
+            )
+            spec.normalize(round_trip)
+            self.assertEqual(round_trip.num_sm_multiplier, 3)
+            self.assertEqual(round_trip.maxnreg, 100)
+
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
 

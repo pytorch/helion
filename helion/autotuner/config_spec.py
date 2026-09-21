@@ -946,9 +946,14 @@ EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
 EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
 EPILOGUE_SUBTILE_MIN_K_HINT = 1024
 EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
-# maxnreg values: None means no limit, otherwise limit to this many registers per thread
-# Lower values allow higher occupancy but may hurt performance for register-heavy kernels
-VALID_MAXNREG = (None, 32, 64, 128, 256)
+# None means no limit. The autotuner retains this deliberately small search
+# domain, while explicit configs may select any positive integer up to the
+# existing supported upper bound.
+AUTOTUNED_MAXNREG = (None, 32, 64, 128, 256)
+# Backward-compatible name for callers that inspect the autotuning surface.
+VALID_MAXNREG = AUTOTUNED_MAXNREG
+MIN_MAXNREG = 1
+MAX_MAXNREG = 256
 DEFAULT_MAXNREG = None
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
@@ -3409,12 +3414,15 @@ class ConfigSpec:
         # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             if "maxnreg" in config:
-                if config["maxnreg"] not in VALID_MAXNREG:
+                value = config["maxnreg"]
+                if value is not None and (
+                    type(value) is not int or value < MIN_MAXNREG or value > MAX_MAXNREG
+                ):
                     raise InvalidConfig(
-                        f"Invalid value for 'maxnreg': {config['maxnreg']!r} must be one of {list(VALID_MAXNREG)!r}"
+                        f"Invalid value for 'maxnreg': {value!r} must be None or an integer between {MIN_MAXNREG} and {MAX_MAXNREG}"
                     )
             else:
-                config["maxnreg"] = VALID_MAXNREG[0]
+                config["maxnreg"] = DEFAULT_MAXNREG
 
             # Cap maxnreg so that maxnreg * threads_per_block doesn't exceed
             # the register file.  On sm100+ ptxas honours .maxnreg over
@@ -3427,7 +3435,7 @@ class ConfigSpec:
                 if maxnreg > limit:
                     if _fix_invalid:
                         valid = [
-                            v for v in VALID_MAXNREG if v is not None and v <= limit
+                            v for v in AUTOTUNED_MAXNREG if v is not None and v <= limit
                         ]
                         if valid:
                             config["maxnreg"] = max(valid)
@@ -4162,7 +4170,7 @@ class ConfigSpec:
                 fields["pallas_fold_dot_lhs_cast"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
-            fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
+            fields["maxnreg"] = EnumFragment(AUTOTUNED_MAXNREG)
         if self.epilogue_subtile_autotune_choices is not None:
             fields["epilogue_subtile"] = EnumFragment(
                 choices=self.epilogue_subtile_autotune_choices

@@ -27,8 +27,8 @@ CuteAffineScanScheduleLiteral = Literal[
     "direct_m16n8_v1",
     "direct_m16n16_v1",
 ]
-NumSmMultiplier = int
-MaxnregLiteral = Literal[32, 64, 128, 256] | None
+NumSmMultiplierLiteral = int
+MaxnregLiteral = int | None
 
 
 class Config(Mapping[str, object]):
@@ -68,8 +68,8 @@ class Config(Mapping[str, object]):
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
         cross_loop_pipeline: CrossLoopPipelineLiteral | None = None,
-        num_sm_multiplier: NumSmMultiplier | None = None,
-        maxnreg: MaxnregLiteral | None = None,
+        num_sm_multiplier: NumSmMultiplierLiteral | None = None,
+        maxnreg: MaxnregLiteral = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
@@ -129,9 +129,12 @@ class Config(Mapping[str, object]):
                 in persistent kernels. The autotuner searches powers of two, but
                 explicit configurations may use intermediate values.
                 Controls multi-occupancy by launching N * num_sms thread blocks instead of just num_sms.
-            maxnreg: Maximum number of registers per thread (None, 32, 64, 128, 256).
-                Lower values allow higher occupancy but may hurt performance. Used with persistent kernels
-                to ensure multi-occupancy can be achieved.
+            maxnreg: None or a positive integer maximum number of registers per
+                thread (1--256). The autotuner searches None, 32, 64, 128, and
+                256, but explicit configurations may use intermediate values.
+                Lower values allow higher occupancy but may hurt performance.
+                Used with persistent kernels to ensure multi-occupancy can be
+                achieved.
             indexing: Indexing strategy for load and store operations. Can be:
                 - A single strategy string (all loads/stores use this strategy):
                   indexing="block_ptr"  # backward compatible

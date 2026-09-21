@@ -1314,6 +1314,32 @@ class TestConfigFragmentCardinality(TestCase):
             ListOf(EnumFragment(("a", "b", "c")), length=4).search_values()
         )
 
+    def test_power_of_two_fragment_off_grid_seed(self) -> None:
+        fragment = PowerOfTwoFragment(1, 128)
+
+        # Explicit configs may start off the autotuned power-of-two surface.
+        # Pattern and differential search must re-enter that surface without
+        # changing any of its generated candidates.
+        self.assertEqual(fragment.pattern_neighbors(3), [2, 4])
+        self.assertEqual(fragment.pattern_neighbors(5), [4, 8])
+        self.assertEqual(fragment.pattern_neighbors(5, radius=2), [2, 4, 8, 16])
+        self.assertEqual(fragment.differential_mutation(3, 1, 2), 2)
+        self.assertEqual(fragment.differential_mutation(3, 2, 1), 4)
+        self.assertEqual(fragment.differential_mutation(3, 1, 1), 2)
+        self.assertEqual(fragment.differential_mutation(6, 1, 1), 4)
+
+        clamped = PowerOfTwoFragment(1, 32)
+        self.assertEqual(clamped.pattern_neighbors(48), [32])
+        self.assertEqual(clamped.pattern_neighbors(64), [32])
+        self.assertEqual(clamped.differential_mutation(48, 1, 2), 32)
+        self.assertEqual(clamped.differential_mutation(64, 2, 1), 32)
+
+        # Existing on-grid behavior is unchanged.
+        self.assertEqual(fragment.pattern_neighbors(4), [2, 8])
+        self.assertEqual(fragment.differential_mutation(4, 1, 2), 2)
+        self.assertEqual(fragment.differential_mutation(4, 2, 1), 8)
+        self.assertEqual(fragment.differential_mutation(4, 1, 1), 4)
+
     def test_enum_fragment_coverage_choices(self):
         fragment = EnumFragment(
             ("a", "b", "c"),
