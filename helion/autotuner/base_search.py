@@ -2884,6 +2884,13 @@ class PopulationBasedSearch(BaseSearch):
             return best
         best_member = candidates[best_slot]
 
+        # Every delta is measured against a fresh run of ``best``. Sampling
+        # noise can make the incumbent's own pair nonzero, so the smallest
+        # positive delta may belong to another candidate. Keep the incumbent
+        # unless at least one paired measurement is actually faster.
+        if best_member is not best and delta_by_slot[best_slot] >= 0:
+            return best
+
         if best_member is not best:
             self.log(
                 f"Final-pick re-picked {best_member.config} (delta "

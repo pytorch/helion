@@ -3649,6 +3649,34 @@ class TestPallas(TestCase):
             final = search.run_final_pick_verification(m["slow"], top_k=5)
         self.assertEqual(list(final.config["block_sizes"]), [1024, 1024, 1024])
 
+    def test_pallas_autotuner_final_pick_requires_device_time_win(self) -> None:
+        """Positive paired deltas cannot displace the current best config."""
+        from unittest.mock import patch
+
+        search, members = self._make_device_micros_search(
+            [
+                ("best", [256], 0.100, 10.0),
+                ("other", [512], 0.110, 9.0),
+            ]
+        )
+
+        def all_slower(
+            _fns: list[Callable[..., object]],
+            _reference_fn: Callable[..., object],
+            *,
+            desc: str | None = None,
+        ) -> list[tuple[float, float]]:
+            return [(10.2, 0.2), (10.1, 0.1)]
+
+        with patch.object(
+            search.config_spec.backend,
+            "get_paired_device_micros_bench",
+            return_value=all_slower,
+        ):
+            final = search.run_final_pick_verification(members["best"], top_k=5)
+
+        self.assertIs(final, members["best"])
+
     @skipIfPallasInterpret(
         "device-µs ranking needs a real TPU; CPU-interpret has no /device:TPU events"
     )
