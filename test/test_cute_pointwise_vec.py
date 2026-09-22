@@ -65,6 +65,16 @@ def _col0_gather(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute", static_shapes=True)
+def _repeated_scale(
+    x: torch.Tensor, scale: torch.Tensor, repeat: hl.constexpr
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * scale[tile.index // repeat]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
 def _tanh1d(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -226,6 +236,25 @@ class TestCutePointwiseVec(TestCase):
         )
         self.assertNotIn("ir.VectorType.get([8]", code)
         torch.testing.assert_close(out, x[:, 0] * 2.0)
+
+    def test_gather_index_extent_does_not_imply_contiguous_loads(self) -> None:
+        """Divided lane indices must retain repeated addresses when vectorizing."""
+        for dtype, vector_width in ((torch.float32, 4), (torch.bfloat16, 8)):
+            for repeat in (1, 64):
+                with self.subTest(dtype=dtype, repeat=repeat):
+                    x = torch.linspace(0.5, 1.5, 1024, device=DEVICE, dtype=dtype)
+                    # Keep all possible wrong lane-base reads in bounds, with
+                    # distinct values so a contiguous-load rewrite is visible.
+                    scale = torch.arange(1024, device=DEVICE).to(dtype)
+                    _, out = code_and_output(
+                        _repeated_scale,
+                        (x, scale, repeat),
+                        block_sizes=[1024],
+                        num_threads=[128],
+                        cute_vector_widths=[vector_width],
+                    )
+                    expected = x * scale[torch.arange(1024, device=DEVICE) // repeat]
+                    torch.testing.assert_close(out, expected)
 
     def test_flat_multi_vec_full_cover(self) -> None:
         """flatten_loops + vec on a 2D kernel: full-cover contiguous tensors
