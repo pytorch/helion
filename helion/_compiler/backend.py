@@ -274,6 +274,12 @@ class Backend(abc.ABC):
         """
         return {}
 
+    def autotune_initial_coverage_keys(
+        self, config_spec: ConfigSpec
+    ) -> tuple[str, ...]:
+        """Config keys whose values should be represented in the initial sample."""
+        return ()
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.

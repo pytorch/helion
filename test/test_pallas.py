@@ -31,6 +31,7 @@ from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -3877,6 +3878,25 @@ class TestPallas(TestCase):
         )
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    def test_pallas_initial_population_runs_each_loop_schedule(self) -> None:
+        """Default-based witnesses for every Pallas loop family are valid."""
+        args = (
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 256, device=DEVICE, dtype=torch.float32),
+        )
+        bound = pallas_inner_loop_add.bind(args)
+        generation = ConfigGeneration(bound.config_spec)
+        configs = [
+            generation.unflatten(flat) for flat in generation.random_population_flat(3)
+        ]
+        by_loop_type = {config["pallas_loop_type"]: config for config in configs}
+        self.assertEqual(set(by_loop_type), {"unroll", "fori_loop", "emit_pipeline"})
+
+        for loop_type, config in by_loop_type.items():
+            with self.subTest(pallas_loop_type=loop_type):
+                result = bound.compile_config(config)(*args)
+                torch.testing.assert_close(result, args[0] + args[1])
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:

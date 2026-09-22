@@ -1904,6 +1904,53 @@ class ConfigGeneration:
             result.append((flat, normalized))
         return result
 
+    def initial_coverage_witness_flats(self) -> list[FlatConfig]:
+        """Build one default-based witness for each backend coverage value.
+
+        Coverage keys are deliberately small categorical surfaces. If a
+        backend declares a non-enumerable, sequence-valued, or very large
+        field, decline to synthesize witnesses and leave sampling
+        unchanged.
+        """
+        keys = self.config_spec.backend.autotune_initial_coverage_keys(self.config_spec)
+        if not keys:
+            return []
+
+        axes: list[tuple[int, list[object]]] = []
+        cardinality = 1
+        for key in keys:
+            layout = self._key_to_flat_indices.get(key)
+            if layout is None:
+                return []
+            indices, is_sequence = layout
+            if is_sequence or len(indices) != 1:
+                return []
+            index = indices[0]
+            values = self.flat_spec[index].search_values(limit=32)
+            if values is None or not values:
+                return []
+            cardinality *= len(values)
+            if cardinality > 32:
+                return []
+            axes.append((index, values))
+
+        default = self.default_flat()
+        witnesses: list[FlatConfig] = []
+        seen: set[Config] = set()
+        for values in itertools.product(*(values for _index, values in axes)):
+            flat = copy.deepcopy(default)
+            for (index, _choices), value in zip(axes, values, strict=True):
+                flat[index] = value
+            try:
+                canonical_flat, config = self.canonicalize_flat(flat)
+            except InvalidConfig:
+                continue
+            if config in seen:
+                continue
+            seen.add(config)
+            witnesses.append(canonical_flat)
+        return witnesses
+
     def user_seed_flat_config_pairs(
         self,
         user_seed_configs: Sequence[Config],
@@ -2032,6 +2079,12 @@ class ConfigGeneration:
                 if len(result) >= n:
                     return result[:n]
             for flat, _config in self.seed_flat_config_pairs(log_func):
+                if any(flat == existing for existing in result):
+                    continue
+                result.append(flat)
+                if len(result) >= n:
+                    return result[:n]
+            for flat in self.initial_coverage_witness_flats():
                 if any(flat == existing for existing in result):
                     continue
                 result.append(flat)

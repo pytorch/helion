@@ -2590,6 +2590,24 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             self.assertEqual(flat[1], 64)
             self.assertEqual(flat[2], 4)
 
+    def test_initial_population_covers_backend_values(self):
+        args = (
+            torch.randn([8, 512, 512], device=DEVICE),
+            torch.randn([8, 512, 512], device=DEVICE),
+        )
+        spec = basic_kernels.add.bind(args).config_spec
+        with patch.object(
+            spec.backend,
+            "autotune_initial_coverage_keys",
+            return_value=("num_warps",),
+        ):
+            gen = ConfigGeneration(spec)
+            values = {
+                gen.unflatten(flat).num_warps for flat in gen.random_population_flat(5)
+            }
+
+        self.assertEqual(values, {1, 2, 4, 8})
+
     def test_lfbo_flash_starting_points_retain_all_live_families(self):
         def member(
             perf: float, family: str, packet: str, wait_hint: int
