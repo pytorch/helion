@@ -290,6 +290,15 @@ class Backend(abc.ABC):
         """
         return True
 
+    def autotune_max_grid_programs(self, config_spec: ConfigSpec) -> int | None:
+        """Return a per-root grid limit, or ``None`` to use axis floors.
+
+        Backends that can evaluate a complete candidate may enforce a coupled
+        grid-size limit in :meth:`autotune_config_is_viable`. Other backends use
+        the legacy independent minimum block size for each grid axis.
+        """
+        return None
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.

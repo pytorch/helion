@@ -3990,6 +3990,34 @@ class TestPallas(TestCase):
             result, expected.to(result.device), rtol=1e-2, atol=1e-2
         )
 
+    def test_pallas_autotune_bounds_total_grid_programs(self) -> None:
+        """Imbalanced grid axes share one total-program limit."""
+        from unittest.mock import patch
+
+        x = torch.randn(8, 512, device=DEVICE, dtype=torch.float32)
+        y = torch.randn_like(x)
+        bound = pallas_add_2d.bind((x, y))
+        backend = bound.config_spec.backend
+
+        # Pallas keeps each grid axis's full search range because viability is
+        # decided from their combined program count.
+        self.assertEqual(
+            [spec.autotuner_min for spec in bound.config_spec.block_sizes],
+            [1, 1],
+        )
+        accepted = helion.Config(block_sizes=[1, 64])
+        oversized = helion.Config(block_sizes=[1, 32])
+        with patch.object(backend, "autotune_max_grid_programs", return_value=64):
+            self.assertTrue(
+                backend.autotune_config_is_viable(bound.config_spec, accepted)
+            )
+            self.assertFalse(
+                backend.autotune_config_is_viable(bound.config_spec, oversized)
+            )
+
+        result = bound.compile_config(accepted)(x, y)
+        torch.testing.assert_close(result, (x + y).to(result.device))
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""

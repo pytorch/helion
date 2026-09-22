@@ -3590,7 +3590,10 @@ class ConfigSpec:
         ``_fragment`` would compute, so memory and shared-memory
         constraints from non-tiled dimensions are respected.
         """
-        if not self.grid_block_ids:
+        if (
+            not self.grid_block_ids
+            or self.backend.autotune_max_grid_programs(self) is not None
+        ):
             return
 
         n_cus = num_compute_units()

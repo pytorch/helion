@@ -16,6 +16,7 @@ from typing import cast
 import torch
 
 from ... import exc
+from ..._compat import num_compute_units
 from ..ast_extension import expr_from_string
 from ..backend import Backend
 from ..backend import LauncherInfo
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
 # in XLA compilation before the tuner gets any timing signal. Explicitly
 # configured kernels are unaffected by this autotune-only limit.
 _MAX_AUTOTUNED_STATIC_UNROLL_STEPS = 16
+_MAX_AUTOTUNED_GRID_PROGRAMS_PER_COMPUTE_UNIT = 64
 
 
 def _peak_live_tile_bytes(
@@ -234,6 +236,10 @@ class PallasBackend(Backend):
             return ("pallas_loop_type",)
         return ()
 
+    def autotune_max_grid_programs(self, _config_spec: ConfigSpec) -> int | None:
+        """Bound each root grid without independently constraining its axes."""
+        return num_compute_units() * _MAX_AUTOTUNED_GRID_PROGRAMS_PER_COMPUTE_UNIT
+
     def autotune_config_is_viable(
         self, config_spec: ConfigSpec, config: Config
     ) -> bool:
@@ -250,6 +256,20 @@ class PallasBackend(Backend):
             spec.block_id: value
             for spec, value in zip(config_spec.block_sizes, block_sizes, strict=True)
         }
+
+        grid_limit = self.autotune_max_grid_programs(config_spec)
+        grid_fact = config_spec.kernel_grid_fact
+        if grid_limit is not None and grid_fact is not None:
+            for root in grid_fact.roots:
+                programs = math.prod(
+                    math.ceil(
+                        config_spec.block_sizes.block_id_lookup(block_id).size_hint
+                        / block_size_by_id[block_id]
+                    )
+                    for block_id in root.block_ids
+                )
+                if programs > grid_limit:
+                    return False
 
         peak_live_bytes = _peak_live_tile_bytes(config_spec, block_size_by_id)
         if peak_live_bytes is not None:
