@@ -1157,6 +1157,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         # descriptor so this dimension is last, but support checks are easier
         # to express in the original tensor dimension order.
         env = CompileEnvironment.current()
+        config = DeviceFunction.current().config
         element_size = fake_tensor.element_size()
         layout_signature = env.tensor_descriptor_layout_signature(fake_tensor)
         if layout_signature is None:
@@ -1242,12 +1243,15 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         descriptor_block_shape: list[int | torch.SymInt] = []
         sizes = fake_tensor.size()
         strides = fake_tensor.stride()
-        if env.index_dtype == torch.int64 and not all(
-            _tensor_dimension_fits_int32(size) for size in sizes
+        if env.index_dtype == torch.int64 and (
+            not config.host_tensor_descriptors
+            or not all(_tensor_dimension_fits_int32(size) for size in sizes)
         ):
+            # Preserve the established fallback for device-created descriptors.
+            # Host descriptors can safely use per-dimension int32 coordinates
+            # after the extent proof above, even when pointer indexing is int64.
             return False
         size_stride = collections.deque(zip(sizes, strides, strict=True))
-        config = DeviceFunction.current().config
         for i, k in enumerate(subscript):
             if k is None:
                 continue
@@ -1303,6 +1307,11 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     if not _scalar_symint_can_codegen_as_scalar(k):
                         return False
             elif isinstance(k, torch.Tensor):
+                if not config.host_tensor_descriptors:
+                    # Device-produced descriptor coordinates are part of the
+                    # host-descriptor feature; keep the legacy device-created
+                    # descriptor path unchanged.
+                    return False
                 if _is_scalar_integer_tensor_index(k):
                     descriptor_block_shape.append(1)
                     continue
@@ -2176,10 +2185,11 @@ class BlockedSubscriptIndexing:
         offsets = self.offsets
         if desc_arg.permutation is not None:
             offsets = [offsets[i] for i in desc_arg.permutation]
-        # Descriptor coordinates are int32 even when a scalar tensor subscript
-        # independently carries int64 values. Descriptor selection proves each
-        # dimension fits before this narrowing conversion.
-        offsets = [f"tl.cast({offset}, tl.int32)" for offset in offsets]
+        if DeviceFunction.current().config.host_tensor_descriptors:
+            # Host-descriptor coordinates are int32 even when a scalar tensor
+            # subscript independently carries int64 values. Descriptor selection
+            # proves each dimension fits before this narrowing conversion.
+            offsets = [f"tl.cast({offset}, tl.int32)" for offset in offsets]
         return f"[{', '.join(offsets)}]"
 
     @property
