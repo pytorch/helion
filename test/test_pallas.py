@@ -29,6 +29,7 @@ from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
+from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -979,6 +980,36 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    @skipIfPallasInterpret("device-side comparison requires a real TPU")
+    def test_large_autotune_accuracy_check(self) -> None:
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_chunked_add,
+            (x,),
+            block_sizes=[128],
+        )
+        expected = x + 1.0
+
+        _chunked_assert_close(
+            result,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            chunk_size=1024,
+            scale_atol_by_expected_rms=True,
+        )
+
+        incorrect = expected.clone()
+        incorrect[-1, -1] += 1.0
+        with self.assertRaises(AssertionError):
+            _chunked_assert_close(
+                result,
+                incorrect,
+                atol=1e-5,
+                rtol=1e-5,
+                chunk_size=1024,
+            )
+
     def test_prefix_sum(self) -> None:
         x = torch.arange(256, device=DEVICE, dtype=torch.int32) % 7
         _code, (forward, reverse) = code_and_output(
