@@ -5,6 +5,7 @@ from typing import NamedTuple
 
 import torch
 
+from ...autotuner.config_spec import AUTOTUNED_PALLAS_LOOP_TYPES
 from ...runtime.config import Config
 from .common import clamp_block_size_targets
 from .registry import AutotunerHeuristic
@@ -36,6 +37,30 @@ class _PallasMatmulFactDims(NamedTuple):
 
 _BF16_DTYPES: tuple[torch.dtype, ...] = (torch.bfloat16, torch.float16)
 _F32_DTYPES: tuple[torch.dtype, ...] = (torch.float32,)
+
+
+class PallasLoopScheduleSeedHeuristic(AutotunerHeuristic):
+    """Seed every lowering available for a Pallas inner loop."""
+
+    name = "pallas_loop_schedule_seed"
+    backend = "pallas"
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.has_pallas_inner_loops
+
+    @classmethod
+    def get_seed_config(cls, env: CompileEnvironment, device_ir: DeviceIR) -> Config:
+        return Config(pallas_loop_type=AUTOTUNED_PALLAS_LOOP_TYPES[0])
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        return [
+            Config(pallas_loop_type=loop_type)
+            for loop_type in AUTOTUNED_PALLAS_LOOP_TYPES
+        ]
 
 
 def _pallas_matmul_seed_dims_or_none(
