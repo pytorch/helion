@@ -504,9 +504,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_event_timed_long_kernel_skips_redundant_estimates(self) -> None:
-        # A kernel longer than both timing windows must be measured with
-        # setup + single-call estimate + one timed repeat (3 launches), not
-        # the 5-call estimate loop.
+        # A kernel longer than both timing windows needs only a setup launch and
+        # one cache-cleared probe. The probe itself is the timing sample.
         invocation_count = 0
         sleep_cycles = int(50e6)  # tens of ms at ~GHz clocks
 
@@ -523,7 +522,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             probe_long_kernel=True,
         )
 
-        self.assertEqual(invocation_count, 3)
+        self.assertEqual(invocation_count, 2)
         self.assertGreater(cast("float", result), 1.0)
 
     def test_wall_clock_long_kernel_skips_redundant_estimates(self) -> None:
@@ -552,7 +551,37 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 probe_long_kernel=True,
             )
 
-        self.assertEqual(invocation_count, 3)
+        self.assertEqual(invocation_count, 2)
+        self.assertAlmostEqual(cast("float", result), 100.0)
+
+    def test_wall_clock_long_kernel_reuses_caller_warmup(self) -> None:
+        invocation_count = 0
+
+        def fn() -> None:
+            nonlocal invocation_count
+            invocation_count += 1
+
+        with (
+            patch("helion.autotuner.benchmarking.synchronize_device"),
+            patch(
+                "helion.autotuner.benchmarking._make_l2_cache_clearer",
+                return_value=lambda: None,
+            ),
+            patch(
+                "helion.autotuner.benchmarking.time.perf_counter",
+                side_effect=(0.0, 0.1),
+            ),
+        ):
+            result = do_bench_generic(
+                fn,
+                warmup=1,
+                rep=50,
+                return_mode="median",
+                probe_long_kernel=True,
+                pre_warmed=True,
+            )
+
+        self.assertEqual(invocation_count, 1)
         self.assertAlmostEqual(cast("float", result), 100.0)
 
     def test_wall_clock_default_does_not_enable_long_kernel_probe(self) -> None:
@@ -662,7 +691,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         with patch(
             "helion.autotuner.benchmarking.sync_object", return_value=100.0
         ) as sync:
-            estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+            estimate_ms, n_warmup, probe_is_sample = _estimate_runtime_and_warmup(
                 run_batch,
                 warmup=1,
                 rep=50,
@@ -673,6 +702,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         sync.assert_called_once_with(0.1, process_group_name="workers")
         self.assertEqual(estimate_ms, 100.0)
         self.assertEqual(n_warmup, 0)
+        self.assertTrue(probe_is_sample)
 
     def test_benchmark_job_forwards_fixed_repetitions(self) -> None:
         fn = _ReturnValue(torch.empty(()))
@@ -1180,7 +1210,11 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.config_spec = SimpleNamespace(
             compiler_seed_timeout_retry_repetitions=None,
-            backend=SimpleNamespace(name="cute", get_do_bench=lambda: None),
+            backend=SimpleNamespace(
+                name="cute",
+                get_do_bench=lambda: None,
+                probe_long_autotune_kernels=lambda _config_spec: False,
+            ),
             cute_flash_search_enabled=False,
         )
         provider.settings = Settings(autotune_benchmark_subprocess=True)
@@ -1243,16 +1277,29 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertTrue(job.probe_long_kernel)
         self.assertEqual(provider._benchmark_worker.run.call_args.kwargs["timeout"], 17)
 
-    def test_long_kernel_probe_is_cute_flash_gated(self) -> None:
+    def test_long_kernel_probe_uses_search_or_backend_policy(self) -> None:
         # The probe applies to flash searches on both timer paths: the
         # event-timed do_bench now short-circuits its estimate loop the same
         # way do_bench_generic does for multi-second candidates.
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
-        provider.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
-        self.assertFalse(provider._probe_long_cute_flash_kernel())
+        provider.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False,
+            backend=SimpleNamespace(
+                probe_long_autotune_kernels=lambda _config_spec: False
+            ),
+        )
+        self.assertFalse(provider._probe_long_kernel())
+
+        provider.config_spec.backend.probe_long_autotune_kernels = (
+            lambda _config_spec: True  # pyrefly: ignore[bad-assignment]
+        )
+        self.assertTrue(provider._probe_long_kernel())
 
         provider.config_spec.cute_flash_search_enabled = True
-        self.assertTrue(provider._probe_long_cute_flash_kernel())
+        provider.config_spec.backend.probe_long_autotune_kernels = (
+            lambda _config_spec: False  # pyrefly: ignore[bad-assignment]
+        )
+        self.assertTrue(provider._probe_long_kernel())
 
     def test_subprocess_accuracy_check_skips_mutated_args(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)

@@ -531,6 +531,14 @@ class Backend(abc.ABC):
         """
         return None
 
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        """Whether candidate timing should first probe for a long-running kernel.
+
+        The probe avoids repeatedly executing a candidate whose first measured
+        call already exceeds the benchmark's warmup and measurement windows.
+        """
+        return False
+
     def get_interleaved_bench(
         self,
     ) -> Callable[..., list[float]] | None:

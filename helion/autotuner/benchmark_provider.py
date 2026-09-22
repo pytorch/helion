@@ -1048,12 +1048,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         custom_bench = backend.get_do_bench()
         return backend.name == "cute" and custom_bench is do_bench_generic
 
-    def _probe_long_cute_flash_kernel(self) -> bool:
-        # Flash attention candidates can run for multiple seconds per launch;
-        # probing from a single call (instead of the 5-call estimate loop)
-        # keeps those benchmarks to ~3 launches on both the event-timed and
-        # wall-clock paths.
-        return bool(self.config_spec.cute_flash_search_enabled)
+    def _probe_long_kernel(self) -> bool:
+        """Whether timing should stop its estimate after one long launch."""
+        if self.config_spec.cute_flash_search_enabled:
+            return True
+        return self.config_spec.backend.probe_long_autotune_kernels(self.config_spec)
 
     def _effective_source_dedup_enabled(self) -> bool:
         """Whether this provider may collapse source-identical candidates.
@@ -1692,22 +1691,25 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 benchmark_runner = (
                     _backend.get_do_bench() if _backend is not None else None
                 ) or do_bench
-                # Only the cute backend enables flash search, and it uses the
-                # default do_bench, which accepts probe_long_kernel.
-                if self._probe_long_cute_flash_kernel():
+                benchmark_callable = functools.partial(
+                    benchmark_function, *working_args
+                )
+                if benchmark_runner in (do_bench, do_bench_generic):
+                    # The exact callable ran immediately above.
                     res = benchmark_runner(
-                        functools.partial(benchmark_function, *working_args),
+                        benchmark_callable,
                         return_mode="median",
-                        warmup=1,  # we are already warmed up above
+                        warmup=1,
                         rep=50,
                         process_group_name=self.kernel.env.process_group_name,
-                        probe_long_kernel=True,
+                        probe_long_kernel=self._probe_long_kernel(),
+                        pre_warmed=True,
                     )
                 else:
                     res = benchmark_runner(
-                        functools.partial(benchmark_function, *working_args),
+                        benchmark_callable,
                         return_mode="median",
-                        warmup=1,  # we are already warmed up above
+                        warmup=1,
                         rep=50,
                         process_group_name=self.kernel.env.process_group_name,
                     )
@@ -2013,7 +2015,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             warmup=warmup,
             rep=rep,
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
-            probe_long_kernel=self._probe_long_cute_flash_kernel(),
+            probe_long_kernel=self._probe_long_kernel(),
             fixed_repetitions=fixed_repetitions,
         )
         try:

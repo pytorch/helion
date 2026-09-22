@@ -409,6 +409,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                 should_deduplicate_generated_sources=lambda config_spec: False,
                 get_do_bench=lambda: None,
                 classify_autotune_exception=lambda error: None,
+                probe_long_autotune_kernels=lambda _config_spec: False,
             ),
         )
         kernel = SimpleNamespace(

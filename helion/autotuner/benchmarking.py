@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
 from typing import TypeVar
+from typing import cast
 
 import torch
 
@@ -644,22 +645,23 @@ def _estimate_runtime_and_warmup(
     warmup: int,
     rep: int,
     process_group_name: str | None,
-) -> tuple[float, int]:
-    """Estimate one launch and avoid redundant work for long-running kernels."""
+) -> tuple[float, int, bool]:
+    """Estimate one launch and identify a probe that is already a valid sample."""
     first_elapsed_ms = run_batch(1)
     first_estimate_ms = sync_object(
         first_elapsed_ms, process_group_name=process_group_name
     )
     if first_estimate_ms >= max(warmup, rep):
-        # The setup and estimate calls have already warmed the kernel.
-        return first_estimate_ms, 0
+        # The setup call warmed the kernel, and this cache-cleared probe already
+        # exceeds the complete timing window. Reuse it as the sole sample.
+        return first_estimate_ms, 0, True
 
     remaining_elapsed_ms = run_batch(4)
     estimate_ms = sync_object(
         (first_elapsed_ms + remaining_elapsed_ms) / 5,
         process_group_name=process_group_name,
     )
-    return estimate_ms, max(1, int(warmup / estimate_ms))
+    return estimate_ms, max(1, int(warmup / estimate_ms)), False
 
 
 # This function is copied from triton._testing.do_bench with modification
@@ -677,6 +679,7 @@ def do_bench(
     default_cudagraph: bool = False,
     fixed_repetitions: int | None = None,
     probe_long_kernel: bool = False,
+    pre_warmed: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -696,10 +699,11 @@ def do_bench(
     :type return_mode: str
     :param fixed_repetitions: Skip adaptive estimation and time exactly this many
         calls after the initial setup call.
-    :param probe_long_kernel: Estimate from a single call first and skip the
-        four remaining estimate calls when that call already exceeds both
-        timing windows; CuTe flash enables it for multi-second attention
-        candidates.
+    :param probe_long_kernel: Estimate from a single call first and reuse that
+        probe as the timing sample when it already exceeds both timing windows;
+        CuTe flash enables it for multi-second attention candidates.
+    :param pre_warmed: Skip the setup launch when the caller has already run
+        and synchronized this exact benchmark callable.
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
@@ -708,7 +712,8 @@ def do_bench(
 
     di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
-    fn()
+    if not pre_warmed:
+        fn()
     di.synchronize()
     # Backward benchmarks mutate grad fields between iterations, so keep their
     # existing launch path.
@@ -733,12 +738,17 @@ def do_bench(
             di.synchronize()
             return float(batch_start.elapsed_time(batch_end))
 
-        estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+        estimate_ms, n_warmup, probe_is_sample = _estimate_runtime_and_warmup(
             run_estimate_batch,
             warmup=warmup,
             rep=rep,
             process_group_name=process_group_name,
         )
+        if probe_is_sample:
+            return cast(
+                "float | tuple[float, ...]",
+                _summarize_statistics([estimate_ms], quantiles, return_mode),
+            )
         n_repeat = max(1, int(rep / estimate_ms))
     elif fixed_repetitions is None:
         # Estimate the runtime of the function
@@ -800,18 +810,21 @@ def do_bench_generic(
     default_cudagraph: bool = False,  # accepted for API symmetry; wall-clock timing doesn't use CG
     fixed_repetitions: int | None = None,
     probe_long_kernel: bool = False,
+    pre_warmed: bool = False,
 ) -> float | tuple[float, ...]:
     """
     Benchmark using wall-clock timing for backends without Triton event timing.
 
     ``fixed_repetitions`` skips adaptive estimation and times exactly that many
-    calls after the initial setup call. ``probe_long_kernel`` avoids four
-    redundant estimate calls when the first call already exceeds both timing
-    windows; CuTe flash enables it for multi-second attention candidates.
+    calls after the initial setup call. ``probe_long_kernel`` reuses the first
+    probe as the timing sample when it already exceeds both timing windows;
+    CuTe flash enables it for multi-second attention candidates.
+    ``pre_warmed`` skips that setup call when the caller already ran and
+    synchronized the same callable.
     """
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
-    _output = fn()
+    _output = None if pre_warmed else fn()
     synchronize_device()
 
     clear_l2 = _make_l2_cache_clearer()
@@ -830,12 +843,14 @@ def do_bench_generic(
             end = time.perf_counter()
             return (end - start) * 1000
 
-        estimate_ms, n_warmup = _estimate_runtime_and_warmup(
+        estimate_ms, n_warmup, probe_is_sample = _estimate_runtime_and_warmup(
             run_estimate_batch,
             warmup=warmup,
             rep=rep,
             process_group_name=process_group_name,
         )
+        if probe_is_sample:
+            return _summarize_statistics_fallback([estimate_ms], quantiles, return_mode)
         n_repeat = max(1, int(rep / estimate_ms))
     elif fixed_repetitions is None:
         synchronize_device()
