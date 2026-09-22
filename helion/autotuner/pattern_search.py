@@ -274,7 +274,11 @@ class PatternSearch(PopulationBasedSearch):
         ]
         pinned_seed_configs.append(config_gen.unflatten(config_gen.default_flat()))
         self.pin_finalist_configs(pinned_seed_configs)
-        return population
+        if self.config_gen.config_spec.cute_flash_search_enabled:
+            return population
+        return self._replace_backend_rejected_initial_configs(
+            population, self.initial_population
+        )
 
     def _autotune(self) -> Config:
         initial_population_name = self.initial_population_strategy.name
