@@ -57,28 +57,6 @@ MAX_REQUEST_BLOCKS = max(
 BLOCK_TABLE_CAPACITY = math.ceil(MAX_REQUEST_BLOCKS / 2) * 2
 
 
-OPAQUE_PARTIAL_LOAD = """
-tl.load(
-    {partial}
-    + {child} * 32768
-    + {query} * 8192
-    + {head_group} * 8192
-    + {heads}[:, None] * 512
-    + {values}[None, :]
-)
-"""
-
-OPAQUE_PARTIAL_LSE_LOAD = """
-tl.load(
-    {partial_lse}
-    + {child} * 64
-    + {query} * 16
-    + {head_group} * 16
-    + {heads}
-)
-"""
-
-
 @helion.aot_kernel(
     static_shapes=False,
     backend="triton",
@@ -157,10 +135,24 @@ def flash_mla(
         dtype=torch.float32,
         device=query.device,
     )
-    # Publish one small, unconditional completion value per partial task.  The
-    # partial payload is intentionally loaded through opaque expressions below;
-    # this affine side relation is the single dependency source of truth for
-    # partial -> radix readiness, including inactive envelope tickets.
+    partial_groups = partial.view(
+        group_capacity,
+        RADIX_FAN_IN,
+        query_len,
+        num_head_groups,
+        heads_per_group,
+        value_dim,
+    )
+    partial_lse_groups = partial_lse.view(
+        group_capacity,
+        RADIX_FAN_IN,
+        query_len,
+        num_head_groups,
+        heads_per_group,
+    )
+    # This ordinary Helion access is an explicit completion relation. The
+    # compiler proves that its release also covers the earlier conditional
+    # payload stores.
     partial_ready = torch.empty(
         (task_capacity, num_head_groups),
         dtype=torch.int32,
@@ -210,13 +202,19 @@ def flash_mla(
 
     # A fixed global envelope keeps every producer/consumer relation affine.
     # Runtime descriptors identify real tasks and request-local tail padding.
-    for tile_task, tile_group in hl.tile(
-        [task_capacity, num_head_groups], block_size=[1, 1]
+    for producer_group, producer_child, tile_group in hl.tile(
+        [group_capacity, RADIX_FAN_IN, num_head_groups], block_size=[1, 1, 1]
     ):
-        request = hl.load(task_requests, [tile_task.begin])
+        request = hl.load(
+            task_requests,
+            [producer_group.begin * RADIX_FAN_IN + producer_child.begin],
+        )
         query_indices = hl.arange(query_len)
         if request >= 0:
-            task_start = hl.load(task_starts, [tile_task.begin])
+            task_start = hl.load(
+                task_starts,
+                [producer_group.begin * RADIX_FAN_IN + producer_child.begin],
+            )
             sequence_length = hl.load(seq_lens, [request])
             causal_lengths = sequence_length - (query_len - query_indices - 1)
             head_indices = tile_group.begin * heads_per_group + hl.arange(
@@ -284,27 +282,29 @@ def flash_mla(
                     0.0,
                     accumulator / safe_sum.view(query_rows, 1),
                 ).view(query_len, heads_per_group, tile_d.block_size)
-                partial[
-                    tile_task,
-                    query_indices,
+                partial_groups[
+                    producer_group,
+                    producer_child,
+                    :,
                     tile_group,
                     :,
                     tile_d,
-                ] = normalized[None, :, None, :, :]
-            partial_lse[
-                tile_task,
-                query_indices,
+                ] = normalized[None, None, :, None, :, :]
+            partial_lse_groups[
+                producer_group,
+                producer_child,
+                :,
                 tile_group,
                 :,
             ] = torch.where(
                 empty,
                 float("-inf"),
                 block_max + torch.log2(safe_sum),
-            )[None, :, None, :]
-        partial_ready[tile_task, tile_group] = 1
+            )[None, None, :, None, :]
+        partial_ready_groups[producer_group, producer_child, tile_group] = 1
 
-    # Every radix task consumes exactly 16 affine slots. Runtime child counts
-    # mask the request-local tail, and zero marks an inactive capacity slot.
+    # Every radix task consumes exactly 16 completion slots. Runtime child
+    # counts trim the payload reads to the request-local tail.
     for radix_group, tile_q, tile_group, tile_h, tile_d in hl.tile(
         [
             group_capacity,
@@ -324,17 +324,13 @@ def flash_mla(
                 tile_group.begin,
             ]
             if (child_tile.begin < child_count) & (child_ready != 0):
-                child_lse = hl.inline_triton(
-                    OPAQUE_PARTIAL_LSE_LOAD,
-                    args={
-                        "partial_lse": partial_lse,
-                        "child": (radix_group.begin * RADIX_FAN_IN + child_tile.begin),
-                        "query": tile_q.begin,
-                        "head_group": tile_group.begin,
-                        "heads": tile_h.index,
-                    },
-                    output_like=best,
-                )
+                child_lse = partial_lse_groups[
+                    radix_group.begin,
+                    child_tile.begin,
+                    tile_q.begin,
+                    tile_group.begin,
+                    tile_h,
+                ]
                 best = torch.maximum(best, child_lse)
 
         denominator = hl.zeros([tile_h.block_size], dtype=torch.float32)
@@ -343,31 +339,23 @@ def flash_mla(
         )
         child = torch.zeros([], dtype=torch.int32, device=query.device)
         while child < child_count:
-            child_lse = hl.inline_triton(
-                OPAQUE_PARTIAL_LSE_LOAD,
-                args={
-                    "partial_lse": partial_lse,
-                    "child": radix_group.begin * RADIX_FAN_IN + child,
-                    "query": tile_q.begin,
-                    "head_group": tile_group.begin,
-                    "heads": tile_h.index,
-                },
-                output_like=best,
-            )
+            child_lse = partial_lse_groups[
+                radix_group.begin,
+                child,
+                tile_q.begin,
+                tile_group.begin,
+                tile_h,
+            ]
             child_weight = torch.exp2(child_lse - best)
             denominator = denominator + child_weight
-            child_value = hl.inline_triton(
-                OPAQUE_PARTIAL_LOAD,
-                args={
-                    "partial": partial,
-                    "child": radix_group.begin * RADIX_FAN_IN + child,
-                    "query": tile_q.begin,
-                    "head_group": tile_group.begin,
-                    "heads": tile_h.index,
-                    "values": tile_d.index,
-                },
-                output_like=accumulator,
-            )
+            child_value = partial_groups[
+                radix_group.begin,
+                child,
+                tile_q.begin,
+                tile_group.begin,
+                tile_h,
+                tile_d,
+            ]
             accumulator = accumulator + child_value * child_weight[:, None]
             child = child + 1
         safe_denominator = torch.where(denominator == 0, 1.0, denominator)
@@ -394,8 +382,8 @@ def flash_mla(
         )
         grouped_ready[radix_group.begin, tile_q.begin, tile_group.begin] = 1
 
-    # The small readiness relation remains a fixed affine scan, while opaque
-    # payload loads visit only the request's runtime group interval.
+    # A fixed completion scan covers the whole reduction envelope. Payload
+    # loads still visit only the request's runtime group interval.
     for tile_b, tile_q, tile_group, tile_h, tile_d in hl.tile(
         [batch_size, query_len, num_head_groups, heads_per_group, value_dim],
         block_size=[1, 1, 1, 1, 512],
@@ -419,17 +407,12 @@ def flash_mla(
             )
         final_group = group_begin
         while (final_group < group_end) & (ready_count == group_capacity):
-            state_lse = hl.inline_triton(
-                OPAQUE_PARTIAL_LSE_LOAD,
-                args={
-                    "partial_lse": grouped_lse,
-                    "child": final_group,
-                    "query": tile_q.begin,
-                    "head_group": tile_group.begin,
-                    "heads": tile_h.index,
-                },
-                output_like=running_max,
-            )
+            state_lse = grouped_lse[
+                final_group,
+                tile_q.begin,
+                tile_group.begin,
+                tile_h,
+            ]
             new_max = torch.maximum(running_max, state_lse)
             old_weight = torch.where(
                 running_max == float("-inf"),
@@ -438,18 +421,13 @@ def flash_mla(
             )
             state_weight = torch.exp2(state_lse - new_max)
             running_sum = running_sum * old_weight + state_weight
-            state_value = hl.inline_triton(
-                OPAQUE_PARTIAL_LOAD,
-                args={
-                    "partial": grouped,
-                    "child": final_group,
-                    "query": tile_q.begin,
-                    "head_group": tile_group.begin,
-                    "heads": tile_h.index,
-                    "values": tile_d.index,
-                },
-                output_like=accumulator,
-            )
+            state_value = grouped[
+                final_group,
+                tile_q.begin,
+                tile_group.begin,
+                tile_h,
+                tile_d,
+            ]
             accumulator = (
                 accumulator * old_weight[:, None] + state_value * state_weight[:, None]
             )

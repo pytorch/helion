@@ -10,7 +10,7 @@ import torch
 CONFIG = {
     "block_sizes": [],
     "loop_orders": [
-        [0, 1],
+        [1, 0, 2],
         [1, 0, 2, 3, 4],
         [0, 1, 2, 3, 4],
     ],
@@ -21,10 +21,10 @@ CONFIG = {
     "range_multi_buffers": [None, None, None, None, None, None, None],
     "range_flattens": [None, None, None, None, None, None, None],
     "static_ranges": [False, False],
-    "load_eviction_policies": ["", "", "", "", "", "", "", "", "", "", "", ""],
+    "load_eviction_policies": [""] * 16,
     "num_warps": 4,
     "num_stages": 1,
-    "indexing": ["pointer"] * 20,
+    "indexing": ["pointer"] * 25,
     "pid_type": "persistent_blocked",
     "cross_loop_pipeline": "dynamic",
     "num_sm_multiplier": 1,

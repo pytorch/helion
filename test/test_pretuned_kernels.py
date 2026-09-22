@@ -272,6 +272,7 @@ def test_flash_mla_uses_existing_tuning_surface() -> None:
     source = inspect.getsource(module.flash_mla.fn)
     assert "partial_ready" in source
     assert "grouped_ready" in source
+    assert "inline_triton" not in source
     assert "num_tasks == 418" not in source
     assert "608" not in source
 
