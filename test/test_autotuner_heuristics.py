@@ -6362,6 +6362,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
         search = PatternSearch.__new__(PatternSearch)
+        search.config_spec = spec
         search.config_gen = config_gen
         search.settings = Settings()
         search.log = MagicMock()
@@ -8069,6 +8070,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 profile = get_effort_profile("full").lfbo_pattern_search
                 assert profile is not None
                 search = PatternSearch.__new__(PatternSearch)
+                search.config_spec = spec
                 search.config_gen = config_gen
                 search.settings = Settings()
                 search.log = MagicMock()

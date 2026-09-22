@@ -43,6 +43,52 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+# Static unroll duplicates each loop body in the generated JAX program. Beyond
+# this many copies for one loop, generated autotune candidates can spend minutes
+# in XLA compilation before the tuner gets any timing signal. Explicitly
+# configured kernels are unaffected by this autotune-only limit.
+_MAX_AUTOTUNED_STATIC_UNROLL_STEPS = 16
+
+
+def _autotune_block_size_by_id(
+    config_spec: ConfigSpec, config: Config
+) -> dict[int, int] | None:
+    """Return concrete block sizes when the candidate has a usable shape."""
+    block_sizes = config.config.get("block_sizes")
+    if not isinstance(block_sizes, list) or len(block_sizes) != len(
+        config_spec.block_sizes
+    ):
+        return None
+    if not all(type(value) is int and value > 0 for value in block_sizes):
+        return None
+    return {
+        spec.block_id: value
+        for spec, value in zip(config_spec.block_sizes, block_sizes, strict=True)
+    }
+
+
+def _config_not_viable_due_to_static_unroll(
+    config_spec: ConfigSpec,
+    config: Config,
+    block_size_by_id: dict[int, int],
+) -> bool:
+    """Return whether static unrolling would expand a device loop too far."""
+    if config.get("pallas_loop_type") != "unroll":
+        return False
+
+    grid_block_ids = set(config_spec.grid_block_ids)
+    for spec in config_spec.block_sizes:
+        if spec.block_id in grid_block_ids:
+            continue
+        extent = spec.size_hint
+        if spec.bounded_by_block_id is not None:
+            extent = block_size_by_id.get(spec.bounded_by_block_id, extent)
+        block_size = block_size_by_id[spec.block_id]
+        if math.ceil(extent / block_size) > _MAX_AUTOTUNED_STATIC_UNROLL_STEPS:
+            return True
+    return False
+
+
 def _embedded_helper_source(body: str) -> str:
     """Source of the in-kernel Pallas helpers referenced by ``body`` (module-level
     so both ``PallasBackend.embedded_helper_source`` and the jax standalone builder
@@ -190,6 +236,20 @@ class PallasBackend(Backend):
 
     def max_reduction_threads(self) -> int | None:
         return None
+
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        """Reject candidates whose static unrolling would over-expand source."""
+        block_size_by_id = _autotune_block_size_by_id(config_spec, config)
+        if block_size_by_id is None:
+            return True
+
+        if _config_not_viable_due_to_static_unroll(  # noqa: SIM103
+            config_spec, config, block_size_by_id
+        ):
+            return False
+        return True
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
