@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ...autotuner.config_fragment import ConfigSpecFragment
+    from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
@@ -776,6 +777,13 @@ class PallasBackend(Backend):
         from ...autotuner.benchmarking import do_bench_generic
 
         return do_bench_generic
+
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        # Pallas benchmarks inline because compiled TorchTPU callables cannot be
+        # sent to the subprocess benchmark worker. A single poor tile choice can
+        # take seconds, so avoid the ordinary five-call estimate for those
+        # candidates.
+        return True
 
     def get_interleaved_bench(self) -> Callable[..., list[float]]:
         from ...autotuner.benchmarking import interleaved_bench_generic
