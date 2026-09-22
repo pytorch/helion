@@ -1372,6 +1372,72 @@ class TestTileDependency(TestCase):
         relation = _root_producers_by_consumer(plan, _one_dimensional_domains())
         self.assertIsNone(relation)
 
+    def test_unknown_subscript_conservatively_spans_dimension(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store", block_ids=(10,)),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    block_ids=(None,),
+                    offsets=(None,),
+                    scalar=(True,),
+                ),
+            ),
+            [[10], [20]],
+        )
+
+        relation = _root_producers_by_consumer(
+            plan,
+            _one_dimensional_domains(consumer_count=4),
+        )
+        self.assertEqual(
+            relation,
+            tuple(frozenset(range(8)) for _ in range(4)),
+        )
+
+    def test_unknown_subscript_preserves_other_affine_dimensions(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=(4, 8),
+                    strides=(8, 1),
+                    block_ids=(10, 11),
+                    scales=(1, 1),
+                    offsets=(0, 0),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=(4, 8),
+                    strides=(8, 1),
+                    block_ids=(20, None),
+                    scales=(1, 1),
+                    offsets=(0, None),
+                    scalar=(False, True),
+                ),
+            ),
+            [[10, 11], [20, 21]],
+        )
+        producer = CoordinateDomain((10, 11), ((10, 4), (11, 8)), ((10, 1), (11, 1)))
+        consumer = CoordinateDomain((20, 21), ((20, 4), (21, 2)), ((20, 1), (21, 1)))
+
+        relation = _root_producers_by_consumer(plan, (producer, consumer))
+        assert relation is not None
+        for consumer_task, producers in enumerate(relation):
+            batch = _coordinates(consumer, consumer_task)[20]
+            self.assertEqual(
+                producers,
+                frozenset(
+                    _index(producer, {10: batch, 11: column}) for column in range(8)
+                ),
+            )
+
     def test_batch_axis_is_part_of_task_mapping(self) -> None:
         plan = build_tile_dependency_graph(
             (

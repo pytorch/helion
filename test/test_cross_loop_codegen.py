@@ -330,6 +330,75 @@ def nested_store_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def conditional_payload_completion_chain(
+    x: torch.Tensor,
+    active_children: torch.Tensor,
+) -> torch.Tensor:
+    """Use an unconditional completion value to cover conditional payloads."""
+    groups, fan_in, width = x.size()
+    payload = torch.empty_like(x)
+    completion = torch.empty((groups, fan_in), dtype=torch.int32, device=x.device)
+    out = torch.empty((groups, width), dtype=torch.float32, device=x.device)
+
+    for producer_group, producer_child, producer_width in hl.tile(
+        [groups, fan_in, width], block_size=[1, 1, 32]
+    ):
+        active = hl.load(active_children, [producer_group.begin])
+        if producer_child.begin < active:
+            payload[producer_group, producer_child, producer_width] = (
+                x[producer_group, producer_child, producer_width] + 1
+            )
+        completion[producer_group, producer_child] = 1
+
+    for consumer_group, consumer_width in hl.tile([groups, width], block_size=[1, 32]):
+        completed = torch.zeros([], dtype=torch.int32, device=x.device)
+        for ready_child in hl.tile(fan_in, block_size=1):
+            completed = completed + completion[consumer_group.begin, ready_child.begin]
+        active = hl.load(active_children, [consumer_group.begin])
+        acc = hl.zeros([consumer_width], dtype=torch.float32)
+        child = torch.zeros([], dtype=torch.int32, device=x.device)
+        while (child < active) & (completed == fan_in):
+            acc = acc + payload[consumer_group.begin, child, consumer_width]
+            child = child + 1
+        out[consumer_group.begin, consumer_width] = acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def nested_early_completion_chain(x: torch.Tensor) -> torch.Tensor:
+    """Do not let nested completion cover a later access in its parent."""
+    batch, width = x.size()
+    payload = torch.empty_like(x)
+    completion = torch.empty_like(x, dtype=torch.int32)
+    out = torch.empty_like(x)
+
+    for producer_batch, producer_width in hl.tile([batch, width], block_size=[1, 32]):
+        for _marker in hl.tile(1, block_size=1):
+            completion[producer_batch.begin, producer_width] = 1
+        payload[producer_batch.begin, producer_width] = (
+            x[producer_batch.begin, producer_width] + 1
+        )
+
+    for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 32]):
+        completed = torch.zeros([], dtype=torch.int32, device=x.device)
+        for _ready in hl.tile(1, block_size=1):
+            completed = completed + torch.sum(
+                completion[consumer_batch.begin, consumer_width]
+            ).to(torch.int32)
+        if completed == consumer_width.block_size:
+            out[consumer_batch.begin, consumer_width] = payload[
+                consumer_batch.begin, consumer_width
+            ]
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def nested_load_store_chain(x: torch.Tensor) -> torch.Tensor:
     """Make one nested scope both a readiness consumer and a producer."""
     batch, width = x.size()
@@ -752,6 +821,51 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("_minimum_resident_programs=", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_completion_relation_covers_conditional_indirect_payload(self) -> None:
+        x = torch.arange(
+            2 * 4 * 32,
+            device=DEVICE,
+            dtype=torch.float32,
+        ).reshape(2, 4, 32)
+        active_children = torch.tensor([4, 2], device=DEVICE, dtype=torch.int32)
+        code, out = code_and_output(
+            conditional_payload_completion_chain,
+            (x, active_children),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        expected = torch.stack(
+            (torch.sum(x[0, :4], dim=0) + 4, torch.sum(x[1, :2], dim=0) + 2)
+        )
+        torch.testing.assert_close(out, expected)
+        self.assertIn("tile_dependency_nested_loop_wait", code)
+        self.assertNotIn("tile_dependency_readiness_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_nested_completion_does_not_cover_later_parent_payload(self) -> None:
+        x = torch.arange(2 * 32, device=DEVICE, dtype=torch.float32).reshape(2, 32)
+        code, out = code_and_output(
+            nested_early_completion_chain,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, x + 1)
+        self.assertIn("tile_dependency_nested_loop_wait", code)
+        # The later parent payload needs its own root-task readiness event; it
+        # cannot be covered by the earlier nested completion publication.
+        self.assertIn("tile_dependency_readiness_wait", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
