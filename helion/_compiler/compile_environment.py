@@ -843,9 +843,10 @@ class CompileEnvironment:
             is_exact = True
         elif factory is torch.empty_like:
             like_input = args[0] if args else kwargs.get("input")
-            is_exact = isinstance(
-                like_input, torch.Tensor
-            ) and self.tensor_layout_is_symbolically_exact(like_input)
+            is_exact = self.settings.static_shapes or (
+                isinstance(like_input, torch.Tensor)
+                and self.tensor_layout_is_symbolically_exact(like_input)
+            )
         if is_exact:
             self._symbolically_exact_layout_storages.add(result_storage)
 
