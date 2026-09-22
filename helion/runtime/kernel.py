@@ -9,7 +9,6 @@ import hashlib
 import inspect
 import itertools
 import logging
-import operator
 import os
 import re
 import sys
@@ -2887,11 +2886,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
+        tensor_descriptor_layout_guards = self.env.tensor_descriptor_layout_guards
+        tensor_descriptor_alignment_guards = getattr(
+            self.env, "tensor_descriptor_alignment_guards", {}
+        )
         if (
             not self.env.specialized_vars
             and not self.env.specialized_strides
-            and not self.env.tensor_descriptor_layout_guards
-            and not self.env.tensor_descriptor_alignment_guards
+            and not tensor_descriptor_layout_guards
+            and not tensor_descriptor_alignment_guards
             and not self.env.runtime_input_specializations
         ):
             return []
@@ -2954,7 +2957,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 return getitem_extractor
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
-                return operator.itemgetter(index)
+
+                def local_extractor(
+                    args: Sequence[object],
+                    _index: int = index,
+                ) -> Hashable:
+                    return cast("Hashable", args[_index])
+
+                return local_extractor
             raise exc.SpecializeArgType(v)
 
         arg_name_to_index: dict[str, int] = {
@@ -2980,14 +2990,24 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
-        implicit_config = self._fixed_config_for_td_layout_guards()
         candidate_configs: tuple[Config, ...] | None
-        if implicit_config is not None:
-            candidate_configs = (implicit_config,)
-        elif not self.settings.force_autotune and len(self.kernel.configs) > 1:
-            candidate_configs = tuple(
-                self._normalized_config_copy(config) for config in self.kernel.configs
-            )
+        if tensor_descriptor_layout_guards or tensor_descriptor_alignment_guards:
+            implicit_config = self._fixed_config_for_td_layout_guards()
+            if implicit_config is not None:
+                candidate_configs = (implicit_config,)
+            elif not self.settings.force_autotune and len(self.kernel.configs) > 1:
+                normalized_configs = []
+                for config in self.kernel.configs:
+                    try:
+                        normalized_configs.append(self._normalized_config_copy(config))
+                    except exc.InvalidConfig:
+                        # Finite-search autotuning deliberately permits invalid
+                        # candidates and skips them at compile time. Descriptor
+                        # guard discovery must not make those failures eager.
+                        continue
+                candidate_configs = tuple(normalized_configs)
+            else:
+                candidate_configs = None
         else:
             candidate_configs = None
 
@@ -3038,7 +3058,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             return min(cap, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE)
 
         for source, guard in sorted(
-            self.env.tensor_descriptor_layout_guards.items(),
+            tensor_descriptor_layout_guards.items(),
             key=lambda item: repr(item[0]),
         ):
             if not guard_is_active(guard):
@@ -3075,7 +3095,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
 
         for source, guard in sorted(
-            self.env.tensor_descriptor_alignment_guards.items(),
+            tensor_descriptor_alignment_guards.items(),
             key=lambda item: repr(item[0]),
         ):
             if not guard_is_active(guard):
