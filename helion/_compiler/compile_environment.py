@@ -622,7 +622,14 @@ class CompileEnvironment:
         has_direct_source = source is not None and _is_supported_tensor_input_source(
             source
         )
-        alignment_source = self.tensor_descriptor_alignment_source(fake_tensor)
+        # The 16-byte base-address requirement belongs to CUDA TMA. Other
+        # tensor-descriptor backends retain their existing legality checks and
+        # must not acquire a CUDA-specific runtime specialization.
+        alignment_source = (
+            self.tensor_descriptor_alignment_source(fake_tensor)
+            if self.device.type == "cuda"
+            else None
+        )
         if alignment_source is not None:
             alignment_guard = self.tensor_descriptor_alignment_guards.setdefault(
                 alignment_source, TensorDescriptorAlignmentGuard()
