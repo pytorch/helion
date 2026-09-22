@@ -51,6 +51,9 @@ if TYPE_CHECKING:
 # configured kernels are unaffected by this autotune-only limit.
 _MAX_AUTOTUNED_STATIC_UNROLL_STEPS = 16
 _MAX_AUTOTUNED_GRID_PROGRAMS_PER_COMPUTE_UNIT = 64
+# Mosaic's low-level scheduler cost grows quickly with pipeline depth. Grouped
+# stages count once because Mosaic schedules one grouped DMA iteration.
+_MAX_AUTOTUNED_LOW_LEVEL_PIPELINE_STEPS = 64
 
 
 def _peak_live_tile_bytes(
@@ -151,6 +154,22 @@ def _config_not_viable_due_to_static_unroll(
     if config.get("pallas_loop_type") != "unroll":
         return False
 
+    return _inner_loop_steps_exceed(
+        config_spec,
+        block_size_by_id,
+        group_size=1,
+        limit=_MAX_AUTOTUNED_STATIC_UNROLL_STEPS,
+    )
+
+
+def _inner_loop_steps_exceed(
+    config_spec: ConfigSpec,
+    block_size_by_id: dict[int, int],
+    *,
+    group_size: int,
+    limit: int,
+) -> bool:
+    """Whether any candidate device loop exceeds ``limit`` grouped steps."""
     grid_block_ids = set(config_spec.grid_block_ids)
     for spec in config_spec.block_sizes:
         if spec.block_id in grid_block_ids:
@@ -159,9 +178,33 @@ def _config_not_viable_due_to_static_unroll(
         if spec.bounded_by_block_id is not None:
             extent = block_size_by_id.get(spec.bounded_by_block_id, extent)
         block_size = block_size_by_id[spec.block_id]
-        if math.ceil(extent / block_size) > _MAX_AUTOTUNED_STATIC_UNROLL_STEPS:
+        if math.ceil(extent / (block_size * group_size)) > limit:
             return True
     return False
+
+
+def _config_not_viable_due_to_low_level_pipeline(
+    config_spec: ConfigSpec,
+    config: Config,
+    block_size_by_id: dict[int, int],
+) -> bool:
+    """Return whether low-level scheduling would process too many stages."""
+    if config.get("pallas_loop_type") != "emit_pipeline" or not config.get(
+        "pallas_use_low_level_scheduler", False
+    ):
+        return False
+
+    group_size = config.get("pallas_emit_pipeline_group_size", 1)
+    return (
+        type(group_size) is int
+        and group_size > 0
+        and _inner_loop_steps_exceed(
+            config_spec,
+            block_size_by_id,
+            group_size=group_size,
+            limit=_MAX_AUTOTUNED_LOW_LEVEL_PIPELINE_STEPS,
+        )
+    )
 
 
 def _embedded_helper_source(body: str) -> str:
@@ -344,7 +387,11 @@ class PallasBackend(Backend):
             return False
         if _config_not_viable_due_to_vmem(config_spec, block_size_by_id):
             return False
-        if _config_not_viable_due_to_static_unroll(  # noqa: SIM103
+        if _config_not_viable_due_to_static_unroll(
+            config_spec, config, block_size_by_id
+        ):
+            return False
+        if _config_not_viable_due_to_low_level_pipeline(  # noqa: SIM103
             config_spec, config, block_size_by_id
         ):
             return False
