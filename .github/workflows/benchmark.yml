@@ -190,6 +190,8 @@ jobs:
       - name: Run TritonBench Benchmark
         if: inputs.suite == 'tritonbench'
         run: |
+          # Stop on benchmark failures so missing JSON errors don't obscure the cause.
+          set -e
           rm -rf /tmp/torchinductor_*/ || true
 
           source .venv/bin/activate

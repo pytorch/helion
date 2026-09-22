@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Sequence
+from typing import cast
 
 import torch
 
@@ -19,8 +20,11 @@ if TYPE_CHECKING:
 
     from torch._inductor.ops_handler import OpsHandler
 
+    from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
+    from ..compile_environment import CompileEnvironment
+    from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..tile_dispatch import TileStrategyDispatch
 
@@ -30,6 +34,32 @@ if TYPE_CHECKING:
 def _flydsl_minimum_expr(a: str, b: str) -> str:
     # flydsl Vector has no ``.minimumf``; min(a,b) = -max(-a,-b).
     return f"(-((-({a})).maximumf((-({b})))))"
+
+
+def _looped_tc(chunk: int, v: int) -> int:
+    """thread_count = 64*W from (chunk, V): chunk // V rounded to whole warps,
+    clamped to [64, 1024]. V is clamped up to 4 (flydsl loads are >=128-bit;
+    V=1/2 waste bandwidth, and the unset default V=1 -> V=4 preserves the 1-warp
+    behavior at chunk=256).
+
+    Single source of truth for both the launcher block dim
+    (``_flydsl_looped_thread_count``) and the codegen thread_count
+    (``looped_reduction_thread_count``) so the two cannot diverge.
+    """
+    _v = max(4, v)
+    return max(64, min(1024, (chunk // _v // 64) * 64))
+
+
+def _has_user_tiled_reduction(env: CompileEnvironment) -> bool:
+    """Whether the kernel has an explicit ``hl.tile(n)`` reduction.
+
+    True when a reduction block_id lives in ``block_sizes`` (not
+    ``reduction_loops``). For these kernels every non-row block dim is a column
+    tile in the warp-per-row model (indices = offset//4 + lane), so it must be a
+    multiple of 256.
+    """
+    bs_ids = env.config_spec.block_sizes.valid_block_ids()
+    return any(info.reduction and info.block_id in bs_ids for info in env.block_sizes)
 
 
 class FlyDSLBackend(Backend):
@@ -61,6 +91,10 @@ class FlyDSLBackend(Backend):
             "num_warps",
             "num_threads",
             "reduction_loops",
+            # Shared per-reduction-block vector width V (elems/thread). The
+            # looped reduction derives thread_count = chunk // V from it; V also
+            # selects the load width (V=4 -> 128-bit, V=8 -> 128-bit fp16).
+            "cute_vector_widths",
         }
     )
 
@@ -69,7 +103,17 @@ class FlyDSLBackend(Backend):
         # Set per-compile by pre_codegen; initialized here so function_decorator
         # and the memory-op codegen can read them directly without defaults.
         self._flydsl_num_threads: int = 64
+        # Wavefronts cooperating on one row: 1 = warp-shuffle only (W=1), >1 =
+        # cross-wave smem block reduce. Set per-compile by pre_codegen.
+        self._flydsl_warps_per_row: int = 1
         self._tensor_use_buffer: dict[int, bool] = {}
+        # Both reset each compile by pre_codegen. ``_needs_warp_helpers`` is set
+        # by reduction_expr when a reduction is generated, so the warp-reduce
+        # helper defs are emitted (from scalar_arg_preamble, which runs after the
+        # body) only for kernels that actually reduce -- not every kernel.
+        # ``_helpers_emitted`` then guards against emitting them more than once.
+        self._flydsl_needs_warp_helpers: bool = False
+        self._flydsl_helpers_emitted: bool = False
 
     @property
     def name(self) -> str:
@@ -115,7 +159,90 @@ class FlyDSLBackend(Backend):
         return 64
 
     def max_reduction_loop(self) -> int | None:
-        return 64
+        # chunk = 64 * W * V (W wavefronts x 64 lanes x V contiguous elems each).
+        # The autotuner enumerates chunks up to W=16 (thread_count 1024) x V.
+        return 8192
+
+    @staticmethod
+    def _flydsl_looped_thread_count(config: Config, bm: int) -> int | None:
+        """Launcher block dim (= 64*W) for the whole-row looped reduction, else
+        None.
+
+        W>1 (cross-wave smem fold via ``_flydsl_bsum``) requires one row per block
+        (bm==1). Reads reduction_loops[0]/cute_vector_widths[0] (slot 0); flydsl
+        supports a single rolled reduction dim, so slot 0 IS the reduction block
+        and this agrees with ``looped_reduction_thread_count`` (which indexes per
+        block). Both delegate the arithmetic to ``_looped_tc``.
+        """
+        if bm != 1:
+            return None
+        rl = config.reduction_loops
+        if not rl or rl[0] is None:
+            return None
+        vw = cast("list[int]", config.config.get("cute_vector_widths", []) or [])
+        v = int(vw[0]) if vw else 1
+        return _looped_tc(int(rl[0]), v)
+
+    def wrap_reduction_accumulator(
+        self,
+        acc_full: str,
+        *,
+        thread_count: int,
+        loop_block_size: int,
+        acc_dtype: torch.dtype,
+    ) -> str:
+        # flydsl's runtime scf.for carries the accumulator as an iter_arg whose
+        # init type must match the vector<Vxf32> the loop body yields. V =
+        # per-lane elements = loop chunk / thread count (identical to the
+        # redcol_vec derived in memory_ops). thread_count = 64*W here, so
+        # loop_block_size // thread_count = V regardless of W.
+        # Only reached on the looped path, where thread_count is always > 0; a
+        # hard failure here is clearer than seeding V=1 and hitting a confusing
+        # downstream vector-type mismatch.
+        assert thread_count > 0, "flydsl looped reduction needs thread_count > 0"
+        vec = max(1, loop_block_size // thread_count)
+        return f"fx.Vector.filled({vec}, {acc_full}, {self.dtype_str(acc_dtype)})"
+
+    def looped_reduction_thread_count(
+        self,
+        *,
+        requested: int,
+        block_size: int,
+        block_index: int,
+        config: Config,
+        config_spec: ConfigSpec,
+    ) -> int | None:
+        # flydsl pins one wavefront (64 threads) per row. For bm>1 that is
+        # 64*bm threads = bm warps, each warp folding its own row -> per-row
+        # thread_count is 64. For bm==1 the row may span W wavefronts:
+        # thread_count = chunk // V (V from the shared cute_vector_widths knob),
+        # so W = thread_count // 64 and V are independent (chunk = 64*W*V);
+        # memory_ops derives redcol_vec = chunk // thread_count = V for free.
+        # (max_reduction_threads=64 caps ``requested`` at 64, so W>1 only comes
+        # from this override recomputing the count from the chunk.)
+        _bm = int(config.block_sizes[0]) if config.block_sizes else 1
+        if _bm != 1:
+            return 64
+        _vw = cast("list[int]", config.config.get("cute_vector_widths", []) or [])
+        _v = config_spec.cute_vector_widths.config_get(_vw, block_index, 1) or 1
+        return _looped_tc(block_size, int(_v))
+
+    def register_reduction_loop_config_slots(
+        self,
+        env: CompileEnvironment,
+        block_id: int,
+        size_hint: int,
+    ) -> None:
+        # FlyDSL shares the CuTe per-thread vector-width knob to pick V
+        # (elems/thread). Register the rdim slot here so the autotuner can set
+        # ``cute_vector_widths`` for a rolled reduction. cute registers its own
+        # slot in its own analysis block (device_ir.py), so this override is
+        # flydsl-only and avoids a duplicate slot for the same rdim.
+        from ...autotuner.config_spec import CuteVectorWidthSpec
+
+        env.config_spec.cute_vector_widths.append(
+            CuteVectorWidthSpec(block_id=block_id, size_hint=size_hint)
+        )
 
     @property
     def library_imports(self) -> dict[str, str]:
@@ -128,6 +255,7 @@ class FlyDSLBackend(Backend):
             "rocdl": "from flydsl.expr import rocdl",
             "gpu": "from flydsl.expr import gpu",
             "full": "from flydsl.expr.vector import full",
+            "ReductionOp": "from flydsl.expr.vector import ReductionOp",
             "helion": "import helion",
             "hl": "import helion.language as hl",
             "_default_flydsl_launcher": (
@@ -140,11 +268,15 @@ class FlyDSLBackend(Backend):
         return f"fx.block_idx.{'xyz'[dim]}"
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        # Elementwise: block = 64*bm (bm warps, one warp per row).
+        # W=1: block = 64*bm (bm warps, one warp per row). bn is pinned to 256.
         # AMD caps a workgroup at 1024 threads.
         bs = config.block_sizes
         bm = int(bs[0])
         n_threads = 64 * bm
+        # Whole-row looped reduction: threads = thread_count (W=1 -> 64).
+        _tc = self._flydsl_looped_thread_count(config, bm)
+        if _tc is not None:
+            n_threads = _tc
         if n_threads > 1024:
             raise exc.BackendUnsupported(
                 self.name, f"block too large: {n_threads} threads"
@@ -212,9 +344,15 @@ class FlyDSLBackend(Backend):
         force: bool = True,
         **kwargs: object,
     ) -> Config:
-        # Sole free knob is bm (rows/block = warps); columns are pinned to 256
-        # and bm capped at 16. FlyDSL has no precompile, so enumerate the few
-        # valid configs and FiniteSearch them in-process.
+        # Search space: free knobs are bm (rows/block = warps) and, for kernels
+        # with a rollable ``:`` reduction, the reduction chunk plus the per-thread
+        # vector width V. bn is pinned to 256 and bm capped at 16 (64*bm <= 1024)
+        # by adjust_block_size_constraints. bm==1 rows may span W wavefronts
+        # (thread_count = chunk // V, W = thread_count // 64); fp16/bf16 add V=8
+        # (128-bit BufferCopy). No constexpr_range (that lands in PR4). FlyDSL has
+        # no precompile and its JIT does not survive the subprocess benchmark
+        # workers the generic search spawns, so enumerate the valid configs and
+        # FiniteSearch them in-process.
         from ...runtime.config import Config
 
         spec = bound_kernel.config_spec
@@ -223,20 +361,94 @@ class FlyDSLBackend(Backend):
         if not isinstance(default_bs, list) or not default_bs:
             return default
         block_sizes = [int(b) for b in default_bs]
+        ndim = len(block_sizes)
 
         row_hint = spec.block_sizes[0].size_hint if spec.block_sizes else 1
         candidates: list[Config] = []
-        seen: set[tuple[int, ...]] = set()
+        seen: set[tuple[object, ...]] = set()
+
+        rl_ids = spec.reduction_loops.valid_block_ids()
+        n_rl = len(rl_ids)
+
+        # V=8 (128-bit BufferCopy) is valid only for 16-bit dtypes; fp32 tops out
+        # at V=4 (a V=8 fp32 copy is 256-bit -> BackendUnsupported). Reduction
+        # input dtype comes from the first tensor arg.
+        _dtype = getattr(args[0], "dtype", None) if args else None
+        _v_choices = (4, 8) if _dtype in (torch.float16, torch.bfloat16) else (4,)
+        _hi_loop = self.max_reduction_loop() or 64
+
+        user_tiled = _has_user_tiled_reduction(bound_kernel.env)
+        # For user-tiled reductions, pin ALL column dims to 256 in the template
+        # so every generated candidate (and the effective default) is valid.
+        if user_tiled and ndim >= 2:
+            for i in range(1, ndim):
+                block_sizes[i] = 256
+
+        # Numel of the first looped-reduction dim (used to filter OOB chunks).
+        rl_numel: int | None = None
+        if len(spec.reduction_loops):
+            rl_numel = spec.reduction_loops[0].size_hint
+
+        def _add(bs: list[int], rl: int | None, v: int | None = None) -> None:
+            # Safety: for user-tiled reductions all column dims must be multiples
+            # of 256 (one warp-pass = 64 lanes x 4 elems). Reject bad configs.
+            if user_tiled and any(b % 256 != 0 for b in bs[1:]):
+                return
+            # Safety: reject a looped chunk whose last pass OOBs the divided
+            # buffer (hardware buffer instructions fault on true OOB). The bound
+            # is V-dependent (V = elems/thread), so it moves with the candidate's
+            # V -- keep this in sync with the (chunk, V) enumeration below. When
+            # ``v`` is None (bm>1 warp-per-row: one 64-lane warp folds the row),
+            # memory_ops derives V = chunk // 64, so use that here too rather than
+            # V=1 -- otherwise this models the undivided element space and the
+            # bound diverges from the codegen it guards.
+            if rl is not None and rl_numel is not None and rl_numel > 0:
+                v_eff = v if v is not None else max(1, rl // 64)
+                tc = rl // v_eff
+                last_offset = ((rl_numel + rl - 1) // rl - 1) * rl
+                max_div_idx = last_offset // v_eff + tc - 1
+                n_div = (rl_numel + v_eff - 1) // v_eff
+                if max_div_idx >= n_div:
+                    return
+            key = (tuple(bs), rl, v)
+            if key in seen:
+                return
+            seen.add(key)
+            kw: dict[str, Any] = {"block_sizes": list(bs)}
+            if rl is not None:
+                kw["reduction_loops"] = [rl] * n_rl
+                if v is not None:
+                    kw["cute_vector_widths"] = [v] * n_rl
+            candidates.append(Config(**kw))
+
         for bm in (1, 2, 4, 8, 16):
             if bm > max(row_hint, 1):
                 continue
             bs = list(block_sizes)
             bs[0] = bm
-            key = tuple(bs)
-            if key in seen:
+            if ndim >= 2:
+                for i in range(1, ndim):
+                    bs[i] = 256
+            _add(bs, None)  # persistent
+            if not rl_ids:
                 continue
-            seen.add(key)
-            candidates.append(Config(block_sizes=list(bs)))
+            if bm == 1:
+                # bm==1: one row may span W wavefronts. thread_count = chunk // V,
+                # W = thread_count // 64 (<=16). Enumerate (chunk, V): chunk from
+                # 64*V (W=1) up to 1024*V (W=16), V in {4} (+8 for fp16/bf16).
+                for v in _v_choices:
+                    c = 64 * v
+                    while c <= _hi_loop and (c // v) <= 1024:
+                        _add(bs, c, v)
+                        c *= 2
+            else:
+                # bm>1: one warp/row (thread_count 64), V = chunk // 64 derived
+                # from the chunk. Offer chunk = 64*V for V in {1,2,4} (+8 fp16).
+                _bm_vs = {1, 2, 4} | ({8} if 8 in _v_choices else set())
+                for v in sorted(_bm_vs):
+                    c = 64 * v
+                    if c <= _hi_loop:
+                        _add(bs, c, None)
 
         if not candidates:
             return default
@@ -245,13 +457,39 @@ class FlyDSLBackend(Backend):
 
         # Benchmark in-process: FlyDSL's JIT/HIP-stream state does not survive
         # the precompile/benchmark subprocess workers, so disable both paths.
-        # In-place mutation of per-bind settings mirrors the base autotune().
+        # These describe a permanent flydsl capability (its JIT can NEVER use the
+        # subprocess workers), so they stay disabled for the bind -- not restored,
+        # unlike baseline_fn below. In-place mutation mirrors the base autotune().
         bound_kernel.settings.autotune_precompile = None
         bound_kernel.settings.autotune_benchmark_subprocess = False
 
+        # The default config (used as autotune baseline) may carry a
+        # reduction_loops chunk that OOBs for non-power-of-2 N; use the
+        # persistent (looped-off) config as the baseline so the accuracy check
+        # compares against a safe reference. Unlike the two settings above this is
+        # a temporary per-autotune override, so restore it in the finally so it
+        # does not leak into a later explicit compile_config on the same bind.
+        prev_baseline_fn = bound_kernel.settings.autotune_baseline_fn
+        if prev_baseline_fn is None and rl_numel is not None:
+            safe_bs = (
+                [block_sizes[0]] + ([256] * (ndim - 1))
+                if ndim >= 2
+                else [block_sizes[0]]
+            )
+            persistent_config = Config(block_sizes=safe_bs)
+            persistent_fn = bound_kernel.compile_config(
+                persistent_config, allow_print=False
+            )
+            bound_kernel.settings.autotune_baseline_fn = lambda *a, _fn=persistent_fn: (
+                _fn(*a)
+            )
+
         from ...autotuner import FiniteSearch
 
-        return FiniteSearch(bound_kernel, args, candidates).autotune()
+        try:
+            return FiniteSearch(bound_kernel, args, candidates).autotune()
+        finally:
+            bound_kernel.settings.autotune_baseline_fn = prev_baseline_fn
 
     def pre_codegen(
         self,
@@ -261,11 +499,39 @@ class FlyDSLBackend(Backend):
     ) -> None:
         from ...language import memory_ops
 
-        # Elementwise regime: block_sizes = [bm] (or [bm, 256]) -> bm rows/block,
-        # one warp (64 lanes) per row, block = 64*bm threads.
+        # Reset per-compilation state so helpers are re-emitted on each compile.
+        self._flydsl_needs_warp_helpers = False
+        self._flydsl_helpers_emitted = False
+        # Two regimes, encoded in block_sizes:
+        #   W=1 (small-N): [bm, 256] -> bm rows/block, 1 warp/row, block = 64*bm.
+        #   W>1 (large-N): [1, ...]  -> 1 row/block, W warps cooperate, 64*W,
+        #                              W = thread_count // 64 from (chunk, V).
         bs = config.block_sizes or [1]
         bm = int(bs[0])
-        self._flydsl_num_threads = 64 * bm
+
+        # Guard: for user-tiled (explicit hl.tile(n)) reductions every column
+        # block size must be a multiple of 256 (= V*64 = one warp-pass width).
+        # The lane index formula ``offset//4 + lane`` goes OOB for any other bn.
+        # This fires for neighbor-explored configs (e.g. bn=128 from autotune)
+        # that the autotune() candidate filter cannot reject because they are
+        # generated after the candidate list is built.
+        from ..compile_environment import CompileEnvironment
+
+        _env = CompileEnvironment.current()
+        if _has_user_tiled_reduction(_env) and any(int(b) % 256 != 0 for b in bs[1:]):
+            raise exc.BackendUnsupported(
+                self.name,
+                f"explicit hl.tile(n) reduction: column block size must be a "
+                f"multiple of 256 (got block_sizes={list(bs)})",
+            )
+
+        # Whole-row looped reduction: thread_count = 64*W from (chunk, V). W>1
+        # means W wavefronts cooperate on one row (bm==1) via the smem block
+        # reduce; else one warp per row -> 64*bm.
+        _tc = self._flydsl_looped_thread_count(config, bm)
+        W = _tc // 64 if _tc is not None else 1
+        self._flydsl_warps_per_row = W
+        self._flydsl_num_threads = 64 * W if W > 1 else 64 * bm
 
         # Reset per-compile; every load/store tensor takes the vectorized buffer path.
         self._tensor_use_buffer = {}
@@ -322,6 +588,23 @@ class FlyDSLBackend(Backend):
         # The literal 4 is the fp16 vec width (fp16-only; fp32 needs the derived
         # width, see _flydsl_buffer_setup).
         return f"{offsets_var} = ({lid}) // 4 + fx.thread_idx.x % 64"
+
+    def range_str(self, begin: str | None, end: str, step: str | None) -> str | None:
+        # Runtime scf.for. The step may be a module-level literal variable
+        # (e.g. _REDUCTION_BLOCK_1) which scf.for materialises as an SSA value.
+        # (PR4 adds the range_constexpr register-caching path.)
+        #
+        # Invariant: flydsl reaches range_str ONLY for the whole-row rolled
+        # reduction loop (a LoopedReductionStrategy device loop); the outer grid
+        # is driven off fx.block_idx, not a range(). We therefore emit a runtime
+        # range() unconditionally, ignoring static_ranges/unroll config. This
+        # method's string-only args cannot see the loop type to assert on, so the
+        # invariant is enforced by convention today -- a range_str that keys off
+        # the loop kind lands with the second flydsl loop path (PR4).
+        args = [a for a in [begin, end] if a is not None]
+        if step and step != "1":
+            args.append(step)  # keep step as-is
+        return "range(" + ", ".join(args) + ")"
 
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
@@ -531,6 +814,176 @@ class FlyDSLBackend(Backend):
                 raise exc.BackendUnsupported(backend_name, f"op {name!r}")
 
         return FlyDSLOpOverrides()
+
+    def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
+        from ..ast_extension import statement_from_string
+
+        # Emit the warp-reduce helper defs once, and only for kernels that
+        # actually reduce (reduction_expr sets _needs_warp_helpers). This hook
+        # runs per scalar arg after the kernel body is generated, so the flag is
+        # already set by the time we get here; a pure-elementwise kernel leaves
+        # it False and emits nothing.
+        if self._flydsl_helpers_emitted or not self._flydsl_needs_warp_helpers:
+            return []
+        self._flydsl_helpers_emitted = True
+
+        # Intra-warp fold: one warp per row -> warp shuffle covers 64 lanes, no
+        # smem. The 6 XOR-shuffle folds (log2 64) are unrolled here rather than
+        # emitted as a range_constexpr loop (that register-caching path lands in
+        # PR4). The warp helpers are needed by BOTH regimes: W=1 uses them
+        # directly; the W>1 block reduce calls them for the intra-warp step.
+        def _fold(step_op: str) -> str:
+            return "\n".join(
+                f"    w = {step_op.format(off=64 >> (s + 1))}" for s in range(6)
+            )
+
+        _wmax_body = _fold("w.maximumf(w.shuffle_xor({off}, 64))")
+        _wsum_body = _fold(
+            "w.addf(w.shuffle_xor({off}, 64), fastmath=arith.FastMathFlags.fast)"
+        )
+        stmts: list[ast.AST] = [
+            statement_from_string(h)
+            for h in [
+                f"def _flydsl_wmax(w):\n{_wmax_body}\n    return w",
+                f"def _flydsl_wmin(w):\n    w = -w\n{_wmax_body}\n    return -w",
+                f"def _flydsl_wsum(w):\n{_wsum_body}\n    return w",
+            ]
+        ]
+
+        if self._flydsl_warps_per_row <= 1:
+            return stmts
+
+        # W>1: W warps cooperate on one row -> cross-warp block reduce via smem.
+        # Each warp folds its 64 lanes with the warp helper, lane 0 writes the
+        # partial to slot ``_wave`` of a fp32 smem buffer, then warp 0 folds the
+        # W partials and broadcasts the result via the disjoint result slot.
+        _WARP = 64
+        _SLOTS = max(1, self._flydsl_num_threads // _WARP)  # one partial per wave
+        _RESULT = _SLOTS  # result slot, disjoint from partials [0.._SLOTS-1]
+        _TOTAL = _SLOTS + 1
+
+        stmts.extend(
+            [
+                statement_from_string(
+                    f"""@fx.struct
+class _FlyDSLRedBuf:
+    s: fx.Array[fx.Float32, {_TOTAL}, 16]  # {_TOTAL} fp32 slots; 16 = alignment bytes"""
+                ),
+                statement_from_string(
+                    "_flydsl_lds = fx.SharedAllocator().allocate(_FlyDSLRedBuf).peek()"
+                ),
+                statement_from_string(
+                    f"_flydsl_sred = _flydsl_lds.s.view(fx.make_layout({_TOTAL}, 1))"
+                ),
+            ]
+        )
+
+        # ``_ident`` seeds the inactive lanes of warp 0's final fold with the
+        # reduction identity so out-of-range slots don't perturb the result.
+        _block = [
+            ("_flydsl_bmax", "_flydsl_wmax", "fx.Float32(-3.4028235e+38)"),
+            ("_flydsl_bmin", "_flydsl_wmin", "fx.Float32(3.4028235e+38)"),
+            ("_flydsl_bsum", "_flydsl_wsum", "fx.Float32(0.0)"),
+        ]
+        for _bname, _wname, _ident in _block:
+            stmts.append(
+                statement_from_string(
+                    f"""def {_bname}(w, _sred):
+    gpu.barrier()
+    _lane = fx.thread_idx.x % {_WARP}
+    _wave = fx.thread_idx.x // {_WARP}
+    _nwaves = fx.block_dim.x // {_WARP}
+    _r = {_wname}(w)
+    if _lane == 0:
+        fx.memref_store(_r, _sred, _wave)
+    gpu.barrier()
+    if _wave == 0:
+        _in = _lane < _nwaves
+        _ls = _in.select(_lane, 0)
+        _v = fx.memref_load(_sred, _ls)
+        _vv = _in.select(_v, {_ident})
+        _vv = {_wname}(_vv)
+        if _lane == 0:
+            fx.memref_store(_vv, _sred, {_RESULT})
+    gpu.barrier()
+    _out = fx.memref_load(_sred, {_RESULT})
+    gpu.barrier()
+    return _out"""
+                )
+            )
+        return stmts
+
+    def reduction_combine_expr(
+        self,
+        reduction_type: str,
+        acc: str,
+        val: str,
+        dtype: torch.dtype,
+    ) -> str:
+        # Looped-reduction accumulate step. ``acc`` is a per-thread vector
+        # (wrap_reduction_accumulator seeds it as fx.Vector.filled before the
+        # loop); the freshly-loaded ``val`` goes on the LEFT so the final
+        # _flydsl_wsum/_wmax fold calls .reduce() on a vector.
+        #
+        # Both operands must share the accumulator dtype (e.g. fp16 input folded
+        # into an fp32 acc), so cast the freshly-loaded value first.
+        val = self.cast_expr(val, self.dtype_str(dtype))
+        # ``maximumf``/``minimumf`` require both operands to be the SAME vector
+        # shape. Re-broadcast acc to ``val``'s shape with ``Vector.filled_like(
+        # val, 0) + acc`` -- a shape-only zero vector plus acc -- NOT
+        # ``(val) - (val)``: a masked tail reduction feeds ``val = +/-inf``
+        # (identity from _mask_to), and ``inf - inf`` is NaN. This is a no-op when
+        # acc already matches val's shape. ``sum`` uses ``+`` directly (it
+        # promotes either way; the masked tail feeds a finite 0 identity).
+        if reduction_type == "sum":
+            return f"({val}) + ({acc})"
+        acc_bc = f"(fx.Vector.filled_like({val}, 0) + ({acc}))"
+        if reduction_type == "max":
+            return f"({val}).maximumf({acc_bc})"
+        if reduction_type == "min":
+            # flydsl Vector has no ``.minimumf``; use min(a,b) = -max(-a,-b).
+            return f"(-((-({val})).maximumf((-({acc_bc})))))"
+        raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
+
+    def reduction_expr(
+        self,
+        input_name: str,
+        reduction_type: str,
+        dim: int,
+        *,
+        block_size_var: str | None = None,
+        threads_in_group: int | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> str:
+        # The _flydsl_{w,b}{sum,max,min} helper defs these calls reference are
+        # emitted by scalar_arg_preamble (which runs after this body is
+        # generated); flag that they are needed so they are emitted only for
+        # reducing kernels.
+        if reduction_type not in ("sum", "max", "min"):
+            raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
+        self._flydsl_needs_warp_helpers = True
+        # fast-math is applied to ``sum`` only, on purpose: float add is not
+        # associative and the shuffle fold reorders it, so ``fast`` authorizes
+        # that reordering; max/min are order-independent and need no flag.
+        if self._flydsl_warps_per_row == 1:
+            # W=1: one warp per row -> warp shuffle covers the whole row, no smem.
+            if reduction_type == "sum":
+                return f"_flydsl_wsum({input_name}.reduce(ReductionOp.ADD, fastmath=arith.FastMathFlags.fast))"
+            if reduction_type == "max":
+                return f"_flydsl_wmax({input_name}.reduce(ReductionOp.MAX))"
+            return f"_flydsl_wmin({input_name}.reduce(ReductionOp.MIN))"
+        # W>1: W warps cooperate on one row -> cross-warp block reduce via shared
+        # mem. The cross-warp buffer ``_flydsl_sred`` is fx.Float32, so the
+        # per-thread ``.reduce(...)`` scalar MUST be fp32 before it is stored to /
+        # reloaded from smem. An fp16 reduce result (e.g. ``torch.amax`` on an
+        # fp16 tile) round-trips through the fp32 smem incorrectly and corrupts
+        # the fold -> systematically wrong max/min. ``.to(fx.Float32)`` fixes it;
+        # it is a no-op for the already-fp32 sum accumulator.
+        if reduction_type == "sum":
+            return f"_flydsl_bsum(({input_name}.reduce(ReductionOp.ADD, fastmath=arith.FastMathFlags.fast)).to(fx.Float32), _flydsl_sred)"
+        if reduction_type == "max":
+            return f"_flydsl_bmax(({input_name}.reduce(ReductionOp.MAX)).to(fx.Float32), _flydsl_sred)"
+        return f"_flydsl_bmin(({input_name}.reduce(ReductionOp.MIN)).to(fx.Float32), _flydsl_sred)"
 
     def reshape_expr(self, expr: str, shape: str) -> str:
         return expr

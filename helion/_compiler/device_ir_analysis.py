@@ -3,10 +3,13 @@ from __future__ import annotations
 import dataclasses
 from itertools import starmap
 import logging
+import math
 import operator
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 
+import sympy
 import torch
 
 from .. import language as hl
@@ -28,23 +31,25 @@ from ..autotuner.config_spec import RootGridFact
 from ..autotuner.config_spec import SymbolicLoopBound
 from ..language import _tracing_ops
 from .compile_environment import FixedBlockSizeSource
+from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
+from .tile_dependency import _relation_product_is_within_budget
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Container
     from collections.abc import Iterable
 
-    import sympy
-
     from ..autotuner.config_spec import ConfigSpec
     from .compile_environment import CompileEnvironment
     from .device_ir import DeviceIR
     from .device_ir import GraphInfo
     from .host_function import HostFunction
+    from .tile_dependency import AffineSubscriptRange
+    from .tile_dependency import IntegerExpression
     from .tile_dependency import TileAccess
 
 
@@ -175,10 +180,14 @@ def _immovable_extent(
         return None
     if value is None:
         return None
-    try:
-        return max(1, int(env.size_hint(value)))
-    except Exception:
+    if type(value) is int:
+        return max(1, value)
+    if not isinstance(value, torch.SymInt):
         return None
+    expression = env.shape_env.simplify(_symint_sympy_expr(value))
+    if expression.free_symbols or not isinstance(expression, sympy.Integer):
+        return None
+    return max(1, int(expression))
 
 
 def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
@@ -318,6 +327,460 @@ def _subscript_static_extent(subscript: object) -> int | None:
 def _subscript_is_full_slice(subscript: object) -> bool:
     """Return whether a tensor subscript covers its complete dimension."""
     return isinstance(subscript, slice) and subscript == slice(None)
+
+
+@dataclasses.dataclass(frozen=True)
+class _AffineIndexScalar:
+    """One scalar index in the bounded quasi-affine access subset.
+
+    Each term is ``(root axis, coefficient, static divisor)``.  Divisor one is
+    the ordinary affine case; larger divisors are admitted only for a direct,
+    unshifted scalar ``tile.id // divisor``.
+    """
+
+    coefficients: tuple[tuple[int, IntegerExpression, int], ...]
+    offset: IntegerExpression
+
+    def scaled(self, factor: IntegerExpression) -> _AffineIndexScalar:
+        return _AffineIndexScalar(
+            tuple(
+                (axis, sympy.simplify(coefficient * factor), divisor)
+                for axis, coefficient, divisor in self.coefficients
+            ),
+            sympy.simplify(self.offset * factor),
+        )
+
+    def plus(self, other: _AffineIndexScalar) -> _AffineIndexScalar:
+        coefficients: dict[tuple[int, int], int | sympy.Expr] = {
+            (axis, divisor): coefficient
+            for axis, coefficient, divisor in self.coefficients
+        }
+        for axis, coefficient, divisor in other.coefficients:
+            key = axis, divisor
+            coefficients[key] = sympy.simplify(coefficients.get(key, 0) + coefficient)
+        return _AffineIndexScalar(
+            tuple(
+                sorted(
+                    (
+                        (axis, value, divisor)
+                        for (axis, divisor), value in coefficients.items()
+                        if value
+                    ),
+                    key=lambda item: (
+                        item[0],
+                        item[2],
+                        sympy.default_sort_key(item[1]),
+                    ),
+                )
+            ),
+            sympy.simplify(self.offset + other.offset),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _AffineIndexTensor:
+    """A small, statically shaped tensor of quasi-affine scalar indices."""
+
+    shape: tuple[int, ...]
+    values: tuple[_AffineIndexScalar, ...]
+
+
+def _flat_coordinate(index: int, shape: tuple[int, ...]) -> tuple[int, ...]:
+    coordinates = [0] * len(shape)
+    for dimension in range(len(shape) - 1, -1, -1):
+        coordinates[dimension] = index % shape[dimension]
+        index //= shape[dimension]
+    return tuple(coordinates)
+
+
+def _flat_index(coordinates: tuple[int, ...], shape: tuple[int, ...]) -> int:
+    result = 0
+    for coordinate, size in zip(coordinates, shape, strict=True):
+        result = result * size + coordinate
+    return result
+
+
+def _broadcast_affine_value(
+    value: _AffineIndexTensor,
+    coordinates: tuple[int, ...],
+) -> _AffineIndexScalar | None:
+    if len(value.shape) > len(coordinates):
+        return None
+    padding = len(coordinates) - len(value.shape)
+    projected: list[int] = []
+    for dimension, size in enumerate(value.shape):
+        coordinate = coordinates[padding + dimension]
+        if size == 1:
+            projected.append(0)
+        elif coordinate < size:
+            projected.append(coordinate)
+        else:
+            return None
+    return value.values[_flat_index(tuple(projected), value.shape)]
+
+
+def _broadcast_shape(
+    left: tuple[int, ...],
+    right: tuple[int, ...],
+) -> tuple[int, ...] | None:
+    result: list[int] = []
+    for offset in range(1, max(len(left), len(right)) + 1):
+        left_size = left[-offset] if offset <= len(left) else 1
+        right_size = right[-offset] if offset <= len(right) else 1
+        if left_size != right_size and left_size != 1 and right_size != 1:
+            return None
+        result.append(max(left_size, right_size))
+    shape = tuple(reversed(result))
+    return shape if _relation_product_is_within_budget(math.prod(shape)) else None
+
+
+def _broadcast_only_index_shape(
+    source_shape: tuple[int, ...],
+    index: object,
+) -> tuple[int, ...] | None:
+    """Apply only ``None`` insertion and full slices to a small shape."""
+    if not isinstance(index, (list, tuple)):
+        return None
+    source_dimension = 0
+    result: list[int] = []
+    for item in index:
+        if item is None:
+            result.append(1)
+        elif _subscript_is_full_slice(item) and source_dimension < len(source_shape):
+            result.append(source_shape[source_dimension])
+            source_dimension += 1
+        else:
+            return None
+    if source_dimension != len(source_shape):
+        return None
+    return tuple(result)
+
+
+def _affine_shape_matches_fake(
+    env: CompileEnvironment,
+    modeled_shape: tuple[int, ...],
+    fake: torch.Tensor,
+) -> bool:
+    """Prove each modeled logical lane dimension matches its FX dimension.
+
+    A reduction iota is represented here by its full logical extent even when
+    lowering later tiles that extent.  Padded physical lanes are masked by the
+    reduction lowering; the logical extent is the exact accessed index set.
+    """
+    if len(modeled_shape) != fake.ndim:
+        return False
+    for modeled_extent, fake_extent in zip(modeled_shape, fake.shape, strict=True):
+        if env.known_equal(fake_extent, modeled_extent):
+            continue
+        block_id = env.resolve_block_id(fake_extent)
+        if block_id is None or not (0 <= block_id < len(env.block_sizes)):
+            return False
+        info = env.block_sizes[block_id]
+        if isinstance(info.size, int | torch.SymInt) and env.known_equal(
+            info.size, modeled_extent
+        ):
+            continue
+        fixed_extent = _immovable_extent(env, env.config_spec, block_id)
+        if fixed_extent is None or fixed_extent != modeled_extent:
+            return False
+    return True
+
+
+def _affine_subscript_ranges(
+    env: CompileEnvironment,
+    subscript: object,
+) -> tuple[AffineSubscriptRange, ...] | None:
+    """Recover an exact bounded quasi-affine set for a flattened tensor index.
+
+    This handles the common source idiom ``view(-1)[affine_offsets]`` without
+    changing the emitted memory operation.  Only fixed-width tile indices,
+    direct scalar ``tile.id // constant``, static iotas, broadcasting,
+    host-backed nonnegative integer scaling, and addition are accepted.
+    Unsupported expressions decline to the existing root-barrier fallback.
+    """
+    from ..language import memory_ops
+    from ..language import view_ops
+    from ..language.tile_ops import tile_index
+
+    memo: dict[torch.fx.Node, _AffineIndexTensor | None] = {}
+
+    def host_scalar_expression(value: object) -> sympy.Expr | None:
+        if type(value) is int:
+            return sympy.Integer(value)
+        if isinstance(value, torch.fx.Node):
+            value = value.meta.get("val")
+        if type(value) is int:
+            return sympy.Integer(value)
+        if not isinstance(value, torch.SymInt):
+            return None
+        expression = env.shape_env.simplify(_symint_sympy_expr(value))
+        if _has_unbacked(expression) or expression.is_integer is not True:
+            return None
+        return expression
+
+    def evaluate(value: object) -> _AffineIndexTensor | None:
+        scalar_expression = host_scalar_expression(value)
+        if scalar_expression is not None:
+            return _AffineIndexTensor(
+                (),
+                (_AffineIndexScalar((), scalar_expression),),
+            )
+        if not isinstance(value, torch.fx.Node):
+            return None
+        if value in memo:
+            return memo[value]
+        memo[value] = None
+        target = value.target
+        args = value.args
+        result: _AffineIndexTensor | None = None
+        if target is torch.ops.prims.iota.default:
+            length = args[0] if args else None
+            start = value.kwargs.get("start", 0)
+            step = value.kwargs.get("step", 1)
+            if (
+                isinstance(length, int)
+                and isinstance(start, int)
+                and isinstance(step, int)
+                and length >= 0
+                and step > 0
+                and _relation_product_is_within_budget(length)
+            ):
+                result = _AffineIndexTensor(
+                    (length,),
+                    tuple(
+                        _AffineIndexScalar((), start + lane * step)
+                        for lane in range(length)
+                    ),
+                )
+        elif target is tile_index and args and isinstance(args[0], torch.fx.Node):
+            info = subscript_tile_info(env, args[0])
+            extent = (
+                None
+                if info is None
+                else _immovable_extent(env, env.config_spec, info.block_id)
+            )
+            if (
+                info is not None
+                and extent is not None
+                and isinstance(info.offset, int)
+                and _relation_product_is_within_budget(extent)
+            ):
+                result = _AffineIndexTensor(
+                    (extent,),
+                    tuple(
+                        _AffineIndexScalar(
+                            ((info.block_id, extent, 1),),
+                            info.offset + lane,
+                        )
+                        for lane in range(extent)
+                    ),
+                )
+        elif target is hl.tile_id and args and isinstance(args[0], torch.fx.Node):
+            info = subscript_tile_info(env, args[0])
+            if info is not None and env.known_equal(info.offset, 0):
+                result = _AffineIndexTensor(
+                    (),
+                    (_AffineIndexScalar(((info.block_id, 1, 1),), 0),),
+                )
+        elif target is view_ops.subscript and args:
+            index = args[1] if len(args) >= 2 else None
+            if isinstance(index, (list, tuple)) and all(
+                item is None or _subscript_is_full_slice(item) for item in index
+            ):
+                base = evaluate(args[0])
+                if base is not None:
+                    indexed_shape = _broadcast_only_index_shape(base.shape, index)
+                    if indexed_shape is not None:
+                        result = _AffineIndexTensor(indexed_shape, base.values)
+        elif target is memory_ops.load and args:
+            index = args[1] if len(args) >= 2 else None
+            extra_mask = args[2] if len(args) >= 3 else value.kwargs.get("extra_mask")
+            if (
+                extra_mask is None
+                and isinstance(index, (list, tuple))
+                and all(
+                    item is None or _subscript_is_full_slice(item) for item in index
+                )
+            ):
+                base = evaluate(args[0])
+                if base is not None:
+                    indexed_shape = _broadcast_only_index_shape(base.shape, index)
+                    if indexed_shape is not None:
+                        result = _AffineIndexTensor(indexed_shape, base.values)
+        elif target in (torch.ops.aten.add.Tensor, operator.add) and len(args) == 2:
+            alpha = value.kwargs.get("alpha", 1)
+            left = evaluate(args[0])
+            right = evaluate(args[1])
+            if alpha == 1 and left is not None and right is not None:
+                shape = _broadcast_shape(left.shape, right.shape)
+                if shape is None:
+                    return None
+                values: list[_AffineIndexScalar] = []
+                for index in range(math.prod(shape)):
+                    coordinates = _flat_coordinate(index, shape)
+                    left_value = _broadcast_affine_value(left, coordinates)
+                    right_value = _broadcast_affine_value(right, coordinates)
+                    if left_value is None or right_value is None:
+                        break
+                    values.append(left_value.plus(right_value))
+                if len(values) == math.prod(shape):
+                    result = _AffineIndexTensor(shape, tuple(values))
+        elif target in (torch.ops.aten.mul.Tensor, operator.mul) and len(args) == 2:
+            left = evaluate(args[0])
+            right = evaluate(args[1])
+
+            def scalar_factor(
+                value: _AffineIndexTensor | None,
+            ) -> IntegerExpression | None:
+                if (
+                    value is None
+                    or value.shape
+                    or len(value.values) != 1
+                    or value.values[0].coefficients
+                ):
+                    return None
+                return sympy.sympify(value.values[0].offset)
+
+            factor = scalar_factor(right)
+            base = left
+            if factor is None:
+                factor = scalar_factor(left)
+                base = right
+            if (
+                factor is not None
+                and factor.is_nonnegative is True
+                and base is not None
+            ):
+                result = _AffineIndexTensor(
+                    base.shape,
+                    tuple(item.scaled(factor) for item in base.values),
+                )
+        elif (
+            target
+            in (
+                operator.floordiv,
+                torch.ops.aten.floor_divide.default,
+                torch.ops.aten.floor_divide.Scalar,
+            )
+            and len(args) == 2
+        ):
+            dividend, divisor = args
+            if (
+                isinstance(dividend, torch.fx.Node)
+                and dividend.target is hl.tile_id
+                and isinstance(divisor, int)
+                and divisor > 0
+            ):
+                base = evaluate(dividend)
+                if (
+                    base is not None
+                    and base.shape == ()
+                    and len(base.values) == 1
+                    and base.values[0].offset == 0
+                    and len(base.values[0].coefficients) == 1
+                ):
+                    axis, coefficient, previous_divisor = base.values[0].coefficients[0]
+                    if coefficient == 1 and previous_divisor == 1:
+                        result = _AffineIndexTensor(
+                            (),
+                            (_AffineIndexScalar(((axis, 1, divisor),), 0),),
+                        )
+        if result is not None:
+            fake = value.meta.get("val")
+            if (
+                (
+                    result.shape
+                    and (
+                        not isinstance(fake, torch.Tensor)
+                        or not _affine_shape_matches_fake(env, result.shape, fake)
+                    )
+                )
+                or (not result.shape and isinstance(fake, torch.Tensor) and fake.ndim)
+                or len(result.values) != math.prod(result.shape)
+            ):
+                result = None
+        memo[value] = result
+        return result
+
+    affine = evaluate(subscript)
+    if affine is None or not affine.values:
+        return None
+    offsets_by_coefficients: dict[
+        tuple[tuple[int, IntegerExpression, int], ...],
+        set[IntegerExpression],
+    ] = {}
+    for value in affine.values:
+        if any(
+            sympy.sympify(coefficient).is_nonnegative is not True or divisor <= 0
+            for _axis, coefficient, divisor in value.coefficients
+        ):
+            return None
+        coefficients = tuple(
+            (axis, env.shape_env.simplify(sympy.sympify(coefficient)), divisor)
+            for axis, coefficient, divisor in value.coefficients
+        )
+        offset = env.shape_env.simplify(sympy.sympify(value.offset))
+        if offset.is_integer is not True:
+            return None
+        offsets_by_coefficients.setdefault(coefficients, set()).add(offset)
+
+    ranges: list[
+        tuple[
+            tuple[tuple[int, int | sympy.Expr, int], ...],
+            int | sympy.Expr,
+            int | sympy.Expr,
+            int,
+        ]
+    ] = []
+    for coefficients, offset_set in sorted(
+        offsets_by_coefficients.items(),
+        key=lambda item: tuple(
+            (axis, sympy.default_sort_key(coefficient), divisor)
+            for axis, coefficient, divisor in item[0]
+        ),
+    ):
+        offsets_by_symbolic_base: dict[Any, set[int]] = {}
+        for offset in offset_set:
+            constant, symbolic_base = sympy.expand(offset).as_coeff_Add()
+            if not isinstance(constant, sympy.Integer):
+                return None
+            offsets_by_symbolic_base.setdefault(symbolic_base, set()).add(int(constant))
+        for symbolic_base, offset_constants in sorted(
+            offsets_by_symbolic_base.items(),
+            key=lambda item: sympy.default_sort_key(item[0]),
+        ):
+            offsets = sorted(offset_constants)
+            begin = previous = offsets[0]
+            step: int | None = None
+            for offset in offsets[1:]:
+                difference = offset - previous
+                if step is None:
+                    step = difference
+                elif difference != step:
+                    ranges.append(
+                        (
+                            coefficients,
+                            symbolic_base + begin,
+                            symbolic_base + previous + step,
+                            step,
+                        )
+                    )
+                    begin = offset
+                    step = None
+                previous = offset
+            ranges.append(
+                (
+                    coefficients,
+                    symbolic_base + begin,
+                    (
+                        symbolic_base + begin + 1
+                        if step is None
+                        else symbolic_base + previous + step
+                    ),
+                    1 if step is None else step,
+                )
+            )
+    return tuple(ranges)
 
 
 def _store_axis_key(
@@ -1127,9 +1590,9 @@ class DeviceIRAnalysis:
                 fake = _accessed_tensor_fake(node)
                 origin = host.tensor_to_origin.get(fake) if fake is not None else None
                 allocation_id = -1
-                tensor_shape: tuple[int, ...] = ()
-                tensor_strides: tuple[int, ...] = ()
-                storage_offset = 0
+                tensor_shape: tuple[sympy.Expr, ...] = ()
+                tensor_strides: tuple[sympy.Expr, ...] = ()
+                storage_offset: sympy.Expr = sympy.Integer(0)
                 subscript_dims: tuple[int, ...] = ()
                 subscript_affine_block_ids: tuple[int | None, ...] = ()
                 subscript_index_scales: tuple[int, ...] = ()
@@ -1137,7 +1600,8 @@ class DeviceIRAnalysis:
                 subscript_is_scalar: tuple[bool, ...] = ()
                 subscript_is_full_slice: tuple[bool, ...] = ()
                 subscript_static_extents: tuple[int | None, ...] = ()
-                layout_is_static = False
+                affine_subscript_ranges = None
+                layout_is_symbolically_exact = False
 
                 if fake is not None:
                     storage = fake.untyped_storage()
@@ -1145,19 +1609,33 @@ class DeviceIRAnalysis:
                     allocation_id = allocation_ids.setdefault(
                         storage_key, len(allocation_ids)
                     )
-                    tensor_shape = tuple(env.size_hint(dim) for dim in fake.shape)
-                    tensor_strides = tuple(
-                        env.size_hint(stride) for stride in fake.stride()
+
+                    def symbolic_layout_value(
+                        value: int | torch.SymInt,
+                    ) -> sympy.Expr:
+                        if type(value) is int:
+                            return sympy.Integer(value)
+                        if not isinstance(value, torch.SymInt):
+                            raise TypeError(
+                                "tensor layout values must be integers or SymInts"
+                            )
+                        return env.shape_env.simplify(_symint_sympy_expr(value))
+
+                    raw_layout = (
+                        *fake.shape,
+                        *fake.stride(),
+                        fake.storage_offset(),
                     )
-                    storage_offset = env.size_hint(fake.storage_offset())
-                    layout_is_static = env.settings.static_shapes or all(
-                        type(value) is int
-                        for value in (
-                            *fake.shape,
-                            *fake.stride(),
-                            fake.storage_offset(),
-                        )
+                    symbolic_layout = tuple(
+                        symbolic_layout_value(value) for value in raw_layout
                     )
+                    layout_is_symbolically_exact = not any(
+                        _has_unbacked(expression) for expression in symbolic_layout
+                    )
+                    rank = fake.ndim
+                    tensor_shape = symbolic_layout[:rank]
+                    tensor_strides = symbolic_layout[rank : 2 * rank]
+                    storage_offset = symbolic_layout[-1]
                     index_list = node.args[1] if len(node.args) >= 2 else None
                     if isinstance(index_list, (list, tuple)):
                         subscript_dims = tuple(range(min(len(index_list), fake.ndim)))
@@ -1187,6 +1665,11 @@ class DeviceIRAnalysis:
                             _subscript_static_extent(index_list[position])
                             for position in subscript_dims
                         )
+                        if fake.ndim == 1 and subscript_dims == (0,):
+                            affine_subscript_ranges = _affine_subscript_ranges(
+                                env,
+                                index_list[0],
+                            )
 
                 has_explicit_mask = (
                     not is_atomic
@@ -1220,8 +1703,9 @@ class DeviceIRAnalysis:
                             subscript_is_full_slice=subscript_is_full_slice,
                             subscript_static_extents=subscript_static_extents,
                             is_atomic=is_atomic,
-                            layout_is_static=layout_is_static,
+                            layout_is_symbolically_exact=layout_is_symbolically_exact,
                             graph_node_index=graph_node_index,
+                            affine_subscript_ranges=affine_subscript_ranges,
                         )
                     )
                 if not is_atomic:

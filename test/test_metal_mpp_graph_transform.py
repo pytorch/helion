@@ -145,6 +145,8 @@ class TestMetalMPPGraphTransform(unittest.TestCase):
         self.assertEqual(mpp_graph.k_block_id, 2)
         self.assertEqual(mpp_graph.begin, [0])
         self.assertEqual(mpp_graph.end, [64])
+        self.assertEqual(mpp_graph.m_block_id, 0)
+        self.assertEqual(mpp_graph.n_block_id, 2)
         self.assertIsNotNone(mpp_graph.lhs_tensor)
         self.assertIsNotNone(mpp_graph.rhs_tensor)
         self.assertEqual(mpp_graph.acc_dtype, torch.float32)

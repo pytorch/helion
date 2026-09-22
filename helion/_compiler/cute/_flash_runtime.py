@@ -212,6 +212,392 @@ def flash_fa4_shared_storage(
     return SharedStorage
 
 
+@functools.cache
+def flash_bwd_shared_storage(
+    head_dim: int,
+    q_stage: int,
+    do_stage: int,
+    kv_stage: int = 1,
+    dtype: object = cutlass.Float16,
+) -> type:
+    """SharedStorage for the fused attention-BACKWARD kernel (1-CTA).
+
+    512 threads / 16 warps: 4 dQ-reduce warps, 2 compute warpgroups, one MMA
+    warp, one load warp. K/V are single-stage (one KV tile per CTA); Q/dO are
+    ``q_stage``/``do_stage``-deep TMA rings over the inner Q-tile loop. sdS is
+    the dS staging buffer consumed by the dK and dQ MMAs (two major-mode views
+    over the same bytes); sdQaccum stages the row-major fp32 dQ tile for the
+    ``cp.reduce.async.bulk`` global add. sLSE/sDelta are parity-double-buffered
+    per-warpgroup column stagings of the base-2 LSE and delta row vectors.
+    """
+
+    @cute.struct
+    class SharedStorage:
+        q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, q_stage * 2]
+        do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, do_stage * 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, kv_stage * 2]
+        s_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dp_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
+        dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_holding_buf: cutlass.Int32
+        # MMA operand start addresses, re-read with ld.volatile per iteration
+        mma_base: cute.struct.MemRange[cutlass.Int32, 8]
+        # CLC tile scheduler: 2-stage response ring (16 B each) + full/empty pairs
+        clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
+        sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sQ: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
+        ]
+        sdO: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * do_stage], 1024
+        ]
+        sK: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+        ]
+        sV: cute.struct.Align[
+            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+        ]
+        sdS: cute.struct.Align[cute.struct.MemRange[dtype, 128 * 128], 1024]
+        # dQ drain staging for the 2D TMA tensor reduce-add: 8 x (32 x 32) fp32
+        # boxes in the canonical SWIZZLE_128B epilogue layout (4KB each, 1KB
+        # aligned), a 2-deep ring per reduce warp. Each lane owns one dQ row
+        # and stores a 32-column chunk as 8 x 16B; the swizzle keeps the 8
+        # lanes of a quarter-warp in distinct 16B bank groups, and one
+        # cp.reduce.async.bulk.tensor per box adds it into row-major dQ.
+        sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 8192], 1024]
+
+    return SharedStorage
+
+
+@dsl_user_op
+def cpasync_reduce_bulk_add_f32(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    store_bytes: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Bulk-group async global reduce-add (f32) from a contiguous smem chunk.
+
+    Ported from flash-attention main's ``copy_utils.cpasync_reduce_bulk_add_f32``
+    (the dQaccum accumulation primitive). Pair with
+    ``cute.arch.cp_async_bulk_commit_group`` / ``cp_async_bulk_wait_group``.
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, smem_ptr_i32, cutlass.Int32(store_bytes).ir_value()],
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def fbwd_p_pairs_packed(
+    frg: cute.Tensor,
+    lse_frg: cute.Tensor,
+    off: int,
+    cnt: int,
+    scale2: Float32,
+    mask_lim: object = None,
+    col_base: int = 0,
+    exp2_f32: bool = False,
+) -> None:
+    """In-place P = exp2(s * scale2 - lse[col]) over one chunk, packed pairs.
+
+    Mirrors flash-attention main's backward softmax recompute
+    (fma_packed_f32x2 + two fastmath exp2 per f32 pair). ``mask_lim`` (when
+    not None) applies the causal keep-threshold ``col >= mask_lim`` with
+    ``col = col_base + pair index`` (columns are the static fragment order).
+    ``exp2_f32`` (autotuner knob ``cute_flash_bwd_exp2_f32``) evaluates the two
+    exp2 on the f32 MUFU path (two ex2.approx.ftz.f32, no f16 pack/unpack);
+    otherwise one packed ex2.approx.f16x2 serves the pair. The f32 path is
+    ~2-5% faster where the compute warps are latency-bound (causal / d64),
+    the f16x2 one where the MUFU pipe is the limit (d128 non-causal).
+    """
+    frg_any = cast("Any", frg)
+    lse_any = cast("Any", lse_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.fma_packed_f32x2(
+            (frg_any[off + 2 * v], frg_any[off + 2 * v + 1]),
+            (scale2, scale2),
+            (-lse_any[2 * v], -lse_any[2 * v + 1]),
+        )
+        if exp2_f32:
+            a = cute.arch.exp2(a)
+            b = cute.arch.exp2(b)
+        else:
+            a, b = exp2_approx_f16x2_to_f32(a, b)
+        if mask_lim is not None:
+            ka = cutlass.Boolean(cutlass.Int32(col_base + 2 * v) >= mask_lim)
+            kb = cutlass.Boolean(cutlass.Int32(col_base + 2 * v + 1) >= mask_lim)
+            a = Float32(cutlass.select_(ka, a, Float32(0.0)))
+            b = Float32(cutlass.select_(kb, b, Float32(0.0)))
+        frg_any[off + 2 * v] = a
+        frg_any[off + 2 * v + 1] = b
+
+
+def fbwd_ds_pairs_packed(
+    dp_frg: cute.Tensor,
+    p_frg: cute.Tensor,
+    p_off: int,
+    dlt_frg: cute.Tensor,
+    cnt: int,
+) -> None:
+    """In-place dS = P * (dP - delta[col]) over one chunk, packed pairs."""
+    dp_any = cast("Any", dp_frg)
+    p_any = cast("Any", p_frg)
+    dlt_any = cast("Any", dlt_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.sub_packed_f32x2(
+            (dp_any[2 * v], dp_any[2 * v + 1]),
+            (dlt_any[2 * v], dlt_any[2 * v + 1]),
+        )
+        a, b = cute.arch.mul_packed_f32x2(
+            (p_any[p_off + 2 * v], p_any[p_off + 2 * v + 1]), (a, b)
+        )
+        dp_any[2 * v] = a
+        dp_any[2 * v + 1] = b
+
+
+@functools.cache
+def flash_bwd_2cta_shared_storage(
+    head_dim: int,
+    dtype: object = cutlass.Float16,
+) -> type:
+    """SharedStorage for the 2-CTA (cluster (2,1,1)) fused backward kernel.
+
+    Per-CTA operand halves per the FA4 SM100 2-CTA backward: sQ/sdOt are the
+    natural-orientation (tile_m/2, D) halves feeding the S and dP gemms;
+    sdO/sQt are transposed (D/2, tile_m) halves feeding dV and dK; sKt is the
+    (D/2, 2*tile_n) B operand of the cluster-wide dQ gemm; sdS is the
+    exchanged dQ A operand (q-half x 2*tile_n) and sdS_xchg stages the
+    outgoing half for the DSMEM copy. All six TMA loads ride
+    PipelineTmaUmma pairs; the raw mbarriers are the leader-side handshakes.
+    """
+    half = 64 * head_dim  # (tile/2, D) or (D/2, tile) halves, in elements
+
+    @cute.struct
+    class SharedStorage:
+        q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        kt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        k_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        v_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        do_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        s_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dp_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        p_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_tmem_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_smem_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dq_empty_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        dkv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        # dV accumulation complete (before the tail dK/dQ): WG0 starts its epilogue early
+        dv_done_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_cluster_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        ds_cluster_leader_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        s_read_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        tmem_holding_buf: cutlass.Int32
+        # MMA operand start addresses, re-read with ld.volatile every
+        # iteration so ptxas cannot hoist the per-k descriptors (see
+        # ``ld_volatile_shared_u32``).
+        mma_base: cute.struct.MemRange[cutlass.Int32, 8]
+        # CLC tile scheduler: 2-stage response ring (16 B each) + full/empty pairs
+        clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        clc_response: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 8], 16]
+        sLSE: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sDelta: cute.struct.MemRange[cutlass.Float32, 2 * 128]
+        sQ: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sdOt: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sdO: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sQt: cute.struct.Align[cute.struct.MemRange[dtype, half], 1024]
+        sK: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sV: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sKt: cute.struct.Align[cute.struct.MemRange[dtype, half * 2], 1024]
+        sdS: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 256], 1024]
+        sdSx: cute.struct.Align[cute.struct.MemRange[dtype, 64 * 128], 1024]
+        sdQaccum: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 4096], 1024]
+
+    return SharedStorage
+
+
+@dsl_user_op
+def ld_volatile_shared_u32(
+    smem_ptr: cute.Pointer,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """``ld.volatile.shared.b32``: a loop-variant read of a stable smem word.
+
+    The MMA warp stores each operand's smem-descriptor start address once and
+    re-reads it here at the top of every iteration. With single-stage operand
+    buffers the start addresses are loop-invariant, and ptxas hoists all the
+    per-k-tile 64-bit descriptors (8-16 per gemm, 10 gemm sites) out of the
+    loop into registers, spilling the 104-register MMA warp to local memory.
+    A volatile load cannot be hoisted, so the descriptors are re-formed per
+    iteration with uniform adds instead.
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32],
+            "ld.volatile.shared.b32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cp_async_ca_4(
+    smem_ptr: cute.Pointer,
+    gmem_ptr: cute.Pointer,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """One 4-byte ``cp.async.ca.shared.global`` (LDGSTS) copy.
+
+    Used to stage the next iteration's LSE/Delta rows into the free parity
+    slot without a register or an exposed load latency; pair with
+    ``cute.arch.cp_async_commit_group`` / ``cp_async_wait_group``.
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [smem_ptr_i32, gmem_ptr.llvm_ptr],
+        "cp.async.ca.shared.global [$0], [$1], 4;",
+        "r,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def set_block_rank(
+    smem_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> cutlass.Int32:
+    """Map an smem pointer to the same offset in another CTA of the cluster."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32, cutlass.Int32(peer_cta_rank_in_cluster).ir_value()],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def cpasync_bulk_s2cluster(
+    smem_src_ptr: cute.Pointer,
+    smem_dst_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    size: object,
+    peer_cta_rank_in_cluster: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Bulk smem->peer-CTA-smem copy completing on the peer's mbarrier.
+
+    Ported from flash-attention main's copy_utils.cpasync_bulk_s2cluster.
+    """
+    smem_src_ptr_i32 = smem_src_ptr.toint(loc=loc, ip=ip).ir_value()
+    smem_dst_ptr_i32 = set_block_rank(
+        smem_dst_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    mbar_ptr_i32 = set_block_rank(
+        mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    llvm.inline_asm(
+        None,
+        [
+            smem_dst_ptr_i32,
+            smem_src_ptr_i32,
+            mbar_ptr_i32,
+            cutlass.Int32(size).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [$0], [$1], $3, [$2];",
+        "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def fbwd_ds_pairs_packed_off(
+    dp_frg: cute.Tensor,
+    dp_off: int,
+    p_frg: cute.Tensor,
+    p_off: int,
+    dlt_frg: cute.Tensor,
+    cnt: int,
+) -> None:
+    """In-place dS = P * (dP - delta[col]) over one chunk with a dP offset."""
+    dp_any = cast("Any", dp_frg)
+    p_any = cast("Any", p_frg)
+    dlt_any = cast("Any", dlt_frg)
+    for v in range(cnt // 2):
+        a, b = cute.arch.sub_packed_f32x2(
+            (dp_any[dp_off + 2 * v], dp_any[dp_off + 2 * v + 1]),
+            (dlt_any[2 * v], dlt_any[2 * v + 1]),
+        )
+        a, b = cute.arch.mul_packed_f32x2(
+            (p_any[p_off + 2 * v], p_any[p_off + 2 * v + 1]), (a, b)
+        )
+        dp_any[dp_off + 2 * v] = a
+        dp_any[dp_off + 2 * v + 1] = b
+
+
+@dsl_user_op
+def red_global_add_f32(
+    gmem_ptr: cute.Pointer,
+    val: object,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Fire-and-forget scalar global reduce-add (no result, no scoreboard)."""
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, Float32(val).ir_value(loc=loc, ip=ip)],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
 def mbar_spin_wait(
     mbar_ptr: object, phase: object, wait_hint: int = 10_000_000
 ) -> None:

@@ -9,7 +9,9 @@ the same eager timing as before.
 from __future__ import annotations
 
 import ast
+from collections.abc import Mapping
 import contextlib
+import dataclasses
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -50,6 +52,9 @@ from .dma import allocate_indirect_dma_resources
 from .dma import async_copy_statements
 from .dma import indirect_group_statements
 from .dma import is_tpu_dma_aligned_shape
+from .memory_access import MEMORY_ACCESS_META
+from .memory_access import MemoryAccess
+from .memory_access import MemoryAccessKind
 from .tensorcore_plan import DmaAccessPlan
 from .tensorcore_plan import build_dma_access_candidates
 
@@ -584,13 +589,15 @@ def _emit_resident_prep_refill_once(
     state.codegen.grouped_resident_prep_refill_cache[refill_key] = "emitted"
 
 
+LoopTensor = tuple[torch.Tensor, torch.fx.Node, tuple[object, ...]]
+LoopTensors = Mapping[int, LoopTensor]
+LoopAccesses = list[MemoryAccess]
+
+
 def _classify_loop_tensors(
     graph_info: object,
     state: object,
-) -> tuple[
-    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-]:
+) -> tuple[LoopTensors, LoopTensors]:
     """Classify tensors accessed in an inner loop body into loaded/stored.
 
     Returns (loaded_tensors, stored_tensors) dicts keyed by id(fake_tensor).
@@ -604,8 +611,8 @@ def _classify_loop_tensors(
             if "val" in node.meta and isinstance(node.meta["val"], torch.Tensor):
                 host_tensor_nodes[node] = node.meta["val"]
 
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]] = {}
+    loaded_tensors: dict[int, LoopTensor] = {}
+    stored_tensors: dict[int, LoopTensor] = {}
 
     for node in graph_info.graph.nodes:  # type: ignore[union-attr]
         if node.op != "call_function":
@@ -620,7 +627,7 @@ def _classify_loop_tensors(
                 fake = host_tensor_nodes[tensor_node]
                 key = id(fake)
                 if key not in loaded_tensors:
-                    sub_vals = _extract_subscript_vals(subscript)
+                    sub_vals = tuple(_extract_subscript_vals(subscript))
                     loaded_tensors[key] = (fake, node, sub_vals)
                     node.meta[_PALLAS_LOOP_LOAD_COUNT_META] = 1
                 else:
@@ -638,7 +645,7 @@ def _classify_loop_tensors(
                 fake = host_tensor_nodes[tensor_node]
                 key = id(fake)
                 if key not in stored_tensors:
-                    sub_vals = _extract_subscript_vals(subscript)
+                    sub_vals = tuple(_extract_subscript_vals(subscript))
                     stored_tensors[key] = (fake, tensor_node, sub_vals)
 
     return loaded_tensors, stored_tensors
@@ -650,8 +657,8 @@ def _scalar_address_expr(
     state: CodegenState,
     captured_exprs: dict[torch.fx.Node, str],
     block_ids: list[int] | None = None,
-    begin_exprs: list[str] | None = None,
-    iter_step_exprs: list[str] | None = None,
+    begin_exprs: Sequence[str] | None = None,
+    iter_step_exprs: Sequence[str] | None = None,
     iteration_indices: list[str] | None = None,
 ) -> str | None:
     """Render a scalar HBM address captured by an inner device loop."""
@@ -1018,6 +1025,49 @@ def plan_grid_indirect_accesses(graphs: list[GraphInfo]) -> None:
             device_fn.pallas_memory_space[id(access.tensor)] = PallasMemorySpace.HBM
 
 
+def _own_memory_accesses(graph_info: object) -> LoopAccesses:
+    """Returns the analyzed memory accesses in ``graph_info``'s own nodes.
+
+    Nested control-flow graphs are not followed; ``_descendant_memory_accesses``
+    covers those.
+    """
+    return [
+        access
+        for node in graph_info.graph.nodes  # type: ignore[union-attr]
+        if isinstance((access := node.meta.get(MEMORY_ACCESS_META)), MemoryAccess)
+    ]
+
+
+def _descendant_memory_accesses(
+    graph_info: object,
+    state: CodegenState,
+) -> LoopAccesses:
+    """Returns the memory accesses in every control-flow graph below ``graph_info``.
+
+    Accesses in ``graph_info`` itself are excluded. Each reachable graph is
+    visited once, depth-first; the order does not matter because every access is
+    collected.
+    """
+    from .plan_tiling import control_flow_child_graph_ids
+
+    accesses: LoopAccesses = []
+    seen: set[int] = set()
+    pending: list[object] = [graph_info]
+    while pending:
+        info = pending.pop()
+        for node in info.graph.nodes:  # type: ignore[union-attr]
+            if node.op != "call_function":
+                continue
+            for graph_id in control_flow_child_graph_ids(node):
+                if not isinstance(graph_id, int) or graph_id in seen:
+                    continue
+                seen.add(graph_id)
+                child = state.get_graph(graph_id)
+                accesses.extend(_own_memory_accesses(child))
+                pending.append(child)
+    return accesses
+
+
 def _tensor_dim_subscripts(subscript_meta: Sequence[object]) -> list[object]:
     """Drop rank-expanding ``None`` entries from a tensor subscript."""
     return [index for index in subscript_meta if index is not None]
@@ -1028,7 +1078,7 @@ def _subscript_at_dim(subscripts: Sequence[object], dim: int) -> object:
 
 
 def _get_dim_block_ids(
-    subscript_meta: list[object],
+    subscript_meta: Sequence[object],
     env: CompileEnvironment,
 ) -> dict[int, int]:
     """Map tensor dimension index -> block_id from subscript metadata."""
@@ -1046,7 +1096,7 @@ def _get_dim_block_ids(
 
 
 def _contiguous_range_patterns(
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    loaded_tensors: LoopTensors,
 ) -> dict[int, dict[int, ContiguousRangeIndexPattern]]:
     """Return direct HBM range patterns keyed by tensor and tensor dimension."""
     from .plan_tiling import ContiguousRangeIndexPattern
@@ -1072,8 +1122,8 @@ def _contiguous_range_base_expr(
     *,
     state: CodegenState,
     block_ids: list[int],
-    begin_exprs: list[str],
-    iter_step_exprs: list[str],
+    begin_exprs: Sequence[str],
+    iter_step_exprs: Sequence[str],
     iteration_indices: list[str],
 ) -> str | None:
     """Render a supported scalar address expression for one loop iteration."""
@@ -1305,10 +1355,10 @@ def _clean_region_predicate(
     state: CodegenState,
     graph: torch.fx.Graph,
     block_ids: list[int],
-    begin_exprs: list[str],
-    iter_step_exprs: list[str],
-    end_exprs: list[str],
-    slice_size_exprs: list[str],
+    begin_exprs: Sequence[str],
+    iter_step_exprs: Sequence[str],
+    end_exprs: Sequence[str],
+    slice_size_exprs: Sequence[str],
     aligned_dim: dict[int, int],
     physical_mask_bounds: dict[int, set[str]] | None = None,
 ) -> tuple[str, list[int]] | None:
@@ -1910,10 +1960,9 @@ def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
     env: CompileEnvironment,
-    aligned_dim: dict[int, int] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Compute grid dimensions and block size vars for the given block_ids."""
-    aligned_dim = aligned_dim or {}
+    aligned_tiles = state.device_function.aligned_tiles
     grid_parts: list[str] = []
     block_size_vars: list[str] = []
     for i, block_id in enumerate(block_ids):
@@ -1923,10 +1972,10 @@ def _compute_grid_and_block_sizes(
         block_value = state.device_function.resolved_block_size(block_id)
         if block_value is not None:
             state.device_function.constexpr_arg(block_size_var, block_value)
-        if block_id in aligned_dim:
+        if block_id in aligned_tiles:
             # Aligned-enclosing span: ceil(end/S)*S - floor(begin/S)*S.
             begin, end = _get_loop_begin_and_end(state, i)
-            sublane = aligned_dim[block_id]
+            sublane = aligned_tiles[block_id]
             a_start = f"(({begin}) - ({begin}) % {sublane})"
             a_end = f"((({end}) + {sublane} - 1) // {sublane} * {sublane})"
             numel_expr = f"({a_end} - {a_start})"
@@ -1942,10 +1991,9 @@ def _pallas_loop_begin_and_step_exprs(
     state: CodegenState,
     block_ids: list[int],
     block_size_vars: list[str],
-    aligned_dim: dict[int, int] | None = None,
 ) -> tuple[list[str], list[str], list[str]]:
     """Return begin, per-iteration step, and slice-size expressions for loop dims."""
-    aligned_dim = aligned_dim or {}
+    aligned_tiles = state.device_function.aligned_tiles
     steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
 
     if not isinstance(steps, (list, tuple)):
@@ -1958,14 +2006,11 @@ def _pallas_loop_begin_and_step_exprs(
     for i in range(len(block_ids)):
         step = steps[i]
         begin_expr, _ = _get_loop_begin_and_end(state, i)
-        if block_ids[i] in aligned_dim:
+        if block_ids[i] in aligned_tiles:
             # Align the tile begin DOWN to the sublane (aligned-enclosing).
-            sublane = aligned_dim[block_ids[i]]
+            sublane = aligned_tiles[block_ids[i]]
             begin_expr = f"(({begin_expr}) - ({begin_expr}) % {sublane})"
-        if step is None or sympy.sympify(step) in (
-            sympy.Integer(0),
-            sympy.Integer(1),
-        ):
+        if _loop_dim_steps_by_block(state, i):
             iter_step_expr = block_size_vars[i]
             slice_size_expr = block_size_vars[i]
         else:
@@ -2060,7 +2105,6 @@ def _fixed_loop_extent(state: CodegenState, loop_dim_index: int) -> int | None:
 def _compute_pipeline_or_dma_extra_pad(
     begin_expr: str,
     bid: int,
-    env: CompileEnvironment,
     state: CodegenState,
     loop_dim_index: int | None = None,
 ) -> int:
@@ -2086,6 +2130,25 @@ def _compute_pipeline_or_dma_extra_pad(
     if alignment is not None and alignment % bs_val == 0:
         return 0
     return bs_val - 1
+
+
+def _record_loop_pad(
+    state: CodegenState,
+    fake: torch.Tensor,
+    dim_idx: int,
+    bid: int,
+    begin_expr: str | None = None,
+    loop_dim_index: int | None = None,
+) -> None:
+    """Record the host-side pad this dim's ``pl.ds`` needs."""
+    from ...language.memory_ops import _record_pad_info
+
+    if begin_expr is None:
+        begin_expr = _active_loop_begin_expr(state, bid)
+    extra_pad = _compute_pipeline_or_dma_extra_pad(
+        begin_expr, bid, state, loop_dim_index
+    )
+    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
 
 
 def _active_loop_begin_expr(state: CodegenState, block_id: int) -> str:
@@ -2294,10 +2357,10 @@ def _emit_inner_loop_offset_indices(
     state: CodegenState,
     strategy: object,
     block_ids: list[int],
-    block_size_vars: list[str],
-    begin_exprs: list[str],
-    iter_step_exprs: list[str],
-    loop_index_exprs: list[str],
+    block_size_vars: Sequence[str],
+    begin_exprs: Sequence[str],
+    iter_step_exprs: Sequence[str],
+    loop_index_exprs: Sequence[str],
     env: CompileEnvironment,
     body_stmts: list[ast.AST],
 ) -> None:
@@ -2337,11 +2400,10 @@ def _setup_inner_loop_masks(
     state: CodegenState,
     strategy: object,
     block_ids: list[int],
-    block_size_vars: list[str],
+    block_size_vars: Sequence[str],
     env: CompileEnvironment,
     body_stmts: list[ast.AST],
     offset_expr_fn: Callable[[int, str], str],
-    aligned_dim: dict[int, int] | None = None,
 ) -> bool:
     """Set up mask variables for inner-loop block_ids.
 
@@ -2351,16 +2413,16 @@ def _setup_inner_loop_masks(
 
     Returns True if any mask requires explicit indices.
     """
-    aligned_dim = aligned_dim or {}
+    aligned_tiles = state.device_function.aligned_tiles
     needs_explicit = False
     if hasattr(strategy, "_setup_mask"):
         for i, bid in enumerate(block_ids):
             offset_var = state.device_function.new_var(f"offset_{bid}")
-            if bid in aligned_dim:
+            if bid in aligned_tiles:
                 # Two-sided validity mask for an aligned-enclosing dynamic row
                 # tile: the load over-reads [a_start, begin) and [end, a_end), so
                 # mask both ends.  The relative offset is measured from a_start.
-                sublane = aligned_dim[bid]
+                sublane = aligned_tiles[bid]
                 begin, end = _get_loop_begin_and_end(state, i)
                 a_start = f"(({begin}) - ({begin}) % {sublane})"
                 mask_var = strategy.fn.new_var(f"mask_{bid}", dce=True)  # pyrefly: ignore[missing-attribute]
@@ -3099,6 +3161,18 @@ def _lane_tile(
     return last if isinstance(last, int) else None
 
 
+def _loop_dim_steps_by_block(state: CodegenState, i: int) -> bool:
+    """Whether loop dim ``i`` advances by its block size."""
+    # step is argument 4 of _for_loop_step; a plain _for_loop has no such
+    # argument, and either way a missing step means "advance by the block".
+    steps = state.proxy_arg(4) if len(state.proxy_args) > 4 else None
+    step = steps[i] if isinstance(steps, (list, tuple)) else steps
+    return step is None or sympy.sympify(step) in (
+        sympy.Integer(0),
+        sympy.Integer(1),
+    )
+
+
 def _loop_dim_is_dynamic(state: CodegenState, i: int) -> bool:
     """Whether loop dim ``i`` has a runtime begin and end (a fully-dynamic jagged
     tile).  The tracing-time form of is_dynamic_bound_tile, used here because the
@@ -3114,26 +3188,29 @@ def _loop_dim_is_dynamic(state: CodegenState, i: int) -> bool:
     )
 
 
-def _aligned_dim(
+def _record_aligned_tiles(
     state: CodegenState,
     env: CompileEnvironment,
     block_ids: list[int],
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-) -> dict[int, int]:
-    """Jagged row tiles (runtime end) that read an aligned-enclosing window.
+    accesses: LoopAccesses,
+) -> None:
+    """Record jagged row tiles that read an aligned-enclosing window.
 
-    Maps each to the sublane S its range rounds down to.  A row aligns when a
+    ``device_function.aligned_tiles`` is the single source of truth, mapping each
+    aligned block id to the sublane S its range rounds down to. A row aligns when a
     tensor it slices must land on a sublane tile (bf16, or f32 spanning more than
     one lane tile), or when a per-row map store carries its shared boundary.
     A DIRECT row that does not carry is omitted: it reads at the exact offset.  S
     is the largest float-tensor sublane (bf16 forces 16); tiles that carry are
     also registered for the store fold/save.
+
+    ``accesses`` covers this loop and every loop nested inside it, as collected
+    by ``_own_memory_accesses`` and ``_descendant_memory_accesses``.
     """
     from .backend import SliceAddressing
     from .backend import _slice_addressing
+    from .plan_tiling import NonePattern
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
-    from helion._compiler.pallas.ordered_carry import is_row_map_axis
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
 
     sublanes = [
@@ -3142,40 +3219,68 @@ def _aligned_dim(
         if isinstance(t, torch.Tensor) and t.is_floating_point()
     ]
     if not sublanes:
-        return {}
+        return
 
     # Strictest addressing each row needs over the tensors it slices.
     addressing: dict[int, SliceAddressing] = {}
-    for fake, _node, sub_meta in (*loaded_tensors.values(), *stored_tensors.values()):
+    written_bids: set[int] = set()
+    atomic_write_bids: set[int] = set()
+    for access in accesses:
+        fake = access.tensor
+        dim_to_bid: dict[int, int] = {}
+        tensor_dim = 0
+        for pattern in access.patterns:
+            if isinstance(pattern, NonePattern):
+                # A NonePattern adds a result dim without consuming a tensor
+                # dim, so it must not advance tensor_dim.
+                continue
+            if isinstance((bid := getattr(pattern, "block_id", None)), int):
+                dim_to_bid[tensor_dim] = bid
+            tensor_dim += 1
+        if access.kind is not MemoryAccessKind.LOAD:
+            written_bids.update(dim_to_bid.values())
+        if access.kind is MemoryAccessKind.ATOMIC:
+            # Only the ordinary store lowering calls emit_carry_store; the
+            # atomic one assigns the ref in place, so the boundary fold and
+            # save never run for it and its head rows are never restored.
+            atomic_write_bids.update(dim_to_bid.values())
         if not (isinstance(fake, torch.Tensor) and fake.is_floating_point()):
             continue
-        dim_to_bid = _get_dim_block_ids(sub_meta, env)
         lane_block = _lane_tile(state, fake, dim_to_bid)
         for dim, dim_bid in dim_to_bid.items():
-            if _slice_addressing(fake, dim, lane_block) is SliceAddressing.ALIGNED:
+            access_addressing = _slice_addressing(fake, dim, lane_block)
+            if access_addressing is SliceAddressing.ALIGNED:
                 addressing[dim_bid] = SliceAddressing.ALIGNED
             else:
                 addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
     sublane = max(sublanes)
-    aligned_dim: dict[int, int] = {}
     for i, bid in enumerate(block_ids):
         if not _loop_dim_is_dynamic(state, i):
             continue  # static begin or end: not a fully-dynamic jagged tile
+        if not _loop_dim_steps_by_block(state, i):
+            continue  # even an aligned begin can leave begin + i * step unaligned
         carry = needs_ordered_carry(state, bid)
-        direct = addressing.get(bid, SliceAddressing.ALIGNED) is SliceAddressing.DIRECT
-        if direct and not carry:
-            continue  # reads any offset; a plain clamped slice suffices
-        if not carry and not is_row_map_axis(state, bid):
-            # ALIGNED but not a map axis: a bf16 reduction over the row.  Its
-            # dense bf16 output store can't be proven aligned for Mosaic (E2003),
-            # so reject it cleanly here instead.  f32 reductions are DIRECT and
-            # already skipped above.
+        if carry and bid in atomic_write_bids:
             raise NotImplementedError(
-                "Pallas: bf16 reduction over a jagged row is not supported yet "
-                "(its dense bf16 output store cannot be proven sublane-aligned)."
+                "Pallas: an atomic write through a jagged row tile whose "
+                "slices must be sublane-aligned bypasses the ordered carry, "
+                "so it cannot share the row with a carried store."
             )
-        aligned_dim[bid] = sublane
+        if not carry:
+            addr = addressing.get(bid)
+            if addr is None or addr is SliceAddressing.DIRECT:
+                continue  # nothing slices the dim, or a clamped slice suffices
+            if bid in written_bids:
+                # Some access rounded the window begin down, so every store on
+                # this dim writes the head rows [aligned_begin, begin), whether
+                # the store itself is DIRECT or ALIGNED.
+                raise NotImplementedError(
+                    "Pallas: a jagged row tile whose slices must be "
+                    "sublane-aligned and that is written through its row dim is "
+                    "only supported when ordered carry can stitch the store."
+                )
+        state.device_function.aligned_tiles[bid] = sublane
         if carry:
             begin, end = _get_loop_begin_and_end(state, i)
             state.device_function.carry_tiles[bid] = CarryBoundaryTile(
@@ -3184,7 +3289,71 @@ def _aligned_dim(
                 end_var=end,
                 sublane=sublane,
             )
-    return aligned_dim
+
+
+@dataclasses.dataclass(frozen=True)
+class InnerLoopWindow:
+    """Describes the iteration window of an inner tile loop.
+
+    All collections are immutable so a lowering cannot rewrite the shared
+    window, e.g. while preparing DMA state.
+    """
+
+    loaded: LoopTensors
+    stored: LoopTensors
+    grid_parts: tuple[str, ...]
+    block_size_vars: tuple[str, ...]
+    begin_exprs: tuple[str, ...]
+    iter_step_exprs: tuple[str, ...]
+    slice_size_exprs: tuple[str, ...]
+    end_exprs: tuple[str, ...]
+
+
+def _build_inner_loop_window(
+    state: CodegenState,
+    graph_info: object,
+    block_ids: list[int],
+    env: CompileEnvironment,
+) -> InnerLoopWindow:
+    """Build the iteration window for an inner tile loop."""
+    loaded, stored = _classify_loop_tensors(graph_info, state)
+    _record_aligned_tiles(
+        state,
+        env,
+        block_ids,
+        [
+            *_own_memory_accesses(graph_info),
+            *_descendant_memory_accesses(graph_info, state),
+        ],
+    )
+    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
+    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
+        state, block_ids, block_size_vars
+    )
+    return InnerLoopWindow(
+        loaded=loaded,
+        stored=stored,
+        grid_parts=tuple(grid_parts),
+        block_size_vars=tuple(block_size_vars),
+        begin_exprs=tuple(begin_exprs),
+        iter_step_exprs=tuple(iter_step_exprs),
+        slice_size_exprs=tuple(slice_size_exprs),
+        end_exprs=tuple(
+            _get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))
+        ),
+    )
+
+
+def _annotate_provable_sublane_alignment(
+    state: CodegenState,
+    block_id: int,
+    offset_expr: str,
+) -> str:
+    """Annotate ``offset_expr`` with its provable sublane alignment, if any."""
+    sublane_alignment = state.device_function.proven_sublane_alignment(block_id)
+    if sublane_alignment is None:
+        return offset_expr
+    return f"pl.multiple_of({offset_expr}, {sublane_alignment})"
 
 
 def _codegen_emit_pipeline(state: CodegenState) -> object:
@@ -3215,24 +3384,49 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    loop_window = _build_inner_loop_window(state, graph_info, block_ids, env)
 
-    aligned_dim = _aligned_dim(state, env, block_ids, loaded_tensors, stored_tensors)
-
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(
-        state, block_ids, env, aligned_dim
-    )
-    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars, aligned_dim
-    )
-    # Loop end expressions (used to clamp store extents for data-dependent begins).
-    end_exprs = [_get_loop_begin_and_end(state, i)[1] for i in range(len(block_ids))]
+    # A pipeline stage can move several adjacent logical tiles in one DMA.
+    # The body still computes one original tile at a time from that larger
+    # buffer, which lets DMA granularity and compute granularity differ.
+    group_size = state.config.get("pallas_emit_pipeline_group_size", 1)
+    if type(group_size) is not int or group_size < 1:
+        raise InvalidConfig(
+            "pallas_emit_pipeline_group_size must be a positive integer"
+        )
+    if group_size > 1:
+        if len(block_ids) != 1:
+            raise InvalidConfig(
+                "grouped emit_pipeline staging currently requires one loop dimension"
+            )
+        block_size = state.device_function.resolved_block_size(block_ids[0])
+        begin_expr = loop_window.begin_exprs[0]
+        end_expr = loop_window.end_exprs[0]
+        if (
+            not isinstance(block_size, int)
+            or not _is_static_int(begin_expr)
+            or not _is_static_int(end_expr)
+            or loop_window.iter_step_exprs[0] != loop_window.slice_size_exprs[0]
+        ):
+            raise InvalidConfig(
+                "grouped emit_pipeline staging requires a fixed contiguous loop"
+            )
+        extent = int(end_expr) - int(begin_expr)
+        if extent % (block_size * group_size) != 0:
+            raise InvalidConfig(
+                "the grouped emit_pipeline stage must evenly divide the loop extent"
+            )
 
     # Pipelined tensors flow through emit_pipeline's per-iter Buffered
     # BlockSpec; the rest stay on the outer pallas_call BlockSpec
     # (escape clause `bs == as`) and are closure-read from the body.
     all_tensor_info, _vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loop_window.loaded,
+        loop_window.stored,
+        block_ids,
+        loop_window.slice_size_exprs,
+        env,
+        state,
     )
 
     # Build in_specs and out_specs
@@ -3265,7 +3459,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             _bid_to_pid_var[pid.block_id] = pid_var
 
     def _make_block_spec(
-        fake: torch.Tensor, subscript_meta: list[object], is_store: bool = False
+        fake: torch.Tensor, subscript_meta: Sequence[object], is_store: bool = False
     ) -> str:
         """Build a BlockSpec string for a tensor accessed in the pipeline body.
 
@@ -3291,16 +3485,21 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             if bid is not None and bid in block_ids:
                 # Inner pipeline dim -- tiled by pipeline grid
                 bid_idx = block_ids.index(bid)
-                slice_size_expr = slice_size_exprs[bid_idx]
-                begin_expr = begin_exprs[bid_idx]
-                iter_step_expr = iter_step_exprs[bid_idx]
-                from ...language.memory_ops import _record_pad_info
-
-                extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state, bid_idx
+                slice_size_expr = loop_window.slice_size_exprs[bid_idx]
+                pipeline_slice_size_expr = (
+                    f"({slice_size_expr}) * {group_size}"
+                    if group_size > 1
+                    else slice_size_expr
+                )
+                begin_expr = loop_window.begin_exprs[bid_idx]
+                iter_step_expr = loop_window.iter_step_exprs[bid_idx]
+                pipeline_iter_step_expr = (
+                    f"({iter_step_expr}) * {group_size}"
+                    if group_size > 1
+                    else iter_step_expr
                 )
                 begin_is_zero = begin_expr == "0"
-                end_expr = end_exprs[bid_idx]
+                end_expr = loop_window.end_exprs[bid_idx]
                 dim_size = shape[dim_idx]
                 # Whether this loop spans the ENTIRE backing tensor dim, i.e.
                 # ``[0, dim_size)`` with a compile-time-constant extent. Only
@@ -3331,10 +3530,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     # ``pl.BoundedSlice`` block shape (required for ds-style
                     # index maps). Lifts the "emit_pipeline fails on unaligned
                     # dims" limitation so data-dependent tile loops can pipeline.
-                    block_shape_parts.append(f"pl.BoundedSlice({slice_size_expr})")
+                    block_shape_parts.append(
+                        f"pl.BoundedSlice({pipeline_slice_size_expr})"
+                    )
                     start_expr = (
                         f"({begin_expr}) + ({lambda_params[bid_idx]}) "
-                        f"* ({iter_step_expr})"
+                        f"* ({pipeline_iter_step_expr})"
                     )
                     is_carry = bid in state.device_function.carry_tiles
                     dim_expr = None
@@ -3363,8 +3564,8 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         # required for carry propagation, and zeroing/masking of
                         # unowned rows is safely handled by the ordered carry logic.
                         size_expr = (
-                            f"jnp.minimum({slice_size_expr}, "
-                            f"({end_exprs[bid_idx]}) - ({start_expr}))"
+                            f"jnp.minimum({pipeline_slice_size_expr}, "
+                            f"({loop_window.end_exprs[bid_idx]}) - ({start_expr}))"
                         )
                     elif not is_store and dim_expr is not None:
                         # Clamp the LOAD extent to the backing tensor instead of
@@ -3384,7 +3585,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                         # offsets extend beyond the backing allocation.
                         size_expr = (
                             f"jnp.clip(({dim_expr}) - ({start_expr}), 0, "
-                            f"{slice_size_expr})"
+                            f"{pipeline_slice_size_expr})"
                         )
                         start_expr = f"jnp.minimum(({start_expr}), ({dim_expr}))"
                         assert physical_mask_plan is not None
@@ -3397,15 +3598,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                             )
                         clamped_to_tensor = True
                     else:
-                        size_expr = slice_size_expr
-                    if bid in state.device_function.carry_tiles:
-                        sublane = state.device_function.carry_tiles[bid].sublane
-                        start_expr = f"pl.multiple_of({start_expr}, {sublane})"
+                        size_expr = pipeline_slice_size_expr
+                    start_expr = _annotate_provable_sublane_alignment(
+                        state, bid, start_expr
+                    )
                     lambda_parts.append(f"pl.ds({start_expr}, {size_expr})")
                 else:
                     # Static, from-zero loop: a block-aligned index is exact.
                     # Identical to the pre-existing codegen.
-                    block_shape_parts.append(slice_size_expr)
+                    block_shape_parts.append(pipeline_slice_size_expr)
                     if iter_step_expr == slice_size_expr:
                         lambda_parts.append(lambda_params[bid_idx])
                     else:
@@ -3413,36 +3614,28 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                             f"(({begin_expr}) + ({lambda_params[bid_idx]}) * ({iter_step_expr})) // ({slice_size_expr})"
                         )
                 if not clamped_to_tensor:
-                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                    _record_loop_pad(state, fake, dim_idx, bid, begin_expr, bid_idx)
             elif bid is not None and bid in _bid_to_pid_var:
                 # Outer grid dim -- select via captured program_id variable
                 pid_var = _bid_to_pid_var[bid]
                 bs_var = state.device_function.block_size_var(bid)
                 if bs_var:
                     block_shape_parts.append(bs_var)
-                    from ...language.memory_ops import _record_pad_info
-
-                    extra_pad = _compute_pipeline_or_dma_extra_pad(
-                        _active_loop_begin_expr(state, bid), bid, env, state
-                    )
-                    _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                    _record_loop_pad(state, fake, dim_idx, bid)
                 else:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                 lambda_parts.append(pid_var)
             elif bid is not None and is_dynamic_bound_tile(state, bid):
-                # Jagged row tile from an inner pipeline.  pl.multiple_of is
-                # assume_multiple: it suppresses the tiled-row alignment check.
-                # Safe because the begin is rounded to the sublane in the dim's
-                # own loop, and a DIRECT f32 single-lane-tile row reads
-                # contiguously.  Always emitted, as sibling loops reference the
-                # same jagged dim.  Must precede the outer-non-grid branch.
+                # Jagged row tile from an inner pipeline. Always emitted, as
+                # sibling loops reference the same jagged dim. Must precede the
+                # outer-non-grid branch.
                 block_m = state.device_function.block_size_var(bid)
-                offset_v = state.codegen.offset_var(bid)
-                sublane = env.backend.sublane_tiling(fake.dtype)  # pyrefly: ignore[missing-attribute]
-                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
-                lambda_parts.append(
-                    f"pl.ds(pl.multiple_of({offset_v}, {sublane}), {block_m})"
+                start_expr = _annotate_provable_sublane_alignment(
+                    state, bid, state.codegen.offset_var(bid)
                 )
+                block_shape_parts.append(f"pl.BoundedSlice({block_m})")
+                lambda_parts.append(f"pl.ds({start_expr}, {block_m})")
+                _record_loop_pad(state, fake, dim_idx, bid)
             elif bid is not None and state.codegen.active_device_loops.get(bid):
                 # Outer non-grid device loop -- the HBM ref is pre-sliced via
                 # ``.at[pl.ds(offset, bs)]`` (see _make_hbm_slice), so the
@@ -3480,16 +3673,20 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             f"pipeline_mode=pl.Buffered(buffer_count=2))"
         )
 
-    def _make_load_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
+    def _make_load_block_spec(
+        fake: torch.Tensor, subscript_meta: Sequence[object]
+    ) -> str:
         """BlockSpec for a pipelined input, clamped when tail zeroing is proven."""
         return _make_block_spec(fake, subscript_meta, is_store=False)
 
-    def _make_store_block_spec(fake: torch.Tensor, subscript_meta: list[object]) -> str:
+    def _make_store_block_spec(
+        fake: torch.Tensor, subscript_meta: Sequence[object]
+    ) -> str:
         """BlockSpec for a pipelined output (clamped ``pl.ds`` extent on dynamic bounds)."""
         return _make_block_spec(fake, subscript_meta, is_store=True)
 
     def _make_hbm_slice(
-        fake: torch.Tensor, hbm_name: str, subscript_meta: list[object]
+        fake: torch.Tensor, hbm_name: str, subscript_meta: Sequence[object]
     ) -> str:
         """Slice the HBM ref for outer non-grid device loop dims.
 
@@ -3556,15 +3753,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
     from ..device_function import PallasMemorySpace
 
-    for fake, _tensor_node, _sub_meta in loaded_tensors.values():
+    for fake, _tensor_node, _sub_meta in loop_window.loaded.values():
         if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
-    for fake, _tensor_node, _sub_meta in stored_tensors.values():
+    for fake, _tensor_node, _sub_meta in loop_window.stored.values():
         if id(fake) in pipelined_tensor_ids:
             state.device_function.pallas_memory_space[id(fake)] = PallasMemorySpace.HBM
 
-    for key, (fake, _tensor_node, sub_meta) in loaded_tensors.items():
-        if key in stored_tensors:
+    for key, (fake, _tensor_node, sub_meta) in loop_window.loaded.items():
+        if key in loop_window.stored:
             continue  # Handle as output instead
         if id(fake) not in pipelined_tensor_ids:
             continue
@@ -3577,7 +3774,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         body_params.append(vmem_name)
         pipeline_in_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
 
-    for fake, _tensor_node, sub_meta in stored_tensors.values():
+    for fake, _tensor_node, sub_meta in loop_window.stored.values():
         if id(fake) not in pipelined_tensor_ids:
             continue
         hbm_name = state.device_function.tensor_arg(fake).name
@@ -3603,9 +3800,30 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             "else _pipeline_indices.index"
         )
     ]
+    pipeline_index_exprs = [
+        f"_helion_compat_pipeline_indices[{i}]" for i in range(len(block_ids))
+    ]
+    compute_stmts: list[ast.AST] = body_stmts
+    pipeline_group_index = "_pipeline_group_index"
+    if group_size > 1:
+        group_loop = statement_from_string(
+            f"for {pipeline_group_index} in range({group_size}): pass"
+        )
+        assert isinstance(group_loop, ast.For)
+        group_loop.body = []
+        body_stmts.append(group_loop)
+        compute_stmts = cast("list[ast.AST]", group_loop.body)
+        pipeline_index_exprs = [
+            (
+                f"(_helion_compat_pipeline_indices[0] * {group_size} "
+                f"+ {pipeline_group_index})"
+            )
+        ]
 
     # Build block_id_to_info for the pipeline state
-    block_id_to_info = _loop_dim_infos(state, block_ids, env, aligned_dim)
+    block_id_to_info = _loop_dim_infos(
+        state, block_ids, env, state.device_function.aligned_tiles
+    )
 
     strategy = _find_strategy(state, block_ids)
     # Emit offset_<bid>/indices_<bid> at the body prologue.
@@ -3613,26 +3831,23 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         state,
         strategy,
         block_ids,
-        block_size_vars,
-        begin_exprs,
-        iter_step_exprs,
-        [f"_helion_compat_pipeline_indices[{i}]" for i in range(len(block_ids))],
+        loop_window.block_size_vars,
+        loop_window.begin_exprs,
+        loop_window.iter_step_exprs,
+        pipeline_index_exprs,
         env,
-        body_stmts,
+        compute_stmts,
     )
-    # Set up mask variables for inner-loop block_ids (non-divisible bounds).
     _setup_inner_loop_masks(
         state,
         strategy,
         block_ids,
-        block_size_vars,
+        loop_window.block_size_vars,
         env,
-        body_stmts,
-        # emit_pipeline passes indices as a single tuple arg
+        compute_stmts,
         offset_expr_fn=lambda i, bs: (
-            f"_helion_compat_pipeline_indices[{i}] * {bs} + jnp.arange({bs})"
+            f"({pipeline_index_exprs[i]}) * {bs} + jnp.arange({bs})"
         ),
-        aligned_dim=aligned_dim,
     )
 
     # Emit absolute offset assignments inside the pipeline body so any
@@ -3654,24 +3869,50 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         len(pipelined_tensor_ids) < len(all_tensor_info) or uses_remote_copy
     )
     if any_non_pipelined:
-        _needs_explicit_indices = True
         for i, bid in enumerate(block_ids):
             offset_name = strategy.offset_var(bid)
-            body_stmts.append(
+            compute_stmts.append(
                 statement_from_string(
-                    f"{offset_name} = ({begin_exprs[i]}) + "
-                    f"(_helion_compat_pipeline_indices[{i}]) * ({iter_step_exprs[i]})"
+                    f"{offset_name} = ({loop_window.begin_exprs[i]}) + "
+                    f"({pipeline_index_exprs[i]}) * "
+                    f"({loop_window.iter_step_exprs[i]})"
                 )
             )
 
     # Build tensor_to_dma_scratch mapping
+    def _dma_scratch_ref(
+        fake: torch.Tensor,
+        sub_meta: Sequence[object],
+        ref_name: str,
+    ) -> str:
+        if group_size == 1:
+            return ref_name
+        dim_to_bid = _get_dim_block_ids(sub_meta, env)
+        parts = [
+            (
+                f"pl.ds({pipeline_group_index} * "
+                f"{loop_window.slice_size_exprs[0]}, "
+                f"{loop_window.slice_size_exprs[0]})"
+                if dim_to_bid.get(dim) == block_ids[0]
+                else ":"
+            )
+            for dim in range(fake.ndim)
+        ]
+        return f"{ref_name}.at[{', '.join(parts)}]"
+
     tensor_to_dma_scratch: dict[str, str] = {}
     idx = 0
-    for _fake, hbm_name in in_tensors:
-        tensor_to_dma_scratch[hbm_name] = body_params[idx]
+    for fake, hbm_name in in_tensors:
+        sub_meta = loop_window.loaded[id(fake)][2]
+        tensor_to_dma_scratch[hbm_name] = _dma_scratch_ref(
+            fake, sub_meta, body_params[idx]
+        )
         idx += 1
-    for _fake, hbm_name in out_tensors:
-        tensor_to_dma_scratch[hbm_name] = body_params[idx]
+    for fake, hbm_name in out_tensors:
+        sub_meta = loop_window.stored[id(fake)][2]
+        tensor_to_dma_scratch[hbm_name] = _dma_scratch_ref(
+            fake, sub_meta, body_params[idx]
+        )
         idx += 1
 
     # Create the pipeline loop state
@@ -3679,7 +3920,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         strategy=strategy,  # pyrefly: ignore[bad-argument-type]
         block_id_to_info=block_id_to_info,
         body_fn_name=body_fn_name,
-        inner_statements=body_stmts,
+        inner_statements=compute_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
         _deferred_physical_mask_bounds={
             node: {bid: tuple(sorted(bounds)) for bid, bounds in by_block.items()}
@@ -3697,11 +3938,11 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         state,
         graph_info.graph,
         block_ids,
-        begin_exprs,
-        iter_step_exprs,
-        end_exprs,
-        slice_size_exprs,
-        aligned_dim,
+        loop_window.begin_exprs,
+        loop_window.iter_step_exprs,
+        loop_window.end_exprs,
+        loop_window.slice_size_exprs,
+        state.device_function.aligned_tiles,
         clean_physical_mask_bounds,
     )
 
@@ -3721,7 +3962,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             _emit_pipeline_clean_region(
                 state,
                 graph_info,
-                body_stmts,
+                compute_stmts,
                 clean_expr,
                 clean_block_ids,
                 body_args,
@@ -3741,7 +3982,10 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
     fn_def.body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
 
     # Build the emit_pipeline call
-    grid_str = ", ".join(grid_parts)
+    pipeline_grid_parts = [*loop_window.grid_parts]
+    if group_size > 1:
+        pipeline_grid_parts[0] = f"({pipeline_grid_parts[0]}) // {group_size}"
+    grid_str = ", ".join(pipeline_grid_parts)
     in_specs_str = ", ".join(in_specs) if in_specs else ""
     out_specs_str = ", ".join(out_specs) if out_specs else ""
 
@@ -3778,7 +4022,7 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
 
 def _is_supported_contiguous_row_slab_dma(
     fake: torch.Tensor,
-    sub_meta: list[object],
+    sub_meta: Sequence[object],
     block_ids: list[int],
     vmem_shape: tuple[int, ...],
     env: CompileEnvironment,
@@ -3844,7 +4088,7 @@ def _is_supported_contiguous_row_slab_dma(
 
 def _can_stream_inner_tile(
     fake: torch.Tensor,
-    sub_meta: list[object],
+    sub_meta: Sequence[object],
     direction: str,
     block_ids: list[int],
     vmem_shape: tuple[int, ...],
@@ -3862,9 +4106,9 @@ def _can_stream_inner_tile(
 
 
 def _compute_vmem_shapes(
-    all_tensor_info: list[tuple[torch.Tensor, list[object], str]],
+    all_tensor_info: Sequence[tuple[torch.Tensor, tuple[object, ...], str]],
     block_ids: list[int],
-    slice_size_exprs: list[str],
+    slice_size_exprs: Sequence[str],
     env: CompileEnvironment,
     state: CodegenState,
     contiguous_ranges: dict[int, dict[int, ContiguousRangeIndexPattern]],
@@ -3910,7 +4154,7 @@ def _compute_vmem_shapes(
 
 def _runtime_vmem_shape_sources(
     fake: torch.Tensor,
-    sub_meta: list[object],
+    sub_meta: Sequence[object],
     block_ids: list[int],
     env: CompileEnvironment,
 ) -> tuple[tuple[torch.Tensor, int] | None, ...]:
@@ -3936,14 +4180,16 @@ def _runtime_vmem_shape_sources(
 
 
 def _classify_pipelined_tensors(
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
+    loaded_tensors: LoopTensors,
+    stored_tensors: LoopTensors,
     block_ids: list[int],
-    slice_size_exprs: list[str],
+    slice_size_exprs: Sequence[str],
     env: CompileEnvironment,
     state: CodegenState,
 ) -> tuple[
-    list[tuple[torch.Tensor, list[object], str]], list[tuple[int, ...]], set[int]
+    list[tuple[torch.Tensor, tuple[object, ...], str]],
+    list[tuple[int, ...]],
+    set[int],
 ]:
     """Build (all_tensor_info, vmem_shapes, pipelined_ids) for an inner loop.
 
@@ -4078,9 +4324,9 @@ def _classify_pipelined_tensors(
 
 
 def _resident_loop_tensor_info(
-    loaded_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-    stored_tensors: dict[int, tuple[torch.Tensor, torch.fx.Node, list[object]]],
-) -> list[tuple[torch.Tensor, list[object], str]]:
+    loaded_tensors: LoopTensors,
+    stored_tensors: LoopTensors,
+) -> list[tuple[torch.Tensor, tuple[object, ...], str]]:
     """Tensor access records needed by optional resident prep lowering."""
     result = [
         (fake, sub_meta, "load")
@@ -4108,6 +4354,13 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     if len(block_ids) != 1:
         raise InvalidConfig(
             "dynamic pallas unroll currently supports one inner tile dimension"
+        )
+    from helion._compiler.pallas.ordered_carry import needs_ordered_carry
+
+    if any(needs_ordered_carry(state, bid) for bid in block_ids):
+        raise InvalidConfig(
+            "pallas_loop_type='unroll' does not support ordered carry; use a "
+            "different pallas_loop_type"
         )
 
     args = state.ast_args[-1]
@@ -4218,6 +4471,248 @@ def _codegen_dynamic_unroll(state: CodegenState) -> object:
     return [expr_from_string(f"{result_var}[{i}]") for i in range(len(carried))]
 
 
+class _AdvanceLoopIndex(ast.NodeTransformer):
+    """Rewrite reads of one loop index to refer to its next iteration."""
+
+    def __init__(self, loop_var: str, *, upper_bound: str | None = None) -> None:
+        self.loop_var = loop_var
+        self.upper_bound = upper_bound
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        if node.id != self.loop_var or not isinstance(node.ctx, ast.Load):
+            return node
+        advanced = ast.BinOp(
+            left=ast.Name(id=self.loop_var, ctx=ast.Load()),
+            op=ast.Add(),
+            right=ast.Constant(value=1),
+        )
+        if self.upper_bound is not None:
+            advanced = ast.Call(
+                func=ast.Attribute(
+                    value=ast.Name(id="jnp", ctx=ast.Load()),
+                    attr="minimum",
+                    ctx=ast.Load(),
+                ),
+                args=[
+                    advanced,
+                    ast.BinOp(
+                        left=cast("ast.expr", expr_from_string(self.upper_bound)),
+                        op=ast.Sub(),
+                        right=ast.Constant(value=1),
+                    ),
+                ],
+                keywords=[],
+            )
+        return ast.copy_location(advanced, node)
+
+
+class _RenameNames(ast.NodeTransformer):
+    """Rename generated local variables while preserving their AST context."""
+
+    def __init__(self, replacements: dict[str, str]) -> None:
+        self.replacements = replacements
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        replacement = self.replacements.get(node.id)
+        if replacement is None:
+            return node
+        return ast.copy_location(
+            ast.Name(id=replacement, ctx=node.ctx),
+            node,
+        )
+
+
+def _clone_statements(statements: list[ast.stmt]) -> list[ast.stmt]:
+    """Clone generated statements without retaining compiler-only AST metadata."""
+    return [statement_from_string(ast.unparse(statement)) for statement in statements]
+
+
+def _is_view_expression(expression: ast.expr, aliases: set[str]) -> bool:
+    """Whether an expression only derives a view/index from an existing alias."""
+    from ..ast_read_writes import ReadWrites
+
+    reads = set(ReadWrites.from_ast(expression).reads)
+    if not reads.intersection(aliases):
+        return False
+    if isinstance(expression, (ast.Name, ast.Attribute, ast.Subscript)):
+        return True
+    if isinstance(expression, ast.Call) and isinstance(expression.func, ast.Attribute):
+        return expression.func.attr in {"reshape", "transpose", "permute", "squeeze"}
+    return False
+
+
+def _last_buffer_use(inner_body: list[ast.AST], scratch_name: str) -> int | None:
+    """Find the last use of a DMA buffer, following generated view aliases."""
+    from ..ast_read_writes import ReadWrites
+
+    aliases = {scratch_name}
+    last_use: int | None = None
+    for index, statement in enumerate(inner_body):
+        effects = ReadWrites.from_ast(statement)
+        if set(effects.reads).intersection(aliases):
+            last_use = index
+        if not isinstance(statement, ast.Assign) or len(statement.targets) != 1:
+            continue
+        target = statement.targets[0]
+        if isinstance(target, ast.Name) and _is_view_expression(
+            statement.value, aliases
+        ):
+            aliases.add(target.id)
+    return last_use
+
+
+def _hoist_nested_fori_prefetch(
+    state: CodegenState,
+    *,
+    prime_statements: list[ast.stmt],
+    load_primes: list[tuple[str, list[ast.stmt]]],
+    inner_loop_vars: list[str],
+    inner_body: list[ast.AST],
+) -> bool:
+    """Carry a double-buffered inner-loop prefetch across outer iterations.
+
+    A nested panel loop normally primes buffer zero at the start of every outer
+    iteration.  When its address is derived only from the enclosing loop index,
+    buffer zero can instead be refilled for outer iteration ``i + 1`` after its
+    last use by iteration ``i``.  This overlaps the next outer tile's first HBM
+    transfer with the current tile's remaining compute.
+    """
+    if not prime_statements or not load_primes or len(inner_loop_vars) != 1:
+        return False
+
+    from ..ast_read_writes import ReadWrites
+    from ..tile_strategy import ForiLoopState
+
+    enclosing_loops = {
+        id(loop): loop
+        for loops in state.codegen.active_device_loops.values()
+        for loop in loops
+        if isinstance(loop, ForiLoopState)
+    }
+    if len(enclosing_loops) != 1:
+        return False
+    (enclosing_loop,) = enclosing_loops.values()
+    if enclosing_loop.iteration_count is None:
+        return False
+
+    outer_body = state.codegen.statements_stack[-1]
+    prime_rw = ReadWrites.from_list(prime_statements)
+    if set(prime_rw.reads).intersection(inner_loop_vars):
+        return False
+
+    # Find the latest statement that defines an address input, then recover the
+    # straight-line assignment slice needed to compute that address for i + 1.
+    insertion_index = 0
+    for index, statement in enumerate(outer_body):
+        effects = ReadWrites.from_ast(statement)
+        if (set(effects.writes) | set(effects.inplace_writes)).intersection(
+            prime_rw.reads
+        ):
+            insertion_index = index + 1
+
+    needed = set(prime_rw.reads) - set(prime_rw.writes)
+    dependencies: list[ast.stmt] = []
+    for statement in reversed(outer_body[:insertion_index]):
+        effects = ReadWrites.from_ast(statement)
+        writes = set(effects.writes) | set(effects.inplace_writes)
+        if not writes.intersection(needed):
+            continue
+        if not isinstance(statement, ast.Assign):
+            return False
+        dependencies.extend(_clone_statements([statement]))
+        needed = (needed - writes) | set(effects.reads)
+    dependencies.reverse()
+    if enclosing_loop.loop_var_name not in needed:
+        return False
+
+    setup, *prime_starts = prime_statements
+    if not isinstance(setup, ast.Assign) or len(setup.targets) != 1:
+        return False
+    iteration_count_target = setup.targets[0]
+    if not isinstance(iteration_count_target, ast.Name):
+        return False
+    inner_iteration_count = iteration_count_target.id
+
+    def guarded(
+        condition: str, name_hint: str, statements: list[ast.stmt]
+    ) -> ast.FunctionDef:
+        fn_name = state.device_function.new_var(name_hint)
+        fn_def = statement_from_string(
+            f"@pl.when({condition})\ndef {fn_name}():\n    pass"
+        )
+        assert isinstance(fn_def, ast.FunctionDef)
+        fn_def.body = statements or [ast.Pass()]
+        return fn_def
+
+    inner_loop_var = inner_loop_vars[0]
+    refill_iteration = f"(({inner_iteration_count} - 1) // 2) * 2"
+    condition = (
+        f"({inner_loop_var} == {refill_iteration}) & "
+        f"(({enclosing_loop.loop_var_name} + 1) < {enclosing_loop.iteration_count})"
+    )
+
+    # Start each next-outer transfer immediately after this iteration's final
+    # read of the buffer it will refill. Group transfers that share a last-use
+    # point so their address calculations are emitted only once.
+    starts_by_last_use: dict[int, list[ast.stmt]] = {}
+    for scratch_name, starts in load_primes:
+        last_use = _last_buffer_use(inner_body, scratch_name)
+        if last_use is None:
+            return False
+        starts_by_last_use.setdefault(last_use, []).extend(starts)
+
+    # Only the first outer iteration needs an explicit prime. Every later prime
+    # is issued by the preceding inner loop after buffer zero's final use.
+    first_prime = guarded(
+        f"{enclosing_loop.loop_var_name} == 0",
+        "_prime_first_outer_loads",
+        prime_starts,
+    )
+    advance = _AdvanceLoopIndex(enclosing_loop.loop_var_name)
+    shared_dependencies: list[ast.stmt] = []
+    shared_names: dict[str, str] = {}
+    if len(starts_by_last_use) > 1:
+        dependency_writes: set[str] = set()
+        for statement in dependencies:
+            dependency_writes.update(ReadWrites.from_ast(statement).writes)
+        shared_names = {
+            name: state.device_function.new_var(f"_next_outer_{name}")
+            for name in sorted(dependency_writes)
+        }
+        shared_dependencies = _clone_statements(dependencies)
+        safe_advance = _AdvanceLoopIndex(
+            enclosing_loop.loop_var_name,
+            upper_bound=enclosing_loop.iteration_count,
+        )
+        shared_dependencies = [
+            safe_advance.visit(statement) for statement in shared_dependencies
+        ]
+        rename = _RenameNames(shared_names)
+        shared_dependencies = [
+            rename.visit(statement) for statement in shared_dependencies
+        ]
+
+    outer_body[insertion_index:insertion_index] = [
+        setup,
+        first_prime,
+        *shared_dependencies,
+    ]
+
+    for last_use, starts in sorted(starts_by_last_use.items(), reverse=True):
+        next_starts = _clone_statements(
+            starts if shared_dependencies else [*dependencies, *starts]
+        )
+        next_starts = [advance.visit(statement) for statement in next_starts]
+        if shared_names:
+            rename = _RenameNames(shared_names)
+            next_starts = [rename.visit(statement) for statement in next_starts]
+        inner_body.insert(
+            last_use + 1,
+            guarded(condition, "_prefetch_next_outer_loads", next_starts),
+        )
+    return True
+
+
 def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> object:
     """Emit inner device loops using jax.lax.fori_loop.
 
@@ -4247,16 +4742,15 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     assert isinstance(proxy_args, list)
     has_loop_state = len(args) > 0
 
-    grid_parts, block_size_vars = _compute_grid_and_block_sizes(state, block_ids, env)
-
-    loaded_tensors, stored_tensors = _classify_loop_tensors(graph_info, state)
+    loop_window = _build_inner_loop_window(state, graph_info, block_ids, env)
+    grid_parts = loop_window.grid_parts
     placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
     placeholder_exprs = {
         placeholder: ast.unparse(arg)
         for placeholder, arg in zip(placeholders, args, strict=True)
     }
     scalar_index_nodes: dict[int, torch.fx.Node] = {}
-    for _fake, load_node, _subscript in loaded_tensors.values():
+    for _fake, load_node, _subscript in loop_window.loaded.values():
         load_indices = load_node.args[1]
         if not isinstance(load_indices, (list, tuple)):
             continue
@@ -4266,10 +4760,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             index_value = index_node.meta.get("val")
             if isinstance(index_value, torch.Tensor) and index_value.ndim == 0:
                 scalar_index_nodes[id(index_value)] = index_node
-    contiguous_ranges = _contiguous_range_patterns(loaded_tensors)
-    begin_exprs, iter_step_exprs, slice_size_exprs = _pallas_loop_begin_and_step_exprs(
-        state, block_ids, block_size_vars
-    )
+    contiguous_ranges = _contiguous_range_patterns(loop_window.loaded)
     indirect_accesses, dma_metadata_ids = _collect_fori_indirect_accesses(
         graph_info, block_ids, state
     )
@@ -4303,7 +4794,12 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loaded_tensors, stored_tensors, block_ids, slice_size_exprs, env, state
+        loop_window.loaded,
+        loop_window.stored,
+        block_ids,
+        loop_window.slice_size_exprs,
+        env,
+        state,
     )
     # Indirect addresses must be available before the graph body so the
     # scheduler can form the next iteration's HBM Refs. Keep their producer
@@ -4385,7 +4881,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             id(input_tensor.untyped_storage()), []
         ).append(input_slot)
     stored_tensor_storages = {
-        id(fake.untyped_storage()) for fake, _node, _sub_meta in stored_tensors.values()
+        id(fake.untyped_storage())
+        for fake, _node, _sub_meta in loop_window.stored.values()
     }
     dma_transfers: list[tuple[DmaTransfer, tuple[int, ...]]] = [
         (transfer, transfer.plan.transfer_shape) for transfer in indirect_accesses
@@ -4508,7 +5005,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     # store record so that its load and store share one VMEM buffer. Build
     # contiguous immediate loads from the original load sites while indirect
     # loads continue to use their access-specific plans above.
-    for fake, _tensor_node, sub_meta in loaded_tensors.values():
+    for fake, _tensor_node, sub_meta in loop_window.loaded.values():
         hbm_name = state.device_function.tensor_arg(fake).name
         scheduled = scheduled_by_hbm_name.get(hbm_name)
         if scheduled is None or hbm_name in prefetched_load_tensors:
@@ -4551,9 +5048,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         state,
         strategy,
         block_ids,
-        block_size_vars,
-        begin_exprs,
-        iter_step_exprs,
+        loop_window.block_size_vars,
+        loop_window.begin_exprs,
+        loop_window.iter_step_exprs,
         dim_idx_exprs,
         env,
         body_stmts,
@@ -4563,7 +5060,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         state,
         strategy,
         block_ids,
-        block_size_vars,
+        loop_window.block_size_vars,
         env,
         body_stmts,
         # fori_loop has direct access to the loop variable
@@ -4575,6 +5072,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         block_id_to_info=block_id_to_info,
         body_fn_name="_fori_body_0",
         loop_var_name=loop_vars[-1],
+        iteration_count=grid_parts[0] if len(grid_parts) == 1 else None,
         static_unroll=static_unroll,
         inner_statements=body_stmts,
         _tensor_to_dma_scratch=tensor_to_dma_scratch,
@@ -4593,7 +5091,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         fake: torch.Tensor,
         vmem_name: str,
         hbm_name: str,
-        subscript_meta: list[object],
+        subscript_meta: Sequence[object],
         *,
         clamp: bool,
         iteration_indices: list[str],
@@ -4609,7 +5107,10 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         ``min(block_size, end - offset)`` and the VMEM side sliced to match, so
         only live rows are written instead of overrunning adjacent regions
         packed in the same tensor; with ``clamp=False`` (loads, dense stores)
-        the VMEM side stays the bare buffer.
+        the VMEM side stays the bare buffer. A carried jagged dim
+        (``carry_tiles``) is never trimmed: ordered carry stores the whole
+        block. Inner-dim HBM offsets carry their proven sublane alignment, if
+        any.
         """
         from helion._compiler.pallas.ordered_carry import is_dynamic_bound_tile
 
@@ -4634,8 +5135,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                     range_pattern.base,
                     state=state,
                     block_ids=block_ids,
-                    begin_exprs=begin_exprs,
-                    iter_step_exprs=iter_step_exprs,
+                    begin_exprs=loop_window.begin_exprs,
+                    iter_step_exprs=loop_window.iter_step_exprs,
                     iteration_indices=iteration_indices,
                 )
                 if base_expr is None:
@@ -4651,16 +5152,22 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 hbm_needs_slice = True
             elif bid is not None and bid in block_ids:
                 bid_idx = block_ids.index(bid)
-                begin_expr = begin_exprs[bid_idx]
-                iter_step_expr = iter_step_exprs[bid_idx]
-                slice_size_expr = slice_size_exprs[bid_idx]
+                begin_expr = loop_window.begin_exprs[bid_idx]
+                iter_step_expr = loop_window.iter_step_exprs[bid_idx]
+                slice_size_expr = loop_window.slice_size_exprs[bid_idx]
                 dim_idx_expr = iteration_indices[bid_idx]
                 offset_expr = f"({begin_expr}) + ({dim_idx_expr}) * ({iter_step_expr})"
+                annotated_offset_expr = _annotate_provable_sublane_alignment(
+                    state, bid, offset_expr
+                )
                 # Mosaic requires the lane (/128) and sublane (/8) VMEM dims to
                 # stay tile-aligned, so only clamp dims outside the last two; a
                 # ragged store on a last-two dim can't clamp and is rejected.
-                if clamp and dim_idx < len(shape) - 2:
-                    end_expr = _get_loop_begin_and_end(state, bid_idx)[1]
+                if clamp and bid in state.device_function.carry_tiles:
+                    # Ordered carry: copy the whole block.
+                    vmem_parts.append(":")
+                elif clamp and dim_idx < len(shape) - 2:
+                    end_expr = loop_window.end_exprs[bid_idx]
                     # Static unroll resolves the iteration in Python. Keep the
                     # DMA extent static too: a traced jnp.minimum here creates
                     # a dynamic HBM subview that Mosaic cannot place reliably.
@@ -4682,14 +5189,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                     )
                 else:
                     vmem_parts.append(":")
-                hbm_parts.append(f"pl.ds({offset_expr}, {slice_size_expr})")
+                hbm_parts.append(f"pl.ds({annotated_offset_expr}, {slice_size_expr})")
                 hbm_needs_slice = True
-                from ...language.memory_ops import _record_pad_info
-
-                extra_pad = _compute_pipeline_or_dma_extra_pad(
-                    begin_expr, bid, env, state, bid_idx
-                )
-                _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                _record_loop_pad(state, fake, dim_idx, bid, begin_expr, bid_idx)
             elif bid is not None and bid not in block_ids:
                 # Outer grid dim: use grid offset
                 grid_loops = state.codegen.active_device_loops.get(bid)
@@ -4729,17 +5231,14 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                         hbm_needs_slice = True
                         vmem_parts.append(":")
                         continue
-                    offset = state.codegen.offset_var(bid)
+                    offset = _annotate_provable_sublane_alignment(
+                        state, bid, state.codegen.offset_var(bid)
+                    )
                     bs_var = state.device_function.block_size_var(bid)
                     if bs_var:
                         hbm_parts.append(f"pl.ds({offset}, {bs_var})")
                         hbm_needs_slice = True
-                        from ...language.memory_ops import _record_pad_info
-
-                        extra_pad = _compute_pipeline_or_dma_extra_pad(
-                            _active_loop_begin_expr(state, bid), bid, env, state
-                        )
-                        _record_pad_info(state, fake, dim_idx, bid, extra_pad)
+                        _record_loop_pad(state, fake, dim_idx, bid)
                     else:
                         hbm_parts.append(":")
                 else:
@@ -4759,8 +5258,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                                 state=state,
                                 captured_exprs=placeholder_exprs,
                                 block_ids=block_ids,
-                                begin_exprs=begin_exprs,
-                                iter_step_exprs=iter_step_exprs,
+                                begin_exprs=loop_window.begin_exprs,
+                                iter_step_exprs=loop_window.iter_step_exprs,
                                 iteration_indices=iteration_indices,
                             )
                     if offset_expr is None:
@@ -4912,6 +5411,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         return _pl_when(state, condition, name_hint, statements)
 
     prime_statements: list[ast.stmt] = []
+    load_primes: list[tuple[str, list[ast.stmt]]] = []
     body_prefetch: ast.FunctionDef | None = None
     body_current_stage_waits: list[ast.stmt] = []
     if prefetched_loads:
@@ -4919,14 +5419,14 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         prime_statements.append(
             statement_from_string(f"{num_iterations} = {grid_parts[-1]}")
         )
-        grid_parts[-1] = num_iterations
+        grid_parts = (*grid_parts[:-1], num_iterations)
         prime_indices = [*loop_vars]
         prime_indices[-1] = "0"
         prime_starts: list[ast.stmt] = []
         for transfer in prefetched_loads:
-            prime_starts.extend(
-                _dma_transfer_statements(transfer, prime_indices, "0", ("start",))
-            )
+            starts = _dma_transfer_statements(transfer, prime_indices, "0", ("start",))
+            prime_starts.extend(starts)
+            load_primes.append((transfer.resources.scratch, starts))
         prime_statements.append(
             _guarded_statements(
                 f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
@@ -4973,7 +5473,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 offset_name = strategy.offset_var(bid)
                 state.codegen.add_statement(
                     statement_from_string(
-                        f"{offset_name} = ({begin_exprs[i]}) + ({dim_idx_exprs[i]}) * ({iter_step_exprs[i]})"
+                        f"{offset_name} = ({loop_window.begin_exprs[i]}) + "
+                        f"({dim_idx_exprs[i]}) * ({loop_window.iter_step_exprs[i]})"
                     )
                 )
 
@@ -5047,6 +5548,16 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             return _read_final_loop_state(state, result_vars)
         return None
 
+    primes_hoisted = False
+    if not static_unroll:
+        primes_hoisted = _hoist_nested_fori_prefetch(
+            state,
+            prime_statements=prime_statements,
+            load_primes=load_primes,
+            inner_loop_vars=loop_vars,
+            inner_body=body_stmts,
+        )
+
     for dim in reversed(range(len(loop_vars))):
         fn_name = state.device_function.new_var(f"_fori_body_{dim}")
         fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
@@ -5055,7 +5566,9 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         fori_call = statement_from_string(
             f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None)"
         )
-        call_prefix = prime_statements if dim == len(loop_vars) - 1 else []
+        call_prefix = (
+            prime_statements if dim == len(loop_vars) - 1 and not primes_hoisted else []
+        )
         if dim == 0:
             # Outermost: emit function def and fori_loop call into the kernel
             state.add_statement(fn_def)

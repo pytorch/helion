@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import functools
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 import torch
 
 from helion import Config
+from helion._compiler.device_function import DeviceFunction
+from helion._compiler.pallas.codegen import _loop_offset_alignment
 from helion._compiler.pallas.memory_access import MemoryAccessKind
 from helion._compiler.pallas.memory_access import build_memory_access
 from helion._compiler.pallas.plan_tiling import ArbitrarySlicePattern
@@ -14,8 +20,13 @@ from helion._compiler.pallas.plan_tiling import TilePattern
 from helion._compiler.pallas.tensorcore_plan import OneHotGatherPlan
 from helion._compiler.pallas.tensorcore_plan import OneHotScatterPlan
 from helion._compiler.pallas.tensorcore_plan import select_tensorcore_plan
+from helion._compiler.pallas.tracing_ops import _annotate_provable_sublane_alignment
+from helion._compiler.tile_strategy import LoopDimInfo
 from helion.language import memory_ops
 from helion.language.atomic_ops import atomic_add
+
+if TYPE_CHECKING:
+    from helion._compiler.inductor_lowering import CodegenState
 
 
 def _placeholder(
@@ -76,6 +87,60 @@ def test_store_and_atomic_memory_accesses_record_values() -> None:
     assert atomic_access.kind is MemoryAccessKind.ATOMIC
     assert store_access.value_node is value_node
     assert atomic_access.value_node is value_node
+
+
+# We normally avoid testing compiler internals. However, here we make an
+# exception because lying to Mosaic about alignment can lead to UB.
+def test_loop_offset_uses_only_proven_window_alignment() -> None:
+    block_id = 3
+    # The loop start has no known alignment unless an aligned window is recorded.
+    loop = SimpleNamespace(
+        block_id_to_info={
+            block_id: LoopDimInfo(begin_var_name="runtime_begin", begin_expr=None)
+        }
+    )
+
+    def make_state(aligned_tiles: dict[int, int], block_size: int) -> CodegenState:
+        # A fake device function, so the real predicate has to be bound onto it
+        # below rather than inherited.
+        device_function = SimpleNamespace(
+            aligned_tiles=aligned_tiles,
+            resolved_block_size=lambda _block_id: block_size,
+        )
+        device_function.proven_sublane_alignment = functools.partial(
+            DeviceFunction.proven_sublane_alignment, device_function
+        )
+        return cast(
+            "CodegenState",
+            SimpleNamespace(
+                device_function=device_function,
+                codegen=SimpleNamespace(active_device_loops={block_id: [loop]}),
+            ),
+        )
+
+    aligned_state = make_state({block_id: 16}, block_size=32)
+    assert _loop_offset_alignment(block_id, aligned_state) == 16
+    assert (
+        _annotate_provable_sublane_alignment(aligned_state, block_id, "offset")
+        == "pl.multiple_of(offset, 16)"
+    )
+
+    # A block size that is not a multiple of the window alignment proves
+    # nothing: offsets 16, 40, 64, ... are not all multiples of 16.
+    unstepped_state = make_state({block_id: 16}, block_size=24)
+    assert _loop_offset_alignment(block_id, unstepped_state) is None
+    assert (
+        _annotate_provable_sublane_alignment(unstepped_state, block_id, "offset")
+        == "offset"
+    )
+
+    # Without an aligned window, leave the offset unannotated.
+    unaligned_state = make_state({}, block_size=32)
+    assert _loop_offset_alignment(block_id, unaligned_state) is None
+    assert (
+        _annotate_provable_sublane_alignment(unaligned_state, block_id, "offset")
+        == "offset"
+    )
 
 
 def test_tensorcore_plan_owns_indirect_fallbacks() -> None:

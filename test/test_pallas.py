@@ -29,6 +29,7 @@ from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
+from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
@@ -322,6 +323,60 @@ def pallas_inner_loop_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(m):
         for tile_n in hl.tile(n):
             out[tile_m, tile_n] = x[tile_m, tile_n] + y[tile_m, tile_n]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_nested_buffered_panel_sum(table: torch.Tensor) -> torch.Tensor:
+    """Consume buffered HBM panels from an index chosen by an outer loop."""
+    experts, panels, rows, columns = table.size()
+    out = torch.empty(
+        [experts, rows, columns],
+        dtype=table.dtype,
+        device=table.device,
+    )
+    for _ in hl.grid(1):
+        for output in hl.tile(experts, block_size=1):
+            expert = (output.begin * 3) % experts
+            total = hl.zeros([rows, columns], dtype=torch.float32)
+            for panel in hl.tile(panels, block_size=1):
+                total = total + table[expert, panel.begin, :, :]
+            out[output, :, :] = total.to(table.dtype)[None, :, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_nested_buffered_multi_panel_sum(
+    expert_ids: torch.Tensor,
+    lhs: torch.Tensor,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    third: torch.Tensor,
+    fourth: torch.Tensor,
+) -> torch.Tensor:
+    """Consume several weight-panel streams selected by one outer index."""
+    experts, panels, _, columns = first.size()
+    rows = lhs.size(1)
+    out = torch.empty(
+        [experts, rows, columns],
+        dtype=first.dtype,
+        device=first.device,
+    )
+    for _ in hl.grid(1):
+        for output in hl.tile(experts, block_size=1):
+            expert = expert_ids[output.begin]
+            total = hl.zeros([rows, columns], dtype=torch.float32)
+            for panel in hl.tile(panels, block_size=1):
+                lhs_panel = lhs[panel.begin, :, :]
+                first_panel = first[expert, panel.begin, :, :]
+                second_panel = second[expert, panel.begin, :, :]
+                third_panel = third[expert, panel.begin, :, :]
+                fourth_panel = fourth[expert, panel.begin, :, :]
+                total = total + hl.dot(lhs_panel, first_panel, out_dtype=torch.float32)
+                total = total + hl.dot(lhs_panel, second_panel, out_dtype=torch.float32)
+                total = total + hl.dot(lhs_panel, third_panel, out_dtype=torch.float32)
+                total = total + hl.dot(lhs_panel, fourth_panel, out_dtype=torch.float32)
+            out[output, :, :] = total.to(first.dtype)[None, :, :]
     return out
 
 
@@ -3976,6 +4031,89 @@ class TestPallas(TestCase):
 
         torch.testing.assert_close(result.cpu(), (args[0] + args[1]).cpu())
 
+    @skipIfPallasInterpret("nested HBM DMA pipeline requires a real TPU")
+    def test_nested_fori_buffered_load_correctness(self) -> None:
+        table = torch.randn(
+            4,
+            2,
+            8,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        _, result = code_and_output(
+            pallas_nested_buffered_panel_sum,
+            (table,),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[2],
+        )
+        expected = torch.stack(
+            [
+                table[(output * 3) % table.size(0)]
+                .to(torch.float32)
+                .sum(dim=0)
+                .to(table.dtype)
+                for output in range(4)
+            ]
+        )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
+    @skipIfPallasInterpret("nested HBM DMA pipeline requires a real TPU")
+    def test_nested_fori_shared_address_correctness(self) -> None:
+        expert_ids = torch.tensor(
+            [2, 0, 3, 1],
+            device=DEVICE,
+            dtype=torch.int32,
+        )
+        lhs = torch.randn(
+            2,
+            8,
+            128,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+        )
+        tables = tuple(
+            torch.randn(
+                4,
+                2,
+                128,
+                128,
+                device=DEVICE,
+                dtype=torch.bfloat16,
+            )
+            for _ in range(4)
+        )
+        _, result = code_and_output(
+            pallas_nested_buffered_multi_panel_sum,
+            (expert_ids, lhs, *tables),
+            pallas_loop_type="fori_loop",
+            pallas_load_buffer_count=[1, 1, 2, 2, 2, 2],
+        )
+        expected = torch.stack(
+            [
+                sum(
+                    (
+                        torch.matmul(
+                            lhs.to(torch.float32),
+                            table[expert_ids[output]].to(torch.float32),
+                        )
+                        for table in tables
+                    ),
+                    start=torch.zeros(
+                        2,
+                        8,
+                        128,
+                        device=DEVICE,
+                        dtype=torch.float32,
+                    ),
+                )
+                .sum(dim=0)
+                .to(tables[0].dtype)
+                for output in range(4)
+            ]
+        )
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
     def test_static_unroll_uses_python_if_for_tile_predicate(self) -> None:
         """A static tile predicate does not leave a side-effectful lax.cond."""
 
@@ -4465,6 +4603,122 @@ class TestPallas(TestCase):
             query.float().cpu(), key.float().cpu(), val.float().cpu()
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_grouped_emit_pipeline_correctness(self) -> None:
+        """One DMA stage may contain several consecutive compute tiles."""
+        query = torch.randn(1, 1, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 1, 512, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 1, 512, 128, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+            pallas_emit_pipeline_group_size=4,
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_grouped_emit_pipeline_output_correctness(self) -> None:
+        """Grouped stages slice pipelined output buffers by compute tile."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            rows, columns = x.size()
+            out = torch.empty_like(x)
+            for tile_rows in hl.tile(rows):
+                for tile_columns in hl.tile(columns):
+                    out[tile_rows, tile_columns] = x[tile_rows, tile_columns] * 2.0
+            return out
+
+        x = torch.randn(128, 512, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            kernel,
+            (x,),
+            block_sizes=[128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_emit_pipeline_group_size=4,
+        )
+        torch.testing.assert_close(result, x * 2.0)
+
+    @skipIfPallasInterpret(
+        "a nonzero pipeline start uses pl.BoundedSlice, whose size is traced "
+        "by the HLO interpreter"
+    )
+    def test_grouped_emit_pipeline_static_offset_correctness(self) -> None:
+        """Grouped stages advance by a full DMA window from a nonzero start."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([1, x.size(1), x.size(2)], device=x.device)
+            for owner in hl.grid(1):
+                acc = hl.zeros([x.size(1), x.size(2)], dtype=torch.float32)
+                for rows in hl.tile(128, x.size(0)):
+                    acc = acc + x[rows, :, :].sum(dim=0)
+                out[owner, :, :] = acc
+            return out
+
+        x = torch.ones(1152, 8, 128, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            kernel,
+            (x,),
+            block_sizes=[128],
+            pallas_loop_type="emit_pipeline",
+            pallas_emit_pipeline_group_size=4,
+        )
+        torch.testing.assert_close(result, x[128:].sum(dim=0, keepdim=True))
+
+    def test_attention_low_level_scheduler_correctness(self) -> None:
+        """The optional TPU low-level scheduler preserves numerical results."""
+        query = torch.randn(1, 1, 128, 128, dtype=torch.float32, device=DEVICE)
+        key = torch.randn(1, 1, 256, 128, dtype=torch.float32, device=DEVICE)
+        val = torch.randn(1, 1, 256, 128, dtype=torch.float32, device=DEVICE)
+        _, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+            pallas_use_low_level_scheduler=True,
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), val.float().cpu()
+        ).to(device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
+    def test_attention_folded_dot_lhs_cast_correctness(self) -> None:
+        """Folding an f32-to-bf16 dot cast preserves attention results."""
+        query = torch.randn(1, 1, 128, 128, dtype=torch.bfloat16, device=DEVICE)
+        key = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, device=DEVICE)
+        val = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, device=DEVICE)
+        args = (query, key, val)
+        common_config = {
+            "block_sizes": [1, 128, 128],
+            "pallas_loop_type": "emit_pipeline",
+            "pallas_pre_broadcast": True,
+            "pallas_use_low_level_scheduler": True,
+        }
+        bound = pallas_attention.bind(args)
+        field = bound.config_spec._flat_fields()["pallas_fold_dot_lhs_cast"]
+        self.assertIsInstance(field, BooleanFragment)
+        assert isinstance(field, BooleanFragment)
+        self.assertEqual(field.search_values(), [False, True])
+        pointwise = torch.randn(128, 128, dtype=torch.bfloat16, device=DEVICE)
+        pointwise_fields = pallas_inner_loop_add.bind(
+            (pointwise, pointwise)
+        ).config_spec._flat_fields()
+        self.assertNotIn("pallas_fold_dot_lhs_cast", pointwise_fields)
+        _, expected = code_and_output(pallas_attention, args, **common_config)
+        _, result = code_and_output(
+            pallas_attention,
+            args,
+            **common_config,
+            pallas_fold_dot_lhs_cast=True,
+        )
+        torch.testing.assert_close(result, expected, rtol=1e-2, atol=2e-3)
 
     def test_attention_fori_loop_correctness(self) -> None:
         """Fori attention buffers K/V while loop-invariant Q remains unchanged."""
@@ -5492,6 +5746,25 @@ class TestPallas(TestCase):
         self.assertNotIn("pltpu.make_async_copy", code)
         torch.testing.assert_close(result, x * r)
 
+    def test_dynamic_unroll_rejects_ordered_carry(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def dependent_row_map(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for mb_cta in hl.tile(m, block_size=8):
+                for mb in hl.tile(mb_cta.begin, mb_cta.end):
+                    for nb in hl.tile(n):
+                        out[mb, nb] = x[mb, nb] * 2
+            return out
+
+        x = torch.randn(16, 128, dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig, "does not support ordered carry"
+        ):
+            dependent_row_map.bind((x,)).to_code(
+                helion.Config(block_sizes=[8, 128], pallas_loop_type="unroll")
+            )
+
     def test_dependent_tile_end_composes_with_streaming_loop_types(self) -> None:
         x = torch.randn(192, 192, device=DEVICE, dtype=torch.float32)
         bound = pallas_causal_prefix_sum.bind((x,))
@@ -5646,6 +5919,37 @@ class TestPallas(TestCase):
         self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 1)
         self.assertIn("_hbm_arg_indices=", code)
         torch.testing.assert_close(result, x * r)
+
+    def test_nested_pipeline_blockspec_records_dynamic_row_padding(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def nested_pipeline_copy(
+            offsets: torch.Tensor, x: torch.Tensor
+        ) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.empty_like(x)
+            for group in hl.grid(offsets.size(0) - 1):
+                begin = offsets[group]
+                end = offsets[group + 1]
+                for tile_m in hl.tile(begin, end):
+                    for tile_n in hl.tile(n):
+                        out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+            return out
+
+        offsets = torch.tensor([0, 13, 25], device=DEVICE, dtype=torch.int32)
+        x = torch.randn(25, 128, device=DEVICE, dtype=torch.bfloat16)
+        code = nested_pipeline_copy.bind((offsets, x)).to_code(
+            helion.Config(
+                block_sizes=[16, 128],
+                pallas_loop_type="emit_pipeline",
+            )
+        )
+        pad_dims = re.search(r"_ds_pad_dims=(\[.*?\])", code)
+        self.assertIsNotNone(pad_dims, "expected _ds_pad_dims in the launcher call")
+        # Entries are (arg index, dim, block size, extra pad). The row dim of
+        # both the input (arg 1) and the output (arg 2) is sliced only by the
+        # nested pipeline, whose dynamic begin needs block_size - 1 = 15 rows.
+        self.assertIn("(1, 0, 16, 15)", pad_dims.group(1))
+        self.assertIn("(2, 0, 16, 15)", pad_dims.group(1))
 
     def test_pipeline_begin_aligned_skips_pad(self) -> None:
         # A block-aligned inner begin (the outer tile's offset) needs no boundary
@@ -6603,7 +6907,7 @@ class TestPallas(TestCase):
         H, D = 4, 16
         offsets = torch.tensor([0, 10], device=DEVICE, dtype=torch.int32)
         torch.manual_seed(0)
-        y = torch.randn(H, 10, D, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(H, 10, D, device=DEVICE, dtype=torch.float32)
 
         code, out = code_and_output(
             opposite,

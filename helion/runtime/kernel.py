@@ -274,9 +274,25 @@ def _input_tensor_metadata(values: Sequence[object]) -> tuple[Hashable, ...]:
 
 def _input_tensor_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
     """Return a canonical key only when tensor arguments alias."""
+    # Eager dispatch normally receives a flat argument list. Only structured
+    # inputs need the deterministic recursive walk and its metadata paths.
+    tensors: list[torch.Tensor] = []
+    for value in values:
+        if isinstance(value, torch.Tensor):
+            tensors.append(value)
+        elif isinstance(value, ConstExpr):
+            continue
+        elif isinstance(value, (tuple, list, dict)) or (
+            dataclasses.is_dataclass(value) and not isinstance(value, type)
+        ):
+            tensors = [tensor for _path, tensor in _walk_input_tensors(values)]
+            break
+    if len(tensors) < 2:
+        return None
+
     aliases: list[int] = []
     unique_tensors: list[torch.Tensor] = []
-    for _path, tensor in _walk_input_tensors(values):
+    for tensor in tensors:
         for index, previous_tensor in enumerate(unique_tensors):
             if tensor is previous_tensor:
                 aliases.append(index)
@@ -284,7 +300,7 @@ def _input_tensor_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
         else:
             aliases.append(len(unique_tensors))
             unique_tensors.append(tensor)
-    return tuple(aliases) if len(set(aliases)) != len(aliases) else None
+    return tuple(aliases) if len(unique_tensors) != len(tensors) else None
 
 
 @dataclasses.dataclass(frozen=True)

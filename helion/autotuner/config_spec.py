@@ -21,6 +21,7 @@ import torch.distributed as dist
 
 from .._compat import _regs_per_block
 from .._compat import device_num_sm
+from .._compat import get_triton_version
 from .._compat import num_compute_units
 from .._compat import supports_amd_cdna_tunables
 from .._compat import supports_maxnreg
@@ -64,6 +65,7 @@ from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -765,7 +767,7 @@ def shrink_block_sizes_for_numel_constraints(
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
-VALID_CROSS_LOOP_SCHEDULES = ("barrier", "static_pipeline")
+VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
@@ -777,6 +779,7 @@ VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc4",
     "split_alias_cpc5",
 )
+CUTE_AFFINE_SCAN_SCHEDULE_KEY = "cute_affine_scan_schedule"
 
 
 def _cute_chunk_recurrence_config_is_safe(
@@ -806,6 +809,9 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "occupancy",
         "pallas_worklist_grouping",
         "pallas_loop_type",
+        "pallas_emit_pipeline_group_size",
+        "pallas_use_low_level_scheduler",
+        "pallas_fold_dot_lhs_cast",
         "pallas_pre_broadcast",
         *CUTE_TCGEN05_TUNABLE_KEYS,
     }
@@ -833,10 +839,11 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | _BACKEND_STRATEGY_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
-        "cross_loop_schedule",
+        "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -853,6 +860,9 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_emit_pipeline_group_size",
+        "pallas_use_low_level_scheduler",
+        "pallas_fold_dot_lhs_cast",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -873,10 +883,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "range_multi_buffers",
         "range_flattens",
         "static_ranges",
-        "cross_loop_schedule",
+        "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -888,6 +899,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_cache_modifiers",
         "store_cache_modifiers",
         "pallas_loop_type",
+        "pallas_emit_pipeline_group_size",
+        "pallas_use_low_level_scheduler",
+        "pallas_fold_dot_lhs_cast",
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
@@ -910,6 +924,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         *_BACKEND_DIAGNOSTIC_CONFIG_KEYS,
         *_BACKEND_STRATEGY_CONFIG_KEYS,
         *FLASH_CONFIG_KEYS,
+        "cute_flash_bwd_persistent",
+        "cute_flash_bwd_two_cta",
+        "cute_flash_bwd_exp2_f32",
     ]
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
@@ -1145,12 +1162,15 @@ class ConfigSpec:
         self.epilogue_subtile_autotune_choices: tuple[int | None, ...] | None = None
         self.epilogue_subtile_k_hint: int = 0
         self.has_pallas_inner_loops: bool = False
+        # Set by the Pallas graph lowering when an inner-loop dot can consume
+        # an f32 producer directly instead of its explicit bf16/f16 cast.
+        self.pallas_fold_dot_lhs_cast_search_enabled: bool = False
         self.pallas_indirect_access_modes: tuple[str, ...] = ()
         self.pallas_indirect_dma_requires_fori: bool = False
         self.has_symbolic_or_data_dependent_bounds: bool = False
         # Populated only after DeviceIR proves that this kernel contains an
         # implicit cross-root dependency supported by the CUDA Triton backend.
-        self.cross_loop_schedule: EnumFragment | None = None
+        self.cross_loop_pipeline: EnumFragment | None = None
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -1162,6 +1182,9 @@ class ConfigSpec:
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
+        # Enabled only after a generic matcher proves a compatible affine scan.
+        # The first choice is the semantic-neutral ordinary lowering.
+        self.cute_affine_scan_schedule: EnumFragment | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
@@ -1200,6 +1223,12 @@ class ConfigSpec:
         # not rediscover the unavailable flash path for a 128x128 candidate.
         self.cute_attention_generic_fallback_enabled: bool = False
         self._cute_attention_generic_fallback_block_size_targets: dict[int, int] = {}
+        # CuTe flash-attention BACKWARD surface: set when the fused
+        # backward-attention detector fires (see cute_flash_bwd.py). Pins the
+        # (kv_tile, q_tile) block sizes to the 128x128 flash envelope.
+        self.cute_flash_bwd_search_enabled: bool = False
+        self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
+        self._cute_flash_bwd_two_cta_allowed: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
@@ -1917,6 +1946,27 @@ class ConfigSpec:
             choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
         )
 
+    def enable_cute_flash_bwd_search(
+        self,
+        *,
+        block_size_targets: Mapping[int, int],
+        two_cta_allowed: bool = False,
+    ) -> None:
+        """Enable the CuTe flash-attention BACKWARD surface.
+
+        Pins the (kv_tile, q_tile) block sizes to the 128x128 envelope the
+        fused backward emitter supports. ``two_cta_allowed`` opens the
+        ``cute_flash_bwd_two_cta`` knob (cluster-of-2 tcgen05 family) when the
+        problem shape supports 256-row cluster KV tiles.
+        """
+        self.cute_flash_bwd_search_enabled = True
+        self._cute_flash_bwd_block_size_targets = dict(block_size_targets)
+        self._cute_flash_bwd_two_cta_allowed = two_cta_allowed
+        for block_id, target in block_size_targets.items():
+            spec = self.block_sizes.block_id_lookup(block_id)
+            spec.autotuner_min = target
+            spec.max_size = target
+
     def enable_cute_attention_generic_fallback(
         self, *, block_size_targets: Mapping[int, int] | None = None
     ) -> None:
@@ -1958,6 +2008,15 @@ class ConfigSpec:
                     if schedule != preferred_schedule
                 ),
             )
+        )
+
+    def enable_cute_affine_scan_search(self, *, step_count: int | None) -> None:
+        """Expose measured direct-affine schedules for a compatible CuTe scan."""
+
+        if self.backend_name != "cute":
+            raise InvalidConfig("direct affine scan configuration requires CuTe")
+        self.cute_affine_scan_schedule = EnumFragment(
+            choices=direct_affine_schedule_choices(step_count)
         )
 
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
@@ -2311,20 +2370,20 @@ class ConfigSpec:
 
     def supports_config_key(self, key: str) -> bool:
         if (
-            key == "cross_loop_schedule"
+            key == "cross_loop_pipeline"
             and self.device is not None
             and self.device.type != "cuda"
         ):
             return False
         return self.backend.supports_config_key(key)
 
-    def enable_cross_loop_schedule(self) -> None:
-        """Expose the compiler-owned cross-loop scheduling dimension."""
-        if not self.supports_config_key("cross_loop_schedule"):
+    def enable_cross_loop_pipeline(self) -> None:
+        """Expose the compiler-owned cross-loop execution dimension."""
+        if not self.supports_config_key("cross_loop_pipeline"):
             raise InvalidConfig(
-                f"cross_loop_schedule is not supported by backend {self.backend_name!r}"
+                f"cross_loop_pipeline is not supported by backend {self.backend_name!r}"
             )
-        self.cross_loop_schedule = EnumFragment(VALID_CROSS_LOOP_SCHEDULES)
+        self.cross_loop_pipeline = EnumFragment(VALID_CROSS_LOOP_PIPELINES)
 
     def enable_cute_async_load_pipeline(self) -> None:
         """Expose the narrow CuTe async state-load search dimensions."""
@@ -2470,6 +2529,28 @@ class ConfigSpec:
             else:
                 raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
 
+    def _normalize_cute_affine_scan(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        fragment = self.cute_affine_scan_schedule
+        if fragment is None:
+            if CUTE_AFFINE_SCAN_SCHEDULE_KEY in config and not fix_invalid:
+                raise InvalidConfig(
+                    "CuTe affine scan schedule requires a compatible affine scan"
+                )
+            config.pop(CUTE_AFFINE_SCAN_SCHEDULE_KEY, None)
+            return
+
+        value = config.setdefault(CUTE_AFFINE_SCAN_SCHEDULE_KEY, fragment.default())
+        if type(value) is not str or value not in fragment.choices:
+            if fix_invalid:
+                config[CUTE_AFFINE_SCAN_SCHEDULE_KEY] = fragment.default()
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_AFFINE_SCAN_SCHEDULE_KEY} must be one of "
+                    f"{fragment.choices!r}, got {value!r}"
+                )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -2555,6 +2636,42 @@ class ConfigSpec:
         self.normalize(normalized)
         return normalized
 
+    def _normalize_amd_mfma(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        if (
+            config.get("matrix_instr_nonkdim") != 32
+            or self.backend_name != "triton"
+            or torch.version.hip is None
+            or not (3, 4) <= get_triton_version().release < (3, 8)
+        ):
+            return
+        properties = torch.cuda.get_device_properties(self.device)
+        arch = properties.gcnArchName  # pyrefly: ignore [missing-attribute]
+        if arch.split(":")[0] != "gfx950":
+            return
+
+        block_sizes = cast("list[int]", config["block_sizes"])
+        for fact in self.matmul_facts:
+            n = (
+                self.block_sizes.config_get(block_sizes, fact.n_block_id, fact.static_n)
+                if fact.n_block_id is not None
+                else fact.static_n
+            )
+            if n is None or n >= 16:
+                continue
+            # Triton 3.4-3.7 lack triton-lang/triton#10305 (fixed in 3.8):
+            # MFMA32's wide-store epilogue corrupts the compiler heap for N < 16.
+            # Automatic instruction selection avoids that layout.
+            if fix_invalid:
+                config["matrix_instr_nonkdim"] = 0
+                return
+            raise InvalidConfig(
+                "matrix_instr_nonkdim=32 with a matmul N tile smaller than 16 "
+                "can crash Triton 3.4-3.7 on gfx950; use matrix_instr_nonkdim=0 "
+                "or 16, or an N tile of at least 16"
+            )
+
     def normalize(
         self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
     ) -> None:
@@ -2568,6 +2685,33 @@ class ConfigSpec:
         if isinstance(config, helion.Config):
             self.normalize(config.config, _fix_invalid=_fix_invalid)
             return
+
+        # ``cross_loop_schedule`` was the former public name. Accept old configs
+        # only at this boundary, then keep ``cross_loop_pipeline`` as the sole
+        # internal key.
+        if "cross_loop_schedule" in config:
+            legacy_value = config.pop("cross_loop_schedule")
+            legacy_pipeline = (
+                {
+                    "barrier": "barrier",
+                    "static_pipeline": "static",
+                }.get(legacy_value)
+                if isinstance(legacy_value, str)
+                else None
+            )
+            if legacy_pipeline is None:
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        "cross_loop_schedule must be one of "
+                        "('barrier', 'static_pipeline')"
+                    )
+            elif "cross_loop_pipeline" not in config:
+                config["cross_loop_pipeline"] = legacy_pipeline
+            elif config["cross_loop_pipeline"] != legacy_pipeline and not _fix_invalid:
+                raise InvalidConfig(
+                    "cross_loop_schedule and cross_loop_pipeline select "
+                    "conflicting execution policies"
+                )
 
         for name in (
             "block_size",
@@ -2596,15 +2740,15 @@ class ConfigSpec:
                     config[names] = [value]
 
         if (
-            "cross_loop_schedule" in config
-            and self.cross_loop_schedule is None
-            and self.supports_config_key("cross_loop_schedule")
+            "cross_loop_pipeline" in config
+            and self.cross_loop_pipeline is None
+            and self.supports_config_key("cross_loop_pipeline")
         ):
             if _fix_invalid:
-                config.pop("cross_loop_schedule")
+                config.pop("cross_loop_pipeline", None)
             else:
                 raise InvalidConfig(
-                    "cross_loop_schedule is available only for kernels "
+                    "cross_loop_pipeline is available only for kernels "
                     "with compiler-inferred cross-loop dependencies"
                 )
 
@@ -2671,6 +2815,7 @@ class ConfigSpec:
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -2989,22 +3134,23 @@ class ConfigSpec:
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
-        cross_loop_schedule_fragment = self.cross_loop_schedule
-        if cross_loop_schedule_fragment is not None:
-            cross_loop_schedule = config.setdefault(
-                "cross_loop_schedule",
-                cross_loop_schedule_fragment.default(),
+        self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
+        cross_loop_pipeline_fragment = self.cross_loop_pipeline
+        if cross_loop_pipeline_fragment is not None:
+            cross_loop_pipeline = config.setdefault(
+                "cross_loop_pipeline",
+                cross_loop_pipeline_fragment.default(),
             )
-            if cross_loop_schedule not in cross_loop_schedule_fragment.choices:
+            if cross_loop_pipeline not in cross_loop_pipeline_fragment.choices:
                 if _fix_invalid:
-                    config["cross_loop_schedule"] = (
-                        cross_loop_schedule_fragment.default()
+                    config["cross_loop_pipeline"] = (
+                        cross_loop_pipeline_fragment.default()
                     )
                 else:
                     raise InvalidConfig(
-                        "cross_loop_schedule must be one of "
-                        f"{cross_loop_schedule_fragment.choices!r}, got "
-                        f"{cross_loop_schedule!r}"
+                        "cross_loop_pipeline must be one of "
+                        f"{cross_loop_pipeline_fragment.choices!r}, got "
+                        f"{cross_loop_pipeline!r}"
                     )
         recurrence_dv_fragment = self.cute_chunk_recurrence_dv_partitions
         if recurrence_dv_fragment is not None:
@@ -3125,6 +3271,28 @@ class ConfigSpec:
                 config.setdefault("pallas_loop_type", "fori_loop")
             else:
                 config.setdefault("pallas_loop_type", VALID_PALLAS_LOOP_TYPES[0])
+        if config.get("pallas_loop_type") == "emit_pipeline":
+            group_size = config.get("pallas_emit_pipeline_group_size")
+            if group_size is not None and (
+                type(group_size) is not int or group_size < 1
+            ):
+                raise InvalidConfig(
+                    "pallas_emit_pipeline_group_size must be a positive integer"
+                )
+            use_low_level_scheduler = config.get("pallas_use_low_level_scheduler")
+            if use_low_level_scheduler is not None and not isinstance(
+                use_low_level_scheduler, bool
+            ):
+                raise InvalidConfig("pallas_use_low_level_scheduler must be a bool")
+            fold_dot_lhs_cast = config.get("pallas_fold_dot_lhs_cast")
+            if fold_dot_lhs_cast is not None and not isinstance(
+                fold_dot_lhs_cast, bool
+            ):
+                raise InvalidConfig("pallas_fold_dot_lhs_cast must be a bool")
+        else:
+            config.pop("pallas_emit_pipeline_group_size", None)
+            config.pop("pallas_use_low_level_scheduler", None)
+            config.pop("pallas_fold_dot_lhs_cast", None)
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
@@ -3712,6 +3880,12 @@ class ConfigSpec:
                         pipeline_family_override=_flash_pipeline_family_override,
                     )
                 )
+            elif self.cute_flash_bwd_search_enabled:
+                fields["cute_flash_bwd_persistent"] = EnumFragment(choices=(0, 1))
+                fields["cute_flash_bwd_two_cta"] = EnumFragment(
+                    choices=(0, 1) if self._cute_flash_bwd_two_cta_allowed else (0,)
+                )
+                fields["cute_flash_bwd_exp2_f32"] = EnumFragment(choices=(0, 1))
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path
@@ -3864,6 +4038,8 @@ class ConfigSpec:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
                 )
+            if self.cute_affine_scan_schedule is not None:
+                fields[CUTE_AFFINE_SCAN_SCHEDULE_KEY] = self.cute_affine_scan_schedule
             fields.update(self.user_defined_tunables)
             return fields
 
@@ -3921,8 +4097,8 @@ class ConfigSpec:
             )
         if self.supports_config_key("pid_type"):
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
-        if self.cross_loop_schedule is not None:
-            fields["cross_loop_schedule"] = self.cross_loop_schedule
+        if self.cross_loop_pipeline is not None:
+            fields["cross_loop_pipeline"] = self.cross_loop_pipeline
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
             fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):
@@ -3974,8 +4150,15 @@ class ConfigSpec:
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
                     )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
+            if self.supports_config_key("pallas_emit_pipeline_group_size"):
+                fields["pallas_emit_pipeline_group_size"] = PowerOfTwoFragment(1, 16, 1)
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
+            if (
+                self.supports_config_key("pallas_fold_dot_lhs_cast")
+                and self.pallas_fold_dot_lhs_cast_search_enabled
+            ):
+                fields["pallas_fold_dot_lhs_cast"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(VALID_MAXNREG)

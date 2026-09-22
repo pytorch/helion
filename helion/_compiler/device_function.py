@@ -442,9 +442,11 @@ class DeviceFunction:
         # using pl.ds() that may need host-side padding.
         self.pallas_pad_info: dict[int, dict[int, tuple[int, int]]] = {}
         # Pallas ordered carry: jagged row block_id -> CarryBoundaryTile.  Filled by
-        # the emit_pipeline codegen when the tile is a legal map axis; read by
+        # the inner-loop codegen when the tile is a legal map axis; read by
         # the store codegen to stitch the boundary across neighbouring groups.
         self.carry_tiles: dict[int, CarryBoundaryTile] = {}
+        # Pallas: jagged tile block_id -> proven runtime-window alignment.
+        self.aligned_tiles: dict[int, int] = {}
         # CarryScratchKey(row block_id, output name) -> carry scratch var name.
         # One scratch per output buffer (a tile may feed several stores),
         # allocated at the store.
@@ -573,6 +575,24 @@ class DeviceFunction:
         """Resolve a block_id to its concrete size for the current config."""
         env = CompileEnvironment.current()
         return env.block_sizes[block_id].from_config(self.config)
+
+    def proven_sublane_alignment(self, block_id: int) -> int | None:
+        """The sublane alignment that block_id's offsets are proven to satisfy.
+
+        A bf16 window rounded down to 16 rows and stepped by a block of 32 is
+        proven: every offset is 16, 48, 80, ... A block of 24 over the same
+        window is not, since 40 and 64 are not multiples of 16. Neither is any
+        dim without a recorded window, whose begin is an arbitrary runtime row.
+
+        ``None`` means promise nothing.
+        """
+        sublane = self.aligned_tiles.get(block_id)
+        if sublane is None:
+            return None
+        block = self.resolved_block_size(block_id)
+        if not isinstance(block, int) or block % sublane != 0:
+            return None
+        return sublane
 
     def evaluate_constexpr_condition(self, test: object) -> bool | None:
         """Resolve a control-flow test to a concrete bool for the current config.
@@ -968,8 +988,13 @@ class DeviceFunction:
     def tensor_stride(self, fake_value: torch.Tensor, dim: int) -> Argument:
         v = fake_value.stride(dim)
         env = CompileEnvironment.current()
-        # Check if this stride was explicitly specialized
+        # Only literalize a dynamic-kernel stride with positive provenance that
+        # the generated wrapper fixes this layout.  A missing input source is
+        # not such a proof: views and aliases of inputs commonly have none.
+        if isinstance(v, int) and env.tensor_layout_is_symbolically_exact(fake_value):
+            return StaticShape(v)
         source = env.tensor_input_source(fake_value)
+        # Check if this input stride was explicitly specialized.
         if (
             source is not None
             and TensorPropertySource(source, TensorProperty.STRIDE, dim)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
+from torch.testing._internal.common_utils import subtest
 
 import helion
 from helion import exc
@@ -12,9 +13,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipUnlessPallas
-from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
-from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 # TODO(tcombes): JAX Pallas interpret mode can't trace these emit_pipeline
@@ -25,6 +24,29 @@ _XFAIL_INTERPRET = (
     "emit_pipeline dynamic pl.ds / program_id BlockSpecs unsupported in JAX "
     "Pallas interpret mode"
 )
+
+# Inner-loop lowerings that support ordered carry.
+_LOOP_TYPES = ["fori_loop", "emit_pipeline"]
+
+# The same, for tests that run the kernel. emit_pipeline hands the jagged window
+# to a BlockSpec whose block size is a runtime value, which interpret mode cannot
+# trace (_XFAIL_INTERPRET); fori_loop copies the window with DMAs between ref
+# slices, which interpret mode runs as plain dynamic slices.
+_LOOP_TYPES_XFAIL_INTERPRET = [
+    subtest(
+        loop_type,
+        name=loop_type,
+        decorators=[xfailIfPallasInterpret(_XFAIL_INTERPRET)]
+        if loop_type == "emit_pipeline"
+        else [],
+    )
+    for loop_type in _LOOP_TYPES
+]
+
+_LOOP_TYPE_CALL = {
+    "fori_loop": "jax.lax.fori_loop",
+    "emit_pipeline": "pltpu.emit_pipeline",
+}
 
 
 # out[s:e] = jagged[s:e] @ dense[g] for each group g delimited by seq_offsets.
@@ -67,6 +89,12 @@ def jagged_dense_bmm_2d_loop(
     return out
 
 
+_BMM_KERNELS = [
+    jagged_dense_bmm,
+    jagged_dense_bmm_2d_loop,
+]
+
+
 def _ref_jagged_bmm(
     seq_offsets: torch.Tensor, jagged: torch.Tensor, dense: torch.Tensor
 ) -> torch.Tensor:
@@ -89,12 +117,12 @@ def _inputs(offsets: list[int], D: int, K: int, dtype: torch.dtype):
     return seq_offsets, jagged, dense
 
 
-def _run(seq_offsets, jagged, dense, block_sizes, kernel=jagged_dense_bmm):
+def _run(seq_offsets, jagged, dense, block_sizes, loop_type, kernel=jagged_dense_bmm):
     return code_and_output(
         kernel,
         (seq_offsets, jagged, dense),
         block_sizes=block_sizes,
-        pallas_loop_type="emit_pipeline",
+        pallas_loop_type=loop_type,
     )
 
 
@@ -105,29 +133,44 @@ def _run(seq_offsets, jagged, dense, block_sizes, kernel=jagged_dense_bmm):
 class TestPallasJaggedCarrySimple(TestCase):
     """Minimal kernels that isolate one carry behaviour each."""
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
+    @parametrize("kernel", _BMM_KERNELS)
+    def test_default_config(self, kernel) -> None:
+        # With no config overrides, jagged tiles use fori_loop. Check that both
+        # groups retain their results across the unaligned boundary at row 13.
+        seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
+        code, out = code_and_output(kernel, (seq_offsets, jagged, dense))
+        self.assertIn(_LOOP_TYPE_CALL["fori_loop"], code)
+        torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
+
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
-    def test_single_group(self, dtype: torch.dtype, kernel) -> None:
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_single_group(self, dtype: torch.dtype, kernel, loop_type: str) -> None:
         # One group: exercises the aligned-enclosing read and the tail mask,
         # with no carry between groups.
         seq_offsets, jagged, dense = _inputs([0, 20], 128, 128, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
+        _code, out = _run(
+            seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
+        )
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
-    def test_aligned_groups_carry_dormant(self, dtype: torch.dtype, kernel) -> None:
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_aligned_groups_carry_dormant(
+        self, dtype: torch.dtype, kernel, loop_type: str
+    ) -> None:
         # Aligned boundaries: carry path is emitted but its runtime guard never fires.
         seq_offsets, jagged, dense = _inputs([0, 16, 32], 128, 128, dtype)
-        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
+        code, out = _run(
+            seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
+        )
         self.assertIn("pl.program_id(0) != 0", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
-    def test_carry_keeps_both_groups(self, kernel) -> None:
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_carry_keeps_both_groups(self, kernel, loop_type: str) -> None:
         # Two groups [0, 3) and [3, 16) share the [0, 16) boundary.  With
         # identity weights out == jagged, so a clobbered carry would be obvious.
         seq_offsets = torch.tensor([0, 3, 16], dtype=torch.int32, device=DEVICE)
@@ -138,13 +181,18 @@ class TestPallasJaggedCarrySimple(TestCase):
         )
         eye = torch.eye(128, dtype=torch.bfloat16, device=DEVICE)
         _code, out = _run(
-            seq_offsets, jagged, torch.stack([eye, eye]), [16, 128, 128], kernel=kernel
+            seq_offsets,
+            jagged,
+            torch.stack([eye, eye]),
+            [16, 128, 128],
+            loop_type,
+            kernel=kernel,
         )
         torch.testing.assert_close(out, jagged)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_carry_masks_bias_add(self, dtype: torch.dtype) -> None:
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_carry_masks_bias_add(self, dtype: torch.dtype, loop_type: str) -> None:
         # Additive map across a shared boundary: groups [0, 3) and [3, 16) over-
         # read each other's rows (loaded as 0).  Unless the store value is masked,
         # those rows write 0 + 1.0 and the carry folds a stray 1.0 into the result.
@@ -166,13 +214,13 @@ class TestPallasJaggedCarrySimple(TestCase):
             jagged_add_one,
             (seq_offsets, jagged),
             block_sizes=[16, 128],
-            pallas_loop_type="emit_pipeline",
+            pallas_loop_type=loop_type,
         )
         torch.testing.assert_close(out, jagged + 1.0)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_carry_separate_outputs(self, dtype: torch.dtype) -> None:
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_carry_separate_outputs(self, dtype: torch.dtype, loop_type: str) -> None:
         # Two stores share one jagged tile: each must carry into its own scratch,
         # otherwise out2's boundary save clobbers out1's.
         @helion.kernel(backend="pallas")
@@ -196,14 +244,16 @@ class TestPallasJaggedCarrySimple(TestCase):
             jagged_add_two,
             (seq_offsets, jagged),
             block_sizes=[16, 128],
-            pallas_loop_type="emit_pipeline",
+            pallas_loop_type=loop_type,
         )
         torch.testing.assert_close(o1, jagged + 1.0)
         torch.testing.assert_close(o2, jagged + 2.0)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_carry_scalar_branch_store(self, dtype: torch.dtype) -> None:
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_carry_scalar_branch_store(
+        self, dtype: torch.dtype, loop_type: str
+    ) -> None:
         # Two groups take different if/else branches across a shared boundary.
         @helion.kernel(backend="pallas")
         def jagged_branch(seq_offsets, jagged):
@@ -228,7 +278,7 @@ class TestPallasJaggedCarrySimple(TestCase):
             jagged_branch,
             (seq_offsets, jagged),
             block_sizes=[16, 128],
-            pallas_loop_type="emit_pipeline",
+            pallas_loop_type=loop_type,
         )
         self.assertIn("lax.cond", code)
         expected = torch.empty_like(jagged)
@@ -246,7 +296,6 @@ class TestPallasJaggedCarryBmm(TestCase):
     """The carry across the full configuration matrix (group counts, block vs
     group size, multiple column tiles, the non-matmul map-axis form)."""
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize(
         "offsets",
@@ -256,46 +305,56 @@ class TestPallasJaggedCarryBmm(TestCase):
             [0, 3, 7, 16],  # several tiny groups in one boundary (cumulative carry)
         ],
     )
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
     def test_bmm_block_eq_sublane(
-        self, dtype: torch.dtype, offsets: list[int], kernel
+        self, dtype: torch.dtype, offsets: list[int], kernel, loop_type: str
     ) -> None:
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
-        self.assertIn("pltpu.emit_pipeline", code)
+        code, out = _run(
+            seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
+        )
+        self.assertIn(_LOOP_TYPE_CALL[loop_type], code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
-    def test_bmm_block_gt_group(self, dtype: torch.dtype, kernel) -> None:
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_bmm_block_gt_group(
+        self, dtype: torch.dtype, kernel, loop_type: str
+    ) -> None:
         # Two groups (13 rows) are smaller than block_row=32, total L=200 >> block_row.
         seq_offsets, jagged, dense = _inputs([0, 13, 100, 113, 200], 128, 128, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [32, 128, 128], kernel=kernel)
+        _code, out = _run(
+            seq_offsets, jagged, dense, [32, 128, 128], loop_type, kernel=kernel
+        )
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
-    def test_bmm_multi_k_tile(self, dtype: torch.dtype, kernel) -> None:
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_bmm_multi_k_tile(self, dtype: torch.dtype, kernel, loop_type: str) -> None:
         # K=256 with block_col=128 gives two output-column tiles; the carry stacks
         # the per-column-tile boundaries along its scratch row dim.
         seq_offsets, jagged, dense = _inputs([0, 17, 40, 71], 128, 256, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
+        _code, out = _run(
+            seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
+        )
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
-    def test_bmm_many_groups(self, dtype: torch.dtype, kernel) -> None:
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_bmm_many_groups(self, dtype: torch.dtype, kernel, loop_type: str) -> None:
         # 50 unaligned groups; carry scratch is per column-tile, not per group.
         offsets = list(range(0, 13 * 51, 13))  # 50 groups
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
+        code, out = _run(
+            seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
+        )
         self.assertIn("carry", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dtype", [torch.float32, torch.bfloat16])
     @parametrize(
         "offsets",
@@ -305,19 +364,22 @@ class TestPallasJaggedCarryBmm(TestCase):
             [0, 16, 16],  # trailing empty
         ],
     )
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
     def test_bmm_empty_groups(
-        self, dtype: torch.dtype, offsets: list[int], kernel
+        self, dtype: torch.dtype, offsets: list[int], kernel, loop_type: str
     ) -> None:
         # Zero-length groups (s == e) iterate no tiles; carry threads the neighbours.
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        _code, out = _run(seq_offsets, jagged, dense, [16, 128, 128], kernel=kernel)
+        _code, out = _run(
+            seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
+        )
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
-    def test_elementwise_map_axis(self) -> None:
-        # The non-matmul map-axis store from commit 2 now runs: out[st] = 2 *
-        # jagged[st], carried across the shared boundary like the matmul case.
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_elementwise_map_axis(self, loop_type: str) -> None:
+        # A non-matmul map-axis store, out[st] = 2 * jagged[st], carried across
+        # the boundary two groups share, exactly as the matmul case is.
         @helion.kernel(backend="pallas")
         def jagged_scale(
             seq_offsets: torch.Tensor, jagged: torch.Tensor
@@ -339,13 +401,13 @@ class TestPallasJaggedCarryBmm(TestCase):
             jagged_scale,
             (seq_offsets, jagged),
             block_sizes=[16, 128],
-            pallas_loop_type="emit_pipeline",
+            pallas_loop_type=loop_type,
         )
         torch.testing.assert_close(out, jagged * 2)
 
-    @xfailIfPallasInterpret(_XFAIL_INTERPRET)
     @parametrize("dynamic_cols", [True, False])
-    def test_dynamic_rows(self, dynamic_cols: bool) -> None:
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_dynamic_rows(self, dynamic_cols: bool, loop_type: str) -> None:
         @helion.kernel(backend="pallas", static_shapes=False)
         def jagged_scale_dyn(
             seq_offsets: torch.Tensor, jagged: torch.Tensor, dynamic_cols: hl.constexpr
@@ -369,25 +431,137 @@ class TestPallasJaggedCarryBmm(TestCase):
             jagged_scale_dyn,
             (seq_offsets, jagged, dynamic_cols),
             block_sizes=[16, 128],
-            pallas_loop_type="emit_pipeline",
+            pallas_loop_type=loop_type,
         )
         self.assertIn("(B,)", code)
         torch.testing.assert_close(out, jagged * 2)
 
 
+def _ref_jagged_row_sum(seq_offsets: torch.Tensor, jagged: torch.Tensor):
+    ref = torch.zeros(
+        (seq_offsets.numel() - 1, jagged.shape[1]),
+        dtype=torch.float32,
+        device=jagged.device,
+    )
+    for g in range(ref.shape[0]):
+        s, e = int(seq_offsets[g]), int(seq_offsets[g + 1])
+        ref[g] = jagged[s:e].float().sum(0)
+    return ref
+
+
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
-class TestPallasJaggedCarryRejects(TestCase):
-    """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
+class TestPallasMultipleOfPromises(TestCase):
+    """What we are willing to assert to Mosaic about a runtime row offset."""
 
-    @xfailIfPallas(
-        "bf16 reduction over a jagged row falls through to the f32-only existing "
-        "path; the unaligned bf16 load can't compile yet"
-    )
-    def test_jagged_reduction_over_row_bf16(self) -> None:
-        # A reduction over the jagged row (summed to a dense output) is not the
-        # carry's shape, so it falls through to the existing path.  That path is
-        # f32-only, so the bf16 case can't compile yet; the xfail tracks the gap.
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_direct_row_window_gets_no_sublane_promise(self, loop_type: str) -> None:
+        # A jagged row that is only ever read must not be promised a sublane
+        # alignment, because nothing rounded its window down.
+        @helion.kernel(backend="pallas")
+        def nested_direct_window(
+            seq_offsets: torch.Tensor,
+            outer_read: torch.Tensor,
+            nested_read: torch.Tensor,
+            dense_out: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            _, width = nested_read.shape
+            groups = seq_offsets.size(0) - 1
+            scalar_out = torch.empty(
+                (groups,), dtype=torch.float32, device=nested_read.device
+            )
+            for group in hl.grid(groups):
+                begin, end = seq_offsets[group], seq_offsets[group + 1]
+                for rows in hl.tile(begin, end):
+                    scalar_out[group] = outer_read[rows, 0].sum()
+                    for cols in hl.tile(0, width):
+                        dense_out[group, cols] = dense_out[group, cols] + nested_read[
+                            rows, cols
+                        ].float().sum(0)
+            return scalar_out, dense_out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        outer_read = torch.randn((32, 128), dtype=torch.float32)
+        nested_read = torch.randn((32, 128), dtype=torch.float32)
+        dense_out = torch.zeros((2, 128), dtype=torch.float32)
+        code = nested_direct_window.bind(
+            (seq_offsets, outer_read, nested_read, dense_out)
+        ).to_code(helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type))
+        self.assertNotIn("multiple_of", code)
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_no_offset_is_promised_its_block_size(self, loop_type: str) -> None:
+        # The runtime begin need not be a multiple of the block size, so
+        # the generated code must not promise block-size alignment.
+        @helion.kernel(backend="pallas")
+        def jagged_row_sum(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((B, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for dt in hl.tile(0, D):
+                    acc = hl.zeros([dt], dtype=torch.float32)
+                    for st in hl.tile(s, e):
+                        acc = acc + jagged[st, dt].sum(0)
+                    out[g, dt] = acc
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32)
+        jagged = torch.randn((25, 512), dtype=torch.float32)
+        code = jagged_row_sum.bind((seq_offsets, jagged)).to_code(
+            helion.Config(block_sizes=[128, 16], pallas_loop_type=loop_type)
+        )
+        self.assertNotRegex(code, r"pl\.multiple_of\([^)]*_BLOCK_SIZE")
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedIndexing(TestCase):
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_rank_expanding_none_needs_no_window(self, loop_type: str) -> None:
+        # The None dimension in jagged[None, st, dt] is just for shape
+        # compatibility, and should not preclude compilation.
+        @helion.kernel(backend="pallas")
+        def jagged_copy_expanded(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((B, L, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[g, st, dt] = jagged[None, st, dt].sum(0) * 2.0
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.float32, device=DEVICE)
+        _code, out = code_and_output(
+            jagged_copy_expanded,
+            (seq_offsets, jagged),
+            block_sizes=[16, 128],
+            pallas_loop_type=loop_type,
+        )
+        # Check only the rows that each group is storing to. The other rows
+        # get NaNs in interpret mode, so let's skip them.
+        torch.testing.assert_close(out[0, 0:13], jagged[0:13] * 2.0)
+        torch.testing.assert_close(out[1, 13:25], jagged[13:25] * 2.0)
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedReductions(TestCase):
+    """Reductions over a bf16 jagged row: aligned window, no store through the row."""
+
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_reduction_access_in_jagged_loop(self, loop_type: str) -> None:
+        # The jagged loop is innermost and slices the tensor itself.
         @helion.kernel(backend="pallas")
         def jagged_row_sum(
             seq_offsets: torch.Tensor, jagged: torch.Tensor
@@ -407,28 +581,318 @@ class TestPallasJaggedCarryRejects(TestCase):
 
         seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
         jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
-        _code, out = code_and_output(
+        code, out = code_and_output(
             jagged_row_sum,
             (seq_offsets, jagged),
             block_sizes=[128, 16],
-            pallas_loop_type="emit_pipeline",
+            pallas_loop_type=loop_type,
         )
-        ref = torch.zeros(2, 128, device=DEVICE)
-        ref[0] = jagged[0:13].float().sum(0)
-        ref[1] = jagged[13:25].float().sum(0)
-        torch.testing.assert_close(out, ref)
+        self.assertIn(_LOOP_TYPE_CALL[loop_type], code)
+        torch.testing.assert_close(
+            out, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
+        )
 
-    @parametrize("kernel", [jagged_dense_bmm, jagged_dense_bmm_2d_loop])
-    def test_block_not_multiple_of_sublane_raises(self, kernel) -> None:
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_reduction_access_in_nested_loop(self, loop_type: str) -> None:
+        # The jagged loop slices nothing itself; its window comes from the nested loop.
+        @helion.kernel(backend="pallas")
+        def jagged_col_accum(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        rows = jagged[st, dt].to(torch.float32)
+                        out[g, dt] = out[g, dt] + rows.sum(0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        out = torch.zeros((2, 128), dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            jagged_col_accum,
+            (seq_offsets, jagged, out),
+            block_sizes=[16, 128],
+            pallas_loop_type=loop_type,
+        )
+        self.assertIn(_LOOP_TYPE_CALL[loop_type], code)
+        torch.testing.assert_close(
+            result, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
+        )
+
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_reduction_access_below_conditional(self, loop_type: str) -> None:
+        # The access is two graphs down: an if branch, then a nested column loop.
+        @helion.kernel(backend="pallas")
+        def jagged_conditional_accum(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    if e - s > 8:
+                        for dt in hl.tile(0, D):
+                            rows = jagged[st, dt].to(torch.float32)
+                            out[g, dt] = out[g, dt] + rows.sum(0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        out = torch.zeros((2, 128), dtype=torch.float32, device=DEVICE)
+        code, result = code_and_output(
+            jagged_conditional_accum,
+            (seq_offsets, jagged, out),
+            block_sizes=[16, 128],
+            pallas_loop_type=loop_type,
+        )
+        self.assertIn(_LOOP_TYPE_CALL[loop_type], code)
+        torch.testing.assert_close(
+            result, _ref_jagged_row_sum(seq_offsets, jagged), rtol=1e-2, atol=1e-2
+        )
+
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_reduction_remasks_after_pointwise(self, loop_type: str) -> None:
+        # Over-read rows must be re-masked after the +1.0, or they leak into the sum.
+        @helion.kernel(backend="pallas")
+        def jagged_plus_one_sum(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((B, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for dt in hl.tile(0, D):
+                    acc = hl.zeros([dt], dtype=torch.float32)
+                    for st in hl.tile(s, e):
+                        rows = jagged[st, dt].to(torch.float32) + 1.0
+                        acc = acc + rows.sum(0)
+                    out[g, dt] = acc
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32, device=DEVICE)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16, device=DEVICE)
+        _code, result = code_and_output(
+            jagged_plus_one_sum,
+            (seq_offsets, jagged),
+            block_sizes=[128, 16],
+            pallas_loop_type=loop_type,
+        )
+        expected = _ref_jagged_row_sum(seq_offsets, jagged)
+        lengths = (seq_offsets[1:] - seq_offsets[:-1]).to(torch.float32)[:, None]
+        torch.testing.assert_close(result, expected + lengths, rtol=1e-2, atol=1e-2)
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedCarryRejects(TestCase):
+    """Shapes the carry refuses (or routes elsewhere) rather than miscompiling."""
+
+    @parametrize("kernel", _BMM_KERNELS)
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_block_not_multiple_of_sublane_raises(self, kernel, loop_type: str) -> None:
         # bf16 sublane S=16; block_row=8 is not a multiple, so the carry rejects it
         # loudly instead of clobbering the boundary with a plain store.
         seq_offsets, jagged, dense = _inputs([0, 13, 25], 128, 128, torch.bfloat16)
         with self.assertRaisesRegex(
             exc.InductorLoweringError, "block_row .* must be a multiple"
         ):
-            _run(seq_offsets, jagged, dense, [8, 128, 128], kernel=kernel)
+            _run(seq_offsets, jagged, dense, [8, 128, 128], loop_type, kernel=kernel)
 
-    def test_multi_grid_group_rejected(self) -> None:
+    @parametrize("loop_type", _LOOP_TYPES)
+    @parametrize("out_dtype", [torch.bfloat16, torch.float32])
+    def test_untiled_column_store_rejected(
+        self, out_dtype: torch.dtype, loop_type: str
+    ) -> None:
+        # With offsets [0, 13, 32] and a 16-row bf16 block, the second group
+        # logically starts at row 13 but its aligned window starts at row 0.
+        # The load mask zeroes rows [0, 13), so a full store would overwrite the
+        # first group with zeros. The untiled ":" column has no carry block
+        # with which to save those rows; reject instead of silently corrupting.
+        # An f32 output is stored DIRECT on its own, but the bf16 load rounds
+        # the window, so that store writes the head rows all the same.
+        @helion.kernel(backend="pallas")
+        def jagged_full_row_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    out[st, :] = (jagged[st, :] * 2).to(out.dtype)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        out = torch.empty((32, 128), dtype=out_dtype)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            jagged_full_row_store.bind((seq_offsets, jagged, out)).to_code(
+                helion.Config(block_sizes=[16], pallas_loop_type=loop_type)
+            )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_nested_direct_store_under_aligned_window_rejected(
+        self, loop_type: str
+    ) -> None:
+        # The store sits one loop down; unseen, it overwrites the preceding group.
+        @helion.kernel(backend="pallas")
+        def nested_mixed_dtype_row_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.empty((L, 1, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for ct in hl.tile(0, D):
+                        out[st, 0, ct] = jagged[st, ct].to(torch.float32)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            nested_mixed_dtype_row_store.bind((seq_offsets, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
+            )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_store_below_while_rejected(self, loop_type: str) -> None:
+        # Same store, two graphs down: inside a while body, then the column loop.
+        @helion.kernel(backend="pallas")
+        def while_nested_row_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.empty((L, 1, D), dtype=torch.float32, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    step = torch.zeros([], dtype=torch.int32, device=jagged.device)
+                    while step < 1:
+                        for ct in hl.tile(0, D):
+                            out[st, 0, ct] = jagged[st, ct].to(torch.float32)
+                        step = step + 1
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 25], dtype=torch.int32)
+        jagged = torch.randn((25, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            while_nested_row_store.bind((seq_offsets, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
+            )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_shifted_store_through_row_rejected(self, loop_type: str) -> None:
+        # Storing to st.index + 1 shifts every row off the row it was read
+        # from, so a group's store can land on a row the previous group owns.
+        # The kernel must be rejected rather than silently corrupt that group.
+        @helion.kernel(backend="pallas")
+        def jagged_shift_store(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[st.index + 1, dt] = jagged[st, dt] * 2
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            jagged_shift_store.bind((seq_offsets, jagged)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
+            )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_atomic_write_through_row_rejected(self, loop_type: str) -> None:
+        # An atomic through the row is a write too, so it needs the same rejection.
+        @helion.kernel(backend="pallas")
+        def jagged_atomic_write(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, out: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        hl.atomic_xchg(out, [st, dt], jagged[st, dt] + 1.0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        out = torch.zeros_like(jagged)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "written through its row dim is only supported when ordered carry",
+        ):
+            jagged_atomic_write.bind((seq_offsets, jagged, out)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
+            )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_atomic_beside_carried_store_rejected(self, loop_type: str) -> None:
+        @helion.kernel(backend="pallas")
+        def carried_store_plus_atomic(
+            seq_offsets: torch.Tensor, jagged: torch.Tensor, atom: torch.Tensor
+        ) -> torch.Tensor:
+            L, D = jagged.shape
+            B = seq_offsets.shape[0] - 1
+            out = torch.zeros((L, D), dtype=jagged.dtype, device=jagged.device)
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st in hl.tile(s, e):
+                    for dt in hl.tile(0, D):
+                        out[st, dt] = jagged[st, dt] * 2
+                        hl.atomic_xchg(atom, [st, dt], jagged[st, dt] + 1.0)
+            return out
+
+        seq_offsets = torch.tensor([0, 13, 32], dtype=torch.int32)
+        jagged = torch.randn((32, 128), dtype=torch.bfloat16)
+        atom = torch.zeros_like(jagged)
+        with self.assertRaisesRegex(
+            exc.InductorLoweringError,
+            "an atomic write through a jagged row tile whose slices must be "
+            "sublane-aligned bypasses the ordered carry",
+        ):
+            carried_store_plus_atomic.bind((seq_offsets, jagged, atom)).to_code(
+                helion.Config(block_sizes=[16, 128], pallas_loop_type=loop_type)
+            )
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_multi_grid_group_rejected(self, loop_type: str) -> None:
         # The fold guard keys seq_offsets program_id(0), so a second grid dimension is
         # refused rather than folding against the wrong program id.
         @helion.kernel(backend="pallas")
@@ -455,7 +919,7 @@ class TestPallasJaggedCarryRejects(TestCase):
                 two_grid_bmm,
                 (seq_offsets, jagged, dense),
                 block_sizes=[16, 128, 128],
-                pallas_loop_type="emit_pipeline",
+                pallas_loop_type=loop_type,
             )
 
     def test_non_jagged_emit_pipeline_unaffected(self) -> None:
@@ -640,7 +1104,6 @@ class TestPallasVmemScalarLoad(TestCase):
         expected = (source.float().sum(-1) + source[:, -1].float()).to(DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallasTpu("pl.kernel launcher: DMAs with bool dtypes are not supported")
     def test_runtime_row_index_bool(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def row_sum_plus_last(x: torch.Tensor) -> torch.Tensor:
@@ -791,5 +1254,8 @@ class TestPallasClampedRefs(TestCase):
 
 instantiate_parametrized_tests(TestPallasJaggedCarrySimple)
 instantiate_parametrized_tests(TestPallasJaggedCarryBmm)
+instantiate_parametrized_tests(TestPallasMultipleOfPromises)
+instantiate_parametrized_tests(TestPallasJaggedIndexing)
+instantiate_parametrized_tests(TestPallasJaggedReductions)
 instantiate_parametrized_tests(TestPallasJaggedCarryRejects)
 instantiate_parametrized_tests(TestPallasVmemScalarLoad)

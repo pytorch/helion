@@ -468,6 +468,180 @@ def gemm_ptx_precomputed_qk(
 
 
 @cute.jit
+def declare_ptx_smem_desc_base(
+    smem_desc_start_a: Int32,
+    smem_desc_base_a: int,
+    var_name_prefix: str = "smem_desc",
+) -> None:
+    """Declare only the k=0 low descriptor word ``{prefix}_lo`` as a PTX register.
+
+    ``declare_ptx_smem_desc`` materializes all ``num_k_tile`` 64-bit operand
+    descriptors as named registers; four operand sets (K, V, dS x2) then pin
+    64 registers in the MMA warp for the whole kernel and spill. FA4 instead
+    keeps one base word per operand and forms each k-tile descriptor at
+    issue time with a uniform add (``gemm_ptx_desc_base_qk``).
+    """
+    smem_desc_base_a_lo, _ = i64_to_i32x2(smem_desc_base_a)
+    smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
+    llvm.inline_asm(
+        None,
+        [Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value()],
+        f".reg .b32 {var_name_prefix}_lo;\n\tmov.b32 {var_name_prefix}_lo, $0;\n\t",
+        "r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def gemm_ptx_desc_base_qk(
+    acc_tmem_addr: Int32,
+    smem_desc_start_b: Int32,
+    smem_desc_base_b: int,
+    tCrB_layout: cute.Layout,
+    smem_var_name_prefix: str,
+    idesc_var_name: str,
+    *,
+    a_layout: cute.Layout,
+    a_base: int,
+    zero_init: bool | Boolean = False,
+    cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
+) -> None:
+    """SS gemm forming both operand descriptors per k-tile from base words.
+
+    A comes from the ``{prefix}_lo`` register declared by
+    ``declare_ptx_smem_desc_base``; B from ``smem_desc_start_b`` (dynamic
+    stage). Each k-tile descriptor is ``{base_lo + k_offset, hi}`` with the
+    hi word an immediate, so no per-k descriptor registers stay live.
+    """
+    _, smem_desc_a_hi = i64_to_i32x2(a_base)
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    num_k_tile = cute.size(tCrB_layout.shape[2])
+    offset_a = [cute.crd2idx((0, 0, k), a_layout) for k in range(num_k_tile)]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
+    zero_init_dynamic = const_expr(isinstance(zero_init, Boolean))
+    pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
+    cta_group_qualifier = const_expr(_mma_cta_group_qualifier(cta_group))
+    mma = f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(_not_zero_init(zero_init)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 tmem_acc;\n\t"
+        ".reg .b32 smem_desc_b_lo_start;\n\t"
+        ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+        ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        "mov.b32 tmem_acc, $2;\n\t"
+        "mov.b32 smem_desc_b_lo_start, $0;\n\t"
+        "setp.ne.b32 p, $1, 0;\n\t"
+        f"mov.b64 smem_desc_a, {{{smem_var_name_prefix}_lo, {hex(smem_desc_a_hi)}}};\n\t"
+        f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, {hex(smem_desc_b_hi)}}};\n\t"
+        + mma
+        + f"[tmem_acc], smem_desc_a, smem_desc_b, {idesc_var_name}, {pred_str};\n\t"
+        + "".join(
+            (
+                f"add.s32 smem_desc_a_lo, {smem_var_name_prefix}_lo, {hex(offset_a[k])};\n\t"
+                f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\t"
+                f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
+                + mma
+                + f"[tmem_acc], smem_desc_a, smem_desc_b, {idesc_var_name}, 1;\n\t"
+            )
+            for k in range(1, num_k_tile)
+        )
+        + "}\n",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def gemm_ptx_dyn_qk(
+    acc_tmem_addr: Int32,
+    smem_desc_start_a: Int32,
+    smem_desc_base_a: int,
+    a_layout: cute.Layout,
+    smem_desc_start_b: Int32,
+    smem_desc_base_b: int,
+    tCrB_layout: cute.Layout,
+    idesc_var_name: str,
+    *,
+    zero_init: bool | Boolean = False,
+    cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
+) -> None:
+    """SS gemm with BOTH operand start addresses as runtime inputs.
+
+    Like ``gemm_ptx_desc_base_qk`` but without the ``{prefix}_lo`` PTX
+    register: the callers pass starts re-read per iteration (see
+    ``_flash_runtime.ld_volatile_shared_u32``) so ptxas forms the per-k
+    descriptors with uniform adds inside the loop instead of hoisting them.
+    """
+    smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    num_k_tile = cute.size(tCrB_layout.shape[2])
+    offset_a = [cute.crd2idx((0, 0, k), a_layout) for k in range(num_k_tile)]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
+    smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
+    zero_init_dynamic = const_expr(isinstance(zero_init, Boolean))
+    pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
+    cta_group_qualifier = const_expr(_mma_cta_group_qualifier(cta_group))
+    mma = f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(_not_zero_init(zero_init)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .pred p;\n\t"
+        ".reg .b32 tmem_acc;\n\t"
+        ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
+        ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+        ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        "mov.b32 tmem_acc, $3;\n\t"
+        "mov.b32 smem_desc_a_lo_start, $0;\n\t"
+        "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+        "setp.ne.b32 p, $2, 0;\n\t"
+        f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, {hex(smem_desc_a_hi)}}};\n\t"
+        f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, {hex(smem_desc_b_hi)}}};\n\t"
+        + mma
+        + f"[tmem_acc], smem_desc_a, smem_desc_b, {idesc_var_name}, {pred_str};\n\t"
+        + "".join(
+            (
+                f"add.s32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
+                f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\t"
+                f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
+                + mma
+                + f"[tmem_acc], smem_desc_a, smem_desc_b, {idesc_var_name}, 1;\n\t"
+            )
+            for k in range(1, num_k_tile)
+        )
+        + "}\n",
+        "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def gemm_ptx_precomputed_qk_static(
     op: cute.nvgpu.tcgen05.mma.MmaOp,
     acc_tmem_addr: Int32,
@@ -564,11 +738,19 @@ def gemm_ptx_precomputed_pv_ts(
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
     wait_hint: int = 10_000_000,
+    a_offsets: tuple[int, ...] | None = None,
 ) -> None:
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
     tCrA_layout = cute.recast_layout(32, 16, tCrA_layout)
     num_k_tile = cute.size(tCrA_layout.shape[2])
-    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(num_k_tile)]
+    if const_expr(a_offsets is not None):
+        # Explicit per-k TMEM column offsets (32-bit words) for a non-contiguous
+        # A operand (e.g. each compute warpgroup's dS half parked in its own
+        # dP column half).
+        assert len(a_offsets) == num_k_tile
+        offset_a = list(a_offsets)
+    else:
+        offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(num_k_tile)]
     offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
     offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, num_k_tile)]
     smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)

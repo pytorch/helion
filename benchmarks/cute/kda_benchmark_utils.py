@@ -62,11 +62,14 @@ def verify_helion_generated_wrapper(
     expected_plan_kind: str,
     expected_source_markers: tuple[str, ...],
     expected_source_patterns: tuple[str, ...] = (),
+    forbidden_source_patterns: tuple[str, ...] = (),
     compiled_fn: object | None = None,
 ) -> dict[str, Any]:
     """Verify that the compiled Helion wrapper used the expected CuTe plan."""
 
-    if not expected_plan_kind or not expected_source_markers:
+    if not expected_plan_kind or not (
+        expected_source_markers or expected_source_patterns or forbidden_source_patterns
+    ):
         raise ValueError("Helion wrapper verification requires a plan and markers")
     typed_bound = cast("_GeneratedWrapperBound", bound)
     source = typed_bound.to_triton_code(config)
@@ -95,11 +98,21 @@ def verify_helion_generated_wrapper(
     invalid_patterns = {
         pattern: count for pattern, count in pattern_counts.items() if count != 1
     }
-    if invalid_markers or invalid_patterns:
+    forbidden_pattern_counts = {
+        pattern: sum(re.fullmatch(pattern, line) is not None for line in stripped_lines)
+        for pattern in forbidden_source_patterns
+    }
+    present_forbidden_patterns = {
+        pattern: count
+        for pattern, count in forbidden_pattern_counts.items()
+        if count != 0
+    }
+    if invalid_markers or invalid_patterns or present_forbidden_patterns:
         raise RuntimeError(
             f"Helion expected {expected_plan_kind} generated-wrapper markers "
             "exactly once, got "
-            f"literal={invalid_markers}, regex={invalid_patterns}"
+            f"literal={invalid_markers}, regex={invalid_patterns}, "
+            f"forbidden={present_forbidden_patterns}"
         )
     return {
         "plan_kind": expected_plan_kind,
@@ -110,6 +123,8 @@ def verify_helion_generated_wrapper(
         "source_marker_counts": marker_counts,
         "expected_source_patterns": list(expected_source_patterns),
         "source_pattern_counts": pattern_counts,
+        "forbidden_source_patterns": list(forbidden_source_patterns),
+        "forbidden_source_pattern_counts": forbidden_pattern_counts,
         "compiled_source_identity_verified": True,
     }
 

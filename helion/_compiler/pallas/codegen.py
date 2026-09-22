@@ -1102,8 +1102,7 @@ def _ds_expr(
                     dim_from_end, tensor.ndim, bitwidth
                 )
                 if alignment % required == 0:
-                    # e.g. pl.ds(pl.multiple_of(offset_3, _BLOCK_SIZE_3), _BLOCK_SIZE_3)
-                    offset = f"pl.multiple_of({offset}, {block_size})"
+                    offset = f"pl.multiple_of({offset}, {alignment})"
 
     return f"pl.ds({offset}, {block_size})"
 
@@ -1142,11 +1141,13 @@ def _loop_offset_alignment(
     block_id: int,
     state: CodegenState,
 ) -> int | None:
-    """Return the proven alignment of a loop's offset for *block_id*, or ``None``.
+    """Return the proven alignment of a loop's offset for ``block_id``, or ``None``.
 
-    A loop with step ``block_size`` produces offsets ``begin + i * block_size``,
-    which are multiples of ``block_size`` iff ``begin`` is.  Returns
-    ``block_size`` (int) when provable, ``None`` otherwise.
+    A loop with step ``block_size`` produces offsets ``begin + i * block_size``.
+    An aligned jagged window proves only its recorded sublane alignment. For any
+    other loop, every offset is block-aligned iff its begin is block-aligned.
+    Return the strongest proven integer alignment, or ``None`` when a runtime
+    begin has no such proof.
     """
     import sympy
 
@@ -1154,16 +1155,25 @@ def _loop_offset_alignment(
     if not isinstance(bs_value, int):
         return None
 
-    # Check that the loop begins at a multiple of block_size.
+    # A recorded window overrides the block-alignment argument below: its
+    # offsets step from a rounded-down begin, so only the sublane is proven.
+    if block_id in state.device_function.aligned_tiles:
+        return state.device_function.proven_sublane_alignment(block_id)
+
+    # Without a recorded window alignment, prove block alignment from the
+    # active loop's begin. A block with no active device loop is a grid dim:
+    # its offset is program_id times the block size, so block alignment holds
+    # without a proof.
     loops = state.codegen.active_device_loops.get(block_id)
     if loops:
         info = loops[-1].block_id_to_info.get(block_id)
-        if info is not None and info.begin_expr is not None:
-            begin = info.begin_expr
-            if not isinstance(begin, (int, sympy.Integer)):
-                return None  # symbolic begin — can't prove alignment
-            if int(begin) % bs_value != 0:
-                return None
+        if info is None or info.begin_expr is None:
+            return None
+        begin = info.begin_expr
+        if not isinstance(begin, (int, sympy.Integer)):
+            return None  # symbolic begin — can't prove alignment
+        if int(begin) % bs_value != 0:
+            return None
 
     return bs_value
 

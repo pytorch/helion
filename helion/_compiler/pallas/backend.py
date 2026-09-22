@@ -309,6 +309,9 @@ class PallasBackend(Backend):
             "flatten_loops",
             "pallas_worklist_grouping",
             "pallas_loop_type",
+            "pallas_emit_pipeline_group_size",
+            "pallas_use_low_level_scheduler",
+            "pallas_fold_dot_lhs_cast",
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
@@ -559,8 +562,8 @@ class PallasBackend(Backend):
     def sublane_tiling(self, dtype: torch.dtype) -> int:
         """Native sublane (2nd-minor) tile for ``dtype``: f32->8, bf16->16, i8->32.
 
-        The jagged carry slices its emit_pipeline VMEM refs at this
-        granularity, and such a ref must be accessed as a *whole* native tile:
+        Aligned jagged windows slice their VMEM refs at this granularity, and
+        such a ref must be accessed as a *whole* native tile:
         a smaller slice (e.g. 8 rows of a bf16 ref, whose tile is 16) is
         rejected by Mosaic ("E2003: unproven memory access alignment"),
         independent of offset.
@@ -1346,6 +1349,9 @@ class PallasBackend(Backend):
         if CompileEnvironment.current().settings.pallas_interpret:
             launcher_args.append("_pallas_interpret=True")
 
+        if config.get("pallas_use_low_level_scheduler", False):
+            launcher_args.append("_use_low_level_scheduler=True")
+
         # No-tiling pure 2D matmul: emit ``_matmul_dot_general=...`` so the
         # launcher uses ``jax.jit(lax.dot_general(...))`` instead of
         # ``pl.pallas_call(...)``. XLA can then attach cross_program_prefetch,
@@ -1508,7 +1514,13 @@ class PallasBackend(Backend):
         return self.build_launcher_name(device_fn.config)
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .aten_lowering import _has_foldable_dot_lhs_cast
         from .aten_lowering import cat_lowering_pallas
+
+        if _has_foldable_dot_lhs_cast(node):
+            from ..compile_environment import CompileEnvironment
+
+            CompileEnvironment.current().config_spec.pallas_fold_dot_lhs_cast_search_enabled = True
 
         if node.target is torch.ops.aten.cat.default:
             return cat_lowering_pallas
@@ -1738,6 +1750,7 @@ class JaxLaunchMeta:
     out_dtypes: list[str]
     interpret: bool
     collective_id: int | None
+    use_low_level_scheduler: bool
     n_args: int
 
 
@@ -2035,6 +2048,7 @@ def capture_jax_launch_metadata(
     ]
     interpret = bool(kw.get("_pallas_interpret") or False)
     collective_id = cast("int | None", kw.get("_collective_id"))
+    use_low_level_scheduler = bool(kw.get("_use_low_level_scheduler") or False)
 
     # Derive the grid, output shapes, and shape-derived scalar launch args from the
     # RUNTIME input shapes so a single standalone is correct at every dynamic shape.
@@ -2168,6 +2182,7 @@ def capture_jax_launch_metadata(
         out_dtypes=out_dtypes,
         interpret=interpret,
         collective_id=collective_id,
+        use_low_level_scheduler=use_low_level_scheduler,
         n_args=len(launch_args),
     )
 
@@ -2360,6 +2375,9 @@ def build_jax_fn_ast(
         ast.parse(f"_USER_POSITIONS = {meta.user_positions!r}").body[0],
         ast.parse(f"_INTERPRET = {meta.interpret!r}").body[0],
         ast.parse(f"_COLLECTIVE_ID = {meta.collective_id!r}").body[0],
+        ast.parse(f"_USE_LOW_LEVEL_SCHEDULER = {meta.use_low_level_scheduler!r}").body[
+            0
+        ],
         ast.parse(f"_N_ARGS = {meta.n_args}").body[0],
     ]
     entrypoint = ast.parse(_jax_entrypoint_source(meta, device_kernel)).body[0]
@@ -2433,6 +2451,7 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        smem_arg_indices=_SMEM_ARG_INDICES,",
         "        collective_id=_COLLECTIVE_ID,",
         "        interpret=_INTERPRET,",
+        "        use_low_level_scheduler=_USE_LOW_LEVEL_SCHEDULER,",
         "        compact=None,",
         "        orig_shapes=orig_shapes,",
         "        ds_pad_dims=_DS_PAD_DIMS,",

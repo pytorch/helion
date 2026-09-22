@@ -28,7 +28,10 @@ import unittest
 import torch
 
 import helion
+from helion._argument_device import _ArgumentDeviceResolver
+from helion._argument_device import _find_argument_device
 import helion.language as hl
+from helion.language.constexpr import ConstExpr
 from helion.runtime.kernel import _make_prepared_arg_guard
 
 
@@ -73,6 +76,26 @@ def _dynamic_add_scalar_list(x: torch.Tensor, values: list[int]) -> torch.Tensor
 
 
 class TestFastDispatchKey(unittest.TestCase):
+    def test_argument_device_discovery_preserves_precedence(self) -> None:
+        cpu = torch.device("cpu")
+        meta = torch.device("meta")
+        cpu_tensor = torch.empty(1)
+        meta_tensor = torch.empty(1, device=meta)
+        cases = (
+            ((cpu_tensor, meta_tensor), cpu),
+            ((meta_tensor, cpu_tensor), meta),
+            ((meta, cpu_tensor), meta),
+            ((None, [meta_tensor], cpu_tensor), meta),
+            (({"empty": None, "device": meta}, cpu_tensor), meta),
+            ((ConstExpr(meta_tensor), cpu_tensor), cpu),
+        )
+        for index, (args, expected) in enumerate(cases):
+            with self.subTest(case=index):
+                self.assertEqual(_find_argument_device(args), expected)
+                self.assertEqual(
+                    _ArgumentDeviceResolver.from_values(args)(args), expected
+                )
+
     def test_refinement_across_dtype_shape_stride(self) -> None:
         """Every pair of argument lists with different *full* keys must also
         have different *fast* keys -- the property that makes a fast-key hit

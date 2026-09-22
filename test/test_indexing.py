@@ -26,6 +26,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNormalMode
 from helion._testing import skipIfRefEager
+from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessTensorDescriptor
@@ -3255,6 +3256,56 @@ class TestIndexing(RefEagerTestBase, TestCase):
         y = torch.randn([2], device=DEVICE)
         torch.testing.assert_close(add_one(y), y + 1)
         self.assertEqual(len(add_one._bound_kernels), 1)
+
+    @onlyBackends(["triton"])
+    @skipIfRocm("ROCm exposes an unrelated cross-loop dependency in this codegen test")
+    @skipIfTileIR("TileIR does not support cross-loop persistent synchronization")
+    @skipIfXPU("XPU exposes an unrelated cross-loop dependency in this codegen test")
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_dynamic_internal_strides_remain_literal(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            triton_do_not_specialize=True,
+        )
+        def two_stage(x: torch.Tensor) -> torch.Tensor:
+            rows = x.size(0)
+            tmp = torch.empty((rows, 32), dtype=x.dtype, device=x.device)
+            out = torch.empty_like(tmp)
+            for tile_m, tile_n in hl.tile([rows, 32], block_size=[1, 32]):
+                tmp[tile_m, tile_n] = x[tile_m, tile_n]
+            for tile_m, tile_n in hl.tile([rows, 32], block_size=[1, 32]):
+                out[tile_m, tile_n] = tmp[tile_m, tile_n] + 1
+            return out
+
+        x = torch.randn([2, 32], device=DEVICE)
+        code, result = code_and_output(two_stage, (x,))
+        torch.testing.assert_close(result, x + 1)
+        # User-input layout remains generic, while compiler-owned contiguous
+        # layouts must not pollute Triton's do-not-specialize set.
+        self.assertIn("'x_stride_0'", code)
+        self.assertNotIn("'tmp_stride_", code)
+        self.assertNotIn("'out_stride_", code)
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Test checks generated Triton code")
+    def test_symbolic_internal_stride_remains_runtime(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=False,
+            triton_do_not_specialize=True,
+        )
+        def transpose_copy(x: torch.Tensor) -> torch.Tensor:
+            rows = x.size(0)
+            out = torch.empty((32, rows), dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([rows, 32], block_size=[1, 32]):
+                out[tile_n, tile_m] = x[tile_m, tile_n].T
+            return out
+
+        x = torch.randn([2, 32], device=DEVICE)
+        code, result = code_and_output(transpose_copy, (x,))
+        torch.testing.assert_close(result, x.T)
+        self.assertIn("'out_stride_0'", code)
 
     @onlyBackends(["triton"])
     @skipIfRefEager("Test checks generated Triton code")

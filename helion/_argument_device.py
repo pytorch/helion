@@ -92,6 +92,9 @@ def _find_argument_device_with_path(
 
 def _find_argument_device(values: Sequence[object]) -> torch.device:
     """Return the first device found by normal kernel argument traversal."""
+    # Most callers only need the leading tensor's device, not a reusable path.
+    if values and (device := _leaf_device(values[0])) is not None:
+        return device
     result = _find_argument_device_with_path(values)
     if result is None:
         raise exc.NoTensorArgs

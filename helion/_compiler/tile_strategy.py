@@ -4094,6 +4094,7 @@ class ForiLoopState(DeviceLoopOrGridState):
 
     body_fn_name: str
     loop_var_name: str  # The fori_loop index variable (e.g., "_j")
+    iteration_count: str | None = None
     static_unroll: bool = False
     inner_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
@@ -4139,6 +4140,13 @@ class VecLaneWrapper:
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
     lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
+    # Preserve which logical blocks each synthetic lane variable distributes.
+    # The aggregate set above is retained for existing reduction scheduling;
+    # late structural lowerings need the exact association to prove coordinate
+    # coverage without guessing from generated variable names.
+    lane_loop_block_ids: dict[str, frozenset[int]] = dataclasses.field(
+        default_factory=dict
+    )
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
@@ -4164,6 +4172,9 @@ class DeviceGridState(DeviceLoopOrGridState):
     ) -> None:
         self.lane_loops.append((lane_var, extent))
         self.lane_loop_blocks.add(block_id)
+        self.lane_loop_block_ids[lane_var] = self.lane_loop_block_ids.get(
+            lane_var, frozenset()
+        ) | {block_id}
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
         from .ast_read_writes import ReadWrites
@@ -6652,6 +6663,14 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
             lane_loop_blocks=set(self._lane_var_by_block),
+            lane_loop_block_ids={
+                lane_var: frozenset(
+                    block_id
+                    for block_id, candidate in self._lane_var_by_block.items()
+                    if candidate == lane_var
+                )
+                for lane_var, _extent in lane_loops
+            },
             lane_setup_statements=lane_setup_statements,
             outer_prefix=outer_setup_statements,
             thread_axis_sizes=tracker.sizes,
@@ -7213,6 +7232,11 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             block_id_to_info=block_id_to_info,
             lane_loops=lane_loops,
             lane_loop_blocks=set(self.block_ids) if lane_loops else set(),
+            lane_loop_block_ids=(
+                {self._lane_var: frozenset(self.block_ids)}
+                if self._lane_var is not None
+                else {}
+            ),
             lane_setup_statements=lane_setup_statements,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,

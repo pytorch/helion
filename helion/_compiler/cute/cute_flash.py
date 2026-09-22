@@ -5056,7 +5056,7 @@ if TYPE_CHECKING:
 # ``_flash_runtime`` (a real module compiled WITHOUT ``from __future__ import
 # annotations``); the generated module imports them. The remaining cute / utils
 # / pipeline symbols are imported under flash-local aliases.
-_FLASH_RUNTIME_ABI = 3
+_FLASH_RUNTIME_ABI = 6
 
 # This literal is part of generated source and therefore the CuTe disk-cache
 # key. Bump it whenever an imported flash runtime helper changes semantics.

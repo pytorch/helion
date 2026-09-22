@@ -1,9 +1,10 @@
 """Reproduce the reportable recurrent KDA decode comparisons.
 
-The two scoped rows are T1 unbounded-softplus (N=15, H=32) and T3 bounded
-speculative decode (N=8, H=16). FlashInfer CuTe DSL and Helion CuTe each get a
-private one-invocation CUDA graph. State restoration and cold-L2 flushing are
-outside the timed interval, and samples alternate in balanced ABBA/BAAB order.
+The scoped rows are T1 unbounded-softplus (N=15, H=32), T3 bounded speculative
+decode (N=8, H=16), and T5 precomputed-gate speculative decode
+(N=32, H=16, HV=32). FlashInfer CuTe DSL and Helion CuTe each get a private
+one-invocation CUDA graph. State restoration and cold-L2 flushing are outside
+the timed interval, and samples alternate in balanced ABBA/BAAB order.
 """
 
 from __future__ import annotations
@@ -55,8 +56,13 @@ IMPLEMENTATIONS = ("flashinfer-cute", "helion-cute")
 DEFAULT_CASES = (
     "t1-unbounded-b15-h32",
     "t3-lower-bound-n8-h16",
+    "t5-precomputed-n32-h16-hv32",
 )
 PINNED_FLASHINFER_SHA = "f67bc2ed555c1ad6a764ad68f7aa9622178e9eae"
+_DIRECT_AFFINE_CODEGEN_PROFILES = {
+    "direct_m16n8_v1": ("m16n8", "interleaved", "async", "state_first"),
+    "direct_m16n16_v1": ("m16n16", "role_major", "async", "state_first"),
+}
 
 
 @dataclass(frozen=True)
@@ -65,6 +71,8 @@ class Case:
     num_sequences: int
     num_tokens: int
     num_heads: int
+    num_value_heads: int
+    use_gate_in_kernel: bool
     lower_bound: float | None
     beta_is_logit: bool
 
@@ -74,6 +82,8 @@ class Case:
 
     @property
     def gate_mode(self) -> str:
+        if not self.use_gate_in_kernel:
+            return "precomputed"
         return "unbounded-softplus" if self.lower_bound is None else "lower-bound"
 
 
@@ -83,6 +93,8 @@ CASES = {
         num_sequences=15,
         num_tokens=1,
         num_heads=32,
+        num_value_heads=32,
+        use_gate_in_kernel=True,
         lower_bound=None,
         beta_is_logit=True,
     ),
@@ -91,7 +103,19 @@ CASES = {
         num_sequences=8,
         num_tokens=3,
         num_heads=16,
+        num_value_heads=16,
+        use_gate_in_kernel=True,
         lower_bound=LOWER_BOUND,
+        beta_is_logit=False,
+    ),
+    "t5-precomputed-n32-h16-hv32": Case(
+        name="t5-precomputed-n32-h16-hv32",
+        num_sequences=32,
+        num_tokens=5,
+        num_heads=16,
+        num_value_heads=32,
+        use_gate_in_kernel=False,
+        lower_bound=None,
         beta_is_logit=False,
     ),
 }
@@ -144,7 +168,7 @@ class RecurrentInputs:
             HEAD_DIM**-0.5,
             0.0 if case.lower_bound is None else case.lower_bound,
             case.num_tokens,
-            True,
+            case.use_gate_in_kernel,
             case.lower_bound is not None,
             case.beta_is_logit,
         )
@@ -295,6 +319,21 @@ def _case_semantics(case: Case, seed: int) -> dict[str, Any]:
     accepted_tokens = [
         index % case.num_tokens + 1 for index in range(case.num_sequences)
     ]
+    input_distribution = {
+        "q_k_v": "normal-std-0.25-bfloat16",
+        "beta_logits": "normal-std-1.0-bfloat16",
+        "state": "normal-std-0.02-bfloat16",
+    }
+    if case.use_gate_in_kernel:
+        input_distribution.update(
+            {
+                "raw_gate": "normal-std-0.25-bfloat16",
+                "a_log": "uniform[-1.5,0)-float32",
+                "dt_bias": "normal-std-0.1-float32",
+            }
+        )
+    else:
+        input_distribution["precomputed_gate"] = "logsigmoid-normal-float32-to-bfloat16"
     return {
         "case": case.name,
         "seed": seed,
@@ -302,7 +341,7 @@ def _case_semantics(case: Case, seed: int) -> dict[str, Any]:
             "num_sequences": case.num_sequences,
             "num_tokens": case.num_tokens,
             "num_query_heads": case.num_heads,
-            "num_value_heads": case.num_heads,
+            "num_value_heads": case.num_value_heads,
             "head_dim": HEAD_DIM,
         },
         "dtype": "bfloat16",
@@ -320,13 +359,7 @@ def _case_semantics(case: Case, seed: int) -> dict[str, Any]:
         "gate_mode": case.gate_mode,
         "lower_bound": case.lower_bound,
         "beta_is_logit": case.beta_is_logit,
-        "input_distribution": {
-            "q_k_v_raw_gate": "normal-std-0.25-bfloat16",
-            "beta_logits": "normal-std-1.0-bfloat16",
-            "a_log": "uniform[-1.5,0)-float32",
-            "dt_bias": "normal-std-0.1-float32",
-            "state": "normal-std-0.02-bfloat16",
-        },
+        "input_distribution": input_distribution,
     }
 
 
@@ -371,12 +404,23 @@ def _make_inputs(case: Case, seed: int) -> RecurrentInputs:
             generator=generator,
         ).mul_(std)
 
-    token_shape = (case.total_tokens, case.num_heads, HEAD_DIM)
-    q = normal(token_shape)
-    k = normal(token_shape)
-    v = normal(token_shape)
-    gate = normal(token_shape)
-    beta_logits = normal((case.total_tokens, case.num_heads), std=1.0)
+    qkv_shape = (case.total_tokens, case.num_heads, HEAD_DIM)
+    value_shape = (case.total_tokens, case.num_value_heads, HEAD_DIM)
+    q = normal(qkv_shape)
+    k = normal(qkv_shape)
+    v = normal(value_shape)
+    if case.use_gate_in_kernel:
+        gate = normal(value_shape)
+    else:
+        gate = torch.nn.functional.logsigmoid(
+            torch.randn(
+                value_shape,
+                device=device,
+                dtype=torch.float32,
+                generator=generator,
+            )
+        ).to(torch.bfloat16)
+    beta_logits = normal((case.total_tokens, case.num_value_heads), std=1.0)
     beta = beta_logits if case.beta_is_logit else torch.sigmoid(beta_logits)
     a_log = torch.empty(case.num_heads, device=device, dtype=torch.float32)
     a_log.uniform_(-1.5, 0.0, generator=generator)
@@ -400,7 +444,7 @@ def _make_inputs(case: Case, seed: int) -> RecurrentInputs:
             device=device,
             dtype=torch.int32,
         ).reshape(case.num_sequences, case.num_tokens)
-    state = normal((state_slots, case.num_heads, HEAD_DIM, HEAD_DIM), std=0.02)
+    state = normal((state_slots, case.num_value_heads, HEAD_DIM, HEAD_DIM), std=0.02)
     cu_seqlens = torch.arange(
         0,
         case.total_tokens + 1,
@@ -432,18 +476,28 @@ def _make_inputs(case: Case, seed: int) -> RecurrentInputs:
 def _torch_reference(
     case: Case, inputs: RecurrentInputs
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    q = inputs.q.float()
-    k = inputs.k.float()
+    value_heads_per_query_head = case.num_value_heads // case.num_heads
+    query_heads = torch.arange(case.num_value_heads, device=inputs.q.device) // (
+        value_heads_per_query_head
+    )
+    q = inputs.q[:, query_heads].float()
+    k = inputs.k[:, query_heads].float()
     q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + L2_EPSILON)
     k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + L2_EPSILON)
-    gate_input = inputs.gate.float() + inputs.dt_bias.reshape(
-        1, case.num_heads, HEAD_DIM
-    )
-    decay_parameter = torch.exp(inputs.a_log).reshape(1, case.num_heads, 1)
-    if case.lower_bound is None:
-        log_decay = -decay_parameter * torch.nn.functional.softplus(gate_input)
+    if case.use_gate_in_kernel:
+        gate_input = (
+            inputs.gate.float()
+            + inputs.dt_bias.reshape(1, case.num_heads, HEAD_DIM)[:, query_heads]
+        )
+        decay_parameter = torch.exp(inputs.a_log)[query_heads].reshape(
+            1, case.num_value_heads, 1
+        )
+        if case.lower_bound is None:
+            log_decay = -decay_parameter * torch.nn.functional.softplus(gate_input)
+        else:
+            log_decay = case.lower_bound * torch.sigmoid(decay_parameter * gate_input)
     else:
-        log_decay = case.lower_bound * torch.sigmoid(decay_parameter * gate_input)
+        log_decay = inputs.gate.float()
     decay = torch.exp(log_decay)
     beta = inputs.beta.float()
     if case.beta_is_logit:
@@ -469,20 +523,21 @@ def _torch_reference(
 def _flashinfer_kwargs(case: Case, inputs: RecurrentInputs) -> dict[str, object]:
     outer_shape = (1, case.total_tokens)
     qkv_shape = (*outer_shape, case.num_heads, HEAD_DIM)
-    beta_shape = (*outer_shape, case.num_heads)
+    value_shape = (*outer_shape, case.num_value_heads, HEAD_DIM)
+    beta_shape = (*outer_shape, case.num_value_heads)
     return {
         "q": inputs.q.view(qkv_shape),
         "k": inputs.k.view(qkv_shape),
-        "v": inputs.v.view(qkv_shape),
-        "g": inputs.gate.view(qkv_shape),
+        "v": inputs.v.view(value_shape),
+        "g": inputs.gate.view(value_shape),
         "beta": inputs.beta.view(beta_shape),
-        "A_log": inputs.a_log,
-        "dt_bias": inputs.dt_bias,
+        "A_log": inputs.a_log if case.use_gate_in_kernel else None,
+        "dt_bias": inputs.dt_bias if case.use_gate_in_kernel else None,
         "scale": HEAD_DIM**-0.5,
         "initial_state": inputs.state,
         "output_final_state": False,
         "use_qk_l2norm_in_kernel": True,
-        "use_gate_in_kernel": True,
+        "use_gate_in_kernel": case.use_gate_in_kernel,
         "lower_bound": case.lower_bound,
         "cu_seqlens": inputs.cu_seqlens,
         "ssm_state_indices": (
@@ -492,7 +547,7 @@ def _flashinfer_kwargs(case: Case, inputs: RecurrentInputs) -> dict[str, object]
         "num_accepted_tokens": (
             None if case.num_tokens == 1 else inputs.num_accepted_tokens
         ),
-        "output": inputs.output.view(qkv_shape),
+        "output": inputs.output.view(value_shape),
         "beta_is_logit": case.beta_is_logit,
     }
 
@@ -584,9 +639,13 @@ def _tracked_flashinfer_cute_call(
             HEAD_DIM,
             case.num_tokens,
             case.num_heads,
-            case.num_heads,
-            2,
-            1,
+            case.num_value_heads,
+            (
+                0
+                if not case.use_gate_in_kernel
+                else (2 if case.lower_bound is not None else 1)
+            ),
+            int(case.use_gate_in_kernel),
             int(case.beta_is_logit),
             1,
             0,
@@ -659,14 +718,18 @@ def _effective_bytes(case: Case) -> int:
     state_elements = (
         (case.num_tokens + 1)
         * case.num_sequences
-        * case.num_heads
+        * case.num_value_heads
         * HEAD_DIM
         * HEAD_DIM
     )
     token_elements = case.total_tokens * (
-        case.num_heads * 2 * HEAD_DIM + case.num_heads * (3 * HEAD_DIM + 1)
+        case.num_heads * 2 * HEAD_DIM + case.num_value_heads * (3 * HEAD_DIM + 1)
     )
-    parameter_bytes = (case.num_heads + case.num_heads * HEAD_DIM) * 4
+    parameter_bytes = (
+        (case.num_heads + case.num_heads * HEAD_DIM) * 4
+        if case.use_gate_in_kernel
+        else 0
+    )
     index_bytes = (
         case.num_sequences * case.num_tokens
         + case.num_sequences
@@ -680,13 +743,16 @@ def _make_helion_kernel(args: argparse.Namespace) -> helion.Kernel:
     return helion.kernel(
         _helion_recurrent_kda_body,
         static_shapes=False,
+        fast_math=True,
         autotune_effort="full",
         autotune_random_seed=args.autotune_seed,
         ignore_warnings=[helion.exc.ProcessGroupNameNotFound],
     )
 
 
-def _helion_codegen_expectation(case: Case) -> tuple[str, tuple[str, ...]]:
+def _helion_codegen_expectation(
+    case: Case, config: dict[str, Any] | None = None
+) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     if case.num_tokens == 1:
         return (
             "split-single-token-rank1",
@@ -694,12 +760,76 @@ def _helion_codegen_expectation(case: Case) -> tuple[str, tuple[str, ...]]:
                 "split_t1_codegen_abi_version = 1",
                 "split_t1_rank1_helper_abi_version = 4",
             ),
+            (),
+            (),
+        )
+    if config is not None:
+        schedule_name = config.get("cute_affine_scan_schedule", "ordinary")
+        if not isinstance(schedule_name, str):
+            raise ValueError(
+                f"unexpected resolved direct-affine schedule: {schedule_name!r}"
+            )
+        if schedule_name != "ordinary":
+            try:
+                mma, coefficient_layout, state_ingress, phase_order = (
+                    _DIRECT_AFFINE_CODEGEN_PROFILES[schedule_name]
+                )
+            except KeyError as error:
+                raise ValueError(
+                    f"unexpected resolved direct-affine schedule: {schedule_name!r}"
+                ) from error
+            ingress_helper = (
+                "stage_state_tile8x8_async_bf16"
+                if state_ingress == "async"
+                else "direct_state_index"
+            )
+            plan_kind = (
+                f"direct-affine-{mma}-{coefficient_layout}-{state_ingress}-"
+                f"{phase_order}"
+            )
+            alias = r"_helion_direct_affine(?:_\d+)?_mma"
+            return (
+                plan_kind,
+                (),
+                (
+                    rf"import helion\._compiler\.cute\.short_affine_scan_mma as {alias}",
+                    rf".*{alias}\.{ingress_helper}\(.*",
+                    rf".*{alias}\.precompute_affine_from_buffers_bf16\(.*",
+                    rf".*{alias}\.project_retain_affine_{mma}_bf16\(.*",
+                    rf".*{alias}\.consume_affine_steps\(.*",
+                ),
+                (),
+            )
+    fixed_token_expected = (
+        case.use_gate_in_kernel
+        and case.num_heads == case.num_value_heads
+        and 2 <= case.num_tokens <= 6
+        and (
+            config is None
+            or (
+                config.get("block_sizes") == [32]
+                and config.get("num_warps") in (2, 4)
+                and config.get("pid_type", "flat") == "flat"
+            )
+        )
+    )
+    if fixed_token_expected:
+        return (
+            "fixed-token-rank1",
+            (
+                "fixed_rank1_codegen_abi_version = 3",
+                "fixed_rank1_rank1_helper_abi_version = 4",
+            ),
+            (),
+            (),
         )
     return (
-        "fixed-token-rank1",
+        "ordinary-cute",
+        (),
+        (),
         (
-            "fixed_rank1_codegen_abi_version = 3",
-            "fixed_rank1_rank1_helper_abi_version = 4",
+            r".*fixed_rank1_codegen_abi_version.*",
+            r".*short_affine_scan_mma.*",
         ),
     )
 
@@ -890,12 +1020,20 @@ def _run_paired_recurrent_graph(args: argparse.Namespace) -> dict[str, Any]:
         pristine.state,
     )
 
-    plan_kind, source_markers = _helion_codegen_expectation(case)
+    config_values = parse_json_object(resolved_config, "resolved Helion config")
+    (
+        plan_kind,
+        source_markers,
+        source_patterns,
+        forbidden_source_patterns,
+    ) = _helion_codegen_expectation(case, config_values)
     generated_wrapper = verify_helion_generated_wrapper(
         helion_bound,
         config,
         expected_plan_kind=plan_kind,
         expected_source_markers=source_markers,
+        expected_source_patterns=source_patterns,
+        forbidden_source_patterns=forbidden_source_patterns,
     )
     provider_metadata = {
         "flashinfer-cute": {
@@ -969,6 +1107,8 @@ def _run_paired_recurrent_graph(args: argparse.Namespace) -> dict[str, Any]:
         final_config,
         expected_plan_kind=plan_kind,
         expected_source_markers=source_markers,
+        expected_source_patterns=source_patterns,
+        forbidden_source_patterns=forbidden_source_patterns,
     )
     assert_stable(
         "Helion generated wrapper during paired graph run",

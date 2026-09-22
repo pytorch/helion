@@ -32,6 +32,7 @@ from ..backend import _largest_divisor_at_most
 from ..backend import _loop_contains_matmul
 from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
+from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
@@ -480,6 +481,55 @@ def _attention_loop_shape(
     return bm, bn, pattern.score_plan
 
 
+def _detect_attention_bwd_mma_loop(
+    fn: DeviceFunction,
+    block_ids: list[int],
+    *,
+    config: Config,
+) -> bool:
+    """True when the inner Q loop belongs to the fused backward-attention body.
+
+    Gated on the bwd search surface flag (set at DeviceIR time by
+    ``detect_flash_bwd_search_surface``) plus the validated config envelope
+    (flat pid, no reorderings, 128x128 block sizes).
+    """
+    from ..compile_environment import CompileEnvironment
+    from ..host_function import HostFunction
+    from .cute_flash_bwd import match_attention_bwd
+
+    env = CompileEnvironment.current()
+    if not env.config_spec.cute_flash_bwd_search_enabled:
+        return False
+    device_ir = HostFunction.current().device_ir
+    if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
+        return False
+    root_block_id = device_ir.grid_block_ids[0][0]
+    if len(block_ids) != 1 or block_ids[0] == root_block_id:
+        return False
+    if config.pid_type != "flat":
+        return False
+    if any(grouping != 1 for grouping in config.l2_groupings):
+        return False
+    if any(order != [*range(len(order))] for order in config.loop_orders):
+        return False
+    if any(thread_count != 0 for thread_count in config.num_threads):
+        return False
+    cute_vector_widths = config.config.get("cute_vector_widths", [])
+    if isinstance(cute_vector_widths, list) and any(
+        width != 1 for width in cute_vector_widths
+    ):
+        return False
+    bm = env.block_sizes[block_ids[0]].from_config(config)
+    bn = env.block_sizes[root_block_id].from_config(config)
+    if bm != 128 or bn != 128:
+        return False
+    match = match_attention_bwd(device_ir)
+    if match is None:
+        return False
+    fn.cute_state.attention_flash_bwd_match = match
+    return True
+
+
 def _detect_attention_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -912,9 +962,12 @@ class CuteBackend(Backend):
         config: Config,
         tile_strategy: TileStrategyDispatch,
     ) -> None:
+        from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
+        from ..device_ir import RootGraphInfo
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
+        from .direct_affine_candidate import discover_direct_affine_candidates
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
         from .layout_propagation import plan_layouts
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
@@ -923,6 +976,36 @@ class CuteBackend(Backend):
         )
         from .view_subtile import annotate_view_subtiles
 
+        device_function = DeviceFunction.current()
+        direct_affine_requested = (
+            config.cute_affine_scan_schedule != DIRECT_AFFINE_ORDINARY_SCHEDULE
+        )
+        if direct_affine_requested:
+            direct_affine_candidates = discover_direct_affine_candidates(graphs)
+            device_function.cute_state.direct_affine_candidates = (
+                direct_affine_candidates
+            )
+            if not CompileEnvironment.current().settings.fast_math:
+                raise exc.BackendUnsupported(
+                    "cute", "direct affine scan requires fast_math=True"
+                )
+            root_graphs = tuple(
+                graph for graph in graphs if isinstance(graph, RootGraphInfo)
+            )
+            if (
+                len(direct_affine_candidates) != 1
+                or len(root_graphs) != 1
+                or direct_affine_candidates[0].graph_id != root_graphs[0].graph_id
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "direct affine scan requires one compatible single-root region",
+                )
+            annotate_view_subtiles(graphs, config)
+            plan_layouts(graphs, config, tile_strategy)
+            return
+
+        device_function.cute_state.direct_affine_candidates = ()
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
@@ -938,8 +1021,9 @@ class CuteBackend(Backend):
         )
         if split_t1_plan is not None:
             return
+
         plan_fixed_token_rank1_recurrence(graphs, tile_strategy)
-        if DeviceFunction.current().cute_state.fixed_token_rank1_plan is not None:
+        if device_function.cute_state.fixed_token_rank1_plan is not None:
             return
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
@@ -956,6 +1040,7 @@ class CuteBackend(Backend):
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
+            or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
@@ -1855,6 +1940,7 @@ class CuteBackend(Backend):
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
+        from .thread_budget import check_thread_limit
 
         device_function = DeviceFunction.current()
         codegen = device_function.codegen
@@ -1929,6 +2015,12 @@ class CuteBackend(Backend):
                 )
             return launcher_args
 
+        direct_affine_plan = device_function.cute_state.direct_affine_plan
+        if direct_affine_plan is not None:
+            x, y, z = direct_affine_plan.cta_shape
+            check_thread_limit(x * y * z, context=str(direct_affine_plan.cta_shape))
+            return launcher_args_with_compile_options(f"block=({x}, {y}, {z})")
+
         # The single-token rank-1 path owns the complete physical body.  The
         # original B1 schedule uses 256 threads while its batched schedule uses
         # one warp; the structural plan proves which topology was emitted.
@@ -1967,7 +2059,10 @@ class CuteBackend(Backend):
         # or 256 threads (Stage-4 warp-spec producer/consumer split). The custom
         # flash codegen owns the whole device body, so the SIMT thread-axis
         # heuristics below do not apply.
-        if device_function.cute_state.attention_flash_block_ids is not None:
+        if (
+            device_function.cute_state.attention_flash_block_ids is not None
+            or device_function.cute_state.attention_flash_bwd_block_ids is not None
+        ):
             flash_threads = device_function.cute_state.attention_flash_threads
             return launcher_args_with_compile_options(f"block=({flash_threads}, 1, 1)")
 
@@ -2640,6 +2735,15 @@ class CuteBackend(Backend):
                     # whole device body; the FX-graph statement walk is bypassed.
                     mma_mode = True
                     fn.cute_state.attention_flash_block_ids = list(block_ids)
+                elif _detect_attention_bwd_mma_loop(
+                    fn,
+                    block_ids,
+                    config=config,
+                ):
+                    # Fused tcgen05 attention BACKWARD: the dedicated bwd
+                    # codegen emits the whole device body.
+                    mma_mode = True
+                    fn.cute_state.attention_flash_bwd_block_ids = list(block_ids)
                 else:
                     mma_mode = _detect_specialized_mma_loop(
                         fn,
