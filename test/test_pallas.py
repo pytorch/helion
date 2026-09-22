@@ -3929,6 +3929,67 @@ class TestPallas(TestCase):
                 result = bound.compile_config(config)(*args)
                 torch.testing.assert_close(result, args[0] + args[1])
 
+    def test_pallas_autotune_filters_excessive_static_unroll(self) -> None:
+        """Autotuning avoids large generated programs but keeps explicit configs."""
+        args = (
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+        )
+        bound = pallas_inner_loop_add.bind(args)
+        backend = bound.config_spec.backend
+        excessive = helion.Config(
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+        )
+        bounded = helion.Config(
+            block_sizes=[8, 1024],
+            pallas_loop_type="unroll",
+        )
+
+        self.assertFalse(
+            backend.autotune_config_is_viable(bound.config_spec, excessive)
+        )
+        self.assertTrue(backend.autotune_config_is_viable(bound.config_spec, bounded))
+
+        # The autotune-only guard does not alter explicit configurations.
+        result = bound.compile_config(
+            helion.Config(
+                block_sizes=[8, 16384],
+                pallas_loop_type="unroll",
+            )
+        )(*args)
+        torch.testing.assert_close(result, (args[0] + args[1]).to(result.device))
+
+    def test_pallas_autotune_filters_live_tiles_over_vmem(self) -> None:
+        """Autotuning screens impossible live tiles before launching them."""
+        from unittest.mock import patch
+
+        a = torch.randn(4, 128, 256, device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn(4, 256, 128, device=DEVICE, dtype=torch.bfloat16)
+        args = (a, b)
+        bound = pallas_bmm.bind(args)
+        config = helion.Config(
+            block_sizes=[4, 128, 128, 128],
+            pallas_loop_type="unroll",
+        )
+
+        with patch(
+            "helion.runtime.pallas.launcher._get_vmem_limit_bytes",
+            return_value=1,
+        ):
+            self.assertFalse(
+                bound.config_spec.backend.autotune_config_is_viable(
+                    bound.config_spec, config
+                )
+            )
+
+        # The same explicit config still compiles and produces the full result.
+        result = bound.compile_config(config)(*args)
+        expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
+        torch.testing.assert_close(
+            result, expected.to(result.device), rtol=1e-2, atol=1e-2
+        )
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""

@@ -43,6 +43,42 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+# Static unroll duplicates each loop body in the generated JAX program. Beyond
+# this many copies for one loop, generated autotune candidates can spend minutes
+# in XLA compilation before the tuner gets any timing signal. Explicitly
+# configured kernels are unaffected by this autotune-only limit.
+_MAX_AUTOTUNED_STATIC_UNROLL_STEPS = 16
+
+
+def _peak_live_tile_bytes(
+    config_spec: ConfigSpec, block_size_by_id: dict[int, int]
+) -> int | None:
+    """Resolve the compiler's live-tile timeline for one candidate."""
+    fact = config_spec.kernel_matmul_fact
+    if fact is None or not fact.attribution_complete or not fact.live_tile_steps:
+        return None
+
+    peak = 0
+    for step in fact.live_tile_steps:
+        live = 0
+        for tile in step:
+            numel = 1
+            for block_id, static_dim in zip(
+                tile.dim_block_ids, tile.static_dims, strict=True
+            ):
+                extent = (
+                    block_size_by_id.get(block_id)
+                    if block_id is not None
+                    else static_dim
+                )
+                if extent is None:
+                    return None
+                numel *= extent
+            live += numel * tile.itemsize
+        peak = max(peak, live)
+    return peak
+
+
 def _embedded_helper_source(body: str) -> str:
     """Source of the in-kernel Pallas helpers referenced by ``body`` (module-level
     so both ``PallasBackend.embedded_helper_source`` and the jax standalone builder
@@ -197,6 +233,52 @@ class PallasBackend(Backend):
         if config_spec.has_pallas_inner_loops:
             return ("pallas_loop_type",)
         return ()
+
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        """Reject candidates that cannot fit or would over-expand source."""
+        block_sizes = config.config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) != len(
+            config_spec.block_sizes
+        ):
+            return True
+        if not all(type(value) is int and value > 0 for value in block_sizes):
+            return True
+
+        block_size_by_id = {
+            spec.block_id: value
+            for spec, value in zip(config_spec.block_sizes, block_sizes, strict=True)
+        }
+
+        peak_live_bytes = _peak_live_tile_bytes(config_spec, block_size_by_id)
+        if peak_live_bytes is not None:
+            from jax.experimental.pallas import tpu as pltpu
+
+            from ...runtime.pallas.launcher import _ensure_cpu_tpu_info
+            from ...runtime.pallas.launcher import _get_vmem_limit_bytes
+            from ...runtime.settings import is_pallas_interpret
+
+            interpret = is_pallas_interpret()
+            if interpret:
+                _ensure_cpu_tpu_info()
+            if peak_live_bytes > _get_vmem_limit_bytes(pltpu, interpret):
+                return False
+
+        if config.get("pallas_loop_type") != "unroll":
+            return True
+
+        grid_block_ids = set(config_spec.grid_block_ids)
+        for spec in config_spec.block_sizes:
+            if spec.block_id in grid_block_ids:
+                continue
+            extent = spec.size_hint
+            if spec.bounded_by_block_id is not None:
+                extent = block_size_by_id.get(spec.bounded_by_block_id, extent)
+            block_size = block_size_by_id[spec.block_id]
+            if math.ceil(extent / block_size) > _MAX_AUTOTUNED_STATIC_UNROLL_STEPS:
+                return False
+        return True
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)

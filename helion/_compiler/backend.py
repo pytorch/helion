@@ -280,6 +280,16 @@ class Backend(abc.ABC):
         """Config keys whose values should be represented in the initial sample."""
         return ()
 
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        """Return whether an automatically generated config is worth compiling.
+
+        This hook only screens candidates produced during autotuning. An explicit
+        fixed config still reaches normal backend validation and compilation.
+        """
+        return True
+
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
         """Convert a torch dtype to a backend-specific type string.

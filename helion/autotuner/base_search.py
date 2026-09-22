@@ -726,17 +726,29 @@ class BaseSearch(BaseAutotuner):
     def _apply_config_filter(
         self, configs: list[Config]
     ) -> tuple[list[Config], list[int]]:
-        """Apply the user-provided config filter, returning passing configs and their indices."""
+        """Apply backend and user filters, returning configs and source indices."""
         config_filter = self.settings.autotune_config_filter
-        if config_filter is None:
-            return configs, list(range(len(configs)))
-        filtered: list[Config | None] = [config_filter(c) for c in configs]
+        filtered: list[Config | None] = []
+        for config in configs:
+            candidate = config_filter(config) if config_filter is not None else config
+            if candidate is not None and not self._backend_config_is_viable(candidate):
+                candidate = None
+            filtered.append(candidate)
         passing_indices = [i for i, fc in enumerate(filtered) if fc is not None]
         passing_configs = cast(
             "list[Config]",
             [filtered[i] for i in passing_indices],
         )
         return passing_configs, passing_indices
+
+    def _backend_config_is_viable(self, config: Config) -> bool:
+        """Return whether the backend can cheaply rule out an autotune config."""
+        config_spec = getattr(self, "config_spec", None) or getattr(
+            self.config_gen, "config_spec", None
+        )
+        backend = getattr(config_spec, "backend", None)
+        check = getattr(backend, "autotune_config_is_viable", None)
+        return check is None or bool(check(config_spec, config))
 
     def benchmark_batch(
         self, configs: list[Config], *, desc: str = "Benchmarking"
@@ -778,7 +790,7 @@ class BaseSearch(BaseAutotuner):
                     results.append(next(inner_iter))
                 else:
                     self.log.debug(
-                        f"Config filtered out by autotune_config_filter: {config!r}"
+                        f"Config filtered out before benchmarking: {config!r}"
                     )
                     results.append(
                         BenchmarkResult(
@@ -1398,6 +1410,9 @@ class PopulationBasedSearch(BaseSearch):
         except exc.InvalidConfig:
             self.config_gen.invalid_config_count += 1
             return None
+        if not self._backend_config_is_viable(config):
+            self.config_gen.invalid_config_count += 1
+            return None
         return PopulationMember(_unset_fn, [], canonical_flat, config)
 
     def _pad_initial_population_with_unique_random(
@@ -1416,6 +1431,9 @@ class PopulationBasedSearch(BaseSearch):
             try:
                 canonical_flat, config = self.config_gen.canonicalize_flat(flat)
             except exc.InvalidConfig:
+                invalid += 1
+                return
+            if not self._backend_config_is_viable(config):
                 invalid += 1
                 return
             if config in seen:
@@ -1440,7 +1458,10 @@ class PopulationBasedSearch(BaseSearch):
                 f"after {attempts} random attempts "
                 f"({invalid} invalid, {duplicate} duplicate)."
             )
-        self.log(f"Initial population after unique random padding: {len(result)} total")
+        if attempts or invalid or duplicate:
+            self.log(
+                f"Initial population after unique random padding: {len(result)} total"
+            )
         return result
 
     def _generate_best_available_population_flat(self) -> list[FlatConfig]:
