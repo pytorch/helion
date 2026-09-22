@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from torch._inductor.ops_handler import OpsHandler
 
     from ...autotuner.config_fragment import ConfigSpecFragment
+    from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
@@ -189,6 +190,13 @@ class PallasBackend(Backend):
 
     def max_reduction_threads(self) -> int | None:
         return None
+
+    def autotune_initial_coverage_keys(
+        self, config_spec: ConfigSpec
+    ) -> tuple[str, ...]:
+        if config_spec.has_pallas_inner_loops:
+            return ("pallas_loop_type",)
+        return ()
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
