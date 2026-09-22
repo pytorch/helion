@@ -16,7 +16,9 @@ from typing import cast
 import torch
 
 from ... import exc
+from ..._compat import num_compute_units
 from ..ast_extension import expr_from_string
+from ..backend import AutotuneGridPolicy
 from ..backend import Backend
 from ..backend import LauncherInfo
 from ..backend import _loop_contains_matmul
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 # in XLA compilation before the tuner gets any timing signal. Explicitly
 # configured kernels are unaffected by this autotune-only limit.
 _MAX_AUTOTUNED_STATIC_UNROLL_STEPS = 16
+_MAX_AUTOTUNED_GRID_PROGRAMS_PER_COMPUTE_UNIT = 64
 
 
 def _autotune_block_size_by_id(
@@ -65,6 +68,29 @@ def _autotune_block_size_by_id(
         spec.block_id: value
         for spec, value in zip(config_spec.block_sizes, block_sizes, strict=True)
     }
+
+
+def _config_not_viable_due_to_grid_size(
+    config_spec: ConfigSpec,
+    block_size_by_id: dict[int, int],
+    max_programs_per_root_grid: int | None,
+) -> bool:
+    """Return whether any root grid launches too many programs."""
+    grid_fact = config_spec.kernel_grid_fact
+    if max_programs_per_root_grid is None or grid_fact is None:
+        return False
+
+    for root in grid_fact.roots:
+        programs = math.prod(
+            math.ceil(
+                config_spec.block_sizes.block_id_lookup(block_id).size_hint
+                / block_size_by_id[block_id]
+            )
+            for block_id in root.block_ids
+        )
+        if programs > max_programs_per_root_grid:
+            return True
+    return False
 
 
 def _config_not_viable_due_to_static_unroll(
@@ -237,14 +263,29 @@ class PallasBackend(Backend):
     def max_reduction_threads(self) -> int | None:
         return None
 
+    def autotune_grid_policy(self, config_spec: ConfigSpec) -> AutotuneGridPolicy:
+        """Constrain complete grids while allowing imbalanced grid axes."""
+        return AutotuneGridPolicy(
+            raise_independent_axis_block_size_minimums=False,
+            max_programs_per_root_grid=(
+                num_compute_units() * _MAX_AUTOTUNED_GRID_PROGRAMS_PER_COMPUTE_UNIT
+            ),
+        )
+
     def autotune_config_is_viable(
         self, config_spec: ConfigSpec, config: Config
     ) -> bool:
-        """Reject candidates whose static unrolling would over-expand source."""
+        """Reject candidates with excessive grids or static source expansion."""
         block_size_by_id = _autotune_block_size_by_id(config_spec, config)
         if block_size_by_id is None:
             return True
 
+        if _config_not_viable_due_to_grid_size(
+            config_spec,
+            block_size_by_id,
+            self.autotune_grid_policy(config_spec).max_programs_per_root_grid,
+        ):
+            return False
         if _config_not_viable_due_to_static_unroll(  # noqa: SIM103
             config_spec, config, block_size_by_id
         ):

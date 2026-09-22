@@ -107,6 +107,21 @@ class LauncherInfo:
     runtime_helper_names: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class AutotuneGridPolicy:
+    """How a backend limits grid-shaped autotune candidates.
+
+    ``raise_independent_axis_block_size_minimums`` applies the legacy
+    search-space heuristic that limits each grid axis separately.
+    ``max_programs_per_root_grid`` enables a coupled candidate check on the
+    product of all axes in each root grid. Backends may select either policy or
+    both explicitly.
+    """
+
+    raise_independent_axis_block_size_minimums: bool = True
+    max_programs_per_root_grid: int | None = None
+
+
 def read_launcher_source(module_name: str) -> str:
     """Raw source of a dependency-free launcher module."""
     import importlib
@@ -291,6 +306,10 @@ class Backend(abc.ABC):
         fixed config still reaches normal backend validation and compilation.
         """
         return True
+
+    def autotune_grid_policy(self, config_spec: ConfigSpec) -> AutotuneGridPolicy:
+        """Return how autotuning should limit grid-shaped candidates."""
+        return AutotuneGridPolicy()
 
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
