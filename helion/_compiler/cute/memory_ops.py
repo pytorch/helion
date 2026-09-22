@@ -58,6 +58,8 @@ from ..compile_environment import RuntimeInputSpecialization
 from ..compile_environment import _replay_tensor_input_source
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
+from .indexing import is_cute_direct_iota_index
+from .indexing import is_cute_unit_stride_iota_index
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -2878,7 +2880,7 @@ def _cute_vector_load_ctx(
     lane_on_stride1 = False
     expr_pos = -1
     tensor_dim = 0
-    for idx in subscript:
+    for subscript_pos, idx in enumerate(subscript):
         if idx is None:
             continue
         expr_pos += 1
@@ -2894,7 +2896,32 @@ def _cute_vector_load_ctx(
             # not as the SymInt that identifies K. Resolve its static extent
             # back to the persistent reduction block.
             bid = env.resolve_block_id(idx.numel())
-            if bid is not None and _cute_lane_strategy(state, bid) is not None:
+            candidate = _cute_lane_strategy(state, bid) if bid is not None else None
+            # Matching the index tensor's extent identifies its lane axis,
+            # but does not prove contiguous addressing.  A gather such as
+            # x[tile.index // 64] has exactly the same extent as tile.index.
+            # Hoisting it at the raw lane base changes the address and can
+            # read beyond x.  Require a direct lane index unless the persistent
+            # reduction's affine rebasing preserves a unit-stride offset.
+            raw_subscript = (
+                state.fx_node.args[1]
+                if state.fx_node is not None and len(state.fx_node.args) > 1
+                else None
+            )
+            raw_index = (
+                raw_subscript[subscript_pos]
+                if isinstance(raw_subscript, (list, tuple))
+                and subscript_pos < len(raw_subscript)
+                else None
+            )
+            valid_iota = (
+                is_cute_unit_stride_iota_index(raw_index)
+                if isinstance(candidate, PersistentReductionStrategy)
+                else is_cute_direct_iota_index(raw_index)
+            )
+            if not valid_iota:
+                return None
+            if bid is not None and candidate is not None:
                 if tensor_dim == stride1_tensor_dim or inner_block_id is None:
                     inner_block_id = bid
                     lane_axis_pos = expr_pos

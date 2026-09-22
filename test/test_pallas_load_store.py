@@ -14,7 +14,6 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallasInterpret
-from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 
 # TODO(tcombes): JAX Pallas interpret mode can't trace these emit_pipeline
@@ -1105,7 +1104,6 @@ class TestPallasVmemScalarLoad(TestCase):
         expected = (source.float().sum(-1) + source[:, -1].float()).to(DEVICE)
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallasTpu("pl.kernel launcher: DMAs with bool dtypes are not supported")
     def test_runtime_row_index_bool(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def row_sum_plus_last(x: torch.Tensor) -> torch.Tensor:
