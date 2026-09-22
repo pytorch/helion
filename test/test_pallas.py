@@ -3988,6 +3988,35 @@ class TestPallas(TestCase):
         )(*args)
         torch.testing.assert_close(result, (args[0] + args[1]).to(result.device))
 
+    def test_pallas_autotune_filters_excessive_low_level_pipeline(self) -> None:
+        """Autotuning bounds low-level scheduler work using grouped steps."""
+        args = (
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+        )
+        bound = pallas_inner_loop_add.bind(args)
+        backend = bound.config_spec.backend
+        excessive = helion.Config(
+            block_sizes=[8, 128],
+            pallas_emit_pipeline_group_size=1,
+            pallas_loop_type="emit_pipeline",
+            pallas_use_low_level_scheduler=True,
+        )
+        bounded = helion.Config(
+            block_sizes=[8, 256],
+            pallas_emit_pipeline_group_size=2,
+            pallas_loop_type="emit_pipeline",
+            pallas_use_low_level_scheduler=True,
+        )
+
+        self.assertFalse(
+            backend.autotune_config_is_viable(bound.config_spec, excessive)
+        )
+        self.assertTrue(backend.autotune_config_is_viable(bound.config_spec, bounded))
+
+        result = bound.compile_config(bounded)(*args)
+        torch.testing.assert_close(result, (args[0] + args[1]).to(result.device))
+
     def test_pallas_autotune_filters_live_tiles_over_vmem(self) -> None:
         """Autotuning screens impossible live tiles before launching them."""
         from unittest.mock import patch
