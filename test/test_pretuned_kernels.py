@@ -281,7 +281,7 @@ def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
     module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4")
     heuristic = _import_pretuned_heuristic("deepseek_v3_moe_nvfp4")
 
-    assert module.deepseek_v3_moe_nvfp4.settings.static_shapes
+    assert not module.deepseek_v3_moe_nvfp4.settings.static_shapes
     assert heuristic.CONFIG["cross_loop_pipeline"] == "dynamic"
     assert heuristic.CONFIG["num_sm_multiplier"] == 2
     assert heuristic.CONFIG["num_warps"] == 4
