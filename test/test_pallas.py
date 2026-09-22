@@ -3940,6 +3940,42 @@ class TestPallas(TestCase):
         )(*args)
         torch.testing.assert_close(result, (args[0] + args[1]).to(result.device))
 
+    @skipIfPallasInterpret("large-grid admission requires a real TPU")
+    def test_pallas_autotune_bounds_total_grid_programs(self) -> None:
+        """Pallas admits imbalanced grids within one total-program limit."""
+        x = torch.randn(256, 32768, device=DEVICE, dtype=torch.float32)
+        y = torch.randn_like(x)
+        bound = pallas_add_2d.bind((x, y))
+        backend = bound.config_spec.backend
+        policy = backend.autotune_grid_policy(bound.config_spec)
+
+        self.assertFalse(policy.raise_independent_axis_block_size_minimums)
+        self.assertIsNotNone(policy.max_programs_per_root_grid)
+        self.assertEqual(
+            [spec.autotuner_min for spec in bound.config_spec.block_sizes],
+            [1, 1],
+        )
+
+        max_programs = policy.max_programs_per_root_grid
+        assert max_programs is not None
+        max_column_programs = max_programs // x.size(0)
+        self.assertGreater(max_column_programs, 1)
+        minimum_column_block = math.ceil(x.size(1) / max_column_programs)
+        accepted_column_block = 1 << (minimum_column_block - 1).bit_length()
+        accepted = helion.Config(block_sizes=[1, accepted_column_block])
+        oversized = helion.Config(block_sizes=[1, accepted_column_block // 2])
+        self.assertTrue(backend.autotune_config_is_viable(bound.config_spec, accepted))
+        self.assertFalse(
+            backend.autotune_config_is_viable(bound.config_spec, oversized)
+        )
+
+        numerical_config = helion.Config(block_sizes=[1, 4096])
+        self.assertTrue(
+            backend.autotune_config_is_viable(bound.config_spec, numerical_config)
+        )
+        result = bound.compile_config(numerical_config)(x, y)
+        torch.testing.assert_close(result, (x + y).to(result.device))
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""
