@@ -31,12 +31,25 @@ import logging
 from pathlib import Path
 import re
 import sys
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import Literal
 
 import numpy as np
 
 from ..runtime.config import Config
+from ..runtime.cute_structural_config import CuteStructuralConfig
+from ..runtime.cute_structural_config import StructuralPolicyError
+from ..runtime.cute_structural_config import require_same_structural_policy
+from .aot_structural_policy import attach_model_policy
+from .aot_structural_policy import load_policy_module
+from .aot_structural_policy import measurement_policy
+from .aot_structural_policy import model_configs
+from .aot_structural_policy import policy_path
+from .aot_structural_policy import policy_suffix
+
+if TYPE_CHECKING:
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -69,6 +82,7 @@ class ShapeConfigData:
     selected_config_indices: list[int] | None = (
         None  # Which configs were selected (set during heuristic generation)
     )
+    cute_structural_policy: CuteStructuralPolicy | None = None
 
 
 @dataclass
@@ -596,8 +610,17 @@ def load_measurements(
     kernel_data: dict[str, dict[str, dict[str, Any]]] = {}
 
     with open(measurements_file, newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        rows = list(csv.DictReader(f))
+        policy = measurement_policy(rows[0]) if rows else None
+        for row in rows:
+            require_same_structural_policy(
+                measurement_policy(row), policy, context="AOT measurement partition"
+            )
+        if "__policy_" in measurements_file.stem and (
+            policy is None or not measurements_file.stem.endswith(policy_suffix(policy))
+        ):
+            raise StructuralPolicyError("AOT measurement filename policy mismatch")
+        for row in rows:
             kname = row["kernel_name"]
             if kernel_name is not None and kname != kernel_name:
                 continue
@@ -607,6 +630,13 @@ def load_measurements(
 
             shape_hash = row["shape_hash"]
             config_hash = row["config_hash"]
+            raw_config = json.loads(row["config"])
+            if policy is not None:
+                envelope = CuteStructuralConfig(raw_config, policy)
+                if config_hash != envelope.identity()[:16]:
+                    raise StructuralPolicyError(
+                        "AOT measurement config identity mismatch"
+                    )
 
             if shape_hash not in kernel_data[kname]:
                 kernel_data[kname][shape_hash] = {
@@ -615,7 +645,7 @@ def load_measurements(
                 }
 
             kernel_data[kname][shape_hash]["configs"][config_hash] = {
-                "config": json.loads(row["config"]),
+                "config": raw_config,
                 "timing_ms": float(row["timing_ms"]),
             }
 
@@ -636,7 +666,11 @@ def load_measurements(
         for shape_data in shapes.values():
             for chash, cdata in shape_data["configs"].items():
                 if chash not in config_map:
-                    config_map[chash] = Config(**cdata["config"])
+                    config_map[chash] = (
+                        Config(**cdata["config"])
+                        if policy is None
+                        else Config.from_dict(cdata["config"])
+                    )
         config_list = [config_map[h] for h in config_hashes]
 
         # Build timing matrix
@@ -657,6 +691,7 @@ def load_measurements(
             configs=config_list,
             shape_hashes=shape_hashes,
             config_hashes=config_hashes,
+            cute_structural_policy=policy,
         )
 
     return result
@@ -969,8 +1004,18 @@ def generate_heuristic(
 
         # Save heuristic code to output_dir (run directory)
         if not target.skip_write:
-            heuristic_file = output_dir / f"heuristic_{kname}.py"
-            heuristic_file.write_text(target.file_header + code)
+            heuristic_file = policy_path(
+                output_dir / f"heuristic_{kname}.py", data.cute_structural_policy
+            )
+            heuristic_file.write_text(
+                target.file_header
+                + attach_model_policy(
+                    code,
+                    {kname: selected_configs},
+                    data.cute_structural_policy,
+                    feature_names={kname: list(data.shape_features[0])},
+                )
+            )
             log.info(f"  Saved heuristic to {heuristic_file}")
 
         results[kname] = HeuristicResult(
@@ -1003,15 +1048,33 @@ def generate_heuristic(
             # Create heuristic filename: _helion_aot_<basename>_<device>_<compute>.py
             base_name = source_path.stem
             heuristic_name = f"_helion_aot_{base_name}_{device_kind}_{compute_kind}.py"
-            source_heuristic_file = source_path.parent / heuristic_name
+            policy = all_data[knames[0]].cute_structural_policy
+            source_heuristic_file = policy_path(
+                source_path.parent / heuristic_name, policy
+            )
 
             # Combine heuristics for all kernels in this source file
             combined_code = _combine_heuristics(knames, results)
+            combined_code = attach_model_policy(
+                combined_code,
+                {name: results[name].selected_configs for name in knames},
+                policy,
+                feature_names={
+                    name: list(all_data[name].shape_features[0]) for name in knames
+                },
+            )
             source_heuristic_file.write_text(target.file_header + combined_code)
             log.info(
                 f"  Saved combined heuristic for {len(knames)} kernel(s) to: {source_heuristic_file}"
             )
 
+    for name, result in results.items():
+        result.generated_code = attach_model_policy(
+            result.generated_code,
+            {name: result.selected_configs},
+            all_data[name].cute_structural_policy,
+            feature_names={name: list(all_data[name].shape_features[0])},
+        )
     return results
 
 
@@ -1119,17 +1182,24 @@ def evaluate_heuristic(
     results: dict[str, dict[str, float]] = {}
 
     for kname, data in all_data.items():
-        heuristic_file = heuristic_dir / f"heuristic_{kname}.py"
+        heuristic_file = policy_path(
+            heuristic_dir / f"heuristic_{kname}.py", data.cute_structural_policy
+        )
         if not heuristic_file.exists():
             log.warning(f"Heuristic file not found for {kname}")
             continue
 
         # Load heuristic module
-        spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
-        if spec is None or spec.loader is None:
-            continue
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        if data.cute_structural_policy is not None:
+            module = load_policy_module(heuristic_file, heuristic_file.read_bytes())
+        else:
+            spec = importlib.util.spec_from_file_location("heuristic", heuristic_file)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+        model_configs(module, kname, data.cute_structural_policy)
 
         select_fn = getattr(module, f"select_config_{kname}", None)
         if select_fn is None:
@@ -1142,6 +1212,13 @@ def evaluate_heuristic(
         for i, features in enumerate(data.shape_features):
             try:
                 selected_config = select_fn(features)
+                if isinstance(selected_config, CuteStructuralConfig):
+                    require_same_structural_policy(
+                        selected_config.policy,
+                        data.cute_structural_policy,
+                        context="AOT measurement evaluation",
+                    )
+                    selected_config = dict(selected_config.config)
                 # Find this config in our data
                 for j, config in enumerate(data.configs):
                     if dict(config) == selected_config:
@@ -1149,6 +1226,8 @@ def evaluate_heuristic(
                         break
                 else:
                     heuristic_timings[i] = np.inf
+            except StructuralPolicyError:
+                raise
             except Exception as e:
                 log.warning(f"Heuristic failed for shape {i}: {e}")
                 heuristic_timings[i] = np.inf

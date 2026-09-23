@@ -13,6 +13,9 @@ from test.test_cute_block_scaled_mma import _native_config
 from test.test_cute_block_scaled_mma import _plain_scales
 
 import helion
+from helion._testing import skipUnlessBackends
+
+pytestmark = skipUnlessBackends(["cute"])
 
 CUDA_DEVICE = "cuda"
 

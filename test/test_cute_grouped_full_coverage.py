@@ -460,7 +460,7 @@ def test_actual_dense_producer_covers_tiles_once_and_preserves_terminal(
 
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
 @skipUnlessBackends(["cute"])
-def test_named_config_roundtrip(mode: str) -> None:
+def test_named_config_and_policy_envelope_roundtrip(mode: str) -> None:
     args = _inputs()
     with _target():
         bound = _bind(grouped_gemm_jagged.fn, args)
@@ -468,8 +468,13 @@ def test_named_config_roundtrip(mode: str) -> None:
         dense = bound.to_code(config)
         ordinary = bound.to_code(_config(None))
         restored = helion.Config.from_json(config.to_json())
-        assert restored.config == config.config
-        assert bound.to_code(restored) == dense
+        envelope = helion.CuteStructuralConfig(
+            config, bound.settings.get_cute_structural_policy()
+        )
+        decoded = helion.CuteStructuralConfig.from_json(envelope.to_json())
+        assert decoded.identity() == envelope.identity()
+        assert decoded.config.config == restored.config == config.config
+        assert bound.to_code(restored) == bound.to_code(decoded.config) == dense
         assert dense != ordinary and restored.to_json() != _config(None).to_json()
 
 

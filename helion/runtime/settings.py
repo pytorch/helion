@@ -26,6 +26,10 @@ from .._compiler.backend_registry import list_backends
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
+from .cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
+from .cute_structural_policy import CuteStructuralOrigins
+from .cute_structural_policy import CuteStructuralPolicy
+from .cute_structural_policy import StructuralSettingOrigin
 from .ref_mode import RefMode
 
 if TYPE_CHECKING:
@@ -33,10 +37,11 @@ if TYPE_CHECKING:
     from ..autotuner.base_search import BaseSearch
     from ..autotuner.pattern_search import InitialPopulationStrategy
     from .config import Config
+    from .cute_structural_config import CuteStructuralConfig
     from .kernel import BoundKernel
 
     _T = TypeVar("_T")
-    ConfigLike = Config | dict[str, object]
+    ConfigLike = Config | dict[str, object] | CuteStructuralConfig
 
     class AutotunerFunction(Protocol):
         def __call__(
@@ -109,7 +114,10 @@ def _env_get_optional_float(var_name: str) -> float | None:
 
 
 def _env_get_bool(var_name: str, default: bool) -> bool:
-    value = os.environ.get(var_name)
+    return _parse_env_bool(var_name, os.environ.get(var_name), default)
+
+
+def _parse_env_bool(var_name: str, value: str | None, default: bool) -> bool:
     if value is None or (value := value.strip()) == "":
         return default
     lowered = value.lower()
@@ -656,6 +664,10 @@ class Settings(_Settings):
     compilation process. Unlike a Config, settings are not auto-tuned and set by the user.
     """
 
+    # Not a dataclass field: public serialization, equality and existing cache
+    # fingerprints continue to contain only the effective setting values.
+    _cute_structural_origins: CuteStructuralOrigins
+
     __slots__ = {
         "backend": (
             "Code generation backend. One of 'triton' (default), 'pallas' (JAX/Pallas), "
@@ -945,8 +957,22 @@ class Settings(_Settings):
                 "auto" if settings["backend"] == "cute" else "word0",
                 mapping={"auto": "auto", "word0": "word0", "philox4": "philox4"},
             )
+        origins: dict[str, StructuralSettingOrigin] = {}
+        for name in CUTE_STRUCTURAL_SETTINGS:
+            if name in settings:
+                origins[name] = "explicit"
+            else:
+                var_name = f"HELION_{name.upper()}"
+                value = os.environ.get(var_name)
+                # Capture value and origin from the same environment read.
+                # The five defaults remain False; policy selection is separate.
+                settings[name] = _parse_env_bool(var_name, value, False)
+                origins[name] = (
+                    "environment" if value is not None and value.strip() else "default"
+                )
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
+        self._cute_structural_origins = CuteStructuralOrigins(**origins)
 
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
@@ -960,9 +986,59 @@ class Settings(_Settings):
 
         self._check_ref_eager_mode_before_print_output_code()
 
+    def __setattr__(self, name: str, value: object) -> None:
+        super().__setattr__(name, value)
+        if (
+            name in CUTE_STRUCTURAL_SETTINGS
+            and "_cute_structural_origins" in self.__dict__
+        ):
+            # Assigning the same value is still an explicit request. Initial
+            # dataclass writes precede creation of the construction origins.
+            self._cute_structural_origins = self._cute_structural_origins.with_explicit(
+                name
+            )
+
+    def __setstate__(
+        self, state: tuple[dict[str, object] | None, dict[str, object]]
+    ) -> None:
+        # copy.copy/deepcopy and pickle restore slots after the instance dict.
+        # Those restoration writes must not become explicit user overrides.
+        namespace, slots = state
+        if namespace is not None:
+            self.__dict__.update(namespace)
+        for name, value in slots.items():
+            object.__setattr__(self, name, value)
+        if "_cute_structural_origins" not in self.__dict__:
+            # Older serialized Settings contain only effective field values,
+            # just like reconstruction from to_dict(). Their flags are explicit.
+            self._cute_structural_origins = CuteStructuralOrigins().with_explicit(
+                *CUTE_STRUCTURAL_SETTINGS
+            )
+
     def copy(self, **overrides: object) -> Settings:
-        """Copy effective settings, with the same shallow semantics as replace."""
-        return dataclasses.replace(self, **overrides)
+        """Copy values and origins, marking supplied structural overrides explicit.
+
+        Like dataclasses.replace, ordinary mutable field values are shared.
+        In contrast, dataclasses.replace and Settings(**settings.to_dict())
+        supply every effective field to the constructor and therefore record
+        every structural value as explicit, even when its value is unchanged.
+        """
+        result = dataclasses.replace(self, **overrides)
+        result._cute_structural_origins = self._cute_structural_origins.with_explicit(
+            *(name for name in CUTE_STRUCTURAL_SETTINGS if name in overrides)
+        )
+        return result
+
+    @property
+    def cute_structural_origins(self) -> CuteStructuralOrigins:
+        """Immutable origins captured at construction and explicit writes."""
+        return self._cute_structural_origins
+
+    def get_cute_structural_policy(self) -> CuteStructuralPolicy:
+        """Snapshot effective booleans without resolving or activating a policy."""
+        return CuteStructuralPolicy(
+            **{name: getattr(self, name) for name in CUTE_STRUCTURAL_SETTINGS}
+        )
 
     def to_dict(self) -> dict[str, object]:
         """

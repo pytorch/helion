@@ -18,10 +18,13 @@ import helion
 from helion._compiler.cute.split_k_cluster_config import CLUSTER8_K4
 from helion._compiler.cute.split_k_cluster_config import LEGACY
 from helion._compiler.cute.split_k_cluster_config import SCHEDULE_KEY
+from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
+
+pytestmark = skipUnlessBackends(["cute"])
 
 FINALIZER_KEY = "cute_split_k_finalizer_warps"
 FINALIZER_MECHANISM = "cute.split_k_finalizer"

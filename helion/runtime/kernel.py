@@ -77,6 +77,11 @@ from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .cute_structural_config import DEFAULT_STRUCTURAL_POLICY
+from .cute_structural_config import CuteStructuralConfig
+from .cute_structural_config import StructuralPolicyError
+from .cute_structural_config import require_same_structural_policy
+from .cute_structural_config import select_structural_policy
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -93,8 +98,10 @@ if TYPE_CHECKING:
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
+    from .cute_structural_config import CuteStructuralPolicyRequest
+    from .cute_structural_policy import CuteStructuralPolicy
 
-    ConfigLike = Config | dict[str, object]
+    ConfigLike = Config | dict[str, object] | CuteStructuralConfig
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -857,6 +864,7 @@ class Kernel(Generic[_R]):
         configs: Sequence[ConfigLike] | None = None,
         settings: Settings | None,
         key: Callable[..., Hashable] | None = None,
+        cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     ) -> None:
         """
         Initialize the Kernel object.  This is typically called from the `@helion.kernel` decorator.
@@ -874,7 +882,11 @@ class Kernel(Generic[_R]):
         # pyrefly: ignore [read-only]
         self.fn: types.FunctionType = fn
         self.signature: inspect.Signature = inspect.signature(fn)
-        self.settings: Settings = settings or Settings()
+        self.settings, selected_configs, self._cute_structural_policy = (
+            select_structural_policy(
+                settings or Settings(), configs or [], cute_structural_policy
+            )
+        )
         self._key_fn: Callable[..., Hashable] | None = key
         # Whether the kernel declares distributed intent via an hl.ProcessGroupName
         # argument. Computed once so the per-call is_distributed check stays cheap
@@ -883,7 +895,7 @@ class Kernel(Generic[_R]):
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
             Config(**config) if isinstance(config, dict) else config
-            for config in configs or []
+            for config in selected_configs
         ]
         self._bind_lock = threading.RLock()
         self._specialize_extra_lock = threading.Lock()
@@ -962,6 +974,25 @@ class Kernel(Generic[_R]):
         grouping telemetry rows by kernel during analysis.
         """
         return inspect.getsource(self.fn)
+
+    def _validate_structural_policy(self) -> None:
+        # Legacy kernels retain their existing mutable Settings behavior. An
+        # explicitly policy-bound kernel cannot silently change its IR contract.
+        if self.cute_structural_policy is not None:
+            if self.settings.backend != "cute":
+                raise StructuralPolicyError(
+                    "A policy-bound Kernel requires backend='cute'"
+                )
+            require_same_structural_policy(
+                self.settings.get_cute_structural_policy(),
+                self.cute_structural_policy,
+                context="Kernel settings",
+            )
+
+    @property
+    def cute_structural_policy(self) -> CuteStructuralPolicy | None:
+        """The explicitly selected policy, or None for the unchanged legacy API."""
+        return self._cute_structural_policy
 
     def _get_bound_kernel_cache_key(
         self, args: tuple[object, ...], signature: tuple[Hashable, ...]
@@ -1453,6 +1484,7 @@ class Kernel(Generic[_R]):
 
     def _bind_isolated(self, args: tuple[object, ...]) -> BoundKernel[_R]:
         """Construct a canonical bound without reading or publishing shared caches."""
+        self._validate_structural_policy()
         args = self._validate_bind_args(args)
         args = self.normalize_args(*args)
         dist_initialized = dist.is_initialized()
@@ -1469,6 +1501,7 @@ class Kernel(Generic[_R]):
         )
 
     def _bind(self, args: tuple[object, ...]) -> BoundKernel[_R]:
+        self._validate_structural_policy()
         with measure("Kernel.bind"):
             args = self._validate_bind_args(args)
             dist_initialized = dist.is_initialized()
@@ -1544,6 +1577,10 @@ class Kernel(Generic[_R]):
         _specialize_extra lookups.
         """
         result: list[Hashable] = []
+        if self.cute_structural_policy is not None:
+            result.append(
+                ("cute_structural_policy", self.cute_structural_policy.identity())
+            )
         assert len(args) <= len(self._annotations)
         for value, annotation in zip(args, self._annotations, strict=False):
             if isinstance(value, ConstExpr):
@@ -1954,6 +1991,7 @@ class Kernel(Generic[_R]):
         Returns:
             _R: The result of the Kernel function call.
         """
+        self._validate_structural_policy()
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
         is_compiling = torch.compiler.is_compiling()
@@ -2146,7 +2184,13 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 specialization and bound caches.
         """
         super().__init__()
+        kernel._validate_structural_policy()
         self.kernel = kernel
+        self._structural_policy = (
+            kernel.settings.get_cute_structural_policy()
+            if kernel.settings.backend == "cute"
+            else None
+        )
         self._reset_generation = kernel._reset_generation
         # Extending this bound's schema evicts all of its dispatch mappings.
         self._dispatch_generation: int | None = None
@@ -2435,6 +2479,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         return self.kernel.configs
 
     def _normalize_config(self, config: ConfigLike) -> Config:
+        self.kernel._validate_structural_policy()
+        if isinstance(config, CuteStructuralConfig):
+            require_same_structural_policy(
+                config.policy, self._structural_policy, context="Late config envelope"
+            )
+            return config.config
         if isinstance(config, Config):
             return config
         # pyrefly: ignore [bad-argument-type]
@@ -2443,8 +2493,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _normalized_config_copy(self, config: ConfigLike) -> Config:
         return self.env.config_spec.normalized_config(self._normalize_config(config))
 
-    def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
+    def config_envelope(self, config: ConfigLike) -> CuteStructuralConfig:
+        """Snapshot a config and this bound's policy for a later pre-binding load."""
+        if self._structural_policy is None:
+            raise ValueError("Config policy envelopes require backend='cute'")
+        return CuteStructuralConfig(
+            self._normalize_config(config), self._structural_policy
+        )
+
+    def format_kernel_decorator(self, config: ConfigLike, settings: Settings) -> str:
         """Return the @helion.kernel decorator capturing backend codegen settings."""
+        if self is not None and self.kernel.cute_structural_policy is not None:
+            config = self.config_envelope(config)
         parts = [
             f"config={config.__repr__()}",
             f"static_shapes={settings.static_shapes}",
@@ -2612,6 +2672,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 and self.env.backend.requires_shape_specialized_module
             ):
                 cache_extra = repr(self._base_spec_key)
+            if self.kernel.cute_structural_policy is not None:
+                cache_extra += self.extra_cache_key()
             with measure("BoundKernel.PyCodeCache.load"):
                 module = PyCodeCache.load(triton_code, extra=cache_extra)
             self.env.backend.annotate_compiled_module(
@@ -2655,7 +2717,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         Returns ``""`` by default, leaving the cache key unchanged.
         """
-        return ""
+        policy = self.kernel.cute_structural_policy
+        return "" if policy is None else f"cute_structural_policy:{policy.identity()}"
 
     def supports_subprocess_benchmark(self) -> bool:
         return True
@@ -2916,11 +2979,17 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Args:
             config: The configuration to set.
         """
+        requested_config = config
         config = self._normalize_config(config)
         self._run = self.compile_config(config)
         self._config = config
+        repro_config = (
+            requested_config
+            if isinstance(requested_config, CuteStructuralConfig)
+            else config
+        )
         counters["best_config_decorator"][
-            self.format_kernel_decorator(config, self.settings)
+            self.format_kernel_decorator(repro_config, self.settings)
         ] = 1
 
     def _specialize_extra(self) -> list[Callable[[Sequence[object]], Hashable]]:
@@ -3605,6 +3674,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     **settings: object,
 ) -> Kernel[_R]: ...
 
@@ -3616,6 +3686,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     **settings: object,
 ) -> _KernelDecorator: ...
 
@@ -3626,6 +3697,7 @@ def kernel(
     config: ConfigLike | None = None,
     configs: Sequence[ConfigLike] | None = None,
     key: Callable[..., Hashable] | None = None,
+    cute_structural_policy: CuteStructuralPolicyRequest = DEFAULT_STRUCTURAL_POLICY,
     **settings: object,
 ) -> Kernel[_R] | _KernelDecorator:
     """
@@ -3639,6 +3711,12 @@ def kernel(
             one of config or configs. Refer to the ``helion.Config`` class for
             details.
         key: Optional callable returning a hashable that augments the specialization key.
+        cute_structural_policy: Select the CuTe config schema before binding.
+            Ordinary CuTe searches without recorded configs automatically enable
+            proved structural passes while honoring explicit settings. None
+            preserves legacy configs and cache identity; "auto" also permits
+            selection for a no-search invocation. A recorded policy selects its
+            exact schema. Existing unversioned declarations retain their axes.
         settings: Keyword arguments representing settings for the Kernel.
             Can also use settings=Settings(...) to pass a Settings object
             directly. Refer to the ``helion.Settings`` class for available
@@ -3669,12 +3747,14 @@ def kernel(
             configs=configs,
             settings=settings_obj,
             key=key,
+            cute_structural_policy=cute_structural_policy,
         )
     return Kernel(
         fn,
         configs=configs,
         settings=settings_obj,
         key=key,
+        cute_structural_policy=cute_structural_policy,
     )
 
 

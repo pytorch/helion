@@ -106,7 +106,9 @@ class RemoteAutotuneCache(LocalAutotuneCache):
         cache_hash = self.key.stable_hash()
         data = _remote_get(self._backend, cache_hash)
         if data is not None:
-            config = Config.from_json(json.loads(data)["config"])
+            record = json.loads(data)
+            self._validate_config_policy(record)
+            config = Config.from_json(record["config"])
             super().put(config)
             log.debug("remote cache hit: %s", cache_hash)
             return config
@@ -143,7 +145,9 @@ class StrictRemoteAutotuneCache(StrictLocalAutotuneCache):
         cache_hash = self.key.stable_hash()
         data = _remote_get(self._backend, cache_hash)
         if data is not None:
-            config = Config.from_json(json.loads(data)["config"])
+            record = json.loads(data)
+            self._validate_config_policy(record)
+            config = Config.from_json(record["config"])
             super().put(config)
             log.debug("remote cache hit: %s", cache_hash)
             return config

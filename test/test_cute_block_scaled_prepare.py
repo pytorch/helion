@@ -16,6 +16,9 @@ from test.test_cute_block_scaled_mma import _wrapper_plan
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 from helion._compiler.cute.block_scaled_prepare import preparation_source
+from helion._testing import skipUnlessBackends
+
+pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from collections.abc import Callable

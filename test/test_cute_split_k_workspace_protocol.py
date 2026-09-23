@@ -25,8 +25,11 @@ import helion
 from helion._compiler.cute.split_k_workspace import workspace_schedule
 from helion._compiler.cute.split_k_workspace_codegen import _reducer_source
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 import helion.language as hl
+
+pytestmark = skipUnlessBackends(["cute"])
 
 
 @pytest.fixture(autouse=True)
