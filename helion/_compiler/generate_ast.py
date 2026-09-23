@@ -245,6 +245,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "chunk_recurrence_warp_dv4",
                     "helion_flash_bwd",
                     "gathered_mma_tma",
+                    "block_scaled_mma",
                 }
                 for plan in self.cute_wrapper_plans
             )
@@ -508,6 +509,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         self.device_function.cute_state.chunk_prepare_plan = None
         raise exc.BackendUnsupported("cute", "chunk prepare failed late validation")
+
+    def _try_codegen_block_scaled_root(self) -> bool:
+        if self.device_function.cute_state.block_scaled_plan is None:
+            return False
+        from .cute.block_scaled_mma import codegen_block_scaled
+
+        if codegen_block_scaled(self):
+            return True
+        raise exc.BackendUnsupported("cute", "block scaling failed late validation")
 
     def _try_codegen_chunk_recurrence_root(self) -> bool:
         plan = self.device_function.cute_state.chunk_recurrence_plan
@@ -1482,7 +1492,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     root = root_graph_info.graph
                     if (
-                        not self._try_codegen_chunk_prepare_root()
+                        not self._try_codegen_block_scaled_root()
+                        and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
