@@ -26,6 +26,21 @@ _COMMON_DEPENDENCIES = (
 # CUTLASS itself is covered by the version in the launcher's cache key. These
 # are source paths relative to the package, making the digest checkout-neutral.
 _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "tcgen05_grouped_rna": (
+        "_compiler/cute/_flash_runtime.py",
+        "_compiler/cute/_mlir_compat.py",
+        "_compiler/cute/tcgen05_flattened_prefix.py",
+        "_compiler/cute/tcgen05_grouped_prefix.py",
+        "_compiler/cute/tcgen05_operand_pipeline.py",
+        "_compiler/cute/tcgen05_operand_transform.py",
+        "_compiler/cute/tcgen05_storage.py",
+    ),
+    "tcgen05_grouped_tma_rn": (
+        "_compiler/cute/tcgen05_flattened_prefix.py",
+        "_compiler/cute/tcgen05_grouped_prefix.py",
+        "_compiler/cute/_flash_runtime.py",
+        "_compiler/cute/_mlir_compat.py",
+    ),
     "resident_reduction": ("_compiler/cute/resident_reduction_runtime.py",),
     "single_host_sum": (
         "runtime/cute/single_sum.py",

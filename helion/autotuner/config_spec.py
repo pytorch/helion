@@ -73,6 +73,38 @@ from .._compiler.cute.tcgen05_config import CuteTcgen05Config
 from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    CONFIG_KEYS as GROUPED_RNA_CONFIG_KEYS,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    CONVERTER_WARPS as GROUPED_RNA_WARPS,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import K_KEY as GROUPED_RNA_K_KEY
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    PREFIX_SCAN_KEY as GROUPED_PREFIX_SCAN_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    PREFIX_SCANS as GROUPED_PREFIX_SCANS,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    RESIDENT_CTAS_KEY as GROUPED_RNA_RESIDENT_CTAS_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    STAGES_KEY as GROUPED_RNA_STAGES_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    WARPS_KEY as GROUPED_RNA_WARPS_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import normalize_grouped_rna_config
+from .._compiler.cute.tcgen05_grouped_descriptors import DESCRIPTOR_KEY
+from .._compiler.cute.tcgen05_grouped_descriptors import DYNAMIC
+from .._compiler.cute.tcgen05_grouped_descriptors import WRAPPED
+from .._compiler.cute.tcgen05_tma_rn import AUTO as CUTE_MMA_F32_AUTO
+from .._compiler.cute.tcgen05_tma_rn import (
+    CONVERSION_KEY as CUTE_MMA_F32_CONVERSION_KEY,
+)
+from .._compiler.cute.tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
+from .._compiler.cute.tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from .._utils import indexing_uses_tensor_descriptor
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
@@ -841,6 +873,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     BACKEND_TUNABLE_KEYS
     | _BACKEND_DIAGNOSTIC_CONFIG_KEYS
     | _BACKEND_STRATEGY_CONFIG_KEYS
+    | GROUPED_RNA_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_pipeline",
@@ -991,6 +1024,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        *GROUPED_RNA_CONFIG_KEYS,
     ]
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
@@ -1317,6 +1351,12 @@ class ConfigSpec:
         self.cute_row_matrix_transport_available: bool = False
         self.cute_materialized_operand_schedule_available: bool = False
         self.cute_materialized_operand_schedule_search_enabled: bool = False
+        self.cute_grouped_rna_k_choices: tuple[int, ...] = ()
+        self.cute_grouped_warp_tf32_available = False
+        self.cute_grouped_rn_two_stage_ctas: tuple[int, ...] = ()
+        self.cute_grouped_block_prefix_recipes: tuple[tuple[int, int, int], ...] = ()
+        self.cute_grouped_block_prefix_seed_enabled = False
+        self.cute_grouped_wrapped_descriptors_available = False
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
         # and behavior is byte-identical to the env-only path. Set True when the
@@ -3319,6 +3359,15 @@ class ConfigSpec:
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
         if self.backend_name == "cute":
+            normalize_grouped_rna_config(
+                config,
+                available_k=self.cute_grouped_rna_k_choices,
+                rn_two_stage_ctas=self.cute_grouped_rn_two_stage_ctas,
+                block_prefix_recipes=self.cute_grouped_block_prefix_recipes,
+                warp_raw_available=self.cute_grouped_warp_tf32_available,
+                wrapped_descriptors_available=self.cute_grouped_wrapped_descriptors_available,
+                fix_invalid=_fix_invalid,
+            )
             self._cute_tcgen05_config.prepare_normalization(
                 config, fix_invalid=_fix_invalid
             )
@@ -4711,6 +4760,45 @@ class ConfigSpec:
                 if self.cute_bf16x2_recurrence_enabled:
                     fields["cute_bf16x2_recurrence"] = BooleanFragment()
                 if self.matmul_facts:
+                    if (
+                        self.cute_grouped_rna_k_choices
+                        or self.cute_grouped_warp_tf32_available
+                    ):
+                        fields[CUTE_MMA_F32_CONVERSION_KEY] = EnumFragment(
+                            choices=(CUTE_MMA_F32_AUTO,)
+                            + (
+                                (CUTE_MMA_F32_TMA_RN,)
+                                if self.cute_grouped_rna_k_choices
+                                else ()
+                            )
+                            + (
+                                (CUTE_MMA_F32_WARP_RAW,)
+                                if self.cute_grouped_warp_tf32_available
+                                else ()
+                            )
+                        )
+                    if self.cute_grouped_rna_k_choices:
+                        fields[GROUPED_RNA_WARPS_KEY] = EnumFragment(
+                            choices=GROUPED_RNA_WARPS
+                        )
+                        fields[GROUPED_RNA_K_KEY] = EnumFragment(
+                            choices=self.cute_grouped_rna_k_choices
+                        )
+                        if self.cute_grouped_rn_two_stage_ctas:
+                            fields[GROUPED_RNA_STAGES_KEY] = EnumFragment(
+                                choices=(0, 2)
+                            )
+                            fields[GROUPED_RNA_RESIDENT_CTAS_KEY] = EnumFragment(
+                                choices=self.cute_grouped_rn_two_stage_ctas
+                            )
+                        if self.cute_grouped_wrapped_descriptors_available:
+                            fields[DESCRIPTOR_KEY] = EnumFragment(
+                                choices=(DYNAMIC, WRAPPED)
+                            )
+                        if self.cute_grouped_block_prefix_recipes:
+                            fields[GROUPED_PREFIX_SCAN_KEY] = EnumFragment(
+                                choices=GROUPED_PREFIX_SCANS
+                            )
                     fields["cute_collective_mma"] = BooleanFragment()
                     fields["cute_collective_static_layouts"] = BooleanFragment()
                     native_collective = (

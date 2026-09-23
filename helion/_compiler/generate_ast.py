@@ -16,6 +16,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
 from ..language._decorators import is_api_func
+from ..runtime.config import Config
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -47,7 +48,6 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
-    from ..runtime.config import Config
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import GraphInfo
     from .host_function import HostFunction
@@ -1995,6 +1995,95 @@ def generate_ast(
                     "row-resident schedule does not support external transforms or partial codegen"
                 )
             return generate_row_resident(func, config, emit_repro_caller)
+        if (
+            env.backend.name == "cute"
+            and config.get("cute_mma_f32_conversion") == "warp_raw"
+        ):
+            from .cute.tcgen05_config import CuteTcgen05Config
+            from .cute.tcgen05_flat_grouped_codegen import (
+                generate_grouped_warp_tf32_candidate,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                CONFIG_KEYS as GROUPED_WARP_KEYS,
+            )
+
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+                and _bounded_cache_request is None
+            ):
+                return generate_grouped_warp_tf32_candidate(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    shared_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                        env.device
+                    ),
+                )
+            config = Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key not in GROUPED_WARP_KEYS
+                }
+            )
+        if env.backend.name == "cute" and (
+            config.get("cute_grouped_rna_warps", 0)
+            or config.get("cute_mma_f32_conversion") == "tma_rn"
+        ):
+            from .cute.tcgen05_config import CuteTcgen05Config
+            from .cute.tcgen05_flat_grouped_codegen import (
+                generate_flat_grouped_native_candidate,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                CONFIG_KEYS as GROUPED_RNA_KEYS,
+            )
+            from .cute.tcgen05_flat_grouped_config import K_KEY as GROUPED_RNA_K_KEY
+            from .cute.tcgen05_flat_grouped_config import K_STAGES
+            from .cute.tcgen05_flat_grouped_config import (
+                STAGES_KEY as GROUPED_RNA_STAGES_KEY,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                WARPS_KEY as GROUPED_RNA_WARPS_KEY,
+            )
+
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+                and _bounded_cache_request is None
+            ):
+                block_k = config[GROUPED_RNA_K_KEY]
+                converter_warps = config.get(GROUPED_RNA_WARPS_KEY, 0)
+                assert isinstance(block_k, int)
+                assert isinstance(converter_warps, int)
+                return generate_flat_grouped_native_candidate(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    converter_warps=converter_warps,
+                    block_k=block_k,
+                    ab_stages=cast(
+                        "int", config.get(GROUPED_RNA_STAGES_KEY, K_STAGES[block_k])
+                    ),
+                    shared_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                        env.device
+                    ),
+                )
+            config = Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key not in GROUPED_RNA_KEYS
+                }
+            )
         if env.backend.name == "cute" and config.get("cute_reduction_sequence") in {
             "bounded",
             "bounded_layout",

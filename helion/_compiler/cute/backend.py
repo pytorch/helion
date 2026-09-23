@@ -1219,6 +1219,16 @@ class CuteBackend(Backend):
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
+            or key
+            in (
+                "cute_grouped_rna_warps",
+                "cute_grouped_rna_block_k",
+                "cute_grouped_ab_stages",
+                "cute_grouped_ctas_per_sm",
+                "cute_grouped_prefix_scan",
+                "cute_grouped_descriptor_policy",
+                "cute_mma_f32_conversion",
+            )
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
