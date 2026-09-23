@@ -447,8 +447,20 @@ class ConfigGeneration:
     def _largest_power_of_two_at_most(value: int) -> int:
         return 1 << (max(value, 1).bit_length() - 1)
 
+    def _repair_cute_packet_prefetch(self, flat_config: FlatConfig) -> None:
+        """Keep the packet choice consistent with its complete-tile gate."""
+        if self.config_spec.backend_name != "cute":
+            return
+        prefetch = self._key_to_flat_indices.get("cute_packet_prefetch")
+        bounds = self._key_to_flat_indices.get("cute_proven_bounds")
+        if prefetch is None or bounds is None:
+            return
+        if flat_config[bounds[0][0]] is not True:
+            flat_config[prefetch[0][0]] = 0
+
     def _repair_cute_num_threads(self, flat_config: FlatConfig) -> None:
         """Keep CuTe launch-thread choices compatible with tuned block sizes."""
+        self._repair_cute_packet_prefetch(flat_config)
         if not self._cute_num_thread_block_pairs:
             return
 

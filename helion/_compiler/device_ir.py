@@ -3160,6 +3160,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             raise exc.NoDeviceLoopsInKernel
         from ..language.random_ops import rewrite_implicit_random_ops
 
+        if CompileEnvironment.current().settings.cute_rng_stream in ("auto", "philox4"):
+            from .cute.philox_stream import rewrite_random_stream
+
+            for graph in device_ir.graphs:
+                rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
         if CompileEnvironment.current().backend.name == "cute":

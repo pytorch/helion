@@ -450,6 +450,16 @@ class Backend(abc.ABC):
         """Whether an axis may be launched wider than the tile it indexes."""
         return False
 
+    def reference_override(
+        self, function: object, args: tuple[object, ...]
+    ) -> tuple[bool, object]:
+        """Optional backend semantic policy for a public operation's reference."""
+        return False, None
+
+    def validate_implicit_rng_reference(self) -> None:
+        """Validate implicit RNG support under the selected semantic policy."""
+        return None
+
     def supports_config_key(self, key: str) -> bool:
         from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
 

@@ -1006,6 +1006,7 @@ class TestRNGBackendParity(TestCase):
             backend="cute",
             static_shapes=False,
             autotune_effort="none",
+            cute_rng_stream="word0",
         )(rng_impl)
 
         x = torch.empty((11, 13), device=DEVICE, dtype=torch.float32)

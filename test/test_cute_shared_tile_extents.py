@@ -124,6 +124,8 @@ def test_rejected_jagged_configs_cover_each_tile_once(
     code = _code(blocks, threads)
     tree = ast.parse(code)
     assert _launch_dims(tree) == launch
+    # Exercise the real vector path as well as the lane/reduction schedule.
+    assert "_helion_affine_load" in code
     for stage in (1, 2, 3):
         for offset in (0, blocks[stage]):
             counts = _coordinates(tree, stage, axis, launch[axis], offset)

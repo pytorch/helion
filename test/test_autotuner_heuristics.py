@@ -141,6 +141,9 @@ from helion._compiler.cute.grouped_worklist_policy import (
 from helion._compiler.cute.grouped_worklist_policy import (
     grouped_worklist_target_identities,
 )
+from helion._compiler.cute.memory_ops import (
+    _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
+)
 from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
@@ -3624,8 +3627,24 @@ class TestAutotunerHeuristic(TestCase):
 
         self.assertIsNot(first, zero)
         self.assertIs(rebound, first)
-        self.assertIs(unaligned, first)
-        self.assertEqual(len(plain_matmul._bound_kernels), 2)
+        # CuTe binds specialize every kernel on its vector-alignment facts, so
+        # an unaligned operand is a distinct bound kernel. Nothing else may
+        # differ: grouped-worklist facts still ignore a plain matmul.
+        self.assertIsNot(unaligned, first)
+        self.assertEqual(len(plain_matmul._bound_kernels), 3)
+        self.assertEqual(
+            set(unaligned.env.runtime_input_specializations),
+            set(first.env.runtime_input_specializations),
+        )
+        self.assertEqual(
+            {
+                key
+                for key in first.env.runtime_input_specializations
+                if first.env.bound_runtime_input_specialization_results[key]
+                != unaligned.env.bound_runtime_input_specialization_results[key]
+            },
+            {_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY},
+        )
         self.assertEqual(zero._compiler_seed_specialization_extractors, ())
         self.assertEqual(first._compiler_seed_specialization_extractors, ())
         self.assertIsNone(

@@ -65,6 +65,11 @@ class Config(Mapping[str, object]):
         cute_signed_bitfield_bf16: bool | None = None,
         cute_proven_bounds: bool | None = None,
         cute_affine_scan_schedule: CuteAffineScanScheduleLiteral | None = None,
+        cute_rng_packet: bool | None = None,
+        cute_independent_reduction: bool | None = None,
+        cute_replicated_reduction: bool | None = None,
+        cute_vector_packet_unroll: bool | None = None,
+        cute_packet_prefetch: int | None = None,
         num_warps: int | None = None,
         num_stages: int | None = None,
         pid_type: PidTypeLiteral | None = None,
@@ -120,6 +125,16 @@ class Config(Mapping[str, object]):
                 scan. ``"ordinary"`` disables the direct lowering;
                 ``"direct_m16n8_v1"`` and ``"direct_m16n16_v1"`` select the
                 measured direct schedule profiles.
+            cute_independent_reduction: Sum each vector lane independently in
+                FP32 before combining lanes, preserving the element expression.
+                This changes summation order. Disabled by default.
+            cute_replicated_reduction: Replicate single-use whole-CTA sums in
+                each warp using one shared-memory barrier. Disabled by default.
+            cute_vector_packet_unroll: Fully unroll small straight-line vector
+                packet loops. Disabled by default to retain compact code.
+            cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
+                in a proved complete tile; 0 (the default) keeps the original order.
+                Requires cute_proven_bounds and storage-disjointness proof.
             num_warps: Number of warps per block.
             num_stages: Number of stages for software pipelining.
             pid_type: Program ID type strategy ("flat", "xyz", "persistent_blocked", "persistent_interleaved").
@@ -188,6 +203,11 @@ class Config(Mapping[str, object]):
             "cute_signed_bitfield_bf16": cute_signed_bitfield_bf16,
             "cute_proven_bounds": cute_proven_bounds,
             "cute_affine_scan_schedule": cute_affine_scan_schedule,
+            "cute_rng_packet": cute_rng_packet,
+            "cute_independent_reduction": cute_independent_reduction,
+            "cute_replicated_reduction": cute_replicated_reduction,
+            "cute_vector_packet_unroll": cute_vector_packet_unroll,
+            "cute_packet_prefetch": cute_packet_prefetch,
             "num_warps": num_warps,
             "num_stages": num_stages,
             "indexing": indexing,
@@ -466,6 +486,10 @@ class Config(Mapping[str, object]):
             "CuteAffineScanScheduleLiteral",
             self.config.get("cute_affine_scan_schedule", "ordinary"),
         )
+
+    @property
+    def cute_packet_prefetch(self) -> int:
+        return cast("int", self.config.get("cute_packet_prefetch", 0))
 
     @property
     def indexing(self) -> IndexingLiteral | list[IndexingLiteral]:

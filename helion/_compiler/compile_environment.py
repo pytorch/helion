@@ -343,6 +343,12 @@ class CompileEnvironment:
         # pyrefly: ignore [read-only]
         self.device = device
         self.settings = settings
+        if settings.cute_rng_stream not in ("auto", "word0", "philox4"):
+            raise ValueError("cute_rng_stream must be auto, word0 or philox4")
+        if settings.cute_rng_stream != "word0" and settings.backend != "cute":
+            raise ValueError(
+                f"cute_rng_stream={settings.cute_rng_stream} requires the CuTe backend"
+            )
         self.index_dtype: torch.dtype = (
             index_dtype or settings.index_dtype or torch.int32
         )
