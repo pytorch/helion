@@ -3299,7 +3299,7 @@ def _analyzed_specialized_mma_plan(
     from .cute.cute_mma import analyze_cute_mma_node
     from .cute.cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
-    candidate = analyze_cute_mma_node(node)
+    candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
     if (
         candidate is None
         or candidate.requires_accumulator_seed

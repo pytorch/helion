@@ -3,6 +3,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from ...autotuner.compiler_coverage import (
+    CompilerCoverageGroup as CompilerCoverageGroup,
+)
+from ...autotuner.compiler_coverage import CoverageDependency as CoverageDependency
+from ...autotuner.compiler_coverage import CoverageWitness as CoverageWitness
 from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
@@ -12,6 +17,7 @@ from .cute import CuteChunkRecurrenceHeuristic
 from .cute import CuteFixedTokenRank1Heuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
+from .cute import CuteNestedRowHeuristic
 from .cute import CutePackedSingleTokenRank1Heuristic
 from .cute import CutePersistentSubwarpRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
@@ -22,6 +28,7 @@ from .cute import CuteResidentRowHeuristic
 from .cute import CuteResidentRowWideClusterHeuristic
 from .cute import CuteRolledClusterLadderHeuristic
 from .cute import CuteRolledRowLadderHeuristic
+from .cute import CuteSiblingRowHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
@@ -31,6 +38,8 @@ from .cute import CuteTcgen05ThreadLocalEpilogueHeuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
+from .cute_launch_bounds import register_matmul_min_blocks_coverage
+from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
@@ -79,6 +88,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
+        CuteSiblingRowHeuristic,
+        CuteNestedRowHeuristic,
         CuteResidentRowHeuristic,
         CuteResidentRowWideClusterHeuristic,
         CuteResidentMultiRowHeuristic,
@@ -231,4 +242,19 @@ def compiler_seed_configs(
             # The primary (rank-0) is the promoted default.
             env.config_spec.compiler_default_config = ranked[0]
         env.config_spec.autotuner_heuristics.append(heuristic.name)
+    if env.backend_name == "cute":
+        configs = add_signed_bitfield_seeds(env, dedupe_configs(configs))
     return dedupe_configs(configs)
+
+
+def register_compiler_coverage_groups(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> None:
+    """Declare independent coverage after every ordinary field is finalized.
+
+    Sampling and explicit-override policy belong to the generic autotuner.
+    Keep declarations present when automatic heuristics are disabled.
+    """
+    if env.backend_name != "cute":
+        return
+    register_matmul_min_blocks_coverage(env, device_ir)

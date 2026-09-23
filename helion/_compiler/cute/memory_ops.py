@@ -26,7 +26,7 @@ from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _decorators
-from ...language.memory_ops import _CUTE_L2_LAST_SUFFIX
+from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
@@ -121,7 +121,10 @@ def register_persistent_vec_alignment_specializations(
     sources = tuple(
         source
         for tensor in env.input_sources
-        if tensor.dtype in _CUTE_VECTOR_DTYPES
+        if (
+            tensor.dtype in _CUTE_VECTOR_DTYPES
+            or tensor.dtype in (torch.float8_e4m3fn, torch.int8)
+        )
         and (source := env.tensor_input_source(tensor)) is not None
     )
     if not sources:
@@ -172,6 +175,74 @@ def runtime_tensor_has_specialized_alignment(
         )
         and int(runtime_tensor.data_ptr()) % required_alignment == 0
     )
+
+
+def tensor_has_specialized_tma_alignment(
+    env: CompileEnvironment,
+    tensor: torch.Tensor,
+) -> bool:
+    """Read cache-key-backed base/outer-stride alignment for a TensorMap.
+
+    Use the immutable binding facts: code generation may run after the weakly
+    held example inputs have expired. The dispatch cache checks these same
+    facts before reusing this specialization with later tensors. Physical
+    alignment is unchanged by logical axis permutations or group indexing.
+    """
+    source = env.tensor_input_source(tensor)
+    specialization = env.runtime_input_specializations.get(
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    )
+    facts = env.bound_runtime_input_specialization_results.get(
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    )
+    if (
+        source is None
+        or specialization is None
+        or source not in specialization.sources
+        or facts is None
+    ):
+        return False
+    signatures = cast(
+        "tuple[tuple[int, tuple[int, ...], tuple[tuple[bool, int], ...]] | None, ...]",
+        facts,
+    )
+    signature = signatures[specialization.sources.index(source)]
+    if signature is None:
+        return False
+    base_residue, _size_residues, stride_facts = signature
+    return (
+        base_residue == 0
+        and sum(unit_stride for unit_stride, _residue in stride_facts) == 1
+        and all(unit_stride or residue == 0 for unit_stride, residue in stride_facts)
+    )
+
+
+def tensor_has_specialized_base_alignment(
+    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
+) -> bool:
+    """Read a cache-key-backed pointer residue without retaining example inputs."""
+    if alignment <= 0 or _CUTE_VECTOR_MAX_BYTES % alignment:
+        return False
+    source = env.tensor_input_source(tensor)
+    specialization = env.runtime_input_specializations.get(
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    )
+    facts = env.bound_runtime_input_specialization_results.get(
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    )
+    if (
+        source is None
+        or specialization is None
+        or facts is None
+        or source not in specialization.sources
+    ):
+        return False
+    signatures = cast(
+        "tuple[tuple[int, tuple[int, ...], tuple[tuple[bool, int], ...]] | None, ...]",
+        facts,
+    )
+    signature = signatures[specialization.sources.index(source)]
+    return signature is not None and signature[0] % alignment == 0
 
 
 def _tensor_storage_disjoint_matrix_signature(
@@ -485,7 +556,7 @@ def _cute_vector_load_expr(
 ) -> str:
     elem_str, _ = _CUTE_VECTOR_DTYPES[dtype]
     ptr = _cute_scalar_pointer_expr(tensor_name, index_exprs)
-    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
         # Explicit-vec ("vec" mode) loads return FLOAT vectors, not the
         # carrier form the L2 helper produces; drop the hint here.
         eviction_suffix = ""
@@ -2301,6 +2372,12 @@ def _try_splice_tcgen05_grouped_tail_epilogue(
     grouped_tail = cute_state.grouped_tail_proof_for_store(state.fx_node)
     if grouped_tail is None:
         return None
+    if grouped_tail.store_mask is not None:
+        if extra_mask is None or state.fx_node.args[3] is not grouped_tail.store_mask:
+            return None
+        # The proved grouped scheduler/store extent owns this exact M/N mask.
+        # Its producer nodes are removed after the collective store is emitted.
+        extra_mask = None
     anchor_result_var = cute_state.matmul_fx_node_result_vars.get(grouped_tail.anchor)
     if anchor_result_var is None:
         return None
@@ -2616,9 +2693,26 @@ def _(state: CodegenState) -> ast.AST:
             _vec_width, vec_block_id, _mode = vec_ctx
             strategy = _cute_lane_strategy(state, vec_block_id)
             assert isinstance(strategy, BlockSizeTileStrategy)
+            from .signed_bitfield import packed_store_value
+            from .signed_bitfield import signed_byte_site
+
             lane_axis_pos = _cute_lane_axis_pos(strategy, vec_block_id, index_exprs)
+            # A grid-owned flush is emitted when the root body is wrapped, after
+            # the deferred hoist has recorded its signed-byte packet. Resolve the
+            # packed value then, but prove scope with this store's own site.
+            store_site = signed_byte_site(state)
 
             def emit_tile_store() -> ast.AST | None:
+                packed_values = packed_store_value(
+                    state,
+                    strategy,
+                    vec_block_id,
+                    _vec_width,
+                    tensor,
+                    index_exprs,
+                    mask_expr,
+                    site=store_site,
+                )
                 return _cute_register_tile_unroll_vec_store(
                     state,
                     strategy,
@@ -2629,6 +2723,7 @@ def _(state: CodegenState) -> ast.AST:
                     mask_expr,
                     tensor.dtype,
                     lane_axis_pos=lane_axis_pos,
+                    packed_values_expr=packed_values,
                 )
 
             scalar_store = statement_from_string(
@@ -2878,6 +2973,62 @@ def _cute_defer_grid_vector_op(
     vloop = getattr(strategy, "_cute_lane_vloop_by_block", {})[block_id]
     owner.deferred_vector_ops.append((vloop, scalar, emit))
     return True
+
+
+def _cute_vector_load_mask_is_lane_only(
+    mask_expr: str | None, lane_mask: str | None
+) -> bool:
+    """The hoist's anchor pointer only protects its own vectorized axis.
+
+    Other masks can invalidate an outer row or gather address even when the
+    contiguous vector lies wholly within its column extent. Keep those loads
+    behind their original scalar predicate; masking their extracted values
+    after an unconditional vector load does not protect memory accesses.
+    """
+    if mask_expr is None:
+        return True
+
+    def lane_only(node: ast.expr) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id == lane_mask
+        if isinstance(node, ast.Constant):
+            return node.value is True
+        return (
+            isinstance(node, ast.BoolOp)
+            and isinstance(node.op, ast.And)
+            and all(lane_only(value) for value in node.values)
+        )
+
+    return lane_only(ast.parse(mask_expr, mode="eval").body)
+
+
+def _cute_signed_byte_packet_is_aligned(
+    env: CompileEnvironment,
+    tensor: torch.Tensor,
+    lane_axis: int,
+    vec_width: int,
+) -> bool:
+    """Prove packed byte addresses from the bound pointer/stride residues."""
+    if vec_width not in (2, 4, 8) or not tensor_has_specialized_base_alignment(
+        env, tensor, vec_width
+    ):
+        return False
+    source = env.tensor_input_source(tensor)
+    specialization = env.runtime_input_specializations[
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    ]
+    signatures = cast(
+        "tuple[tuple[int, tuple[int, ...], tuple[tuple[bool, int], ...]] | None, ...]",
+        env.bound_runtime_input_specialization_results[
+            _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+        ],
+    )
+    signature = signatures[specialization.sources.index(source)]
+    assert signature is not None  # The base-alignment proof checked this entry.
+    return all(
+        unit_stride if axis == lane_axis else residue % vec_width == 0
+        for axis, (unit_stride, residue) in enumerate(signature[2])
+    )
 
 
 def _cute_vector_load_ctx(
@@ -3165,6 +3316,16 @@ def _cute_vector_load_ctx(
             state, strategy, inner_block_id, index_exprs, lane_axis_pos
         ):
             return None
+        if tensor.dtype is torch.int8 and (
+            not _cute_signed_byte_packet_is_aligned(
+                env, tensor, stride1_tensor_dim, vec_width
+            )
+            or index_exprs[lane_axis_pos]
+            != _cute_active_index_var(state, inner_block_id)
+        ):
+            # The hoist substitutes the canonical lane base. Do not discard
+            # an affine/gather offset or assume alignment for a signed input.
+            return None
         if getattr(strategy, "_cute_flat_multi", False):
             # Flattened multi-dim tile: the hoist emits FLAT base pointers
             # (``t.iterator + lane_base``), which is only sound when the
@@ -3204,6 +3365,59 @@ def _cute_vector_load_ctx(
         pos_by_block[inner_block_id] = lane_axis_pos
         return vec_width, inner_block_id, "tile_unroll"
     return None
+
+
+def _cute_resolved_load_mask(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    index_exprs: Sequence[str],
+    extra_mask: ast.AST | None,
+) -> str | None:
+    """Mask full slices with the same axis that supplies their address.
+
+    Equal logical extents can belong to different active axes. The address
+    resolver prefers a unique reduction axis for a full slice; choosing the
+    first equal extent again while masking can instead capture an unrelated
+    output-row mask. In collective staging that row coordinate is unavailable.
+    Preserve the resolved block identity through the ordinary mask builder.
+    """
+    env = CompileEnvironment.current()
+    mask_subscript = list(subscript)
+    tensor_dim = 0
+    for pos, index in enumerate(subscript):
+        if index is None:
+            continue
+        if isinstance(index, slice) and index == slice(None):
+            candidates = [
+                block_id
+                for block_id in _matching_block_ids(env, tensor.shape[tensor_dim])
+                if _cute_active_index_var(state, block_id) == index_exprs[tensor_dim]
+            ]
+            if candidates:
+                # Operand remapping can give multiple block IDs the same
+                # address. They are interchangeable only with identical masks.
+                if (
+                    len(
+                        {
+                            _cute_active_mask_var(state, block_id)
+                            for block_id in candidates
+                        }
+                    )
+                    != 1
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute", "full-slice load mask has ambiguous coordinate bounds"
+                    )
+                mask_subscript[pos] = env.block_sizes[candidates[0]].var
+        tensor_dim += 1
+    return _cute_combined_mask(
+        state,
+        mask_subscript,
+        extra_mask,
+        tensor=tensor,
+        include_tensor_index_masks=False,
+    )
 
 
 @_decorators.codegen(load, "cute")
@@ -3329,12 +3543,8 @@ def _(state: CodegenState) -> object:
         inactive_slice_expr="None",
         inactive_singleton_slice_expr="0",
     )
-    mask_expr = _cute_combined_mask(
-        state,
-        subscript,
-        extra_mask,
-        tensor=tensor,
-        include_tensor_index_masks=False,
+    mask_expr = _cute_resolved_load_mask(
+        state, tensor, subscript, index_exprs, extra_mask
     )
     # Autotunable per-load-site cache hint, applied to the ``cute.arch.load``
     # forms (vectorized, and scalar when a hint is set).  "first"/"last" are
@@ -3352,16 +3562,35 @@ def _(state: CodegenState) -> object:
             policy = policies[load_idx]
             if policy == "streaming":
                 eviction_suffix = ", cop='cs'"
-            elif policy == "l2_last":
-                # L2::evict_last policy loads (inline PTX; only the 16-byte
-                # unroll-hoist form honors it — see _CUTE_L2_LAST_SUFFIX).
-                eviction_suffix = _CUTE_L2_LAST_SUFFIX
+            elif policy in ("l2_last", "l1_l2_first", "l1_l2_last"):
+                # Inline-PTX L2 hints apply only to aligned 16-byte packets.
+                eviction_suffix = f"__{policy}__"
             elif mapped := _CUTE_EVICTION_POLICY_MAP.get(policy, ""):
                 eviction_suffix = f", level1_eviction_priority={mapped!r}"
     load_expr: str | None = None
     load_placeholders: dict[str, ast.AST] = {}
     branch_vec_candidate: tuple[int, int] | None = None
     vec_ctx = _cute_vector_load_ctx(state, tensor, subscript, index_exprs, extra_mask)
+    if vec_ctx is not None and not _cute_vector_load_mask_is_lane_only(
+        mask_expr, _cute_active_mask_var(state, vec_ctx[1])
+    ):
+        from ..reduction_strategy import PersistentReductionStrategy
+
+        vec_width, vec_block_id, vec_mode = vec_ctx
+        strategy = _cute_lane_strategy(state, vec_block_id)
+        if (
+            vec_mode == "unroll"
+            and isinstance(strategy, PersistentReductionStrategy)
+            and _persistent_vec_is_exact_aligned(
+                state, strategy, index_exprs, tensor, vec_width
+            )
+        ):
+            # A resolved tensor-index mask can protect an outer row/gather as
+            # well as the lane. Keep it on the scalar marker: the late local
+            # pass proves whole-fragment validity and a safe inactive pointer
+            # before placing the vector transaction inside its legal scope.
+            branch_vec_candidate = (vec_block_id, vec_width)
+        vec_ctx = None
     if vec_ctx is not None:
         vec_width, vec_block_id, vec_mode = vec_ctx
         from ..reduction_strategy import LoopedReductionStrategy
@@ -3423,6 +3652,13 @@ def _(state: CodegenState) -> object:
 
             assert isinstance(strategy, BlockSizeTileStrategy)
             lane_axis_pos = _cute_lane_axis_pos(strategy, vec_block_id, index_exprs)
+            # The hoist may be emitted when the root body is wrapped; record a
+            # signed-byte packet against the load's original lowering site.
+            load_site = None
+            if tensor.dtype is torch.int8:
+                from .signed_bitfield import signed_byte_site
+
+                load_site = signed_byte_site(state)
 
             def emit_tile_load() -> ast.AST:
                 return expr_from_string(
@@ -3436,6 +3672,8 @@ def _(state: CodegenState) -> object:
                         vec_width,
                         eviction_suffix=eviction_suffix,
                         lane_axis_pos=lane_axis_pos,
+                        mask_expr=mask_expr,
+                        signed_byte_site=load_site,
                     )
                 )
 

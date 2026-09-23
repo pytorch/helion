@@ -15,7 +15,6 @@ from torch.utils._ordered_set import OrderedSet
 
 from .. import exc
 from ..language._decorators import is_api_func
-from ..runtime.config import Config
 from .ast_extension import ExtendedAST
 from .ast_extension import LoopType
 from .ast_extension import NodeVisitor
@@ -46,7 +45,7 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
-    from ..runtime import Config
+    from ..runtime.config import Config
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -209,6 +208,41 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._compute_inter_loop_barriers()
         # Same, for a store->load read-after-write *within* one loop body.
         self._compute_intra_loop_barriers()
+
+    def _cute_can_bake_tensor_shapes(self) -> bool:
+        if not self.cute_uses_matmul:
+            return True
+        if self.cute_wrapper_plans:
+            return all(
+                plan.get("kind")
+                in {
+                    "helion_small_biased_attention",
+                    "helion_flash",
+                    "chunk_prepare_tma",
+                    "chunk_recurrence_sm100",
+                    "chunk_recurrence_warp_dv4",
+                    "helion_flash_bwd",
+                }
+                for plan in self.cute_wrapper_plans
+            )
+        return False
+
+    def allow_dead_assignments_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
+        """Allow liveness-based DCE for assignments from proven pure FX nodes.
+
+        Unlike removing their statements, this preserves any CSE temporary
+        still read by another node or by a replacement collective lowering.
+        The caller must prove that the supplied nodes have no side effects.
+        """
+        for node in nodes:
+            for _body, statement in self._statements_by_owner_node_id.get(id(node), ()):
+                for assignment in ast.walk(statement):
+                    if (
+                        isinstance(assignment, ast.Assign)
+                        and len(assignment.targets) == 1
+                        and isinstance(target := assignment.targets[0], ast.Name)
+                    ):
+                        self.device_function.dce_vars.append(target.id)
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -1506,17 +1540,53 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     )
                     from .tile_strategy import restore_unprocessed_lane_reduce_markers
                     from .tile_strategy import split_lane_loop_reductions
+                    from .tile_strategy import validate_lane_reduce_owners
 
                     # First interchange any ``for LANE: ... for MB: ...`` nest
                     # whose inner serial loop carries lane-reduce markers into a
                     # lane-outside-mb accumulator nest plus a lane-inside-mb
                     # reduction nest; then split the (now inner) lane loops into
                     # the two-pass accumulate/finalize/consume structure.
-                    self.device_function.body = (
-                        interchange_lane_outside_serial_reductions(
-                            list(self.device_function.body)
-                        )
+                    proven_disjoint_pairs = (
+                        self.device_function.proven_disjoint_tensor_pairs()
                     )
+                    from .cute.nested_lane_reductions import (
+                        normalize_nested_lane_reductions,
+                    )
+                    from .cute.nested_lane_reductions import resolve_pruned_lane_owners
+
+                    resolve_pruned_lane_owners(
+                        list(self.device_function.body),
+                        self.device_function.cute_state.reshape_lane_fallbacks,
+                    )
+                    self.device_function.body = normalize_nested_lane_reductions(
+                        list(self.device_function.body),
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                        proven_tensor_stride_values=self.device_function.proven_tensor_stride_values(),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                    )
+                    validate_lane_reduce_owners(list(self.device_function.body))
+                    self.device_function.body = interchange_lane_outside_serial_reductions(
+                        list(self.device_function.body),
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                        protected_names={
+                            alias
+                            for name, aliases in self.device_function._variable_renames.items()
+                            if any(alias != name for alias in aliases)
+                            for alias in (name, *aliases)
+                        },
+                    )
+                    validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = split_lane_loop_reductions(
                         list(self.device_function.body),
                         uniform_names={
@@ -1526,16 +1596,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             ),
                             *self._extra_params,
                         },
-                        proven_disjoint_tensor_pairs=(
-                            self.device_function.proven_disjoint_tensor_pairs()
-                        ),
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
                         proven_tensor_stride_values=(
                             self.device_function.proven_tensor_stride_values()
                         ),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                        running_sums=self.device_function.cute_matmul_running_sums,
                     )
-                    # Safety net: revert any lane-reduce marker that neither pass
-                    # rewrote so no ``_helion_lane_reduce`` call leaks into the
-                    # emitted kernel.
+                    # Reject any owned marker without a proved lowering, so an
+                    # incomplete per-lane input cannot stand in for a reduction.
                     self.device_function.body = restore_unprocessed_lane_reduce_markers(
                         list(self.device_function.body)
                     )
@@ -1831,20 +1903,11 @@ def generate_ast(
                 if codegen.device_function.has_rng_ops()
                 else []
             )
-            final_host_statements = rng_statements + codegen.host_statements
-            shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind")
-                in {
-                    "helion_small_biased_attention",
-                    "helion_flash",
-                    "chunk_prepare_tma",
-                    "chunk_recurrence_sm100",
-                    "chunk_recurrence_warp_dv4",
-                    "helion_flash_bwd",
-                }
-                for plan in codegen.cute_wrapper_plans
-            )
-            if codegen.cute_uses_matmul and not shape_bake_safe_wrapper_only:
+            final_host_statements: list[ast.AST] = [
+                *rng_statements,
+                *codegen.host_statements,
+            ]
+            if not codegen._cute_can_bake_tensor_shapes():
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"
@@ -1883,6 +1946,9 @@ def generate_ast(
                     for key in (
                         "lhs_name",
                         "rhs_name",
+                        "lhs_scale_name",
+                        "rhs_scale_name",
+                        "workspace_name",
                         "c_name",
                         "d_name",
                         "q_name",
@@ -1918,6 +1984,7 @@ def generate_ast(
                         "direct_pointers_name",
                         "direct_strides_name",
                         "scale_name",
+                        "m_extent_name",
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))

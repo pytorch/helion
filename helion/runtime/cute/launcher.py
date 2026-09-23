@@ -66,6 +66,7 @@ from ..._compiler.cute.tcgen05_constants import (
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..triton.launcher import get_num_sm
+from .source_dependencies import wrapper_source_dependencies
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -2264,9 +2265,11 @@ def _cute_disk_cache_key(
     hash is unavailable.  The key must be computable *before* the kernel is
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
-    generated device-kernel source, full input specialization (dtypes, ranks,
-    baked shapes/strides, constexpr values), launch shape (block/cluster), the
-    preferred shared-memory carveout, CuTe compile options, the IR-affecting
+    generated device-kernel source, external compiled-helper sources, full input
+    specialization (dtypes, ranks,
+    pointer alignments, baked shapes/strides, constexpr values), launch shape
+    (block/cluster), preferred shared-memory carveout, CuTe compile options,
+    the IR-affecting
     ``CUTE_DSL_*`` env vars (target SM arch among them), and the cutlass version.
 
     ``num_sm`` is the device SM count the persistent flash wrapper bakes into
@@ -2281,6 +2284,15 @@ def _cute_disk_cache_key(
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
         return None
+    plans = cast(
+        "Sequence[dict[str, object]]",
+        getattr(cute_kernel, "_helion_cute_wrapper_plans", ()),
+    )
+    helper_sources = wrapper_source_dependencies(
+        cast("str", plan.get("kind", "")) for plan in plans
+    )
+    if helper_sources is None:
+        return None
     try:
         import cutlass
 
@@ -2289,8 +2301,9 @@ def _cute_disk_cache_key(
         cutlass_version = ""
     payload = repr(
         (
-            "helion-cute-cache-v1",
+            "helion-cute-cache-v2",
             source_hash,
+            helper_sources,
             schema_key,
             block,
             wrapper_plans,

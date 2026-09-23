@@ -184,6 +184,8 @@ def _lane_reduce_marker_expr(
     group_lane_expr: str = "",
     group_count: int = 1,
     group_cluster_n: int = 1,
+    owner_lane: str | None = None,
+    matmul_contribution: bool = False,
 ) -> str:
     # ``group_*`` (optional) carry the parameters of a strided grouped
     # reduction. They are required when the reduction's live thread axis is
@@ -197,10 +199,14 @@ def _lane_reduce_marker_expr(
     # finalize uses the cross-warp ``_cute_grouped_reduce_shared_two_stage``;
     # ``group_count`` (the number of independent groups in the CTA) is needed
     # only by that two-stage helper.
+    owner = f", {owner_lane!r}" if owner_lane is not None else ""
+    if matmul_contribution:
+        assert owner_lane is not None and reduction_type == "sum"
+        owner += ", True"
     return (
         f"{_HELION_LANE_REDUCE_MARKER}({input_name}, {reduction_type!r}, "
         f"{identity_expr}, {threads_in_group}, {group_pre}, {group_span}, "
-        f"{group_lane_expr!r}, {group_count}, {group_cluster_n})"
+        f"{group_lane_expr!r}, {group_count}, {group_cluster_n}{owner})"
     )
 
 
@@ -229,6 +235,13 @@ class _LaneReduceMarker:
     # > 1 when the reduction group is additionally split across the CTAs of
     # a thread-block cluster; the finalize then uses the DSM cluster reduce.
     group_cluster_n: int = 1
+    # An explicit marker argument survives the text-based AST cloning below.
+    # Physical thread groups and equal loop extents do not identify a serial
+    # lane: an unrelated nested tile can have either in common with this one.
+    owner_lane: str | None = None
+    # Emitted only for the product side of a scalar matmul contraction. The
+    # accumulator/rescale is deliberately outside this complete sum.
+    matmul_contribution: bool = False
 
     def finalize_expr(self, reduced: str) -> str:
         return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
@@ -273,7 +286,7 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
     if not isinstance(target, ast.Name):
         return None
     call = _find_lane_reduce_call(stmt.value)
-    if call is None or len(call.args) not in (8, 9):
+    if call is None or len(call.args) not in (8, 9, 10, 11):
         return None
     (
         input_node,
@@ -287,8 +300,16 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         *rest,
     ) = call.args
     group_cluster_n = int(ast.literal_eval(rest[0])) if rest else 1
+    owner_lane = ast.literal_eval(rest[1]) if len(rest) >= 2 else None
+    if owner_lane is not None and (not isinstance(owner_lane, str) or not owner_lane):
+        raise exc.BackendUnsupported("cute", "invalid reduction lane owner")
     input_name = ast.unparse(input_node)
     reduction_type = ast.literal_eval(type_node)
+    matmul_contribution = ast.literal_eval(rest[2]) if len(rest) == 3 else False
+    if type(matmul_contribution) is not bool or (
+        matmul_contribution and (owner_lane is None or reduction_type != "sum")
+    ):
+        raise exc.BackendUnsupported("cute", "invalid matmul contribution marker")
     identity_expr = ast.unparse(identity_node)
     threads_in_group = int(ast.literal_eval(threads_node))
     group_pre = int(ast.literal_eval(group_pre_node))
@@ -311,7 +332,39 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         group_lane_expr=group_lane_expr,
         group_count=group_count,
         group_cluster_n=group_cluster_n,
+        owner_lane=owner_lane,
+        matmul_contribution=matmul_contribution,
     )
+
+
+def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
+    """Reject markers inside a different serial lane before any rewriting.
+
+    The compiler emitters attach the actual strategy's lane name. Older
+    unowned markers remain supported by standalone AST helpers/tests; they are
+    not emitted by production lowering. Serial non-lane loops are left to the
+    existing interchange proof. Residual owned markers must not be restored to
+    incomplete scalar inputs by the final safety net.
+    """
+
+    def visit(node: ast.AST, lanes: tuple[str, ...]) -> None:
+        lane = getattr(node, HELION_LANE_LOOP_VAR_ATTR, None)
+        if isinstance(node, ast.For) and lane is not None:
+            lanes = (*lanes, lane)
+        marker = _is_lane_reduce_marker_assign(node)
+        if (
+            marker is not None
+            and marker.owner_lane is not None
+            and (not lanes or lanes[-1] != marker.owner_lane)
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "reduction marker is nested in a different lane owner"
+            )
+        for child in ast.iter_child_nodes(node):
+            visit(child, lanes)
+
+    for statement in body:
+        visit(statement, ())
 
 
 def _combine_expr(reduction_type: str, acc: str, val: str) -> str:
@@ -514,6 +567,8 @@ def split_lane_loop_reductions(
     proven_tensor_stride_values: dict[tuple[str, int], int] | None = None,
     thread_axis_names: dict[str, frozenset[int]] | None = None,
     scalar_definitions: dict[str, ast.AST] | None = None,
+    rename_groups: dict[str, str] | None = None,
+    running_sums: set[str] | None = None,
 ) -> list[ast.AST]:
     """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
     markers into the two-pass accumulate / finalize / consume structure.
@@ -540,6 +595,8 @@ def split_lane_loop_reductions(
                 proven_tensor_stride_values or {},
                 proven_thread_axes,
                 proven_scalar_definitions,
+                rename_groups or {},
+                running_sums or set(),
             )
         )
         _update_proven_uniform_names(stmt, proven_uniform)
@@ -549,9 +606,7 @@ def split_lane_loop_reductions(
 
 
 def _restore_stmt_lane_reduce_markers(stmt: ast.AST) -> ast.AST:
-    """Recurse into statement-list fields and replace any surviving
-    ``R = ..._helion_lane_reduce(IN, TYPE, ID, T)...`` assignment with
-    ``R = ...IN...`` (the raw per-lane input)."""
+    """Reject unlowered owned markers; restore only legacy unowned markers."""
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
         if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
@@ -559,6 +614,10 @@ def _restore_stmt_lane_reduce_markers(stmt: ast.AST) -> ast.AST:
     if isinstance(stmt, ast.Assign):
         m = _is_lane_reduce_marker_assign(stmt)
         if m is not None:
+            if m.owner_lane is not None:
+                raise exc.BackendUnsupported(
+                    "cute", "reduction marker has no proved lane lowering"
+                )
             return statement_from_string(
                 f"{m.result_var} = {m.finalize_expr(m.input_name)}"
             )
@@ -568,15 +627,12 @@ def _restore_stmt_lane_reduce_markers(stmt: ast.AST) -> ast.AST:
 def restore_unprocessed_lane_reduce_markers(
     body: list[ast.AST],
 ) -> list[ast.AST]:
-    """Replace any surviving ``R = ..._helion_lane_reduce(IN, TYPE, ID, T)...``
-    assignment with ``R = ...IN...`` (the raw per-lane input).
+    """Reject production markers whose lane lowering has not been proved.
 
-    A safety net: ``split_lane_loop_reductions`` only rewrites markers it can
-    place in a two-pass lane structure. A marker emitted in a context neither
-    that pass nor ``interchange_lane_outside_serial_reductions`` handles would
-    otherwise leak the ``_helion_lane_reduce`` call into the emitted kernel.
-    Reverting to the per-lane input keeps the kernel compilable (it falls back
-    to the original single-pass per-lane reduction behavior).
+    The proved interchange path removes its markers itself. A surviving owned
+    marker has no reduction-preserving raw-input fallback. Unowned markers
+    retain the legacy restore for standalone AST callers; production reduction
+    emitters always attach an owner.
 
     Recurses only into statement-bearing fields (``body``/``orelse``/
     ``finalbody``) instead of using ``ast.NodeTransformer``; markers are always
@@ -594,6 +650,8 @@ def _split_stmt_lane_reductions(
     proven_tensor_stride_values: dict[tuple[str, int], int],
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: dict[str, str],
+    running_sums: set[str] | None = None,
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
@@ -610,6 +668,8 @@ def _split_stmt_lane_reductions(
                     proven_tensor_stride_values=proven_tensor_stride_values,
                     thread_axis_names=dict(thread_axis_names),
                     scalar_definitions=dict(scalar_definitions),
+                    rename_groups=rename_groups,
+                    running_sums=running_sums,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -628,6 +688,157 @@ def _split_stmt_lane_reductions(
         proven_tensor_stride_values,
         thread_axis_names,
         scalar_definitions,
+        rename_groups,
+        running_sums,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _LaneRunningSum:
+    """One compiler-created scalar self-add kept in the full first pass."""
+
+    name: str
+    update_index: int
+    input_name: str
+    phase1_indices: tuple[int, ...]
+    iterator: str
+
+
+def _certify_lane_running_sum(
+    loop: ast.For,
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+    rename_groups: dict[str, str],
+    running_sums: set[str] | None,
+) -> _LaneRunningSum | None:
+    """Prove the narrow mixed-matmul/owned-reduction composition.
+
+    A name spelling is not provenance. Only the scalar accumulators recorded
+    by matmul fallback may enter this path, and that provenance is necessary
+    but insufficient: one unconditional self-add must have a complete, pure
+    input slice independent of every marker and all other carried bindings.
+    The marker inputs must also be independent of this running sum. Multiple
+    definitions, forward/conditional definitions, collectives and unknown
+    effects require another schedule and remain unsupported here.
+    """
+    from .ast_read_writes import ReadWrites
+    from .ast_read_writes import ast_rename
+
+    if not running_sums or any(marker.owner_lane is None for _, marker in markers):
+        return None
+    body = [_clone_stmt(statement) for statement in loop.body]
+    for statement in body:
+        ast_rename(statement, rename_groups)
+    writes = [
+        {
+            node.id
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+        for statement in body
+    ]
+    all_writes = set().union(*writes)
+    effects = _ordered_block_reads_writes(cast("list[ast.stmt]", body))
+    candidates = (
+        {_canonical_name(name, rename_groups) for name in running_sums}
+        & effects.reads_before_write
+        & all_writes
+    )
+    if not candidates:
+        return None
+    if _static_lane_loop_extent(loop) is None or loop.orelse:
+        raise exc.BackendUnsupported(
+            "cute", "certified lane running sum requires a complete static lane loop"
+        )
+    if len(candidates) != 1:
+        raise exc.BackendUnsupported(
+            "cute", "certified lane running sum requires one scalar accumulator"
+        )
+    name = next(iter(candidates))
+    positions = [index for index, names in enumerate(writes) if name in names]
+    if len(positions) != 1:
+        raise exc.BackendUnsupported(
+            "cute", "certified lane running sum requires one unconditional self-add"
+        )
+    update_index = positions[0]
+    update = body[update_index]
+    addend = _self_addend(update, name)
+    raw_update = loop.body[update_index]
+    raw_addend = _self_addend(raw_update, name)
+    if (
+        _plain_assignment_name(update) != name
+        or writes[update_index] != {name}
+        or _plain_assignment_name(raw_update) != name
+        or not isinstance(addend, ast.Name)
+        or not isinstance(raw_addend, ast.Name)
+        or addend.id not in all_writes
+        or any(name in ReadWrites.from_ast(stmt).reads for stmt in body[:update_index])
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "certified lane running sum requires one unconditional self-add"
+        )
+
+    marker_indices = {index for index, _ in markers}
+    marker_results = {
+        _canonical_name(marker.result_var, rename_groups) for _, marker in markers
+    }
+    for index, statement in enumerate(body):
+        if index in marker_indices:
+            continue
+        if _is_proven_relocatable_assignment(statement, allow_load=True):
+            continue
+        if _validated_idempotent_store(statement) is None:
+            raise exc.BackendUnsupported(
+                "cute", "certified lane running sum has an unproved body effect"
+            )
+
+    selected: set[int] = {update_index}
+
+    def require_input_slice(root: str, before: int) -> None:
+        if root == name or root in marker_results:
+            raise exc.BackendUnsupported(
+                "cute", "certified lane running sum input depends on a carry or marker"
+            )
+        if root == lane_var or root not in all_writes:
+            return
+        producers = [index for index, names in enumerate(writes) if root in names]
+        if len(producers) != 1:
+            raise exc.BackendUnsupported(
+                "cute", "certified lane running sum has no complete input slice"
+            )
+        index = producers[0]
+        statement = body[index]
+        if (
+            index >= before
+            or index in marker_indices
+            or writes[index] != {root}
+            or _plain_assignment_name(statement) != root
+            or sum(
+                isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+                for node in ast.walk(statement)
+            )
+            != 1
+            or not _is_proven_relocatable_assignment(statement, allow_load=True)
+            or _contains_unduplicatable_op(statement)
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "certified lane running sum has no complete input slice"
+            )
+        if index in selected:
+            return
+        selected.add(index)
+        for dependency in ReadWrites.from_ast(statement).reads:
+            require_input_slice(dependency, index)
+
+    require_input_slice(addend.id, update_index)
+    for index, marker in markers:
+        require_input_slice(_canonical_name(marker.input_name, rename_groups), index)
+    return _LaneRunningSum(
+        name=name,
+        update_index=update_index,
+        input_name=raw_addend.id,
+        phase1_indices=tuple(sorted(selected)),
+        iterator=ast.dump(loop.iter),
     )
 
 
@@ -639,6 +850,8 @@ def _split_one_lane_loop(
     proven_tensor_stride_values: dict[tuple[str, int], int],
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: dict[str, str],
+    running_sums: set[str] | None = None,
 ) -> list[ast.AST]:
     from .. import exc
     from .ast_read_writes import ReadWrites
@@ -664,6 +877,8 @@ def _split_one_lane_loop(
                 proven_tensor_stride_values=proven_tensor_stride_values,
                 thread_axis_names=dict(thread_axis_names),
                 scalar_definitions=dict(scalar_definitions),
+                rename_groups=rename_groups,
+                running_sums=running_sums,
             )
         if any(_find_lane_reduce_call(node) is not None for node in ast.walk(loop)):
             from .. import exc
@@ -675,6 +890,31 @@ def _split_one_lane_loop(
         return [loop]
 
     marker_indices = {i for i, _ in markers}
+    if any(
+        marker.owner_lane is not None and marker.owner_lane != lane_var
+        for _, marker in markers
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "reduction marker is nested in a different lane owner"
+        )
+    running_sum = _certify_lane_running_sum(
+        loop, lane_var, markers, rename_groups, running_sums
+    )
+    # A certified matmul self-add stays in the complete accumulation pass.
+    # Only its completed value is available to the remaining carry updates;
+    # keep the existing independent-carry check for every other binding.
+    tail_indices = [
+        index
+        for index in range(len(body))
+        if running_sum is None or index != running_sum.update_index
+    ]
+    carry_body = [body[index] for index in tail_indices]
+    carry_markers = {
+        index
+        for index, original in enumerate(tail_indices)
+        if original in marker_indices
+    }
+    _validate_renamed_lane_carries(carry_body, lane_var, carry_markers, rename_groups)
 
     if _lane_split_reorders_aliasing_memory(
         body,
@@ -683,6 +923,11 @@ def _split_one_lane_loop(
         lane_var,
         _static_lane_loop_extent(loop),
         proven_tensor_stride_values,
+        additional_inputs=(
+            [(running_sum.update_index, running_sum.input_name)]
+            if running_sum is not None
+            else None
+        ),
     ):
         from .. import exc
 
@@ -690,6 +935,23 @@ def _split_one_lane_loop(
             "cute",
             "synthetic-lane reduction would reorder a potentially aliasing write",
         )
+
+    if any(marker.matmul_contribution for _, marker in markers):
+        staged = _split_staged_matmul_lane_reductions(
+            loop,
+            lane_var,
+            markers,
+            thread_axis_names=thread_axis_names,
+            scalar_definitions=scalar_definitions,
+        )
+        if staged is None:
+            raise exc.BackendUnsupported(
+                "cute", "matmul contribution has no complete staged lane schedule"
+            )
+        _validate_owned_lane_carry_schedule(
+            body, staged, lane_var, marker_indices, rename_groups
+        )
+        return staged
 
     # A matmul whose *output* is reduced over a lane-distributed axis (e.g.
     # matmul_layernorm's ``acc.sum(-1)`` over the synthetic-lane N output) cannot
@@ -704,38 +966,45 @@ def _split_one_lane_loop(
     # already handle correctly:
     #   * an unduplicatable op must feed the reduction, and
     #   * the marker results must NOT be consumed by a cross-lane loop-carried
-    #     accumulator.  Online-softmax attention carries ``mi``/``di`` across the
-    #     lane loop (``di = di * alpha + sum``); there the per-lane restore is
-    #     correct, so the stash path must stay out of the way.
-    if any(
-        _contains_unduplicatable_op(stmt) for stmt in body
-    ) and not _markers_feed_cross_lane_carry(body, lane_var, markers):
+    #     accumulator. A phi copy only rules out this stash path; it does not
+    #     prove that an owned full-lane reduction can restore its raw input.
+    if (
+        running_sum is None
+        and any(_contains_unduplicatable_op(stmt) for stmt in body)
+        and not _markers_feed_cross_lane_carry(body, lane_var, markers)
+    ):
         stashed = _split_lane_loop_with_register_stash(loop, lane_var, markers)
         if stashed is not None:
+            _validate_owned_lane_carry_schedule(
+                body, stashed, lane_var, marker_indices, rename_groups
+            )
             return stashed
 
     # Safety: the two-pass split is only valid when the reduction marker is the
-    # ONLY cross-lane carried value in this lane loop. If the body has another
-    # loop-carried accumulator across the lanes (e.g. a matmul ``dot_acc`` or a
+    # ONLY unproved cross-lane carried value in this lane loop. Another
+    # loop-carried accumulator across the lanes (e.g. an uncertified matmul sum or a
     # plain ``extra += per_lane`` sum that already accumulates over the lanes),
-    # splitting would drop or double-count it. Fall back to the original
-    # single-pass per-lane behavior by replacing each marker with its raw input.
-    if _has_extra_cross_lane_carry(body, lane_var, marker_indices):
+    # splitting would drop or double-count it. Only legacy unowned markers can
+    # use the original raw-input fallback; owned markers require a complete
+    # reduction and are rejected before selecting a split subpath.
+    if _has_extra_cross_lane_carry(carry_body, lane_var, carry_markers):
         return [_restore_per_lane_markers(loop, markers)]
 
     input_roots = {m.input_name for _, m in markers}
 
     # Phase 1: the backward slice that produces all reduction inputs.
-    phase1_indices, _phase1_written = _backward_slice(body, input_roots)
+    if running_sum is not None:
+        phase1_indices = list(running_sum.phase1_indices)
+    else:
+        phase1_indices, _phase1_written = _backward_slice(body, input_roots)
 
     # A generated serial loop can carry a value through SSA names that are
     # restored only by the final rename pass.  At this point the loop may read
     # the marker input while ``ReadWrites`` reports only its temporary output
     # name, causing the backward slice above to select the initializer and skip
     # the update loop.  Splitting that shape would reduce the initializer (often
-    # zero) instead of the completed accumulator.  Keep the original per-lane
-    # order whenever an unselected serial loop between the chosen producer and
-    # marker reads the marker input.
+    # zero) instead of the completed accumulator. Decline an owned reduction
+    # without a proved slice; retain the legacy unowned per-lane behavior.
     phase1_index_set = set(phase1_indices)
     for marker_index, marker in markers:
         if any(
@@ -759,6 +1028,9 @@ def _split_one_lane_loop(
             scalar_definitions=scalar_definitions,
         )
         if dependent is not None:
+            _validate_owned_lane_carry_schedule(
+                body, dependent, lane_var, marker_indices, rename_groups
+            )
             return dependent
         return [_restore_per_lane_markers(loop, markers)]
 
@@ -766,16 +1038,16 @@ def _split_one_lane_loop(
     # reduction-input producers. That is only safe for side-effect-free
     # producers. A matmul / collective in the slice (cross-thread shared-memory
     # reductions, ``cute.gemm``, ``dot``) cannot be duplicated without racing on
-    # shared memory, so fall back to per-lane behavior in that case (the
-    # register-stash path above handles the cases where the per-lane restore
-    # would be numerically wrong).
+    # shared memory. If the stash path did not prove a complete reduction,
+    # decline owned markers rather than restoring an incomplete raw input.
     if any(_contains_unduplicatable_op(body[i]) for i in phase1_indices):
         return [_restore_per_lane_markers(loop, markers)]
 
     prefix: list[ast.AST] = []  # acc init statements (outside the lane loops)
     accumulate_body: list[ast.AST] = [body[i] for i in phase1_indices]
+    marker_updates: dict[int, ast.AST] = {}
     finalize: list[ast.AST] = []
-    for _, m in markers:
+    for marker_index, m in markers:
         acc_var = f"{m.result_var}_lane_acc"
         prefix.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
         # Cast the per-lane input to the accumulator dtype before combining so
@@ -783,16 +1055,24 @@ def _split_one_lane_loop(
         # ``a if a > b else b``) does not see mixed fp32/bf16 operands.
         ctor = _dtype_ctor_from_identity(m.identity_expr)
         combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
-        accumulate_body.append(
-            statement_from_string(
-                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
-            )
+        update = statement_from_string(
+            f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val)}"
         )
+        accumulate_body.append(update)
+        marker_updates[marker_index] = update
         finalize.extend(_finalize_lane_reduce_marker(m, acc_var))
+    if running_sum is not None:
+        # Keep the original producer/self-add order, interleaving each marker's
+        # accumulation at its original position. Never regroup the matmul sum
+        # or initialize it again at a synthetic-lane boundary.
+        accumulate_body = [
+            marker_updates[index] if index in marker_updates else body[index]
+            for index in sorted(phase1_index_set | marker_indices)
+        ]
 
     # Phase 2: everything except the marker assignments themselves; the
     # reduced scalar is already finalized so consumers read it directly.
-    phase2_body = [s for i, s in enumerate(body) if i not in marker_indices]
+    phase2_body = [body[index] for index in tail_indices if index not in marker_indices]
 
     # A statement is lane-varying if it (transitively) reads the lane var.
     # Statements that only depend on the finalized scalar(s) are lane-invariant
@@ -820,6 +1100,23 @@ def _split_one_lane_loop(
             or bool(reads & lane_varying_names)
             or bool(writes & lane_varying_names)
         )
+
+    if running_sum is not None:
+        # Compiler provenance identifies a completed matmul result, not a
+        # prefix-sum API. An observable per-lane/conditional use of that value
+        # needs a different proof; admit only pure lane-invariant finalizers.
+        derived = _forward_live_names(phase2_body, {running_sum.name})
+        if any(
+            set(ReadWrites.from_ast(stmt).reads) & derived
+            and (
+                is_lane_varying(stmt)
+                or not _is_proven_relocatable_assignment(stmt, allow_load=False)
+            )
+            for stmt in phase2_body
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "certified lane running sum has a non-invariant consumer"
+            )
 
     keep_indices = _live_phase2_indices(phase2_body)
     lane_invariant_tail: list[ast.AST] = []
@@ -853,7 +1150,217 @@ def _split_one_lane_loop(
     result.extend(lane_invariant_tail)
     if lane_varying_tail:
         result.append(_clone_lane_loop_with_body(loop, lane_varying_tail))
+    _validate_owned_lane_carry_schedule(
+        body,
+        result,
+        lane_var,
+        marker_indices,
+        rename_groups,
+        running_sum=running_sum,
+    )
     return result
+
+
+def _validate_owned_lane_carry_schedule(
+    body: list[ast.AST],
+    lowered: list[ast.AST],
+    lane_var: str,
+    marker_indices: set[int],
+    rename_groups: dict[str, str],
+    *,
+    running_sum: _LaneRunningSum | None = None,
+) -> None:
+    """Require each allowed carry update once after the full-lane reductions.
+
+    The early variation check proves that a carry can be uniform after marker
+    finalization; it does not prove that every split subpath preserves it.
+    In particular, the register stash drops outside-only updates and repeats
+    inside-observed updates in its consume loop. Admit a carry only when the
+    selected schedule retains its exact normalized assignment once, outside
+    every loop and after all marker results. The explicit matmul running-sum
+    certificate is the sole exception: its original self-add and full input
+    slice must remain once per lane, in order, inside the original iterator.
+    Compound or multiple updates remain conservatively declined.
+    """
+    from .ast_read_writes import ast_rename
+
+    if not any(
+        marker.owner_lane is not None
+        for index in marker_indices
+        if (marker := _is_lane_reduce_marker_assign(body[index])) is not None
+    ):
+        return
+
+    def normalize(statements: list[ast.AST]) -> list[ast.AST]:
+        result = [_clone_stmt(statement) for statement in statements]
+        for statement in result:
+            ast_rename(statement, rename_groups)
+        return result
+
+    def binding_writes(statement: ast.AST) -> set[str]:
+        # ReadWrites also models store(value) as an in-place memory write.
+        # This proof counts assignments to scalar bindings, not stored values.
+        return {
+            node.id
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+        }
+
+    original = normalize(body)
+    effects = _ordered_block_reads_writes(cast("list[ast.stmt]", original))
+    original_writes = [binding_writes(statement) for statement in original]
+    carried = (effects.reads_before_write & set().union(*original_writes)) - {lane_var}
+    if not carried:
+        return
+    selected = normalize(lowered)
+    marker_results = {
+        marker.result_var
+        for index in marker_indices
+        if (marker := _is_lane_reduce_marker_assign(original[index])) is not None
+    }
+    selected_writes = [binding_writes(statement) for statement in selected]
+    if running_sum is not None:
+        positions = [
+            index
+            for index, writes in enumerate(selected_writes)
+            if running_sum.name in writes
+        ]
+        if len(positions) != 1 or running_sum.name not in carried:
+            raise exc.BackendUnsupported(
+                "cute", "lane reduction cannot prove the certified per-lane update"
+            )
+        boundary = positions[0]
+        phase1 = selected[boundary]
+        expected: list[ast.AST] = []
+        for index in sorted(set(running_sum.phase1_indices) | marker_indices):
+            if index not in marker_indices:
+                expected.append(body[index])
+                continue
+            marker = _is_lane_reduce_marker_assign(body[index])
+            assert marker is not None
+            accumulator = f"{marker.result_var}_lane_acc"
+            ctor = _dtype_ctor_from_identity(marker.identity_expr)
+            value = (
+                f"{ctor}({marker.input_name})"
+                if ctor is not None
+                else marker.input_name
+            )
+            expected.append(
+                statement_from_string(
+                    f"{accumulator} = "
+                    f"{_combine_expr(marker.reduction_type, accumulator, value)}"
+                )
+            )
+        if not (
+            isinstance(phase1, ast.For)
+            and isinstance(phase1.target, ast.Name)
+            and phase1.target.id == lane_var
+            and ast.dump(phase1.iter) == running_sum.iterator
+            and not phase1.orelse
+            and [ast.dump(stmt) for stmt in phase1.body]
+            == [ast.dump(stmt) for stmt in normalize(expected)]
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "lane reduction cannot prove the certified per-lane update"
+            )
+        # Every reduction must finalize after that complete lane sweep, before
+        # a tail can observe the completed matmul accumulator.
+        finalized_at: set[int] = set()
+        for marker_result in marker_results:
+            definitions = [
+                index
+                for index, writes in enumerate(selected_writes)
+                if marker_result in writes
+            ]
+            if (
+                len(definitions) != 1
+                or definitions[0] <= boundary
+                or _plain_assignment_name(selected[definitions[0]]) != marker_result
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "certified lane update precedes no complete finalization"
+                )
+            finalized_at.add(definitions[0])
+        from .ast_read_writes import ReadWrites
+
+        if any(
+            index != boundary
+            and index <= max(finalized_at)
+            and running_sum.name in ReadWrites.from_ast(statement).reads
+            for index, statement in enumerate(selected)
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "certified lane running sum is consumed before finalization"
+            )
+    for name in carried:
+        if running_sum is not None and name == running_sum.name:
+            continue
+        updates = [
+            statement
+            for statement, writes in zip(original, original_writes, strict=True)
+            if name in writes
+        ]
+        positions = [
+            index for index, writes in enumerate(selected_writes) if name in writes
+        ]
+        if (
+            len(updates) == 1
+            and isinstance(update := updates[0], ast.Assign)
+            and len(update.targets) == 1
+            and isinstance(update.targets[0], ast.Name)
+            and update.targets[0].id == name
+            and len(positions) == 1
+            and ast.dump(selected[positions[0]]) == ast.dump(update)
+        ):
+            boundary = positions[0]
+            finalized = set().union(*selected_writes[:boundary])
+            if marker_results <= finalized and not any(
+                writes & marker_results for writes in selected_writes[boundary:]
+            ):
+                continue
+        raise exc.BackendUnsupported(
+            "cute", "lane reduction cannot prove a once-per-tile carried update"
+        )
+
+
+def _validate_renamed_lane_carries(
+    body: list[ast.AST],
+    lane_var: str,
+    marker_indices: set[int],
+    rename_groups: dict[str, str],
+) -> None:
+    """Check every independent carry before any stash or split can discard it.
+
+    Always normalize production names, even when a raw-name carry already
+    exists. That carry neither protects a second renamed update from the
+    earlier stash path nor proves a complete per-lane reduction. An owned
+    marker needs a full reduction over its lane; no subpath below proves that
+    reduction together with an independent lane-varying carry. Decline the
+    composition rather than losing either observable update or the reduction.
+
+    Unowned standalone AST markers retain their legacy raw-carry behavior;
+    all production emitters attach an owner.
+    """
+    from .ast_read_writes import ast_rename
+
+    owned = any(
+        marker.owner_lane is not None
+        for index in marker_indices
+        if (marker := _is_lane_reduce_marker_assign(body[index])) is not None
+    )
+    if not owned and (
+        not rename_groups or _has_extra_cross_lane_carry(body, lane_var, marker_indices)
+    ):
+        return
+    normalized = [_clone_stmt(statement) for statement in body]
+    for statement in normalized:
+        ast_rename(statement, rename_groups)
+    if _has_extra_cross_lane_carry(
+        normalized, lane_var, marker_indices, finalized_markers=owned
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "lane reduction cannot preserve an independent loop-carried value"
+        )
 
 
 def _lift_lane_invariant_if(
@@ -1108,6 +1615,88 @@ def _lane_reduction_owner_exprs_for_statement(
         if owner_expr is not None and reads & dependencies:
             owner_exprs.append(owner_expr)
     return list(dict.fromkeys(owner_exprs))
+
+
+def _split_staged_matmul_lane_reductions(
+    loop: ast.For,
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+    *,
+    thread_axis_names: dict[str, frozenset[int]],
+    scalar_definitions: dict[str, ast.AST],
+) -> list[ast.AST] | None:
+    """Stash a collective prefix, then finalize proved product reductions.
+
+    This path accepts only owned markers and straight-line scalar assignments.
+    Each FP32 collective in the prefix executes once per lane; later passes
+    read its register fragment. The existing dependent-reduction scheduler
+    keeps final, lane-invariant recurrence updates outside every lane sweep.
+    Both carry validators still apply to the original body and final schedule.
+    """
+    if any(marker.owner_lane != lane_var for _, marker in markers):
+        return None
+    extent = _static_lane_loop_extent(loop)
+    if extent is None or not 1 < extent <= 256:
+        return None
+    body = list(loop.body)
+    marker_indices = {index for index, _ in markers}
+    names = [_plain_assignment_name(statement) for statement in body]
+    if None in names or len(set(names)) != len(names):
+        return None
+    for index, statement in enumerate(body):
+        if index not in marker_indices and not _is_proven_relocatable_assignment(
+            statement, allow_load=True, allow_reduction=True
+        ):
+            return None
+    collective_indices = [
+        index
+        for index, statement in enumerate(body)
+        if _contains_unduplicatable_op(statement)
+    ]
+    if collective_indices and min(marker_indices) <= max(collective_indices):
+        return None
+    transformed = [_clone_stmt(statement) for statement in body]
+    prefix: list[ast.AST] = []
+    if collective_indices:
+        uid = next(_LANE_STASH_COUNTER)
+        compute = [
+            _clone_stmt(statement) for statement in body[: max(collective_indices) + 1]
+        ]
+        for index in collective_indices:
+            statement = body[index]
+            assert isinstance(statement, ast.Assign)
+            call = statement.value
+            if not (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id in _CHUNK_REDUCTION_HELPERS
+                and len(call.args) >= 3
+                and _dtype_ctor_from_identity(ast.unparse(call.args[2]))
+                == "cutlass.Float32"
+            ):
+                return None
+            name = names[index]
+            fragment = f"_lane_stash_{uid}_{name}"
+            prefix.append(
+                statement_from_string(
+                    f"{fragment} = cute.make_rmem_tensor({extent}, cutlass.Float32)"
+                )
+            )
+            compute.append(statement_from_string(f"{fragment}[{lane_var}] = {name}"))
+            transformed[index] = statement_from_string(
+                f"{name} = {fragment}[{lane_var}]"
+            )
+        prefix.append(_clone_lane_loop_with_body(loop, compute))
+    staged_loop = _clone_lane_loop_with_body(loop, transformed)
+    assert isinstance(staged_loop, ast.For)
+    scheduled = _split_dependent_lane_reductions(
+        staged_loop,
+        lane_var,
+        markers,
+        thread_axis_names=thread_axis_names,
+        scalar_definitions=scalar_definitions,
+    )
+    return [*prefix, *scheduled] if scheduled is not None else None
 
 
 def _split_dependent_lane_reductions(
@@ -1648,10 +2237,11 @@ def _markers_feed_cross_lane_carry(
 
     Helion represents a loop-carried value with a phi ``X_copy = X`` read at the
     TOP of the loop body (before the value is rewritten) and a corresponding
-    output assignment renamed back to ``X`` by a later pass.  Such an
-    accumulating lane loop must keep the existing per-lane restore lowering, so
-    the register-stash path (which assumes each marker result is consumed only by
-    per-lane / store consumers, never carried across lanes) must not fire.
+    output assignment renamed back to ``X`` by a later pass. Such a copy
+    conservatively excludes the register-stash path, which assumes each marker
+    result is consumed only by per-lane / store consumers. It does not prove
+    completeness for a raw-input restore; owned markers still require a
+    complete reduction lowering.
 
     matmul_layernorm's N-output lane loop has no such top-level ``X_copy = X``
     carry (its ``acc`` is the matmul accumulator, carried by the *inner* K loop,
@@ -1693,6 +2283,8 @@ def _has_extra_cross_lane_carry(
     body: list[ast.AST],
     lane_var: str,
     marker_indices: set[int],
+    *,
+    finalized_markers: bool = False,
 ) -> bool:
     """Return True when ``body`` contains a loop-carried accumulator across the
     lanes that is INDEPENDENT of the reduction markers.
@@ -1705,6 +2297,13 @@ def _has_extra_cross_lane_carry(
     marker result, such as a matmul ``dot_acc += dot_product`` — must keep
     accumulating once per lane, so the split would drop or corrupt it. In that
     case the caller falls back to the single-pass per-lane behavior.
+
+    For owned-marker legality, ``finalized_markers`` checks variation after
+    treating every marker result as a completed, lane-invariant reduction.
+    Merely depending on a marker is insufficient: ``carry + partial + reduced``
+    still contains an independent lane-varying contribution. Only an update
+    that becomes lane-invariant after finalization can move to the tile tail.
+    The default retains the legacy unowned-marker predicate.
 
     A carried value is detected as a name that is *live-in* to the lane body
     (read before it is written within the body, directly or through a
@@ -1761,7 +2360,16 @@ def _has_extra_cross_lane_carry(
     # ``dot_acc += dot_product(lane)``) cannot move to the once-per-tile tail,
     # so the two-pass split would break it. A lane-invariant update (e.g.
     # welford's ``acc_cnt += block_size``) is fine in the tail.
-    lane_varying = _lane_varying_names(body, lane_var)
+    variation_body = (
+        [
+            statement
+            for index, statement in enumerate(body)
+            if index not in marker_indices
+        ]
+        if finalized_markers
+        else body
+    )
+    lane_varying = _lane_varying_names(variation_body, lane_var)
 
     # Bail if some carried accumulator is independent of every marker AND its
     # update consumes a lane-varying value.
@@ -1774,7 +2382,9 @@ def _has_extra_cross_lane_carry(
         if not update_is_lane_varying:
             continue
         for w in rw.writes:
-            if root(w) in live_in and root(w) not in marker_tainted:
+            if root(w) in live_in and (
+                finalized_markers or root(w) not in marker_tainted
+            ):
                 return True
     return False
 
@@ -2579,9 +3189,17 @@ def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
 def _restore_per_lane_markers(
     loop: ast.For, markers: list[tuple[int, _LaneReduceMarker]]
 ) -> ast.For:
-    """Replace each ``_helion_lane_reduce`` marker in ``loop`` with its raw
-    per-lane input, restoring the original single-pass behavior (used when the
-    two-pass split is unsafe)."""
+    """Restore legacy markers only; raw inputs do not complete owned reductions.
+
+    A carry or unduplicatable producer explains why a split is unsafe, not why
+    its reduction can be omitted. Production markers denote a full reduction
+    over the owning serial lane and physical thread group. The interchange
+    proof removes its already-materialized marker consumers separately.
+    """
+    if any(marker.owner_lane is not None for _, marker in markers):
+        raise exc.BackendUnsupported(
+            "cute", "owned lane reduction has no proved complete per-lane restore"
+        )
     body = list(loop.body)
     for idx, m in markers:
         body[idx] = statement_from_string(
@@ -2615,6 +3233,8 @@ def _lane_split_reorders_aliasing_memory(
     lane_var: str,
     lane_extent: int | None,
     proven_tensor_stride_values: dict[tuple[str, int], int],
+    *,
+    additional_inputs: list[tuple[int, str]] | None = None,
 ) -> bool:
     """Whether splitting the repeated lane loop can reorder an aliasing write.
 
@@ -2633,6 +3253,7 @@ def _lane_split_reorders_aliasing_memory(
     from .cute.persistent_branch_vec import _definition_snapshots
     from .cute.persistent_branch_vec import _lane_accesses_are_iteration_independent
     from .cute.persistent_branch_vec import _memory_load_calls
+    from .cute.persistent_branch_vec import _plain_scalar_store_pointer
 
     tensor_names = {
         node.value.id
@@ -2665,7 +3286,7 @@ def _lane_split_reorders_aliasing_memory(
         ):
             writes.append((write_index, call, _store_tensor_roots(call, tensor_names)))
 
-    definition_snapshots = _definition_snapshots(cast("list[ast.stmt]", body))
+    address_snapshots: dict[frozenset[str], list[dict[str, ast.expr]] | None] = {}
     definitely_written: set[str] = set()
     live_in: set[str] = set()
     may_writes: set[str] = set()
@@ -2677,8 +3298,10 @@ def _lane_split_reorders_aliasing_memory(
             definitely_written.update(effects.writes)
     loop_carried_names = live_in & may_writes
 
-    for marker_index, marker in markers:
-        stage_indices, _ = _backward_slice(body[:marker_index], {marker.input_name})
+    inputs = [(index, marker.input_name) for index, marker in markers]
+    inputs.extend(additional_inputs or ())
+    for input_index, input_name in inputs:
+        stage_indices, _ = _backward_slice(body[:input_index], {input_name})
         for load_index in stage_indices:
             for load_call in _memory_load_calls(body[load_index]):
                 load_marker = (
@@ -2700,28 +3323,46 @@ def _lane_split_reorders_aliasing_memory(
                 for write_index, store_call, write_roots in writes:
                     if not roots_may_alias(write_roots, load_roots):
                         continue
+                    store_pointer = (
+                        store_call.args[3]
+                        if _is_persistent_branch_vec_store(store_call)
+                        else _plain_scalar_store_pointer(store_call)
+                    )
+                    if write_index <= load_index or store_pointer is None:
+                        return True
+                    # Freeze only the two addresses and their complete
+                    # dependency closure. Large value arithmetic cannot
+                    # invalidate an otherwise compact address proof.
+                    address_names = frozenset(
+                        ReadWrites.from_ast(pointer).reads
+                        | ReadWrites.from_ast(store_pointer).reads
+                    )
+                    if address_names not in address_snapshots:
+                        address_snapshots[address_names] = _definition_snapshots(
+                            cast("list[ast.stmt]", body),
+                            required_names=set(address_names),
+                        )
+                    definition_snapshots = address_snapshots[address_names]
+                    if definition_snapshots is None:
+                        return True
                     unstable_address_names = set(loop_carried_names)
-                    if write_index > load_index:
-                        for crossed_statement in body[load_index + 1 : write_index + 1]:
-                            unstable_address_names.update(
-                                ReadWrites.from_ast(crossed_statement).writes
-                            )
+                    for crossed_statement in body[load_index + 1 : write_index + 1]:
+                        unstable_address_names.update(
+                            ReadWrites.from_ast(crossed_statement).writes
+                        )
                     # A write before this producer load is an intra-iteration
                     # dependence and cannot move. A later exact store may cross
                     # the loop backedge only when both accesses have the same
                     # injective lane mapping.
-                    if (
-                        write_index > load_index
-                        and _lane_accesses_are_iteration_independent(
-                            load_call,
-                            store_call,
-                            lane_var=lane_var,
-                            lane_extent=lane_extent,
-                            load_definitions=definition_snapshots[load_index],
-                            store_definitions=definition_snapshots[write_index],
-                            proven_tensor_stride_values=proven_tensor_stride_values,
-                            loop_carried_names=unstable_address_names,
-                        )
+                    if _lane_accesses_are_iteration_independent(
+                        load_call,
+                        store_call,
+                        lane_var=lane_var,
+                        lane_extent=lane_extent,
+                        load_definitions=definition_snapshots[load_index],
+                        store_definitions=definition_snapshots[write_index],
+                        proven_tensor_stride_values=proven_tensor_stride_values,
+                        loop_carried_names=unstable_address_names,
                     ):
                         continue
                     return True
@@ -2838,6 +3479,9 @@ def _forward_live_names(body: list[ast.AST], roots: set[str]) -> set[str]:
 
 def interchange_lane_outside_serial_reductions(
     body: list[ast.AST],
+    *,
+    proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
+    protected_names: set[str] | None = None,
 ) -> list[ast.AST]:
     """Interchange a ``for LANE: ... for MB: ...`` nest whose inner serial loop
     contains ``_helion_lane_reduce`` markers.
@@ -2849,9 +3493,9 @@ def interchange_lane_outside_serial_reductions(
     ``mb`` iteration (lane INSIDE ``mb``). A single lane loop cannot satisfy
     both nestings, so emit two specialized loop nests:
 
-    * Nest B (grad_w): the original ``for LANE: ... for MB: ...`` loop with the
-      lane-reduce markers and the reduction-consuming side effects removed —
-      keeping only the per-feature accumulators and their stores.
+    * Nest B (grad_w): the original ``for LANE: ... for MB: ...`` loop. Remove
+      reduction-consuming stores and their dead producers when aliasing and
+      exact overwrite coverage are proven; otherwise retain the partial stores.
     * Nest A (grad_x): a ``for MB: ... for LANE: ...`` loop carrying only the
       lane reduction and its broadcast consumer. Its inner lane loop still holds
       the markers so the subsequent ``split_lane_loop_reductions`` pass produces
@@ -2861,15 +3505,31 @@ def interchange_lane_outside_serial_reductions(
     """
     new_body: list[ast.AST] = []
     for stmt in body:
-        new_body.extend(_interchange_stmt(stmt))
+        new_body.extend(
+            _interchange_stmt(
+                stmt, proven_disjoint_tensor_pairs or set(), protected_names or set()
+            )
+        )
     return new_body
 
 
-def _interchange_stmt(stmt: ast.AST) -> list[ast.AST]:
+def _interchange_stmt(
+    stmt: ast.AST,
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    protected_names: set[str],
+) -> list[ast.AST]:
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
         if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
-            setattr(stmt, field, interchange_lane_outside_serial_reductions(old))
+            setattr(
+                stmt,
+                field,
+                interchange_lane_outside_serial_reductions(
+                    old,
+                    proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                    protected_names=protected_names,
+                ),
+            )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
     if (
         lane_var is None
@@ -2878,10 +3538,17 @@ def _interchange_stmt(stmt: ast.AST) -> list[ast.AST]:
         or stmt.target.id != lane_var
     ):
         return [stmt]
-    return _interchange_one_lane_loop(stmt, lane_var)
+    return _interchange_one_lane_loop(
+        stmt, lane_var, proven_disjoint_tensor_pairs, protected_names
+    )
 
 
-def _interchange_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
+def _interchange_one_lane_loop(
+    loop: ast.For,
+    lane_var: str,
+    proven_disjoint_tensor_pairs: set[frozenset[str]],
+    protected_names: set[str],
+) -> list[ast.AST]:
     from .ast_read_writes import ReadWrites
 
     body: list[ast.AST] = list(loop.body)
@@ -2998,7 +3665,8 @@ def _interchange_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
     # --- Nest B (grad_w): the original lane loop with markers reverted to their
     # raw per-lane inputs. Its per-feature accumulators (lane-outside-mb) are
     # already correct; its reduction-broadcast store writes a partial (per-lane)
-    # value that Nest A re-stores with the full reduction afterwards.
+    # value that Nest A re-stores with the full reduction afterwards. Prune the
+    # first store only after proving it is unobservable and fully overwritten.
     restored_mb_body = list(mb_loop.body)
     for idx, m in markers:
         restored_mb_body[idx] = statement_from_string(
@@ -3006,6 +3674,23 @@ def _interchange_one_lane_loop(loop: ast.For, lane_var: str) -> list[ast.AST]:
         )
     mb_loop.body = restored_mb_body
     nest_b = loop
+
+    from .cute.interchanged_store_dce import eliminate_interchanged_stores
+
+    reduction_consumers = _forward_live_names(mb_body, marker_results)
+    eliminate_interchanged_stores(
+        nest_b,
+        mb_loop,
+        nest_a,
+        {
+            index
+            for index, statement in enumerate(mb_body)
+            if _has_side_effect(statement)
+            and set(ReadWrites.from_ast(statement).reads) & reduction_consumers
+        },
+        proven_disjoint_tensor_pairs,
+        protected_names,
+    )
 
     return [nest_b, *nest_a]
 
@@ -6110,8 +6795,21 @@ class NDTileStrategy(_BaseNDTileStrategy):
                 jagged_tile_block_size,
             ]
             if not self.supports_index_rank_expansion():
+                tile_mask = None
+                if (
+                    thread_axis is not None
+                    and block_size_var is not None
+                    and env.backend.launches_surplus_tile_threads()
+                    and self.fn.tile_strategy.has_surplus_threads_for_block_id(
+                        block_idx
+                    )
+                ):
+                    tile_mask = env.backend.thread_in_tile_mask_expr(
+                        block_size_var, axis=thread_axis
+                    )
+                prefix = f"({tile_mask}) and " if tile_mask is not None else ""
                 return statement_from_string(
-                    f"{mask_var} = ({index_var}) < {{parent}}",
+                    f"{mask_var} = {prefix}({index_var}) < {{parent}}",
                     parent=self._to_ast(jagged_tile_parent),
                 )
             k = len(parent_dims)
@@ -6171,6 +6869,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             num_threads = [0 for _ in block_ids]
         assert len(num_threads) == len(block_ids)
         self.num_threads = num_threads
+        self._shared_thread_extents: dict[int, int] = {}
         self.mma_mode = mma_mode
         self.inactive_block_ids = inactive_block_ids or set()
         self._lane_var_by_block: dict[int, str] = {}
@@ -6301,6 +7000,34 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return None
         return int(block_size_expr)
 
+    def use_shared_thread_extents(self, extents: dict[int, int]) -> None:
+        """Fit SIMT lane loops to the physical extents shared by sibling loops."""
+        for block_id, threads in extents.items():
+            idx = self.block_ids.index(block_id)
+            size = self._configured_block_size_int(self.block_size[idx])
+            if size is None or (size > threads and size % threads != 0):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "a shared tile thread axis requires an evenly partitioned tile",
+                )
+            self._shared_thread_extents[block_id] = threads
+            elements_per_thread = max(1, size // threads)
+            if elements_per_thread == 1:
+                self._lane_var_by_block.pop(block_id, None)
+            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
+            if elements_per_thread % vec:
+                self._cute_lane_vec_width_by_block.pop(block_id, None)
+
+    def thread_extent_for_masking(self, block_id: int, thread_extent: int) -> int:
+        """Tile lanes that can own an element when a sibling widens the launch."""
+        if block_id in self._shared_thread_extents:
+            size = self._configured_block_size_int(
+                self.block_size[self.block_ids.index(block_id)]
+            )
+            assert size is not None
+            return min(thread_extent, size)
+        return thread_extent
+
     def _maybe_apply_cute_cluster(
         self, env: CompileEnvironment, state: CodegenState
     ) -> None:
@@ -6348,7 +7075,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         [block_id] = self._lane_var_by_block.keys()
         vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
         idx = self.block_ids.index(block_id)
-        nt = self.num_threads[idx]
+        nt = self._shared_thread_extents.get(block_id, self.num_threads[idx])
         static_bs = self._configured_block_size_int(self.block_size[idx])
         if static_bs is None or nt <= 0 or nt % 32 != 0:
             return
@@ -6379,12 +7106,12 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         if block_id in self.inactive_block_ids:
             return 1
         idx = self.block_ids.index(block_id)
-        nt = self.num_threads[idx]
+        nt = self._shared_thread_extents.get(block_id, self.num_threads[idx])
         if nt == 0:
             return 1
         bs = self._configured_block_size_int(self.block_size[idx])
         assert isinstance(bs, int)  # validated by _thread_extent_for_axis
-        return bs // nt // self._cute_cluster_by_block.get(block_id, 1)
+        return max(1, bs // nt) // self._cute_cluster_by_block.get(block_id, 1)
 
     def _thread_extent_for_axis(
         self, block_id: int, block_size: SymIntLike
@@ -6394,7 +7121,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         if self.mma_mode:
             return 1  # MMA handles element distribution, no CUDA threads needed
         idx = self.block_ids.index(block_id)
-        nt = self.num_threads[idx]
+        nt = self._shared_thread_extents.get(block_id, self.num_threads[idx])
         if nt == 0:
             return block_size
         backend_name = CompileEnvironment.current().backend.name
@@ -6407,7 +7134,9 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     f"num_threads requires static ND block sizes for {backend_name}",
                 )
             resolved_block_size = static_block_size
-        if resolved_block_size % nt != 0:
+        if resolved_block_size % nt != 0 and not (
+            block_id in self._shared_thread_extents and resolved_block_size < nt
+        ):
             raise exc.BackendUnsupported(
                 backend_name,
                 (
@@ -6493,7 +7222,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         return exprs
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
-        if not self._lane_var_by_block:
+        if not self._lane_var_by_block and not self._shared_thread_extents:
             return super().codegen_grid(state)
 
         block_ids = self.block_ids
@@ -6721,7 +7450,9 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 end,
                 thread_axis=axis if isinstance(static_extent, int) else None,
                 block_size_var=(
-                    str(static_extent) if isinstance(static_extent, int) else None
+                    str(self.thread_extent_for_masking(block_idx, static_extent))
+                    if isinstance(static_extent, int)
+                    else None
                 ),
             )
             if mask_statement is not None:
@@ -6772,7 +7503,11 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
-        if not self._lane_var_by_block and not self.mma_mode:
+        if (
+            not self._lane_var_by_block
+            and not self._shared_thread_extents
+            and not self.mma_mode
+        ):
             return super().codegen_device_loop(state)
 
         block_ids = self.block_ids
@@ -7020,7 +7755,9 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 end,
                 thread_axis=axis if isinstance(static_extent, int) else None,
                 block_size_var=(
-                    str(static_extent) if isinstance(static_extent, int) else None
+                    str(self.thread_extent_for_masking(block_idx, static_extent))
+                    if isinstance(static_extent, int)
+                    else None
                 ),
             )
             if mask_statement is not None:

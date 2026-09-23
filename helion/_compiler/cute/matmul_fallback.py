@@ -107,7 +107,7 @@ _ACC_PHI_PASSTHROUGH_TARGETS = frozenset(
 
 
 def _cute_acc_is_rescaled_loop_carried(acc_node: object) -> bool:
-    """Return True for a *rescaled* loop-carried accumulator (online softmax).
+    """Return True when arithmetic transforms a loop-carried accumulator.
 
     The cross-lane ``dot_acc`` accumulator (sum the K products across lane
     iterations in fp32, then add the accumulator once) is correct - and more
@@ -117,20 +117,17 @@ def _cute_acc_is_rescaled_loop_carried(acc_node: object) -> bool:
     * a plain matmul K-loop ``acc = hl.dot(x, y, acc=acc)`` where ``acc`` is the
       loop-carried phi added to verbatim (no rescale inside the K loop).
 
-    A flash-attention online-softmax recurrence instead *rescales* the
-    accumulator every K iteration (``acc = acc * alpha + p @ v``).  The ``acc``
-    operand passed to the dot is therefore a value *derived from* the loop phi
-    through an arithmetic rescale rather than the bare phi.  There ``dot_acc``
-    double-counts every prior product (the running sum is re-added each
-    iteration while the rescaled base is recomputed), so the matmul must emit a
-    per-iteration ``acc = (rescaled acc) + product`` update and let the loop phi
-    carry the running sum.
+    A rescaled accumulator is derived from the loop phi through arithmetic.
+    If that arithmetic depends on another contraction-lane reduction, eagerly
+    updating the carry would reuse partial products or an incomplete rescale.
+    The product then needs its own complete owned sum; the reduction scheduler
+    must prove that the rescale and carry update execute once afterward.
 
     Detection: strip pure dtype-casts / views off ``acc``.  If what remains is
     a ``_new_var`` loop-carried phi (or anything not derived from a phi), the
     accumulator is NOT rescaled -> keep ``dot_acc``.  If the phi is only
     reachable *through* an arithmetic op (mul/add/sub/div/...), the accumulator
-    is rescaled -> use the per-iteration form.
+    is rescaled -> require the separate lane-invariance/scheduling proof.
     """
     import torch.fx
 
@@ -249,9 +246,9 @@ def _cute_rescale_is_lane_invariant(acc_node: object, k_block_id: int | None) ->
     the accumulator by a per-chunk decay (``b_h *= exp(g[..., chunk_last]))``
     that is constant across the within-chunk / lane index, so the cross-lane
     ``dot_acc`` running sum stays correct (the rescale factors out of the sum).
-    Flash-attention's ``acc = acc * alpha`` instead rescales by ``alpha``, which
-    is derived from the per-K-tile scores, so it is lane-varying and the
-    per-iteration update must be kept.
+    A rescale derived from per-K-tile scores instead needs those reductions
+    finalized before its once-per-tile update. The owned product-sum path
+    preserves that dependency without re-adding a running partial sum.
     """
     import torch.fx
 
@@ -496,6 +493,65 @@ def _emit_cute_grouped_sum_reduction(
     )
 
 
+def _emit_cute_owned_product_sum(
+    cg: CodegenInterface,
+    input_name: str,
+    *,
+    value_dtype: torch.dtype,
+    loop_state: object,
+    k_block_id: int,
+    owner_lane: str,
+) -> str:
+    """Describe a complete serial-K and physical-thread FP32 product sum."""
+    from ..tile_strategy import _lane_reduce_marker_expr
+
+    backend = CompileEnvironment.current().backend
+    if value_dtype != torch.float32:
+        raise exc.BackendUnsupported("cute", "staged matmul sum requires FP32")
+    axis_sizes, block_axes = _cute_active_thread_layout(cg)
+    loop_block_axes = getattr(loop_state, "block_thread_axes", {})
+    thread_axis = block_axes.get(k_block_id)
+    if thread_axis is None and isinstance(loop_block_axes, dict):
+        thread_axis = loop_block_axes.get(k_block_id)
+    reduce_extent = axis_sizes.get(thread_axis, 1) if thread_axis is not None else 1
+    pre = 1
+    for axis in range(thread_axis or 0):
+        pre *= axis_sizes.get(axis, 1)
+    group_span = pre * reduce_extent
+    group_count = 1
+    lane_expr = ""
+    if reduce_extent > 1 and (pre > 1 or reduce_extent > 32):
+        lane_expr = backend.thread_linear_index_expr(axis_sizes)
+        num_threads = 1
+        for size in axis_sizes.values():
+            num_threads *= size
+        actual_threads = 1
+        for size in getattr(cg, "max_thread_block_dims", ()):
+            actual_threads *= max(size, 1)
+        if (
+            lane_expr is None
+            or num_threads > actual_threads
+            or num_threads % group_span
+            or (group_span > 32 and group_span % 32)
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "staged matmul sum has no proved physical thread group"
+            )
+        group_count = num_threads // group_span
+    return _lane_reduce_marker_expr(
+        input_name,
+        "sum",
+        f"{backend.dtype_str(value_dtype)}(0)",
+        reduce_extent,
+        group_pre=pre,
+        group_span=group_span if lane_expr else 0,
+        group_lane_expr=lane_expr,
+        group_count=group_count,
+        owner_lane=owner_lane,
+        matmul_contribution=True,
+    )
+
+
 def _emit_cute_matmul_n_collapse(
     cg: CodegenInterface,
     lhs: ast.AST,
@@ -633,9 +689,55 @@ def _emit_cute_matmul_n_collapse(
     return result
 
 
+def _cute_product_uses_owned_lane_reduction(
+    cg: CodegenInterface, product: ast.AST, owner_lane: str
+) -> bool:
+    """Prove a product's dependence on a prior reduction of its K lane.
+
+    Only the current straight-line scalar prefix participates. An owned
+    compiler marker, followed by unique ordered pure definitions, supplies
+    the dependence; names alone and enclosing scopes do not. This selects
+    the existing product-sum marker, whose complete schedule must still pass
+    every ownership, carry, effect and alias check in the lane scheduler.
+    """
+    from ..ast_read_writes import ReadWrites
+    from ..generate_ast import GenerateAST
+    from ..tile_strategy import _is_lane_reduce_marker_assign
+    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ..tile_strategy import _plain_assignment_name
+
+    if not isinstance(cg, GenerateAST):
+        return False
+    body = cg.statements_stack[-1]
+    names = [_plain_assignment_name(statement) for statement in body]
+    if None in names or len(set(names)) != len(names):
+        return False
+    all_names = set(names)
+    defined: set[str] = set()
+    dependent: set[str] = set()
+    for statement, name in zip(body, names, strict=True):
+        assert name is not None
+        reads = set(ReadWrites.from_ast(statement).reads)
+        if reads & (all_names - defined):
+            return False
+        marker = _is_lane_reduce_marker_assign(statement)
+        if marker is not None:
+            if marker.owner_lane != owner_lane:
+                return False
+            dependent.add(name)
+        elif not _is_proven_relocatable_assignment(
+            statement, allow_load=True, allow_reduction=True
+        ):
+            return False
+        elif reads & dependent:
+            dependent.add(name)
+        defined.add(name)
+    return bool(set(ReadWrites.from_ast(product).reads) & dependent)
+
+
 def _emit_cute_matmul(
     cg: CodegenInterface,
-    lhs: ast.AST | CutePackedAffineLoad,
+    lhs: ast.AST | CutePackedAffineLoad | CutePackedTerms,
     rhs: ast.AST | CutePackedTerms,
     *,
     accumulate_in_lane_loop: bool = True,
@@ -655,7 +757,7 @@ def _emit_cute_matmul(
         cg.cute_uses_matmul = True  # type: ignore[attr-defined]
     reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
     lhs_terms: tuple[ast.AST, ...]
-    if isinstance(lhs, CutePackedAffineLoad):
+    if isinstance(lhs, (CutePackedAffineLoad, CutePackedTerms)):
         lhs_terms = tuple(lhs.terms)
     else:
         lhs_terms = (lhs,)
@@ -709,35 +811,29 @@ def _emit_cute_matmul(
             if loops and isinstance(loops[-1], DeviceLoopOrGridState):
                 loop_state = loops[-1]
     reduction_base_acc = acc
+    product_lane: str | None = None
     if loop_state is not None and k_block_id is not None:
         lane_vars = getattr(loop_state.strategy, "_lane_var_by_block", None)
         lane_var = lane_vars.get(k_block_id) if isinstance(lane_vars, dict) else None
         if not accumulate_in_lane_loop:
             lane_var = None
-        # BUG#1 fix: a flash-attention online-softmax accumulator is rescaled
-        # (``acc = acc * alpha + p @ v``) every iteration of the K lane loop.
-        # The cross-lane ``dot_acc`` running sum would then be re-added each
-        # iteration while ``acc`` is independently rescaled, double-counting
-        # every prior product.  When ``acc`` is such a loop-carried value, emit
-        # the per-iteration ``acc = acc + product`` update instead (the loop
-        # phi carries the running sum) by skipping the ``dot_acc`` path.  A
-        # loop-invariant accumulator (e.g. a standalone ``addmm`` bias) keeps
-        # ``dot_acc`` so the per-lane products are summed before the bias add.
-        #
-        # EXCEPTION: a *lane-invariant* rescale (GDN's chunk recurrence
-        # ``b_h *= decay`` where ``decay`` depends only on the chunk, not the
-        # within-chunk / lane index) factors out of the cross-lane sum:
-        # ``sum_c (b_h*decay + p_k[c]*b_v[c]) over c`` is wrong, but the
-        # mathematically intended update ``b_h = b_h*decay + sum_c p_k[c]*b_v[c]``
-        # is exactly what the ``dot_acc`` path produces once the AST post-pass
-        # hoists the rescale + final add out of the lane loop.  Keep ``dot_acc``
-        # in that case; only flash-attention's lane-varying rescale falls back.
+        # Keep the running sum when its inputs are independent of the owned
+        # lane reductions. A reduction-fed rescale or product needs an explicit
+        # product marker and a complete staged reduction schedule.
         if (
             lane_var is not None
             and acc is not None
-            and _cute_acc_is_rescaled_loop_carried(acc_node)
-            and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+            and (
+                (
+                    _cute_acc_is_rescaled_loop_carried(acc_node)
+                    and not _cute_rescale_is_lane_invariant(acc_node, k_block_id)
+                )
+                or _cute_product_uses_owned_lane_reduction(cg, product, lane_var)
+            )
         ):
+            # Complete dependent reductions before the product sum and consume
+            # that sum in the once-per-tile carry update, with or without rescale.
+            product_lane = lane_var
             lane_var = None
         if lane_var is not None:
             product_name = cg.lift(product, dce=True, prefix="dot_product").id
@@ -796,15 +892,31 @@ def _emit_cute_matmul(
         reduction_value_dtype = (
             reduction_dtype or lhs_dtype or rhs_dtype or out_dtype or torch.float32
         )
-        product = expr_from_string(
-            _emit_cute_grouped_sum_reduction(
-                cg,
-                reduction_input,
-                value_dtype=reduction_value_dtype,
-                loop_state=loop_state,
-                k_block_id=k_block_id,
+        if product_lane is not None:
+            product = cg.lift(
+                expr_from_string(
+                    _emit_cute_owned_product_sum(
+                        cg,
+                        reduction_input,
+                        value_dtype=reduction_value_dtype,
+                        loop_state=loop_state,
+                        k_block_id=k_block_id,
+                        owner_lane=product_lane,
+                    )
+                ),
+                dce=True,
+                prefix="dot_sum",
             )
-        )
+        else:
+            product = expr_from_string(
+                _emit_cute_grouped_sum_reduction(
+                    cg,
+                    reduction_input,
+                    value_dtype=reduction_value_dtype,
+                    loop_state=loop_state,
+                    k_block_id=k_block_id,
+                )
+            )
     elif static_k_extent is not None and static_k_extent > 1:
         scale_dtype = reduction_dtype or lhs_dtype or rhs_dtype or out_dtype
         scale_expr = str(static_k_extent)

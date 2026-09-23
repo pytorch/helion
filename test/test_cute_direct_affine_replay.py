@@ -868,6 +868,73 @@ def test_composer_emits_generic_mma_paths(
     assert _ast_bytes(replay.source_statements) == source_before
 
 
+@pytest.mark.parametrize(
+    ("step_count", "mma"),
+    [(3, DirectAffineMma.M16N8), (5, DirectAffineMma.M16N16)],
+)
+@pytest.mark.parametrize(
+    "owner", ("ordinary_feature_serial", "ordinary_row_serial", "foreign_lane", None)
+)
+def test_composer_rebinds_only_proved_feature_reduction_owners(
+    step_count: int, mma: DirectAffineMma, owner: str | None
+) -> None:
+    plan = _plan(step_count, mma)
+    replay = _detached_replay(step_count)
+    coordinates = _coordinates(plan)
+    owner_argument = "" if owner is None else f", {owner!r}"
+    statements = _statements(
+        "partial = source_feature * source_feature\n"
+        "reduced = cutlass.Float32(_helion_lane_reduce(partial, 'sum', "
+        f"cutlass.Float32(0), 32, 1, 0, '', 1, 1{owner_argument}))\n"
+        "normalized = source_feature + reduced"
+    )
+    metadata = object()
+    vars(statements[1])["replay_metadata"] = metadata
+    vector = DirectAffineValueReplay(
+        statements=statements,
+        value=_expression("normalized"),
+        bindings=DirectAffineReplayBindings(feature=_expression("source_feature")),
+    )
+    pointwise = DirectAffineValueReplay(
+        statements=(),
+        value=_expression("source_feature"),
+        bindings=DirectAffineReplayBindings(feature=_expression("source_feature")),
+    )
+    templates = _resolved_templates(
+        entry_state=_value_replay("entry", "row", "feature"),
+        steps=tuple(
+            dataclasses.replace(
+                _step_replay(index),
+                diagonal=vector,
+                prediction_vector=pointwise,
+                update_vector=pointwise,
+                observation_vector=pointwise,
+            )
+            for index in range(step_count)
+        ),
+    )
+    original = _ast_bytes(statements)
+    emission = _compose_with_templates(
+        replay,
+        plan,
+        coordinates,
+        _proof(step_count, replay=replay),
+        templates,
+    )
+
+    assert _ast_bytes(statements) == original
+    assert vars(statements[1])["replay_metadata"] is metadata
+    if owner not in (None, coordinates.feature.lane_name):
+        assert emission is None
+        return
+    assert emission is not None
+    source = "\n".join(
+        ast.unparse(statement) for statement in emission.replacement_statements
+    )
+    assert source.count("cute.arch.warp_reduction_sum") == step_count
+    assert "_helion_lane_reduce" not in source
+
+
 def test_composer_rejects_name_collision_from_retained_program_scope() -> None:
     plan = _plan(3, DirectAffineMma.M16N8)
     replay = dataclasses.replace(

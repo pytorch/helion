@@ -20,7 +20,9 @@ import sympy
 import torch
 from torch.fx.node import Node
 from torch.fx.node import map_arg
+from torch.utils._sympy.functions import FloorDiv
 
+from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -58,37 +60,48 @@ def _get_tile_shape(
     """Map a FakeTensor's symbolic dimensions to concrete tile (block) sizes."""
     shape: list[int] = []
     for dim_size in fake_tensor.shape:
-        block_id = env.get_block_id(dim_size)
-        if block_id is not None:
-            # pyrefly: ignore [bad-argument-type]
-            bs = env.block_sizes[block_id].from_config(config)
-            if isinstance(bs, int):
-                shape.append(int(bs))
-                continue
-        raw_expr = getattr(getattr(dim_size, "node", None), "_expr", None)
-        if isinstance(raw_expr, sympy.Expr):
-            replacements: dict[sympy.Symbol, sympy.Integer] = {}
-            for symbol in raw_expr.free_symbols:
-                if not isinstance(symbol, sympy.Symbol):
-                    break
-                block_id = env.get_block_id(symbol)
-                if block_id is None:
-                    break
-                # pyrefly: ignore [bad-argument-type]
-                bs = env.block_sizes[env.canonical_block_id(block_id)].from_config(
-                    config
-                )
-                if not isinstance(bs, int):
-                    break
-                replacements[symbol] = sympy.Integer(bs)
-            else:
-                shape.append(int(raw_expr.xreplace(replacements)))
-                continue
+        if (extent := _resolve_tile_extent(dim_size, env, config)) is not None:
+            shape.append(extent)
+            continue
         with contextlib.suppress(Exception):
             shape.append(int(dim_size))
             continue
         shape.append(env.size_hint(dim_size))
     return shape
+
+
+def _resolve_tile_extent(
+    size: int | torch.SymInt,
+    env: CompileEnvironment,
+    config: Config,
+) -> int | None:
+    """Evaluate a tile extent from the selected config without SymInt guards.
+
+    Runtime symbols are deliberately left unresolved. Their size hints are not
+    evidence for a static iteration count or a thread-to-element assignment.
+    """
+    if isinstance(size, int):
+        return size
+    block_id = env.get_block_id(size)
+    if block_id is not None:
+        value = env.block_sizes[block_id].from_config(config)
+        return value if isinstance(value, int) else None
+    expr = size.node._expr
+    if not isinstance(expr, sympy.Expr):
+        return None
+    replacements: dict[sympy.Symbol, sympy.Integer] = {}
+    for symbol in expr.free_symbols:
+        if not isinstance(symbol, sympy.Symbol):
+            return None
+        block_id = env.get_block_id(symbol)
+        if block_id is None:
+            return None
+        value = env.block_sizes[env.canonical_block_id(block_id)].from_config(config)
+        if not isinstance(value, int):
+            return None
+        replacements[symbol] = sympy.Integer(value)
+    resolved = expr.xreplace(replacements)
+    return int(resolved) if isinstance(resolved, sympy.Integer) else None
 
 
 def _resolve_dim_block_id(
@@ -153,6 +166,25 @@ def _get_dim_local_coord(
     """
     block_id = _resolve_dim_block_id(cg, fake_tensor, dim)
     if block_id is None:
+        size = fake_tensor.shape[dim]
+        if isinstance(size, torch.SymInt) and isinstance(size.node._expr, FloorDiv):
+            base, divisor = size.node._expr.args
+            env = CompileEnvironment.current()
+            block_id = env.get_block_id(base)
+            if (
+                block_id is not None
+                and isinstance(divisor, sympy.Integer)
+                and divisor > 0
+            ):
+                extent = cg.device_function.resolved_block_size(block_id)
+                coord = _get_block_local_coord(cg, block_id)
+                if (
+                    isinstance(extent, int)
+                    and extent > 0
+                    and extent % int(divisor) == 0
+                    and coord is not None
+                ):
+                    return f"({coord}) // cutlass.Int32({int(divisor)})"
         return "cutlass.Int32(0)"
     coord = _get_block_local_coord(cg, block_id)
     return coord if coord is not None else "cutlass.Int32(0)"
@@ -242,6 +274,21 @@ def _grid_local_coord_expr(
     thread_axis: int,
 ) -> str:
     """Return the current grid-local coordinate, including lane-loop offsets."""
+    from ..tile_strategy import NDTileStrategy
+
+    loops = cg.active_device_loops.get(block_id)
+    grid_state = cg.current_grid_state
+    strategy = (
+        loops[-1].strategy
+        if loops
+        else (grid_state.strategy if grid_state is not None else None)
+    )
+    if isinstance(strategy, NDTileStrategy) and block_id in strategy.block_ids:
+        # The emitted index already includes the selected blocked/strided lane
+        # layout, vector inner lane, and any CTA slice. Reconstructing these
+        # from thread_idx and an outer lane counter loses part of that mapping.
+        return f"({strategy.index_var(block_id)}) - ({strategy.offset_var(block_id)})"
+
     coord = f"cutlass.Int32(cute.arch.thread_idx()[{thread_axis}])"
     if cg.current_grid_state is None:
         return coord
@@ -788,11 +835,47 @@ def resolve_cute_shape_chain_value_at(
     return _resolve_shape_chain_expr(ctx, node, flat_index)
 
 
+def codegen_cute_virtual_clone(
+    ctx: LoweringContext, node: Node
+) -> CuteShapeChainView | None:
+    """Keep a logical tile copy virtual until its final shape is known.
+
+    A contiguous clone introduced by reshape copies the same logical elements.
+    Its already-loaded SSA leaves are immutable, so deferring their selection
+    preserves the copy without assigning coordinates to temporary split dims.
+    Ordinary materialized clones keep the existing pointwise lowering.
+    """
+    source = node.args[0]
+    if not isinstance(source, Node):
+        return None
+    value = ctx.env[source]
+    if not isinstance(value, CuteShapeChainView):
+        return None
+    if (
+        len(node.args) != 1
+        or set(node.kwargs) - {"memory_format"}
+        or node.kwargs.get("memory_format")
+        not in (None, torch.contiguous_format, torch.preserve_format)
+        or not _shape_chain_only_users(node)
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "virtual shape-chain clone requires shape-only consumers"
+        )
+    return value
+
+
 def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
     """Codegen for view/reshape on CuTe tiles."""
     from ..generate_ast import GenerateAST
+    from .indexing import CutePackedTerms
+    from .packed_matmul import virtual_packed_terms
 
     assert isinstance(ctx.cg, GenerateAST)
+    packed_terms = virtual_packed_terms(node)
+    if packed_terms is not None:
+        values = tuple(ctx.env[term] for term in packed_terms)
+        if all(isinstance(value, ast.AST) for value in values):
+            return CutePackedTerms(cast("tuple[ast.AST, ...]", values))
     # pyrefly: ignore [bad-argument-type]
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     shape_chain = tensor if isinstance(tensor, CuteShapeChainView) else None

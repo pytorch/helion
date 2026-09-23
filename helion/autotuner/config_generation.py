@@ -7,7 +7,9 @@ import itertools
 import math
 import operator
 import random
+from types import MappingProxyType
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import Callable
 from typing import Literal
 from typing import TypeVar
@@ -17,6 +19,7 @@ from .._compat import warps_to_threads
 from ..exc import AutotuneError
 from ..exc import InvalidConfig
 from .block_id_sequence import BlockIdSequence
+from .compiler_coverage import same_value
 from .config_fragment import Category
 from .config_fragment import ConfigSpecFragment
 from .config_fragment import EnumFragment
@@ -128,6 +131,10 @@ class ConfigGeneration:
         _flash_pipeline_family_override: str | None = None,
         advanced_controls_files: list[str] | None = None,
         process_group_name: str | None = None,
+        compiler_coverage_enabled: bool = True,
+        _field_view: Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment]
+        | None = None,
+        _initial_sampling: bool = False,
     ) -> None:
         def _collect_spec(spec: ConfigSpecFragment) -> object:
             """
@@ -144,6 +151,9 @@ class ConfigGeneration:
 
         super().__init__()
         self.config_spec = config_spec
+        self._field_view = _field_view
+        self._initial_sampling = _initial_sampling
+        self.compiler_coverage_enabled = compiler_coverage_enabled
         self.process_group_name = process_group_name
         self._advanced_controls_files = advanced_controls_files
         self._flash_pipeline_family_override = (
@@ -152,7 +162,13 @@ class ConfigGeneration:
             else None
         )
         self.flat_spec: list[ConfigSpecFragment] = []
-        if self._flash_pipeline_family_override is None:
+        if self._field_view is not None:
+            config_spec._flat_config_from_fields(
+                _collect_spec,
+                self._field_view,
+                advanced_controls_files=advanced_controls_files,
+            )
+        elif self._flash_pipeline_family_override is None:
             config_spec.flat_config(
                 _collect_spec,
                 advanced_controls_files=advanced_controls_files,
@@ -174,6 +190,7 @@ class ConfigGeneration:
         self._cute_num_thread_block_pairs: list[tuple[int, int]] = []
         self._cute_block_index_by_id: dict[int, int] = {}
         self._cute_num_thread_index_by_id: dict[int, int] = {}
+        self._cute_loop_order_index_by_id: dict[int, int] = {}
         self._cute_flatten_loop_groups: list[tuple[int, list[int]]] = []
         if self.config_spec.backend_name == "cute":
             self._init_cute_num_thread_pairs()
@@ -254,6 +271,12 @@ class ConfigGeneration:
             for i, spec in enumerate(self.config_spec.num_threads)
             if i < len(num_thread_indices) and spec.block_id in block_index_by_id
         ]
+        loop_order_indices, _ = self._key_to_flat_indices.get("loop_orders", ([], True))
+        self._cute_loop_order_index_by_id = {
+            spec.block_ids[0]: loop_order_indices[i]
+            for i, spec in enumerate(self.config_spec.loop_orders)
+            if i < len(loop_order_indices)
+        }
         try:
             flatten_indices, _ = self._key_to_flat_indices["flatten_loops"]
         except KeyError:
@@ -275,14 +298,101 @@ class ConfigGeneration:
     @functools.cached_property
     def overridden_flat_indices(self) -> set[int]:
         """Return flat_spec indices that are frozen by config overrides."""
-        if not self._override_values:
-            return set()
         result: set[int] = set()
         for key in self._override_values:
             if key in self._key_to_flat_indices:
                 indices, _ = self._key_to_flat_indices[key]
                 result.update(indices)
+        if not self.compiler_coverage_enabled:
+            for group in self.config_spec.compiler_coverage_groups:
+                if group.key in self._key_to_flat_indices:
+                    result.update(self._key_to_flat_indices[group.key][0])
         return result
+
+    def _flat_fields(self) -> Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        if self._field_view is not None:
+            return self._field_view
+        if self._flash_pipeline_family_override is None:
+            return self.config_spec._flat_fields()
+        return self.config_spec._flat_fields_with_flash_family(
+            self._flash_pipeline_family_override
+        )
+
+    def initial_population_view(self) -> ConfigGeneration:
+        """Own a full-layout view whose random draws use only old coordinates."""
+        if not self.config_spec.compiler_coverage_groups:
+            return self
+        self.config_spec.validate_compiler_coverage_groups()
+        return ConfigGeneration(
+            self.config_spec,
+            overrides=copy.deepcopy(self._override_values),
+            _flash_pipeline_family_override=self._flash_pipeline_family_override,
+            advanced_controls_files=copy.deepcopy(self._advanced_controls_files),
+            process_group_name=self.process_group_name,
+            compiler_coverage_enabled=self.compiler_coverage_enabled,
+            _field_view=MappingProxyType(copy.deepcopy(dict(self._flat_fields()))),
+            _initial_sampling=True,
+        )
+
+    @functools.cached_property
+    def _compiler_coverage_sampler(self) -> ConfigGeneration | None:
+        if not self._initial_sampling and self.compiler_coverage_enabled:
+            return None
+        owned = {group.key for group in self.config_spec.compiler_coverage_groups}
+        fields = self._flat_fields()
+        if not owned.intersection(fields):
+            return None
+        return ConfigGeneration(
+            self.config_spec,
+            overrides=copy.deepcopy(
+                {
+                    key: value
+                    for key, value in self._override_values.items()
+                    if key not in owned
+                }
+            ),
+            _flash_pipeline_family_override=self._flash_pipeline_family_override,
+            advanced_controls_files=copy.deepcopy(self._advanced_controls_files),
+            process_group_name=self.process_group_name,
+            _field_view=MappingProxyType(
+                copy.deepcopy(
+                    {key: value for key, value in fields.items() if key not in owned}
+                )
+            ),
+        )
+
+    def _lift_projected_raw(self, flat: FlatConfig) -> FlatConfig:
+        """Transfer raw slots by name without normalization, repair or RNG draws."""
+        sampler = self._compiler_coverage_sampler
+        assert sampler is not None
+        if len(flat) != len(sampler.flat_spec):
+            raise ValueError("Cached flat config does not match the projected layout")
+        legacy = {
+            group.key: group.legacy
+            for group in self.config_spec.compiler_coverage_groups
+        }
+        result: FlatConfig = [None] * len(self.flat_spec)
+        for key, (indices, is_sequence) in self._key_to_flat_indices.items():
+            if key in legacy:
+                assert len(indices) == 1 and not is_sequence
+                result[indices[0]] = legacy[key]
+                continue
+            old_indices, old_sequence = sampler._key_to_flat_indices[key]
+            if old_sequence != is_sequence or len(old_indices) != len(indices):
+                raise ValueError("Compiler coverage changed old flat slots")
+            for index, old_index in zip(indices, old_indices, strict=True):
+                result[index] = copy.deepcopy(flat[old_index])
+        return result
+
+    def projected_cache_flat_pair(self, flat: FlatConfig) -> tuple[FlatConfig, Config]:
+        sampler = self._compiler_coverage_sampler
+        assert self._initial_sampling and sampler is not None
+        old_flat = copy.deepcopy(flat)
+        # Decode only with the old layout. Preserve the same raw slots the old
+        # best-available builder retains after its normal unflatten call.
+        sampler.unflatten(old_flat)
+        lifted = self._lift_projected_raw(old_flat)
+        return lifted, self.unflatten(lifted)
 
     @functools.cached_property
     def _key_to_flat_indices(self) -> dict[str, tuple[list[int], bool]]:
@@ -292,16 +402,27 @@ class ConfigGeneration:
         """
         mapping: dict[str, tuple[list[int], bool]] = {}
         idx = 0
-        layout = (
-            self.config_spec.flat_key_layout(
+        if self._field_view is not None:
+            layout = [
+                (key, *field._flat_key_info())
+                for key, field in self._field_view.items()
+            ]
+            if (
+                self.config_spec._advanced_controls_file_fragment(
+                    self._advanced_controls_files
+                )
+                is not None
+            ):
+                layout.append(("advanced_controls_file", 1, False))
+        elif self._flash_pipeline_family_override is None:
+            layout = self.config_spec.flat_key_layout(
                 advanced_controls_files=self._advanced_controls_files
             )
-            if self._flash_pipeline_family_override is None
-            else self.config_spec._flat_key_layout_with_flash_family(
+        else:
+            layout = self.config_spec._flat_key_layout_with_flash_family(
                 advanced_controls_files=self._advanced_controls_files,
                 flash_pipeline_family=self._flash_pipeline_family_override,
             )
-        )
         for key, count, is_sequence in layout:
             mapping[key] = (list(range(idx, idx + count)), is_sequence)
             idx += count
@@ -395,6 +516,10 @@ class ConfigGeneration:
                 )
                 thread_product = (thread_product // resolved_threads) * next_threads
 
+        if self.config_spec.cute_tile_loop_paths and not self.config_spec.matmul_facts:
+            self._repair_cute_tile_loop_threads(flat_config)
+            return
+
         explicit_indices = [
             idx
             for idx, _ in self._cute_num_thread_block_pairs
@@ -441,16 +566,68 @@ class ConfigGeneration:
             for root in roots
         ]
 
+    def _repair_cute_tile_loop_threads(self, flat_config: FlatConfig) -> None:
+        """Fit simultaneous SIMT axes without multiplying sequential passes."""
+        spec = self.config_spec
+        inactive = spec.cute_inactive_tile_block_ids | spec.reduction_block_ids
+
+        def launch_axes() -> list[dict[int, int]]:
+            axes: list[dict[int, int]] = []
+            for path in spec.cute_tile_loop_paths:
+                position = 0
+                seen: set[int] = set()
+                for block_ids in path:
+                    order_index = self._cute_loop_order_index_by_id.get(block_ids[0])
+                    order = (
+                        cast("list[int]", flat_config[order_index])
+                        if order_index is not None
+                        else range(len(block_ids))
+                    )
+                    for dimension in order:
+                        block_id = block_ids[dimension]
+                        if block_id in inactive or block_id in seen:
+                            continue
+                        seen.add(block_id)
+                        thread_index = self._cute_num_thread_index_by_id.get(block_id)
+                        block_index = self._cute_block_index_by_id.get(block_id)
+                        if thread_index is None or block_index is None:
+                            continue
+                        threads = flat_config[thread_index]
+                        size = flat_config[block_index]
+                        if type(threads) is not int or type(size) is not int:
+                            continue
+                        extent = threads if threads > 0 else size
+                        if extent <= 1:
+                            continue
+                        if position == len(axes):
+                            axes.append({})
+                        axes[position][thread_index] = extent
+                        position += 1
+            return axes
+
+        while True:
+            axes = launch_axes()
+            extents = [max(axis.values()) for axis in axes]
+            if functools.reduce(operator.mul, extents, 1) <= 1024:
+                return
+            # The physical launch uses the maximum of each axis across paths,
+            # not the largest path product. Only shrink a current maximum;
+            # equally wide siblings may need to shrink together.
+            index, threads = max(
+                (
+                    (index, extent)
+                    for axis, maximum in zip(axes, extents, strict=True)
+                    for index, extent in axis.items()
+                    if extent == maximum
+                ),
+                key=operator.itemgetter(1),
+            )
+            flat_config[index] = self._largest_power_of_two_at_most(threads // 2)
+
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""
         result = self._fragment_default_flat()
-        flat_fields = (
-            self.config_spec._flat_fields()
-            if self._flash_pipeline_family_override is None
-            else self.config_spec._flat_fields_with_flash_family(
-                self._flash_pipeline_family_override
-            )
-        )
+        flat_fields = self._flat_fields()
         for key, (indices, is_sequence) in self._key_to_flat_indices.items():
             if key not in config.config:
                 has_default, value = self.config_spec.flatten_missing_field_default(
@@ -730,15 +907,32 @@ class ConfigGeneration:
             The full configuration object.
         """
 
+        return self._unflatten(flat_values)
+
+    def _unflatten(
+        self,
+        flat_values: FlatConfig,
+        *,
+        fix_invalid: bool = True,
+        repair: bool = True,
+    ) -> Config:
         def get_next_value(spec: ConfigSpecFragment) -> object:
             i = next(count)
             assert type(self.flat_spec[i]) is type(spec)
             return flat_values[i]
 
         assert len(flat_values) == len(self.flat_spec)
-        self._repair_cute_num_threads(flat_values)
+        if repair:
+            self._repair_cute_num_threads(flat_values)
         count: itertools.count[int] = itertools.count()
-        if self._flash_pipeline_family_override is None:
+        if self._field_view is not None or not fix_invalid:
+            config = self.config_spec._flat_config_from_fields(
+                get_next_value,
+                self._flat_fields(),
+                advanced_controls_files=self._advanced_controls_files,
+                _fix_invalid=fix_invalid,
+            )
+        elif self._flash_pipeline_family_override is None:
             config = self.config_spec.flat_config(
                 get_next_value,
                 advanced_controls_files=self._advanced_controls_files,
@@ -754,6 +948,31 @@ class ConfigGeneration:
         # Overrides may reintroduce pointer stores that break subtiled outputs
         self.config_spec.fix_epilogue_subtile_store_indexing(config.config)
         return config
+
+    def strict_config_pair(self, config: Config) -> tuple[FlatConfig, Config]:
+        """Validate a complete effective coverage config before repair can hide it."""
+        prepared = self._apply_overrides(copy.deepcopy(config))
+        self.config_spec.normalize(prepared.config)
+        for group in self.config_spec.compiler_coverage_groups:
+            value = prepared.config.get(group.key, group.legacy)
+            if not any(same_value(value, mode) for mode in group.domain):
+                raise InvalidConfig(
+                    f"Invalid compiler coverage mode {group.key}={value!r}"
+                )
+        flat = self.flatten(prepared)
+        strict = self._unflatten(copy.deepcopy(flat), fix_invalid=False, repair=False)
+        for key, value in prepared.config.items():
+            if key not in strict.config or strict.config[key] != value:
+                raise InvalidConfig(f"Coverage transfer changed supplied field {key!r}")
+        normalized_flat, normalized = self.canonicalize_flat(flat)
+        if strict != normalized:
+            raise InvalidConfig("Coverage transfer requires config repair")
+        self.config_spec.normalize(normalized.config)
+        return normalized_flat, normalized
+
+    def strict_unflatten(self, flat: FlatConfig) -> Config:
+        """Decode an expanded warm witness without first repairing its mode."""
+        return self._unflatten(copy.deepcopy(flat), fix_invalid=False, repair=False)
 
     def block_numel(self, flat_config: FlatConfig) -> int:
         return functools.reduce(
@@ -1964,6 +2183,9 @@ class ConfigGeneration:
             A random flat configuration.
         """
 
+        sampler = self._compiler_coverage_sampler
+        if sampler is not None:
+            return self._lift_projected_raw(sampler.random_flat())
         with sync_seed(process_group_name=self.process_group_name):
             config = [spec.random() for spec in self.flat_spec]
             self.shrink_config(config, PowerOfTwoFragment(1, 2048, 32).random())
@@ -1973,7 +2195,15 @@ class ConfigGeneration:
     @functools.cached_property
     def _config_value_priors(self) -> dict[str, ValuePrior]:
         """Per-config-key sampling priors supplied by the active backend."""
-        return dict(self.config_spec.backend.config_value_priors(self.config_spec))
+        sampler = self._compiler_coverage_sampler
+        if sampler is not None:
+            return sampler._config_value_priors
+        result = dict(self.config_spec.backend.config_value_priors(self.config_spec))
+        if self._field_view is not None:
+            for group in self.config_spec.compiler_coverage_groups:
+                if group.key not in self._field_view:
+                    result.pop(group.key, None)
+        return result
 
     @functools.cached_property
     def _flat_index_to_key_pos(self) -> dict[int, tuple[str, int]]:
@@ -1993,6 +2223,9 @@ class ConfigGeneration:
         declines). Used for half of the random portion of the initial
         population; with no priors this is exactly ``random_flat``.
         """
+        sampler = self._compiler_coverage_sampler
+        if sampler is not None:
+            return self._lift_projected_raw(sampler.biased_random_flat())
         priors = self._config_value_priors
         if not priors:
             return self.random_flat()

@@ -158,6 +158,8 @@ from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
     from ...language.matmul_ops import CuteTcgen05SearchPlan
@@ -195,14 +197,10 @@ _TRACE_THROUGH_TARGETS = {
     # data shuffle.  Permuted operands fall back to scalar codegen.
 }
 
-# Extra forward-trace targets used ONLY for *output dtype* inference
-# (``_trace_mma_to_store_dtype``). These are the whitelisted fused-epilogue
-# aux-binary ops (e.g. the rowwise scale ``acc * scale[...]``). Tracing
-# through them only follows the chain to the store node and reads the store
-# *target tensor's* dtype, so it never changes the inferred dtype; it just
-# lets inference reach the store past a fused scale/bias step. This is needed
-# for fp8 inputs (whose ``input_dtype`` is never a valid epilogue output
-# dtype) so the plan picks up the real bf16/f16/f32 store dtype.
+# Extra forward-trace targets used only for output store/dtype/lifetime
+# analysis. Operand tracing remains restricted to _TRACE_THROUGH_TARGETS.
+# These are the fused epilogue unary and auxiliary-binary operations. The
+# store's epilogue classifier separately validates complete renderability.
 _DTYPE_TRACE_EXTRA_TARGETS = {
     torch.ops.aten.mul.Tensor,
     torch.ops.aten.add.Tensor,
@@ -2897,7 +2895,8 @@ def ensure_tcgen05_fragment_epilogue_plan(
         graph_node
         for graph_info in fn.codegen.codegen_graphs
         for graph_node in graph_info.graph.nodes
-        if _decode_cute_mma_target(graph_node) is not None
+        if _decode_cute_mma_target(graph_node, graphs=fn.codegen.codegen_graphs)
+        is not None
     ]
     if anchors != [node]:
         return reject()
@@ -2945,6 +2944,30 @@ def ensure_tcgen05_fragment_epilogue_plan(
     return True
 
 
+def _unwrap_lossless_mma_upcast(node: Node) -> Node:
+    """Recover only the single half/BF16-to-FP32 conversion MMA can absorb."""
+    if (
+        node.op == "call_function"
+        and node.target is torch.ops.prims.convert_element_type.default
+        and len(node.args) == 2
+        and not node.kwargs
+        and isinstance(node.args[0], Node)
+        and node.args[1] is torch.float32
+    ):
+        source = node.args[0]
+        source_value = source.meta.get("val")
+        if (
+            isinstance(source_value, torch.Tensor)
+            and source_value.ndim == 2
+            and source_value.dtype in (torch.float16, torch.bfloat16)
+        ):
+            # Half/BF16 values are represented exactly in FP32. Collective
+            # MMA can consume their original bits with an FP32 accumulator;
+            # scalar fallback still sees the unchanged conversion node.
+            return source
+    return node
+
+
 def _analyze_mma_operand(
     node: Node,
     env: CompileEnvironment,
@@ -2953,10 +2976,14 @@ def _analyze_mma_operand(
     if permute is None:
         return None
     load_value, source_to_logical_order = permute
+    if source_to_logical_order is None:
+        load_value = _unwrap_lossless_mma_upcast(load_value)
     info = _direct_load_tensor(load_value)
     if info is None:
         return None
     load_node, _, source_fake = info
+    if not _is_unmasked_load(load_node):
+        return None
     value_fake = node.meta.get("val")
     if not isinstance(value_fake, torch.Tensor):
         return None
@@ -2984,7 +3011,7 @@ def _analyze_mma_operand(
         return None
     return _MmaOperandInfo(
         load=load_node,
-        terminal=node if source_to_logical_order is not None else load_node,
+        terminal=node,
         source_fake=source_fake,
         logical_fake=(
             source_fake.permute(source_to_logical_order)
@@ -3354,6 +3381,7 @@ def _decode_cute_mma_target(
     node: Node,
     *,
     device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
 ) -> _CuteMmaTarget | None:
     """Decode a reduction target supported by the collective CuTe MMA path.
 
@@ -3407,7 +3435,7 @@ def _decode_cute_mma_target(
             requires_accumulator_seed = cached
         else:
             requires_accumulator_seed = not _is_zero_init_acc_node(
-                acc, device_ir=device_ir
+                acc, device_ir=device_ir, graphs=graphs
             )
             if device_ir is not None:
                 # Codegen deep-copies FX graphs, so graph identity is no longer
@@ -3435,7 +3463,8 @@ def tcgen05_fragment_epilogue_has_unique_anchor(
     """Whether fragment-plan commitment can own the complete MMA function."""
     return (
         sum(
-            _decode_cute_mma_target(node, device_ir=device_ir) is not None
+            _decode_cute_mma_target(node, device_ir=device_ir, graphs=graphs)
+            is not None
             for graph_info in graphs
             for node in graph_info.graph.nodes
         )
@@ -3485,9 +3514,10 @@ def analyze_cute_mma_node(
     node: Node,
     *,
     device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
 ) -> _CuteMmaNode | None:
     """Match a codegen-able MMA and analyze its matrix operand structure."""
-    target = _decode_cute_mma_target(node, device_ir=device_ir)
+    target = _decode_cute_mma_target(node, device_ir=device_ir, graphs=graphs)
     if target is None:
         return None
     from ..compile_environment import CompileEnvironment
@@ -4101,13 +4131,24 @@ def _trace_acc_init_node(
     node: Node,
     *,
     device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
 ) -> Node | None:
+    """Trace an accumulator through the exact graphs being analyzed or emitted.
+
+    Codegen copies graphs, so a supplied graph set must match by identity.
+    Structural matching remains only for callers using the legacy DeviceIR
+    context; even there, multiple identical loop bodies are ambiguous.
+    """
     from ...language import _tracing_ops
     from ..device_ir import NodeArgsGraphInfo
     from ..host_function import HostFunction
 
-    active_device_ir = (
-        HostFunction.current().device_ir if device_ir is None else device_ir
+    active_graphs = (
+        graphs
+        if graphs is not None
+        else (
+            HostFunction.current().device_ir if device_ir is None else device_ir
+        ).graphs
     )
     current = node
     seen: set[Node] = set()
@@ -4117,7 +4158,7 @@ def _trace_acc_init_node(
             current_placeholders = list(current.graph.find_nodes(op="placeholder"))
             node_args_graphs = [
                 graph_info
-                for graph_info in active_device_ir.graphs
+                for graph_info in active_graphs
                 if isinstance(graph_info, NodeArgsGraphInfo)
             ]
             matches = [
@@ -4125,7 +4166,7 @@ def _trace_acc_init_node(
                 for graph_info in node_args_graphs
                 if current.graph is graph_info.graph
             ]
-            if not matches:
+            if not matches and graphs is None:
                 current_signature = _graph_signature(current.graph)
                 matches = [
                     graph_info
@@ -4176,10 +4217,11 @@ def _is_zero_init_acc_node(
     node: Node,
     *,
     device_ir: DeviceIR | None = None,
+    graphs: Sequence[GraphInfo] | None = None,
 ) -> bool:
     from ...language import creation_ops
 
-    init_node = _trace_acc_init_node(node, device_ir=device_ir)
+    init_node = _trace_acc_init_node(node, device_ir=device_ir, graphs=graphs)
     if init_node is None or init_node.op != "call_function":
         return False
     if init_node.target is creation_ops.full:
@@ -4475,7 +4517,8 @@ def prepare_cute_collective_lane_loop_suppression(
     analyzed_candidates = {
         node: candidate
         for node in graph.nodes
-        if (candidate := analyze_cute_mma_node(node)) is not None
+        if (candidate := analyze_cute_mma_node(node, graphs=cg.codegen_graphs))
+        is not None
     }
     for node in graph.nodes:
         candidate = analyzed_candidates.get(node)
@@ -4536,12 +4579,7 @@ def prepare_cute_collective_lane_loop_suppression(
                 analysis, bm=bm, bn=bn, bk=bk
             ):
                 continue
-            if (
-                len(lhs_load.users) != 1
-                or len(rhs_load.users) != 1
-                or next(iter(lhs_load.users)) is not node
-                or next(iter(rhs_load.users)) is not node
-            ):
+            if not _operand_infos_exclusive_for_mma(lhs_operand, rhs_operand, node):
                 continue
             allowed_k_lane_loops: tuple[DeviceLoopState, ...] = (
                 (k_loop_info[0],)
@@ -4561,7 +4599,13 @@ def prepare_cute_collective_lane_loop_suppression(
             ):
                 continue
             cute_state = cg.device_function.cute_state
-            _register_collective_handled_loads(cute_state, lhs_load, rhs_load)
+            _register_collective_handled_loads(
+                cute_state,
+                lhs_load,
+                rhs_load,
+                lhs_operand.terminal,
+                rhs_operand.terminal,
+            )
             if grid_state.has_lane_loops():
                 cute_state.request_root_lane_loop_suppression()
             continue
@@ -4616,6 +4660,11 @@ def prepare_cute_collective_lane_loop_suppression(
             allow_rank3_rhs_mn_major=allow_rank3_rhs_mn_major,
         )
         if lhs_info is None or rhs_info is None:
+            continue
+        # The fallback in codegen_cute_mma only admits grouped addmm when
+        # analyze_cute_mma_node declined. Keep ordinary operands and their
+        # scalar lane coordinates live for that same fallback decision.
+        if not rhs_info.rhs_rank3_grouped_nt:
             continue
         lhs_fake = lhs_info.logical_fake
         rhs_fake = rhs_info.logical_fake
@@ -4808,6 +4857,8 @@ def prepare_cute_collective_lane_loop_suppression(
             cute_state,
             lhs_info.load,
             rhs_info.load,
+            lhs_info.terminal,
+            rhs_info.terminal,
             extra_dependency_nodes=(
                 *lhs_info.collective_dependency_nodes,
                 *rhs_info.collective_dependency_nodes,
@@ -13825,7 +13876,7 @@ def codegen_cute_mma(
 
     if ctx.cg.current_grid_state is None:
         return _unsupported_schedule("MMA was not inside a grid tile")
-    candidate = analyze_cute_mma_node(node)
+    candidate = analyze_cute_mma_node(node, graphs=ctx.cg.codegen_graphs)
     if candidate is not None and (candidate.with_acc != with_acc or candidate.is_dot):
         candidate = None
 
@@ -13853,7 +13904,9 @@ def codegen_cute_mma(
         if rhs_info is None or not rhs_info.rhs_rank3_grouped_nt:
             return _unsupported_schedule("MMA RHS was not grouped rank-3")
         acc_expr = (
-            None if _is_zero_init_acc_node(acc_node) else ctx.to_ast(ctx.env[acc_node])
+            None
+            if _is_zero_init_acc_node(acc_node, graphs=ctx.cg.codegen_graphs)
+            else ctx.to_ast(ctx.env[acc_node])
         )
         mma: _CuteMmaNode | Node = lhs_arg
         rhs_node = rhs_arg
@@ -14150,7 +14203,9 @@ def codegen_cute_mma_dot(state: CodegenState) -> object | None:
         return None
     if state.fx_node is None:
         return None
-    candidate = analyze_cute_mma_node(state.fx_node)
+    candidate = analyze_cute_mma_node(
+        state.fx_node, graphs=state.codegen.codegen_graphs
+    )
     if candidate is None or not candidate.is_dot:
         return None
 

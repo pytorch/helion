@@ -54,6 +54,7 @@ from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
+from .._compiler.autotuner_heuristics import register_compiler_coverage_groups
 from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
@@ -2360,6 +2361,10 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                             self.env.config_spec.compiler_seed_configs.append(
                                 seed_config
                             )
+                with self.env.use_runtime_arg_values(runtime_args):
+                    register_compiler_coverage_groups(
+                        self.env, self.host_function.device_ir
+                    )
 
     def _apply_mark_static(self, args: tuple[object, ...]) -> None:
         """
@@ -2414,13 +2419,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         return self.env.config_spec.normalized_config(self._normalize_config(config))
 
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str:
-        """Return the @helion.kernel decorator snippet capturing configs and settings that influence Triton code generation."""
+        """Return the @helion.kernel decorator capturing backend codegen settings."""
         parts = [
             f"config={config.__repr__()}",
             f"static_shapes={settings.static_shapes}",
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
+        if settings.backend == "cute":
+            parts.append("backend='cute'")
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(

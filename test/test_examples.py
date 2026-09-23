@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import typing
 import unittest
 from unittest.mock import patch
 
@@ -1927,6 +1928,13 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("int4 unpacking not supported on pallas")
     def test_int4_gemm(self):
+        self._check_int4_gemm(automatic=False)
+
+    @unittest.skipUnless(_get_backend() == "cute", "CuTe automatic-policy coverage")
+    def test_int4_gemm_cute_automatic_policy(self):
+        self._check_int4_gemm(automatic=True)
+
+    def _check_int4_gemm(self, *, automatic: bool):
         # Matrix dimensions
         M, K, N = 256, 512, 256
 
@@ -1947,17 +1955,25 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (A, B_packed)
 
-        check_example(
-            "int4_gemm",
-            args,
-            expected,
-            fn_name="matmul_bf16_int4",
-            block_sizes=[64, 64, 32],
-            num_warps=4,
-            num_stages=3,
-            rtol=2e-1,
-            atol=1.0,
+        mod = import_path(EXAMPLES_DIR / "int4_gemm.py")
+        kernel = mod.matmul_bf16_int4
+        if _get_backend() == "cute":
+            kernel = helion.kernel(kernel.fn, backend="cute", static_shapes=False)
+        config: dict[str, typing.Any] = (
+            {}
+            if automatic
+            else {"block_sizes": [64, 64, 32], "num_warps": 4, "num_stages": 3}
         )
+        with patch.object(mod, "matmul_bf16_int4", kernel):
+            check_example(
+                "int4_gemm",
+                args,
+                expected,
+                fn_name="matmul_bf16_int4",
+                rtol=2e-1,
+                atol=1.0,
+                **config,
+            )
 
     @onlyBackends(["cute"])
     @skipIfNotCUDA()
@@ -2277,6 +2293,16 @@ class TestExamples(RefEagerTestBase, TestCase):
     )
     @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
+        self._check_squeeze_and_excitation_net_fwd(automatic=False)
+
+    @unittest.skipUnless(_get_backend() == "cute", "CuTe automatic-policy coverage")
+    @skipIfSharedMemoryLessThan(
+        131072, reason="block sizes exceed device shared memory limit"
+    )
+    def test_squeeze_and_excitation_net_fwd_cute_automatic_policy(self):
+        self._check_squeeze_and_excitation_net_fwd(automatic=True)
+
+    def _check_squeeze_and_excitation_net_fwd(self, *, automatic: bool):
         m, n, k = 128, 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
         a = torch.randn([n, k], device=DEVICE, dtype=torch.float32)
@@ -2288,16 +2314,24 @@ class TestExamples(RefEagerTestBase, TestCase):
         c = torch.relu(x @ a)
         d = torch.sigmoid(c @ b)
 
-        check_example(
-            "squeeze_and_excitation_net",
-            args,
-            (expected_out, c, d),
-            fn_name="squeeze_and_excitation_net_fwd",
-            block_sizes=[128, 128, 128, 128],
-            num_warps=4,
-            num_stages=2,
-            atol=0.15,
+        mod = import_path(EXAMPLES_DIR / "squeeze_and_excitation_net.py")
+        kernel = mod.squeeze_and_excitation_net_fwd
+        if _get_backend() == "cute":
+            kernel = helion.kernel(kernel.fn, backend="cute", static_shapes=True)
+        config: dict[str, typing.Any] = (
+            {}
+            if automatic
+            else {"block_sizes": [128, 128, 128, 128], "num_warps": 4, "num_stages": 2}
         )
+        with patch.object(mod, "squeeze_and_excitation_net_fwd", kernel):
+            check_example(
+                "squeeze_and_excitation_net",
+                args,
+                (expected_out, c, d),
+                fn_name="squeeze_and_excitation_net_fwd",
+                atol=0.15,
+                **config,
+            )
 
     @xfailIfPallas("conflicting tiling patterns")
     @skipIfA10G("failure on a10g")

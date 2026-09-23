@@ -380,6 +380,11 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        self.cute_half_atomic_output_promotions: dict[str, torch.dtype] = {}
+        # Internal stage compilers may inherit a proved TensorMap-aligned view
+        # of an owning kernel input. Only the stage builder populates this set;
+        # ordinary input tensors still require their runtime cache-key proof.
+        self.cute_proven_tma_inputs: set[torch.Tensor] = set()
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still
@@ -1719,6 +1724,16 @@ class CompileEnvironment:
         self.fake_mode.__enter__()
         tls.env = self
         return self
+
+    @contextlib.contextmanager
+    def suspend(self) -> typing.Iterator[None]:
+        """Temporarily leave this environment while compiling an owned stage."""
+        assert tls.env is self
+        self.__exit__(None, None, None)
+        try:
+            yield
+        finally:
+            self.__enter__()
 
     def __exit__(
         self,
