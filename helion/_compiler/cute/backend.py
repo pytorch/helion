@@ -1096,6 +1096,7 @@ class CuteBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..device_ir import RootGraphInfo
+        from .block_scaled_mma import plan_block_scaled
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
@@ -1137,6 +1138,9 @@ class CuteBackend(Backend):
             return
 
         device_function.cute_state.direct_affine_candidates = ()
+        plan_block_scaled(graphs)
+        if DeviceFunction.current().cute_state.block_scaled_plan is not None:
+            return
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
@@ -1237,7 +1241,9 @@ class CuteBackend(Backend):
             or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
-            or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
+            or key.startswith(
+                ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
+            )
         ):
             return True
         return super().supports_config_key(key)
@@ -2321,6 +2327,8 @@ class CuteBackend(Backend):
         # launch topology rather than the carrier's logical tile axes.
         if device_function.cute_state.chunk_prepare_plan is not None:
             return launcher_args_with_compile_options("block=(128, 1, 1)")
+        if device_function.cute_state.block_scaled_plan is not None:
+            return launcher_args_with_compile_options("block=(192, 1, 1)")
         recurrence_plan = device_function.cute_state.chunk_recurrence_plan
         if recurrence_plan is not None:
             return launcher_args_with_compile_options(

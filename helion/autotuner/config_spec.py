@@ -28,6 +28,9 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
+from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
+from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
+from .._compiler.cute.block_scaled_config import normalize_block_scaled_config
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
@@ -873,6 +876,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     BACKEND_TUNABLE_KEYS
     | _BACKEND_DIAGNOSTIC_CONFIG_KEYS
     | _BACKEND_STRATEGY_CONFIG_KEYS
+    | BLOCK_SCALED_CONFIG_KEYS
     | GROUPED_RNA_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
@@ -1028,6 +1032,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        *BLOCK_SCALED_CONFIG_KEYS,
         *GROUPED_RNA_CONFIG_KEYS,
     ]
 )
@@ -1114,6 +1119,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
         "cute_packet_prefetch",
+        *BLOCK_SCALED_CONFIG_KEYS,
     }
 )
 
@@ -1262,6 +1268,7 @@ class ConfigSpec:
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
+        self.cute_scaled_mma_available = False
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_packet_prefetch_enabled = False
@@ -3872,6 +3879,13 @@ class ConfigSpec:
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
+        if self.backend_name == "cute":
+            normalize_block_scaled_config(
+                config,
+                available=self.cute_scaled_mma_available,
+                capability=self.target_device_capability,
+                fix_invalid=_fix_invalid,
+            )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
             cross_loop_pipeline = config.setdefault(
@@ -4988,6 +5002,15 @@ class ConfigSpec:
                 )
             if self.cute_affine_scan_schedule is not None:
                 fields[CUTE_AFFINE_SCAN_SCHEDULE_KEY] = self.cute_affine_scan_schedule
+            if (
+                self.cute_scaled_mma_available
+                and self.target_device_capability is not None
+                and self.target_device_capability[0] == 10
+            ):
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in BLOCK_SCALED_CHOICES.items()
+                )
             if self.cute_matmul_min_blocks_search_enabled:
                 fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))
             fields.update(self.user_defined_tunables)

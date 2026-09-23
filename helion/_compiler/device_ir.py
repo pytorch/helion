@@ -3170,11 +3170,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
+        scaled_contractions = 0
         if CompileEnvironment.current().backend.name == "cute":
             from .cute.fold_noop_stores import fold_noop_stores
             from .cute.fuse_mm_accumulation import fuse_mm_accumulation
             from .cute.fuse_u32_multiply import fuse_u32_multiply
+            from .cute.scaled_contraction import expose_scaled_contractions
 
+            scaled_contractions = expose_scaled_contractions(device_ir)
             for graph_info in device_ir.graphs:
                 fold_noop_stores(graph_info.graph)
                 fuse_mm_accumulation(graph_info)
@@ -3197,6 +3200,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
+        if scaled_contractions:
+            from .cute.active_blocks import active_block_ids
+
+            device_ir.codegen_active_block_ids = active_block_ids(
+                device_ir.graphs,
+                (block_id for ids in device_ir.grid_block_ids for block_id in ids),
+                CompileEnvironment.current(),
+            )
         defer_load_masks = CompileEnvironment.current().backend.name == "pallas"
         for graph in device_ir.graphs:
             validate_host_tensor_usage(graph.graph)

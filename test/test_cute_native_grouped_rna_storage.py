@@ -199,7 +199,7 @@ def test_native_helper_dependency_edit_changes_only_native_disk_identity(
     monkeypatch.setattr(source_dependencies, "_PACKAGE_ROOT", tmp_path)
     native, scaled, ordinary = (
         _kernel("tcgen05_grouped_rna"),
-        _kernel("chunk_recurrence_sm100"),
+        _kernel("block_scaled_mma"),
         _kernel("tcgen05_ab_tma"),
     )
     before = [_key(kernel) for kernel in (native, scaled, ordinary)]
