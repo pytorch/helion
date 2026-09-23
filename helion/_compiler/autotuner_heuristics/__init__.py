@@ -55,6 +55,8 @@ from .cute import grouped_row_union_cluster4_carrier
 from .cute import grouped_row_union_paired_clc_carrier
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
+from .cute_grouped_rna import CuteGroupedRnaHeuristic
+from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
 from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
@@ -100,6 +102,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CutePackedSingleTokenRank1Heuristic,
         CuteFixedTokenRank1Heuristic,
         CuteCollectiveMatmulHeuristic,
+        CuteGroupedRnaHeuristic,
         CuteMaterializedMmaHeuristic,
         CuteMaterializedOperandHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
@@ -280,7 +283,7 @@ def compiler_seed_configs(
     if env.backend_name == "cute":
         configs = add_host_sum_seeds(env, dedupe_configs(configs))
         configs = add_signed_bitfield_seeds(env, configs)
-    configs = dedupe_configs(configs)
+    configs = interleave_grouped_rna_seeds(dedupe_configs(configs))
     if env.backend_name == "cute":
         serial_rows = CuteResidentReductionHeuristic.serial_row_seed_configs(
             env, device_ir

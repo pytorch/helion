@@ -80,6 +80,26 @@ def test_transitive_helper_changes_only_its_family(
     assert _key(unaffected) == before[1]
 
 
+@pytest.mark.parametrize(
+    "edited", ("_compiler/cute/_flash_runtime.py", "_compiler/cute/_mlir_compat.py")
+)
+def test_grouped_mailbox_helpers_invalidate_both_conversion_families(
+    source_tree: Path, edited: str
+) -> None:
+    rna = _kernel("tcgen05_grouped_rna")
+    tma_rn = _kernel("tcgen05_grouped_tma_rn")
+    unrelated = _kernel("chunk_recurrence_sm100")
+    before = _key(rna), _key(tma_rn), _key(unrelated)
+    path = source_tree / edited
+    path.write_text("# changed shared mailbox lowering\n")
+    assert _key(rna) != before[0]
+    assert _key(tma_rn) != before[1]
+    assert _key(unrelated) == before[2]
+    path.unlink()
+    assert _key(rna) is None and _key(tma_rn) is None
+    assert _key(unrelated) == before[2]
+
+
 def test_wrapper_generator_edit_invalidates_all_kinds(source_tree: Path) -> None:
     kernels = [_kernel(None), *map(_kernel, source_dependencies._WRAPPER_DEPENDENCIES)]
     before = list(map(_key, kernels))
