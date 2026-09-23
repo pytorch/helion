@@ -244,6 +244,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
                     "helion_flash_bwd",
+                    "gathered_mma_tma",
                 }
                 for plan in self.cute_wrapper_plans
             )

@@ -1225,6 +1225,19 @@ class DeviceFunction:
                 disjoint_pairs=proven_disjoint_tensor_pairs,
                 rename_groups={k: v[0] for k, v in self._variable_renames.items()},
             )
+            if any(
+                plan.get("kind") == "gathered_mma_tma"
+                for plan in self.codegen.cute_wrapper_plans
+            ):
+                # A proved late region may introduce TMA objects supplied by
+                # the wrapper and an explicit producer/consumer launch shape.
+                args.extend(
+                    create_arg(name)
+                    for name in self.wrapper_only_params
+                    if name not in wrapper_only_params
+                )
+                exact_thread_block_dims = thread_block_dims = (288, 1, 1)
+                thread_block_dims_are_exact = True
             if self.cute_state.collective_register_chain_block_dims is not None:
                 exact_thread_block_dims = thread_block_dims = (
                     self.cute_state.collective_register_chain_block_dims

@@ -59,6 +59,11 @@ def _key(kernel: SimpleNamespace) -> str | None:
     "kind,edited,unrelated",
     [
         (
+            "gathered_mma_tma",
+            "_compiler/cute/gathered_mma_runtime.py",
+            "tcgen05_ab_tma",
+        ),
+        (
             "chunk_recurrence_sm100",
             "_compiler/cute/chunk_recurrence_sm100.py",
             "chunk_recurrence_warp_dv4",
