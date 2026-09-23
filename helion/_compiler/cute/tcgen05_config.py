@@ -884,6 +884,7 @@ class CuteTcgen05Config:
             and config.get(FANOUT_CONFIG_KEY, "off") == "off"
             and config.get("cute_materialized_operand_schedule", "off") == "off"
             and config.get("cute_materialized_schedule", "off") == "off"
+            and not config.get("cute_split_k_workspace")
             and config.get("cute_split_k_schedule", "legacy") == "legacy"
         )
 

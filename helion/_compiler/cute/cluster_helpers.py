@@ -39,6 +39,31 @@ def _set_block_rank(
 
 
 @dsl_user_op
+def load_shared_remote_f32(
+    smem_ptr: cute.Pointer,
+    peer_cta_rank_in_cluster: Int32,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> Float32:
+    """Read a published FP32 word; the caller owns both cluster rendezvous."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cast("Any", smem_ptr).toint(loc=loc, ip=ip).ir_value(),
+                peer_cta_rank_in_cluster.ir_value(),
+            ],
+            "{ .reg .u32 peer_addr; mapa.shared::cluster.u32 peer_addr, $1, $2; "
+            "ld.shared::cluster.f32 $0, [peer_addr]; }",
+            "=f,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+        )
+    )
+
+
+@dsl_user_op
 def store_shared_remote_x4(
     val0: Float32 | Int32,
     val1: Float32 | Int32,

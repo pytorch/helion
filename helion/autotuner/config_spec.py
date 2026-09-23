@@ -69,6 +69,21 @@ from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.split_k_cluster import validate_cluster_config
+from .._compiler.cute.split_k_cluster_config import (
+    FINALIZER_KEY as SPLIT_K_FINALIZER_KEY,
+)
+from .._compiler.cute.split_k_cluster_config import FINALIZER_WARPS
+from .._compiler.cute.split_k_cluster_config import SCHEDULE_KEY as SPLIT_K_SCHEDULE_KEY
+from .._compiler.cute.split_k_cluster_config import SCHEDULES as SPLIT_K_SCHEDULES
+from .._compiler.cute.split_k_cluster_config import normalize_cluster_finalizer
+from .._compiler.cute.split_k_cluster_config import normalize_cluster_schedule
+from .._compiler.cute.split_k_workspace_config import STAGES_KEY as SPLIT_K_STAGES_KEY
+from .._compiler.cute.split_k_workspace_config import WORKSPACE_CONFIG_KEYS
+from .._compiler.cute.split_k_workspace_config import (
+    WORKSPACE_KEY as SPLIT_K_WORKSPACE_KEY,
+)
+from .._compiler.cute.split_k_workspace_config import normalize_workspace_config
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -138,6 +153,7 @@ if TYPE_CHECKING:
 
     from .._compiler.backend import Backend
     from .._compiler.cute.loop_nesting import TileLoopPath
+    from .._compiler.cute.split_k_cluster import ClusterKFacts
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
@@ -877,6 +893,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | _BACKEND_DIAGNOSTIC_CONFIG_KEYS
     | _BACKEND_STRATEGY_CONFIG_KEYS
     | BLOCK_SCALED_CONFIG_KEYS
+    | {SPLIT_K_SCHEDULE_KEY, SPLIT_K_FINALIZER_KEY}
+    | WORKSPACE_CONFIG_KEYS
     | GROUPED_RNA_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
@@ -1033,6 +1051,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
         *BLOCK_SCALED_CONFIG_KEYS,
+        SPLIT_K_SCHEDULE_KEY,
+        SPLIT_K_FINALIZER_KEY,
+        *WORKSPACE_CONFIG_KEYS,
         *GROUPED_RNA_CONFIG_KEYS,
     ]
 )
@@ -1120,6 +1141,9 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_vector_packet_unroll",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
+        SPLIT_K_SCHEDULE_KEY,
+        SPLIT_K_FINALIZER_KEY,
+        *WORKSPACE_CONFIG_KEYS,
     }
 )
 
@@ -1359,6 +1383,8 @@ class ConfigSpec:
         # Their search floors use the rank of that launch, independently of
         # any native MMA region sharing the complete kernel configuration.
         self.cute_pointwise_region_grid_groups: tuple[tuple[int, ...], ...] = ()
+        self.cute_split_k_cluster_facts: ClusterKFacts | None = None
+        self.cute_split_k_workspace_available: bool = False
         self.cute_materialized_schedule_available: bool = False
         self.cute_materialized_schedule_search_enabled: bool = False
         self.cute_row_matrix_transport_available: bool = False
@@ -3372,6 +3398,22 @@ class ConfigSpec:
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
         if self.backend_name == "cute":
+            normalize_cluster_schedule(
+                config,
+                available=self.cute_split_k_cluster_facts is not None,
+                fix_invalid=_fix_invalid,
+            )
+            validate_cluster_config(self, config, fix_invalid=_fix_invalid)
+            normalize_cluster_finalizer(
+                config,
+                available=self.cute_split_k_cluster_facts is not None,
+                fix_invalid=_fix_invalid,
+            )
+            normalize_workspace_config(
+                config,
+                available=self.cute_split_k_workspace_available,
+                fix_invalid=_fix_invalid,
+            )
             normalize_grouped_rna_config(
                 config,
                 available_k=self.cute_grouped_rna_k_choices,
@@ -4317,6 +4359,14 @@ class ConfigSpec:
             for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
                 config.pop(key, None)
 
+        if self.backend_name == "cute":
+            validate_cluster_config(self, config, fix_invalid=_fix_invalid)
+            normalize_cluster_finalizer(
+                config,
+                available=self.cute_split_k_cluster_facts is not None,
+                fix_invalid=_fix_invalid,
+            )
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -4550,6 +4600,8 @@ class ConfigSpec:
 
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
+        # The additive finalizer choice must not change existing seed configs.
+        config.config.pop(SPLIT_K_FINALIZER_KEY, None)
         if self.cute_matmul_min_blocks_search_enabled:
             # This optional matmul coordinate has no old default Config key.
             # Keep the public default exact; flat search still represents zero.
@@ -4835,6 +4887,12 @@ class ConfigSpec:
                             fields[GROUPED_PREFIX_SCAN_KEY] = EnumFragment(
                                 choices=GROUPED_PREFIX_SCANS
                             )
+                    if self.cute_split_k_cluster_facts is not None:
+                        fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(SPLIT_K_SCHEDULES)
+                        fields[SPLIT_K_FINALIZER_KEY] = EnumFragment(FINALIZER_WARPS)
+                    if self.cute_split_k_workspace_available:
+                        fields[SPLIT_K_WORKSPACE_KEY] = BooleanFragment()
+                        fields[SPLIT_K_STAGES_KEY] = IntegerFragment(1, 16, 2)
                     fields["cute_collective_mma"] = BooleanFragment()
                     fields["cute_collective_static_layouts"] = BooleanFragment()
                     native_collective = (

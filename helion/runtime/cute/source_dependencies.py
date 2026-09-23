@@ -26,6 +26,7 @@ _COMMON_DEPENDENCIES = (
 # CUTLASS itself is covered by the version in the launcher's cache key. These
 # are source paths relative to the package, making the digest checkout-neutral.
 _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "split_k_cluster": ("_compiler/cute/cluster_helpers.py",),
     "tcgen05_grouped_rna": (
         "_compiler/cute/_flash_runtime.py",
         "_compiler/cute/_mlir_compat.py",
