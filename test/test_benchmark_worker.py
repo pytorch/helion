@@ -1764,6 +1764,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
                 warmup: int,
                 rep: int,
                 desc: str,
+                fresh_process: bool = False,
             ) -> list[float | None]:
                 self.confirm_fns = fns
                 self.confirm_warmup = warmup
@@ -1807,6 +1808,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
                 warmup: int,
                 rep: int,
                 desc: str,
+                fresh_process: bool = False,
             ) -> list[float | None]:
                 return [0.92, None]
 
@@ -1926,6 +1928,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
                 warmup: int,
                 rep: int,
                 desc: str,
+                fresh_process: bool = False,
             ) -> list[float | None]:
                 self.fns = fns
                 self.warmup = warmup

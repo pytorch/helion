@@ -3190,7 +3190,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
             kvo,
         )
         code = _unpacked_ordered_kernel.bind(args).to_triton_code(
-            _worklist_config([8, 8], loop_type="emit_pipeline")
+            _worklist_config([128, 128], loop_type="emit_pipeline")
         )
         self.assertNotIn("_rc_prep_refill", code)
         self.assertNotIn("_prep", code)
@@ -3201,6 +3201,7 @@ class TestResidentCacheAndPrepHoist(unittest.TestCase):
         self.assertIn("_compact_ordered_window=0", code)
         # The logical end can exceed the backing K/V extent, so shortening the
         # DMA would leave a lane that the loop mask considers valid stale.
+        # Pin the block extent used by the padding assertion below.
         self.assertIn("_ds_pad_dims=[(3, 0, 128, 127), (4, 0, 128, 127)]", code)
         self.assertNotIn("jnp.clip(50 -", code)
 

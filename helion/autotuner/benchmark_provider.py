@@ -555,8 +555,13 @@ class BenchmarkProvider(abc.ABC):
         warmup: int,
         rep: int,
         desc: str = "Benchmarking",
+        fresh_process: bool = False,
     ) -> list[IsolatedBenchmarkTiming] | None:
         """Benchmark already-validated functions in an isolated subprocess.
+
+        With ``fresh_process``, discard earlier worker state and use one new
+        process per function. This isolates cached arguments and allocations
+        during final selection while retaining worker reuse during search.
 
         Return ``None`` when the provider cannot support the isolated path or
         per-function ``None`` when a timing could not be confirmed and callers
@@ -2051,6 +2056,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         warmup: int,
         rep: int,
         desc: str = "Benchmarking",
+        fresh_process: bool = False,
     ) -> list[IsolatedBenchmarkTiming] | None:
         if not self._subprocess_benchmark_enabled():
             return None
@@ -2059,41 +2065,49 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         timings: list[IsolatedBenchmarkTiming] = []
         for fn in fns:
+            if fresh_process and self._benchmark_worker is not None:
+                self._benchmark_worker.shutdown()
+                self._benchmark_worker = None
             try:
-                timing = self._run_subprocess_benchmark_job(
-                    cast("CompiledConfig", fn),
-                    warmup=warmup,
-                    rep=rep,
-                )
-            except BenchmarkWorkerUnkillable:
-                raise
-            except BenchmarkTimeout as e:
-                self.log.warning(f"{desc} subprocess failed: {e}")
-                self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
-                timings.append(IsolatedBenchmarkFailure("timeout"))
-                continue
-            except BenchmarkSubprocessError as e:
-                self.log.warning(f"{desc} subprocess failed: {e}")
-                timing = None
-            except Exception as e:
-                e.__traceback__ = None
-                if match_unrecoverable_runtime_error(e):
-                    self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
-                    # The confirmation re-ran a previously accepted candidate in
-                    # an isolated worker; a sticky CUDA error means that config is
-                    # still unsafe, so remove it from contention.
-                    timings.append(IsolatedBenchmarkFailure("error"))
+                try:
+                    timing = self._run_subprocess_benchmark_job(
+                        cast("CompiledConfig", fn),
+                        warmup=warmup,
+                        rep=rep,
+                    )
+                except BenchmarkWorkerUnkillable:
+                    raise
+                except BenchmarkTimeout as e:
+                    self.log.warning(f"{desc} subprocess failed: {e}")
+                    self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
+                    timings.append(IsolatedBenchmarkFailure("timeout"))
                     continue
-                self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
-                timing = None
-            # A wrapper-load failure disables the worker because later
-            # candidates may depend on the same unavailable source module.
-            # Treat the whole isolated batch as unavailable so the caller
-            # rebenchmarks every finalist in-process instead of mixing partial
-            # fresh timings with stale population measurements.
-            if self._subprocess_wrapper_unloadable:
-                return None
-            timings.append(None if timing is None else float(timing))
+                except BenchmarkSubprocessError as e:
+                    self.log.warning(f"{desc} subprocess failed: {e}")
+                    timing = None
+                except Exception as e:
+                    e.__traceback__ = None
+                    if match_unrecoverable_runtime_error(e):
+                        self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
+                        # The confirmation re-ran a previously accepted candidate in
+                        # an isolated worker; a sticky CUDA error means that config is
+                        # still unsafe, so remove it from contention.
+                        timings.append(IsolatedBenchmarkFailure("error"))
+                        continue
+                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                    timing = None
+                # A wrapper-load failure disables the worker because later
+                # candidates may depend on the same unavailable source module.
+                # Treat the whole isolated batch as unavailable so the caller
+                # rebenchmarks every finalist in-process instead of mixing partial
+                # fresh timings with stale population measurements.
+                if self._subprocess_wrapper_unloadable:
+                    return None
+                timings.append(None if timing is None else float(timing))
+            finally:
+                if fresh_process and self._benchmark_worker is not None:
+                    self._benchmark_worker.shutdown()
+                    self._benchmark_worker = None
         return timings
 
 
