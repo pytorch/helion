@@ -1209,6 +1209,23 @@ class TestPersistentKernels(RefEagerTestBase, TestCase):
 class TestNumSmMultiplier(RefEagerTestBase, TestCase):
     """Test num_sm_multiplier for multi-occupancy in persistent kernels."""
 
+    @skipIfNotCUDA()
+    @skipIfRefEager("Compilation options are not used in ref eager mode")
+    def test_explicit_intermediate_maxnreg(self):
+        args = (
+            torch.randn([128, 256], device=DEVICE),
+            torch.randn([128, 256], device=DEVICE),
+        )
+        code, result = code_and_output(
+            add_kernel,
+            args,
+            pid_type="persistent_blocked",
+            num_sm_multiplier=3,
+            maxnreg=100,
+        )
+        self.assertIn("maxnreg=100", code)
+        torch.testing.assert_close(result, args[0] + args[1])
+
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
     def test_num_sm_multiplier_blocked_grid_size(self):
         """Test that num_sm_multiplier affects grid size in blocked persistent kernels."""
@@ -1231,6 +1248,14 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         self.assertIn("(_NUM_SM * 2,)", code_m2)
         self.assertIn("tl.cdiv(total_pids, _NUM_SM * 2)", code_m2)
 
+        # Explicit configs may choose an intermediate occupancy point even
+        # though the autotuner's default search grid remains powers of two.
+        code_m3, result_m3 = code_and_output(
+            add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=3
+        )
+        self.assertIn("(_NUM_SM * 3,)", code_m3)
+        self.assertIn("tl.cdiv(total_pids, _NUM_SM * 3)", code_m3)
+
         # Test with multiplier=4
         code_m4, result_m4 = code_and_output(
             add_kernel, args, pid_type="persistent_blocked", num_sm_multiplier=4
@@ -1242,6 +1267,7 @@ class TestNumSmMultiplier(RefEagerTestBase, TestCase):
         expected = args[0] + args[1]
         torch.testing.assert_close(result_m1, expected)
         torch.testing.assert_close(result_m2, expected)
+        torch.testing.assert_close(result_m3, expected)
         torch.testing.assert_close(result_m4, expected)
 
     @skipIfRefEager("Code pattern checking not applicable in ref eager mode")
