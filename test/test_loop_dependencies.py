@@ -16,6 +16,7 @@ from helion._testing import is_cuda
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessTensorDescriptor
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
 
@@ -568,6 +569,7 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertIn("ld.acquire.gpu.global.u32", code)
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
 
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_outlined_matmul_root_threads_tensor_descriptor(self) -> None:
         a = torch.arange(256, device=DEVICE, dtype=torch.float32).reshape(16, 16)
         b = torch.eye(16, device=DEVICE)
