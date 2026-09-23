@@ -11,12 +11,12 @@ import pytest
 import torch
 
 from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
 from test.test_autotuner_heuristics import _grouped_worklist_kernel_body
 from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test.test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from test.test_cute_shared_rhs_grouped import _plans
-from test.test_cute_shared_rhs_grouped import _target
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import (
@@ -83,9 +83,11 @@ def _bind(
         backend="cute",
         autotune_effort="none",
         static_shapes=static_shapes,
+        cute_region_fission=True,
         cute_full_slice_matmul_tiling=True,
         cute_segmented_matmul_tiling=True,
         cute_flatten_nested_reductions=True,
+        cute_materialize_transformed_operands=True,
     )._bind_isolated(values)
 
 

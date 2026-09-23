@@ -337,6 +337,7 @@ def test_native_k_major_original_mamba_and_mutated_graphs(
         helion_mamba2_chunk_scan_kernel.fn,
         backend="cute",
         static_shapes=True,
+        cute_region_fission=True,
         cute_full_slice_matmul_tiling=True,
         autotune_effort="none",
     )

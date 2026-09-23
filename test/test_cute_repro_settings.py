@@ -5,6 +5,8 @@ import json
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from examples.int4_gemm import matmul_bf16_int4
+from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -12,6 +14,7 @@ from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_flatten_nested_reductions import _joint_sum
 from test.test_cute_full_slice_matmul import _matmul
+from test.test_cute_materialized_fission import _se_args
 from test.test_cute_shared_rhs_grouped import _offset_mm
 
 import helion
@@ -31,9 +34,11 @@ if TYPE_CHECKING:
 
 
 _STRUCTURAL_SETTINGS = (
+    "cute_region_fission",
     "cute_full_slice_matmul_tiling",
     "cute_segmented_matmul_tiling",
     "cute_flatten_nested_reductions",
+    "cute_materialize_transformed_operands",
 )
 
 
@@ -60,6 +65,8 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 def _case(
     setting: str,
 ) -> tuple[Callable[..., Any], tuple[object, ...], str]:
+    if setting == "cute_region_fission":
+        return squeeze_and_excitation_net_fwd.fn, _se_args(), "fission"
     if setting == "cute_full_slice_matmul_tiling":
         return (
             _matmul,
@@ -85,7 +92,15 @@ def _case(
             (torch.empty((37, 69)), torch.tensor([0, 0, 1, 19, 37], dtype=torch.int64)),
             "_helion_flat_reduction",
         )
-    raise AssertionError(f"Unknown structural setting: {setting}")
+    assert setting == "cute_materialize_transformed_operands"
+    return (
+        matmul_bf16_int4.fn,
+        (
+            torch.empty((16, 40), dtype=torch.bfloat16),
+            torch.empty((20, 24), dtype=torch.int8),
+        ),
+        "_helion_materialized_operand",
+    )
 
 
 def _host(bound: BoundKernel[Any]) -> str:
@@ -157,7 +172,10 @@ def test_structural_binding_and_config_roundtrip(
         autotune_effort="none",
         **switches,
     )._bind_isolated(args)
-    assert (marker in _host(bound)) == enabled
+    if marker == "fission":
+        assert (bound.env.cute_fission_plan is not None) == enabled
+    else:
+        assert (marker in _host(bound)) == enabled
     _check_roundtrip(
         bound, args, monkeypatch, conflicting_environment=conflicting_environment
     )
@@ -181,6 +199,24 @@ def test_composed_structural_settings_roundtrip(
         **switches,
     )._bind_isolated(args)
     assert marker in _host(bound)
+    _check_roundtrip(bound, args, monkeypatch, conflicting_environment=True)
+
+
+def test_dynamic_materialization_specializations_roundtrip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setting = "cute_materialize_transformed_operands"
+    function, args, marker = _case(setting)
+    bound = helion.kernel(
+        function,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+        **(dict.fromkeys(_STRUCTURAL_SETTINGS, False) | {setting: True}),
+    )._bind_isolated(args)
+    assert marker in _host(bound)
+    assert bound.env.specialized_vars
+    assert bound.env.shape_env.guards
     _check_roundtrip(bound, args, monkeypatch, conflicting_environment=True)
 
 
@@ -256,6 +292,50 @@ def test_decorator_is_an_immutable_config_and_settings_snapshot(
     first.configs[0].block_sizes[0] = 64
     first.configs[0].config["loop_orders"][0][0] = 2
     first.settings.cute_full_slice_matmul_tiling = True
+    second = _replay(decorator, _pointwise)
+    assert json.dumps(second.configs[0].config, sort_keys=True) == expected_config
+    assert all(not getattr(second.settings, name) for name in _STRUCTURAL_SETTINGS)
+
+
+@pytest.mark.parametrize("from_environment", [False, True])
+def test_materialized_composed_structural_settings_roundtrip(
+    from_environment: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = _se_args()
+    switches = dict.fromkeys(_STRUCTURAL_SETTINGS, True)
+    if from_environment:
+        for name in _STRUCTURAL_SETTINGS:
+            monkeypatch.setenv(f"HELION_{name.upper()}", "1")
+        switches = {}
+    bound = helion.kernel(
+        squeeze_and_excitation_net_fwd.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        **switches,
+    )._bind_isolated(args)
+    assert bound.env.cute_fission_plan is not None
+    assert "_helion_fullslice_k" in _host(bound)
+    _check_roundtrip(bound, args, monkeypatch, conflicting_environment=True)
+
+
+def test_materialized_decorator_is_an_immutable_config_and_settings_snapshot(
+    _pointwise_bound: BoundKernel[Any],
+) -> None:
+    config = helion.Config(block_sizes=[16], loop_orders=[[0]])
+    expected_config = json.dumps(config.config, sort_keys=True)
+    decorator = _pointwise_bound.format_kernel_decorator(
+        config, _pointwise_bound.settings
+    )
+    config.block_sizes[0] = 32
+    config.config["loop_orders"][0][0] = 1
+    for name in _STRUCTURAL_SETTINGS:
+        setattr(_pointwise_bound.settings, name, True)
+    first = _replay(decorator, _pointwise)
+    assert json.dumps(first.configs[0].config, sort_keys=True) == expected_config
+    first.configs[0].block_sizes[0] = 64
+    first.configs[0].config["loop_orders"][0][0] = 2
+    first.settings.cute_region_fission = True
     second = _replay(decorator, _pointwise)
     assert json.dumps(second.configs[0].config, sort_keys=True) == expected_config
     assert all(not getattr(second.settings, name) for name in _STRUCTURAL_SETTINGS)

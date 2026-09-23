@@ -14458,6 +14458,7 @@ class TestCuteLowerings(unittest.TestCase):
                     device_ir=SimpleNamespace(
                         grid_block_ids=[[2]],
                         root_ids=[0],
+                        codegen_active_block_ids=None,
                     )
                 ),
             ),

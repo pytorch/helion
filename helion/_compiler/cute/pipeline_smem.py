@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from torch.fx import Node
 
+    from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from .cute_mma import _CuteMmaNode
 
@@ -30,6 +31,29 @@ class Tcgen05PipelineSmemFacts(NamedTuple):
     input_dtype_bytes: int
     output_dtype_bytes: int
     capacity_bytes: int
+
+
+def pipeline_region_graphs(
+    device_ir: DeviceIR, node: Node, *, separately_launched: bool
+) -> tuple[GraphInfo, ...] | None:
+    """Charge only allocations in the candidate's proven device function."""
+    if len(device_ir.root_ids) == 1:
+        return tuple(device_ir.graphs)
+    if not separately_launched:
+        return None
+    from .materialized_fission_codegen import _region_graph_ids
+
+    graph_id = next(
+        info.graph_id for info in device_ir.graphs if info.graph is node.graph
+    )
+    owners = [
+        region
+        for root in device_ir.root_ids
+        if graph_id in (region := _region_graph_ids(device_ir.graphs, root))
+    ]
+    if len(owners) != 1:
+        return None
+    return tuple(info for info in device_ir.graphs if info.graph_id in owners[0])
 
 
 def analyze_pipeline_smem_facts(

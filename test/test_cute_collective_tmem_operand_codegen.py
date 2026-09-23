@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from functools import partial
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from test.test_cute_collective_tmem_seed import _dependent_contractions
 from test.test_cute_collective_tmem_seed import _dependent_inputs
 from test.test_cute_collective_vector_epilogue_codegen import _mamba_config
 from test.test_cute_collective_vector_epilogue_codegen import _residual_matmul
+from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_packed_collective_matmul import _config as _packed_config
 from test.test_cute_packed_collective_matmul import _original_bound
 
@@ -29,6 +31,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuri
 from helion._compiler.cute.collective_matmul import (
     has_collective_tmem_operand_candidate,
 )
+from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
@@ -230,10 +233,14 @@ def test_warp_compute_retains_original_operand_path() -> None:
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_tf32_and_packed_a_keep_their_existing_native_paths(
-    packed: bool,
+    packed: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     if packed:
+        # This control exercises the original packed contraction. Materialized
+        # operands have separate producer axes and a native consumer below.
+        monkeypatch.setenv("HELION_CUTE_MATERIALIZE_TRANSFORMED_OPERANDS", "0")
         bound = _original_bound()
+        assert bound.env.cute_fission_plan is None
         config = _packed_config()
     else:
         bound = _cpu_bind(_seeded_contraction, _inputs(torch.float32))
@@ -245,6 +252,68 @@ def test_tf32_and_packed_a_keep_their_existing_native_paths(
     assert "OperandSource.TMEM" not in source
     assert "OperandSource.SMEM" in source
     assert _scalar_epilogues(source) == _scalar_epilogues(control)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_materialized_packed_operand_keeps_native_shared_a(
+    dtype: torch.dtype,
+) -> None:
+    with (
+        _cpu_target(),
+        patch.object(
+            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+        ),
+    ):
+        bound = _original_bound(
+            (128, 256, 128),
+            dtype,
+            cute_region_fission=True,
+            cute_materialize_transformed_operands=True,
+            cute_full_slice_matmul_tiling=True,
+            cute_segmented_matmul_tiling=True,
+            cute_flatten_nested_reductions=True,
+        )
+        plan = bound.env.cute_fission_plan
+        assert plan is not None and plan.region_count == 2
+        assert bound.host_function is not None
+        with bound.env, bound.host_function:
+            selected = next(
+                seed
+                for seed in bound.config_spec.autotune_seed_configs()
+                if seed.get("tcgen05_cta_group") in ("one", "two")
+            )
+            config = bound._normalized_config_copy(
+                helion.Config.from_dict(
+                    bound.config_spec.default_config().config | selected.config
+                )
+            )
+        control = bound.to_code(config)
+        source = bound.to_code(
+            helion.Config.from_dict(config.config | {"cute_collective_tmem_a": True})
+        )
+
+    def stages(code: str) -> list[str]:
+        result = []
+        for node in ast.walk(ast.parse(code)):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "PyCodeCache"
+                and node.func.attr == "load"
+            ):
+                stage = ast.literal_eval(node.args[0])
+                assert isinstance(stage, str)
+                result.append(stage)
+        return result
+
+    before, after = stages(control), stages(source)
+    assert len(before) == len(after) == 2
+    assert "OperandSource.SMEM" in after[1]
+    assert all("OperandSource.TMEM" not in stage for stage in after)
+    assert [ast.dump(ast.parse(stage)) for stage in before] == [
+        ast.dump(ast.parse(stage)) for stage in after
+    ]
 
 
 def test_tmem_a_preserves_operand_alias_rejection() -> None:

@@ -246,6 +246,7 @@ def _mamba_kernel(*, static_shapes: bool) -> helion.Kernel:
         helion_mamba2_chunk_scan_kernel.fn,
         backend="cute",
         static_shapes=static_shapes,
+        cute_region_fission=True,
         cute_full_slice_matmul_tiling=True,
         autotune_effort="none",
     )

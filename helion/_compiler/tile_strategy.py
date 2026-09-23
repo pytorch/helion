@@ -7340,7 +7340,12 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     # loads already hoisted into the wrapper (cute_mma's
                     # request_root_lane_loop_suppression), which would strand
                     # the hoists; keep grid vec to matmul-free kernels.
-                    and not env.config_spec.matmul_facts
+                    and (
+                        not env.config_spec.matmul_facts
+                        or set(block_ids).issubset(
+                            env.config_spec.cute_pointwise_region_block_ids
+                        )
+                    )
                     # Epilogue subtiling stages stores through smem with a
                     # sync_threads INSIDE the per-element pipeline, which the
                     # vec store-collection protocol silently corrupts (50%
@@ -7929,7 +7934,12 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         )
 
         if vec_width > 1 and (
-            env.config_spec.matmul_facts
+            (
+                env.config_spec.matmul_facts
+                and not set(block_ids).issubset(
+                    env.config_spec.cute_pointwise_region_block_ids
+                )
+            )
             or _cute_epilogue_subtile_active(self.fn.config)
         ):
             # See the matmul-fallback lane-loop-suppression and the

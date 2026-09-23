@@ -58,8 +58,13 @@ from .cute_epilogue_fanout import register_epilogue_fanout_coverage
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
 from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
+from .cute_materialized import CuteMaterializedMmaHeuristic
+from .cute_materialized_operand import CuteMaterializedOperandHeuristic
+from .cute_materialized_pdl import register_materialized_pdl_coverage
+from .cute_packed_operand import register_packed_operand_coverage
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
+from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
@@ -95,6 +100,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CutePackedSingleTokenRank1Heuristic,
         CuteFixedTokenRank1Heuristic,
         CuteCollectiveMatmulHeuristic,
+        CuteMaterializedMmaHeuristic,
+        CuteMaterializedOperandHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteTcgen05GroupedWorklistHeuristic,
@@ -351,6 +358,7 @@ def register_compiler_coverage_groups(
     if env.backend_name != "cute":
         return
     register_epilogue_fanout_coverage(env, device_ir)
+    register_materialized_pdl_coverage(env, device_ir)
     configs = grouped_full_coverage_configs(env, device_ir)
     deep_configs = grouped_full_coverage_configs(env, device_ir, block_k=128)
     if not configs:
@@ -501,6 +509,8 @@ def register_compiler_coverage_groups(
                 ),
             )
         )
+    register_row_resident_coverage(env, device_ir)
+    register_packed_operand_coverage(env, device_ir)
     carriers = env.config_spec.compiler_seed_configs
     if not carriers:
         # Declarations remain available when automatic seed use is disabled.

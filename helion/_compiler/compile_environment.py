@@ -272,6 +272,7 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from .autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from .backend import Backend
+    from .cute.materialized_fission import MaterializedFissionPlan
     from .pallas.compact_worklist import CompactWorklistPlan
     from .pallas.compact_worklist import ResidentCacheDecision
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -386,6 +387,7 @@ class CompileEnvironment:
             default=None,
         )
         self.cute_resolved_wrapper_plans: list[dict[str, object]] = []
+        self.cute_fission_plan: MaterializedFissionPlan | None = None
         self.cute_half_atomic_output_promotions: dict[str, torch.dtype] = {}
         # Internal stage compilers may inherit a proved TensorMap-aligned view
         # of an owning kernel input. Only the stage builder populates this set;

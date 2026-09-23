@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
@@ -255,3 +256,88 @@ def test_device_tile_origin_keeps_its_nonzero_begin(
             range(offset, offset + 64)
         )
         assert {origin for _, origin in records} == {offset}
+
+
+@pytest.mark.parametrize(
+    ("blocks", "threads", "layouts", "vectors", "order", "pid"),
+    (
+        (
+            [256, 128, 128, 256, 16],
+            [64, 0, 0, 0, 0],
+            ["strided", "strided"],
+            [4, 4],
+            [0, 1],
+            "flat",
+        ),
+        (
+            [16, 512, 128, 128, 16],
+            [2, 4, 0, 0, 0],
+            ["blocked", "strided"],
+            [4, 1],
+            [1, 0],
+            "persistent_blocked",
+        ),
+        (
+            [64, 16, 128, 256, 32],
+            [2, 16, 0, 0, 0],
+            ["blocked", "strided"],
+            [2, 4],
+            [0, 1],
+            "persistent_interleaved",
+        ),
+        (
+            [512, 32, 128, 16, 64],
+            [32, 32, 0, 0, 0],
+            ["strided", "blocked"],
+            [2, 4],
+            [1, 0],
+            "persistent_interleaved",
+        ),
+    ),
+)
+def test_materialized_interleave_keeps_every_source_row(
+    blocks: list[int],
+    threads: list[int],
+    layouts: list[str],
+    vectors: list[int],
+    order: list[int],
+    pid: str,
+    emitted_origins: dict[int, set[str]],
+) -> None:
+    kernel = helion.kernel(
+        matmul_bf16_int4.fn,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+        cute_materialize_transformed_operands=True,
+    )
+    bound = kernel._bind_isolated(
+        (
+            torch.empty((512, 1024), dtype=torch.bfloat16),
+            torch.empty((512, 512), dtype=torch.int8),
+        )
+    )
+    config = helion.Config.from_dict(
+        {
+            "block_sizes": blocks,
+            "num_threads": threads,
+            "cute_lane_layouts": [*layouts, "blocked", "blocked", "blocked"],
+            "cute_vector_widths": [*vectors, 1, 1, 1],
+            "loop_orders": [order, [0, 1]],
+            "pid_type": pid,
+            "cute_collective_mma": False,
+            "tcgen05_persistence_model": (
+                "non_persistent" if pid == "flat" else "static_persistent"
+            ),
+        }
+    )
+    source = _region(bound.to_code(config), 0)
+    for offset in range(0, 512, blocks[0]):
+        records = _axis_coordinates(source, 0, offset, emitted_origins)
+        assert Counter(index for index, _ in records) == Counter(
+            range(offset, offset + blocks[0])
+        )
+        assert {origin for _, origin in records} == {offset}
+        # The interleave's arange uses tile.begin plus the local coordinate;
+        # both packed nibbles must return to this same logical input row.
+        assert all(origin + index - offset == index for index, origin in records)

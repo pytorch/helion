@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
+from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
@@ -188,6 +189,7 @@ def _bind(
     args: tuple[torch.Tensor, ...],
     *,
     enabled: bool = True,
+    fission: bool = False,
     static_shapes: bool = True,
     backend: str = "cute",
 ) -> BoundKernel[Any]:
@@ -196,6 +198,7 @@ def _bind(
         static_shapes=static_shapes,
         autotune_effort="none",
         cute_full_slice_matmul_tiling=enabled,
+        cute_region_fission=fission,
     )(function)
     with _cpu_target():
         return kernel._bind_isolated(args)
@@ -461,3 +464,21 @@ def test_missing_helper_bindings_leave_source_unchanged(
     assert ast.dump(ast.Module(_host(before).body, [])) == ast.dump(
         ast.Module(_host(after).body, [])
     )
+
+
+def test_fission_first_stage_gets_its_own_k_loop() -> None:
+    x, a = _inputs((32, 16, 64), torch.bfloat16)
+    b = torch.empty((16, 64), dtype=torch.bfloat16)
+    bound = _bind(
+        cast("FunctionType", squeeze_and_excitation_net_fwd.fn), (x, a, b), fission=True
+    )
+    assert bound.env.cute_fission_plan is not None
+    ir = _host(bound).device_ir
+    assert ir.grid_block_ids == [[0, 1], [3, 4]]
+    assert [
+        graph.block_ids for graph in ir.graphs if type(graph) is ForLoopGraphInfo
+    ] == [[2], [5]]
+    assert [fact.k_block_id for fact in bound.config_spec.matmul_facts] == [2, 5]
+    with _cpu_target():
+        code = bound.to_code(helion.Config(block_sizes=[16, 16, 16, 16, 32, 16]))
+    ast.parse(code)

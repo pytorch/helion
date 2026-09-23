@@ -1067,6 +1067,14 @@ class CuteBackend(Backend):
         from .online_to_3pass import rewrite_online_to_3pass
 
         rewrite_online_to_3pass(hf)
+        from ..compile_environment import CompileEnvironment
+
+        plan = CompileEnvironment.current().cute_fission_plan
+        if plan is not None:
+            from .materialized_fission import apply_materialized_fission
+
+            apply_materialized_fission(hf, plan)
+
         from .full_slice_matmul import stripmine_full_slice_matmuls
 
         stripmine_full_slice_matmuls(hf)
@@ -1186,6 +1194,9 @@ class CuteBackend(Backend):
                 "cute_reduction_pack_output",
                 "cute_reduction_sequence",
                 "cute_host_paired_sum",
+                "cute_materialized_schedule",
+                "cute_materialized_operand_schedule",
+                "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"
             or key == "cute_bf16x2_recurrence"
@@ -2932,9 +2943,14 @@ class CuteBackend(Backend):
                 if block_id in inactive_block_ids:
                     num_threads_config[i] = 1
             is_device_loop = any(bid not in grid_ids for bid in block_ids)
+            active_block_ids = device_ir.codegen_active_block_ids
             reduction_axis_reserve = (
                 1
-                if any(info.reduction for info in env.block_sizes)
+                if any(
+                    info.reduction
+                    and (active_block_ids is None or info.block_id in active_block_ids)
+                    for info in env.block_sizes
+                )
                 and self.reduction_axis_first()
                 else 0
             )
