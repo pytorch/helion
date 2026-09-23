@@ -744,7 +744,17 @@ class PersistentReductionStrategy(ReductionStrategy):
                 # ``cute.arch.warp_reduction`` is correct.
                 if _block_has_indexed_reduction(fn, block_index):
                     max_threads = min(max_threads, _CUTE_WARP_REDUCTION_THREADS)
-            self._thread_count = next_power_of_2(min(size_hint, max_threads))
+            if env.backend.name == "flydsl" and size_hint > max_threads:
+                # Persistent wide: use N/V threads so the full row fits in one
+                # pass without looping. V from cute_vector_widths, clamped to >=4.
+                _vw = cast(
+                    "list[int]",
+                    fn.config.config.get("cute_vector_widths", []) or [],
+                )
+                _v = max(4, int(_vw[0]) if _vw else 4)
+                self._thread_count = max(64, min(1024, (size_hint // _v // 64) * 64))
+            else:
+                self._thread_count = next_power_of_2(min(size_hint, max_threads))
             if env.backend.name == "cute":
                 # Persistent reductions use the same per-block thread-count
                 # knob as rolled reductions.  A smaller live subgroup keeps
@@ -1821,7 +1831,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         tracker = ThreadAxisTracker()
         if self._thread_count > 0:
             tracker.record(block_index, self._get_thread_axis(), self._thread_count)
-        return DeviceLoopState(
+        device_loop_state = DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=inner_body,
@@ -1829,6 +1839,15 @@ class LoopedReductionStrategy(ReductionStrategy):
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
         )
+
+        # Register-slot metadata for in_local[] register caching. Backends that
+        # cache reduction loads across passes (FlyDSL) record their per-block loop
+        # geometry here; the default is a no-op.
+        env.backend.record_reduction_loop_meta(
+            state, block_index, numel, device_loop_state
+        )
+
+        return device_loop_state
 
     def codegen_reduction(
         self,

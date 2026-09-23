@@ -99,6 +99,8 @@ def _flydsl_buffer_setup(
     tensor: torch.Tensor,
     tensor_name: str,
     subscript: list[object] | tuple[object, ...],
+    *,
+    is_load: bool = False,
 ) -> dict:
     """Build the cached buffer/div/copy-atom setup shared by load and store.
 
@@ -149,6 +151,7 @@ def _flydsl_buffer_setup(
     _lb = 0
     if is_rolled_col:
         from ..reduction_strategy import LoopedReductionStrategy
+        from ..reduction_strategy import PersistentReductionStrategy
 
         assert col_block_id is not None
         _rs = state.device_function.tile_strategy.block_id_to_strategy.get(
@@ -162,6 +165,14 @@ def _flydsl_buffer_setup(
             if _tc > 0 and _lb >= _tc:
                 rolled_col_vec = max(1, _lb // _tc)
                 rolled_col_offset = _rs.offset_var(col_block_id)
+        elif isinstance(_rs, PersistentReductionStrategy) and _rs._thread_count > 64:
+            # Persistent wide: all N/V threads cover the full row in one pass.
+            # chunk=N, offset=0 (no loop), vec=N//thread_count=V.
+            _tc = _rs._thread_count
+            _lb = env.block_sizes[col_block_id].size_hint()
+            if _tc > 0 and _lb >= _tc:
+                rolled_col_vec = max(1, _lb // _tc)
+                rolled_col_offset = "0"
     # Column tail: when N is not a multiple of the chunk (64*V), the last pass
     # runs past column N. Build a per-element predicate to drop those columns.
     rolled_col_pred: str | None = None
@@ -182,14 +193,24 @@ def _flydsl_buffer_setup(
     is_vec = col_block_id is not None
 
     device_fn = state.device_function
-    setup_key = (tensor_name, is_vec, is_rolled_col)
+    # Cache modifier: non-temporal (2) bypasses L1 for single-pass reads.
+    # Only applied to loads — stores always use modifier=0 (cached write).
+    _backend = cast("FlyDSLBackend", env.backend)
+    _cache_modifier = (
+        getattr(_backend, "_flydsl_load_cache_modifier", 0) if is_load else 0
+    )
+    setup_key = (tensor_name, is_vec, is_rolled_col, _cache_modifier)
     setup = device_fn._flydsl_setup.get(setup_key)
     if setup is None:
         _hoist = None
         # A rolled ``:`` column that fits in one wavefront (N <= 64) has a loop
         # that is never emitted, so its outer_prefix is dead and hoisting setup
         # there drops it. Keep _hoist None so setup emits inline in the live body.
-        _degenerate_rolled_col = is_rolled_col and rolled_col_offset is None
+        # Persistent-wide (rolled_col_offset=="0") also has no loop to hoist
+        # into, so treat it the same as degenerate (emit setup inline).
+        _degenerate_rolled_col = is_rolled_col and (
+            rolled_col_offset is None or rolled_col_offset == "0"
+        )
         if (
             col_block_id is not None
             and not _degenerate_rolled_col
@@ -252,7 +273,9 @@ def _flydsl_buffer_setup(
                 dce=True,
             )
             atom = state.codegen.lift(
-                expr_from_string(f"fx.make_copy_atom(fx.rocdl.{_copy_cls}(), {_bits})"),
+                expr_from_string(
+                    f"fx.make_copy_atom(fx.rocdl.{_copy_cls}({_cache_modifier}), {_bits})"
+                ),
                 prefix="flydsl_atom",
                 dce=True,
             )
@@ -325,7 +348,9 @@ def _(state: CodegenState) -> None:
         return None
 
     if use_buffer:
-        _info = _flydsl_buffer_setup(env, state, tensor, tensor_name, subscript)
+        _info = _flydsl_buffer_setup(
+            env, state, tensor, tensor_name, subscript, is_load=False
+        )
         setup = _info["setup"]
         col_block_id = _info["col_block_id"]
         is_vec = _info["is_vec"]
@@ -456,7 +481,9 @@ def _(state: CodegenState) -> ast.AST:
 
     if use_buffer:
         # buffer tensor path for both x[tile_n,:] and x[tile_m,tile_n].
-        _info = _flydsl_buffer_setup(env, state, tensor, tensor_name, subscript)
+        _info = _flydsl_buffer_setup(
+            env, state, tensor, tensor_name, subscript, is_load=True
+        )
         setup = _info["setup"]
         col_block_id = _info["col_block_id"]
         is_vec = _info["is_vec"]
@@ -481,6 +508,140 @@ def _(state: CodegenState) -> ast.AST:
             chunk_idx = state.codegen.index_var(col_block_id)
         else:
             chunk_idx = "fx.thread_idx.x"
+
+        device_fn = state.device_function
+        _atom_name = setup["atom"]
+        _div_name = setup["div"]
+
+        # Register-caching via in_local[] pattern (2-read HBM):
+        # When constexpr_range is active, emit an empty Python list into outer_prefix
+        # and build it via .append() inside the reduce-loop body — exactly mirroring
+        # the reference FlyDSL kernel's in_local.append(vec) pattern.  FlyDSL's
+        # range_constexpr Python-executes the loop at trace time, so each
+        # cache.append(memref_load_vec(r)) adds a DISTINCT SSA value object.
+        # The normalize-loop reads cache[tile_idx] — a per-iteration SSA reference,
+        # not a new allocation.  This avoids the VGPR pressure of the list-comprehension
+        # approach (which created N make_rmem_tensor ops with long live ranges).
+        if (
+            is_rolled_col
+            and rolled_col_offset is not None
+            and getattr(backend, "_flydsl_use_constexpr_range", False)
+        ):
+            _cr_meta = getattr(device_fn, "_flydsl_cr_meta", {}).get(col_block_id)
+            # Only cache tensors that appeared in both a reduce-loop graph AND a
+            # normalize-loop graph (intersection computed in pre_codegen).
+            # Use isinstance consistent with pre_codegen's own check.
+            _fx_arg = state.fx_node.args[0] if state.fx_node is not None else None
+            _is_reduce_tensor = isinstance(
+                _fx_arg, torch.fx.Node
+            ) and _fx_arg.name in getattr(backend, "_flydsl_cr_reduce_tensors", set())
+            if _cr_meta is not None and _is_reduce_tensor:
+                _chunk, _outer_prefix = _cr_meta
+                # Cache and loaded-set are keyed by (col_block_id, tensor_name) so
+                # separate reduction dimensions don't share state — fixes the multi-
+                # block-index bug where the second dim skipped the write phase.
+                _cache_key = (col_block_id, tensor_name)
+                _cr_cache = getattr(device_fn, "_flydsl_cr_cache", None)  # pyrefly: ignore[missing-attribute]
+                _cr_loaded = getattr(device_fn, "_flydsl_cr_loaded", None)  # pyrefly: ignore[missing-attribute]
+                if _cr_cache is None or _cr_loaded is None:
+                    # record_reduction_loop_meta was not called (e.g. strategy is not
+                    # LoopedReductionStrategy). Skip the cache path safely.
+                    _cr_cache = None
+                if _cr_cache is not None:
+                    _cache_var = _cr_cache.get(_cache_key)
+                    if _cache_var is None:
+                        # First encounter: hoist an empty Python list into outer_prefix
+                        # (before the reduce-loop). range_constexpr will append SSA values
+                        # to it at trace time during the reduce-loop body.
+                        _cache_var = f"_cr_{tensor_name}_{col_block_id}_cache"
+                        _cr_cache[_cache_key] = _cache_var
+                        with state.codegen.set_statements(_outer_prefix):
+                            state.add_statement(
+                                statement_from_string(f"{_cache_var} = []")
+                            )
+                # _tile_idx folds to a plain integer at trace time because
+                # range_constexpr(0, N, chunk) is unrolled: each unrolled copy
+                # binds rolled_col_offset to a literal multiple of chunk (0, chunk,
+                # 2*chunk, …), so the expression is a compile-time constant.
+                # This invariant is guaranteed by range_str emitting range_constexpr
+                # only when _flydsl_use_constexpr_range is True.
+                _tile_idx = f"({rolled_col_offset}) // {_chunk}"
+                if _cr_cache is not None and _cache_key not in _cr_loaded:  # pyrefly: ignore[not-iterable]
+                    # Write phase (reduce-loop): allocate per-iteration register,
+                    # load from HBM, append the loaded SSA value to the cache list.
+                    # Each range_constexpr iteration appends a distinct SSA object.
+                    _cr_loaded.add(_cache_key)  # pyrefly: ignore[missing-attribute]
+                    _r_cr = f"_r_{tensor_name}_{col_block_id}_cr"
+                    state.add_statement(
+                        statement_from_string(
+                            f"{_r_cr} = fx.make_rmem_tensor({vec_width}, {dtype_str})"
+                        )
+                    )
+                    state.add_statement(
+                        statement_from_string(
+                            f"fx.copy_atom_call({_atom_name}, "
+                            f"fx.slice({_div_name}, (None, {chunk_idx})), {_r_cr})"
+                        )
+                    )
+                    _lv_cr = f"_lv_{tensor_name}_{col_block_id}_cr"
+                    state.add_statement(
+                        statement_from_string(f"{_lv_cr} = fx.memref_load_vec({_r_cr})")
+                    )
+                    # Append the SSA value to the cache — at trace time this
+                    # stores a distinct SSA object per unrolled iteration.
+                    state.add_statement(
+                        statement_from_string(f"{_cache_var}.append({_lv_cr})")  # pyrefly: ignore[unbound-name]
+                    )
+                    if rolled_col_pred is not None:
+                        # Full-tile elision: inside range_constexpr, rolled_col_offset
+                        # is a Python integer at trace time, so const_expr(roffset +
+                        # chunk <= N) is a compile-time bool.  When True (full tile),
+                        # the ternary short-circuits and no select() is emitted — same
+                        # as v7's `is_full = const_expr(base + CHUNK <= N)` fast path.
+                        _cr_chunk = getattr(backend, "_flydsl_constexpr_chunk", 0) or 0
+                        _cr_numel = getattr(backend, "_flydsl_cr_numel", 0) or 0
+                        if _cr_chunk > 0 and _cr_numel > 0:
+                            return expr_from_string(
+                                f"({_lv_cr} if const_expr(({rolled_col_offset}) + {_cr_chunk}"
+                                f" <= {_cr_numel}) else"
+                                f" ({rolled_col_pred}).select({_lv_cr},"
+                                f" fx.Vector.filled_like({_lv_cr}, 0)))"
+                            )
+                        return expr_from_string(
+                            f"({rolled_col_pred}).select({_lv_cr}, "
+                            f"fx.Vector.filled_like({_lv_cr}, 0))"
+                        )
+                    return expr_from_string(_lv_cr)
+                if _cr_cache is None:
+                    # record_reduction_loop_meta was not called — fall through to normal load.
+                    pass
+                else:
+                    # Read phase (normalize-loop): read from cache — no HBM copy.
+                    # Indexing invariant: cache[ti] was appended by iteration ti of the
+                    # reduce-loop.  _tile_idx = (roffset) // chunk folds to ti (0,1,2,…)
+                    # at each unrolled copy of range_constexpr(0, N, chunk), so
+                    # cache[_tile_idx] correctly retrieves the reduce-loop's SSA value for
+                    # the matching tile.  This holds for any vec_width V: chunk = BT*V,
+                    # roffset = ti*chunk → roffset // chunk = ti regardless of V.
+                    _lv_r = f"_lv_{tensor_name}_{col_block_id}_cr_r"
+                    state.add_statement(
+                        statement_from_string(f"{_lv_r} = {_cache_var}[{_tile_idx}]")  # pyrefly: ignore[unbound-name]
+                    )
+                    if rolled_col_pred is not None:
+                        _cr_chunk = getattr(backend, "_flydsl_constexpr_chunk", 0) or 0
+                        _cr_numel = getattr(backend, "_flydsl_cr_numel", 0) or 0
+                        if _cr_chunk > 0 and _cr_numel > 0:
+                            return expr_from_string(
+                                f"({_lv_r} if const_expr(({rolled_col_offset}) + {_cr_chunk}"
+                                f" <= {_cr_numel}) else"
+                                f" ({rolled_col_pred}).select({_lv_r},"
+                                f" fx.Vector.filled_like({_lv_r}, 0)))"
+                            )
+                        return expr_from_string(
+                            f"({rolled_col_pred}).select({_lv_r}, "
+                            f"fx.Vector.filled_like({_lv_r}, 0))"
+                        )
+                    return expr_from_string(_lv_r)
 
         # Explicit hl.tile(n) tail: N not a multiple of the per-pass span (4*64)
         # -> the last chunk's high lanes would read past column N. The AMD buffer

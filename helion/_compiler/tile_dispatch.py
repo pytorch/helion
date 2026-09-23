@@ -126,14 +126,30 @@ class TileStrategyDispatch:
                     size_hint = env.size_hint(numel)
                 if reduction_loop is None:
                     if size_hint > max_threads:
-                        # Too many elements for a single warp; force a looped
-                        # reduction. CuTe can cover a wider chunk with either
-                        # more live lanes or per-thread scalar lanes.
-                        reduction_loop = (
-                            cute_looped_reduction_block_size(size_hint, max_threads)
-                            if env.backend.name == "cute"
-                            else max_threads
+                        # FlyDSL bm=1 persistent: allow PersistentReductionStrategy
+                        # with N/V threads so the full row stays in registers across
+                        # both reduce and normalize passes (one HBM read instead of
+                        # two). Skip the forced-looped conversion in this case.
+                        # Only bypass for explicit persistent-wide configs
+                        # (flydsl_persistent_wide=True set by autotune or user).
+                        # User-provided reduction_loops=[None] without the flag
+                        # keeps the looped path (chunk=max_threads) which is
+                        # correct for small N where _thread_count would be 64.
+                        _flydsl_persistent_wide = (
+                            env.backend.name == "flydsl"
+                            and config.block_sizes
+                            and int(config.block_sizes[0]) == 1
+                            and config.config.get("flydsl_persistent_wide", False)
                         )
+                        if not _flydsl_persistent_wide:
+                            # Too many elements for a single warp; force a looped
+                            # reduction. CuTe can cover a wider chunk with either
+                            # more live lanes or per-thread scalar lanes.
+                            reduction_loop = (
+                                cute_looped_reduction_block_size(size_hint, max_threads)
+                                if env.backend.name == "cute"
+                                else max_threads
+                            )
             strategy = env.backend.create_reduction_strategy(
                 fn, block_id, reduction_loop
             )

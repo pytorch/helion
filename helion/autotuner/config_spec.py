@@ -846,6 +846,9 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_threads",
         "cute_vector_widths",
+        "constexpr_range",
+        "flydsl_load_cache_modifier",
+        "flydsl_waves_per_eu",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_async_load_stages",
@@ -906,6 +909,18 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "cute_vector_widths",
+        # FlyDSL: emit range_constexpr for small reduction tile counts so the
+        # loaded input vectors can be register-cached across two passes (2-read HBM).
+        "constexpr_range",
+        # FlyDSL: BufferCopy cache modifier (0=cached, 2=non-temporal/bypass L1).
+        "flydsl_load_cache_modifier",
+        # FlyDSL: waves_per_eu occupancy hint (0=auto, 2/4/8=target waves per EU).
+        "flydsl_waves_per_eu",
+        # FlyDSL: hard VGPR cap (--amdgpu-num-vgpr=N); 0=no cap.
+        "flydsl_maxnreg",
+        # FlyDSL: marks reduction_loops=None as intentional persistent-wide
+        # (all N/V threads active, no loop). Prevents config_spec from forcing None -> chunk.
+        "flydsl_persistent_wide",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_async_load_stages",
@@ -2960,8 +2975,21 @@ class ConfigSpec:
                     ):
                         block_threshold = min(block_threshold, 32)
                     if new_loops[i] is None and spec.size_hint > block_threshold:
-                        new_loops[i] = min(spec.size_hint, block_threshold)
-                        changed = True
+                        # FlyDSL persistent-wide: flydsl_persistent_wide=True marks
+                        # this as an intentional N/V-thread single-pass config.
+                        # Keep reduction_loops=None so PersistentReductionStrategy
+                        # is selected instead of forcing a looped chunk.
+                        _block_sizes = config.get("block_sizes", [])
+                        _is_wide_persistent = (
+                            config.get("flydsl_persistent_wide", False)
+                            and getattr(spec, "allow_wide_persistent", False)
+                            and isinstance(_block_sizes, list)
+                            and _block_sizes
+                            and int(_block_sizes[0]) == 1
+                        )
+                        if not _is_wide_persistent:
+                            new_loops[i] = min(spec.size_hint, block_threshold)
+                            changed = True
                     elif (
                         new_loops[i] is not None
                         and max_loop is not None
@@ -4168,6 +4196,13 @@ class ConfigSpec:
                 and self.pallas_fold_dot_lhs_cast_search_enabled
             ):
                 fields["pallas_fold_dot_lhs_cast"] = BooleanFragment()
+        # FlyDSL register-caching: emit range_constexpr (in_local[] pattern, 2-read
+        # HBM) when the tile count is small enough.  Registering as a BooleanFragment
+        # lets the beam-search neighbor generator flip it True<->False so autotune can
+        # reliably discover the faster variant rather than depending on whether the
+        # initial candidate list happened to include a constexpr_range=True entry.
+        if self.supports_config_key("constexpr_range"):
+            fields["constexpr_range"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(AUTOTUNED_MAXNREG)
@@ -4565,9 +4600,14 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         *,
         block_id: int,
         size_hint: int,
+        allow_wide_persistent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
+        # When True, _normalize preserves chunk >= size_hint instead of
+        # collapsing to None.  Set by backends that use the single-iteration
+        # looped path for register caching (allow_wide_persistent_reduction).
+        self.allow_wide_persistent = allow_wide_persistent
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -4615,7 +4655,13 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _normalize(self, name: str, value: object) -> int | None:
         if value is None:
             return None
-        normalized = super()._normalize(name, value)
+        # For wide-persistent configs (FlyDSL chunk=N single-pass), allow
+        # non-power-of-two chunk values so non-POT N (e.g. 20000) can be
+        # offered as a persistent single-iteration candidate.
+        if self.allow_wide_persistent and isinstance(value, int) and value > 0:
+            normalized: int | None = value
+        else:
+            normalized = super()._normalize(name, value)
         # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
         # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
         # block size <= 1.  The autotuner search never proposes < 8 (its fragment
@@ -4635,8 +4681,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # two reductions).  Collapsing to ``None`` here matches the
         # ``_flat_config`` behaviour and keeps the persistent/loop choice in
         # sync regardless of how the value was generated.
+        # Exception: backends that set allow_wide_persistent_reduction use the
+        # single-iteration looped path for register caching (in_local[] across
+        # reduce+normalize passes), so preserve chunk >= size_hint for them.
         if isinstance(normalized, int) and normalized >= self.size_hint:
-            return None
+            if not self.allow_wide_persistent:
+                return None
         return normalized
 
     def _fill_missing(self) -> None:

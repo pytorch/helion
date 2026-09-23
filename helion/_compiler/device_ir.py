@@ -1124,6 +1124,7 @@ class DeviceIR:
                     ReductionLoopSpec(
                         block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
+                        allow_wide_persistent=env.backend.allow_wide_persistent_reduction(),
                     )
                 )
                 env.backend.register_reduction_loop_config_slots(
