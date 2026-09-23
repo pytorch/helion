@@ -146,10 +146,13 @@ def clear_jit_fast_path_caches(
         fn_globals = getattr(fn, "__globals__", None)
         if fn_name is None or fn_globals is None:
             return
-        triton_jit_fn = fn_globals.get(f"_helion_{fn_name}")
-        clear = getattr(triton_jit_fn, "clear_fast_path_caches", None)
-        if clear is not None:
-            clear()
+        kernels = getattr(fn, "_helion_cute_kernels", None)
+        if not isinstance(kernels, tuple):
+            kernels = (fn_globals.get(f"_helion_{fn_name}"),)
+        for kernel in kernels:
+            clear = getattr(kernel, "clear_fast_path_caches", None)
+            if clear is not None:
+                clear()
     except Exception:
         if log is not None:
             log.debug("Failed to clear Triton JIT fast-path cache.", exc_info=True)
