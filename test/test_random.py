@@ -38,12 +38,13 @@ def _assert_uses_philox(testcase: TestCase, code: str) -> None:
         return
     testcase.assertTrue(
         ("3528531795" in code and "3449720151" in code)
-        or ("36183" in code and "52638" in code and "8019" in code and "53841" in code),
+        or ("36183" in code and "52638" in code and "8019" in code and "53841" in code)
+        or ("0xD2511F53" in code and "0xCD9E8D57" in code),
         "Philox round constants not found in generated code",
     )
     testcase.assertTrue(
-        ("2654435769" in code or "-1640531527" in code)
-        and ("3144134277" in code or "-1150833019" in code),
+        ("2654435769" in code or "-1640531527" in code or "0x9E3779B9" in code)
+        and ("3144134277" in code or "-1150833019" in code or "0xBB67AE85" in code),
         "Philox key schedule constants not found in generated code",
     )
 

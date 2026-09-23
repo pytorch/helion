@@ -19,6 +19,9 @@ Scope and safety:
   loop-carried accumulators are reassigned and therefore excluded).
 - The consumer must be a top-level ``w = t + c`` / ``c + t`` / ``t - c`` /
   ``c - t`` assignment in the SAME statement list as the multiply.
+- Separately, marked distributed-scale subtractions from the existing scale
+  hoister are contracted after a definite FP32 type proof. This makes that
+  already chosen contraction independent of masked-load scheduling.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import ast
 
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
+from .scaled_sub_fusion import contract_distributed_scale_subtractions
 
 
 def _collect_counts(
@@ -200,4 +204,4 @@ def fuse_fma(
     reads, writes = _collect_counts(body)
     float_names: set[str] = set()
     _process_list(body, reads, writes, float_names, rename_groups or {})
-    return body
+    return contract_distributed_scale_subtractions(body, rename_groups or {})

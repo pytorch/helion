@@ -11,10 +11,8 @@ V-loop 2 reads the cached fp32 value back instead of re-running the
 ``Uint16 -> Float16`` bitcast chain. Eliminates the redundant per-lane
 bitcast+cast pair.
 
-A second peephole removes
-``A = Float<N>(warp_reduction_*(...)) ; B = Float32(A)`` round-trips
-left over after ``hoist_warp_reduce`` promoted the accumulator to fp32
-— the Float<N> wrap is dead in that situation.
+A second peephole removes repeated casts to the same dtype. Narrowing
+the reduction result and then widening it must retain the rounding.
 
 Lives in ``helion/_compiler/cute/merge_sibling_v_loops.py``.
 """
@@ -98,13 +96,8 @@ class TestCuteMergeSiblingVLoops(TestCase):
             code,
         )
 
-    def test_cast_elision_on_warp_reduction(self) -> None:
-        """The double-cast peephole must collapse
-        ``A = Float16(warp_reduction(...)); B = Float32(A)`` into
-        ``A = warp_reduction(...); B = A``. The inner Float16 wrap on
-        the max-reduce becomes dead after ``hoist_warp_reduce`` promoted
-        the accumulator to fp32.
-        """
+    def test_narrowing_cast_preserved_on_warp_reduction(self) -> None:
+        """An accumulator promotion does not make a result cast redundant."""
         x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
         code, out = code_and_output(
             _reduction_kernel,
@@ -115,13 +108,11 @@ class TestCuteMergeSiblingVLoops(TestCase):
         )
         ref = torch.nn.functional.softmax(x, dim=1)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
-        # The original pattern ``local_amax = Float16(warp_reduction_max(...))``
-        # must have been elided to just ``local_amax = warp_reduction_max(...)``.
-        self.assertNotIn(
+        self.assertIn(
             "local_amax = cutlass.Float16(cute.arch.warp_reduction_max",
             code,
         )
-        self.assertIn(
+        self.assertNotIn(
             "local_amax = cute.arch.warp_reduction_max",
             code,
         )

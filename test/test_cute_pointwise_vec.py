@@ -360,6 +360,32 @@ class TestCutePointwiseVec(TestCase):
         self.assertIn("_cute_load_l2_evict_last", code)
         torch.testing.assert_close(out, x * y)
 
+    def test_two_level_eviction_policy(self) -> None:
+        """8/16-byte cache hints and scalar fallbacks preserve every element."""
+        for dtype, width in (
+            (torch.float32, 4),
+            (torch.float16, 8),
+            (torch.bfloat16, 8),
+        ):
+            for policy in ("l1_l2_first", "l1_l2_last"):
+                for selected_width in sorted({width, 4, 2, 1}, reverse=True):
+                    with self.subTest(dtype=dtype, policy=policy, width=selected_width):
+                        x = torch.randn(2**14, device=DEVICE, dtype=dtype)
+                        y = torch.randn_like(x)
+                        code, out = code_and_output(
+                            _mul1d,
+                            (x, y),
+                            block_sizes=[1024],
+                            num_threads=[128],
+                            cute_vector_widths=[selected_width],
+                            load_eviction_policies=[policy, policy],
+                        )
+                        helper = "_cute_load_l1_l2_evict_" + policy.rsplit("_", 1)[1]
+                        packet_bytes = selected_width * x.element_size()
+                        self.assertEqual(f"{helper}(" in code, packet_bytes == 16)
+                        self.assertEqual(f"{helper}_8b(" in code, packet_bytes == 8)
+                        torch.testing.assert_close(out, x * y, atol=0, rtol=0)
+
     def test_epilogue_subtile_disables_vec(self) -> None:
         """Regression: epilogue_subtile stages stores through smem with a
         sync inside the per-element pipeline; combined with the vec

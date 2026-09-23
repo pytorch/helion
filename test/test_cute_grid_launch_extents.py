@@ -205,9 +205,12 @@ def test_multiple_grid_requirements_combine_per_axis(kind: str) -> None:
     code = _code(kernel, args, _config(kind))
     assert sorted(_launch_block(code)) == expected
     if kind == "merged":
-        # The larger root launches 256 threads; the 128-thread root retains
-        # its own thread mask to prevent duplicate/out-of-tile accesses.
-        assert "cute.arch.thread_idx()[0]) < 128" in code
+        # The larger root launches 256 threads. The 128-thread root is
+        # re-planned over every launched thread (4 lanes of stride 256), so
+        # no surplus thread mask is needed to prevent duplicate accesses.
+        assert "for lane_0 in range(4):" in code
+        assert "cutlass.Int32(lane_0) * 256" in code
+        assert "thread_idx()[0]) <" not in code
 
 
 def test_explicit_launch_metadata_ignores_expression_spelling_and_dead_names() -> None:
@@ -249,12 +252,17 @@ def test_mixed_rank_grid_keeps_surplus_thread_mask(
     )
     assert sorted(_launch_block(code)) == [1, 1, max(first_threads, second_threads)]
     if first_threads > second_threads:
+        # A 128-element root cannot spread over 256 threads, so its surplus
+        # threads stay masked by the physical thread bound.
         assert "_BLOCK_SIZE_2 = 128" in code
-        assert "cute.arch.thread_idx()[1]) < _BLOCK_SIZE_2" in code
+        assert "cute.arch.thread_idx()[1]) < 128" in code
         assert "if mask_2:" in code
     elif second_threads > first_threads:
-        assert "cute.arch.thread_idx()[1]) < 128" in code
-        assert "if mask_1:" in code
+        # The vectorized 2048-element root is re-planned over all 256 launched
+        # threads (one lane of stride 256) and needs no surplus mask.
+        assert "cutlass.Int32(lane_1) * 256" in code
+        assert "mask_1 =" not in code
+        assert "mask_2 =" not in code
     else:
         assert "mask_1 =" not in code
         assert "mask_2 =" not in code

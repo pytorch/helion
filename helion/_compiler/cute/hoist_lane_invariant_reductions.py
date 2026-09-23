@@ -111,7 +111,11 @@ _PURE_WARP_REDUCTION_CALLS = {
     "cute.arch.warp_reduction_max",
     "cute.arch.warp_reduction_sum",
 }
-_PURE_LOAD_HELPERS = {"_cute_load_l2_evict_last"}
+_PURE_LOAD_HELPERS = {
+    "_cute_load_l2_evict_last",
+    "_cute_load_l1_l2_evict_first",
+    "_cute_load_l1_l2_evict_last",
+}
 _CUTLASS_SCALAR_TYPES = {
     "cutlass.BFloat16": 2,
     "cutlass.Boolean": 1,

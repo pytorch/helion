@@ -764,6 +764,8 @@ class _CuteFuseTwoPassLoads:
         load_call = load_calls[0]
 
         snapshots = _definition_snapshots(container)
+        if snapshots is None:
+            return False
         definitely_written: set[str] = set()
         live_in: set[str] = set()
         may_writes: set[str] = set()

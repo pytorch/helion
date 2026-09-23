@@ -260,8 +260,11 @@ class TestCuteFMAScaleHoist(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         # The reduce-loop scale hoist for ``v_1 * 1.4427``.
         self.assertIn("= v_1 * 1.4426950408889634", code)
-        # The V-loop body uses the FMA-friendly form via v_5.
-        self.assertIn("cute.math.exp2(v_5 * 1.4426950408889634 - _helion_scaled_", code)
+        # The V-loop body preserves the explicit FP32 FMA via v_5.
+        self.assertIn(
+            "cute.math.exp2(cute.math.fma(v_5, 1.4426950408889634, -_helion_scaled_",
+            code,
+        )
 
     def test_dce_removes_dead_sub_after_fma_hoist(self) -> None:
         """After the FMA hoist rewrites ``cast(v_X) * CONST`` to read

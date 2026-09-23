@@ -24,6 +24,8 @@ from ..cute.grouped_worklist_policy import GroupedBMajor
 from ..cute.grouped_worklist_policy import GroupedWorklistHardwareIdentity
 from ..cute.grouped_worklist_policy import get_grouped_worklist_target_policy
 from ..cute.grouped_worklist_policy import grouped_worklist_target_identities
+from ..cute.loop_nesting import sibling_row_loop_blocks
+from ..cute.loop_nesting import tile_loop_paths
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
@@ -60,6 +62,7 @@ from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ...autotuner.config_fragment import BlockSizeFragment
@@ -76,7 +79,7 @@ if TYPE_CHECKING:
 
 def _seq_config_list(
     seq: Any,  # noqa: ANN401 - BlockIdSequence of any spec type
-    overrides: dict[int, object],
+    overrides: Mapping[int, object],
 ) -> list[object]:
     """Build a full-length config list for a BlockIdSequence, filling
     non-overridden slots with each spec's default.  Seeds must match the
@@ -769,6 +772,21 @@ def _cute_tile_inner_block_dtype(
     softmax_two_pass — its two ``hl.tile`` loops over the reduction
     axis don't go through the ``ReductionLoopSpec`` path)."""
     bs = env.block_sizes[block_id]
+    if env.is_jagged_tile(block_id):
+        # Jagged lengths have no static numel. Their tile symbol still
+        # identifies data values in the traced body; ignore index/mask tensors.
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                val = node.meta.get("val")
+                if (
+                    isinstance(val, torch.Tensor)
+                    and val.ndim >= 1
+                    and val.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                    and isinstance(val.shape[-1], torch.SymInt)
+                    and val.shape[-1]._sympy_() == bs.var._sympy_()
+                ):
+                    return val.dtype
+        return None
     block_numel = bs.numel
     try:
         block_numel_int = int(block_numel)
@@ -1396,6 +1414,289 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             return Config(**seed)
         except Exception:
             return None
+
+
+def _cute_reread_cache_policies(
+    spec: ConfigSpec, inner_block_ids: tuple[int, ...]
+) -> list[str]:
+    # A repeated input benefits from retention on the earlier passes and
+    # eviction on the last. Seed this alongside ordinary cache policies;
+    # the compiler never infers a cache choice from a kernel name or size.
+    cache_policies = [""] * spec.load_eviction_policies.length
+    tensor_passes: dict[str, list[tuple[int, int]]] = {}
+    for fact in spec.memory_op_facts:
+        axes = set(fact.subscript_block_ids).intersection(inner_block_ids)
+        if (
+            fact.kind == "load"
+            and fact.eviction_index is not None
+            and fact.tensor_name is not None
+            and len(axes) == 1
+        ):
+            pass_index = inner_block_ids.index(next(iter(axes)))
+            tensor_passes.setdefault(fact.tensor_name, []).append(
+                (pass_index, fact.eviction_index)
+            )
+    for accesses in tensor_passes.values():
+        passes = {pass_index for pass_index, _ in accesses}
+        if len(passes) > 1:
+            last_pass = max(passes)
+            for pass_index, eviction_index in accesses:
+                cache_policies[eviction_index] = (
+                    "l1_l2_first" if pass_index == last_pass else "l1_l2_last"
+                )
+    return cache_policies
+
+
+class CuteSiblingRowHeuristic(AutotunerHeuristic):
+    """Coherent vector/thread seeds for distinct sibling row-tile passes.
+
+    Independent tile IDs make it unlikely for an ordinary coordinate search
+    to discover a common layout for the reduction and consume passes. Seed
+    warp-sized chunks and whole-row tiles with the same configuration for
+    every pass, including a multi-row warp layout for short rows.
+    """
+
+    name = "cute_sibling_row"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
+        if spec.matmul_facts or spec.reduction_loops:
+            return []
+        plan = sibling_row_loop_blocks(env, device_ir, device_ir.graphs)
+        jagged = False
+        if plan is None:
+            # Dynamic row lengths have no host-side bound to equate. Seeds
+            # may still configure sibling passes coherently; the compiler
+            # retains each pass's own bound and masks.
+            paths = tile_loop_paths(device_ir, device_ir.graphs)
+            if (
+                len(paths) >= 2
+                and all(
+                    len(path) == 2 and all(len(axis) == 1 for axis in path)
+                    for path in paths
+                )
+                and len({path[0][0] for path in paths}) == 1
+                and all(env.is_jagged_tile(path[1][0]) for path in paths)
+            ):
+                plan = (
+                    paths[0][0][0],
+                    tuple(dict.fromkeys(path[1][0] for path in paths)),
+                )
+                jagged = True
+        if plan is None or len(plan[1]) < 2:
+            return []
+        row_block_id, inner_block_ids = plan
+        block_ids = {row_block_id, *inner_block_ids}
+        if len(spec.block_sizes) != len(block_ids) or any(
+            len(item.block_ids) != 1 for item in spec.block_sizes
+        ):
+            return []
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        if set(block_specs) != block_ids:
+            return []
+        for sequence in (
+            spec.num_threads,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+        ):
+            if not set(inner_block_ids).issubset(sequence.valid_block_ids()):
+                return []
+        vec = min(
+            _cute_tile_seed_vec_width_for_dtype(
+                _cute_tile_inner_block_dtype(env, device_ir, block_id)
+            )
+            for block_id in inner_block_ids
+        )
+        if vec <= 1:
+            return []
+        row_fragment = block_specs[row_block_id]._fragment(spec)
+        inner_fragments = [
+            block_specs[block_id]._fragment(spec) for block_id in inner_block_ids
+        ]
+        low = max(fragment.low for fragment in inner_fragments)
+        high = min(fragment.high for fragment in inner_fragments)
+        row_extent = (
+            1 << (max(1, block_specs[inner_block_ids[0]].size_hint) - 1).bit_length()
+        )
+        candidates: list[tuple[int, int, int]] = []
+        if jagged:
+            # Size hints cannot describe device-resident row lengths. Offer
+            # several register footprints so a cold search can discover wide,
+            # vectorized sweeps without synchronizing many independent knobs.
+            candidates.extend(
+                (1, threads * elements_per_thread, threads)
+                for threads in (128, 256, 512)
+                for elements_per_thread in (32, 64)
+            )
+        for threads in (256, 128, 512):
+            if row_extent % (threads * vec) == 0 and row_extent // threads <= 64:
+                candidates.append((1, row_extent, threads))
+        if row_extent <= 2048 and row_extent % (32 * vec) == 0:
+            candidates.append((4, row_extent, 32))
+        wide_chunk = min(1024, high)
+        if wide_chunk >= vec:
+            candidates.append((1, wide_chunk, wide_chunk // vec))
+        candidates.extend(((1, 32 * vec, 32), (4, 32 * vec, 32)))
+
+        cache_policies = _cute_reread_cache_policies(spec, inner_block_ids)
+
+        seeds: list[Config] = []
+        for rows, columns, threads in candidates:
+            if not (
+                row_fragment.low <= rows <= row_fragment.high and low <= columns <= high
+            ):
+                continue
+            seeds.append(
+                Config.from_dict(
+                    {
+                        "block_sizes": _seq_config_list(
+                            spec.block_sizes,
+                            {
+                                row_block_id: rows,
+                                **dict.fromkeys(inner_block_ids, columns),
+                            },
+                        ),
+                        "num_threads": _seq_config_list(
+                            spec.num_threads,
+                            {
+                                row_block_id: rows,
+                                **dict.fromkeys(inner_block_ids, threads),
+                            },
+                        ),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths, dict.fromkeys(inner_block_ids, vec)
+                        ),
+                        "cute_lane_layouts": _seq_config_list(
+                            spec.cute_lane_layouts,
+                            dict.fromkeys(inner_block_ids, "strided"),
+                        ),
+                    }
+                )
+            )
+            if any(cache_policies):
+                seeds.append(
+                    Config.from_dict(
+                        {**seeds[-1].config, "load_eviction_policies": cache_policies}
+                    )
+                )
+        return dedupe_configs(seeds)
+
+
+class CuteNestedRowHeuristic(AutotunerHeuristic):
+    """Seed matching layouts for sibling passes over nested row tiles.
+
+    A coalesced outer feature axis can own the threads while an inner
+    jagged axis accumulates serially. Configuring each sibling independently
+    makes this layout difficult to discover through individual mutations.
+    """
+
+    name = "cute_nested_row"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
+        if spec.matmul_facts or spec.reduction_loops:
+            return []
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        if len(paths) < 2 or any(
+            len(path) != 3 or any(len(axis) != 1 for axis in path) for path in paths
+        ):
+            return []
+        roots = {path[0][0] for path in paths}
+        outer = {path[1][0] for path in paths}
+        inner = {path[2][0] for path in paths}
+        if (
+            len(roots) != 1
+            or len(outer) != len(paths)
+            or len(inner) != len(paths)
+            or roots & (outer | inner)
+            or outer & inner
+            or any(env.is_jagged_tile(block_id) for block_id in outer)
+            or not all(env.is_jagged_tile(block_id) for block_id in inner)
+        ):
+            return []
+        axes = roots | outer | inner
+        if any(len(item.block_ids) != 1 for item in spec.block_sizes):
+            return []
+        blocks = {item.block_id: item for item in spec.block_sizes}
+        if set(blocks) != axes or any(
+            not axes.issubset(sequence.valid_block_ids())
+            for sequence in (
+                spec.num_threads,
+                spec.cute_vector_widths,
+                spec.cute_lane_layouts,
+            )
+        ):
+            return []
+        extents = {blocks[block_id].size_hint for block_id in outer}
+        if len(extents) != 1:
+            return []
+        (extent,) = extents
+        columns = 1 << (max(1, extent) - 1).bit_length()
+        fragments = {bid: block._fragment(spec) for bid, block in blocks.items()}
+        seeds = []
+        for column_tile in dict.fromkeys((columns, min(columns, 128))):
+            for reduction_tile in (32, 128, 256):
+                values = {
+                    **dict.fromkeys(roots, 1),
+                    **dict.fromkeys(outer, column_tile),
+                    **dict.fromkeys(inner, reduction_tile),
+                }
+                if not all(
+                    fragments[bid].low <= value <= fragments[bid].high
+                    for bid, value in values.items()
+                ):
+                    continue
+                threads = {
+                    **dict.fromkeys(roots | inner, 1),
+                    **dict.fromkeys(outer, min(column_tile, 256)),
+                }
+                seeds.append(
+                    Config.from_dict(
+                        {
+                            "block_sizes": _seq_config_list(spec.block_sizes, values),
+                            "num_threads": _seq_config_list(spec.num_threads, threads),
+                            "cute_vector_widths": _seq_config_list(
+                                spec.cute_vector_widths, dict.fromkeys(axes, 1)
+                            ),
+                            "cute_lane_layouts": _seq_config_list(
+                                spec.cute_lane_layouts, dict.fromkeys(axes, "strided")
+                            ),
+                        }
+                    )
+                )
+        return dedupe_configs(seeds)
 
 
 class CuteResidentRowHeuristic(AutotunerHeuristic):
@@ -2645,6 +2946,9 @@ def _tcgen05_grouped_worklist_source_analysis(
 
 
 _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT = 8
+# Seed ranking leaves room for CuTe pipeline bookkeeping beyond the explicit
+# shared arena. Final codegen/resource validation still decides admissibility.
+_TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM = 1024
 
 
 def _bounded_grouped_worklist_seed_families(
@@ -3768,6 +4072,30 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                     ]
                     with contextlib.suppress(Exception):
                         seeds.append(Config(**wide_seed))
+            # Independent scalar chains can use one small packet per thread:
+            # vector loads precede the packet's arithmetic and stores follow
+            # it. Width eight may use two 128-bit transfers for FP32. Keep the
+            # existing wide/unrolled seeds as alternatives for bandwidth work.
+            block_ids = [item.block_id for item in spec.block_sizes]
+            bs_pos = block_ids.index(vec_block)
+            high = spec.block_sizes.block_id_lookup(vec_block)._fragment(spec).high
+            for threads in (128, 256):
+                for packet_width in (4, 8):
+                    block_size = threads * packet_width
+                    if block_size > high:
+                        continue
+                    packet = dict(primary.config)
+                    packet["block_sizes"] = [
+                        block_size if index == bs_pos else size
+                        for index, size in enumerate(primary.block_sizes)
+                    ]
+                    packet["num_threads"] = _seq_config_list(
+                        spec.num_threads, {vec_block: threads}
+                    )
+                    packet["cute_vector_widths"] = _seq_config_list(
+                        spec.cute_vector_widths, {vec_block: packet_width}
+                    )
+                    seeds.append(Config.from_dict(packet))
         return seeds
 
     @classmethod

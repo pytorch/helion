@@ -15,6 +15,7 @@ import math
 import re
 from typing import TYPE_CHECKING
 
+from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ..ast_read_writes import ReadWrites
 
 if TYPE_CHECKING:
@@ -123,13 +124,27 @@ def _mutated_value_roots(node: ast.AST) -> set[str]:
 def _freeze_definition(
     node: ast.expr,
     definitions: dict[str, ast.expr],
-) -> ast.expr:
+) -> ast.expr | None:
     """Inline known values so a definition keeps assignment-time semantics."""
+
+    class _TooLarge(Exception):
+        pass
 
     class _FreezeNames(ast.NodeTransformer):
         def __init__(self) -> None:
             super().__init__()
             self.expanding: set[str] = set()
+            self.remaining = 4096
+
+        def visit(self, node: ast.AST) -> ast.AST | list[ast.stmt] | None:
+            # Repeated scalar arithmetic can encode an exponentially large
+            # expression DAG. Callers must decline the entire proof when this
+            # budget is exceeded: omitting a definition could hide its lane
+            # dependence and make an aliased address appear injective.
+            self.remaining -= 1
+            if self.remaining < 0:
+                raise _TooLarge
+            return super().visit(node)
 
         def visit_Name(self, node: ast.Name) -> ast.AST:
             if not isinstance(node.ctx, ast.Load) or node.id in self.expanding:
@@ -140,18 +155,55 @@ def _freeze_definition(
             self.expanding.add(node.id)
             replacement = self.visit(_clone_expr(definition))
             self.expanding.remove(node.id)
+            assert isinstance(replacement, ast.expr)
             return ast.copy_location(replacement, node)
 
-    result = _FreezeNames().visit(_clone_expr(node))
+    try:
+        result = _FreezeNames().visit(_clone_expr(node))
+    except _TooLarge:
+        return None
     assert isinstance(result, ast.expr)
     return result
 
 
+def _needed_definition_names(
+    statements: list[ast.stmt], required_names: set[str]
+) -> set[str]:
+    """Close the requested names over all possible assignment dependencies."""
+    dependencies: dict[str, set[str]] = {}
+    needed = set(required_names)
+    for statement in statements:
+        # Retain aliases used by structured mutations even when the alias is
+        # absent from the requested expressions. Their referents are needed by
+        # the normal invalidation below, e.g. alias = source; alias[0] = value.
+        needed.update(_mutated_value_roots(statement))
+        for name, value in _single_name_definitions([statement]).items():
+            dependencies.setdefault(name, set()).update(
+                ReadWrites.from_ast(value).reads
+            )
+    pending = list(needed)
+    while pending:
+        for dependency in dependencies.get(pending.pop(), ()):
+            if dependency not in needed:
+                needed.add(dependency)
+                pending.append(dependency)
+    return needed
+
+
 def _definition_snapshots(
-    statements: list[ast.stmt],
-) -> list[dict[str, ast.expr]]:
-    """Return the definitions dominating each top-level statement."""
+    statements: list[ast.stmt], *, required_names: set[str] | None = None
+) -> list[dict[str, ast.expr]] | None:
+    """Return the definitions dominating each top-level statement.
+
+    A dependency-closed subset avoids expanding irrelevant scalar arithmetic.
+    Keep every write invalidation, including mutations through aliases, so the
+    selected definitions match the corresponding full snapshots. An oversized
+    definition in the selected dependency closure still declines the proof.
+    """
+    if required_names is not None:
+        required_names = _needed_definition_names(statements, required_names)
     definitions: dict[str, ast.expr] = {}
+    definition_reads: dict[str, set[str]] = {}
     result: list[dict[str, ast.expr]] = []
     for statement in statements:
         result.append(dict(definitions))
@@ -174,22 +226,23 @@ def _definition_snapshots(
         for name in _mutated_value_roots(statement):
             definition = definitions.get(name)
             if definition is not None:
-                invalidated.update(ReadWrites.from_ast(definition).reads)
+                invalidated.update(definition_reads[name])
         while invalidated:
             newly_invalidated: set[str] = set()
-            for name, value in tuple(definitions.items()):
-                if name in invalidated or (
-                    set(ReadWrites.from_ast(value).reads) & invalidated
-                ):
+            for name in tuple(definitions):
+                if name in invalidated or (definition_reads[name] & invalidated):
                     definitions.pop(name)
+                    definition_reads.pop(name)
                     newly_invalidated.add(name)
             invalidated = newly_invalidated
-        definitions.update(
-            {
-                name: _freeze_definition(value, definitions)
-                for name, value in exact_definitions.items()
-            }
-        )
+        for name, value in exact_definitions.items():
+            if required_names is not None and name not in required_names:
+                continue
+            frozen = _freeze_definition(value, definitions)
+            if frozen is None:
+                return None
+            definitions[name] = frozen
+            definition_reads[name] = set(ReadWrites.from_ast(frozen).reads)
     return result
 
 
@@ -350,6 +403,28 @@ def _plain_scalar_store_pointer(call: ast.Call) -> ast.expr | None:
     ):
         return call.func.value
     return None
+
+
+def _memory_address_definition_snapshots(
+    statements: list[ast.stmt],
+) -> list[dict[str, ast.expr]] | None:
+    """Snapshot canonical addresses used by the lane-independence proofs."""
+    required_names: set[str] = set()
+    for statement in statements:
+        for call in ast.walk(statement):
+            if not isinstance(call, ast.Call):
+                continue
+            if (load := _marker_call(call, _LOAD_MARKER, 6)) is not None:
+                pointer = load.args[4]
+            elif (store := _marker_call(call, _STORE_MARKER, 6)) is not None:
+                pointer = store.args[3]
+            else:
+                pointer = _plain_scalar_load_pointer(call)
+                if pointer is None:
+                    pointer = _plain_scalar_store_pointer(call)
+            if pointer is not None:
+                required_names.update(ReadWrites.from_ast(pointer).reads)
+    return _definition_snapshots(statements, required_names=required_names)
 
 
 def _single_tensor_iterator_root(node: ast.AST) -> str | None:
@@ -1268,6 +1343,8 @@ class _BranchLocalPersistentVectorizer:
         load_pointer = load_marker.args[4]
         load_roots = self._pointer_roots(load_pointer)
         definition_snapshots = _definition_snapshots(body)
+        if definition_snapshots is None:
+            return True
         for store_index, stmt in enumerate(body):
             for node in ast.walk(stmt):
                 if not isinstance(node, ast.Call):
@@ -1321,6 +1398,8 @@ class _BranchLocalPersistentVectorizer:
         """
         store_roots = self._pointer_roots(store_marker.args[3])
         definition_snapshots = _definition_snapshots(body)
+        if definition_snapshots is None:
+            return True
         for access_index, stmt in enumerate(body):
             for node in _memory_load_calls(stmt):
                 pointer = self._load_pointer(node)
@@ -1445,9 +1524,9 @@ class _BranchLocalPersistentVectorizer:
                         vector_type = (
                             f"ir.VectorType.get([{width}], {carrier}.mlir_type)"
                         )
-                        if eviction == "__l2_last__":
+                        if eviction in _CUTE_CACHE_LOAD_HELPERS:
                             load_source = (
-                                f"_cute_load_l2_evict_last({ast.unparse(base)}, "
+                                f"{_CUTE_CACHE_LOAD_HELPERS[eviction]}({ast.unparse(base)}, "
                                 f"{vector_type})"
                                 if width * itemsize == 16
                                 else f"cute.arch.load({ast.unparse(base)}, {vector_type})"

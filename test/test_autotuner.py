@@ -130,6 +130,7 @@ _TEST_CUTE_FLASH_BACKEND = SimpleNamespace(
 def _cute_flash_test_config_spec() -> SimpleNamespace:
     return SimpleNamespace(
         cute_flash_search_enabled=True,
+        compiler_coverage_groups=(),
         backend=_TEST_CUTE_FLASH_BACKEND,
     )
 
@@ -4335,6 +4336,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
         generation.flat_spec = [EnumFragment(tuple(range(7)))]
+        generation.compiler_coverage_enabled = True
         generation._override_values = {}
         generation.unflatten = lambda _flat: initial.config
         self.assertIsNone(generation.flash_exact_effective_search_space_configs(1))
@@ -12617,6 +12619,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search.settings = settings
         search.config_spec = SimpleNamespace(  # type: ignore[assignment]
             compiler_seed_configs=[],
+            compiler_coverage_groups=(),
             compiler_seed_timeout_retry_repetitions=(
                 compiler_seed_timeout_retry_repetitions
             ),
@@ -13057,6 +13060,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                     if name not in {"self", "kernel", "args"}
                 }
                 search = object.__new__(search_cls)
+                search.config_spec = _cute_flash_test_config_spec()
                 for name in parameters | inherited_fields:
                     setattr(search, name, 1)
                 if hasattr(search, "flash_structural_search"):

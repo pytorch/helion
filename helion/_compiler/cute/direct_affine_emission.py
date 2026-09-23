@@ -512,13 +512,35 @@ def _split_feature_reduction_loop(
     buffers: Mapping[str, DirectAffineSharedBuffer],
     lane_name: str,
     reserved_names: AbstractSet[str],
+    *,
+    source_lane: str | None = None,
 ) -> tuple[ast.stmt, ...] | None:
     """Finalize captured feature reductions before their vector consumers."""
 
     from ... import exc
+    from ..tile_strategy import _find_lane_reduce_call
     from ..tile_strategy import _is_lane_reduce_marker_assign
     from ..tile_strategy import split_lane_loop_reductions
 
+    loop = _clone_ast(loop)
+    if source_lane is not None:
+        destination_lane = getattr(loop, HELION_LANE_LOOP_VAR_ATTR, None)
+        if not isinstance(destination_lane, str):
+            return None
+        # The validated replay replaces the complete ordinary feature axis.
+        # Its owner is a marker string, not an expression substitution; rebind
+        # exactly that proved owner on this detached materialization loop.
+        for statement in loop.body:
+            marker = _is_lane_reduce_marker_assign(statement)
+            if marker is None or marker.owner_lane is None:
+                continue
+            if marker.owner_lane != source_lane:
+                return None
+            call = _find_lane_reduce_call(statement)
+            assert call is not None
+            call.args[9] = ast.copy_location(
+                ast.Constant(value=destination_lane), call.args[9]
+            )
     markers = tuple(
         marker
         for statement in loop.body
@@ -637,6 +659,7 @@ def _emit_coefficient_materialization(
             buffers,
             lane_name,
             reserved_names,
+            source_lane=coordinates.feature.lane_name,
         )
         if split_feature_loop is None:
             return None

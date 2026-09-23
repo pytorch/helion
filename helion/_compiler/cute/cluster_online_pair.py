@@ -41,6 +41,7 @@ from __future__ import annotations
 import ast
 import copy
 import dataclasses
+import math
 from typing import Callable
 
 _CLUSTER_REDUCE = "_cute_grouped_reduce_cluster"
@@ -294,16 +295,106 @@ class _VecExpMatch:
     canonical: str
 
 
+def _scaled_exp_subtrahend(
+    argument: ast.expr, scaled_values: dict[str, float]
+) -> str | None:
+    if isinstance(argument, ast.BinOp) and isinstance(argument.op, ast.Sub):
+        subtrahend = argument.right
+    elif (
+        isinstance(argument, ast.Call)
+        and ast.unparse(argument.func) == "cute.math.fma"
+        and len(argument.args) == 3
+        and not argument.keywords
+        and isinstance(argument.args[1], ast.Constant)
+        and type(argument.args[1].value) is float
+        and math.isfinite(argument.args[1].value)
+        and argument.args[1].value > 0
+        and isinstance(argument.args[2], ast.UnaryOp)
+        and isinstance(argument.args[2].op, ast.USub)
+    ):
+        # The distributed-scale contraction makes the existing FP32
+        # ``value * C - scaled_max`` explicit. Recognize its subtractive
+        # addend without expanding the FMA back into rounded operations.
+        subtrahend = argument.args[2].operand
+        if not (
+            isinstance(subtrahend, ast.Name)
+            and scaled_values.get(subtrahend.id) == argument.args[1].value
+        ):
+            return None
+    else:
+        return None
+    if isinstance(subtrahend, ast.Name) and subtrahend.id in scaled_values:
+        return subtrahend.id
+    return None
+
+
+def _is_fp32_cache_read(value: ast.expr, cache_names: set[str]) -> bool:
+    if not (
+        isinstance(value, ast.Call)
+        and ast.unparse(value.func) == "cutlass.Float32"
+        and len(value.args) == 1
+        and not value.keywords
+    ):
+        return False
+    value = value.args[0]
+    # Register caches can contain FP32 values, half values, or their raw
+    # Uint16 bits. Admit only those reads and typed conversions, not a
+    # second scaled-max dependency or an opaque/effectful value recipe.
+    while isinstance(value, ast.Call) and len(value.args) == 1 and not value.keywords:
+        if ast.unparse(value.func) in {
+            "cutlass.Float32",
+            "cutlass.Float16",
+            "cutlass.BFloat16",
+            "cutlass.Uint16",
+        }:
+            value = value.args[0]
+        elif (
+            isinstance(value.func, ast.Attribute)
+            and value.func.attr == "bitcast"
+            and ast.unparse(value.args[0])
+            in {"cutlass.Float32", "cutlass.Float16", "cutlass.BFloat16"}
+        ):
+            value = value.func.value
+        else:
+            return False
+    return (
+        isinstance(value, ast.Subscript)
+        and isinstance(value.value, ast.Name)
+        and value.value.id in cache_names
+        and all(
+            isinstance(
+                node,
+                (
+                    ast.Name,
+                    ast.Load,
+                    ast.Constant,
+                    ast.BinOp,
+                    ast.Add,
+                    ast.Sub,
+                    ast.Mult,
+                    ast.UnaryOp,
+                    ast.USub,
+                    ast.UAdd,
+                ),
+            )
+            and (not isinstance(node, ast.Constant) or type(node.value) is int)
+            for node in ast.walk(value.slice)
+        )
+    )
+
+
 def _find_vec_exp(
     root: ast.stmt,
     stop_at: ast.stmt | None,
-    scaled_names: set[str],
+    scaled_values: dict[str, float],
     cache_names: set[str],
 ) -> _VecExpMatch | None:
     """Find the (unique) constexpr vec loop under ``root`` (searching
     statements before ``stop_at`` only) whose body computes
-    ``cute.math.exp2(<expr> - <scaled>)`` reading exactly one fuse-cache
-    slot; return its canonical form."""
+    ``cute.math.exp2(<expr> - <scaled>)`` or its explicit FP32 FMA form,
+    reading exactly one fuse-cache slot; return its canonical form. The
+    canonical form retains the operation and rounding choice, so a fused
+    sum expression never matches an unfused output expression."""
     matches: list[_VecExpMatch] = []
     for node in ast.walk(root):
         if node is stop_at:
@@ -325,14 +416,18 @@ def _find_vec_exp(
                 if not _is_exp2(sub):
                     continue
                 arg = sub.args[0]
-                if not (
-                    isinstance(arg, ast.BinOp)
-                    and isinstance(arg.op, ast.Sub)
-                    and isinstance(arg.right, ast.Name)
-                    and arg.right.id in scaled_names
-                ):
+                scaled_name = _scaled_exp_subtrahend(arg, scaled_values)
+                if scaled_name is None:
                     continue
                 inlined = _inline_locals(arg, node.body, stmt)
+                if isinstance(inlined, ast.Call):
+                    # Keep the new admission limited to the emitter's
+                    # FP32 contraction, independently of the raw cache dtype.
+                    if not (
+                        _is_fp32_cache_read(inlined.args[0], cache_names)
+                        and sum(name == scaled_name for name in _loads(inlined)) == 1
+                    ):
+                        continue
                 cache_slots = [
                     s
                     for s in ast.walk(inlined)
@@ -343,14 +438,14 @@ def _find_vec_exp(
                 if len(cache_slots) != 1:
                     continue
                 canonical = _canonical_src(
-                    inlined, {vec_var: "_V_", arg.right.id: "_S_"}
+                    inlined, {vec_var: "_V_", scaled_name: "_S_"}
                 )
                 matches.append(
                     _VecExpMatch(
                         node,
                         stmt,
                         sub,
-                        arg.right.id,
+                        scaled_name,
                         copy.deepcopy(cache_slots[0].slice),
                         canonical,
                     )
@@ -539,9 +634,7 @@ def _try_rewrite_pair(
         return False
 
     # --- sweep B: the vec-loop exp2 keyed by one of the scaled vars.
-    match_b = _find_vec_exp(
-        site_b.for_node, site_b.assign, set(scaled_before), set(caches)
-    )
+    match_b = _find_vec_exp(site_b.for_node, site_b.assign, scaled_before, set(caches))
     if match_b is None:
         return False
     scaled0 = match_b.scaled_name
@@ -598,7 +691,12 @@ def _try_rewrite_pair(
         top = body[i]
         if not isinstance(top, ast.For):
             continue
-        found = _find_vec_exp(top, None, set(scaled_after), set(caches))
+        found = _find_vec_exp(
+            top,
+            None,
+            {name: value for name, (value, _) in scaled_after.items()},
+            set(caches),
+        )
         if found is not None:
             if match_c is not None:
                 return False
@@ -635,6 +733,24 @@ def _try_rewrite_pair(
     exp_cache = f"_pair_exp_cache_{k}"
     rescale = f"_pair_rescale_{k}"
     gmax = f"_pair_gmax_{k}"
+    negative_inf = f"_pair_negative_inf_{k}"
+    used_names = {
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+    }
+    used_names.update(canon(name) for name in tuple(used_names))
+    while negative_inf in used_names:
+        negative_inf += "_"
+    scale_assignments = [
+        node
+        for statement, _in_sweep_b in region
+        for node in ast.walk(statement)
+        if _is_name_assign(node) and node.targets[0].id == scaled0
+    ]
+    if len(scale_assignments) != 1:
+        return False
 
     # 1) site A -> CTA-local block reduce (drop buf/mbar args).
     block_args = ", ".join(ast.unparse(a) for a in site_a.call.args[:4])
@@ -642,6 +758,15 @@ def _try_rewrite_pair(
         f"_x = {_BLOCK_REDUCE}({block_args}, group_span={site_a.group_span})"
     ).value
     ast.fix_missing_locations(site_a.assign)
+
+    # An all--inf CTA slice contributes zero when another CTA has a finite
+    # maximum. Normalize that slice in the zero frame so exp(-inf - -inf)
+    # does not poison the local sum. Keep the true local maximum in the
+    # packed exchange: a globally all--inf row must still produce NaN, and
+    # NaN input elements continue to poison their local exponential/sum.
+    scale_assignments[0].value = _stmt(
+        f"_x = (cutlass.Float32(0) if {negative_inf} else {mi_name}) * {scale_const!r}"
+    ).value
 
     # 2) sweep B: name the exp2 (reuse an existing ``v = exp2(...)`` if the
     # emitter already produced one), cache it, and reference it in the
@@ -740,13 +865,26 @@ def _try_rewrite_pair(
 
     # 5) top-level declarations: the f32 exp cache next to the load cache,
     # and the rescale factor after the post-exchange scaled var.
-    rescale_stmts = [_stmt(f"{rescale} = cute.math.exp2({scaled0} - {scaled1})")]
+    # The empty slice's cached exponentials are zero. Select a zero rescale
+    # directly; evaluating exp(0 - a very negative global maximum) could
+    # overflow and turn a valid 0*scale into NaN. A globally invalid row
+    # still has a NaN denominator from the packed combine.
+    rescale_stmts = [
+        _stmt(
+            f"{rescale} = cutlass.Float32(0) if {negative_inf} "
+            f"else cute.math.exp2({scaled0} - {scaled1})"
+        )
+    ]
     if fold_scalar is not None:
         rescale_stmts.append(_stmt(f"{fold_scalar} = {fold_scalar} * {rescale}"))
     body[scaled1_idx + 1 : scaled1_idx + 1] = rescale_stmts
     body.insert(
         cache_alloc_idx + 1,
         _stmt(f"{exp_cache} = cute.make_rmem_tensor({cache_size}, cutlass.Float32)"),
+    )
+    body.insert(
+        body.index(site_a.for_node) + 1,
+        _stmt(f"{negative_inf} = {mi_name} == cutlass.Float32(float('-inf'))"),
     )
 
     # 6) preamble: site B's receive buffer becomes ``cluster_n`` Int64 pair

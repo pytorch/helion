@@ -18,6 +18,7 @@ from .reduction_strategy import ReductionStrategy
 from .reduction_strategy import cute_looped_reduction_block_size
 from .tile_strategy import CompactedShape
 from .tile_strategy import DeviceLoopState
+from .tile_strategy import PerThreadNDTileStrategy
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from .. import Config
+    from .cute.loop_nesting import TileLoopPath
     from .inductor_lowering import CodegenState
 
     SymIntLike = torch.SymInt | int
@@ -72,16 +74,63 @@ class TileStrategyDispatch:
         super().__init__()
         self.strategies: list[TileStrategy] = []
         self.block_id_to_strategy = BlockIDStrategyMapping()
+        self._cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.loop_nesting import tile_loop_paths
+
+            self._cute_tile_loop_paths = tile_loop_paths(
+                HostFunction.current().device_ir, fn.codegen.codegen_graphs
+            )
         self._add_loop_strategies(fn, config)
+        if CompileEnvironment.current().backend.name == "cute":
+            self._normalize_shared_tile_thread_extents()
         self._add_reduction_strategies(fn, config)
+
+    def _normalize_shared_tile_thread_extents(self) -> None:
+        """Repartition sibling tile loops over their common physical launch.
+
+        Separate loop paths reuse CUDA axes. Their launch takes each axis's
+        maximum extent, so using a narrower sibling's original thread count
+        in a lane loop overlaps its neighboring lane iterations. Resolve the
+        maximum before creating reductions or emitting any lane coordinates.
+        Only existing SIMT tile axes are widened; scalar and MMA axes keep
+        their ownership model.
+        """
+        if CompileEnvironment.current().config_spec.matmul_facts:
+            # Matrix layouts own additional physical-thread contracts beyond
+            # the scalar tile coordinates normalized here.
+            return
+        dims = self.thread_block_dims()
+        updates: list[tuple[PerThreadNDTileStrategy, dict[int, int]]] = []
+        for strategy in self.strategies:
+            if not isinstance(strategy, PerThreadNDTileStrategy) or strategy.mma_mode:
+                continue
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                continue
+            extents = {
+                block_id: dims[base_axis + local_axis]
+                for block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
+                    strategy
+                )
+                if size is not None
+                and base_axis + local_axis < len(dims)
+                and dims[base_axis + local_axis] > size
+            }
+            if extents:
+                updates.append((strategy, extents))
+        for strategy, extents in updates:
+            strategy.use_shared_thread_extents(extents)
 
     def _add_loop_strategies(self, fn: DeviceFunction, config: Config) -> None:
         device_ir = HostFunction.current().device_ir
         for block_ids in device_ir.grid_block_ids:
             self._add_loop_strategy(block_ids, fn, config)
         for graph in fn.codegen.codegen_graphs:
-            if isinstance(graph, ForLoopGraphInfo) and not isinstance(
-                graph, ReductionLoopGraphInfo
+            if (
+                isinstance(graph, ForLoopGraphInfo)
+                and not isinstance(graph, ReductionLoopGraphInfo)
+                and graph.block_ids
             ):
                 block_ids = [*graph.block_ids]
                 self._add_loop_strategy(block_ids, fn, config)
@@ -317,7 +366,8 @@ class TileStrategyDispatch:
 
         if num_grids <= 1:
             branched = self._branch_by_control_flow()
-            return branched if branched is not None else [self.strategies]
+            branches = branched if branched is not None else [self.strategies]
+            return self._branch_by_tile_loops(branches)
 
         loop_strategies = self.strategies[num_grids:]
         branches: list[list[TileStrategy]] = []
@@ -333,7 +383,31 @@ class TileStrategyDispatch:
                 if all(grid_max < bid < next_min for bid in ls.block_ids):
                     branch.append(ls)
             branches.append(branch)
-        return branches
+        return self._branch_by_tile_loops(branches)
+
+    def _branch_by_tile_loops(
+        self, branches: list[list[TileStrategy]]
+    ) -> list[list[TileStrategy]]:
+        """Let sibling CuTe tile passes reuse their nesting-level axes."""
+        paths = self._cute_tile_loop_paths
+        if not paths:
+            return branches
+        result: list[list[TileStrategy]] = []
+        for branch in branches:
+            shared = [s for s in branch if isinstance(s, ReductionStrategy)]
+            for path in paths:
+                nested = [
+                    strategy
+                    for block_ids in path
+                    for strategy in branch
+                    if tuple(strategy.block_ids) == block_ids
+                ]
+                if not nested:
+                    continue
+                candidate = [*nested, *shared]
+                if candidate not in result:
+                    result.append(candidate)
+        return result
 
     def _branch_by_control_flow(self) -> list[list[TileStrategy]] | None:
         """Split strategies into mutually-exclusive control-flow branches.
@@ -436,6 +510,15 @@ class TileStrategyDispatch:
             first in branch and second in branch for branch in self._strategy_branches()
         )
 
+    def strategies_cover_branches(
+        self, target: TileStrategy, candidates: Sequence[TileStrategy]
+    ) -> bool:
+        """Every branch containing target also contains a candidate strategy."""
+        branches = [branch for branch in self._strategy_branches() if target in branch]
+        return bool(branches) and all(
+            any(candidate in branch for candidate in candidates) for branch in branches
+        )
+
     def executable_reduction_block_ids(self) -> set[int]:
         """Reduction block IDs that correspond to executable reduction work."""
         spec = CompileEnvironment.current().config_spec
@@ -534,9 +617,11 @@ class TileStrategyDispatch:
         if base_axis is None:
             return False
         dims = self.thread_block_dims()
-        for _block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
+        for block_id, local_axis, size, _expr in self._iter_strategy_thread_axes(
             strategy
         ):
+            if isinstance(strategy, PerThreadNDTileStrategy) and size is not None:
+                size = strategy.thread_extent_for_masking(block_id, size)
             axis = base_axis + local_axis
             # ``size is None`` means the extent is dynamic; the static launch
             # dims cannot prove the launch matches, so keep the mask.
@@ -595,6 +680,8 @@ class TileStrategyDispatch:
             ) in self._iter_strategy_thread_axes(strategy):
                 if block_id != target_block_id:
                     continue
+                if isinstance(strategy, PerThreadNDTileStrategy) and size is not None:
+                    size = strategy.thread_extent_for_masking(block_id, size)
                 axis = base_axis + local_axis
                 if size is None or axis >= len(dims):
                     return True
