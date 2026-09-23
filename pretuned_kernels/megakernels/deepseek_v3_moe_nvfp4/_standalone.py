@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import signal_dependents
 from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
@@ -50,6 +51,7 @@ def standalone_router(
     expert_block = hl.register_block_size(2, 32)
     reduction_block = hl.register_block_size(256, 1024)
     for tile_row, tile_expert in hl.tile([rows, experts], block_size=[1, expert_block]):
+        signal_dependents()
         accumulator = hl.zeros([tile_row, tile_expert], dtype=torch.float32)
         for tile_k in hl.tile(hidden_size, block_size=reduction_block):
             accumulator = torch.addmm(
@@ -545,6 +547,7 @@ def shared_w13_nvfp4(
     row_block = hl.register_block_size(16, 16)
     group_block = hl.register_block_size(64, 64)
     for tile_row in hl.tile(twice_intermediate, block_size=row_block):
+        signal_dependents()
         weight_row = tile_row.index.to(torch.int64)
         accumulator = hl.zeros([row_block], dtype=torch.float32)
         for tile_group in hl.tile(hidden_groups, block_size=group_block):

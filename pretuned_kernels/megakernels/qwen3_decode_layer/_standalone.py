@@ -7,6 +7,7 @@ import math
 from typing import TYPE_CHECKING
 
 from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import signal_dependents
 from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
@@ -126,6 +127,7 @@ def rms_norm_per_block_quant(
     groups_per_row = scale.shape[1]
     hl.specialize(groups_per_row)
     for tile_m in hl.tile(num_tokens, block_size=1):
+        signal_dependents()
         rms = hl.zeros([tile_m], dtype=torch.float32)
         for tile_n in hl.tile(hidden_size):
             values = input[tile_m, tile_n].to(torch.float32)

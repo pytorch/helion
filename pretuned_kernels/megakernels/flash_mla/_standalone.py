@@ -8,6 +8,7 @@ import math
 from typing import TYPE_CHECKING
 
 from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import signal_dependents
 from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
@@ -71,6 +72,7 @@ def flash_mla_partial(
     for tile_task, tile_group in hl.tile(
         [num_tasks, num_head_groups], block_size=[1, 1]
     ):
+        signal_dependents()
         request = hl.load(task_requests, [tile_task.begin])
         task_start = hl.load(task_starts, [tile_task.begin])
         sequence_length = hl.load(seq_lens, [request])

@@ -15,6 +15,7 @@ from itertools import pairwise
 from typing import TYPE_CHECKING
 
 from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import signal_dependents
 from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
@@ -160,6 +161,7 @@ def mxfp4_top4_routing(
     )
     ids = torch.empty((tokens, top_k), dtype=torch.int32, device=routing_logits.device)
     for tile_t in hl.tile(tokens, block_size=1):
+        signal_dependents()
         logits = routing_logits[tile_t, :].to(torch.float32)
         expert_index = hl.arange(experts)
         first_value = torch.amax(logits, dim=-1)
