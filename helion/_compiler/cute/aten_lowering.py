@@ -542,7 +542,13 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None
         else cute_static_k_invariant_extent(lhs_node, rhs_node)
     )
+    from .collective_matmul import mark_collective_matmul
 
+    collective = mark_collective_matmul(
+        ctx, node, k_block_id=k_block_id, lhs=lhs, rhs=rhs, acc=acc
+    )
+    if collective is not None:
+        return collective
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 
@@ -794,7 +800,13 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None
         else cute_static_k_invariant_extent(lhs_node, rhs_node)
     )
+    from .collective_matmul import mark_collective_matmul
 
+    collective = mark_collective_matmul(
+        ctx, node, k_block_id=k_block_id, lhs=lhs, rhs=rhs, acc=acc
+    )
+    if collective is not None:
+        return collective
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 

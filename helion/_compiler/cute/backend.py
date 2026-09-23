@@ -1178,7 +1178,19 @@ class CuteBackend(Backend):
             or key == "cute_reduction_reloads"
             or key == "cute_async_store_policy"
             or key == "cute_bf16x2_recurrence"
+            or key == "cute_register_chain"
             or key == "cute_signed_bitfield_bf16"
+            or key == "cute_collective_mma"
+            or key == "cute_collective_static_layouts"
+            or key == "cute_collective_copy"
+            or key == "cute_collective_recipe"
+            or key == "cute_collective_operand_packets"
+            or key == "cute_collective_epilogue"
+            or key == "cute_collective_stages"
+            or key == "cute_collective_compute"
+            or key == "cute_collective_native_seeded"
+            or key == "cute_collective_tmem_seed"
+            or key == "cute_collective_tmem_a"
             or key == "cute_proven_bounds"
             or key == "cute_rng_packet"
             or key == "cute_independent_reduction"
@@ -2231,6 +2243,14 @@ class CuteBackend(Backend):
             x, y, z = direct_affine_plan.cta_shape
             check_thread_limit(x * y * z, context=str(direct_affine_plan.cta_shape))
             return launcher_args_with_compile_options(f"block=({x}, {y}, {z})")
+
+        register_chain_block_dims = (
+            device_function.cute_state.collective_register_chain_block_dims
+        )
+        if register_chain_block_dims is not None:
+            return launcher_args_with_compile_options(
+                f"block={register_chain_block_dims}"
+            )
 
         # The single-token rank-1 path owns the complete physical body.  The
         # original B1 schedule uses 256 threads while its batched schedule uses

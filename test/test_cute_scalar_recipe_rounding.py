@@ -5,11 +5,20 @@ import operator
 import struct
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _mock_cuda_unavailable
+
+import helion
 from helion._compiler.cute.scalar_recipe_rounding import preserve_fp32_multiply_rounding
+from helion._testing import skipUnlessBackends
+import helion.language as hl
+
+CUDA_DEVICE = "cuda"
 
 
 def _rewrite(source: str) -> str:
@@ -102,3 +111,75 @@ def test_explicit_fma_survives_with_a_separately_rounded_product_input() -> None
     )
     assert source.count("mul.rn.f32") == 1
     assert "cute.math.fma(" in source
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rounded_operand_dot(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), device=a.device, dtype=a.dtype)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            left = a[tile_m, tile_k].float()
+            row = a[tile_m, 0].float()
+            scaled = left * 1.44269504
+            decay = torch.exp2(scaled - row[:, None] * 1.44269504)
+            operand = ((decay * -1.25) * 0.953125).to(a.dtype)
+            acc = hl.dot(operand, b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@skipUnlessBackends(["cute"])
+def test_collective_rounding_boundary_respects_fast_math(
+    fast_math: bool, dtype: torch.dtype
+) -> None:
+    args = (torch.empty((64, 32), dtype=dtype), torch.empty((32, 32), dtype=dtype))
+    kernel = helion.kernel(
+        _rounded_operand_dot.fn,
+        backend="cute",
+        static_shapes=True,
+        fast_math=fast_math,
+        autotune_effort="none",
+    )
+    config = helion.Config(
+        block_sizes=[64, 32, 32],
+        num_threads=[4, 32, 1],
+        cute_vector_widths=[1, 1, 1],
+        cute_collective_mma=True,
+    )
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        source = _cpu_bind(kernel, args).to_code(config)
+    assert "cute.gemm(" in source
+    assert ("mul.rn.f32" in source) is not fast_math
+    if not fast_math:
+        assert "from helion._compiler.cute.inline_asm_helpers import" in source
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("copy", ["scalar", "async_cached"])
+@skipUnlessBackends(["cute"])
+def test_cancelled_exponent_preserves_halfway_operand_rounding(
+    dtype: torch.dtype, copy: str
+) -> None:
+    a = torch.full((64, 32), -12.125, dtype=dtype, device=CUDA_DEVICE)
+    b = torch.eye(32, dtype=dtype, device=CUDA_DEVICE)
+    bound = _rounded_operand_dot._bind_isolated((a, b))
+    bound.set_config(
+        helion.Config(
+            block_sizes=[64, 32, 32],
+            num_threads=[4, 32, 1],
+            cute_vector_widths=[1, 1, 1],
+            cute_collective_mma=True,
+            cute_collective_copy=copy,
+        )
+    )
+    expected = torch.full_like(a, -1.25 * 0.953125)
+    torch.testing.assert_close(bound(a, b), expected, atol=0, rtol=0)

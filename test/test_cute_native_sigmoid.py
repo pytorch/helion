@@ -74,6 +74,7 @@ def _native_config() -> helion.Config:
         tcgen05_acc_stages=2,
         tcgen05_c_stages=2,
         tcgen05_num_epi_warps=4,
+        cute_collective_mma=False,
     )
 
 
