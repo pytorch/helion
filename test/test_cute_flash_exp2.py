@@ -929,8 +929,24 @@ def test_degree2_packet_emits_exact_causal_pass2_arguments() -> None:
         )
 
 
-def test_sm103_packed_f16x2_rewrite_requires_exact_promoted_seed() -> None:
-    intermediate_source = _emit_dense_resident_value_graph_source(
+def test_sm103_packed_f16x2_rewrite_follows_the_schedule_not_the_seed() -> None:
+    """The packed rewrite tracks the schedule's preconditions, not a seed match.
+
+    It survives a config that walks off the promoted seed in a field the
+    lowering does not depend on, and it turns off when the config breaks a
+    field it does depend on. A KV size the policy does not name still gets the
+    standard body, because the lowering choice itself is still policy-owned.
+    """
+    promoted_source = _emit_dense_resident_value_graph_source(num_kv=2048)
+    off_seed_source = _emit_dense_resident_value_graph_source(
+        num_kv=2048,
+        config_overrides={cute_flash.FLASH_E2E_OFFSET0_KEY: 9},
+    )
+    broken_precondition_source = _emit_dense_resident_value_graph_source(
+        num_kv=2048,
+        config_overrides={cute_flash.FLASH_SP_ROW_SUM_KEY: "fragment"},
+    )
+    unseeded_source = _emit_dense_resident_value_graph_source(
         num_kv=384,
         config_overrides={
             cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta",
@@ -939,25 +955,28 @@ def test_sm103_packed_f16x2_rewrite_requires_exact_promoted_seed() -> None:
             cute_flash.FLASH_Q_TILE_COUNT_KEY: 2,
         },
     )
-    manual_source = _emit_dense_resident_value_graph_source(
-        num_kv=2048,
-        config_overrides={cute_flash.FLASH_E2E_OFFSET0_KEY: 9},
-    )
-    promoted_source = _emit_dense_resident_value_graph_source(num_kv=2048)
 
-    assert "f16x2_xu=True" not in intermediate_source
-    assert "f16x2_xu=True" not in manual_source
     assert "f16x2_xu=True" in promoted_source
+    assert "f16x2_xu=True" in off_seed_source
+    assert "f16x2_xu=True" not in broken_precondition_source
+    assert "f16x2_xu=True" not in unseeded_source
 
 
-def test_sm103_scaled_all_xu_codegen_requires_exact_rescale_threshold() -> None:
+def test_sm103_scaled_all_xu_probability_shift_fits_the_rescale_threshold() -> None:
+    """The stored probability shift shrinks to fit fp16 instead of bailing out.
+
+    A pinned probability reaches ``2**(shift + rescale_threshold)``, so the
+    policy's shift of 7 only fits up to a threshold of 8. Raising the threshold
+    lowers the shift and keeps the packed body; it must not silently drop back
+    to the standard body, which costs ~14% on GB300.
+    """
     all_xu_source = _emit_dense_resident_value_graph_source(num_kv=2048)
-    overflow_source = _emit_dense_resident_value_graph_source(
+    raised_source = _emit_dense_resident_value_graph_source(
         num_kv=2048,
-        config_overrides={cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 9.0},
+        config_overrides={cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 12.0},
     )
     all_xu_module = ast.parse(all_xu_source)
-    overflow_module = ast.parse(overflow_source)
+    raised_module = ast.parse(raised_source)
 
     def _pass2_calls(module: ast.Module) -> list[ast.Call]:
         return [
@@ -969,9 +988,9 @@ def test_sm103_scaled_all_xu_codegen_requires_exact_rescale_threshold() -> None:
         ]
 
     all_xu_calls = _pass2_calls(all_xu_module)
-    overflow_calls = _pass2_calls(overflow_module)
-    assert len(all_xu_calls) == len(overflow_calls) == 2
-    for call in all_xu_calls:
+    raised_calls = _pass2_calls(raised_module)
+    assert len(all_xu_calls) == len(raised_calls) == 2
+    for call in all_xu_calls + raised_calls:
         assert [ast.literal_eval(call.args[index]) for index in (6, 7, 8)] == [
             16,
             0,
@@ -984,10 +1003,14 @@ def test_sm103_scaled_all_xu_codegen_requires_exact_rescale_threshold() -> None:
     assert (
         "cutlass.Float32(7.0) - flash_row_max_safe * _flash_scale_log2" in all_xu_source
     )
-    for call in overflow_calls:
-        assert [ast.literal_eval(call.args[index]) for index in (6, 7)] == [16, 8]
-        assert not any(keyword.arg == "f16x2_xu" for keyword in call.keywords)
-    assert "cutlass.Float32(7.0)" not in overflow_source
+    # 3 + 12 == 15 < log2(65504); 7 + 12 would not fit.
+    assert (
+        "cutlass.Float32(3.0) - flash_row_max_safe * _flash_scale_log2" in raised_source
+    )
+    assert cute_flash._flash_fitted_probability_log2_shift(7, 12.0) == 3
+    assert cute_flash._flash_fitted_probability_log2_shift(7, 8.0) == 7
+    assert cute_flash._flash_fitted_probability_log2_shift(7, 0.0) == 7
+    assert cute_flash._flash_fitted_probability_log2_shift(7, 16.0) == 0
 
 
 def test_dense_target_seed_match_ignores_conflicting_environment() -> None:
@@ -1008,7 +1031,7 @@ def test_dense_target_seed_match_ignores_conflicting_environment() -> None:
         )
         policy = get_flash_target_policy((10, 3)).tuning.dense_policy(256)
         assert dense_cfg.wait_hint == 10000000
-        assert cute_flash._flash_dense_target_seed_matches(dense_cfg, policy)
+        assert cute_flash._flash_dense_lowering_schedule_supported(dense_cfg, policy)
 
 
 def test_dense_resident_value_graph_codegen_and_barrier_protocol() -> None:
@@ -1130,13 +1153,40 @@ def test_dense_resident_value_graph_gate_preserves_fallbacks() -> None:
         _emit_dense_resident_value_graph_source(num_kv=2048),
         _emit_dense_resident_value_graph_source(has_lse=True),
         _emit_dense_resident_value_graph_source(score_plan=modified_plan),
+        # Schedule fields the resident body depends on.
         _emit_dense_resident_value_graph_source(
-            config_overrides={cute_flash.FLASH_E2E_OFFSET_KEY: 4}
+            config_overrides={cute_flash.FLASH_SPLIT_P_ARRIVE_KEY: False}
+        ),
+        _emit_dense_resident_value_graph_source(
+            config_overrides={cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 0.0}
         ),
     )
     for fallback_source in fallback_sources:
         assert "resident_softmax_value_graph" not in fallback_source
         assert "fa4_sp_exp_convert_store_whole_rowsum" in fallback_source
+
+    # The whole-row statistics protocol is also a dependency, but selecting the
+    # fragment row sum picks a different pass-2 body, not the whole-row one.
+    fragment_source = _emit_dense_resident_value_graph_source(
+        config_overrides={cute_flash.FLASH_SP_ROW_SUM_KEY: "fragment"}
+    )
+    assert "resident_softmax_value_graph" not in fragment_source
+    assert "fa4_sp_exp_convert_store_whole_rowsum" not in fragment_source
+
+    # A field the resident body does NOT depend on must keep the lowering: the
+    # exact-seed gate this replaced made every such neighbour ~14% slower and
+    # pinned the autotuner to the seed.
+    for neighbour in (
+        {cute_flash.FLASH_E2E_OFFSET_KEY: 4},
+        {cute_flash.FLASH_KV_STAGE_KEY: 5},
+        {cute_flash.FLASH_CORR_TILE_SIZE_KEY: 16},
+        {cute_flash.FLASH_SOFTMAX_REGS_KEY: 184},
+        {cute_flash.FLASH_ROLE_MAP_KEY: "fa4"},
+    ):
+        neighbour_source = _emit_dense_resident_value_graph_source(
+            config_overrides=neighbour
+        )
+        assert "resident_softmax_value_graph" in neighbour_source, neighbour
 
 
 def test_dense_resident_softmax_lowering_dispatch_is_exhaustive() -> None:

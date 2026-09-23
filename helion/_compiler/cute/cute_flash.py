@@ -63,6 +63,7 @@ from .flash_schedule import FlashStatReleaseMapping
 from .flash_schedule import build_fa4_schedule
 from .flash_schedule import max_fa4_kv_depth
 from .flash_schedule import verify_flash_schedule
+from .flash_tuning import FLASH_FLOAT16_MAX_LOG2
 from .flash_tuning import FlashCausalSeedTemplate
 from .flash_tuning import FlashPackedExp2Mode
 from .flash_tuning import FlashSoftmaxLowering
@@ -3785,19 +3786,67 @@ def _flash_config_matches_tuning_values(
     return all(actual.get(key) == value for key, value in expected.items())
 
 
-def _flash_dense_target_seed_matches(
+def _flash_fitted_probability_log2_shift(shift: int, rescale_threshold: float) -> int:
+    """Return the largest legal probability shift at ``rescale_threshold``.
+
+    The specialized dense bodies store probabilities pre-scaled by
+    ``2**shift``, and alpha-pinning lets a stored probability reach
+    ``2**(shift + rescale_threshold)``, which has to stay inside fp16. Shrink
+    the shift to fit instead of abandoning the lowering: a shift of 0 is the
+    original unshifted body, so every threshold stays expressible.
+    """
+    headroom = int(math.floor(FLASH_FLOAT16_MAX_LOG2 - rescale_threshold))
+    return max(0, min(shift, headroom))
+
+
+def _flash_dense_lowering_schedule_supported(
     cfg: FlashAttentionConfig,
     policy: FlashDenseTuningPolicy | None,
 ) -> bool:
-    """Return whether ``cfg`` is the validated target-promoted dense seed."""
+    """Return whether ``cfg``'s schedule can host the policy's dense lowering.
+
+    The specialized dense bodies (resident value graph, packed f16x2 exp2)
+    replace the whole per-KV softmax value graph, so they need the surrounding
+    FA4 schedule to supply exactly the barrier protocol, TMEM repetitions and
+    statistics handoff they were written against. Only those structural
+    requirements belong here.
+
+    In particular this must NOT require ``cfg`` to equal the promoted seed
+    field for field. Doing that turns every neighbour of the seed into a
+    silent fallback to the standard body, which measured ~14% slower on
+    ``2x32x32768x64`` fp16 -- a cliff the autotuner cannot climb out of, so the
+    search converges back onto the seed no matter how long it runs.
+    """
     if policy is None:
         return False
-    return _flash_config_matches_tuning_values(
-        cfg,
-        {
-            **_flash_dense_tuning_overrides(policy),
-            FLASH_Q_TILE_COUNT_KEY: 2,
-        },
+    lowering = policy.softmax_lowering
+    packed = policy.packed_exp2_mode
+    if (
+        lowering is FlashSoftmaxLowering.STANDARD
+        and packed is FlashPackedExp2Mode.DISABLED
+    ):
+        return False
+    if not (
+        cfg.pipeline_family == "fa4_2cta"
+        and not cfg.persistent
+        and cfg.q_tile_count == 2
+        and cfg.split_p_arrive
+        and cfg.exp2_impl == "split"
+        # Both bodies are whole-row value graphs; the chunked ("disc") body
+        # runs a different barrier protocol.
+        and not cfg.softmax_disc
+        and cfg.sp_row_sum == "whole"
+        and cfg.e2e_schedule != "xu"
+        # Both bodies pin alpha, so the rescale-skip lever must be armed.
+        and cfg.rescale_threshold > 0.0
+    ):
+        return False
+    if lowering is FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH:
+        # The resident value graph acknowledges the statistics slot per KV
+        # tile, which is the ``single`` transport's protocol.
+        return cfg.stat_transport == "single"
+    return cfg.stat_transport in ("single", "single_final") and (
+        cfg.exp2_packet in _FLASH_DEG1_EXP2_PACKETS
     )
 
 
@@ -7112,7 +7161,9 @@ def emit_flash_fa4_device_body(
     probability_log2_shift = (
         dense_tuning.probability_log2_shift if dense_tuning is not None else 0
     )
-    dense_seed_matches = _flash_dense_target_seed_matches(cfg, dense_tuning)
+    dense_lowering_schedule_ok = _flash_dense_lowering_schedule_supported(
+        cfg, dense_tuning
+    )
     dense_softmax_lowering = (
         dense_tuning.softmax_lowering
         if dense_tuning is not None
@@ -7125,9 +7176,11 @@ def emit_flash_fa4_device_body(
     )
     dense_target_lowering_applies = (
         dense_tuning is not None
-        and dense_seed_matches
+        and dense_lowering_schedule_ok
         and not is_causal
         and not has_lse
+        # Both bodies read the score tile through the whole-row TMEM reduction.
+        and use_tmem_row_reduce
         and cfg.use_2cta_instrs
         and not cfg.separate_kv_rings
         and not cfg.softmax_disc
@@ -7210,7 +7263,9 @@ def emit_flash_fa4_device_body(
         and cfg.exp2_packet in _FLASH_DEG1_EXP2_PACKETS
     )
     effective_probability_log2_shift = (
-        probability_log2_shift
+        _flash_fitted_probability_log2_shift(
+            probability_log2_shift, cfg.rescale_threshold
+        )
         if use_packed_f16x2_xu or dense_resident_value_graph_candidate
         else 0
     )
