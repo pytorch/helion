@@ -1,10 +1,12 @@
 # ruff: noqa: ANN001, ANN202
-"""Matched separate-launch Helion baseline for the Gemma 4 A4B MoE probe."""
+"""Matched PDL-enabled Helion baseline for the Gemma 4 A4B MoE probe."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
 import helion
@@ -89,6 +91,7 @@ def route_candidates(logits, top_k):
         (batch, groups, top_k), dtype=torch.int32, device=logits.device
     )
     for tile_m, tile_group in hl.tile([batch, groups], block_size=[1, 1]):
+        wait_and_launch_dependents()
         token = tile_m.begin
         group = tile_group.begin
         experts = group * group_size + hl.arange(group_size)
@@ -112,6 +115,7 @@ def route_merge(candidate_values, candidate_ids, per_expert_scale, top_k):
         (batch, top_k), dtype=torch.int32, device=candidate_values.device
     )
     for tile_m in hl.tile(batch, block_size=1):
+        wait_and_launch_dependents()
         token = tile_m.begin
         values, positions = torch.topk(
             values_flat[token, :], top_k, dim=-1, largest=True
@@ -153,6 +157,7 @@ def expert_gate_up(
     for tile_m, tile_slot, tile_i in hl.tile(
         [batch, top_k, intermediate], block_size=[1, 1, None]
     ):
+        wait_and_launch_dependents()
         token = tile_m.begin
         slot = tile_slot.begin
         selected_expert = topk_ids[token, slot]
@@ -188,6 +193,7 @@ def expert_geglu(gate_up):
         (assignments, intermediate), dtype=gate_up.dtype, device=gate_up.device
     )
     for tile_m, tile_i in hl.tile([assignments, intermediate], block_size=[1, None]):
+        wait_and_launch_dependents()
         gate = gate_up[tile_m, tile_i].to(torch.float32)
         up = gate_up[tile_m, tile_i + intermediate]
         output[tile_m, tile_i] = (
@@ -219,6 +225,7 @@ def expert_down(activation, expert_weight, selected_ids, selected_weights):
     for tile_m, tile_slot, tile_n in hl.tile(
         [batch, top_k, hidden], block_size=[1, 1, None]
     ):
+        wait_and_launch_dependents()
         token = tile_m.begin
         slot = tile_slot.begin
         selected_expert = selected_ids[token, slot]
@@ -240,6 +247,7 @@ def expert_reduce(expert_outputs):
         (batch, hidden), dtype=expert_outputs.dtype, device=expert_outputs.device
     )
     for tile_m, tile_n in hl.tile([batch, hidden], block_size=[1, None]):
+        wait_and_launch_dependents()
         values = expert_outputs[tile_m, :, tile_n].to(torch.float32)
         output[tile_m, tile_n] = torch.sum(values, dim=1).to(output.dtype)
     return output
@@ -251,6 +259,7 @@ def post_norm(x, weight, eps):
     hl.specialize(hidden)
     output = torch.empty_like(x)
     for tile_m in hl.tile(batch, block_size=1):
+        wait_and_launch_dependents()
         values = x[tile_m, :].to(torch.float32)
         inv_rms = torch.rsqrt(torch.mean(values * values, dim=-1) + eps)
         normalized = (values * inv_rms[:, None]).to(x.dtype)
@@ -281,11 +290,11 @@ def build(
 
     candidate_args = (router_logits, top_k)
     candidates = _compile(route_candidates, candidate_args, "route_candidates")
-    candidate_values, candidate_ids = candidates(*candidate_args)
+    candidate_values, candidate_ids = launch_dependent(candidates, *candidate_args)
 
     merge_args = (candidate_values, candidate_ids, tensors["per_expert_scale"], top_k)
     merge = _compile(route_merge, merge_args, "route_merge")
-    topk_weights, topk_ids = merge(*merge_args)
+    topk_weights, topk_ids = launch_dependent(merge, *merge_args)
 
     gate_up_args = (
         tensors["residual"],
@@ -296,11 +305,13 @@ def build(
         eps,
     )
     gate_up_kernel = _compile(expert_gate_up, gate_up_args, "expert_gate_up")
-    gate_up, selected_ids, selected_weights = gate_up_kernel(*gate_up_args)
+    gate_up, selected_ids, selected_weights = launch_dependent(
+        gate_up_kernel, *gate_up_args
+    )
 
     geglu_args = (gate_up,)
     geglu = _compile(expert_geglu, geglu_args, "expert_geglu")
-    activation = geglu(*geglu_args)
+    activation = launch_dependent(geglu, *geglu_args)
 
     down_args = (
         activation,
@@ -309,26 +320,30 @@ def build(
         selected_weights,
     )
     down = _compile(expert_down, down_args, "expert_down")
-    expert_outputs = down(*down_args)
+    expert_outputs = launch_dependent(down, *down_args)
 
     reduce_args = (expert_outputs,)
     reduce = _compile(expert_reduce, reduce_args, "expert_reduce")
-    moe_down = reduce(*reduce_args)
+    moe_down = launch_dependent(reduce, *reduce_args)
 
     post_args = (moe_down, tensors["post_ff_norm_weight"], eps)
     post = _compile(post_norm, post_args, "post_norm")
-    moe_branch = post(*post_args)
+    moe_branch = launch_dependent(post, *post_args)
 
     def launch() -> tuple[torch.Tensor, ...]:
         local_logits = router(*router_args)
-        local_candidates, local_candidate_ids = candidates(local_logits, top_k)
-        local_weights, local_ids = merge(
+        local_candidates, local_candidate_ids = launch_dependent(
+            candidates, local_logits, top_k
+        )
+        local_weights, local_ids = launch_dependent(
+            merge,
             local_candidates,
             local_candidate_ids,
             tensors["per_expert_scale"],
             top_k,
         )
-        local_gate_up, local_selected_ids, local_selected_weights = gate_up_kernel(
+        local_gate_up, local_selected_ids, local_selected_weights = launch_dependent(
+            gate_up_kernel,
             tensors["residual"],
             tensors["pre_ff_norm_weight"],
             tensors["expert_gate_up_weight"],
@@ -336,15 +351,18 @@ def build(
             local_weights,
             eps,
         )
-        local_activation = geglu(local_gate_up)
-        local_expert_outputs = down(
+        local_activation = launch_dependent(geglu, local_gate_up)
+        local_expert_outputs = launch_dependent(
+            down,
             local_activation,
             tensors["expert_down_weight"],
             local_selected_ids,
             local_selected_weights,
         )
-        local_down = reduce(local_expert_outputs)
-        local_branch = post(local_down, tensors["post_ff_norm_weight"], eps)
+        local_down = launch_dependent(reduce, local_expert_outputs)
+        local_branch = launch_dependent(
+            post, local_down, tensors["post_ff_norm_weight"], eps
+        )
         return (
             local_branch,
             local_logits,

@@ -2,8 +2,8 @@
 # pyrefly: ignore-errors
 """Helion GPT-OSS native-MXFP4 MoE kernels for batch size one.
 
-The four kernels mirror FlashInfer's monolithic TRT-LLM launch boundaries:
-routing, GEMM1 plus OAI SwiGLU, GEMM2 plus bias, and weighted finalization.
+The four PDL-chained kernels mirror FlashInfer's monolithic TRT-LLM launch
+boundaries: routing, GEMM1 plus OAI SwiGLU, GEMM2 plus bias, and weighted finalization.
 The GEMMs consume the post-load FlashInfer weight, bias, and scale layouts
 directly.  MXFP4 arithmetic uses native ``hl.dot_scaled`` tensor-core ops.
 """
@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
+from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
 import helion
@@ -426,6 +428,7 @@ def mxfp4_moe_gemm1_swiglu_oai_decode(
     for tile_slot, tile_physical_row in hl.tile(
         [top_k, twice_intermediate], block_size=[1, block_physical_row]
     ):
+        wait_and_launch_dependents()
         slot = tile_slot.begin
         expert = topk_ids[0, slot]
         expert_row = expert * twice_intermediate + tile_physical_row.index
@@ -515,6 +518,7 @@ def mxfp4_moe_gemm2_decode(
     for tile_slot, tile_physical_row in hl.tile(
         [top_k, hidden], block_size=[1, block_physical_row]
     ):
+        wait_and_launch_dependents()
         slot = tile_slot.begin
         expert = topk_ids[0, slot]
         expert_row = expert * hidden + tile_physical_row.index
@@ -587,6 +591,7 @@ def mxfp4_moe_finalize(
     )
     weights = topk_weights.view(top_k)
     for tile_n in hl.tile(output_hidden):
+        wait_and_launch_dependents()
         values = expert_output[:, tile_n].to(torch.float32)
         output[:, tile_n] = torch.sum(
             values * weights[:, None].to(torch.float32),
@@ -864,7 +869,7 @@ def build(
         gemm1_args,
         "gemm1_swiglu_oai",
     )
-    activation = gemm1(*gemm1_args)
+    activation = launch_dependent(gemm1, *gemm1_args)
 
     gemm2_args = (
         activation,
@@ -874,29 +879,32 @@ def build(
         ids,
     )
     gemm2 = _compile(mxfp4_moe_gemm2_decode, gemm2_args, "gemm2")
-    expert_output = gemm2(*gemm2_args)
+    expert_output = launch_dependent(gemm2, *gemm2_args)
 
     finalize_args = (expert_output, weights, shape.output_hidden)
     finalize = _compile(mxfp4_moe_finalize, finalize_args, "finalize")
-    output = finalize(*finalize_args)
+    output = launch_dependent(finalize, *finalize_args)
 
     def launch() -> tuple[torch.Tensor, ...]:
         local_weights, local_ids = routing(*routing_args)
-        local_activation = gemm1(
+        local_activation = launch_dependent(
+            gemm1,
             tensors["hidden"],
             tensors["w13"],
             tensors["w13_scale"].view(torch.uint8),
             tensors["w13_bias"],
             local_ids,
         )
-        local_expert_output = gemm2(
+        local_expert_output = launch_dependent(
+            gemm2,
             local_activation,
             tensors["w2"],
             tensors["w2_scale"].view(torch.uint8),
             tensors["w2_bias"],
             local_ids,
         )
-        local_output = finalize(
+        local_output = launch_dependent(
+            finalize,
             local_expert_output,
             local_weights,
             shape.output_hidden,

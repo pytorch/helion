@@ -4,7 +4,8 @@
 
 The single kernel preserves the production routing, gate/up plus OAI SwiGLU,
 down projection plus bias, and weighted-finalization boundaries.  The matched
-standalone baseline uses the same Helion operations as four CUDA launches.
+standalone baseline uses the same Helion operations as four PDL-chained CUDA
+launches.
 """
 
 from __future__ import annotations
@@ -672,7 +673,7 @@ def main(verbose: bool = True) -> dict:
         return (
             persistent_graph.replay,
             [
-                ("standalone_helion", standalone_graph.replay),
+                ("standalone_helion_pdl", standalone_graph.replay),
                 (f"vllm_auto ({backend})", vllm_graph.replay),
             ],
             (

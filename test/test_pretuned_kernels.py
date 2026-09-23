@@ -1215,7 +1215,7 @@ class TestPretunedKernelsPerformance(TestCase):
         actual = _run_pretuned_kernel_main_and_parse_summary(name)
         gated_actual = actual
         if name in _MATCHED_STANDALONE_GEOMEAN_FLOOR:
-            standalone = actual["baselines"]["standalone_helion"]
+            standalone = actual["baselines"]["standalone_helion_pdl"]
             self.assertGreaterEqual(
                 standalone["geomean"],
                 _MATCHED_STANDALONE_GEOMEAN_FLOOR[name],

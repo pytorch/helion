@@ -1,11 +1,13 @@
 # ruff: noqa: A001, A002, ANN001, ANN202
-"""Matched separate-launch Helion baseline for the Qwen3 decode-layer probe."""
+"""Matched PDL-enabled Helion baseline for the Qwen3 decode-layer probe."""
 
 from __future__ import annotations
 
 import math
 from typing import TYPE_CHECKING
 
+from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
 import helion
@@ -160,6 +162,59 @@ def rms_norm_per_block_quant(
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none", backend="triton")
+def rms_norm_per_block_quant_pdl(
+    result,
+    input,
+    weight,
+    scale,
+    epsilon,
+    residual,
+    group_size,
+):
+    """Downstream RMSNorm/quant launch with a programmatic dependency."""
+    num_tokens, hidden_size = input.shape
+    hl.specialize(hidden_size)
+    hl.specialize(group_size)
+    groups_per_row = scale.shape[1]
+    hl.specialize(groups_per_row)
+    for tile_m in hl.tile(num_tokens, block_size=1):
+        wait_and_launch_dependents()
+        rms = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(hidden_size):
+            values = input[tile_m, tile_n].to(torch.float32)
+            if residual is not None:
+                values = values + residual[tile_m, tile_n]
+            rms = rms + values.pow(2).sum(dim=-1)
+        rms = torch.rsqrt(rms * (1.0 / hidden_size) + epsilon)
+
+        m_idx = tile_m.begin + hl.arange(tile_m.block_size)
+        m_block = m_idx[:, None, None]
+        for tile_group, tile_n in hl.tile(
+            [groups_per_row, group_size], block_size=[None, group_size]
+        ):
+            group_idx = tile_group.index
+            n_idx = group_idx[:, None] * group_size + tile_n.index[None, :]
+            n_block = n_idx[None, :, :]
+            values = input[m_block, n_block].to(torch.float32)
+            if residual is not None:
+                values = values + residual[m_block, n_block]
+            normalized = (values * rms[:, None, None]).to(torch.bfloat16) * weight[
+                n_block
+            ]
+            quant_scale = (
+                torch.amax(torch.abs(normalized), dim=-1).to(torch.float32) / FP8_MAX
+            ).clamp(min=FP8_MIN_SCALE)
+            scale[tile_m, tile_group] = quant_scale
+            result[m_block, n_block] = (
+                (normalized / quant_scale[:, :, None])
+                .clamp(FP8_MIN, FP8_MAX)
+                .to(result.dtype)
+            )
+            if residual is not None:
+                residual[m_block, n_block] = values.to(residual.dtype)
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none", backend="triton")
 def block_fp8_mm(activation_q, activation_scale, weight_q, weight_scale, group_size):
     m, k = activation_q.size()
     n, weight_k = weight_q.size()
@@ -167,6 +222,7 @@ def block_fp8_mm(activation_q, activation_scale, weight_q, weight_scale, group_s
     hl.specialize(group_size)
     output = torch.empty((m, n), dtype=torch.bfloat16, device=activation_q.device)
     for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+        wait_and_launch_dependents()
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k, block_size=group_size):
             partial = hl.dot(
@@ -209,6 +265,7 @@ def fused_qk_norm_rope(
     embed_dim = rotary_dim // 2
     qk_width = (num_heads_q + num_heads_k) * head_dim
     for tile_m, tile_n in hl.tile([num_tokens, qk_width], block_size=[1, head_dim]):
+        wait_and_launch_dependents()
         x = qkv[tile_m, tile_n].to(torch.float32)
         rms = torch.rsqrt(x.pow(2).sum(-1) * (1.0 / head_dim) + eps)
         dimension = tile_n.index - tile_n.begin
@@ -238,6 +295,7 @@ def reshape_and_cache_flash(key, value, kv_cache, slot_mapping, block_size):
         [num_tokens, num_kv_heads, head_dim],
         block_size=[1, 1, head_dim],
     ):
+        wait_and_launch_dependents()
         token = tile_t.index
         cache_head = tile_h.index
         dimension = tile_d.index
@@ -325,6 +383,7 @@ def paged_gqa_decode_attention_split(
     for tile_split, tile_bg, tile_q in hl.tile(
         [splits, token_kv_heads, q_per_kv], block_size=[1, 1, None]
     ):
+        wait_and_launch_dependents()
         m_i = hl.full([tile_bg, tile_q], -3.4028234663852886e38, dtype=torch.float32)
         l_i = hl.full([tile_bg, tile_q], 1.0, dtype=torch.float32)
         acc = hl.zeros([tile_bg, tile_q, head_dim], dtype=torch.float32)
@@ -420,6 +479,7 @@ def merge_attention_splits(partial_out, partial_lse, merge_chunks):
     for tile_chunk, tile_head in hl.tile(
         [merge_chunks, query_heads], block_size=[1, 1]
     ):
+        wait_and_launch_dependents()
         split_idx = (
             tile_chunk.index[:, None] * splits_per_chunk
             + hl.arange(splits_per_chunk)[None, :]
@@ -442,6 +502,7 @@ def merge_attention_splits(partial_out, partial_lse, merge_chunks):
         chunk_out[tile_chunk, tile_head, :] = merged
         chunk_lse[tile_chunk, tile_head] = max_lse + torch.log2(denominator)
     for final_head in hl.tile(query_heads, block_size=1):
+        wait_and_launch_dependents()
         chunk_idx = hl.arange(merge_chunks)
         lse_offsets = chunk_idx[:, None] * query_heads + final_head.index[None, :]
         lse_values = chunk_lse_storage[lse_offsets]
@@ -476,6 +537,7 @@ def per_token_group_fp8_quant(
         [num_tokens, groups_per_row, group_size],
         block_size=[1, None, group_size],
     ):
+        wait_and_launch_dependents()
         values = input[tile_m, tile_group, tile_n]
         scale = torch.amax(torch.abs(values), dim=-1).clamp(min=eps) / FP8_MAX
         output_s[tile_m, tile_group] = scale
@@ -497,6 +559,7 @@ def silu_and_mul_per_block_quant(gate_up, group_size):
         (m, groups), dtype=torch.float32, device=gate_up.device
     )
     for tile_m, tile_i in hl.tile([m, intermediate], block_size=[1, group_size]):
+        wait_and_launch_dependents()
         gate = gate_up[tile_m, tile_i].to(torch.float32)
         up = gate_up[tile_m, tile_i + intermediate].to(torch.float32)
         activated = gate * torch.sigmoid(gate) * up
@@ -533,7 +596,7 @@ def build(
     group: int,
     eps: float,
 ) -> tuple[Callable[[], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]:
-    """Compile and materialize the matched twelve-launch decoder graph."""
+    """Compile and materialize the matched twelve-launch PDL decoder graph."""
     rms_args = (
         tensors["pre_q"],
         tensors["hidden_states"],
@@ -554,7 +617,7 @@ def build(
         group,
     )
     qkv_mm = _compile(block_fp8_mm, qkv_args, QKV_CONFIG)
-    qkv = qkv_mm(*qkv_args)
+    qkv = launch_dependent(qkv_mm, *qkv_args)
 
     qk_args = (
         qkv,
@@ -569,7 +632,7 @@ def build(
         tensors["position"],
     )
     qk = _compile(fused_qk_norm_rope, qk_args, GRANULAR_CONFIG)
-    qk(*qk_args)
+    launch_dependent(qk, *qk_args)
     key_begin = q_heads * head_dim
     qkv_width = (q_heads + 2 * kv_heads) * head_dim
     query = qkv[:, :key_begin].view(-1, q_heads, head_dim)
@@ -582,7 +645,7 @@ def build(
 
     cache_args = (key, value, tensors["kv_cache"], tensors["slot_mapping"], cache_block)
     cache = _compile(reshape_and_cache_flash, cache_args, GRANULAR_CONFIG)
-    cache(*cache_args)
+    launch_dependent(cache, *cache_args)
 
     attention_args = (
         query,
@@ -597,11 +660,11 @@ def build(
     attention_split = _compile(
         paged_gqa_decode_attention_split, attention_args, GRANULAR_CONFIG
     )
-    partial_out, partial_lse = attention_split(*attention_args)
+    partial_out, partial_lse = launch_dependent(attention_split, *attention_args)
 
     merge_args = (partial_out, partial_lse, 16)
     merge = _compile(merge_attention_splits, merge_args, GRANULAR_CONFIG)
-    attention = merge(*merge_args)
+    attention = launch_dependent(merge, *merge_args)
 
     attention_quant_args = (
         attention.view(-1, hidden),
@@ -615,7 +678,7 @@ def build(
         attention_quant_args,
         ATTENTION_QUANT_CONFIG,
     )
-    attention_quant(*attention_quant_args)
+    launch_dependent(attention_quant, *attention_quant_args)
 
     o_args = (
         tensors["attention_q"],
@@ -625,7 +688,7 @@ def build(
         group,
     )
     o_mm = _compile(block_fp8_mm, o_args, O_CONFIG)
-    attention_out = o_mm(*o_args)
+    attention_out = launch_dependent(o_mm, *o_args)
 
     post_args = (
         tensors["ffn_q"],
@@ -636,7 +699,8 @@ def build(
         tensors["residual"],
         group,
     )
-    rms(*post_args)
+    post_rms = _compile(rms_norm_per_block_quant_pdl, post_args, RMS_CONFIG)
+    launch_dependent(post_rms, *post_args)
 
     w13_args = (
         tensors["ffn_q"],
@@ -646,13 +710,13 @@ def build(
         group,
     )
     w13 = _compile(block_fp8_mm, w13_args, W13_CONFIG)
-    gate_up = w13(*w13_args)
+    gate_up = launch_dependent(w13, *w13_args)
 
     activation_args = (gate_up, group)
     activation = _compile(
         silu_and_mul_per_block_quant, activation_args, ACTIVATION_CONFIG
     )
-    activation_q, activation_scale = activation(*activation_args)
+    activation_q, activation_scale = launch_dependent(activation, *activation_args)
 
     w2_args = (
         activation_q,
@@ -662,12 +726,12 @@ def build(
         group,
     )
     w2 = _compile(block_fp8_mm, w2_args, W2_CONFIG)
-    output = w2(*w2_args)
+    output = launch_dependent(w2, *w2_args)
 
     def launch() -> tuple[torch.Tensor, ...]:
         rms(*rms_args)
-        local_qkv = qkv_mm(*qkv_args)
-        qk(local_qkv, *qk_args[1:])
+        local_qkv = launch_dependent(qkv_mm, *qkv_args)
+        launch_dependent(qk, local_qkv, *qk_args[1:])
         local_query = local_qkv[:, :key_begin].view(-1, q_heads, head_dim)
         local_key = local_qkv[:, key_begin : key_begin + kv_heads * head_dim].view(
             -1, kv_heads, head_dim
@@ -675,14 +739,16 @@ def build(
         local_value = local_qkv[:, key_begin + kv_heads * head_dim : qkv_width].view(
             -1, kv_heads, head_dim
         )
-        cache(
+        launch_dependent(
+            cache,
             local_key,
             local_value,
             tensors["kv_cache"],
             tensors["slot_mapping"],
             cache_block,
         )
-        local_partials, local_lse = attention_split(
+        local_partials, local_lse = launch_dependent(
+            attention_split,
             local_query,
             tensors["kv_cache"],
             tensors["block_table"],
@@ -692,16 +758,18 @@ def build(
             q_heads // kv_heads,
             attention_splits,
         )
-        local_attention = merge(local_partials, local_lse, 16)
-        attention_quant(
+        local_attention = launch_dependent(merge, local_partials, local_lse, 16)
+        launch_dependent(
+            attention_quant,
             local_attention.view(-1, hidden),
             tensors["attention_q"],
             tensors["attention_scale"],
             group,
             1e-10,
         )
-        local_attention_out = o_mm(*o_args)
-        rms(
+        local_attention_out = launch_dependent(o_mm, *o_args)
+        launch_dependent(
+            post_rms,
             tensors["ffn_q"],
             local_attention_out,
             tensors["post_weight"],
@@ -710,9 +778,12 @@ def build(
             tensors["residual"],
             group,
         )
-        local_gate_up = w13(*w13_args)
-        local_activation_q, local_activation_scale = activation(local_gate_up, group)
-        local_output = w2(
+        local_gate_up = launch_dependent(w13, *w13_args)
+        local_activation_q, local_activation_scale = launch_dependent(
+            activation, local_gate_up, group
+        )
+        local_output = launch_dependent(
+            w2,
             local_activation_q,
             local_activation_scale,
             tensors["w2_q"],
