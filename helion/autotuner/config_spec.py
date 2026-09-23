@@ -852,6 +852,14 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_reduction_schedule",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_reduction_group_rows",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
@@ -932,6 +940,14 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_reduction_schedule",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_reduction_group_rows",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
@@ -1016,6 +1032,14 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "num_sm_multiplier",
         "maxnreg",
+        "cute_reduction_schedule",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_reduction_group_rows",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
@@ -1184,6 +1208,8 @@ class ConfigSpec:
         )
         # Device-IR facts enable this only for plausible in-place 16-bit state
         # updates. Generated-AST matching is stricter and remains authoritative.
+        self.cute_resident_reduction_blocks: set[int] = set()
+        self.cute_sequence_reduction_blocks: set[int] = set()
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
@@ -1268,6 +1294,7 @@ class ConfigSpec:
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
+        self.cute_host_paired_sum_available: bool = False
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
         # and behavior is byte-identical to the env-only path. Set True when the
@@ -2562,6 +2589,160 @@ class ConfigSpec:
             raise InvalidConfig("packet prefetch requires CuTe")
         self.cute_packet_prefetch_enabled = True
 
+    def _normalize_cute_host_paired_sum(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_host_paired_sum"
+        value = config.get(key, "off")
+        if not self.cute_host_paired_sum_available:
+            if value != "off" and not fix_invalid:
+                raise InvalidConfig(
+                    "host sums require a typed independent pair or terminal sum/cast"
+                )
+            config.pop(key, None)
+            return
+        if value not in ("off", "mapped", "narrow"):
+            if not fix_invalid:
+                raise InvalidConfig(f"unsupported paired host sum layout: {value!r}")
+            value = "off"
+        config[key] = value
+
+    def _normalize_cute_reduction_sequence(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_reduction_sequence"
+        if not self.cute_sequence_reduction_blocks:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "resident sequences require a device-tile reduction chain"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, "scalar")
+        if value not in ("scalar", "reload", "resident", "bounded", "bounded_layout"):
+            if fix_invalid:
+                config[key] = "scalar"
+            else:
+                raise InvalidConfig(f"unsupported CuTe reduction sequence: {value!r}")
+
+    def _normalize_cute_reduction_local_tree(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_reduction_local_tree"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_resident_reduction_blocks
+            and config.get("cute_reduction_schedule") in ("resident", "pipelined")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+        else:
+            raise InvalidConfig(
+                "cute_reduction_local_tree requires a resident FP32 sum schedule"
+            )
+
+    def _normalize_cute_reduction_row_output(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        row_key = "cute_reduction_row_schedule"
+        pack_key = "cute_reduction_pack_output"
+        row = config.get(row_key, "batched")
+        resident = bool(self.cute_resident_reduction_blocks) and config.get(
+            "cute_reduction_schedule"
+        ) in ("resident", "pipelined")
+        if row == "batched":
+            config.pop(row_key, None)
+        elif (
+            type(row) is str
+            and row in ("serial", "serial_deferred")
+            and resident
+            and (
+                row != "serial_deferred"
+                or (
+                    config.get("cute_reduction_schedule") == "pipelined"
+                    and config.get("cute_reduction_pipeline_depth", 2) == 2
+                )
+            )
+        ):
+            pass
+        elif fix_invalid:
+            config.pop(row_key, None)
+        else:
+            raise InvalidConfig(
+                f"{row_key} requires a resident schedule; deferred retirement requires a two-slot pipeline"
+            )
+        pack = config.get(pack_key, False)
+        if pack is False:
+            config.pop(pack_key, None)
+        elif (
+            pack is True
+            and resident
+            and self.target_device_capability is not None
+            and self.target_device_capability[0] == 10
+        ):
+            pass
+        elif fix_invalid:
+            config.pop(pack_key, None)
+        else:
+            raise InvalidConfig(
+                f"{pack_key} requires a Boolean and a resident FP32 output product on SM100"
+            )
+
+    def _normalize_cute_reduction_schedule(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_reduction_schedule"
+        group_key = "cute_reduction_group_rows"
+        depth_key = "cute_reduction_pipeline_depth"
+        if not self.cute_resident_reduction_blocks:
+            if (
+                any(k in config for k in (key, group_key, depth_key))
+                and not fix_invalid
+            ):
+                raise InvalidConfig(
+                    "resident CuTe reductions require static serial-row sums"
+                )
+            config.pop(key, None)
+            config.pop(group_key, None)
+            config.pop(depth_key, None)
+            return
+        value = config.setdefault(key, "scalar")
+        if value not in ("scalar", "resident", "pipelined"):
+            if fix_invalid:
+                config[key] = "scalar"
+            else:
+                raise InvalidConfig(f"unsupported CuTe reduction schedule: {value!r}")
+        group = config.setdefault(group_key, 1)
+        if type(group) is not int or group not in (1, 2, 3, 4):
+            if fix_invalid:
+                config[group_key] = 1
+            else:
+                raise InvalidConfig(f"unsupported CuTe reduction group size: {group!r}")
+        if config[key] == "scalar":
+            config[group_key] = 1
+        # An omitted depth must not add a key to old normalized configs or
+        # generated-source headers. The search fragment still defaults to 2.
+        depth = config.get(depth_key, 2)
+        if type(depth) is not int or depth not in (2, 4):
+            if fix_invalid:
+                config[depth_key] = 2
+            else:
+                raise InvalidConfig(
+                    f"unsupported CuTe reduction pipeline depth: {depth!r}"
+                )
+        if config[key] != "pipelined" and config.get(depth_key, 2) != 2:
+            if fix_invalid:
+                config[depth_key] = 2
+            else:
+                raise InvalidConfig(
+                    "CuTe reduction pipeline depth 4 requires the pipelined schedule"
+                )
+
     def _normalize_cute_async_load_pipeline(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3053,6 +3234,11 @@ class ConfigSpec:
             self._cute_tcgen05_config.prepare_normalization(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_reduction_schedule(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_reduction_local_tree(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_reduction_row_output(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_reduction_sequence(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_host_paired_sum(config, fix_invalid=_fix_invalid)
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
@@ -4272,6 +4458,10 @@ class ConfigSpec:
         if self.backend_name == "cute":
             if self.cute_signed_bitfield_bf16_available:
                 fields["cute_signed_bitfield_bf16"] = BooleanFragment()
+            if self.cute_host_paired_sum_available:
+                fields["cute_host_paired_sum"] = EnumFragment(
+                    choices=("off", "mapped", "narrow")
+                )
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
             elif self.cute_flash_search_enabled:
@@ -4352,6 +4542,35 @@ class ConfigSpec:
                     and len(self.cute_reduction_reloads) > 0
                 ):
                     fields["cute_reduction_reloads"] = self.cute_reduction_reloads
+                if self.cute_sequence_reduction_blocks:
+                    fields["cute_reduction_sequence"] = EnumFragment(
+                        choices=(
+                            "scalar",
+                            "reload",
+                            "resident",
+                            "bounded",
+                            "bounded_layout",
+                        )
+                    )
+                if self.cute_resident_reduction_blocks:
+                    fields["cute_reduction_local_tree"] = BooleanFragment()
+                    fields["cute_reduction_schedule"] = EnumFragment(
+                        choices=("scalar", "resident", "pipelined")
+                    )
+                    fields["cute_reduction_group_rows"] = EnumFragment(
+                        choices=(1, 2, 4, 3)
+                    )
+                    fields["cute_reduction_row_schedule"] = EnumFragment(
+                        choices=("batched", "serial", "serial_deferred")
+                    )
+                    if (
+                        self.target_device_capability is not None
+                        and self.target_device_capability[0] == 10
+                    ):
+                        fields["cute_reduction_pack_output"] = BooleanFragment()
+                    fields["cute_reduction_pipeline_depth"] = EnumFragment(
+                        choices=(2, 4)
+                    )
                 if self.cute_async_load_pipeline_enabled:
                     fields["cute_async_load_stages"] = EnumFragment(
                         choices=(0, 3, 4, 5)

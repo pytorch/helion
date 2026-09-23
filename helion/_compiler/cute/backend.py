@@ -1176,6 +1176,17 @@ class CuteBackend(Backend):
             or key == "cute_vector_widths"
             or key == "cute_lane_layouts"
             or key == "cute_reduction_reloads"
+            or key
+            in {
+                "cute_reduction_schedule",
+                "cute_reduction_group_rows",
+                "cute_reduction_pipeline_depth",
+                "cute_reduction_local_tree",
+                "cute_reduction_row_schedule",
+                "cute_reduction_pack_output",
+                "cute_reduction_sequence",
+                "cute_host_paired_sum",
+            }
             or key == "cute_async_store_policy"
             or key == "cute_bf16x2_recurrence"
             or key == "cute_register_chain"
@@ -1478,6 +1489,13 @@ class CuteBackend(Backend):
             ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
+            "_cute_resident_load_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_load_vector",
+            "_cute_resident_store_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_store_vector",
+            "_cute_resident_copy_async": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_copy_async",
+            "_cute_resident_sums": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_sums",
+            "_cute_resident_sums_disjoint": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_sums_disjoint",
+            "_cute_try_paired_sum_cast": "from helion.runtime.cute.paired_sum import try_paired_sum_cast as _cute_try_paired_sum_cast",
+            "_cute_try_single_sum_cast": "from helion.runtime.cute.single_sum import try_single_sum_cast as _cute_try_single_sum_cast",
             "_cute_grouped_reduce_warp": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_warp",
             "_cute_grouped_reduce_cluster": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_cluster",
             "_cute_grouped_reduce_block": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_block",
