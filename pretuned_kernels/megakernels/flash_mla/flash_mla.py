@@ -4,8 +4,8 @@ The kernel preserves ThunderMLA's prepared-query/paged-cache boundary and its
 BF16 operands/output with FP32 softmax, MMA accumulation, LSE, and reduction
 state. It uses a fixed N128/radix-16 capacity envelope whose runtime descriptors
 select the active attention topology. The benchmark compares against both the
-root-matched three-launch Helion implementation and vLLM's production
-FlashInfer MLA decode entry point.
+root-matched three-launch Helion implementation with programmatic dependent
+launch (PDL) and vLLM's production FlashInfer MLA decode entry point.
 """
 
 from __future__ import annotations
@@ -793,7 +793,7 @@ def main(verbose: bool = True) -> dict:
         return (
             persistent_graph.replay,
             [
-                ("standalone_helion", standalone_graph.replay),
+                ("standalone_helion_pdl", standalone_graph.replay),
                 (f"vllm_auto ({backend})", vllm_graph.replay),
             ],
             (

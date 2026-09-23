@@ -1,15 +1,18 @@
 # ruff: noqa: ANN001, ANN202
 """Matched, independently tuned Helion kernels for DeepSeek-V3 NVFP4 MoE.
 
-The nine launches implement exactly the persistent kernel's logical roots.
-Independent router/input-quant work and routed/shared expert branches use CUDA
-streams so the baseline is not artificially serialized.
+The nine launches implement exactly the persistent kernel's logical roots and
+use PDL within each dependency chain. Independent router/input-quant work and
+routed/shared expert branches use CUDA streams so the baseline is not
+artificially serialized.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
 import helion
@@ -124,6 +127,7 @@ def grouped_topk(
     weights = torch.empty((batch, top_k), dtype=torch.float32, device=logits.device)
     ids = torch.empty((batch, top_k), dtype=torch.int32, device=logits.device)
     for _program in hl.grid(1):
+        wait_and_launch_dependents()
         # The production DeepSeek router promotes BF16 logits before applying
         # sigmoid and performs group selection in FP32.
         scores = torch.sigmoid(logits[:, :].to(torch.float32))
@@ -398,6 +402,7 @@ def selected_w13_swiglu_nvfp4(
     for tile_slot, tile_output_group in hl.tile(
         [top_k, activation_groups], block_size=[1, output_groups]
     ):
+        wait_and_launch_dependents()
         slot = tile_slot.begin
         expert = topk_ids[0, slot]
         expert_address = expert.to(torch.int64)
@@ -481,6 +486,7 @@ def selected_w2_nvfp4(
     block_rows = hl.register_block_size(128, 256)
     block_groups = hl.register_block_size(32, 32)
     for tile_slot, tile_row in hl.tile([top_k, hidden], block_size=[1, block_rows]):
+        wait_and_launch_dependents()
         slot = tile_slot.begin
         expert = topk_ids[0, slot]
         expert_address = expert.to(torch.int64)
@@ -582,6 +588,7 @@ def shared_swiglu_quant_nvfp4(
     output_q_groups = output_q.view(1, groups, 8)
     group_block = hl.register_block_size(32, 32)
     for tile_group in hl.tile(groups, block_size=group_block):
+        wait_and_launch_dependents()
         index = tile_group.index[:, None] * 16 + hl.arange(16)[None, :]
         gate = preactivation[index * 2].to(torch.float32)
         up = preactivation[index * 2 + 1].to(torch.float32)
@@ -623,6 +630,7 @@ def shared_w2_nvfp4(
     row_block = hl.register_block_size(16, 16)
     group_block = hl.register_block_size(64, 64)
     for tile_row in hl.tile(hidden, block_size=row_block):
+        wait_and_launch_dependents()
         weight_row = tile_row.index.to(torch.int64)
         accumulator = hl.zeros([row_block], dtype=torch.float32)
         for tile_group in hl.tile(groups, block_size=group_block):
@@ -659,6 +667,7 @@ def weighted_add(
     hl.specialize(top_k)
     output = torch.empty((1, hidden), dtype=torch.bfloat16, device=expert_output.device)
     for tile_n in hl.tile(hidden):
+        wait_and_launch_dependents()
         values = expert_output[:, tile_n].to(torch.float32)
         weights = topk_weights[0, :].to(torch.bfloat16).to(torch.float32)
         routed = torch.sum(values * weights[:, None], dim=0, keepdim=True).to(
@@ -758,7 +767,7 @@ def _compile(name: str, kernel, args: tuple):
 
 
 def build(tensors: dict[str, torch.Tensor], shape):
-    """Build the matched nine-launch graph with independently tuned roots."""
+    """Build the matched nine-launch PDL graph with independently tuned roots."""
     hidden = tensors["hidden"]
     router = _compile("router", standalone_router, (hidden, tensors["router_weight"]))
     logits = router(hidden, tensors["router_weight"])
@@ -777,7 +786,7 @@ def build(tensors: dict[str, torch.Tensor], shape):
         shape.routed_scale,
     )
     topk = _compile("topk", grouped_topk, topk_args)
-    weights, ids = topk(*topk_args)
+    weights, ids = launch_dependent(topk, *topk_args)
 
     routed_w13_args = (
         hidden_q,
@@ -789,7 +798,7 @@ def build(tensors: dict[str, torch.Tensor], shape):
         tensors["activation_global_scale"],
     )
     routed_w13 = _compile("routed_w13", selected_w13_swiglu_nvfp4, routed_w13_args)
-    activation_q, activation_scale = routed_w13(*routed_w13_args)
+    activation_q, activation_scale = launch_dependent(routed_w13, *routed_w13_args)
     routed_w2_args = (
         activation_q,
         activation_scale,
@@ -799,7 +808,7 @@ def build(tensors: dict[str, torch.Tensor], shape):
         tensors["alpha2"],
     )
     routed_w2 = _compile("routed_w2", selected_w2_nvfp4, routed_w2_args)
-    expert_output = routed_w2(*routed_w2_args)
+    expert_output = launch_dependent(routed_w2, *routed_w2_args)
 
     shared_w13_args = (
         hidden_q,
@@ -815,8 +824,10 @@ def build(tensors: dict[str, torch.Tensor], shape):
         shared_swiglu_quant_nvfp4,
         (shared_preactivation, tensors["activation_global_scale"]),
     )
-    shared_activation_q, shared_activation_scale = shared_activation(
-        shared_preactivation, tensors["activation_global_scale"]
+    shared_activation_q, shared_activation_scale = launch_dependent(
+        shared_activation,
+        shared_preactivation,
+        tensors["activation_global_scale"],
     )
     shared_w2_args = (
         shared_activation_q,
@@ -826,7 +837,7 @@ def build(tensors: dict[str, torch.Tensor], shape):
         tensors["shared_alpha2"],
     )
     shared_w2 = _compile("shared_w2", shared_w2_nvfp4, shared_w2_args)
-    shared_output = shared_w2(*shared_w2_args)
+    shared_output = launch_dependent(shared_w2, *shared_w2_args)
     final = _compile("final", weighted_add, (expert_output, weights, shared_output))
 
     quant_stream = torch.cuda.Stream()
@@ -841,7 +852,8 @@ def build(tensors: dict[str, torch.Tensor], shape):
             )
 
         local_logits = router(hidden, tensors["router_weight"])
-        local_weights, local_ids = topk(
+        local_weights, local_ids = launch_dependent(
+            topk,
             local_logits,
             tensors["correction_bias"],
             shape.top_k,
@@ -862,11 +874,13 @@ def build(tensors: dict[str, torch.Tensor], shape):
             (
                 local_shared_activation_q,
                 local_shared_activation_scale,
-            ) = shared_activation(
+            ) = launch_dependent(
+                shared_activation,
                 local_shared_preactivation,
                 tensors["activation_global_scale"],
             )
-            local_shared_output = shared_w2(
+            local_shared_output = launch_dependent(
+                shared_w2,
                 local_shared_activation_q,
                 local_shared_activation_scale,
                 tensors["shared_w2"],
@@ -875,7 +889,8 @@ def build(tensors: dict[str, torch.Tensor], shape):
             )
 
         current_stream.wait_stream(quant_stream)
-        local_activation_q, local_activation_scale = routed_w13(
+        local_activation_q, local_activation_scale = launch_dependent(
+            routed_w13,
             local_hidden_q,
             local_hidden_scale,
             tensors["native_w13"],
@@ -884,7 +899,8 @@ def build(tensors: dict[str, torch.Tensor], shape):
             tensors["alpha1"],
             tensors["activation_global_scale"],
         )
-        local_expert_output = routed_w2(
+        local_expert_output = launch_dependent(
+            routed_w2,
             local_activation_q,
             local_activation_scale,
             tensors["w2"],
@@ -893,7 +909,9 @@ def build(tensors: dict[str, torch.Tensor], shape):
             tensors["alpha2"],
         )
         current_stream.wait_stream(shared_stream)
-        local_output = final(local_expert_output, local_weights, local_shared_output)
+        local_output = launch_dependent(
+            final, local_expert_output, local_weights, local_shared_output
+        )
         return (
             local_output,
             local_logits,

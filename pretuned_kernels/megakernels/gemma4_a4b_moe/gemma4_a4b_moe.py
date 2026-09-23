@@ -6,8 +6,8 @@ The single Helion function's eight top-level tile loops implement router
 projection, hierarchical top-k, gate/up projection, GeGLU, down projection,
 expert reduction, and output RMSNorm.  The benchmark uses the production
 batch-one geometry and checks it against a same-source, root-matched
-eight-launch Helion graph and vLLM's Gemma 4 router and fused-MoE
-implementation.
+eight-launch Helion graph with programmatic dependent launch (PDL) and vLLM's
+Gemma 4 router and fused-MoE implementation.
 """
 
 from __future__ import annotations
@@ -881,7 +881,7 @@ def main(verbose: bool = True) -> dict:
             return (
                 helion_graph.replay,
                 [
-                    ("standalone_helion", standalone_graph.replay),
+                    ("standalone_helion_pdl", standalone_graph.replay),
                     (f"vllm_auto ({backend})", vllm_graph.replay),
                 ],
                 f"{label:>10s}  {expert_ids!s:>34s}",
