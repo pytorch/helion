@@ -562,8 +562,12 @@ class TensorAttributeType(TypeInfo):
         self, args: tuple[TypeInfo, ...], kwargs: dict[str, TypeInfo], origin: Origin
     ) -> TypeInfo:
         attr = self.attr()
-        if origin.is_device() and (
-            replacement := get_device_func_replacement(getattr(torch.Tensor, attr))
+        if (
+            origin.is_device()
+            and attr in {"chunk", "unbind"}
+            and (
+                replacement := get_device_func_replacement(getattr(torch.Tensor, attr))
+            )
         ):
             result = CallableType(origin, replacement).propagate_call(
                 (self.tensor, *args), kwargs, origin

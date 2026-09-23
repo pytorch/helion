@@ -273,6 +273,9 @@ operations accept positive and negative axes and return a tuple of two tensors.
 Lowerings that require a permutation of rank-compacted tile tensors are
 currently rejected. Unbinding an already trailing dimension of size two
 remains supported with flattened tiles.
+Direct `permute` calls have the same restriction. The autotuner skips
+configurations that compact the input rank. Disable `flatten_loops`
+for the affected tile axes to use these permutations.
 
 The axis and the size being split must be known at compile time. Use
 `hl.specialize` before the device loop when the split size needs specialization.
@@ -290,6 +293,7 @@ For example, for an accumulator of shape `[tile_m, 128]`:
 left, right = torch.chunk(acc, 2, dim=-1)  # each has shape [tile_m, 64]
 grouped = acc.reshape(tile_m, 2, 64).permute(0, 2, 1)
 left, right = grouped.unbind(dim=-1)      # same two contiguous halves
+left, right = hl.split(grouped)          # equivalent lowering
 ```
 
 ### subscript()

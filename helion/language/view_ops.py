@@ -45,12 +45,16 @@ def _split_dim(tensor: torch.Tensor, dim: int, op: str) -> tuple[int, int]:
     return dim, size
 
 
-def _unbind_two(
-    tensor: torch.Tensor, dim: int, op: str
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _check_split_backend(op: str) -> None:
     env = CompileEnvironment.current()
     if env.backend_name != "triton":
-        raise exc.BackendUnsupported(env.backend_name, f"{op} device lowering")
+        raise exc.BackendUnsupported(
+            env.backend_name,
+            f"{op} device lowering. Use hl.split() for a trailing size-two axis",
+        )
+
+
+def _unbind_two(tensor: torch.Tensor, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     if dim != tensor.ndim - 1:
         order = [i for i in range(tensor.ndim) if i != dim] + [dim]
         tensor = tensor.permute(order)
@@ -64,14 +68,16 @@ def _torch_unbind(
     dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lower a size-two unbind to a permutation and hl.split."""
+    _check_split_backend("torch.unbind")
     dim, size = _split_dim(input, dim, "torch.unbind")
     if size != 2:
         raise exc.UnsupportedSplitConfiguration(
             op="torch.unbind", requirement="a split dimension of size 2"
         )
     shape = list(input.shape)
+    # Replace a specialized SymInt with a literal 2 so hl.split sees a constant.
     shape[dim] = size
-    return _unbind_two(input.reshape(shape), dim, "torch.unbind")
+    return _unbind_two(input.reshape(shape), dim)
 
 
 @_decorators.device_func_replacement(torch.chunk)
@@ -82,6 +88,7 @@ def _torch_chunk(
     dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Lower two equal, contiguous chunks through a size-two unbind."""
+    _check_split_backend("torch.chunk")
     if type(chunks) is not int or chunks != 2:
         raise exc.UnsupportedSplitConfiguration(
             op="torch.chunk", requirement="chunks=2"
@@ -91,18 +98,17 @@ def _torch_chunk(
         raise exc.UnsupportedSplitConfiguration(
             op="torch.chunk", requirement="a positive even split dimension size"
         )
-    if CompileEnvironment.current().backend.pad_factory_tensors_to_power_of_2 and (
-        size & (size - 1)
-    ):
-        # Reshaping a padded axis into [2, size // 2] would split at the
-        # padded midpoint instead of the logical midpoint.
+    if size & (size - 1):
+        # Triton pads to powers of two. Reshaping a padded axis into
+        # [2, size // 2] would split at the padded midpoint instead of
+        # the logical midpoint.
         raise exc.UnsupportedSplitConfiguration(
             op="torch.chunk",
-            requirement="a power-of-two split dimension size on this backend",
+            requirement="a power-of-two split dimension size",
         )
     shape = list(input.shape)
     shape[dim : dim + 1] = [2, size // 2]
-    return _unbind_two(input.reshape(shape), dim, "torch.chunk")
+    return _unbind_two(input.reshape(shape), dim)
 
 
 @_decorators.api(tiles_as_sizes=True)

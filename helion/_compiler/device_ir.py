@@ -2629,8 +2629,14 @@ class WalkDeviceAST(NodeVisitor):
         value = self.visit(node.value)
         # Apply the replacement here so saved bound methods use it too.
         assert isinstance(node, ExtendedAST)
-        if isinstance(node._type_info, TensorAttributeType) and (
-            replacement := get_device_func_replacement(getattr(torch.Tensor, node.attr))
+        if (
+            isinstance(node._type_info, TensorAttributeType)
+            and node.attr in {"chunk", "unbind"}
+            and (
+                replacement := get_device_func_replacement(
+                    getattr(torch.Tensor, node.attr)
+                )
+            )
         ):
             return functools.partial(replacement, value)
         return getattr(value, node.attr)

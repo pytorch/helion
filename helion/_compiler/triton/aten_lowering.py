@@ -141,14 +141,12 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
     output_val = node.meta["val"]
     assert isinstance(output_val, torch.Tensor)
     assert isinstance(dim, int)
-    dim = cast("int", dim)
     logical_rank = input_val.ndim
-    assert 0 <= dim < logical_rank + 1 or -logical_rank - 1 <= dim < 0
     if dim < 0:
         dim += logical_rank + 1
     tile_strategy = ctx.cg.device_function.tile_strategy
-    input_compacted = tile_strategy._compact_shape(input_val.shape)
-    output_compacted = tile_strategy._compact_shape(output_val.shape)
+    input_compacted = tile_strategy.compact_shape(input_val.shape)
+    output_compacted = tile_strategy.compact_shape(output_val.shape)
     new_axes = [
         axis
         for axis, compacted in enumerate(output_compacted)
@@ -163,10 +161,10 @@ def codegen_stack(ctx: LoweringContext, node: Node) -> object:
         for axis, compacted in enumerate(output_compacted)
         if axis not in new_axes
     ]
-    if len(new_axes) != 1 or remaining_output != [*shifted_input]:
-        raise exc.UnsupportedSplitConfiguration(
-            op="torch.stack",
-            requirement="a stack axis representable by one physical dimension",
+    if len(new_axes) != 1 or remaining_output != shifted_input:
+        raise exc.InvalidConfig(
+            "torch.stack requires a stack axis representable by one physical "
+            "dimension. Disable flatten_loops for the affected tile axes."
         )
     stack_dim = new_axes[0]
     bidx = ctx.cg.device_function.new_var("broadcast_idx")

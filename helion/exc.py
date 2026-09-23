@@ -412,7 +412,7 @@ class InvalidConfig(BaseError):
     message = "{}"
 
 
-class UnsupportedSplitConfiguration(InvalidConfig):
+class UnsupportedSplitConfiguration(BaseError):
     message = "{op} in Helion device loops requires {requirement}."
 
 

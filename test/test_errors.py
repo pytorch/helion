@@ -435,7 +435,7 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ) -> torch.Tensor:
             out = torch.empty_like(x)
             for tile in hl.tile(x.size(0)):
-                values = hl.zeros([tile, 2])
+                values = hl.zeros([tile, x.size(1)])
                 if use_chunk:
                     if use_method:
                         a, b = values.chunk(2, dim=-1)
@@ -449,16 +449,19 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                 out[tile, :] = values + a.sum() + b.sum()
             return out
 
-        x = torch.empty((32, 2), device=DEVICE)
-        for use_chunk in (False, True):
-            for use_method in (False, True):
-                with (
-                    self.subTest(use_chunk=use_chunk, use_method=use_method),
-                    self.assertRaisesRegex(
-                        helion.exc.BackendUnsupported, "device lowering"
-                    ),
-                ):
-                    fn.bind((x, use_chunk, use_method))
+        # Backend errors take precedence even when the split size is invalid.
+        for d in (2, 3):
+            x = torch.empty((32, d), device=DEVICE)
+            for use_chunk in (False, True):
+                for use_method in (False, True):
+                    with (
+                        self.subTest(d=d, use_chunk=use_chunk, use_method=use_method),
+                        self.assertRaisesRegex(
+                            helion.exc.BackendUnsupported,
+                            r"device lowering.*hl\.split\(\)",
+                        ),
+                    ):
+                        fn.bind((x, use_chunk, use_method))
 
     @onlyBackends(["triton"])
     @skipIfNotTriton("torch.chunk lowering is Triton-only")

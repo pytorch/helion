@@ -230,6 +230,7 @@ class TestViews(RefEagerTestBase, TestCase):
             lo = x.new_empty((n, d // 2))
             hi = torch.empty_like(lo)
             for tile in hl.tile(n):
+                # The split extent comes from a full-slice reduction block.
                 values = x[tile, :]
                 if use_method:
                     a, b = values.chunk(2, dim=-1)
@@ -250,6 +251,35 @@ class TestViews(RefEagerTestBase, TestCase):
                     torch.testing.assert_close(result, expected)
                     if _get_backend() == "triton":
                         self.assertIn("tl.split", code)
+
+    @onlyBackends(["triton"])
+    @skipIfNotTriton("torch.unbind lowering is Triton-only")
+    def test_torch_unbind_full_slice(self):
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, use_method: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            n, d = x.shape
+            d = hl.specialize(d)
+            lo = x.new_empty((n,))
+            hi = torch.empty_like(lo)
+            for tile in hl.tile(n):
+                # Keep the full-slice block symbol until unbind specializes it.
+                values = x[tile, :]
+                if use_method:
+                    unbind = values.unbind
+                    a, b = unbind(dim=-1)
+                else:
+                    a, b = torch.unbind(values, dim=1)
+                lo[tile] = a
+                hi[tile] = b
+            return lo, hi
+
+        x = torch.arange(65 * 2, device=DEVICE, dtype=torch.float32).reshape(65, 2)
+        for use_method in (False, True):
+            with self.subTest(use_method=use_method):
+                _code, result = code_and_output(fn, (x, use_method), block_sizes=[32])
+                torch.testing.assert_close(result, torch.unbind(x, dim=1))
 
     @onlyBackends(["triton"])
     @skipIfNotTriton("torch.unbind lowering is Triton-only")
