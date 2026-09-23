@@ -5,11 +5,13 @@ import enum
 
 from .flash_arch import FlashHardwareCapabilities
 from .flash_tuning import FlashCausalTuningPolicy
+from .flash_tuning import FlashCausalSeedTemplate
 from .flash_tuning import FlashDenseTuningPolicy
 from .flash_tuning import FlashPackedExp2Mode
 from .flash_tuning import FlashSoftmaxLowering
 from .flash_tuning import FlashTuningDType
 from .flash_tuning import FlashTuningPolicy
+from .flash_tuning import FlashTuningWorkload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,6 +254,76 @@ _FLASH_TARGET_POLICIES = {
                     softmax_lowering=FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH,
                     softmax_regs=184,
                     first_load_order=0,
+                ),
+            ),
+        ),
+        additional_tunings=(
+            # SM103 registered resident-softmax seeds only for hd64/FP16
+            # (#3416-#3419), so head_dim=128 falls back to the STANDARD softmax
+            # lowering. Seed an hd128 causal entry with the head-dim-agnostic
+            # resident template so the same RESIDENT_VALUE_GRAPH lowering that
+            # hd64 uses is reachable at hd128. Values come from the best
+            # measured 1-CTA hd128 config (the resident path requires
+            # not use_2cta_instrs).
+            FlashTuningPolicy(
+                workload=FlashTuningWorkload(
+                    head_dim=128, dtype=FlashTuningDType.FLOAT16
+                ),
+                tmem_row_reduce_min_kv=256,
+                causal_policies=(
+                    FlashCausalTuningPolicy(
+                        num_kv=512,
+                        kv_stage=3,
+                        seed_template=FlashCausalSeedTemplate.RESIDENT_V1,
+                        e2e_offset=0,
+                        e2e_offset0=0,
+                        role_map="fa4",
+                        epi_tma=False,
+                        softmax_lowering=(
+                            FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+                        ),
+                        softmax_regs=200,
+                        first_load_order=2,
+                    ),                    FlashCausalTuningPolicy(
+                        num_kv=1024,
+                        kv_stage=3,
+                        seed_template=FlashCausalSeedTemplate.RESIDENT_V1,
+                        e2e_offset=0,
+                        e2e_offset0=0,
+                        role_map="fa4",
+                        epi_tma=False,
+                        softmax_lowering=(
+                            FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+                        ),
+                        softmax_regs=200,
+                        first_load_order=2,
+                    ),                    FlashCausalTuningPolicy(
+                        num_kv=2048,
+                        kv_stage=3,
+                        seed_template=FlashCausalSeedTemplate.RESIDENT_V1,
+                        e2e_offset=0,
+                        e2e_offset0=0,
+                        role_map="fa4",
+                        epi_tma=False,
+                        softmax_lowering=(
+                            FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+                        ),
+                        softmax_regs=200,
+                        first_load_order=2,
+                    ),                    FlashCausalTuningPolicy(
+                        num_kv=4096,
+                        kv_stage=3,
+                        seed_template=FlashCausalSeedTemplate.RESIDENT_V1,
+                        e2e_offset=0,
+                        e2e_offset0=0,
+                        role_map="fa4",
+                        epi_tma=True,
+                        softmax_lowering=(
+                            FlashSoftmaxLowering.RESIDENT_VALUE_GRAPH
+                        ),
+                        softmax_regs=200,
+                        first_load_order=2,
+                    ),
                 ),
             ),
         ),
