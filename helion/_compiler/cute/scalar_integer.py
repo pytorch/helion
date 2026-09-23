@@ -14,7 +14,39 @@ _INTEGER_CASTS = frozenset(
 )
 
 
-def _integer_expression(node: ast.expr, lane: str, known: AbstractSet[str]) -> bool:
+def _integer_expression(
+    node: ast.expr,
+    lane: str,
+    known: AbstractSet[str],
+    *,
+    integer_tensors: AbstractSet[str] = frozenset(),
+) -> bool:
+    # Tensor facts are for kind-only analysis of an existing value. They do
+    # not prove that re-evaluating a load is safe; replay proofs leave them empty.
+    if integer_tensors and isinstance(node, ast.IfExp):
+        # A predicated load retains integer kind when both possible values
+        # are integral. The original predicate and its evaluation stay in place.
+        return all(
+            _integer_expression(value, lane, known, integer_tensors=integer_tensors)
+            for value in (node.body, node.orelse)
+        )
+    if (
+        integer_tensors
+        and isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "load"
+        and not node.args
+        and not node.keywords
+    ):
+        pointer = node.func.value
+        while isinstance(pointer, ast.BinOp) and isinstance(pointer.op, ast.Add):
+            pointer = pointer.left
+        return (
+            isinstance(pointer, ast.Attribute)
+            and pointer.attr == "iterator"
+            and isinstance(pointer.value, ast.Name)
+            and pointer.value.id in integer_tensors
+        )
     if isinstance(node, ast.Constant):
         return type(node.value) is int
     if isinstance(node, ast.Name):
@@ -51,12 +83,14 @@ def _integer_expression(node: ast.expr, lane: str, known: AbstractSet[str]) -> b
         # cast must already be integral: float rounding can destroy adjacency
         # or change a rematerialized predicate through contraction.
         return isinstance(node.args[0], ast.Name) or _integer_expression(
-            node.args[0], lane, known
+            node.args[0], lane, known, integer_tensors=integer_tensors
         )
     if isinstance(node, ast.UnaryOp) and isinstance(
         node.op, (ast.UAdd, ast.USub, ast.Invert)
     ):
-        return _integer_expression(node.operand, lane, known)
+        return _integer_expression(
+            node.operand, lane, known, integer_tensors=integer_tensors
+        )
     if isinstance(node, ast.BinOp) and isinstance(
         node.op,
         (
@@ -72,7 +106,9 @@ def _integer_expression(node: ast.expr, lane: str, known: AbstractSet[str]) -> b
             ast.BitXor,
         ),
     ):
-        return _integer_expression(node.left, lane, known) and _integer_expression(
-            node.right, lane, known
+        return _integer_expression(
+            node.left, lane, known, integer_tensors=integer_tensors
+        ) and _integer_expression(
+            node.right, lane, known, integer_tensors=integer_tensors
         )
     return False

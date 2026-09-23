@@ -61,6 +61,17 @@ def is_in_ref_mode_context() -> bool:
         return False
 
 
+def dispatch_reference(
+    function: object, reference: Callable[..., object], args: tuple[object, ...]
+) -> object:
+    """Keep backend-selected semantic policies consistent in eager validation."""
+    env = CompileEnvironment.current()
+    matched, result = env.backend.reference_override(function, args)
+    if matched:
+        return result
+    return reference(*args)
+
+
 class NoCurrentRefModeContext(RuntimeError):
     """Raised when RefModeContext.current() is called but no context is active."""
 
@@ -351,6 +362,8 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
     ) -> torch.Tensor:
         from ..language.random_ops import ref_implicit_random
 
+        CompileEnvironment.current().backend.validate_implicit_rng_reference()
+
         shape: list[int | RefTile]
         if "size" in kwargs:
             shape_arg = kwargs["size"]
@@ -383,6 +396,8 @@ class RefModeTorchFunctionMode(BaseTorchFunctionMode):
         normal: bool,
     ) -> torch.Tensor:
         from ..language.random_ops import ref_implicit_random
+
+        CompileEnvironment.current().backend.validate_implicit_rng_reference()
 
         assert args
         input_tensor = cast("torch.Tensor", args[0])

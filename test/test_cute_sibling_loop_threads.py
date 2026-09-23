@@ -325,7 +325,12 @@ def test_sibling_seeds_configure_all_passes_by_block_id(
             ) == spec.num_threads.config_get(seed.num_threads, 2)
             widths = cast("list[int]", seed.config["cute_vector_widths"])
             width = spec.cute_vector_widths.config_get(widths, 1)
-            assert width == vec
+            if seed.config.get("cute_independent_reduction"):
+                assert width in (vec, vec // 2)
+                assert seed.config["cute_replicated_reduction"] is True
+                assert seed.config["cute_vector_packet_unroll"] is True
+            else:
+                assert width == vec
             assert spec.cute_vector_widths.config_get(widths, 2) == width
             assert seed.config["cute_lane_layouts"][1:] == ["strided", "strided"]
             assert tile_loop_thread_count(env, ir, ir.graphs, seed) <= 1024

@@ -41,7 +41,9 @@ def test_flattened_reductions_preserve_tails_empty_rows_and_graph_updates(
         cute_vector_widths=[1, 4, 4, 4],
         cute_lane_layouts=["strided"] * 4,
     )
-    bound.to_code(config)
+    generated = bound.to_code(config)
+    if not unaligned:
+        assert "_helion_affine_load" in generated
     bound.set_config(config)
     args = (values, offsets, 1e-6)
     for _ in range(2):
