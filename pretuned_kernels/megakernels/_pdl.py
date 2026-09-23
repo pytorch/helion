@@ -14,6 +14,15 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 
+def signal_dependents() -> None:
+    """Make the following PDL grid launchable without waiting for a predecessor."""
+    hl.inline_triton(
+        "tl.extra.cuda.gdc_launch_dependents()",
+        args=(),
+        output_like=None,
+    )
+
+
 def wait_and_launch_dependents() -> None:
     """Wait for the preceding grid, then make the following grid launchable."""
     hl.inline_triton(
