@@ -39,6 +39,7 @@ def test_a_packet_coordinates_preserve_flat_index_for_every_bk_residue():
 @pytest.mark.parametrize("shape", ((32, 4096, 64), (48, 8192, 80)))
 @pytest.mark.parametrize("bias", (False, True))
 @pytest.mark.parametrize("finalizer_warps", (1, 4))
+@skipUnlessBackends(["cute"])
 def test_emitted_a_packets_cover_each_private_slab_once(shape, bias, finalizer_warps):
     bound, args = _bind(shape, bias=bias)
     config = _carrier(bound)

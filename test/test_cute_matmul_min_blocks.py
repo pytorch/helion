@@ -599,7 +599,15 @@ def test_failed_carrier_transfer_keeps_old_registry_and_domain() -> None:
 def test_global_positive_override_preserves_other_coverage_groups(
     value: int, disabled: bool
 ) -> None:
+    automatic = helion.kernel(
+        squeeze_and_excitation_net_fwd.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="full",
+    ).cute_structural_policy
+    assert automatic is not None
     settings = {
+        "cute_structural_policy": automatic,
         "autotune_config_overrides": {MIN_BLOCKS_KEY: value},
         "disable_autotuner_heuristics": disabled,
     }
@@ -778,7 +786,15 @@ def _materialized_bind(
 def test_materialized_global_positive_override_preserves_other_coverage_groups(
     value: int, disabled: bool
 ) -> None:
+    automatic = helion.kernel(
+        squeeze_and_excitation_net_fwd.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="full",
+    ).cute_structural_policy
+    assert automatic is not None
     settings = {
+        "cute_structural_policy": automatic,
         "autotune_config_overrides": {MIN_BLOCKS_KEY: value},
         "disable_autotuner_heuristics": disabled,
     }
@@ -884,6 +900,7 @@ def test_materialized_seed_local_positive_keeps_automatic_pair_and_other_groups(
     seed = _group(base).witnesses[0].carrier
     seed.config[MIN_BLOCKS_KEY] = value
     settings = {
+        "cute_structural_policy": base.kernel.cute_structural_policy,
         "autotune_seed_configs": [seed],
         "disable_autotuner_heuristics": disabled,
     }

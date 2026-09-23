@@ -134,6 +134,7 @@ def _wrapper_plan(source: str) -> dict[str, object]:
     "shape", [(128, 16, 128), (512, 64, 512), (1024, 128, 1024), (73, 5, 41)]
 )
 @pytest.mark.parametrize("static", [False, True])
+@skipUnlessBackends(["cute"])
 def test_original_and_dynamic_metadata_are_proved(
     shape: tuple[int, int, int], static: bool
 ) -> None:
@@ -146,6 +147,7 @@ def test_original_and_dynamic_metadata_are_proved(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@skipUnlessBackends(["cute"])
 def test_generic_scale_layout_and_output_dtype(dtype: torch.dtype) -> None:
     bound, _ = _bind_native(generic=True, static=False, dtype=dtype)
     with _cpu_target():
@@ -165,6 +167,7 @@ def test_generic_scale_layout_and_output_dtype(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@skipUnlessBackends(["cute"])
 def test_explicit_intermediate_rounding_is_retained(dtype: torch.dtype) -> None:
     bound, _ = _bind_native(dtype=dtype)
     with _cpu_target():
@@ -183,6 +186,7 @@ def test_source_load_mask_and_fill_require_the_original_proof(
     assert _plain_load(load, torch.float4_e2m1fn_x2) is None
 
 
+@skipUnlessBackends(["cute"])
 def test_output_aliasing_an_input_declines_native_reordering() -> None:
     args = list(_inputs(4, 3, 4))
     packed = cast("torch.Tensor", args[0])
@@ -202,6 +206,7 @@ def test_output_aliasing_an_input_declines_native_reordering() -> None:
 
 
 @pytest.mark.parametrize("strides", [(0, 1), (1, 0), (1, 1)])
+@skipUnlessBackends(["cute"])
 def test_overlapping_output_elements_decline_native_reordering(
     strides: tuple[int, int],
 ) -> None:
@@ -222,6 +227,7 @@ def test_overlapping_output_elements_decline_native_reordering(
 
 
 @pytest.mark.parametrize("strides", [(1, 6), (7, 1), (11, 2)])
+@skipUnlessBackends(["cute"])
 def test_noncontiguous_disjoint_output_layout_is_supported(
     strides: tuple[int, int],
 ) -> None:
@@ -238,6 +244,7 @@ def test_noncontiguous_disjoint_output_layout_is_supported(
         assert _wrapper_plan(bound.to_code(_native_config()))["m"] == 4
 
 
+@skipUnlessBackends(["cute"])
 def test_all_native_seeds_round_trip_and_emit() -> None:
     bound, _ = _bind_native()
     assert bound.host_function is not None
@@ -308,6 +315,7 @@ def test_native_configuration_requires_proven_format_and_hardware() -> None:
         "changed_scale_arithmetic",
     ],
 )
+@skipUnlessBackends(["cute"])
 def test_native_region_proof_rejects_changed_semantics(change: str) -> None:
     bound, _ = _bind_native()
     checked = False
@@ -400,6 +408,7 @@ class _StoppedProof(Exception):
 @pytest.mark.parametrize(
     "target", [operator.getitem, operator.neg, torch.ops.aten.item.default]
 )
+@skipUnlessBackends(["cute"])
 def test_integer_recipe_rejects_opaque_values_even_with_concrete_metadata(
     target: Callable[..., object],
 ) -> None:
@@ -445,6 +454,7 @@ def test_integer_recipe_uses_strict_bounds_and_expansion_limit() -> None:
     assert render(row) is None
 
 
+@skipUnlessBackends(["cute"])
 def test_source_proof_declines_deep_dags_without_python_recursion_failure() -> None:
     bound, _ = _bind_native()
     graph = torch.fx.Graph()
