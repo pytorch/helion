@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from copy import deepcopy
+from itertools import zip_longest
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -18,6 +19,9 @@ from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
+from ..compile_environment import ConfigValueExpression
+from ..compile_environment import FixedBlockSizeSource
+from ..compile_environment import _symint_sympy_expr
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -38,6 +42,9 @@ from ..cute.grouped_worklist_policy import get_grouped_worklist_target_policy
 from ..cute.grouped_worklist_policy import grouped_worklist_target_identities
 from ..cute.loop_nesting import sibling_row_loop_blocks
 from ..cute.loop_nesting import tile_loop_paths
+from ..cute.matmul_utils import cute_matmul_root_placements
+from ..cute.mma_support import cute_fp32_dot_uses_tf32
+from ..cute.packed_matmul import packed_axis_for_fact
 from ..cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ..cute.strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ..cute.strategies import TCGEN05_STRATEGY_CONFIG_KEY
@@ -1437,6 +1444,485 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             return Config(**seed)
         except Exception:
             return None
+
+
+class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
+    """Seed collective operand staging for independent contractions."""
+
+    name = "cute_collective_matmul"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # Copy legality needs guarded strides even when heuristic seeds are
+        # disabled and the caller explicitly selects a collective config.
+        if cls._axes(env, device_ir):
+            env.config_spec.enable_cute_proven_bounds()
+            return cls.CACHE_SPECIALIZATION_FACTS
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @staticmethod
+    def _axes(
+        env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        placements = cute_matmul_root_placements(env, device_ir)
+        if not placements:
+            return ()
+        axes = []
+        occupied: dict[int, tuple[int, ...]] = {}
+        roots: dict[tuple[int, ...], tuple[int, int]] = {}
+        factors: dict[int, int] = {}
+        block_specs = {
+            block_id: item
+            for item in env.config_spec.block_sizes
+            for block_id in item.block_ids
+        }
+        for fact, root in placements:
+            m, n, k = fact.m_block_id, fact.n_block_id, fact.k_block_id
+            factor = 1
+            if k is None:
+                packed = packed_axis_for_fact(env, device_ir, fact)
+                if packed is not None:
+                    k, factor = packed.block_id, packed.factor
+            if (
+                m is None
+                or n is None
+                or k is None
+                or len({m, n, k}) != 3
+                or fact.lhs_ndim not in (2, 3)
+                or fact.rhs_ndim != fact.lhs_ndim
+                or fact.lhs_dtype not in (torch.float16, torch.bfloat16, torch.float32)
+                or fact.rhs_dtype != fact.lhs_dtype
+                or fact.lhs_dtype == torch.float32
+                and (
+                    not cute_fp32_dot_uses_tf32()
+                    or env.config_spec.target_device_capability is None
+                    or env.config_spec.target_device_capability[0] < 8
+                )
+                or fact.lhs_ndim == 3
+                and not all(
+                    (item := block_specs.get(block_id)) is not None
+                    and item.max_size == 1
+                    for block_id in root
+                    if block_id not in (m, n)
+                )
+                or n not in root
+                or k in root
+                or root in roots
+                and roots[root] != (m, n)
+                or any(
+                    block_id in occupied and occupied[block_id] != root
+                    for block_id in (m, n, k)
+                )
+                or k in factors
+                and factors[k] != factor
+            ):
+                return ()
+            if (m, n, k, factor) not in axes:
+                axes.append((m, n, k, factor))
+            roots[root] = (m, n)
+            occupied.update(dict.fromkeys((m, n, k), root))
+            factors[k] = factor
+        return tuple(axes)
+
+    @staticmethod
+    def _bounded_k_seeds(
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        axes: tuple[tuple[int, int, int, int], ...],
+        seeds: list[Config],
+    ) -> tuple[list[Config], tuple[str, ...]]:
+        """Explore config-owned outer chunks together with the MMA geometry.
+
+        A collective seed at the default outer chunk may launch only a few
+        CTAs. Mutating the chunk after the search has selected a scalar tile
+        does not recover the collective's coordinated M/N/thread settings.
+        Follow the compiler's config-expression provenance, independent of
+        user parameter names, to seed both choices together.
+        """
+
+        def keys(expression: ConfigValueExpression) -> set[str]:
+            result: set[str] = set()
+            for argument in expression.arguments:
+                if isinstance(argument, str):
+                    result.add(argument)
+                elif isinstance(argument, ConfigValueExpression):
+                    result.update(keys(argument))
+            return result
+
+        spec = env.config_spec
+        blocks = {
+            item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
+        }
+        root_ids = {block_id for root in device_ir.grid_block_ids for block_id in root}
+        default = spec._base_default_config()
+        result = []
+        parameters: list[str] = []
+        for _m, _n, k, _factor in axes:
+            if k not in blocks:
+                continue
+            bound_id = blocks[k].bounded_by_block_id
+            if bound_id is None or bound_id not in root_ids:
+                continue
+            source = env.block_sizes[bound_id].block_size_source
+            if not isinstance(source, FixedBlockSizeSource) or not isinstance(
+                source.value, torch.SymInt
+            ):
+                continue
+            expression = env.config_value_expressions.get(
+                _symint_sympy_expr(source.value)
+            )
+            if expression is None:
+                continue
+            parameter_keys = keys(expression)
+            if len(parameter_keys) != 1:
+                continue
+            parameter = next(iter(parameter_keys))
+            fragment = spec.user_defined_tunables[parameter]
+            values = fragment.search_values(limit=32)
+            if values is None:
+                continue
+            for seed in seeds:
+                if seed.get("cute_collective_copy") == "scalar":
+                    continue
+                inner = spec.block_sizes.config_get(seed.block_sizes, k)
+                assert isinstance(inner, int)
+                for value in values:
+                    if (
+                        type(value) is not int
+                        or value <= 0
+                        or value == default[parameter]
+                    ):
+                        continue
+                    candidate = Config.from_dict(
+                        default.config | seed.config | {parameter: value}
+                    )
+                    if expression.evaluate(candidate) >= inner:
+                        result.append(
+                            Config.from_dict(seed.config | {parameter: value})
+                        )
+                        if parameter not in parameters:
+                            parameters.append(parameter)
+        return result, tuple(parameters)
+
+    @staticmethod
+    def _interleave_bounded_k_seeds(
+        spec: ConfigSpec,
+        seeds: list[Config],
+        parameters: tuple[str, ...],
+    ) -> list[Config]:
+        """Expose compound schedules before the initial-population cutoff.
+
+        The seed generator nests geometries, pipelines, and then config-owned
+        K chunks. Taking its prefix can test every pipelined geometry only at
+        the default chunk, even though all the coupled choices exist later.
+        Register-produced A can additionally require native seed reuse,
+        vector recipes, cooperative epilogues, and proved bounds together.
+        FP32 native MMA can instead convert vector register loads directly,
+        avoiding an asynchronous copy's raw shared-memory staging. Rotate its
+        paired copy/recipe choices before repeating geometries. When the TMEM
+        storage alternative is present, rotate through complete
+        schedules as well as compute/copy/depth/chunk groups, retaining the
+        ranked geometry order within each. This only reorders existing seeds;
+        the first seed, default promotion, other heuristics, and search budget
+        stay unchanged. Unrelated user knobs never supply a grouping dimension.
+        """
+        tmem_operand_schedules = any(
+            seed.get("cute_collective_tmem_a", False) for seed in seeds
+        )
+        register_recipe_schedules = any(
+            seed.get("cute_collective_compute") == "tcgen05"
+            and seed.get("cute_collective_copy") == "scalar"
+            and seed.get("cute_collective_recipe") in ("vector", "vector_unrolled")
+            for seed in seeds
+        )
+        packet_schedules = any(
+            seed.get("cute_collective_operand_packets", False) for seed in seeds
+        )
+        if (
+            not parameters
+            and not tmem_operand_schedules
+            and not register_recipe_schedules
+            and not packet_schedules
+        ):
+            return seeds
+        default = spec._base_default_config()
+        groups: dict[tuple[object, ...], list[Config]] = {}
+        for seed in seeds:
+            key = (
+                seed.get("cute_collective_compute", "warp"),
+                seed.get("cute_collective_copy", "scalar"),
+                seed.get("cute_collective_stages", 1),
+                *(seed.get(parameter, default[parameter]) for parameter in parameters),
+            )
+            if tmem_operand_schedules:
+                key += (
+                    seed.get("cute_collective_native_seeded", False),
+                    seed.get("cute_collective_recipe", "scalar"),
+                    seed.get("cute_collective_epilogue", "scalar"),
+                    seed.get("cute_collective_tmem_seed", False),
+                    seed.get("cute_proven_bounds", False),
+                    seed.get("cute_collective_tmem_a", False),
+                )
+            elif register_recipe_schedules:
+                key += (seed.get("cute_collective_recipe", "scalar"),)
+            if packet_schedules:
+                key += (seed.get("cute_collective_operand_packets", False),)
+            groups.setdefault(key, []).append(seed)
+        return [
+            seed
+            for row in zip_longest(*groups.values())
+            for seed in row
+            if seed is not None
+        ]
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        # The collective proof imports DeviceIR, which imports the runtime
+        # kernel while this registry is being initialized.
+        from ..cute.collective_matmul import has_collective_native_seed_candidate
+        from ..cute.collective_matmul import has_collective_tmem_operand_candidate
+
+        spec = env.config_spec
+        # Those search families do not carry collective controls. Their
+        # flatten/unflatten path would silently turn these into unrelated
+        # native-MMA seeds instead of measuring the requested collective.
+        if spec.cute_tcgen05_search_enabled or spec.cute_flash_search_enabled:
+            return []
+        axes = cls._axes(env, device_ir)
+        if not axes:
+            return []
+        blocks = {
+            item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
+        }
+        axis_ids = {block_id for m, n, k, _ in axes for block_id in (m, n, k)}
+        singleton_axes = set(blocks) - axis_ids
+        if any(blocks[block_id].max_size != 1 for block_id in singleton_axes):
+            return []
+        fp32_inputs = any(
+            fact.lhs_dtype == torch.float32
+            for fact, _root in cute_matmul_root_placements(env, device_ir)
+        )
+        fixed_k = axis_ids - set(blocks)
+        if any(
+            block_id not in {k for _, _, k, _ in axes}
+            or not env.block_sizes[block_id].reduction
+            or not env.block_sizes[block_id].numel.is_Integer
+            or not 1 < int(env.block_sizes[block_id].numel) <= 128
+            for block_id in fixed_k
+        ):
+            return []
+        fragments = {
+            block_id: item._fragment(spec) for block_id, item in blocks.items()
+        }
+        seeded_native = has_collective_native_seed_candidate(device_ir.graphs)
+        result = []
+        for bm, bn, bk in (
+            (64, 32, 64),
+            (64, 64, 64),
+            (32, 32, 64),
+            (32, 32, 32),
+            (128, 32, 64),
+            (64, 32, 32),
+            (128, 64, 128),
+            (64, 64, 128),
+            (32, 64, 32),
+            (32, 64, 64),
+        ):
+            if any(bk % factor for _, _, _, factor in axes):
+                continue
+            values = {
+                block_id: value
+                for m, n, k, factor in axes
+                for block_id, value in zip(
+                    (m, n, k), (bm, bn, bk // factor), strict=True
+                )
+                if block_id in blocks
+            }
+            threads = {
+                block_id: value
+                for m, n, k, _ in axes
+                for block_id, value in zip((m, n, k), (128 // bn, bn, 1), strict=True)
+            }
+            values.update(dict.fromkeys(singleton_axes, 1))
+            threads.update(dict.fromkeys(singleton_axes, 0))
+            if not all(
+                fragments[block_id].low <= value <= fragments[block_id].high
+                for block_id, value in values.items()
+            ):
+                continue
+            copy_modes = (
+                ("scalar",)
+                if any(factor > 1 for _, _, _, factor in axes)
+                else ("scalar", "async", "async_cached")
+            )
+            for copy in copy_modes:
+                seed = Config.from_dict(
+                    {
+                        "block_sizes": _seq_config_list(spec.block_sizes, values),
+                        "num_threads": _seq_config_list(spec.num_threads, threads),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths,
+                            dict.fromkeys(axis_ids | singleton_axes, 1),
+                        ),
+                        "cute_lane_layouts": _seq_config_list(
+                            spec.cute_lane_layouts,
+                            dict.fromkeys(axis_ids | singleton_axes, "blocked"),
+                        ),
+                        "cute_collective_mma": True,
+                        "cute_collective_copy": copy,
+                    }
+                )
+                if (
+                    fp32_inputs
+                    and bm in (64, 128)
+                    and spec.target_device_capability is not None
+                    and spec.target_device_capability[0] == 10
+                ):
+                    # Retain the established native candidates and ordering;
+                    # the warp alternative also admits a smaller M32 tile.
+                    result.append(
+                        Config.from_dict(
+                            seed.config | {"cute_collective_compute": "tcgen05"}
+                        )
+                    )
+                result.append(seed)
+            if (
+                bm in (64, 128)
+                and spec.target_device_capability is not None
+                and spec.target_device_capability[0] == 10
+            ):
+                # Native MMA consumes the same generic shared recipes, including
+                # the scalar fallback for transformed or unaligned operands.
+                native_seed = Config.from_dict(
+                    result[-1].config | {"cute_collective_compute": "tcgen05"}
+                )
+                if not fp32_inputs:
+                    result.append(native_seed)
+                if seeded_native:
+                    result.append(
+                        Config.from_dict(
+                            native_seed.config | {"cute_collective_native_seeded": True}
+                        )
+                    )
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_stages": stages})
+                for seed in result
+                if seed.get("cute_collective_compute", "warp") == "warp"
+                and seed.get("cute_collective_copy") == "async_cached"
+                for stages in (2, 4)
+            ]
+        )
+        bounded_seeds, bounded_parameters = cls._bounded_k_seeds(
+            env, device_ir, axes, result
+        )
+        result.extend(bounded_seeds)
+        # Keep register-vector recipe traversal paired with a complete MMA
+        # geometry. Unrolling is a separate search choice because its register
+        # pressure can outweigh the saved loop and address instructions.
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_recipe": recipe})
+                for seed in result
+                if (
+                    seed.get("cute_collective_copy") == "async_cached"
+                    or (
+                        fp32_inputs
+                        and seed.get("cute_collective_compute") == "tcgen05"
+                        and seed.get("cute_collective_copy") == "scalar"
+                    )
+                )
+                and seed.get("cute_collective_stages", 1) == 1
+                for recipe in ("vector", "vector_unrolled")
+            ]
+        )
+        # Pair cooperative epilogues with complete copy/compute geometries.
+        # Keep scalar epilogues available when repartitioning increases register
+        # pressure or the output's stride/mask proof cannot vectorize stores.
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_epilogue": epilogue})
+                for seed in result
+                if seed.get("cute_collective_recipe") == "vector_unrolled"
+                for epilogue in ("vector", "vector_unrolled")
+            ]
+        )
+        # A dependent native contraction can carry its FP32 seed directly
+        # through TMEM. Keep the shared route available as a search alternative.
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_tmem_seed": True})
+                for seed in result
+                if seed.get("cute_collective_compute") == "tcgen05"
+                and seed.get("cute_collective_native_seeded", False)
+                and seed.get("cute_collective_recipe") == "vector_unrolled"
+                and seed.get("cute_collective_epilogue") == "vector_unrolled"
+            ]
+        )
+        if spec.cute_proven_bounds_enabled:
+            result.extend(
+                [
+                    Config.from_dict(seed.config | {"cute_proven_bounds": True})
+                    for seed in result
+                    if seed.get("cute_collective_recipe") == "vector_unrolled"
+                    and seed.get("cute_collective_epilogue") == "vector_unrolled"
+                ]
+            )
+        if (
+            not fp32_inputs
+            and all(factor == 1 for _m, _n, _k, factor in axes)
+            and has_collective_tmem_operand_candidate(device_ir.graphs)
+        ):
+            # TMEM A changes register ownership as well as storage. Couple it
+            # to complete native/vector geometries, retaining seed reuse and
+            # proven bounds when available, rather than waiting for unrelated
+            # coordinate mutations to discover the full schedule.
+            result.extend(
+                [
+                    Config.from_dict(seed.config | {"cute_collective_tmem_a": True})
+                    for seed in result
+                    if seed.get("cute_collective_compute") == "tcgen05"
+                    and seed.get("cute_collective_recipe") == "vector_unrolled"
+                    and seed.get("cute_collective_epilogue") == "vector_unrolled"
+                ]
+            )
+        if fp32_inputs:
+            # Store four already-rounded operand words together. This can save
+            # shared instructions/bank conflicts, but changes register lifetime;
+            # retain the scalar stores and both recipe loop schedules.
+            result.extend(
+                [
+                    Config.from_dict(
+                        deepcopy(seed.config)
+                        | {"cute_collective_operand_packets": True}
+                    )
+                    for seed in result
+                    if seed.get("cute_collective_recipe")
+                    in ("vector", "vector_unrolled")
+                    and seed.get("cute_collective_copy") == "scalar"
+                    and seed.get("cute_collective_stages", 1) == 1
+                ]
+            )
+        return cls._interleave_bounded_k_seeds(
+            spec, dedupe_configs(result), bounded_parameters
+        )
 
 
 def _cute_reread_cache_policies(

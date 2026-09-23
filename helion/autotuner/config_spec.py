@@ -858,7 +858,19 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_register_chain",
         "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
@@ -926,7 +938,19 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_register_chain",
         "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
@@ -998,7 +1022,19 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_register_chain",
         "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
@@ -2657,6 +2693,27 @@ class ConfigSpec:
                 else:
                     raise InvalidConfig(f"{key} must be a boolean")
 
+    def _normalize_cute_register_chain(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_register_chain"
+        if key not in config:
+            return
+        value = config[key]
+        supported = (
+            bool(self.matmul_facts)
+            and self.target_device_capability is not None
+            and self.target_device_capability[0] >= 8
+        )
+        if type(value) is not bool or (value and not supported):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(
+                    "cute_register_chain requires a boolean, matrix contractions, "
+                    "and CUDA compute capability >= 8.0"
+                )
+
     def _normalize_cute_proven_bounds(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3004,6 +3061,131 @@ class ConfigSpec:
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
+            if self.matmul_facts:
+                value = config.setdefault("cute_collective_mma", False)
+                if not isinstance(value, bool):
+                    if _fix_invalid:
+                        config["cute_collective_mma"] = False
+                    else:
+                        raise InvalidConfig("cute_collective_mma must be a boolean")
+                for key in (
+                    "cute_collective_native_seeded",
+                    "cute_collective_tmem_seed",
+                    "cute_collective_tmem_a",
+                ):
+                    seeded = config.setdefault(key, False)
+                    if not isinstance(seeded, bool):
+                        if _fix_invalid:
+                            config[key] = False
+                        else:
+                            raise InvalidConfig(f"{key} must be a boolean")
+                    if seeded is True and (
+                        self.target_device_capability is None
+                        or self.target_device_capability[0] != 10
+                    ):
+                        if _fix_invalid:
+                            config[key] = False
+                        else:
+                            raise InvalidConfig(f"{key} requires SM100-family hardware")
+                packet_key = "cute_collective_operand_packets"
+                if not isinstance(config.get(packet_key, False), bool):
+                    if _fix_invalid:
+                        config[packet_key] = False
+                    else:
+                        raise InvalidConfig(f"{packet_key} must be a boolean")
+                copy = config.setdefault("cute_collective_copy", "scalar")
+                if copy not in ("scalar", "async", "async_cached"):
+                    if _fix_invalid:
+                        config["cute_collective_copy"] = "scalar"
+                    else:
+                        raise InvalidConfig(
+                            "cute_collective_copy must be scalar, async, or async_cached"
+                        )
+                for key in ("cute_collective_recipe", "cute_collective_epilogue"):
+                    recipe = config.get(key, "scalar")
+                    if recipe not in ("scalar", "vector", "vector_unrolled"):
+                        if _fix_invalid:
+                            config[key] = "scalar"
+                        else:
+                            raise InvalidConfig(
+                                f"{key} must be scalar, vector, or vector_unrolled"
+                            )
+                compute = config.setdefault("cute_collective_compute", "warp")
+                if compute not in ("warp", "tcgen05"):
+                    if _fix_invalid:
+                        config["cute_collective_compute"] = "warp"
+                    else:
+                        raise InvalidConfig(
+                            "cute_collective_compute must be warp or tcgen05"
+                        )
+                if compute == "tcgen05" and (
+                    self.target_device_capability is None
+                    or self.target_device_capability[0] != 10
+                ):
+                    if _fix_invalid:
+                        config["cute_collective_compute"] = "warp"
+                    else:
+                        raise InvalidConfig(
+                            "native collective compute requires SM100-family hardware"
+                        )
+                for key, choices, default in (
+                    ("cute_collective_stages", (1, 2, 3, 4), 1),
+                ):
+                    if key in config and (
+                        type(config[key]) is not int or config[key] not in choices
+                    ):
+                        if _fix_invalid:
+                            config[key] = default
+                        else:
+                            raise InvalidConfig(f"{key} must be one of {choices}")
+            elif any(
+                key in config
+                for key in (
+                    "cute_collective_mma",
+                    "cute_collective_copy",
+                    "cute_collective_recipe",
+                    "cute_collective_operand_packets",
+                    "cute_collective_epilogue",
+                    "cute_collective_stages",
+                    "cute_collective_compute",
+                    "cute_collective_native_seeded",
+                    "cute_collective_tmem_seed",
+                    "cute_collective_tmem_a",
+                )
+            ):
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        "cute_collective_mma requires a matrix contraction"
+                    )
+                config.pop("cute_collective_mma", None)
+                config.pop("cute_collective_copy", None)
+                config.pop("cute_collective_recipe", None)
+                config.pop("cute_collective_operand_packets", None)
+                config.pop("cute_collective_epilogue", None)
+                config.pop("cute_collective_stages", None)
+                config.pop("cute_collective_compute", None)
+                config.pop("cute_collective_native_seeded", None)
+                config.pop("cute_collective_tmem_seed", None)
+                config.pop("cute_collective_tmem_a", None)
+        if self.backend_name == "cute":
+            key = "cute_collective_static_layouts"
+            value = config.get(key, False)
+            if value is False:
+                config.pop(key, None)
+            elif (
+                value is True
+                and self.matmul_facts
+                and config.get("cute_collective_mma", False)
+                and config.get("cute_collective_compute", "warp") == "warp"
+            ):
+                pass
+            elif _fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    "cute_collective_static_layouts requires warp collective MMA"
+                )
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -4188,6 +4370,52 @@ class ConfigSpec:
                     )
                 if self.cute_bf16x2_recurrence_enabled:
                     fields["cute_bf16x2_recurrence"] = BooleanFragment()
+                if self.matmul_facts:
+                    fields["cute_collective_mma"] = BooleanFragment()
+                    fields["cute_collective_static_layouts"] = BooleanFragment()
+                    native_collective = (
+                        self.target_device_capability is not None
+                        and self.target_device_capability[0] == 10
+                    )
+                    fields["cute_collective_compute"] = EnumFragment(
+                        choices=("warp", "tcgen05") if native_collective else ("warp",),
+                    )
+                    fields["cute_collective_native_seeded"] = (
+                        BooleanFragment()
+                        if native_collective
+                        else EnumFragment(choices=(False,))
+                    )
+                    fields["cute_collective_tmem_seed"] = (
+                        BooleanFragment()
+                        if native_collective
+                        else EnumFragment(choices=(False,))
+                    )
+                    fields["cute_collective_tmem_a"] = (
+                        BooleanFragment()
+                        if native_collective
+                        else EnumFragment(choices=(False,))
+                    )
+                    fields["cute_collective_stages"] = EnumFragment(
+                        choices=(1, 2, 3, 4)
+                    )
+                    fields["cute_collective_copy"] = EnumFragment(
+                        choices=("scalar", "async", "async_cached")
+                    )
+                    fields["cute_collective_recipe"] = EnumFragment(
+                        choices=("scalar", "vector", "vector_unrolled")
+                    )
+                    fields["cute_collective_operand_packets"] = EnumFragment(
+                        choices=(False, True),
+                        search_choices=(False, True)
+                        if any(
+                            fact.lhs_dtype == torch.float32
+                            for fact in self.matmul_facts
+                        )
+                        else (False,),
+                    )
+                    fields["cute_collective_epilogue"] = EnumFragment(
+                        choices=("scalar", "vector", "vector_unrolled")
+                    )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
                 if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
@@ -4208,6 +4436,19 @@ class ConfigSpec:
                     fields["cute_rng_packet"] = BooleanFragment()
                 if self.cute_packet_prefetch_enabled:
                     fields["cute_packet_prefetch"] = EnumFragment(choices=(0, 2, 4, 8))
+                if (
+                    self.matmul_facts
+                    and self.target_device_capability is not None
+                    and self.target_device_capability[0] >= 8
+                ):
+                    chain_seeded = any(
+                        seed.config.get("cute_register_chain") is True
+                        for seed in self.compiler_seed_configs
+                    )
+                    fields["cute_register_chain"] = EnumFragment(
+                        (False, True),
+                        search_choices=(False, True) if chain_seeded else (False,),
+                    )
                 # CuTe's SIMT search normally has no pid_type coordinate.  A
                 # metadata-specialized compiler seed may nevertheless prove one
                 # exact 3-D ``xyz`` launch safe after the earlier, deliberately

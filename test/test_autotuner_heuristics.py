@@ -3624,14 +3624,16 @@ class TestAutotunerHeuristic(TestCase):
             unaligned = plain_matmul.bind(
                 (storage[1:].view(128, 128), make_args(128)[1])
             )
+            revisited = plain_matmul.bind(make_args(128))
 
         self.assertIsNot(first, zero)
-        self.assertIs(rebound, first)
+        self.assertIsNot(rebound, first)
+        self.assertIs(revisited, first)
         # CuTe binds specialize every kernel on its vector-alignment facts, so
         # an unaligned operand is a distinct bound kernel. Nothing else may
         # differ: grouped-worklist facts still ignore a plain matmul.
         self.assertIsNot(unaligned, first)
-        self.assertEqual(len(plain_matmul._bound_kernels), 3)
+        self.assertEqual(len(plain_matmul._bound_kernels), 4)
         self.assertEqual(
             set(unaligned.env.runtime_input_specializations),
             set(first.env.runtime_input_specializations),
@@ -3645,11 +3647,26 @@ class TestAutotunerHeuristic(TestCase):
             },
             {_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY},
         )
-        self.assertEqual(zero._compiler_seed_specialization_extractors, ())
-        self.assertEqual(first._compiler_seed_specialization_extractors, ())
-        self.assertIsNone(
-            first.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
-        )
+        # Explicit collective configs need metadata guards even with seeds
+        # disabled. They must not register grouped-worklist facts or policies.
+        for bound in (zero, first, rebound, unaligned):
+            self.assertEqual(
+                [
+                    extractor.fact
+                    for extractor in bound._compiler_seed_specialization_extractors
+                ],
+                ["input_tensor_metadata"],
+            )
+            self.assertIsNone(
+                bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
+            )
+            self.assertFalse(
+                any(
+                    key.startswith("cute_tcgen05_grouped_worklist:")
+                    for key in bound.env.runtime_input_specializations
+                )
+            )
+            self.assertEqual(bound.config_spec.compiler_seed_configs, [])
 
     @onlyBackends(["cute"])
     def test_grouped_worklist_unannotated_prepacked_seeds_and_rebind(self) -> None:
