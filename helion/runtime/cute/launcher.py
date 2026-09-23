@@ -520,6 +520,44 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "gathered_mma_tma":
+        bn = plan_int("bn")
+        stages = plan_int("stages")
+        kernel_args = plan["kernel_args"]
+        if (
+            bn not in (128, 256, 512)
+            or stages not in (2, 3, 4)
+            or (128 + bn) * 64 * 2 * stages + 18432 > 232448
+            or not isinstance(kernel_args, (list, tuple))
+            or len(kernel_args) != 6
+            or not all(isinstance(name, str) for name in kernel_args)
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid gathered MMA wrapper geometry"
+            )
+        parameters = cast("Sequence[str]", kernel_args)
+        extent = (
+            f"arg{plan_int('m_extent_idx')}"
+            if "m_extent_idx" in plan
+            else str(plan_int("m_extent"))
+        )
+        body.extend(
+            (
+                (
+                    f"    {', '.join(parameters)} = _helion_make_gathered_tma("
+                    f"arg{plan_int('lhs_idx')}, arg{plan_int('rhs_idx')}, {bn}, {stages})"
+                ),
+                (
+                    f"    grid_x = cutlass.Int32({plan_int('groups') * ((plan_int('n_size') + bn - 1) // bn)}) * "
+                    f"cutlass.Int32(cutlass.min({plan_int('grid_cap')}, cutlass.max(1, "
+                    f"(cutlass.Int64(cutlass.Int32({extent})) + 127) // 128)))"
+                ),
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            )
+        )
+        call_args.extend(parameters)
+        return
     if kind == "chunk_recurrence_sm100":
         outputs_scaled = plan.get("outputs_scaled")
         factor_key_xor = plan.get("factor_key_xor")
@@ -2012,6 +2050,18 @@ def _create_cute_wrapper(
         )
     for plan in wrapper_plans:
         _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
+    gathered_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "gathered_mma_tma"
+    ]
+    if gathered_plans:
+        if (
+            len(wrapper_plans) != 1
+            or tuple(cast("Sequence[int]", gathered_plans[0]["source_block"])) != block
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "gathered MMA requires its proved source launch"
+            )
+        block = (288, 1, 1)
     sm100_recurrence_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "chunk_recurrence_sm100"
     ]
@@ -2102,6 +2152,10 @@ def _create_cute_wrapper(
         "CUstream": cuda_driver.CUstream,
         "_kernel": cute_kernel,
     }
+    if gathered_plans:
+        from ..._compiler.cute.gathered_mma_runtime import make_tma_arguments
+
+        namespace["_helion_make_gathered_tma"] = make_tma_arguments
     if sm100_recurrence_plans:
         from ..._compiler.cute.chunk_recurrence_sm100 import host_chain_dv2
 
@@ -4933,6 +4987,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         "chunk_prepare_tma",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
+        "gathered_mma_tma",
     }:
         return True
     if not kind.startswith("tcgen05"):
@@ -6101,6 +6156,7 @@ def _cute_build_fast_relaunch(
             "chunk_prepare_tma",
             "chunk_recurrence_sm100",
             "chunk_recurrence_warp_dv4",
+            "gathered_mma_tma",
         }
         for plan in wrapper_plans
     ):

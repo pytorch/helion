@@ -53,6 +53,10 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/paired_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
+    "gathered_mma_tma": (
+        "_compiler/cute/_mlir_compat.py",
+        "_compiler/cute/gathered_mma_runtime.py",
+    ),
     "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
     "chunk_recurrence_warp_dv4": (
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",

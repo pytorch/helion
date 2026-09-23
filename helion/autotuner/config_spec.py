@@ -915,6 +915,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_collective_native_seeded",
         "cute_collective_tmem_seed",
         "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
@@ -1006,6 +1008,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_collective_native_seeded",
         "cute_collective_tmem_seed",
         "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
@@ -1102,6 +1106,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_collective_native_seeded",
         "cute_collective_tmem_seed",
         "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
         "cute_proven_bounds",
         "cute_rng_packet",
         "cute_independent_reduction",
@@ -3440,14 +3446,14 @@ class ConfigSpec:
                                 f"{key} must be scalar, vector, or vector_unrolled"
                             )
                 compute = config.setdefault("cute_collective_compute", "warp")
-                if compute not in ("warp", "tcgen05"):
+                if compute not in ("warp", "tcgen05", "tma_gather"):
                     if _fix_invalid:
                         config["cute_collective_compute"] = "warp"
                     else:
                         raise InvalidConfig(
-                            "cute_collective_compute must be warp or tcgen05"
+                            "cute_collective_compute must be warp, tcgen05, or tma_gather"
                         )
-                if compute == "tcgen05" and (
+                if compute in ("tcgen05", "tma_gather") and (
                     self.target_device_capability is None
                     or self.target_device_capability[0] != 10
                 ):
@@ -3459,6 +3465,8 @@ class ConfigSpec:
                         )
                 for key, choices, default in (
                     ("cute_collective_stages", (1, 2, 3, 4), 1),
+                    ("cute_gathered_mma_n", (128, 256, 512), 256),
+                    ("cute_gathered_mma_stages", (2, 3, 4), 3),
                 ):
                     if key in config and (
                         type(config[key]) is not int or config[key] not in choices
@@ -3467,6 +3475,16 @@ class ConfigSpec:
                             config[key] = default
                         else:
                             raise InvalidConfig(f"{key} must be one of {choices}")
+                if compute == "tma_gather":
+                    n = config.setdefault("cute_gathered_mma_n", 256)
+                    stages = config.setdefault("cute_gathered_mma_stages", 3)
+                    if n == 512 and stages != 2:
+                        if _fix_invalid:
+                            config["cute_gathered_mma_stages"] = 2
+                        else:
+                            raise InvalidConfig(
+                                "512-column gathered MMA requires two stages"
+                            )
             elif any(
                 key in config
                 for key in (
@@ -3480,6 +3498,8 @@ class ConfigSpec:
                     "cute_collective_native_seeded",
                     "cute_collective_tmem_seed",
                     "cute_collective_tmem_a",
+                    "cute_gathered_mma_n",
+                    "cute_gathered_mma_stages",
                 )
             ):
                 if not _fix_invalid:
@@ -3496,6 +3516,8 @@ class ConfigSpec:
                 config.pop("cute_collective_native_seeded", None)
                 config.pop("cute_collective_tmem_seed", None)
                 config.pop("cute_collective_tmem_a", None)
+                config.pop("cute_gathered_mma_n", None)
+                config.pop("cute_gathered_mma_stages", None)
         if self.backend_name == "cute":
             key = "cute_collective_static_layouts"
             value = config.get(key, False)
@@ -4805,8 +4827,19 @@ class ConfigSpec:
                         self.target_device_capability is not None
                         and self.target_device_capability[0] == 10
                     )
+                    gathered_collective = native_collective and any(
+                        seed.config.get("cute_collective_compute") == "tma_gather"
+                        for seed in self.compiler_seed_configs
+                    )
                     fields["cute_collective_compute"] = EnumFragment(
-                        choices=("warp", "tcgen05") if native_collective else ("warp",),
+                        choices=("warp", "tcgen05", "tma_gather")
+                        if native_collective
+                        else ("warp",),
+                        search_choices=("warp", "tcgen05", "tma_gather")
+                        if gathered_collective
+                        else ("warp", "tcgen05")
+                        if native_collective
+                        else ("warp",),
                     )
                     fields["cute_collective_native_seeded"] = (
                         BooleanFragment()
@@ -4843,6 +4876,16 @@ class ConfigSpec:
                     )
                     fields["cute_collective_epilogue"] = EnumFragment(
                         choices=("scalar", "vector", "vector_unrolled")
+                    )
+                    fields["cute_gathered_mma_n"] = EnumFragment(
+                        choices=(256, 128, 512),
+                        search_choices=(256, 128, 512)
+                        if gathered_collective
+                        else (256,),
+                    )
+                    fields["cute_gathered_mma_stages"] = EnumFragment(
+                        choices=(3, 2, 4),
+                        search_choices=(3, 2, 4) if gathered_collective else (3,),
                     )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
