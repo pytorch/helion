@@ -860,6 +860,9 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_reduction_sequence",
         "cute_host_paired_sum",
         "cute_reduction_group_rows",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
@@ -948,6 +951,9 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_reduction_sequence",
         "cute_host_paired_sum",
         "cute_reduction_group_rows",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
@@ -1040,6 +1046,9 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_reduction_sequence",
         "cute_host_paired_sum",
         "cute_reduction_group_rows",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
@@ -1295,6 +1304,19 @@ class ConfigSpec:
         self.cute_affine_scan_schedule: EnumFragment | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
+        # A separately launched, proved pointwise producer can share one
+        # Config with a native GEMM. Keep its ordinary SIMT layout knobs in
+        # the native search schema; MMA-owned axes retain their auto layout.
+        self.cute_pointwise_region_block_ids: frozenset[int] = frozenset()
+        # Separately launched pointwise grids whose axes have one root owner.
+        # Their search floors use the rank of that launch, independently of
+        # any native MMA region sharing the complete kernel configuration.
+        self.cute_pointwise_region_grid_groups: tuple[tuple[int, ...], ...] = ()
+        self.cute_materialized_schedule_available: bool = False
+        self.cute_materialized_schedule_search_enabled: bool = False
+        self.cute_row_matrix_transport_available: bool = False
+        self.cute_materialized_operand_schedule_available: bool = False
+        self.cute_materialized_operand_schedule_search_enabled: bool = False
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
         # and behavior is byte-identical to the env-only path. Set True when the
@@ -2589,6 +2611,72 @@ class ConfigSpec:
             raise InvalidConfig("packet prefetch requires CuTe")
         self.cute_packet_prefetch_enabled = True
 
+    def _normalize_cute_pointwise_pid_type(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_pointwise_pid_type"
+        value = config.get(key, "inherit")
+        if type(value) is str and value == "inherit":
+            config.pop(key, None)
+            return
+        if (
+            type(value) is str
+            and value == "flat"
+            and self.cute_pointwise_region_block_ids
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(f"{key}={value!r} requires a proved pointwise region")
+
+    def _normalize_cute_materialized_operand_schedule(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_materialized_operand_schedule"
+        value = config.get(key, "off")
+        if type(value) is str and value == "off":
+            config.pop(key, None)
+            return
+        if (
+            type(value) is str
+            and value == "warp_narrow4"
+            and self.cute_materialized_operand_schedule_available
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(f"{key}={value!r} requires a proved packed byte operand")
+
+    @property
+    def cute_materialized_schedule_choices(self) -> tuple[str, ...]:
+        choices = ("off", "warp_rows2")
+        if self.cute_row_matrix_transport_available:
+            return (*choices, "warp_rows2_matrix")
+        return choices
+
+    def _normalize_cute_materialized_schedule(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_materialized_schedule"
+        value = config.get(key, "off")
+        if type(value) is str and value == "off":
+            config.pop(key, None)
+            return
+        if (
+            type(value) is str
+            and value in self.cute_materialized_schedule_choices[1:]
+            and self.cute_materialized_schedule_available
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a proved compact row-resident pair"
+        )
+
     def _normalize_cute_host_paired_sum(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3239,6 +3327,11 @@ class ConfigSpec:
             self._normalize_cute_reduction_row_output(config, fix_invalid=_fix_invalid)
             self._normalize_cute_reduction_sequence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_host_paired_sum(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_materialized_operand_schedule(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_pointwise_pid_type(config, fix_invalid=_fix_invalid)
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
@@ -4164,6 +4257,12 @@ class ConfigSpec:
         n_cus = num_compute_units()
         n_dims = len(self.grid_block_ids)
         max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
+        independent_max_blocks: dict[int, int] = {
+            block_id: math.ceil((n_cus * 64) ** (1.0 / len(grid)))
+            for grid in self.cute_pointwise_region_grid_groups
+            for block_id in grid
+        }
+
         for grid_bid in self.grid_block_ids:
             try:
                 spec = self.block_sizes.block_id_lookup(grid_bid)
@@ -4172,7 +4271,9 @@ class ConfigSpec:
             if spec.size_hint <= 0:
                 continue
             default = spec._fragment(self).default_val
-            min_block = spec.size_hint // max_blocks_per_dim
+            min_block = spec.size_hint // independent_max_blocks.get(
+                grid_bid, max_blocks_per_dim
+            )
             min_block = min(min_block, default)
             if min_block >= 2:
                 min_block = 1 << (min_block.bit_length() - 1)
@@ -4279,6 +4380,10 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if key == "cute_materialized_schedule":
+                return True, "off"
+            if key == "cute_materialized_operand_schedule":
+                return True, "off"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
@@ -4462,8 +4567,24 @@ class ConfigSpec:
                 fields["cute_host_paired_sum"] = EnumFragment(
                     choices=("off", "mapped", "narrow")
                 )
+            if self.cute_materialized_schedule_search_enabled:
+                fields["cute_materialized_schedule"] = EnumFragment(
+                    choices=self.cute_materialized_schedule_choices
+                )
+            if self.cute_materialized_operand_schedule_search_enabled:
+                fields["cute_materialized_operand_schedule"] = EnumFragment(
+                    choices=("off", "warp_narrow4")
+                )
+            if self.cute_pointwise_region_block_ids:
+                fields["cute_pointwise_pid_type"] = EnumFragment(
+                    choices=("inherit", "flat")
+                )
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
+                if self.cute_pointwise_region_block_ids:
+                    fields["num_threads"] = self.num_threads
+                    fields["cute_vector_widths"] = self.cute_vector_widths
+                    fields["cute_lane_layouts"] = self.cute_lane_layouts
             elif self.cute_flash_search_enabled:
                 fields.update(
                     self._cute_flash_autotune_fragments(
@@ -5245,6 +5366,14 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # Needed for matmul dims smaller than the heuristic default (e.g. M<16),
         # where the default would otherwise overshoot to a masked tile.
         default = min(default, self.dim_max_size)
+        if any(
+            self.block_id in group for group in base.cute_pointwise_region_grid_groups
+        ):
+            # Widen independent pointwise searches without changing the old
+            # effective default, which the fragment clamps to its soft floor.
+            # Shared axes and hard layout/alignment minima remain unchanged.
+            default = max(min(default, self.max_size), low)
+            low = min(self.min_size, self.max_size)
         return BlockSizeFragment(
             low,
             self.max_size,
@@ -5263,7 +5392,13 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
             return 0
         return super()._normalize(name, value)
 
-    def _fragment(self, base: ConfigSpec) -> NumThreadsFragment:
+    def _fragment(self, base: ConfigSpec) -> NumThreadsFragment | EnumFragment:
+        if (
+            base.cute_tcgen05_search_enabled
+            and base.cute_pointwise_region_block_ids
+            and self.block_id not in base.cute_pointwise_region_block_ids
+        ):
+            return EnumFragment((0,))
         max_threads = min(max(self.size_hint, 1), 1024)
         default = next_power_of_2(max_threads)
         return NumThreadsFragment(default)
@@ -5426,6 +5561,12 @@ class CuteLaneLayoutSpec(_BlockIdItem):
         super().__init__([block_id])
 
     def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if (
+            base.cute_tcgen05_search_enabled
+            and base.cute_pointwise_region_block_ids
+            and self.block_id not in base.cute_pointwise_region_block_ids
+        ):
+            return EnumFragment(("blocked",))
         return EnumFragment(choices=_CUTE_LANE_LAYOUT_CHOICES)
 
     def _normalize(self, name: str, value: object) -> str:
@@ -5457,6 +5598,12 @@ class CuteVectorWidthSpec(_BlockIdItem):
         self.size_hint = size_hint
 
     def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if (
+            base.cute_tcgen05_search_enabled
+            and base.cute_pointwise_region_block_ids
+            and self.block_id not in base.cute_pointwise_region_block_ids
+        ):
+            return EnumFragment((1,))
         return EnumFragment(choices=_CUTE_VECTOR_WIDTH_CHOICES)
 
     def _normalize(self, name: str, value: object) -> int:

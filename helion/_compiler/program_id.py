@@ -3381,7 +3381,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if (
             emit_pdl_wait
             and self._tcgen05_is_two_cta()
-            and (role_block.role_predicate == self._tcgen05_tma_load_role_predicate())
+            and (
+                role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+                or device_function.config.get("tcgen05_materialized_pdl", False)
+                and device_function.config.get("tcgen05_epilogue_fanout") == "shared"
+                and role_block.role_predicate == self._tcgen05_epi_role_predicate()
+            )
         ):
             # PDL parity with Quack/CUTLASS: TMA producers wait before
             # touching scheduler state or issuing global-memory TMA work.

@@ -11,8 +11,8 @@ import pytest
 import torch
 
 from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import _target
 from test.test_cute_grouped_coverage_search import _search
-from test.test_cute_shared_rhs_grouped import _target
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import (
@@ -41,9 +41,11 @@ if TYPE_CHECKING:
 KEY = "tcgen05_grouped_full_coverage"
 WIDTH = "tcgen05_grouped_worklist_source_m_tile"
 FLAGS = {
+    "cute_region_fission": True,
     "cute_full_slice_matmul_tiling": True,
     "cute_segmented_matmul_tiling": True,
     "cute_flatten_nested_reductions": True,
+    "cute_materialize_transformed_operands": True,
 }
 
 

@@ -35,6 +35,7 @@ from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
 from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
 from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
+from .pipeline_smem import pipeline_smem_bytes
 from .strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
@@ -356,6 +357,9 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     "tcgen05_cluster_m",
     "tcgen05_cluster_n",
     "tcgen05_ab_stages",
+    "tcgen05_region_ab_stages",
+    "tcgen05_region_c_stages",
+    "tcgen05_materialized_pdl",
     "tcgen05_acc_stages",
     "tcgen05_c_stages",
     TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY,
@@ -433,6 +437,16 @@ class CuteTcgen05Config:
         self.config_spec = config_spec
         self.search_enabled: bool = False
         self.matmul_block_ids: tuple[int, int, int] | None = None
+        # Separate device launches may own independent native contractions.
+        # They share pipeline knobs, but never a single matrix-axis projection.
+        self.materialized_matmul_block_ids: tuple[tuple[int, int, int], ...] = ()
+        self.materialized_matmul_shapes: tuple[tuple[int, int, int], ...] = ()
+        self.materialized_pipeline_facts: tuple[
+            Tcgen05PipelineSmemFacts | None, ...
+        ] = ()
+        self.materialized_pair_budget_facts: tuple[
+            Tcgen05PipelineSmemFacts | None, ...
+        ] = ()
         # DeviceIR may later replace missing MatmulFact extents with runtime
         # hints. Keep the preflight plan's compile-time provenance for CuTe.
         self.matmul_compile_time_static_extents: (
@@ -470,6 +484,8 @@ class CuteTcgen05Config:
         self.epilogue_fanout_search_enabled: bool = False
         self.deep_direct_entry_validation_enabled: bool = False
         self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
+        # Root identities from the typed operand-materialization dependency proof.
+        self.materialized_operand_pdl_roots: tuple[int, int] | None = None
         self.num_epi_warps_search_choices: tuple[int, ...] | None = None
         self.num_epi_warps_validation_choices: tuple[int, ...] | None = None
 
@@ -654,11 +670,133 @@ class CuteTcgen05Config:
             acc_stages=acc_stages,
         )
 
+    def _materialized_paired_stage_limits(
+        self, config: dict[str, object]
+    ) -> list[int] | None:
+        if not self.materialized_matmul_block_ids or not self.epilogue_fanout_plans:
+            return None
+        if (
+            config.get(FANOUT_CONFIG_KEY) != "shared"
+            or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two"
+            or config.get("tcgen05_cluster_m", 1) != 2
+            or not fanout_schedule_supported(config)
+            or not self.epilogue_fanout_config_supported(config)
+        ):
+            return None
+        blocks = config.get("block_sizes")
+        if not isinstance(blocks, list):
+            return None
+        c_counts = config.get(
+            "tcgen05_region_c_stages", [0] * len(self.materialized_matmul_block_ids)
+        )
+        assert isinstance(c_counts, list)
+        limits = []
+        for region, (axes, shape, facts, pair_facts) in enumerate(
+            zip(
+                self.materialized_matmul_block_ids,
+                self.materialized_matmul_shapes,
+                self.materialized_pipeline_facts,
+                self.materialized_pair_budget_facts,
+                strict=True,
+            )
+        ):
+            indices = [self._config_block_index(axis) for axis in axes]
+            if any(index is None or index >= len(blocks) for index in indices):
+                return None
+            bm, bn, bk = (blocks[cast("int", index)] for index in indices)
+            if (
+                bm not in (128, 256)
+                or bn not in (64, 128, 256)
+                or bk not in (64, 128, 256)
+                or any(
+                    extent % tile
+                    for extent, tile in zip(shape, (bm, bn, bk), strict=True)
+                )
+            ):
+                return None
+            c_count = c_counts[region] or config.get("tcgen05_c_stages", 2)
+            if c_count not in (2, 4):
+                return None
+            pairs = [
+                pair
+                for pair in self.epilogue_fanout_plans
+                if pair.block_ids == axes[:2]
+            ]
+            if pairs:
+                if (
+                    len(pairs) != 1
+                    or pairs[0].output_dtype.itemsize != 2
+                    or c_count != 2
+                    or pair_facts is None
+                ):
+                    return None
+                facts = pair_facts
+            elif facts is None:
+                return None
+            assert facts is not None
+            # Equal-size full output rings have 1024B-multiple sizes, so the
+            # second ring adds no alignment gap beyond the existing reservation.
+            base = pipeline_smem_bytes(
+                facts, bm=bm, bn=bn, bk=bk, ab_stages=1, c_stages=c_count, acc_stages=2
+            )
+            ab_one = tcgen05_ab_smem_bytes_per_cta(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                dtype_bytes=facts.input_dtype_bytes,
+                ab_stages=1,
+                cluster_m=2,
+            )
+            ring = base - ab_one - (2 * 1024 + 16 + 32)
+            extra = ring if pairs else 0
+            limits.append(
+                max(
+                    (
+                        count
+                        for count in range(1, 17)
+                        if pipeline_smem_bytes(
+                            facts,
+                            bm=bm,
+                            bn=bn,
+                            bk=bk,
+                            ab_stages=count,
+                            c_stages=c_count,
+                            acc_stages=2,
+                        )
+                        + extra
+                        <= facts.capacity_bytes
+                    ),
+                    default=0,
+                )
+            )
+        return limits if limits and all(limits) else None
+
     def _validate_cta_group_config(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
         if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two":
             return
+        region_limits = self._materialized_paired_stage_limits(config)
+        if region_limits is not None:
+            counts = config.get("tcgen05_region_ab_stages", [0] * len(region_limits))
+            assert isinstance(counts, list)
+            effective = [
+                count or config.get("tcgen05_ab_stages", 2) for count in counts
+            ]
+            if all(
+                type(count) is int and 1 <= count <= limit
+                for count, limit in zip(effective, region_limits, strict=True)
+            ):
+                return
+            if fix_invalid:
+                config["tcgen05_region_ab_stages"] = [
+                    min(cast("int", count), limit)
+                    for count, limit in zip(effective, region_limits, strict=True)
+                ]
+                return
+            raise InvalidConfig(
+                "materialized two-CTA AB pipelines exceed their complete per-region SMEM budgets"
+            )
         limit = self._paired_pipeline_stage_limit(config)
         if limit is not None and limit > 0:
             return
@@ -671,7 +809,7 @@ class CuteTcgen05Config:
             "persistent two-CTA schedule, and supported shared-memory geometry"
         )
 
-    def _paired_pipeline_seed_configs(self) -> list[Config]:
+    def _paired_pipeline_seed_configs(self, *, acc_stages: int = 2) -> list[Config]:
         if not self.paired_pipeline_search_enabled():
             return []
         facts = self.pipeline_smem_facts
@@ -695,7 +833,7 @@ class CuteTcgen05Config:
                     block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
                     assert block_sizes is not None
                     maximum = max_pipeline_ab_stages(
-                        facts, bm=bm, bn=bn, bk=bk, c_stages=2, acc_stages=2
+                        facts, bm=bm, bn=bn, bk=bk, c_stages=2, acc_stages=acc_stages
                     )
                     # Include a shallow ring so the tuner can choose occupancy
                     # over latency hiding. Geometry and memory capacity decide
@@ -712,7 +850,7 @@ class CuteTcgen05Config:
                                 tcgen05_cluster_n=1,
                                 tcgen05_ab_stages=stages,
                                 tcgen05_c_stages=2,
-                                tcgen05_acc_stages=2,
+                                tcgen05_acc_stages=acc_stages,
                                 tcgen05_persistence_model="static_persistent",
                                 tcgen05_strategy="role_local_monolithic",
                                 tcgen05_layout_strategy="default",
@@ -722,6 +860,32 @@ class CuteTcgen05Config:
                             )
                         )
         return seeds
+
+    def materialized_operand_pdl_supported(self, config: dict[str, object]) -> bool:
+        # This exact static TWO schedule emits a TMA-role dependency wait before
+        # all initial/refill operand reads. Alternative/fused schedules do not
+        # inherit this proof or the separate producer launch.
+        parameters = self._paired_pipeline_parameters(config)
+        extents = self.matmul_compile_time_static_extents
+        if (
+            self.materialized_operand_pdl_roots is None
+            or parameters is None
+            or extents is None
+            or any(
+                extent is None or extent % tile != 0
+                for extent, tile in zip(extents, parameters[:3], strict=True)
+            )
+        ):
+            return False
+        limit = self._paired_pipeline_stage_limit(config)
+        return (
+            limit is not None
+            and limit > 0
+            and config.get(FANOUT_CONFIG_KEY, "off") == "off"
+            and config.get("cute_materialized_operand_schedule", "off") == "off"
+            and config.get("cute_materialized_schedule", "off") == "off"
+            and config.get("cute_split_k_schedule", "legacy") == "legacy"
+        )
 
     def _matmul_config_view(
         self, config: dict[str, object]
@@ -2139,6 +2303,70 @@ class CuteTcgen05Config:
         fix_invalid: bool,
         validate_schedule: bool = False,
     ) -> None:
+        for key, domain in (
+            ("tcgen05_region_ab_stages", range(17)),
+            ("tcgen05_region_c_stages", (0, 2, 4)),
+        ):
+            if key not in config:
+                continue
+            stages = config[key]
+            valid = (
+                isinstance(stages, list)
+                and len(stages) == len(self.materialized_matmul_block_ids)
+                and len(stages) >= 2
+                and all(type(stage) is int and stage in domain for stage in stages)
+            )
+            if not valid:
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} requires one valid stage count per materialized MMA region"
+                    )
+                config.pop(key)
+            elif not any(stages):
+                config.pop(key)
+        if "tcgen05_materialized_pdl" in config:
+            value = config["tcgen05_materialized_pdl"]
+            if type(value) is not bool or (
+                len(self.materialized_matmul_block_ids) < 2
+                and self.materialized_operand_pdl_roots is None
+            ):
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        "tcgen05_materialized_pdl requires a proved materialized producer/consumer edge"
+                    )
+                config.pop("tcgen05_materialized_pdl")
+            elif not value:
+                config.pop("tcgen05_materialized_pdl")
+        region_keys = (
+            "tcgen05_region_ab_stages",
+            "tcgen05_region_c_stages",
+            *(
+                ("tcgen05_materialized_pdl",)
+                if len(self.materialized_matmul_block_ids) >= 2
+                else ()
+            ),
+        )
+        if validate_schedule and any(key in config for key in region_keys):
+            if self._materialized_paired_stage_limits(config) is None:
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        "per-region pipelines and PDL require the complete typed paired materialized fanout schedule"
+                    )
+                for key in region_keys:
+                    config.pop(key, None)
+        if (
+            validate_schedule
+            and len(self.materialized_matmul_block_ids) < 2
+            and config.get("tcgen05_materialized_pdl")
+        ):
+            supported = self.materialized_operand_pdl_supported(config)
+            if not supported:
+                if not fix_invalid:
+                    raise InvalidConfig(
+                        "tcgen05_materialized_pdl requires a proved materialized "
+                        "dependency and its native TMA dependency-wait schedule"
+                    )
+                config.pop("tcgen05_materialized_pdl")
         if config.get(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY) == "pre_loop":
             # Keep the inert default implicit in both fanout controls so carriers
             # also round-trip when fanout search and its coordinate are disabled.
@@ -3707,7 +3935,9 @@ class CuteTcgen05Config:
             cluster_m_choices = self.cluster_m_search_choices
         else:
             cluster_m_choices = (1, 2)
-        paired_search = self.paired_pipeline_search_enabled()
+        paired_search = self.paired_pipeline_search_enabled() or bool(
+            self.materialized_matmul_block_ids
+        )
         if paired_search:
             cluster_m_choices = tuple(dict.fromkeys((*cluster_m_choices, 2)))
         # cluster_n=2 (the Quack-canonical 4-CTA cluster: B multicast on top
@@ -3827,6 +4057,18 @@ class CuteTcgen05Config:
             fragments[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY] = EnumFragment(
                 TCGEN05_C_ACQUIRE_PLACEMENTS
             )
+        if len(self.materialized_matmul_block_ids) >= 2:
+            fragments["tcgen05_region_ab_stages"] = ListOf(
+                IntegerFragment(0, 16, 0), len(self.materialized_matmul_block_ids)
+            )
+            fragments["tcgen05_region_c_stages"] = ListOf(
+                EnumFragment((0, 2, 4)), len(self.materialized_matmul_block_ids)
+            )
+        if (
+            len(self.materialized_matmul_block_ids) >= 2
+            or self.materialized_operand_pdl_roots is not None
+        ):
+            fragments["tcgen05_materialized_pdl"] = BooleanFragment()
         if (
             self.aux_kernel_detected
             or self.epilogue_fanout_search_enabled
@@ -4686,6 +4928,11 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        if self._materialized_paired_stage_limits(config) is not None:
+            # Each launch has its own proved axes and budget. The single-matrix
+            # projection below cannot choose geometry for this complete recipe.
+            self._validate_cta_group_config(config, fix_invalid=True)
+            return
         if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
             if self.paired_pipeline_search_enabled():
                 config["tcgen05_cluster_m"] = 2

@@ -585,6 +585,8 @@ def test_exact_rejected_backward_config_declines_before_emission() -> None:
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
+        cute_region_fission=True,
+        cute_materialize_transformed_operands=True,
         cute_full_slice_matmul_tiling=True,
         cute_segmented_matmul_tiling=True,
         cute_flatten_nested_reductions=True,

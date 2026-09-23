@@ -6,12 +6,15 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
+from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
 from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_cute_full_slice_matmul import _bind
+from test.test_cute_materialized_fission import _se_args
+from test.test_cute_materialized_fission import _sources
 
 from helion._compiler.ast_read_writes import dead_assignment_elimination
 from helion._compiler.cute.memory_ops import _pure_epilogue_ancestors
@@ -159,3 +162,52 @@ def test_epilogue_dce_stops_at_memory_mutation_and_random_operations() -> None:
     for leaf in (loaded, mutated, random):
         relu = graph.call_function(torch.ops.aten.relu.default, (leaf,))
         assert _pure_epilogue_ancestors(relu) == (relu,)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(128, 256, 64), (73, 88, 56)])
+@skipUnlessBackends(["cute"])
+def test_materialized_rounded_relu_only_emits_the_fused_expression(
+    dtype: torch.dtype, shape: tuple[int, int, int]
+) -> None:
+    bound = _bind(
+        squeeze_and_excitation_net_fwd.fn, _se_args(shape, dtype), fission=True
+    )
+    sources = _sources(bound.to_code(bound.config_spec.default_config()))
+    assert all("cute.gemm(" in source and "tcgen05_" in source for source in sources)
+    # The real ReLU is evaluated on the rounded TMEM value. Its old scalar
+    # duplicate combined the FP32 accumulator placeholder with a 16-bit zero,
+    # causing a CuTe type error even though nothing read its result.
+    assert not _max_calls(sources[0])
+    relu_steps = [
+        node
+        for node in ast.walk(ast.parse(sources[0]))
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id.startswith("tcgen05_chain_step")
+            for target in node.targets
+        )
+        and any(
+            isinstance(child, ast.Compare)
+            and any(isinstance(op, ast.Gt) for op in child.ops)
+            for child in ast.walk(node.value)
+        )
+    ]
+    assert relu_steps
+    assert all("_helion_fullslice_acc" not in ast.unparse(node) for node in relu_steps)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@skipUnlessBackends(["cute"])
+def test_materialized_unfused_scalar_relu_remains_live(
+    dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HELION_CUTE_MMA_IMPL", "universal")
+    bound = _bind(
+        squeeze_and_excitation_net_fwd.fn,
+        _se_args((128, 256, 64), dtype),
+        fission=True,
+    )
+    first = _sources(bound.to_code(bound.config_spec.default_config()))[0]
+    assert "tcgen05_" not in first
+    assert _max_calls(first)

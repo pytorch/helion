@@ -280,6 +280,8 @@ def test_actual_masked_and_vector_sources_follow_the_same_fusion_policy(
             static_shapes=False,
             autotune_effort="none",
             fast_math=fast_math,
+            cute_region_fission=True,
+            cute_materialize_transformed_operands=True,
             cute_full_slice_matmul_tiling=True,
             cute_segmented_matmul_tiling=True,
             cute_flatten_nested_reductions=True,

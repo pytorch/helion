@@ -56,6 +56,8 @@ def _original(static: bool) -> tuple[BoundKernel, tuple[object, ...]]:
         backend="cute",
         static_shapes=static,
         autotune_effort="none",
+        cute_region_fission=True,
+        cute_materialize_transformed_operands=True,
         cute_full_slice_matmul_tiling=True,
         cute_segmented_matmul_tiling=True,
         cute_flatten_nested_reductions=True,

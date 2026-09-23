@@ -1958,7 +1958,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "int4_gemm.py")
         kernel = mod.matmul_bf16_int4
         if _get_backend() == "cute":
-            kernel = helion.kernel(kernel.fn, backend="cute", static_shapes=False)
+            settings: dict[str, typing.Any] = (
+                {} if automatic else {"cute_materialize_transformed_operands": False}
+            )
+            kernel = helion.kernel(
+                kernel.fn, backend="cute", static_shapes=False, **settings
+            )
         config: dict[str, typing.Any] = (
             {}
             if automatic
@@ -2317,7 +2322,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         mod = import_path(EXAMPLES_DIR / "squeeze_and_excitation_net.py")
         kernel = mod.squeeze_and_excitation_net_fwd
         if _get_backend() == "cute":
-            kernel = helion.kernel(kernel.fn, backend="cute", static_shapes=True)
+            settings: dict[str, typing.Any] = (
+                {} if automatic else {"cute_region_fission": False}
+            )
+            kernel = helion.kernel(
+                kernel.fn, backend="cute", static_shapes=True, **settings
+            )
         config: dict[str, typing.Any] = (
             {}
             if automatic
