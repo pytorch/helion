@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import dataclasses
 from types import SimpleNamespace
+from typing import cast
 import unittest
 from unittest.mock import patch
 
 import torch
 
+from test.cute_population_contracts import with_flat_min_blocks_default
+
 import helion
 from helion import _compat
 from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from helion._compiler.cute.strategies import Tcgen05LayoutOverrides
 from helion._compiler.cute.strategies import Tcgen05LayoutStrategy
@@ -179,7 +184,9 @@ def _cute_4096_matmul_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(budget_bytes: int):
+def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(
+    budget_bytes: int, *, capacity_bytes: int | None = None
+):
     """Bind the 4096^3 matmul with the per-CTA AB-SMEM budget mocked.
 
     The SMEM-budget gate is purely deterministic given a budget value
@@ -194,6 +201,12 @@ def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(budget_bytes: int):
     in-memory bind cache (the cache is keyed by args and would
     otherwise replay the first test's recorded spec).
     """
+    # The paired-CTA family accounts for its complete allocation against the
+    # raw capacity, independently of the legacy AB-only reservation. Keep both
+    # views deterministic; a zero budget without an explicit capacity models
+    # unavailable device memory information.
+    if capacity_bytes is None:
+        capacity_bytes = budget_bytes + 28 * 1024 if budget_bytes else 0
     args = (
         torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
         torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
@@ -201,6 +214,11 @@ def _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(budget_bytes: int):
     _cute_4096_matmul_kernel._bound_kernels.clear()
     with (
         patch_cute_mma_support(),
+        patch.object(
+            CuteTcgen05Config,
+            "per_cta_smem_capacity_bytes",
+            return_value=capacity_bytes,
+        ),
         patch.object(
             CuteTcgen05Config,
             "per_cta_ab_smem_budget_bytes",
@@ -873,27 +891,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_smem_budget_gate(self) -> None:
-        """SMEM-budget gate validates explicit ``tcgen05_ab_stages=3`` configs.
+        """The broader paired search preserves legacy AB-budget enforcement.
 
-        The 4096^3 BF16 matmul binding records the SMEM-budget gate so
-        search-time normalization can demote sampled ``ab=3`` candidates
-        whose ``(bm, bn, bk, cluster_m)`` per-CTA AB-SMEM cost exceeds the
-        device's optin SMEM cap minus the non-AB reservation (see
-        ``cute_plan.md`` §7.0). Cycle 97 made ``ab=3`` BUDGET-AWARE-SEARCHABLE:
-        the broad random search fragment is now lifted to ``ab=3`` wherever
-        the SMEM-budget constraints are recorded (B200-class optin, bf16/fp16),
-        and ``_fix_ab_stages_search_config`` demotes a sampled ab=3 that does
-        not fit (over-budget bare AB, or the real source-C ring overflow) — so
-        the autotuner can reach the ab=3 winner directly instead of only via the
-        per-shape seeds. The validation surface stays unchanged: explicit
-        ``helion.Config(tcgen05_ab_stages=3)`` always round-trips for
-        explicit user configs.
-
-        The gate is purely deterministic given a budget value, so we
-        pin the per-CTA AB-SMEM budget to B200's nominal value via
-        ``_bind_cute_4096_matmul_kernel_with_mocked_smem_budget`` —
-        that keeps coverage live on any host regardless of the live
-        GPU's optin SMEM cap.
+        Pin raw capacity and the legacy AB reservation to the same B200
+        budget. The fragment admits the compact paired family's deeper rings,
+        while automatic CTA configs must retain the existing ab=3 keep/demote
+        behavior for their actual tile sizes and epilogue allocations.
         """
         # B200's optin reports 232 448 bytes = 227 KiB; subtract the
         # 28 KiB non-AB reservation to match what
@@ -913,21 +916,19 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(constraints.per_cta_smem_budget_bytes, b200_budget_bytes)
 
         search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-        # Where the SMEM-budget constraints were recorded (here: the mocked B200
-        # budget), the for_search cap is lifted to the dtype's hardware-validated
-        # stage cap (6 for 16-bit) so the autotuner can SAMPLE deep-AB pipelines
-        # (bk=64/ab=5 wins on edge shapes) directly. A sampled depth that does
-        # not fit is then demoted by ``_fix_ab_stages_search_config`` /
-        # budget-clamped by ``_validate_direct_entry_ab_stage_envelope`` (the
-        # over-budget cases below).
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
+        # The fragment covers both the legacy AB reservation and the explicit
+        # paired-CTA allocation proof. The latter admits up to 16 stages; the
+        # unchanged legacy configs below must still obey their narrower budget.
+        self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+        self.assertEqual(
+            search_fragments["tcgen05_ab_stages"].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
         validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
-        # 16-bit 4096^3 is FFI-eligible (fp16 == bf16 parity), so the validation
-        # surface admits the deeper FFI direct-entry stage tuples — up to ab=6
-        # (the (ab=6, c=4) tuple at bk=64; see
-        # ``test_cute_tcgen05_full_tile_ffi_seed_config``). Explicit user configs
-        # at ab=3 still round-trip; the for_search cap stays budget-aware at 3.
-        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 6)
+        self.assertEqual(
+            validation_fragments["tcgen05_ab_stages"].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
 
         # cluster_m=2 256x256x128 ab=3: the canonical 4096^3 fast config —
         # fits the per-CTA budget (196 608 bytes vs B200's 203 776-byte
@@ -993,40 +994,66 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_gate_off_below_b200(self) -> None:
-        """Gate stays off when target device's SMEM optin is sub-B200.
+        """Missing legacy budget never admits deeper automatic/FFI seeds.
 
-        Mocking the budget helper to return 0 — the value the helper
-        produces for non-CUDA hosts and any device whose optin cap sits
-        below ``TCGEN05_AB_STAGES_THREE_MIN_DEVICE_SMEM_OPTIN`` — must
-        keep ``_tcgen05_ab_stages_three_search_constraints`` ``None`` so
-        the search surface stays at ``ab_stages_max=2`` and the
-        canonical seed does not carry ``ab=3``. This guards against
-        broadening the search past the hardware's known-good envelope
-        on heterogeneous / multi-GPU setups.
+        A known smaller raw capacity can independently prove a compact paired
+        pipeline. Unknown capacity must disable that family as well.
         """
-        bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(0)
-        spec = bound.config_spec
-
-        self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
-        search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-        self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 2)
-        # Validation surface stays at 3 so explicit user configs still
-        # round-trip even on a device the gate is off for.
-        validation_fragments = spec._tcgen05_optional_fragments(for_search=False)
-        self.assertEqual(validation_fragments["tcgen05_ab_stages"].high, 3)
-        # The full-tile cluster_m=2 family now seeds six configs (the
-        # canonical static-persistent seed, the CLC dynamic-persistence
-        # scheduler seed, the 4-CTA cluster_n=2 seed, the CLC + cluster_n=2
-        # seed, and the two M-paired block_m=512 seeds) — none of which may
-        # deepen the AB pipeline past the baseline ab=2 when the gate is off.
-        # In particular the deep-staged bk=64/ab=6 CLC variant must NOT be
-        # seeded: its admission goes through ``ab_stages_three_fits``, which
-        # rejects every depth once the budget helper reports 0.
-        seeds = spec.compiler_seed_configs
-        self.assertEqual(len(seeds), 6)
-        self.assertNotIn("tcgen05_ab_stages", seeds[0].config)
-        for seed in seeds:
-            self.assertIn(seed.config.get("tcgen05_ab_stages"), (None, 2))
+        for capacity in (0, 164 * 1024):
+            with self.subTest(capacity_bytes=capacity):
+                bound = _bind_cute_4096_matmul_kernel_with_mocked_smem_budget(
+                    0, capacity_bytes=capacity
+                )
+                spec = bound.config_spec
+                tcfg = spec._cute_tcgen05_config
+                self.assertIsNone(spec._tcgen05_ab_stages_three_search_constraints)
+                self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+                search = spec._tcgen05_optional_fragments(for_search=True)
+                validation = spec._tcgen05_optional_fragments(for_search=False)
+                seeds = spec.compiler_seed_configs
+                legacy = [
+                    seed
+                    for seed in seeds
+                    if seed.get("tcgen05_cta_group", "auto") == "auto"
+                ]
+                paired = [
+                    seed for seed in seeds if seed.get("tcgen05_cta_group") == "two"
+                ]
+                # Retain every original family and its baseline depth, while
+                # excluding the old deep-AB CLC seed when its budget is absent.
+                self.assertEqual(len(legacy), 6)
+                self.assertNotIn("tcgen05_ab_stages", legacy[0].config)
+                for seed in legacy:
+                    self.assertIn(seed.get("tcgen05_ab_stages"), (None, 2))
+                if capacity == 0:
+                    self.assertIsNone(tcfg.pipeline_smem_facts)
+                    self.assertFalse(paired)
+                    self.assertEqual(search["tcgen05_ab_stages"].high, 2)
+                    self.assertEqual(validation["tcgen05_ab_stages"].high, 3)
+                    continue
+                self.assertTrue(tcfg.paired_pipeline_search_enabled())
+                self.assertTrue(paired)
+                self.assertEqual(
+                    search["tcgen05_ab_stages"].high,
+                    TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+                )
+                facts = tcfg.pipeline_smem_facts
+                assert facts is not None
+                self.assertEqual(facts.capacity_bytes, capacity)
+                for seed in paired:
+                    bm, bn, bk = seed.block_sizes
+                    self.assertLessEqual(
+                        pipeline_smem_bytes(
+                            facts,
+                            bm=bm,
+                            bn=bn,
+                            bk=bk,
+                            ab_stages=cast("int", seed["tcgen05_ab_stages"]),
+                            c_stages=2,
+                            acc_stages=2,
+                        ),
+                        capacity,
+                    )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_uses_analyzed_block_indices(
@@ -1050,8 +1077,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 )
             self.assertIsNotNone(spec._tcgen05_ab_stages_three_search_constraints)
             search_fragments = spec._tcgen05_optional_fragments(for_search=True)
-            # Constraints recorded -> search cap is the 16-bit hard cap.
-            self.assertEqual(search_fragments["tcgen05_ab_stages"].high, 6)
+            # Extra unrelated slots must not hide either allocation proof.
+            self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+            self.assertEqual(
+                search_fragments["tcgen05_ab_stages"].high,
+                TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+            )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_ab_stages_three_seeded_in_initial_population(
@@ -1088,6 +1119,7 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             config.config
             for config in spec.compiler_seed_configs
             if config.config.get("tcgen05_cluster_m") == 2
+            and config.config.get("tcgen05_cta_group", "auto") == "auto"
         ]
         self.assertGreaterEqual(len(cluster_m2_seeds), 1)
         canonical_seeds = [
@@ -1501,11 +1533,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         self.assertEqual(search_fragments["tcgen05_num_epi_warps"].choices, (4,))
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_partial_tile_search_keeps_persistent_pid_types_out(
+    def test_cute_tcgen05_partial_tile_search_preserves_cta_family_gates(
         self,
     ) -> None:
-        """Autotune excludes persistent pid types when the search can sample
-        block sizes that produce partial tiles."""
+        """Compact paired tiles unlock persistence without widening auto CTA gates."""
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -1523,14 +1554,57 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 192], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch_cute_mma_support():
+        with (
+            patch_cute_mma_support(),
+            patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+        ):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         self.assertEqual([x.max_size for x in spec.block_sizes], [256, 128, 64])
-        self.assertNotIn("persistent_blocked", spec.allowed_pid_types)
-        self.assertNotIn("persistent_interleaved", spec.allowed_pid_types)
+        self.assertIn("persistent_blocked", spec.allowed_pid_types)
+        self.assertIn("persistent_interleaved", spec.allowed_pid_types)
+        # The automatic 256x256 two-CTA tile is still unavailable. The explicit
+        # family has exact 128x64 tiles for N=192 and its own allocation proof.
         self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
         self.assertEqual(spec._tcgen05_num_epi_warps_search_choices, (4,))
+        self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+        seeds = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if seed.get("tcgen05_cta_group") == "two"
+        ]
+        self.assertTrue(seeds)
+        generation = spec.create_config_generation()
+        for seed in seeds:
+            normalized = helion.Config.from_dict(
+                spec.default_config().config | seed.config
+            )
+            spec.normalize(normalized, _fix_invalid=True)
+            self.assertEqual(normalized["tcgen05_cluster_m"], 2)
+            self.assertEqual(normalized["pid_type"], "persistent_blocked")
+            self.assertTrue(
+                all(
+                    extent % block == 0
+                    for extent, block in zip(
+                        (256, 192, 64), normalized.block_sizes, strict=True
+                    )
+                )
+            )
+            self.assertEqual(
+                generation.unflatten(generation.flatten(normalized)),
+                with_flat_min_blocks_default(spec, normalized),
+            )
+        automatic = helion.Config(
+            block_sizes=[256, 128, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cta_group="auto",
+            tcgen05_cluster_m=2,
+        )
+        spec.normalize(automatic, _fix_invalid=True)
+        self.assertEqual(automatic["tcgen05_cta_group"], "auto")
+        self.assertEqual(automatic["tcgen05_cluster_m"], 1)
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_double_edge_no_divisor_keeps_flat_search(self) -> None:
@@ -2023,7 +2097,12 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
             torch.randn([256, 64], device=DEVICE, dtype=HALF_DTYPE),
             torch.randn([64, 128], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch_cute_mma_support():
+        with (
+            patch_cute_mma_support(),
+            patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+        ):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
         # cute_tcgen05_search_enabled gates the inclusion of the tcgen05
@@ -2036,9 +2115,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         # _flat_fields exposes that as an EnumFragment with a single
         # choice rather than the default IntegerFragment(1, 4, 4).
         self.assertEqual(flat_fields["tcgen05_num_epi_warps"].choices, (4,))
-        # This small-N problem cannot form the validated 256x256
-        # CtaGroup.TWO tile, so cluster_m is narrowed to 1.
-        self.assertEqual(flat_fields["tcgen05_cluster_m"].choices, (1,))
+        # The automatic family still cannot form its 256x256 tile. Explicit
+        # paired-CTA kernels can use the independently proved 128x64 geometry.
+        self.assertEqual(spec._tcgen05_cluster_m_search_choices, (1,))
+        self.assertEqual(flat_fields["tcgen05_cluster_m"].choices, (1, 2))
+        self.assertEqual(flat_fields["tcgen05_cta_group"].choices, ("auto", "two"))
         self.assertIn("persistent_blocked", flat_fields["pid_type"].choices)
         self.assertIn("persistent_interleaved", flat_fields["pid_type"].choices)
         self.assertNotIn("num_threads", flat_fields)

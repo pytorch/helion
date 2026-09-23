@@ -2427,7 +2427,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
         if settings.backend == "cute":
-            parts.append("backend='cute'")
+            # Structural settings determine the config's axis schema at binding.
+            # Record opt-outs too, independent of the replay process's environment.
+            parts.extend(
+                [
+                    "backend='cute'",
+                    f"cute_full_slice_matmul_tiling={settings.cute_full_slice_matmul_tiling}",
+                    f"cute_segmented_matmul_tiling={settings.cute_segmented_matmul_tiling}",
+                    f"cute_flatten_nested_reductions={settings.cute_flatten_nested_reductions}",
+                ]
+            )
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(
