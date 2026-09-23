@@ -4,10 +4,15 @@ import ast
 from itertools import accumulate
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import patch
 
+from examples.layer_norm import layer_norm_bwd
 import numpy as np
 import pytest
+import torch
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_interchanged_store_dce import _PAIRS
 from test.test_cute_interchanged_store_dce import _execute as _execute_interchange
 from test.test_cute_interchanged_store_dce import _program
@@ -15,6 +20,7 @@ from test.test_cute_interchanged_store_dce import _program
 import helion
 from helion._compiler import tile_strategy as lanes
 from helion._compiler.ast_read_writes import ast_rename
+from helion._testing import skipUnlessBackends
 
 
 def _marker(owner: str | None, value: str = "partial") -> str:
@@ -561,3 +567,53 @@ def test_owned_serial_interchange_has_complete_numeric_reduction(
     np.testing.assert_array_equal(actual["column"].values, masked.sum(0))
     assert actual["output"].stores == valid_rows * valid_cols
     assert actual["column"].stores == 4
+
+
+@skipUnlessBackends(["cute"])
+def test_exact_rejected_backward_config_declines_before_emission() -> None:
+    x = torch.empty((4096, 4096), dtype=torch.bfloat16)
+    args = (
+        torch.empty_like(x),
+        x,
+        torch.empty(4096),
+        torch.empty(4096),
+        torch.empty(4096, dtype=torch.bfloat16),
+        True,
+    )
+    kernel = helion.kernel(
+        layer_norm_bwd.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_full_slice_matmul_tiling=True,
+        cute_segmented_matmul_tiling=True,
+        cute_flatten_nested_reductions=True,
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    config = helion.Config.from_dict(
+        {
+            "block_sizes": [256, 256],
+            "cute_cluster_n": 1,
+            "cute_host_paired_sum": "off",
+            "cute_lane_layouts": ["blocked", "blocked", "blocked"],
+            "cute_min_blocks_per_mp": 4,
+            "cute_reduction_group_rows": 4,
+            "cute_reduction_reloads": ["gmem"],
+            "cute_reduction_schedule": "pipelined",
+            "cute_reduction_sequence": "bounded_layout",
+            "cute_vector_widths": [2, 8, 1],
+            "load_eviction_policies": ["streaming", "last", "last", "l2_last", "first"],
+            "num_threads": [0, 32, 256],
+        }
+    )
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        bound = _cpu_bind(kernel, args)
+        with pytest.raises(helion.exc.BackendUnsupported, match="different lane owner"):
+            bound.to_code(config)

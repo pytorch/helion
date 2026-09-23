@@ -2306,7 +2306,12 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             torch.randn([512, 512], device=DEVICE),
             torch.randn([512, 512], device=DEVICE),
         )
-        bound_kernel = matmul.bind(args)
+        # Bind outside the shared cache: an earlier test in this process can
+        # leave compiled configs on the cached BoundKernel whose generated
+        # module files were deleted with that test's fresh inductor cache. Those
+        # cannot be serialized into the benchmark worker, so they silently
+        # fall back in-process and are not counted below.
+        bound_kernel = matmul._bind_isolated(args)
         bound_kernel.settings.autotune_benchmark_subprocess = True
         bound_kernel.settings.autotune_benchmark_timeout = 60
         bound_kernel.settings.autotune_precompile = None

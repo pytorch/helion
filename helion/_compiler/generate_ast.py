@@ -29,6 +29,7 @@ from .compile_environment import CompileEnvironment
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
+from .device_function import TensorArg
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from ..runtime.config import Config
+    from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -1585,6 +1587,104 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     proven_disjoint_pairs = (
                         self.device_function.proven_disjoint_tensor_pairs()
                     )
+                    if self.device_function.cute_state.resident_sequence_regions:
+                        from .cute.resident_sequence import (
+                            materialize_resident_sequences,
+                        )
+
+                        fn = self.device_function
+                        env = CompileEnvironment.current()
+                        fn.body = materialize_resident_sequences(
+                            list(fn.body),
+                            regions=fn.cute_state.resident_sequence_regions,
+                            tensor_dtypes={
+                                argument.name: env.backend.dtype_str(
+                                    argument.fake_value.dtype
+                                )
+                                for argument in fn.arguments
+                                if isinstance(argument, TensorArg)
+                            },
+                            rename_groups={
+                                name: aliases[0]
+                                for name, aliases in fn._variable_renames.items()
+                            },
+                            disjoint_pairs=proven_disjoint_pairs,
+                            boundary_names={argument.name for argument in fn.arguments}
+                            | set(self._extra_params),
+                            resident=fn.config.config.get("cute_reduction_sequence")
+                            == "resident",
+                            new_var=fn.new_var,
+                        )
+                    if self.device_function.cute_state.resident_reduction_layouts:
+                        from .cute.resident_reductions import (
+                            materialize_resident_reductions,
+                        )
+                        from .cute.resident_reductions import (
+                            proven_resident_tensor_alignments,
+                        )
+                        from .cute.resident_reductions import (
+                            proven_resident_tensor_strides,
+                        )
+                        from .reduction_strategy import _cute_shared_memory_budget_bytes
+
+                        fn = self.device_function
+                        env = CompileEnvironment.current()
+                        pipelined = (
+                            fn.config.config.get("cute_reduction_schedule")
+                            == "pipelined"
+                        )
+                        constexpr_values = {
+                            name: size
+                            for block_ids, name in fn.block_size_var_cache.items()
+                            if len(block_ids) == 1
+                            and isinstance(
+                                size := fn.resolved_block_size(block_ids[0]), int
+                            )
+                        }
+                        fn.body = materialize_resident_reductions(
+                            list(fn.body),
+                            layouts=fn.cute_state.resident_reduction_layouts,
+                            tensor_dtypes={
+                                argument.name: env.backend.dtype_str(
+                                    argument.fake_value.dtype
+                                )
+                                for argument in fn.arguments
+                                if isinstance(argument, TensorArg)
+                            },
+                            tensor_strides=proven_resident_tensor_strides(fn),
+                            tensor_alignments=proven_resident_tensor_alignments(fn),
+                            group_rows=cast(
+                                "int",
+                                fn.config.config.get("cute_reduction_group_rows", 1),
+                            ),
+                            pipelined=pipelined,
+                            pipeline_depth=fn.config.cute_reduction_pipeline_depth,
+                            row_schedule=cast(
+                                "str",
+                                fn.config.get("cute_reduction_row_schedule", "batched"),
+                            ),
+                            pack_output=cast(
+                                "bool",
+                                fn.config.get("cute_reduction_pack_output", False),
+                            ),
+                            local_tree=cast(
+                                "bool",
+                                fn.config.get("cute_reduction_local_tree", False),
+                            ),
+                            shared_memory_budget=_cute_shared_memory_budget_bytes()
+                            if pipelined
+                            else 0,
+                            disjoint_pairs=proven_disjoint_pairs,
+                            rename_groups={
+                                name: aliases[0]
+                                for name, aliases in fn._variable_renames.items()
+                            },
+                            new_var=fn.new_var,
+                            constexpr_values=constexpr_values,
+                            uniform_names={argument.name for argument in fn.arguments}
+                            | set(self._extra_params),
+                            require_proof=True,
+                        )
                     from .cute.nested_lane_reductions import (
                         normalize_nested_lane_reductions,
                     )
@@ -1844,9 +1944,22 @@ def generate_ast(
     store_transform: Callable[..., ast.AST] | None = None,
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
+    _bounded_cache_request: BoundedCacheRequest | None = None,
 ) -> ast.Module:
     with func:
         env = CompileEnvironment.current()
+        if env.backend.name == "cute" and config.get("cute_reduction_sequence") in {
+            "bounded",
+            "bounded_layout",
+        }:
+            if store_transform is None and load_transform is None and not extra_params:
+                from .cute.bounded_cache_codegen import generate_bounded_cache
+
+                return generate_bounded_cache(func, config, emit_repro_caller)
+            # Unsupported external transforms keep the ordinary lowering.
+            config = type(config).from_dict(
+                {**config.config, "cute_reduction_sequence": "scalar"}
+            )
         env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
@@ -1873,7 +1986,12 @@ def generate_ast(
             for stmt in func.body:
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
-            kernel_def = codegen.device_function.codegen_function_def()
+            if _bounded_cache_request is None:
+                kernel_def = codegen.device_function.codegen_function_def()
+            else:
+                kernel_def = codegen.device_function.codegen_function_def(
+                    bounded_cache_request=_bounded_cache_request
+                )
             block_dims = (
                 codegen.device_function.cute_state.collective_register_chain_block_dims
             )
@@ -2074,6 +2192,26 @@ def generate_ast(
                 }
                 assert not remaining, (
                     f"sourceless prologue params not removed by DCE: {remaining}"
+                )
+
+            if env.backend_name == "cute":
+                from .cute.host_paired_sum import PAIRED_SUM_KEY
+                from .cute.host_paired_sum import lower_host_sum_pairs
+                from .cute.host_single_sum import lower_host_single_sum
+
+                final_host_statements = lower_host_sum_pairs(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
+                )
+                final_host_statements = lower_host_single_sum(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
                 )
 
             host_def = func.codegen_function_def(

@@ -26,6 +26,18 @@ _COMMON_DEPENDENCIES = (
 # CUTLASS itself is covered by the version in the launcher's cache key. These
 # are source paths relative to the package, making the digest checkout-neutral.
 _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "resident_reduction": ("_compiler/cute/resident_reduction_runtime.py",),
+    "single_host_sum": (
+        "runtime/cute/single_sum.py",
+        "runtime/cute/paired_sum.py",
+        "_compiler/cute/single_sum_runtime.py",
+        "_compiler/cute/resident_reduction_runtime.py",
+    ),
+    "paired_host_sum": (
+        "runtime/cute/paired_sum.py",
+        "_compiler/cute/paired_sum_runtime.py",
+        "_compiler/cute/resident_reduction_runtime.py",
+    ),
     "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
     "chunk_recurrence_warp_dv4": (
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",
