@@ -7,9 +7,9 @@ and FP8 quantization, QKV projection, Q/K norm and RoPE, KV-cache update, split
 paged attention and merge, output projection, and the complete gated FFN.  The
 benchmark fixes the production tensor capacity while sequence length, position,
 page-table entries, and slot mapping remain runtime metadata.  It checks the
-result against both a same-source, root-matched twelve-launch Helion graph and
-the corresponding compiled vLLM decoder layer with its default backend
-selection.
+result against both a same-source, root-matched twelve-launch Helion graph with
+programmatic dependent launch (PDL) and the corresponding compiled vLLM decoder
+layer with its default backend selection.
 """
 
 from __future__ import annotations
@@ -1863,7 +1863,7 @@ def main(verbose: bool = True) -> dict:
         return (
             helion_graph.replay,
             [
-                ("standalone_helion", standalone_graph.replay),
+                ("standalone_helion_pdl", standalone_graph.replay),
                 (f"vllm_auto ({backend})", vllm_graph.replay),
             ],
             f"{BATCH:>5d}  {HIDDEN:>6d}  {context_len:>7d}  {ATTENTION_SPLITS:>6d}",

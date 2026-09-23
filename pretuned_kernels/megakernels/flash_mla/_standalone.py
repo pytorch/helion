@@ -1,5 +1,5 @@
 # ruff: noqa: ANN001
-"""Root-matched three-launch Helion control for the FlashMLA megakernel."""
+"""Root-matched three-launch PDL control for the FlashMLA megakernel."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import copy
 import math
 from typing import TYPE_CHECKING
 
+from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
 import helion
@@ -176,6 +178,7 @@ def flash_mla_final(
         [num_head_groups, heads_per_group, batch_size, query_len, value_dim],
         block_size=[1, None, 1, 1, None],
     ):
+        wait_and_launch_dependents()
         task_begin = hl.load(task_offsets, [tile_b.begin])
         task_end = hl.load(task_offsets, [tile_b.begin + 1])
         task_count = task_end - task_begin
@@ -246,6 +249,7 @@ def flash_mla_radix(
         ],
         block_size=[1, 1, 1, None, None],
     ):
+        wait_and_launch_dependents()
         child_begin = hl.load(group_starts, [tile_group.begin])
         child_count = hl.load(group_counts, [tile_group.begin])
         best = hl.full([tile_h.block_size], float("-inf"), torch.float32)
@@ -369,7 +373,7 @@ def build(
     scale: float,
     block_n: int,
 ) -> tuple[Callable[[], torch.Tensor], tuple[CompiledConfig, ...], torch.Tensor]:
-    """Compile the independently tuned partial, radix, and final launches."""
+    """Compile the independently tuned, PDL-chained attention launches."""
     partial_args = (
         tensors["query"],
         tensors["kv_cache"],
@@ -390,20 +394,26 @@ def build(
         tensors["group_counts"],
     )
     radix_call = _compile(flash_mla_radix, radix_args, CONFIGS["radix"])
-    grouped, grouped_lse = radix_call(*radix_args)
+    grouped, grouped_lse = launch_dependent(radix_call, *radix_args)
 
     final_args = (grouped, grouped_lse, tensors["group_offsets"])
     final_call = _compile(flash_mla_final, final_args, CONFIGS["final"])
 
     def launch() -> torch.Tensor:
         partial_value, partial_lse_value = partial_call(*partial_args)
-        grouped_value, grouped_lse_value = radix_call(
+        grouped_value, grouped_lse_value = launch_dependent(
+            radix_call,
             partial_value,
             partial_lse_value,
             tensors["group_starts"],
             tensors["group_counts"],
         )
-        return final_call(grouped_value, grouped_lse_value, tensors["group_offsets"])
+        return launch_dependent(
+            final_call,
+            grouped_value,
+            grouped_lse_value,
+            tensors["group_offsets"],
+        )
 
     output = launch()
     return launch, (partial_call, radix_call, final_call), output
