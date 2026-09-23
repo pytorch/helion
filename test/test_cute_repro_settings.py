@@ -10,6 +10,9 @@ import torch
 
 from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
+from test.test_cute_flatten_nested_reductions import _joint_sum
+from test.test_cute_full_slice_matmul import _matmul
+from test.test_cute_shared_rhs_grouped import _offset_mm
 
 import helion
 from helion._testing import skipUnlessBackends
@@ -27,8 +30,17 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 
+_STRUCTURAL_SETTINGS = (
+    "cute_full_slice_matmul_tiling",
+    "cute_segmented_matmul_tiling",
+    "cute_flatten_nested_reductions",
+)
+
+
 @pytest.fixture(autouse=True)
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    for name in _STRUCTURAL_SETTINGS:
+        monkeypatch.delenv(f"HELION_{name.upper()}", raising=False)
     monkeypatch.delenv("HELION_BACKEND", raising=False)
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
@@ -43,6 +55,37 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ):
         yield
     torch.set_num_threads(previous_threads)
+
+
+def _case(
+    setting: str,
+) -> tuple[Callable[..., Any], tuple[object, ...], str]:
+    if setting == "cute_full_slice_matmul_tiling":
+        return (
+            _matmul,
+            (
+                torch.empty((32, 16), dtype=torch.float16),
+                torch.empty((16, 64), dtype=torch.float16),
+            ),
+            "_helion_fullslice_k",
+        )
+    if setting == "cute_segmented_matmul_tiling":
+        return (
+            _offset_mm,
+            (
+                torch.empty((37, 16), dtype=torch.bfloat16),
+                torch.empty((16, 24), dtype=torch.bfloat16),
+                torch.tensor([0, 0, 1, 19, 37], dtype=torch.int64),
+            ),
+            "_helion_segment_group",
+        )
+    if setting == "cute_flatten_nested_reductions":
+        return (
+            _joint_sum,
+            (torch.empty((37, 69)), torch.tensor([0, 0, 1, 19, 37], dtype=torch.int64)),
+            "_helion_flat_reduction",
+        )
+    raise AssertionError(f"Unknown structural setting: {setting}")
 
 
 def _host(bound: BoundKernel[Any]) -> str:
@@ -67,25 +110,25 @@ def _check_roundtrip(
 ) -> None:
     config = bound.config_spec.default_config()
     expected_config = json.dumps(config.config, sort_keys=True)
-    expected_settings = (
-        bound.settings.backend,
-        bound.settings.static_shapes,
-        bound.settings.index_dtype,
-    )
+    expected_settings = {
+        name: getattr(bound.settings, name) for name in _STRUCTURAL_SETTINGS
+    }
     decorator = bound.format_kernel_decorator(config, bound.settings)
     expected_source = bound.to_code(config)
     assert json.dumps(config.config, sort_keys=True) == expected_config
     if conflicting_environment:
         monkeypatch.setenv("HELION_BACKEND", "triton")
+        for name, enabled in expected_settings.items():
+            monkeypatch.setenv(f"HELION_{name.upper()}", str(int(not enabled)))
     else:
         monkeypatch.delenv("HELION_BACKEND", raising=False)
+        for name in _STRUCTURAL_SETTINGS:
+            monkeypatch.delenv(f"HELION_{name.upper()}", raising=False)
     replay = _replay(decorator, bound.kernel.fn)
     assert replay.settings.backend == "cute"
-    assert (
-        replay.settings.backend,
-        replay.settings.static_shapes,
-        replay.settings.index_dtype,
-    ) == expected_settings
+    assert {
+        name: getattr(replay.settings, name) for name in _STRUCTURAL_SETTINGS
+    } == expected_settings
     assert json.dumps(replay.configs[0].config, sort_keys=True) == expected_config
     rebound = replay._bind_isolated(args)
     assert _host(rebound) == _host(bound)
@@ -94,6 +137,51 @@ def _check_roundtrip(
         == bound.config_spec.cache_fingerprint_hash()
     )
     assert rebound.to_code() == expected_source
+
+
+@pytest.mark.parametrize("setting", _STRUCTURAL_SETTINGS)
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("conflicting_environment", [False, True])
+def test_structural_binding_and_config_roundtrip(
+    setting: str,
+    enabled: bool,
+    conflicting_environment: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    function, args, marker = _case(setting)
+    switches = dict.fromkeys(_STRUCTURAL_SETTINGS, False) | {setting: enabled}
+    bound = helion.kernel(
+        function,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        **switches,
+    )._bind_isolated(args)
+    assert (marker in _host(bound)) == enabled
+    _check_roundtrip(
+        bound, args, monkeypatch, conflicting_environment=conflicting_environment
+    )
+
+
+@pytest.mark.parametrize("from_environment", [False, True])
+def test_composed_structural_settings_roundtrip(
+    from_environment: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    function, args, marker = _case("cute_full_slice_matmul_tiling")
+    switches = dict.fromkeys(_STRUCTURAL_SETTINGS, True)
+    if from_environment:
+        for name in _STRUCTURAL_SETTINGS:
+            monkeypatch.setenv(f"HELION_{name.upper()}", "1")
+        switches = {}
+    bound = helion.kernel(
+        function,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        **switches,
+    )._bind_isolated(args)
+    assert marker in _host(bound)
+    _check_roundtrip(bound, args, monkeypatch, conflicting_environment=True)
 
 
 def _pointwise(x: torch.Tensor) -> torch.Tensor:
@@ -121,6 +209,7 @@ def test_default_unrelated_kernel_roundtrip(
         autotune_effort="none",
         index_dtype=index_dtype,
     )._bind_isolated(args)
+    assert all(not getattr(bound.settings, name) for name in _STRUCTURAL_SETTINGS)
     _check_roundtrip(bound, args, monkeypatch, conflicting_environment=True)
 
 
@@ -137,6 +226,7 @@ def test_other_backend_decorators_are_unchanged(
         backend=backend,
         static_shapes=False,
         index_dtype=index_dtype,
+        **dict.fromkeys(_STRUCTURAL_SETTINGS, True),
     )
     config = helion.Config(block_sizes=[32], num_warps=4)
     expected = (
@@ -154,18 +244,18 @@ def test_decorator_is_an_immutable_config_and_settings_snapshot(
 ) -> None:
     config = helion.Config(block_sizes=[16], loop_orders=[[0]])
     expected_config = json.dumps(config.config, sort_keys=True)
-    expected_static_shapes = _pointwise_bound.settings.static_shapes
     decorator = _pointwise_bound.format_kernel_decorator(
         config, _pointwise_bound.settings
     )
     config.block_sizes[0] = 32
     config.config["loop_orders"][0][0] = 1
-    _pointwise_bound.settings.static_shapes = not expected_static_shapes
+    for name in _STRUCTURAL_SETTINGS:
+        setattr(_pointwise_bound.settings, name, True)
     first = _replay(decorator, _pointwise)
     assert json.dumps(first.configs[0].config, sort_keys=True) == expected_config
     first.configs[0].block_sizes[0] = 64
     first.configs[0].config["loop_orders"][0][0] = 2
-    first.settings.static_shapes = not expected_static_shapes
+    first.settings.cute_full_slice_matmul_tiling = True
     second = _replay(decorator, _pointwise)
     assert json.dumps(second.configs[0].config, sort_keys=True) == expected_config
-    assert second.settings.static_shapes == expected_static_shapes
+    assert all(not getattr(second.settings, name) for name in _STRUCTURAL_SETTINGS)

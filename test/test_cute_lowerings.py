@@ -1316,6 +1316,7 @@ class TestCuteLowerings(unittest.TestCase):
                     persistent_code,
                 )
         self.assertIn("cute.gemm(", direct_row_code)
+        self.assertIn("tcgen05_num_bits = cutlass.BFloat16.width", direct_row_code)
         self.assertNotIn("while tcgen05_role_local", direct_row_code)
         torch.testing.assert_close(direct_actual, expected.T, rtol=0, atol=0)
         torch.testing.assert_close(direct_row_actual, expected.T, rtol=0, atol=0)
@@ -2735,10 +2736,9 @@ class TestCuteLowerings(unittest.TestCase):
     def test_tcgen05_k_tail_keeps_tma_pipeline_with_scalar_fallback(self) -> None:
         """A K-tail uses TMA for full K tiles, then scalar-fills the tail.
 
-        This pins the target-8 G2.1 fix: non-static-full K must not demote the
-        whole matmul to scalar SMEM fills. The scalar fallback starts with a
-        CTA barrier so loader warps cannot overwrite a TMA SMEM stage before
-        the prior full-tile UMMA issue has completed.
+        Non-static-full K must not demote the whole matmul to scalar SMEM
+        fills. The scalar fallback waits for prior UMMA reads, fills the
+        tail, and publishes it before the next tensor-core issue.
         """
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
@@ -2803,8 +2803,10 @@ class TestCuteLowerings(unittest.TestCase):
                 )
                 if (
                     len(fallback_src) >= 4
-                    and fallback_src[0] == "cute.arch.sync_threads()"
+                    and "cute.nvgpu.tcgen05.commit(" in fallback_src[0]
+                    and fallback_src[1].startswith("cute.arch.mbarrier_wait(")
                     and fallback_src[-1] == "cute.arch.sync_threads()"
+                    and fallback_src[-2] == "cute.arch.fence_view_async_shared()"
                     and "if mma_active:" in fallback_body_src
                     and "sA_mma" in fallback_body_src
                     and "sB_mma" in fallback_body_src
@@ -2818,12 +2820,11 @@ class TestCuteLowerings(unittest.TestCase):
             torch.testing.assert_close(result, expected, atol=2e-1, rtol=1e-2)
 
     def test_tcgen05_codegen_emits_setmaxregister_split(self) -> None:
-        """Tcgen05 codegen emits Quack-style register reallocation: consumer
-        warps (exec MMA + epilogue) call ``setmaxregister_increase(256)``;
-        every other warp (TMA, AB-load, idle padding warps) calls
-        ``setmaxregister_decrease(120)``. The "not consumer" framing of the
-        decrease branch catches idle warps so they don't sit at the default
-        ~168-register budget and steal headroom from real consumers."""
+        """Reallocate registers uniformly within each four-warp warpgroup.
+
+        Epilogue warps increase to 256; MMA, load, scheduler and padding warps
+        decrease to 120, including the last two warps in a six-warp CTA.
+        """
 
         @helion.kernel(backend="cute")
         def cute_matmul_setmaxregister(
@@ -2849,18 +2850,18 @@ class TestCuteLowerings(unittest.TestCase):
             config = _make_tcgen05_persistent_config(l2_groupings=[4])
             code = bound.to_triton_code(config)
 
-        # Non-consumer warps (TMA, AB-load, idle padding) drop to 120 regs.
+        # MMA, load, scheduler and padding warps drop to 120 regs.
         self.assertIn(
-            "if not (tcgen05_exec_active or tcgen05_epi_active):",
+            "if not tcgen05_epi_active:",
             code,
         )
         self.assertIn(
             "cute.arch.setmaxregister_decrease(120)",
             code,
         )
-        # Consumer / epi warps raise to 256 regs.
+        # The epilogue warps raise to 256 regs.
         self.assertIn(
-            "if tcgen05_exec_active or tcgen05_epi_active:",
+            "if tcgen05_epi_active:",
             code,
         )
         self.assertIn(
@@ -2878,6 +2879,54 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertGreater(increase_pos, epi_active_pos)
         self.assertLess(decrease_pos, mma_slice_pos)
         self.assertLess(increase_pos, mma_slice_pos)
+
+        # Evaluate the emitted role predicates for complete and partial
+        # warpgroups. The old exec-or-epi split disagreed on warps 4 and 5.
+        tree = ast.parse(code)
+        roles = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in ("tcgen05_exec_active", "tcgen05_epi_active")
+        ]
+        self.assertEqual(len(roles), 2)
+        branches = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and len(node.body) == 1
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Call)
+            and ast.unparse(node.body[0].value.func)
+            in (
+                "cute.arch.setmaxregister_decrease",
+                "cute.arch.setmaxregister_increase",
+            )
+        ]
+        self.assertEqual(len(branches), 2)
+        role_code = compile(ast.Module(body=roles, type_ignores=[]), "<roles>", "exec")
+        conditions = [
+            compile(ast.Expression(branch.test), "<register-predicate>", "eval")
+            for branch in branches
+        ]
+        for warp_count in (6, 8):
+            decisions = []
+            for warp in range(warp_count):
+                scope = {
+                    "__builtins__": {},
+                    "cutlass": SimpleNamespace(Int32=int),
+                    "tcgen05_warp_idx": warp,
+                }
+                exec(role_code, scope)
+                decision = tuple(
+                    bool(eval(condition, scope)) for condition in conditions
+                )
+                self.assertEqual(sum(decision), 1)
+                decisions.append(decision)
+            for first in range(0, warp_count, 4):
+                self.assertEqual(len(set(decisions[first : first + 4])), 1)
 
     def test_tcgen05_codegen_does_not_emit_dead_acc_frag_alias(self) -> None:
         """After the acc_frag persistent-loop fix, the prefix should
@@ -4324,7 +4373,7 @@ class TestCuteLowerings(unittest.TestCase):
         CTA's consumer release to the leader CTA's empty barrier and
         starve non-leader CTAs of arrivals — the cluster_m=2 hang the
         prior cycle reproduced). The consumer arrive count must also
-        be per-CTA (``role_warp_count - scheduler_warp_count``)
+        be per-CTA (``(role_warp_count - scheduler_warp_count) * 32``)
         without the ``× cluster_size`` Quack-style multiplier.
 
         Pin both invariants on the captured generated code so a
@@ -4530,8 +4579,8 @@ class TestCuteLowerings(unittest.TestCase):
 
         Pin:
 
-        - The sched_pipeline consumer arrive count stays at 6 (4 epi
-          + 1 mma + 1 ab_load = 6 consumer warps; the C-input warp
+        - The sched_pipeline consumer arrive count stays at 192 threads
+          (4 epi + 1 mma + 1 ab_load = 6 consumer warps; the C-input warp
           is excluded so the count is identical to the
           ``c_input_warps=0`` baseline).
         - The cluster_layout pin (2, 1, 1) for cluster_m=2 is
@@ -4707,11 +4756,12 @@ class TestCuteLowerings(unittest.TestCase):
         ``PipelineAsync`` edge (producer = 4 epi warps, consumer = 1 store
         warp, depth = c_stages). The store warp is now a REAL sched consumer,
         so the cycle-91 ``- store_warp_count`` sched-consumer subtraction is
-        removed (count goes 6 -> 7).
+        removed (the thread arrival count goes from 192 to 224).
 
         Pins (store_warps=1): the widened role gate, the C-store edge, the
         epi-warp producer commit + the store-warp consumer wait/release, and
-        the sched consumer arrive count = 7. The launch envelope stays 8.
+        the sched consumer arrive count = 224 threads. The launch envelope
+        stays at 8 warps.
 
         The store_warps=0 production path is asserted BYTE-IDENTICAL (the whole
         split is behind ``has_store_warp``) by
@@ -8556,33 +8606,10 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("alpha", seen_fx_kwargs[0])
         self.assertEqual(seen_fx_kwargs[0]["alpha"], 2.0)
 
-    def test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch(
+    def test_tcgen05_fused_chain_preserves_intermediate_cast_dtype_mismatch(
         self,
     ) -> None:
-        """G3.1.1 must reject ``out[tile] = chain(acc).to(d_inter)``
-        when the store-target tensor dtype is ``d_target != d_inter``.
-
-        The user's ``.to(d_inter)`` call is an explicit intermediate
-        cast that affects rounding (``fp32 -> d_inter -> d_target``
-        rounds differently from ``fp32 -> d_target``). The splice
-        site only emits the final ``.to(target_dtype)`` cast; if the
-        analyzer accepted the chain anyway, the rendered kernel would
-        silently drop the intermediate cast and change arithmetic.
-
-        At the FX level Helion always wraps the user's store value in
-        an *implicit* ``convert_element_type`` to the store-target
-        tensor's dtype, so the user-explicit ``.to(d_inter)`` shows up
-        as a *second* ``convert_element_type`` *inside* the chain
-        (between the outer Helion-implicit cast and the chain's leaf
-        unary op). The chain step loop rejects any
-        ``convert_element_type`` mid-chain because it's not on the
-        unary whitelist; the G3.1.0 backstop then fires. This test
-        pins that rejection: ``out_fp16[tile] = relu(acc).to(bf16)``
-        would silently change rounding if the analyzer accepted, but
-        the chain-loop reject of the inner ``convert_element_type``
-        keeps it correct.
-        """
-
+        """An explicit BF16 rounding remains before a different FP16 store."""
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -8598,39 +8625,27 @@ class TestCuteLowerings(unittest.TestCase):
                 acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
                 for tile_k in hl.tile(k):
                     acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                # Intermediate cast to bf16, then store into an fp16
-                # tensor: the analyzer must reject because the
-                # rendered ``.to(target_dtype)`` only handles the
-                # final cast, dropping the intermediate.
                 out[tile_m, tile_n] = torch.relu(acc).to(torch.bfloat16)
             return out
 
-        x = torch.randn(128, 128, dtype=torch.float16, device=DEVICE)
-        y = torch.randn(128, 128, dtype=torch.float16, device=DEVICE)
-        out = torch.empty(128, 128, dtype=torch.float16, device=DEVICE)
-        with (
-            self.assertRaises(exc.BackendUnsupported) as cm,
-            patch_cute_mma_support(),
-        ):
-            cute_matmul_relu_dtype_mismatch.bind((x, y, out)).set_config(
-                _make_tcgen05_persistent_config(
-                    block_sizes=[128, 128, 32],
-                    pid_type="persistent_interleaved",
-                )
-            )
-            cute_matmul_relu_dtype_mismatch(x, y, out)
-        # The chain analyzer's intermediate-cast-dtype reject fires
-        # before the kernel-side cross-site dtype assertion would.
-        # Pin the diagnostic to the G3.1.0 backstop message
-        # specifically — a generic kernel/store dtype-mismatch
-        # ``BackendUnsupported`` would also pass an
-        # ``assertRaises(BackendUnsupported)`` check, but it would
-        # mean the analyzer's dtype-reject was a no-op and the
-        # rendering proceeded to a kernel that the cross-site
-        # assertion later caught (a different defect class).
-        message = str(cm.exception)
-        self.assertIn("tcgen05 MMA path", message)
-        self.assertIn("indices and masks", message)
+        # Every dot product is exactly 16 * y[0, :], avoiding reduction-order
+        # noise while making BF16 intermediate rounding visibly different.
+        x = torch.full((128, 128), 0.125, dtype=torch.float16, device=DEVICE)
+        y = torch.linspace(-1.01, 1.01, 128, device=DEVICE, dtype=torch.float16)
+        y = y.expand(128, 128).contiguous()
+        out = torch.empty_like(x)
+        config = _make_tcgen05_persistent_config(
+            block_sizes=[128, 128, 32], pid_type="persistent_interleaved"
+        )
+        with patch_cute_mma_support():
+            bound = cute_matmul_relu_dtype_mismatch.bind((x, y, out))
+            bound.set_config(config)
+            source = bound.to_triton_code(config)
+            actual = cute_matmul_relu_dtype_mismatch(x, y, out)
+        self.assertIn(".to(cutlass.BFloat16).to(cutlass.Float32)", source)
+        expected = (y.float() * 16).relu().to(torch.bfloat16).to(torch.float16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertFalse(torch.equal(expected, (y * 16).relu()))
 
     def test_tcgen05_fused_relu_epilogue_ieee_edge_cases(self) -> None:
         """G3.1.1 relu must match ``torch.relu`` on the full IEEE
@@ -9335,7 +9350,9 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertIn("cute.math.exp2", code)
         self.assertIn("1.4426950408889634", code)
         self.assertIn("tcgen05_chain_step", code)
-        self.assertIn("1.0 /", code)
+        self.assertIn("cute.math.rcp", code)
+        self.assertIn("approx=True, ftz=True", code)
+        self.assertNotIn("1.0 /", code)
         self.assertNotIn("_cute_sigmoid_approx_ftz_f32", code)
         out = bound(x, y)
         expected = torch.sigmoid((x @ y).float()).to(x.dtype)
@@ -12693,6 +12710,17 @@ class TestCuteLowerings(unittest.TestCase):
         # assertion below locks in the current teardown flow.
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive()", code)
         self.assertIn("tcgen05_tmem_alloc_barrier.arrive_and_wait()", code)
+
+        # Allocation must publish its shared pointer to all threads, including
+        # producer warps when the compiler hoists pointer loads. Consumers must
+        # then rendezvous at one static named-barrier site across both roles.
+        self.assertEqual(code.count("tcgen05_tmem_allocator.wait_for_alloc()"), 1)
+        self.assertIn(
+            "cute.arch.sync_threads()\n"
+            "    if tcgen05_exec_active or tcgen05_epi_active:\n"
+            "        tcgen05_tmem_allocator.wait_for_alloc()\n",
+            code,
+        )
 
     def test_tcgen05_codegen_supports_serialized_root_n_threads(self) -> None:
         @helion.kernel(backend="cute")
@@ -18477,9 +18505,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         kernel = self._bias_residual_gelu_kernel()
         args = (
             torch.empty([640, 128], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([128, 642], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([128, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
             torch.empty([642], device=DEVICE, dtype=torch.bfloat16),
-            torch.empty([640, 642], device=DEVICE, dtype=torch.bfloat16),
+            torch.empty([640, 648], device=DEVICE, dtype=torch.bfloat16)[:, :642],
         )
 
         with patch_cute_mma_support():
@@ -21112,6 +21140,8 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
             def __init__(self) -> None:
                 self._counter = 0
                 self.cute_state = CuteDeviceFunctionState()
+                # The mailbox snapshot reads the scheduler wait-mode knob.
+                self.config: dict[str, object] = {}
 
             def new_var(self, name: str) -> str:
                 self._counter += 1
@@ -21183,6 +21213,676 @@ mailbox[cutlass.Int32(3), producer_state.index] = first
         self.assertLess(arrive, wait)
         self.assertLess(wait, acquire)
         self.assertIn("cute.make_layout((2, 1, 1))", source)
+
+    def _make_shared_mailbox_bridge(
+        self, *, cluster_m: int = 2, cluster_n: int = 1, two_cta: bool = False
+    ) -> tuple[Any, Any]:
+        """Exercise the real layout and shared-loop builders with CPU metadata."""
+        from helion._compiler.cute.device_state import CuteTcgen05MatmulPlan
+
+        df, splitter = self._make_role_local_stubs()
+        plan = CuteTcgen05MatmulPlan(
+            bm=256 if two_cta else 128,
+            bn=128,
+            bk=128,
+            k_tile_count=1,
+            cluster_m=cluster_m,
+            cluster_n=cluster_n,
+            is_two_cta=two_cta,
+            uses_role_local_persistent_body=True,
+            uses_cluster_m2_one_cta_role_local_bridge=False,
+            cta_thread_count=192,
+            physical_m_threads=32,
+            acc_stage_count=2,
+            ab_stage_count=2,
+            c_stage_count=2,
+            epi_warp_count=4,
+        )
+        splitter._tcgen05_plan = lambda: plan
+        return splitter, splitter._build_tcgen05_persistent_layout(df)
+
+    def _assert_shared_mailbox_reader_order(
+        self, statements: list[ast.stmt], layout: Any
+    ) -> None:
+        """All CTA readers must finish before the elected release, even on exit."""
+
+        def call_indices(name: str) -> list[int]:
+            return [
+                index
+                for index, statement in enumerate(statements)
+                for node in ast.walk(statement)
+                if isinstance(node, ast.Call) and ast.unparse(node.func) == name
+            ]
+
+        waits = call_indices(f"{layout.sched_pipeline}.consumer_wait")
+        releases = call_indices(f"{layout.sched_pipeline}.consumer_release")
+        barriers = call_indices("cute.arch.sync_threads")
+        fences = call_indices("cute.arch.fence_view_async_shared")
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(len(releases), 1)
+        self.assertEqual(len(barriers), 2)
+        self.assertEqual(len(fences), 1)
+        self.assertEqual(call_indices("cute.arch.sync_warp"), [])
+        wait, release = statements[waits[0]], statements[releases[0]]
+        self.assertIsInstance(wait, ast.If)
+        self.assertIsInstance(release, ast.If)
+        self.assertEqual(ast.unparse(wait.test), layout.consumer_leader_var)
+        self.assertEqual(ast.unparse(release.test), layout.consumer_leader_var)
+        self.assertEqual(len(wait.body), 1)
+        self.assertEqual(
+            [ast.unparse(stmt) for stmt in release.body],
+            [
+                f"{layout.sched_pipeline}.consumer_release({layout.sched_consumer_state})",
+                f"{layout.sched_consumer_state}.advance()",
+            ],
+        )
+        self.assertEqual(wait.orelse, [])
+        self.assertEqual(release.orelse, [])
+        # The rendezvous and proxy fence must be top-level, not inside the
+        # elected-lane, role or valid-tile branches.
+        for index in [*barriers, *fences]:
+            self.assertIsInstance(statements[index], ast.Expr)
+        reads = [
+            index
+            for index, statement in enumerate(statements)
+            if any(
+                isinstance(node, ast.Subscript)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == layout.work_tile_smem
+                and isinstance(node.ctx, ast.Load)
+                for node in ast.walk(statement)
+            )
+        ]
+        self.assertEqual(len(reads), 4)
+        for index, target in zip(
+            reads,
+            [*layout.work_tile_coord_vars, layout.work_tile_valid_var],
+            strict=True,
+        ):
+            statement = statements[index]
+            self.assertIsInstance(statement, ast.Assign)
+            self.assertEqual([ast.unparse(t) for t in statement.targets], [target])
+        self.assertLess(waits[0], barriers[0])
+        self.assertLess(barriers[0], fences[0])
+        self.assertLess(fences[0], reads[0])
+        self.assertLess(reads[-1], barriers[1])
+        self.assertLess(barriers[1], releases[0])
+        # Reading an invalid first/next tile cannot bypass the balancing
+        # release. The only release predicate is the elected CTA leader.
+        self.assertNotIn(layout.work_tile_valid_var, ast.unparse(release.test))
+
+    def test_shared_mailbox_bridge_initial_and_next_tile_reader_order(self) -> None:
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        for cluster_n in (1, 2):
+            for two_cta in (False, True):
+                with self.subTest(cluster_n=cluster_n, two_cta=two_cta):
+                    splitter, layout = self._make_shared_mailbox_bridge(
+                        cluster_n=cluster_n, two_cta=two_cta
+                    )
+                    prelude = splitter._build_tcgen05_persistent_prelude(layout)
+                    shared = Tcgen05PersistentProgramIDs._PersistentRoleBlock(
+                        role_predicate=None,
+                        stmts=[self._stmt("consume_residual_tile()")],
+                    )
+                    body = splitter._build_tcgen05_persistent_tile_body(
+                        layout, [shared]
+                    )
+                    self._assert_shared_mailbox_reader_order(prelude, layout)
+                    self._assert_shared_mailbox_reader_order(body, layout)
+                    self.assertEqual(ast.unparse(body[1]), "consume_residual_tile()")
+
+    def test_shared_mailbox_bridge_retains_single_arrival_and_stage(self) -> None:
+        splitter, layout = self._make_shared_mailbox_bridge()
+        prelude = splitter._build_tcgen05_persistent_prelude(layout)
+        source = "\n".join(ast.unparse(stmt) for stmt in prelude)
+        self.assertIn(
+            "cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread, 2)",
+            source,
+        )
+        pipeline_create = next(
+            node
+            for statement in prelude
+            for node in ast.walk(statement)
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "cutlass.pipeline.PipelineAsync.create"
+        )
+        options = {
+            item.arg: ast.unparse(item.value) for item in pipeline_create.keywords
+        }
+        self.assertEqual(options["num_stages"], "1")
+        self.assertEqual(options["consumer_mask"], "cutlass.Int32(0)")
+        self.assertEqual(options["defer_sync"], "True")
+        self.assertEqual(source.count(".consumer_release("), 1)
+        self.assertEqual(source.count(f"{layout.sched_consumer_state}.advance()"), 1)
+        self.assertEqual(source.count("_cute_store_shared_remote_x4("), 1)
+        self.assertLess(
+            source.index("pipeline_init_wait("), source.index(".producer_acquire(")
+        )
+
+    def test_shared_mailbox_bridge_requires_all_cta_readers(self) -> None:
+        from helion import exc
+
+        splitter, layout = self._make_shared_mailbox_bridge()
+        with self.assertRaisesRegex(
+            exc.InvalidConfig, "requires CTA-wide synchronization"
+        ):
+            splitter._build_tcgen05_persistent_tile_body(
+                layout, [], emit_block_wide_sync=False
+            )
+
+    def test_unclustered_shared_mailbox_keeps_existing_synchronization(self) -> None:
+        splitter, layout = self._make_shared_mailbox_bridge(cluster_m=1)
+        self.assertEqual(layout.work_tile_consume_stmts, [])
+        self.assertEqual(layout.work_tile_release_stmts, [])
+        prelude = splitter._build_tcgen05_persistent_prelude(layout)
+        for emit_sync in (False, True):
+            with self.subTest(emit_sync=emit_sync):
+                body = splitter._build_tcgen05_persistent_tile_body(
+                    layout, [], emit_block_wide_sync=emit_sync
+                )
+                source = "\n".join(ast.unparse(stmt) for stmt in body)
+                self.assertEqual(
+                    source.count("cute.arch.sync_threads()"), int(emit_sync)
+                )
+                self.assertNotIn("fence_view_async_shared", source)
+                self.assertNotIn("consumer_release", source)
+                self.assertNotIn("consumer_wait", source)
+        source = "\n".join(ast.unparse(stmt) for stmt in prelude)
+        self.assertEqual(source.count("cute.arch.sync_threads()"), 1)
+        self.assertNotIn("fence_view_async_shared", source)
+
+    def _make_mailbox_release_stubs(
+        self, *, staged: bool = False, two_cta: bool = False
+    ) -> tuple[Any, Any, Any, Any]:
+        """Use the real AST builders and role predicates without a kernel binding."""
+        from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+
+        df, splitter = self._make_role_local_stubs()
+        plan = SimpleNamespace(
+            has_scheduler_warp=True,
+            has_c_input_warp=True,
+            has_store_warp=True,
+            tma_warp_id=5,
+            exec_warp_id=4,
+            epi_warp_count=4,
+            store_warp_id=7,
+            c_input_warp_id=7,
+            is_two_cta=two_cta,
+            sched_stage_count=2 if staged else 1,
+            grouped=None,
+            row_union=None,
+            source_tile_m=128,
+            source_tile_n=128,
+            bn=128,
+            bm=256 if two_cta else 128,
+            accumulator_view="nm",
+            output_offsets=("tile_offset_0", "tile_offset_1"),
+            tma_store_full_tiles_only=True,
+        )
+        splitter._tcgen05_plan = lambda: plan
+        splitter._tcgen05_sched_pipeline_plan = lambda: SimpleNamespace(
+            pipeline="sched_pipeline", consumer_state="sched_state"
+        )
+        splitter._tcgen05_is_two_cta = lambda: two_cta
+        splitter._tcgen05_cluster_m = lambda: 2 if two_cta else 1
+        splitter._tcgen05_uses_cluster_m2_one_cta_role_local_bridge = lambda: False
+        # Undo this class's partitioner-only predicate stubs. These tests check
+        # the actual full-warp gates that enclose the new full-mask rendezvous.
+        for name in (
+            "_tcgen05_tma_load_role_predicate",
+            "_tcgen05_mma_exec_role_predicate",
+            "_tcgen05_epi_role_predicate",
+        ):
+            setattr(
+                splitter,
+                name,
+                getattr(Tcgen05PersistentProgramIDs, name).__get__(splitter),
+            )
+        layout = self._make_minimal_layout(cluster_m=2 if two_cta else 1)
+        return df, splitter, layout, plan
+
+    def _assert_mailbox_release_sequences(self, root: ast.AST, count: int) -> None:
+        """Check state convergence after every emitted per-thread arrival.
+
+        Every consumer thread releases after its own mailbox reads, so no
+        warp barrier precedes the release; the arrival count covers all lanes.
+        """
+        found = 0
+        for node in ast.walk(root):
+            for _field, value in ast.iter_fields(node):
+                if not isinstance(value, list):
+                    continue
+                for index, stmt in enumerate(value):
+                    if not isinstance(stmt, ast.Expr):
+                        continue
+                    if ast.unparse(stmt) != (
+                        "sched_pipeline.consumer_release(sched_state)"
+                    ):
+                        continue
+                    found += 1
+                    self.assertEqual(
+                        [ast.unparse(item) for item in value[index + 1 : index + 3]],
+                        ["sched_state.advance()", "cute.arch.sync_warp()"],
+                    )
+        self.assertEqual(found, count)
+
+    def _assert_mailbox_tile_and_terminal(self, root: ast.If) -> ast.While:
+        self.assertNotIn("lane_idx", ast.unparse(root.test))
+        self.assertIn(
+            "cute.arch.make_warp_uniform(cute.arch.warp_idx())", ast.unparse(root.test)
+        )
+        loops = [stmt for stmt in root.body if isinstance(stmt, ast.While)]
+        self.assertEqual(len(loops), 1)
+        loop = loops[0]
+        self._assert_mailbox_release_sequences(loop, 1)
+        terminal = ast.Module(
+            body=root.body[root.body.index(loop) + 1 :], type_ignores=[]
+        )
+        self._assert_mailbox_release_sequences(terminal, 1)
+        self._assert_mailbox_release_sequences(root, 2)
+        # This terminal sequence executes even when the initial valid flag is
+        # false, so an empty worklist still balances its single sentinel stage.
+        self.assertIsInstance(loop.test, ast.Name)
+        self.assertEqual(loop.orelse, [])
+        return loop
+
+    def test_mailbox_release_waits_for_all_readers_before_arrival(self) -> None:
+        from helion._compiler.program_id import (
+            _build_sched_pipeline_consumer_release_block,
+        )
+
+        blocks = [
+            _build_sched_pipeline_consumer_release_block(
+                sched_pipeline="sched_pipeline", sched_consumer_state="sched_state"
+            )
+            for _ in range(2)
+        ]
+        for block in blocks:
+            self.assertEqual(len(block), 3)
+            self._assert_mailbox_release_sequences(
+                ast.Module(body=block, type_ignores=[]), 1
+            )
+        self.assertTrue(
+            {
+                id(node)
+                for stmt in blocks[0]
+                for node in ast.walk(stmt)
+                if isinstance(node, ast.stmt)
+            }.isdisjoint(
+                {
+                    id(node)
+                    for stmt in blocks[1]
+                    for node in ast.walk(stmt)
+                    if isinstance(node, ast.stmt)
+                }
+            )
+        )
+
+    def test_mailbox_release_scheduler_roles_and_terminal(self) -> None:
+        from helion._compiler.device_function import DeviceFunction
+
+        for staged in (False, True):
+            for two_cta in (False, True):
+                for warp_leader in (False, True):
+                    df, splitter, layout, _plan = self._make_mailbox_release_stubs(
+                        staged=staged, two_cta=two_cta
+                    )
+                    config = (
+                        {
+                            TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY: TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+                        }
+                        if warp_leader
+                        else {}
+                    )
+                    # The mailbox snapshot reads the wait mode from the device
+                    # function while the wait block reads the current one.
+                    df.config = config
+                    for predicate in (
+                        splitter._tcgen05_tma_load_role_predicate(),
+                        splitter._tcgen05_mma_exec_role_predicate(),
+                        splitter._tcgen05_epi_role_predicate(),
+                    ):
+                        with self.subTest(
+                            staged=staged,
+                            two_cta=two_cta,
+                            warp_leader=warp_leader,
+                            role=predicate,
+                        ):
+                            role = splitter._PersistentRoleBlock(
+                                role_predicate=predicate,
+                                stmts=[self._stmt("role_math(__test_virtual_pid__)")],
+                            )
+                            with patch.object(
+                                DeviceFunction,
+                                "current",
+                                return_value=SimpleNamespace(config=config),
+                            ):
+                                emitted = (
+                                    splitter._build_role_local_while_with_scheduler(
+                                        df,
+                                        layout,
+                                        role,
+                                        scheduler_var_prefix="test",
+                                        dependency_stmts=[
+                                            self._stmt(
+                                                "dependent = __test_virtual_pid__"
+                                            )
+                                        ],
+                                    )
+                                )
+                            loop = self._assert_mailbox_tile_and_terminal(emitted)
+                            lines = [ast.unparse(stmt) for stmt in loop.body]
+                            if warp_leader:
+                                # Only the acquiring lane reads the mailbox; the
+                                # body consumes its broadcast register snapshot.
+                                self.assertIn("test_mailbox_", lines[0])
+                                self.assertNotIn("work_tile_smem[", lines[0])
+                            else:
+                                self.assertIn(
+                                    "work_tile_smem[cutlass.Int32(0), sched_state.index]"
+                                    if staged
+                                    else "work_tile_smem[cutlass.Int32(0)]",
+                                    lines[0],
+                                )
+                            self.assertIn("consumer_release", lines[1])
+                            self.assertLess(
+                                1,
+                                next(
+                                    i
+                                    for i, text in enumerate(lines)
+                                    if text.startswith("dependent =")
+                                ),
+                            )
+                            self.assertEqual(
+                                ast.unparse(emitted).count(
+                                    "sched_pipeline.consumer_wait"
+                                ),
+                                2,
+                            )
+
+    def test_mailbox_release_grouped_modes_and_terminal(self) -> None:
+        from helion._compiler.cute.grouped_full_coverage import (
+            Tcgen05GroupedFullCoveragePlan,
+        )
+
+        for mode in ("off", "dense", "dense_local", "runtime_clc", "runtime_direct"):
+            for staged in (False, True):
+                for two_cta in (False, True):
+                    if mode == "dense_local" and two_cta:
+                        continue
+                    df, splitter, layout, plan = self._make_mailbox_release_stubs(
+                        staged=staged, two_cta=two_cta
+                    )
+                    runtime_table = mode in ("runtime_clc", "runtime_direct")
+                    uses_pipeline = mode != "runtime_direct"
+                    fields = (
+                        "cta_tile_idx_m",
+                        "cta_tile_idx_n",
+                        "metadata_idx",
+                        "group_idx",
+                        "problem_m",
+                        "problem_n",
+                        "problem_k",
+                        "global_m_start",
+                        "valid_m",
+                        "store_m",
+                    )
+                    grouped = SimpleNamespace(
+                        **{name: f"grouped_{name}" for name in fields}
+                    )
+                    grouped.full_coverage = (
+                        Tcgen05GroupedFullCoveragePlan(
+                            predicate="full_coverage",
+                            groups=4,
+                            m=1024,
+                            n=256,
+                            k=256,
+                            tile_m=128,
+                            tile_n=128,
+                            tile_k=128 if two_cta else 64,
+                            consumer_local=mode == "dense_local",
+                        )
+                        if mode in ("dense", "dense_local")
+                        else None
+                    )
+                    grouped.runtime_tile_records = (
+                        "tile_records" if runtime_table else None
+                    )
+                    grouped.runtime_total_clusters = (
+                        "total_clusters" if runtime_table else None
+                    )
+                    grouped.device_split_sizes = True
+                    grouped.layout = "problem_sizes"
+                    plan.grouped = grouped
+                    splitter._tcgen05_uses_grouped_worklist_nm_runtime_table = (
+                        lambda runtime_table=runtime_table: runtime_table
+                    )
+                    splitter._tcgen05_uses_grouped_worklist_nm_scheduler_mailbox = (
+                        lambda runtime_table=runtime_table: not runtime_table
+                    )
+                    splitter._tcgen05_uses_grouped_worklist_nm_runtime_clc = (
+                        lambda mode=mode: mode == "runtime_clc"
+                    )
+                    for predicate in (
+                        splitter._tcgen05_tma_load_role_predicate(),
+                        splitter._tcgen05_mma_exec_role_predicate(),
+                        splitter._tcgen05_epi_role_predicate(),
+                    ):
+                        with self.subTest(
+                            mode=mode, staged=staged, two_cta=two_cta, role=predicate
+                        ):
+                            role = splitter._PersistentRoleBlock(
+                                role_predicate=predicate,
+                                stmts=[
+                                    self._stmt(
+                                        "role_math(pid_0, pid_1, grouped_problem_m, grouped_problem_k, grouped_global_m_start)"
+                                    )
+                                ],
+                            )
+                            emitted = (
+                                splitter._build_grouped_worklist_nm_role_local_while(
+                                    df,
+                                    role,
+                                    layout=layout if uses_pipeline else None,
+                                    scheduler_var_prefix="test",
+                                    dependency_stmts=None,
+                                    role_prelude_stmts=None,
+                                    initialize_tile_counter=True,
+                                    emit_pdl_wait=True,
+                                )
+                            )
+                            if not uses_pipeline:
+                                self._assert_mailbox_release_sequences(emitted, 0)
+                                self.assertNotIn("sched_pipeline", ast.unparse(emitted))
+                                continue
+                            loop = self._assert_mailbox_tile_and_terminal(emitted)
+                            lines = [ast.unparse(stmt) for stmt in loop.body]
+                            release_index = next(
+                                i
+                                for i, text in enumerate(lines)
+                                if "consumer_release" in text
+                            )
+                            self.assertLess(
+                                release_index,
+                                next(
+                                    i
+                                    for i, text in enumerate(lines)
+                                    if text.startswith("role_math(")
+                                ),
+                            )
+                            # Reads of the reusable mailbox must all precede
+                            # the arrival. Immutable runtime-record loads may
+                            # follow it after the record index is materialized.
+                            next_wait_index = next(
+                                i
+                                for i, text in enumerate(lines)
+                                if "sched_pipeline.consumer_wait" in text
+                            )
+                            self.assertFalse(
+                                any(
+                                    "work_tile_smem[" in text
+                                    for text in lines[
+                                        release_index + 1 : next_wait_index
+                                    ]
+                                )
+                            )
+                            if mode == "dense_local":
+                                release_gate = loop.body[release_index]
+                                self.assertIsInstance(release_gate, ast.If)
+                                self.assertEqual(
+                                    ast.unparse(release_gate.test), "not full_coverage"
+                                )
+                                terminal = emitted.body[-1]
+                                self.assertIsInstance(terminal, ast.If)
+                                self.assertEqual(
+                                    ast.unparse(terminal.test), "not full_coverage"
+                                )
+
+    def _emit_mailbox_aux_role(
+        self,
+        *,
+        staged: bool,
+        two_cta: bool,
+        phase: str,
+        post_l2: bool,
+        tma: bool,
+        inline: bool = False,
+    ) -> tuple[Any, Any, Any, ast.stmt | list[ast.stmt]]:
+        df, splitter, layout, plan = self._make_mailbox_release_stubs(
+            staged=staged, two_cta=two_cta
+        )
+        tensor = SimpleNamespace(shape=(1024, 1024), dtype=torch.bfloat16)
+        plan.c_input_aux_tensor_descriptors = [
+            SimpleNamespace(host_tensor_val=tensor, broadcast_axis=None)
+        ]
+        df.tensor_arg = lambda value: SimpleNamespace(name="aux_tensor")
+        df.cute_state.aux_pipeline_plan = SimpleNamespace(
+            pipeline="aux_pipeline",
+            producer_state="aux_state",
+            epi_tile_var="epi_tile",
+            use_tma_load=tma,
+            rings=[
+                SimpleNamespace(
+                    smem="aux_smem",
+                    tma_atom="tma_atom" if tma else None,
+                    tma_tensor="tma_tensor" if tma else None,
+                )
+            ],
+        )
+        dependencies = (
+            [
+                self._stmt("tile_offset_0 = __test_virtual_pid__ * 128"),
+                self._stmt("tile_offset_1 = __test_virtual_pid__ * 64"),
+            ]
+            if post_l2
+            else None
+        )
+        backend = SimpleNamespace(dtype_str=lambda dtype: "cutlass.BFloat16")
+        with patch.object(
+            CompileEnvironment, "current", return_value=SimpleNamespace(backend=backend)
+        ):
+            emitted = splitter._build_c_input_warp_role_local_while(
+                df,
+                layout,
+                shared_body_extracted=dependencies,
+                tile_phase=phase,
+                inline_aux_only=inline,
+            )
+        return df, splitter, layout, emitted
+
+    def test_mailbox_release_aux_edge_and_terminal(self) -> None:
+        for staged in (False, True):
+            for two_cta in (False, True):
+                with self.subTest(staged=staged, two_cta=two_cta):
+                    _df, _splitter, _layout, emitted = self._emit_mailbox_aux_role(
+                        staged=staged,
+                        two_cta=two_cta,
+                        phase="edge",
+                        post_l2=False,
+                        tma=False,
+                    )
+                    self.assertIsInstance(emitted, ast.If)
+                    loop = self._assert_mailbox_tile_and_terminal(emitted)
+                    self.assertIn("consumer_release", ast.unparse(loop.body[0]))
+                    self.assertNotIn("aux_pipeline", ast.unparse(emitted))
+
+    def test_mailbox_release_aux_early_late_and_terminal(self) -> None:
+        for staged in (False, True):
+            for two_cta in (False, True):
+                for post_l2 in (False, True):
+                    for tma in (False, True):
+                        for phase in ("all", "full"):
+                            with self.subTest(
+                                staged=staged,
+                                two_cta=two_cta,
+                                post_l2=post_l2,
+                                tma=tma,
+                                phase=phase,
+                            ):
+                                _df, _splitter, _layout, emitted = (
+                                    self._emit_mailbox_aux_role(
+                                        staged=staged,
+                                        two_cta=two_cta,
+                                        phase=phase,
+                                        post_l2=post_l2,
+                                        tma=tma,
+                                    )
+                                )
+                                self.assertIsInstance(emitted, ast.If)
+                                loop = self._assert_mailbox_tile_and_terminal(emitted)
+                                source = ast.unparse(loop)
+                                release = source.index(
+                                    "sched_pipeline.consumer_release"
+                                )
+                                copy = source.index("cute.copy(")
+                                if post_l2:
+                                    self.assertLess(
+                                        source.index("tile_offset_1 ="), release
+                                    )
+                                    self.assertLess(release, copy)
+                                else:
+                                    self.assertLess(copy, release)
+                                tail = ast.unparse(emitted).count(
+                                    "aux_pipeline.producer_tail(aux_state)"
+                                )
+                                self.assertEqual(tail, int(tma))
+
+    def test_mailbox_release_inline_aux_has_only_parent_handshake(self) -> None:
+        for tma in (False, True):
+            with self.subTest(tma=tma):
+                df, splitter, layout, inline = self._emit_mailbox_aux_role(
+                    staged=True,
+                    two_cta=False,
+                    phase="all",
+                    post_l2=True,
+                    tma=tma,
+                    inline=True,
+                )
+                self.assertIsInstance(inline, list)
+                inline_module = ast.Module(body=inline, type_ignores=[])
+                self._assert_mailbox_release_sequences(inline_module, 0)
+                self.assertNotIn("sched_pipeline", ast.unparse(inline_module))
+                self.assertNotIn("producer_tail", ast.unparse(inline_module))
+                role = splitter._PersistentRoleBlock(
+                    role_predicate=splitter._tcgen05_epi_role_predicate(),
+                    stmts=[self._stmt("epilogue_and_store()")],
+                )
+                emitted = splitter._build_role_local_while_with_scheduler(
+                    df,
+                    layout,
+                    role,
+                    scheduler_var_prefix="inline",
+                    dependency_stmts=None,
+                    store_aux_per_tile_stmts=inline,
+                    store_aux_predicate="cute.arch.make_warp_uniform(cute.arch.warp_idx()) == cutlass.Int32(7)",
+                )
+                loop = self._assert_mailbox_tile_and_terminal(emitted)
+                source = ast.unparse(loop)
+                self.assertLess(
+                    source.index("sched_pipeline.consumer_release"),
+                    source.index("cute.copy("),
+                )
 
     def test_tcgen05_persistent_foreach_multi_root_keeps_host_guard(self) -> None:
         """Multi-root tcgen05 role-local codegen is guarded as unvalidated.

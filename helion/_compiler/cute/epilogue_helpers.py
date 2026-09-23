@@ -69,7 +69,7 @@ def sigmoid_approx_ftz_f32(
     """FP32 sigmoid with the native approximate reciprocal instruction."""
     value = Float32(x)  # pyrefly: ignore[bad-argument-type]
     return _rcp_approx_ftz_impl(
-        1.0 + cute.math.exp2(-value * _LOG2_E),
+        1.0 + cute.math.exp2(value * -_LOG2_E),
         loc=loc,
         ip=ip,
     )

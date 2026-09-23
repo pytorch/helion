@@ -26,6 +26,7 @@ class Tcgen05LifecycleContext:
     is_two_cta: bool
     use_tma: bool
     skip_ab_producer_advance: bool = False
+    tmem_permit_released_early: bool = False
 
     def render_store_post_loop_lines(
         self, *, tma_store_pipeline_tail: str = ""
@@ -78,12 +79,13 @@ class Tcgen05LifecycleContext:
             # without this CTA sync: epi warps synchronize through
             # tmem_alloc_barrier before free.
             post_loop_lines.append("cute.arch.sync_threads()")
+        if not self.tmem_permit_released_early:
+            post_loop_lines.append(
+                f"if {self.epi_active}:\n"
+                f"    {self.tmem_allocator}.relinquish_alloc_permit()"
+            )
         post_loop_lines.extend(
             [
-                (
-                    f"if {self.epi_active}:\n"
-                    f"    {self.tmem_allocator}.relinquish_alloc_permit()"
-                ),
                 (
                     f"if {self.epi_active}:\n"
                     f"    {self.tmem_alloc_barrier}.arrive_and_wait()"

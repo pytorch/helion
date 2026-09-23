@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from copy import deepcopy
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
@@ -20,6 +21,17 @@ from ...runtime.config import Config
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
+from ..cute.grouped_full_coverage import FULL_COVERAGE_PIPELINES
+from ..cute.grouped_full_coverage import full_coverage_index_domain
+from ..cute.grouped_full_coverage import full_coverage_pipeline_supported
+from ..cute.grouped_full_coverage import full_coverage_smem_upper_bound
+from ..cute.grouped_row_union import PAIRED_CLC
+from ..cute.grouped_row_union import PAIRED_CLC_SCHEDULE
+from ..cute.grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
+from ..cute.grouped_row_union import TRANSPOSED
+from ..cute.grouped_row_union import TRANSPOSED_SCHEDULE
+from ..cute.grouped_row_union import index_domain as row_union_index_domain
+from ..cute.grouped_row_union import resident_ctas_supported
 from ..cute.grouped_worklist_policy import GroupedBMajor
 from ..cute.grouped_worklist_policy import GroupedWorklistHardwareIdentity
 from ..cute.grouped_worklist_policy import get_grouped_worklist_target_policy
@@ -33,7 +45,12 @@ from ..cute.strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from ..cute.strategies import Tcgen05PersistenceModel
 from ..cute.strategies import Tcgen05Strategy
 from ..cute.tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+from ..cute.tcgen05_config import CuteTcgen05Config
 from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
+from ..cute.tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
@@ -45,10 +62,14 @@ from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+from ..cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES,
+)
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+from ..cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
@@ -56,6 +77,8 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from ..cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
+from ..cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
@@ -2376,7 +2399,10 @@ def _tcgen05_grouped_worklist_structural_fact(
     if len(spec.matmul_facts) != 1 or len(spec.block_sizes) != 3:
         return None
     fact = _tcgen05_fact_with_static_provenance(spec, spec.matmul_facts[0])
-    if fact.lhs_dtype is not torch.bfloat16 or fact.rhs_dtype is not torch.bfloat16:
+    if (
+        fact.lhs_dtype not in (torch.float16, torch.bfloat16)
+        or fact.rhs_dtype != fact.lhs_dtype
+    ):
         return None
     if (
         fact.m_block_id is None
@@ -2526,7 +2552,9 @@ def _tcgen05_grouped_worklist_config(
     if clc and not runtime_direct:
         raise ValueError("grouped worklist CLC requires runtime_direct=True")
     cluster_m = (
-        1 if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE else 2
+        1
+        if source_m_tile in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+        else 2
     )
     values: dict[str, object] = {
         "block_sizes": [256, 128, block_k],
@@ -2900,12 +2928,13 @@ def _tcgen05_grouped_worklist_source_analysis(
 ]:
     """Return legal source-M families and any exact reviewed row signature."""
     if analysis.input_kind == "device_split_sizes":
-        # Compact A has no physical source-tile constraint. Source-32 currently
-        # requires the one-CTA path, which is not valid for device split sizes.
+        # Compact A has no physical source-tile constraint. Source-32 uses the
+        # one-CTA mailbox path with the same device-derived interval metadata.
         return (
             (
                 TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
                 TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
             ),
             None,
         )
@@ -2972,6 +3001,68 @@ def _bounded_grouped_worklist_seed_families(
         if index < len(family)
     )
     return dedupe_configs(ranked)[:_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT]
+
+
+def _tcgen05_grouped_output_ring_seeds(
+    seeds: Sequence[Config],
+    *,
+    group_count: int,
+    dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    """Cover the alternate output ring for device-metadata mailbox schedules.
+
+    Grouped mode and its source-M tile are seed-only search coordinates. Their
+    existing seeds all use C2, so random configurations cannot sample a complete
+    C4 schedule. Add one C4/default-register witness per existing two-CTA
+    source-M/BK geometry, retaining the original seed prefix at the caller.
+    """
+    budget = capacity_bytes - _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    if group_count <= 0 or dtype_bytes != 2 or budget <= 0:
+        return []
+    seen: set[tuple[int, int]] = set()
+    result: list[Config] = []
+    for seed in seeds:
+        block_k = cast("list[int]", seed.config["block_sizes"])[2]
+        profile = resolve_tcgen05_grouped_worklist_mma_profile(
+            seed.config, block_k=block_k
+        )
+        if profile is None or profile.cluster_m != 2:
+            continue
+        key = (profile.source_m_tile, block_k)
+        if key in seen:
+            continue
+        seen.add(key)
+        # The existing grouped C4 envelope admits at most three AB stages.
+        # Select the deepest inherited stage count that fits the physical
+        # worklist tile, which differs from the logical [256, 128] config tile.
+        ab_stages = min(cast("int", seed.config["tcgen05_ab_stages"]), 3)
+        while ab_stages > 0:
+            required = tcgen05_grouped_worklist_smem_bytes(
+                group_count=group_count,
+                device_split_sizes=True,
+                sched_stage_count=cast(
+                    "int", seed.config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1)
+                ),
+                bm=profile.mma_m,
+                bn=profile.mma_n,
+                bk=block_k,
+                dtype_bytes=dtype_bytes,
+                ab_stages=ab_stages,
+                acc_stages=cast("int", seed.config["tcgen05_acc_stages"]),
+                c_stages=4,
+                cluster_m=profile.cluster_m,
+            )
+            if required <= budget:
+                values = dict(seed.config)
+                values["tcgen05_ab_stages"] = ab_stages
+                values["tcgen05_c_stages"] = 4
+                values[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = TCGEN05_CONSUMER_REGS_DEFAULT
+                values.pop(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, None)
+                result.append(Config.from_dict(values))
+                break
+            ab_stages -= 1
+    return dedupe_configs(result)
 
 
 def _tcgen05_grouped_worklist_hardware_identity(
@@ -3049,6 +3140,35 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         )
         if analysis is None:
             return frozenset()
+        # Explicit configs may compile outside the ordinary sampler's block
+        # domains. Keep their semantic/codegen support separate from whether
+        # this binding can declare an automatic coverage carrier.
+        spec._cute_tcgen05_config.grouped_full_coverage_supported = (
+            analysis.full_coverage_supported
+            and spec.target_device_capability == (10, 0)
+        )
+        spec._cute_tcgen05_config.grouped_row_union_supported = (
+            analysis.dense_row_union_supported
+            and spec.target_device_capability == (10, 0)
+        )
+        spec._cute_tcgen05_config.grouped_row_union_cluster4_supported = (
+            analysis.dense_row_union_cluster4_supported
+            and spec.target_device_capability == (10, 0)
+            and CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+            >= TRANSPOSED.shared_upper_bound
+        )
+        spec._cute_tcgen05_config.grouped_row_union_paired_clc_supported = (
+            analysis.dense_row_union_paired_clc_supported
+            and spec.target_device_capability == (10, 0)
+            and CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+            >= PAIRED_CLC.shared_upper_bound
+        )
+        spec._cute_tcgen05_config.grouped_row_union_multi_resident_supported = (
+            spec._cute_tcgen05_config.grouped_row_union_supported
+            and resident_ctas_supported(
+                2, CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+            )
+        )
         seed_facts = analysis.seed_facts
         if analysis.input_kind == "external_worklist":
             from ..cute.grouped_worklist import (
@@ -3067,6 +3187,23 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                 group_count=seed_facts.groups_hint,
                 device_split_sizes=seed_facts.device_split_sizes,
             )
+        # A coordinate without any carrier would perturb the old random domain
+        # even when additive coverage has no declaration. Share the complete
+        # proposal predicate with the declaration builder, including live block
+        # domains. Final lowering independently checks guarded runtime metadata.
+        spec._cute_tcgen05_config.grouped_full_coverage_eligible = (
+            _grouped_full_coverage_carrier(env, device_ir) is not None
+            or _grouped_full_coverage_carrier(env, device_ir, block_k=128) is not None
+        )
+        spec._cute_tcgen05_config.grouped_row_union_eligible = (
+            grouped_row_union_carrier(env, device_ir) is not None
+        )
+        spec._cute_tcgen05_config.grouped_row_union_cluster4_eligible = (
+            grouped_row_union_cluster4_carrier(env, device_ir) is not None
+        )
+        spec._cute_tcgen05_config.grouped_row_union_paired_clc_eligible = (
+            grouped_row_union_paired_clc_carrier(env, device_ir) is not None
+        )
         if env.settings.disable_autotuner_heuristics:
             return frozenset({"input_tensor_metadata"})
         return cls.CACHE_SPECIALIZATION_FACTS
@@ -3122,7 +3259,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         eligible = cls._eligible_inputs(env, device_ir)
         if eligible is None:
             return []
-        _fact, analysis = eligible
+        fact, analysis = eligible
         spec = env.config_spec
         seed_facts = analysis.seed_facts
         source_m_tiles, reviewed_rows = _tcgen05_grouped_worklist_source_analysis(
@@ -3180,6 +3317,15 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                         continue
                     values.pop(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, None)
                     mailbox_family.append(Config.from_dict(values))
+                if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+                    # Consumer registers are seed-only. Keep the existing BK64
+                    # mailbox witness inside the bounded family interleave.
+                    mailbox_family.insert(
+                        0,
+                        _tcgen05_grouped_worklist_config(
+                            source_m_tile, 64, 7, 240, runtime_direct=False
+                        ),
+                    )
                 family = dedupe_configs(mailbox_family)
             family = [
                 config
@@ -3196,10 +3342,28 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             ):
                 preferred_target_seed = family_target_seed
             families.append(family)
-        return _bounded_grouped_worklist_seed_families(
+        seeds = _bounded_grouped_worklist_seed_families(
             families,
             preferred_config=preferred_target_seed,
         )
+        if seed_facts.device_split_sizes:
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_output_ring_seeds(
+                        [
+                            *seeds,
+                            *(config for family in families for config in family),
+                        ],
+                        group_count=seed_facts.groups_hint,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        capacity_bytes=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
+        return seeds
 
     @classmethod
     def should_promote(cls, env: CompileEnvironment) -> bool:
@@ -3227,6 +3391,218 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config] | None:
         return cls._seed_configs(env, device_ir)
+
+
+def grouped_row_union_carrier(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> Config | None:
+    """One ordinary dense carrier, without grouped scheduler requirements.
+
+    Input metadata only proposes the seed. Codegen repeats the complete
+    semantic, allocation, typed-index and layout proof under shape guards.
+    """
+    spec = env.config_spec
+    if not spec._cute_tcgen05_config.grouped_row_union_supported:
+        return None
+    fact = _tcgen05_grouped_worklist_structural_fact(env)
+    if fact is None:
+        return None
+    from ..cute.cute_mma import analyze_tcgen05_grouped_worklist
+
+    analysis = analyze_tcgen05_grouped_worklist(env, device_ir, fact)
+    if analysis is None or not analysis.dense_row_union_supported:
+        return None
+    hints = analysis.seed_facts
+    if not row_union_index_domain(
+        hints.groups_hint, hints.packed_m_hint, hints.n_hint, hints.k_hint
+    ):
+        return None
+    blocks = spec._tcgen05_matmul_seed_block_sizes(bm=128, bn=64, bk=128)
+    if blocks is None:
+        return None
+    # The existing per-CTA budget excludes pipeline/barrier overhead. Only the
+    # two ordinary BF16 A/B rings occupy bulk SMEM; output uses SIMT stores.
+    if (
+        CuteTcgen05Config.per_cta_smem_budget_bytes(env.device)
+        < 2 * (128 + 64) * 128 * 2
+    ):
+        return None
+    carrier = Config.from_dict(
+        {
+            "block_sizes": blocks,
+            "loop_orders": _seq_config_list(spec.loop_orders, {}),
+            "l2_groupings": _seq_config_list(
+                spec.l2_groupings, {item.block_id: 1 for item in spec.l2_groupings}
+            ),
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_strategy": "role_local_monolithic",
+            "tcgen05_persistence_model": "static_persistent",
+        }
+    )
+    return carrier if _filter_reachable_block_size_configs(spec, [carrier]) else None
+
+
+def grouped_row_union_cluster4_carrier(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> Config | None:
+    """A coherent physical schedule, appended after the existing carriers."""
+    return _grouped_row_union_physical_carrier(env, TRANSPOSED_SCHEDULE)
+
+
+def grouped_row_union_paired_clc_carrier(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> Config | None:
+    return _grouped_row_union_physical_carrier(env, PAIRED_CLC_SCHEDULE)
+
+
+def _grouped_row_union_physical_carrier(
+    env: CompileEnvironment, schedule: str
+) -> Config | None:
+    spec = env.config_spec
+    if not spec._cute_tcgen05_config.row_union_profile_supported(schedule):
+        return None
+    blocks = spec._tcgen05_matmul_seed_block_sizes(bm=128, bn=64, bk=128)
+    if blocks is None:
+        return None
+    carrier = Config.from_dict(
+        {
+            "block_sizes": blocks,
+            "loop_orders": _seq_config_list(spec.loop_orders, {}),
+            "l2_groupings": _seq_config_list(
+                spec.l2_groupings, {item.block_id: 1 for item in spec.l2_groupings}
+            ),
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_strategy": "role_local_monolithic",
+            "tcgen05_persistence_model": "static_persistent",
+            "tcgen05_grouped_dense_row_union": True,
+            GROUPED_ROW_UNION_SCHEDULE_KEY: schedule,
+        }
+    )
+    return carrier if _filter_reachable_block_size_configs(spec, [carrier]) else None
+
+
+def _grouped_full_coverage_carrier(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    block_k: int = 64,
+    source_m_tile: int = 32,
+) -> Config | None:
+    """One shared predicate for the optional domain and its coverage carrier."""
+    spec = env.config_spec
+    profile = next(
+        (profile for profile in FULL_COVERAGE_PIPELINES if profile[0] == block_k), None
+    )
+    if profile is None:
+        return None
+    _, ab_stages, consumer_regs = profile
+    if not full_coverage_pipeline_supported(
+        block_k, ab_stages, consumer_regs, source_m_tile=source_m_tile
+    ):
+        return None
+    if spec.target_device_capability != (10, 0):
+        return None
+    eligible = CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, device_ir)
+    if eligible is None:
+        return None
+    _fact, analysis = eligible
+    hints = analysis.seed_facts
+    if not analysis.full_coverage_supported or not full_coverage_index_domain(
+        hints.groups_hint,
+        hints.packed_m_hint,
+        hints.n_hint,
+        hints.k_hint,
+        source_m_tile,
+        128,
+        block_k,
+    ):
+        return None
+    if block_k == 128 and full_coverage_smem_upper_bound(
+        hints.groups_hint, block_k, ab_stages, source_m_tile=source_m_tile
+    ) > CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device):
+        return None
+    carrier = _tcgen05_grouped_worklist_config(
+        source_m_tile,
+        block_k,
+        ab_stages,
+        consumer_regs,
+        runtime_direct=False,
+        l2_swizzle_size=1,
+    )
+    if block_k == 128:
+        # Reuse the ordinary general worklist reservation lattice. This is a
+        # coherent pipeline carrier, not a shape-specific scheduler selection.
+        carrier.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = (
+            _tcgen05_grouped_scaled_reserved_sms(spec.num_sm, 32)
+        )
+    if not _filter_reachable_block_size_configs(spec, [carrier]):
+        return None
+    # TCGen role and AB-stage fields fully specify this carrier. The generic
+    # warp/stage aliases are absent from its flat serializer; omit only those
+    # redundant aliases from this new declaration, leaving legacy seeds intact.
+    carrier.config.pop("num_stages")
+    carrier.config.pop("num_warps")
+    return carrier
+
+
+def grouped_full_coverage_configs(
+    env: CompileEnvironment, device_ir: DeviceIR, *, block_k: int = 64
+) -> list[Config]:
+    """Return independent carrier/witness configs for additive compiler coverage.
+
+    The generic coverage facility owns population assembly and explicit override
+    handling. These records never enter the capped legacy seed family. Hints
+    restrict proposal generation only; final lowering rechecks guarded metadata.
+    """
+    if not env.config_spec._cute_tcgen05_config.grouped_full_coverage_eligible:
+        return []
+    carrier = _grouped_full_coverage_carrier(env, device_ir, block_k=block_k)
+    if carrier is None:
+        return []
+    dense = Config.from_dict(
+        deepcopy(carrier.config)
+        | {
+            TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY: TCGEN05_GROUPED_FULL_COVERAGE_DENSE
+        }
+    )
+    return [carrier, dense]
+
+
+class CuteTcgen05GroupedSource64Heuristic(AutotunerHeuristic):
+    """Add one larger ONE tile without replacing existing grouped seeds."""
+
+    name = "cute_tcgen05_grouped_source64"
+    backend = "cute"
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls.get_seed_config(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        carrier = _grouped_full_coverage_carrier(
+            env, device_ir, block_k=128, source_m_tile=64
+        )
+        if carrier is not None:
+            carrier.config[TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY] = (
+                TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+            )
+        return carrier
 
 
 class CuteTcgen05GroupedStaticCommonKHeuristic(AutotunerHeuristic):

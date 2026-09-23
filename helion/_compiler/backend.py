@@ -260,6 +260,14 @@ class Backend(abc.ABC):
         """
         return None
 
+    def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
+        """Whether a typed physical collective owns an axis's element coordinates."""
+        return False
+
+    def codegen_config(self, config: Config) -> Config:
+        """Resolve a backend-owned physical schedule without mutating search input."""
+        return config
+
     def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
         """Per-config-key priors that bias the autotuner's random exploration.
 
@@ -3195,6 +3203,7 @@ def _grouped_rank3_specialized_mma_plan(
 ) -> _SpecializedMmaPlan | None:
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import _rank3_grouped_root_axes
+    from .cute.grouped_row_union import physical_schedule
     from .host_function import HostFunction
 
     if node.target is not torch.ops.aten.addmm.default:
@@ -3269,8 +3278,10 @@ def _grouped_rank3_specialized_mma_plan(
         and worklist_profile is None
     ):
         return None
-    if worklist_profile is not None:
-        mma_bm, mma_bn = worklist_profile.mma_m, worklist_profile.mma_n
+    row_profile = physical_schedule(config)
+    collective_profile = row_profile or worklist_profile
+    if collective_profile is not None:
+        mma_bm, mma_bn = collective_profile.mma_m, collective_profile.mma_n
     mma_impl = _choose_mma_impl(
         lhs_val.dtype,
         bm=mma_bm,
@@ -3278,7 +3289,7 @@ def _grouped_rank3_specialized_mma_plan(
         bk=bk,
         config=config,
         input_device=lhs_val.device,
-        defer_grouped_worklist_smem_check=worklist_profile is not None,
+        defer_grouped_worklist_smem_check=collective_profile is not None,
     )
     if mma_impl != "tcgen05":
         return None

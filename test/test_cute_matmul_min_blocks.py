@@ -100,6 +100,13 @@ def _search(
     return search
 
 
+STRUCTURAL_SETTINGS = (
+    "cute_full_slice_matmul_tiling",
+    "cute_segmented_matmul_tiling",
+    "cute_flatten_nested_reductions",
+)
+
+
 REGISTRATION = (
     "helion._compiler.autotuner_heuristics.register_matmul_min_blocks_coverage"
 )
@@ -152,6 +159,7 @@ def _bind(
             torch.empty((128, 128), dtype=dtype),
             torch.empty((128, 128), dtype=dtype),
         )
+    settings = dict.fromkeys(STRUCTURAL_SETTINGS, True) | settings
     kernel = helion.kernel(
         function,
         backend="cute",
@@ -504,9 +512,7 @@ def test_unrepresentable_grouped_default_keeps_old_registry_and_population() -> 
         rows = search._generate_initial_population_flat()
         assert random.getstate() == old_rng
     assert rows == old_rows
-    assert not spec.compiler_coverage_groups
-    assert "compiler_coverage_outcomes" not in vars(search)
-    assert "compiler_coverage_outcomes" not in vars(old)
+    assert search.compiler_coverage_outcomes == old.compiler_coverage_outcomes
 
 
 @pytest.mark.parametrize("disabled", (False, True))
@@ -639,3 +645,36 @@ def test_seed_local_positive_keeps_automatic_pair(value: int, disabled: bool) ->
             and entry.outcome in ("added", "already_present")
             for entry in outcomes
         )
+
+
+@pytest.mark.parametrize("disabled", (False, True))
+def test_inactive_fanout_default_placement_seed_roundtrip(disabled: bool) -> None:
+    base, _ = _bind("matmul")
+    seed = _group(base).witnesses[0].carrier
+    seed.config[MIN_BLOCKS_KEY] = 0
+    seed.config.pop("tcgen05_c_acquire_placement", None)
+    bound, _ = _bind("matmul", disable_autotuner_heuristics=disabled)
+    implicit = bound._normalized_config_copy(seed)
+    seed.config["tcgen05_c_acquire_placement"] = "pre_loop"
+    explicit = bound._normalized_config_copy(seed)
+    assert explicit == implicit
+    assert "tcgen05_c_acquire_placement" not in explicit.config
+    with bound.env:
+        generation = bound.config_spec.create_config_generation()
+        flat, selected = generation.strict_config_pair(seed)
+        assert selected == explicit
+        assert generation.unflatten(flat) == explicit
+
+
+@pytest.mark.parametrize("disabled", (False, True))
+@pytest.mark.parametrize("placement", ("first_in_loop", "later_before_barrier"))
+def test_inactive_fanout_nondefault_placement_is_preserved(
+    disabled: bool, placement: str
+) -> None:
+    base, _ = _bind("matmul")
+    seed = _group(base).witnesses[0].carrier
+    seed.config["tcgen05_c_acquire_placement"] = placement
+    bound, _ = _bind("matmul", disable_autotuner_heuristics=disabled)
+    selected = bound._normalized_config_copy(seed)
+    assert selected["tcgen05_c_acquire_placement"] == placement
+    assert bound._normalized_config_copy(selected) == selected

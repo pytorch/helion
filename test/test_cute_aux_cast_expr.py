@@ -76,11 +76,10 @@ def test_aux_cast_roundtrip_ir_render_and_hoist(
     product = graph.product(graph.load(torch.float32), graph.load(torch.float32))
     cast = graph.cast(graph.cast(product, dtype), torch.float32)
     expr = graph.classify(cast)
-    assert isinstance(expr, epilogue._CastTensorExpr)
-    assert expr.source_dtype == dtype and expr.target_dtype == torch.float32
-    assert isinstance(expr.operand, epilogue._CastTensorExpr)
-    assert expr.operand.source_dtype == torch.float32
-    assert expr.operand.target_dtype == dtype
+    assert isinstance(expr, epilogue._UnaryTensorExpr)
+    assert expr.step.op_name == f"to_{torch.float32}"
+    assert isinstance(expr.operand, epilogue._UnaryTensorExpr)
+    assert expr.operand.step.op_name == f"to_{dtype}"
     assert epilogue._is_auxiliary_tensor_expr_node(cast)
     assert not epilogue._tensor_expr_contains_current(expr)
     current = epilogue._CurrentTensorExpr()
@@ -99,10 +98,13 @@ def test_aux_cast_roundtrip_ir_render_and_hoist(
     prelude, result = step.render_prelude_and_expr("acc", bindings, _names(), "")
     hoisted, aux = step.render_hoistable_aux_prelude_and_expr(bindings, _names(), "")
     narrow = "BFloat16" if dtype == torch.bfloat16 else "Float16"
+    # Each explicit conversion converts through its requested type and back
+    # to the FP32 compute type, so both rounding boundaries stay separate.
     assert hoisted == (
         "tcgen05_aux_product_0 = a * b\n"
-        f"tcgen05_aux_expr_1 = (tcgen05_aux_product_0).to(cutlass.{narrow})\n"
-        "tcgen05_aux_expr_2 = (tcgen05_aux_expr_1).to(cutlass.Float32)\n"
+        "tcgen05_aux_expr_1 = (tcgen05_aux_product_0)"
+        f".to(cutlass.{narrow}).to(cutlass.Float32)\n"
+        "tcgen05_aux_expr_2 = tcgen05_aux_expr_1.to(cutlass.Float32)\n"
     )
     assert prelude == hoisted + (
         f"tcgen05_chain_step_3 = {step.render_with_hoisted_aux('acc', aux)}\n"
@@ -230,7 +232,7 @@ def test_aux_cast_preserves_broadcast_leaf_and_depth_guard() -> None:
         torch.float32,
     )
     expr = graph.classify(cast)
-    assert isinstance(expr, epilogue._CastTensorExpr)
+    assert isinstance(expr, epilogue._UnaryTensorExpr)
     (leaf,) = epilogue._auxiliary_tensor_expr_operands(expr)
     assert leaf.broadcast_axis == 1
     for _ in range(32):
@@ -246,10 +248,9 @@ def test_aux_cast_does_not_turn_carrier_or_unknown_node_into_auxiliary() -> None
     node = graph.cast(carrier, torch.bfloat16)
     assert graph.classify(node) is None
     assert not epilogue._is_auxiliary_tensor_expr_node(node)
-    # Traversal is nevertheless exhaustive over the new typed variant.
-    expr = epilogue._CastTensorExpr(
-        epilogue._CurrentTensorExpr(), torch.float32, torch.bfloat16
-    )
+    # A carrier cast is an ordinary unary step for traversal purposes.
+    step, _operand = epilogue._floating_cast_step(node)
+    expr = epilogue._UnaryTensorExpr(step, epilogue._CurrentTensorExpr())
     assert epilogue._tensor_expr_contains_current(expr)
     assert epilogue._auxiliary_tensor_expr_operands(expr) == ()
 
@@ -330,11 +331,14 @@ def test_computed_aux_cast_codegen_keeps_both_rounding_boundaries(
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
             and node.targets[0].id.startswith("tcgen05_aux_expr")
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Attribute)
-            and node.value.func.attr == "to"
         ):
-            cast_targets.append(ast.unparse(node.value.args[0]))
+            cast_targets.extend(
+                ast.unparse(call.args[0])
+                for call in ast.walk(node.value)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "to"
+            )
     narrow = "cutlass.BFloat16" if dtype == torch.bfloat16 else "cutlass.Float16"
     assert narrow in cast_targets and "cutlass.Float32" in cast_targets
     assert "tcgen05_aux_product" in code

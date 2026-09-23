@@ -926,6 +926,33 @@ _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS = 600
 class CuteBackend(Backend):
     """CuTe DSL (CUTLASS Python DSL) code generation backend."""
 
+    def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
+        from ..compile_environment import CompileEnvironment
+        from .grouped_row_union import physical_schedule
+        from .grouped_row_union import schedule_supported
+
+        env = CompileEnvironment.current()
+        spec = env.config_spec._cute_tcgen05_config
+        profile = physical_schedule(fn.config)
+        axes = spec.matmul_block_ids
+        return (
+            profile is not None
+            and spec.row_union_profile_supported(profile.name)
+            and axes is not None
+            and env.canonical_block_id(block_id)
+            in tuple(env.canonical_block_id(axis) for axis in axes[:2])
+            and schedule_supported(fn.config, profile.source_tile)
+            and tuple(fn.resolved_block_size(axis) for axis in axes)
+            == profile.source_tile
+        )
+
+    def codegen_config(self, config: Config) -> Config:
+        from ..compile_environment import CompileEnvironment
+
+        return CompileEnvironment.current().config_spec._cute_tcgen05_config.project_row_union_codegen(
+            config
+        )
+
     # Bump when config_value_priors() changes its candidate distribution.
     config_value_priors_version = 3
 
@@ -1031,6 +1058,17 @@ class CuteBackend(Backend):
         from .online_to_3pass import rewrite_online_to_3pass
 
         rewrite_online_to_3pass(hf)
+        from .full_slice_matmul import stripmine_full_slice_matmuls
+
+        stripmine_full_slice_matmuls(hf)
+
+        from .segmented_matmul import normalize_segmented_matmuls
+
+        normalize_segmented_matmuls(hf)
+
+        from .flatten_nested_reductions import flatten_nested_reductions
+
+        flatten_nested_reductions(hf)
 
     def pre_codegen(
         self,
