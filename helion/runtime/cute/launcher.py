@@ -1684,13 +1684,14 @@ def _create_cute_wrapper(
         if kind == "tensor":
             ptr_name = f"arg{i}_ptr"
             params.append(f"{ptr_name}: cute.Pointer")
-            if len(entry) == 5:
-                # ("tensor", dtype, rank, sizes, strides) — baked layout.
+            if len(entry) in (5, 6):
+                # ("tensor", dtype, rank, sizes, strides[, alignment]) — baked
+                # layout. An omitted alignment denotes the original 16-byte ABI.
                 # Wrapper plans (matmul TMA) also reference
                 # ``arg{i}_shape{d}`` / ``arg{i}_stride{d}`` names, so we
                 # bind those names to their literal values in the wrapper
                 # body before constructing the tensor.
-                (_, _dtype, rank, sizes_t, strides_t) = entry
+                (_, _dtype, rank, sizes_t, strides_t) = entry[:5]
                 assert isinstance(rank, int)
                 assert isinstance(sizes_t, tuple) and len(sizes_t) == rank
                 assert isinstance(strides_t, tuple) and len(strides_t) == rank
@@ -1715,7 +1716,7 @@ def _create_cute_wrapper(
                 )
                 call_args.append(f"arg{i}")
                 continue
-            (_, _dtype, rank) = entry
+            (_, _dtype, rank) = entry[:3]
             assert isinstance(rank, int)
             shape_names = [f"arg{i}_shape{d}" for d in range(rank)]
             stride_names = [f"arg{i}_stride{d}" for d in range(rank)]
@@ -1734,7 +1735,7 @@ def _create_cute_wrapper(
             continue
 
         if kind == "wrapper_tensor":
-            (_, name, _dtype, rank, sizes_t, strides_t) = entry
+            (_, name, _dtype, rank, sizes_t, strides_t) = entry[:6]
             assert isinstance(name, str)
             assert isinstance(rank, int)
             assert isinstance(sizes_t, tuple) and len(sizes_t) == rank
@@ -1760,7 +1761,7 @@ def _create_cute_wrapper(
             continue
 
         if kind == "wrapper_tensor_runtime_leading_extent":
-            (_, name, _dtype, rank, tail_sizes, strides) = entry
+            (_, name, _dtype, rank, tail_sizes, strides) = entry[:6]
             assert isinstance(name, str)
             assert isinstance(rank, int)
             assert isinstance(tail_sizes, tuple) and len(tail_sizes) == rank - 1
@@ -2078,6 +2079,14 @@ class _CompiledCuteLauncher:
                 asBytecode=True,
                 bytecode_reader=read_bytecode_and_check_crc32,
             )
+            if (
+                self._compile_options
+                and _TVM_FFI_COMPILE_OPTION in self._compile_options.split()
+            ):
+                # Compilation imports this runtime through the SDK's FFI
+                # provider. A fresh-process disk hit must also load its global
+                # symbols before the cached host module is linked.
+                importlib.import_module("tvm_ffi")
             dsl = CuTeDSL._get_dsl()
             engine = dsl.compiler_provider.jit(
                 module, shared_libs=dsl.get_shared_libs()
@@ -2641,6 +2650,25 @@ def _validate_cute_launcher_tensor(arg: torch.Tensor) -> None:
         raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
     if arg.ndim <= 0:
         raise exc.BackendUnsupported("cute", "launcher requires tensor rank >= 1")
+
+
+def _cute_pointer_alignment(data_ptr: int) -> int:
+    """Prove at most 16-byte alignment from the actual argument pointer."""
+    return min(16, data_ptr & -data_ptr) if data_ptr else 16
+
+
+def _cute_schema_with_pointer_alignment(
+    entry: tuple[object, ...], alignment: int
+) -> tuple[object, ...]:
+    # Keep aligned schemas/cache keys unchanged. Lower-alignment pointer types
+    # require distinct compiled wrappers, including in the on-disk cache.
+    return entry if alignment == 16 else (*entry, alignment)
+
+
+def _cute_schema_pointer_alignment(entry: tuple[object, ...]) -> int:
+    """Read a tensor/wrapper tensor entry's optional alignment specialization."""
+    has_alignment = len(entry) in (4, 6) if entry[0] == "tensor" else len(entry) == 7
+    return cast("int", entry[-1]) if has_alignment else 16
 
 
 def _validate_tcgen05_grouped_tensor_devices(
@@ -5168,12 +5196,14 @@ def _build_cute_schema_and_args(
                 )
             sizes_t = tuple(int(arg.size(d)) for d in range(ndim))
             strides_t = tuple(int(arg.stride(d)) for d in range(ndim))
+            data_ptr = int(arg.data_ptr())
+            alignment = _cute_pointer_alignment(data_ptr)
             launch_args.append(
                 make_ptr(
                     cast("Any", _torch_dtype_to_cutlass(arg.dtype)),
-                    arg.data_ptr(),
+                    data_ptr,
                     gmem_space,
-                    assumed_align=16,
+                    assumed_align=alignment,
                 )
             )
             # ``cute.make_layout`` rejects a 0 in any shape dimension, so
@@ -5186,9 +5216,17 @@ def _build_cute_schema_and_args(
                 # constant strides — typically a 2-3x reduction in
                 # ``smsp__inst_executed`` for reduction kernels where the
                 # inner loop is dominated by stride multiplies.
-                schema.append(("tensor", str(arg.dtype), ndim, sizes_t, strides_t))
+                schema.append(
+                    _cute_schema_with_pointer_alignment(
+                        ("tensor", str(arg.dtype), ndim, sizes_t, strides_t), alignment
+                    )
+                )
             else:
-                schema.append(("tensor", str(arg.dtype), ndim))
+                schema.append(
+                    _cute_schema_with_pointer_alignment(
+                        ("tensor", str(arg.dtype), ndim), alignment
+                    )
+                )
                 launch_args.extend(sizes_t)
                 launch_args.extend(strides_t)
             continue
@@ -5225,35 +5263,43 @@ def _build_cute_schema_and_args(
         _validate_cute_launcher_tensor(tensor)
         sizes = tuple(int(tensor.size(d)) for d in range(tensor.ndim))
         strides = tuple(int(tensor.stride(d)) for d in range(tensor.ndim))
+        data_ptr = int(tensor.data_ptr())
+        alignment = _cute_pointer_alignment(data_ptr)
         launch_args.append(
             make_ptr(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
-                tensor.data_ptr(),
+                data_ptr,
                 gmem_space,
-                assumed_align=16,
+                assumed_align=alignment,
             )
         )
         if runtime_leading_extent:
             schema.append(
-                (
-                    "wrapper_tensor_runtime_leading_extent",
-                    name,
-                    str(tensor.dtype),
-                    tensor.ndim,
-                    sizes[1:],
-                    strides,
+                _cute_schema_with_pointer_alignment(
+                    (
+                        "wrapper_tensor_runtime_leading_extent",
+                        name,
+                        str(tensor.dtype),
+                        tensor.ndim,
+                        sizes[1:],
+                        strides,
+                    ),
+                    alignment,
                 )
             )
             launch_args.append(sizes[0])
         else:
             schema.append(
-                (
-                    "wrapper_tensor",
-                    name,
-                    str(tensor.dtype),
-                    tensor.ndim,
-                    sizes,
-                    strides,
+                _cute_schema_with_pointer_alignment(
+                    (
+                        "wrapper_tensor",
+                        name,
+                        str(tensor.dtype),
+                        tensor.ndim,
+                        sizes,
+                        strides,
+                    ),
+                    alignment,
                 )
             )
         if owned:
@@ -5536,7 +5582,7 @@ class _CuteFastRelaunch:
 
     This caches the marshalled ``exe_args`` once and per call only:
 
-    1. checks the metadata guard (no pointer equality),
+    1. checks metadata and compiled pointer alignment (no pointer equality),
     2. writes each tensor arg's ``data_ptr()`` into its probe-verified
        ``exe_args`` slot (tensor pointers marshal by value),
     3. refreshes the CUDA stream slot(s), and
@@ -5578,7 +5624,15 @@ class _CuteFastRelaunch:
         executor: object,
         exe_args: list[object],
         tensor_guards: tuple[
-            tuple[int, str, int | None, torch.dtype, tuple[int, ...], tuple[int, ...]],
+            tuple[
+                int,
+                str,
+                int | None,
+                torch.dtype,
+                tuple[int, ...],
+                tuple[int, ...],
+                int,
+            ],
             ...,
         ],
         scalar_guards: tuple[_CuteLastScalarArgGuard, ...],
@@ -5632,6 +5686,7 @@ class _CuteFastRelaunch:
             dtype,
             shape,
             stride,
+            alignment,
         ) in self.tensor_guards:
             tensor = args[index]
             if (
@@ -5641,6 +5696,7 @@ class _CuteFastRelaunch:
                 or tensor.device.index != device_index
                 or tensor.size() != shape
                 or tensor.stride() != stride
+                or tensor.data_ptr() % alignment != 0
             ):
                 return _CUTE_FASTPATH_MISS
         for guard in self.scalar_guards:
@@ -5737,14 +5793,17 @@ def _cute_build_fast_relaunch(
     ):
         return None
     device_index: int | None = None
-    tensors: list[tuple[int, torch.Tensor]] = []
+    tensors: list[tuple[int, torch.Tensor, int]] = []
     for index, arg in enumerate(args):
         if isinstance(arg, torch.Tensor):
             if arg.device.type != "cuda":
                 return None
             if device_index is None:
                 device_index = arg.device.index
-            tensors.append((index, arg))
+            alignment = _cute_schema_pointer_alignment(launch.schema[index])
+            if arg.data_ptr() % alignment != 0:
+                return None
+            tensors.append((index, arg, alignment))
     if device_index is None:
         device_index = torch.cuda.current_device()
     try:
@@ -5765,12 +5824,12 @@ def _cute_build_fast_relaunch(
         if len(base_ptr_positions) != len(tensors):
             return None
         own_base = list(orig_base)
-        for k, (_arg_index, tensor) in enumerate(tensors):
+        for k, (_arg_index, tensor, alignment) in enumerate(tensors):
             own_base[base_ptr_positions[k]] = make_ptr(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
                 int(tensor.data_ptr()),
                 gmem_space,
-                assumed_align=16,
+                assumed_align=alignment,
             )
         base = tuple(own_base)
         stream_a = cuda_driver.CUstream(raw0)
@@ -5809,14 +5868,14 @@ def _cute_build_fast_relaunch(
         # the address of a per-object ctypes cell containing it).
         alt_base = list(base)
         shifts: list[int] = []
-        for k, (_arg_index, tensor) in enumerate(tensors):
+        for k, (_arg_index, tensor, alignment) in enumerate(tensors):
             shift = 512 * (k + 1)
             shifts.append(shift)
             alt_base[base_ptr_positions[k]] = make_ptr(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
                 int(tensor.data_ptr()) + shift,
                 gmem_space,
-                assumed_align=16,
+                assumed_align=alignment,
             )
         exe4, _adapted4 = execution_args.generate_execution_args(
             (*tuple(alt_base), stream_a), {}
@@ -5825,7 +5884,7 @@ def _cute_build_fast_relaunch(
         if len(n4) != len(n1):
             return None
         tensor_slots: list[tuple[int, int | None, object | None]] = []
-        for k, (arg_index, tensor) in enumerate(tensors):
+        for k, (arg_index, tensor, _alignment) in enumerate(tensors):
             ptr = int(tensor.data_ptr())
             want = ptr + shifts[k]
             by_val = [
@@ -5887,7 +5946,15 @@ def _cute_build_fast_relaunch(
         # --- Metadata guards (no pointer equality).
         constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
         tensor_guards: list[
-            tuple[int, str, int | None, torch.dtype, tuple[int, ...], tuple[int, ...]]
+            tuple[
+                int,
+                str,
+                int | None,
+                torch.dtype,
+                tuple[int, ...],
+                tuple[int, ...],
+                int,
+            ]
         ] = []
         scalar_guards: list[_CuteLastScalarArgGuard] = []
         for index, arg in enumerate(args):
@@ -5900,6 +5967,7 @@ def _cute_build_fast_relaunch(
                         arg.dtype,
                         tuple(int(arg.size(d)) for d in range(arg.ndim)),
                         tuple(int(arg.stride(d)) for d in range(arg.ndim)),
+                        _cute_schema_pointer_alignment(launch.schema[index]),
                     )
                 )
                 continue
