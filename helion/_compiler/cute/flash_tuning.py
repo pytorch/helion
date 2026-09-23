@@ -140,10 +140,13 @@ class FlashDenseTuningPolicy:
     softmax_disc: bool | None = None
     disc_pipe_depth: int | None = None
     sp_row_sum: str | None = None
+    kv_tile_n: int = 128
 
     def __post_init__(self) -> None:
         if self.num_kv <= 0:
             raise ValueError("dense KV size must be positive")
+        if self.kv_tile_n <= 0 or self.kv_tile_n % 32:
+            raise ValueError("dense KV tile width must be a positive multiple of 32")
         _validate_policy_choice(
             "dense exp2 packet", self.exp2_packet, _FLASH_POLICY_EXP2_PACKETS
         )
