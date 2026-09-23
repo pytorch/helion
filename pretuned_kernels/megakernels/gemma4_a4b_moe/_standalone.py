@@ -6,6 +6,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from pretuned_kernels.megakernels._pdl import launch_dependent
+from pretuned_kernels.megakernels._pdl import signal_dependents
 from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
@@ -64,6 +65,7 @@ def router_project(residual, router_scale, root_size, router_weight, eps):
         (batch, num_experts), dtype=torch.float32, device=residual.device
     )
     for tile_m, tile_expert in hl.tile([batch, num_experts], block_size=[1, None]):
+        signal_dependents()
         token = tile_m.begin
         row = residual[token, :].to(torch.float32)
         inv_rms = torch.rsqrt(torch.mean(row * row, dim=-1) + eps)
