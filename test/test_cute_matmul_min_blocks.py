@@ -25,6 +25,7 @@ from helion._compiler.autotuner_heuristics.cute_launch_bounds import (
     register_matmul_min_blocks_coverage,
 )
 from helion.autotuner import LFBOTreeSearch
+from helion.autotuner.compiler_coverage import CoverageDependency
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.metrics import AutotuneMetrics
@@ -611,12 +612,22 @@ def test_global_positive_override_preserves_other_coverage_groups(
     assert (
         spec.compiler_coverage_groups == previous.config_spec.compiler_coverage_groups
     )
-    # Ordinary warp collectives supply a real unrelated group even when
+    # Warp collectives and split-K supply real unrelated groups even when
     # automatic heuristic use is disabled. No materialized bundle is needed.
     assert [group.mechanism for group in spec.compiler_coverage_groups] == [
-        "cute.collective_static_layouts"
+        "cute.split_k_cluster",
+        "cute.split_k_finalizer",
+        "cute.collective_static_layouts",
     ]
-    assert all(not group.dependencies for group in spec.compiler_coverage_groups)
+    assert [group.dependencies for group in spec.compiler_coverage_groups] == [
+        (),
+        (
+            CoverageDependency(
+                "cute.split_k_cluster", "cute_split_k_schedule", "cluster8_k4"
+            ),
+        ),
+        (),
+    ]
     assert (
         spec.structural_fingerprint() == previous.config_spec.structural_fingerprint()
     )
