@@ -2095,7 +2095,8 @@ class PopulationBasedSearch(BaseSearch):
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
             candidate_private_args: When an isolated worker is unavailable,
-                keep mutated argument storage private to each candidate.
+                additionally retain a sacrificial allocation to avoid recycled
+                allocator addresses. All candidates always have private storage.
         """
         if len(members) < 2:
             return
@@ -2145,46 +2146,34 @@ class PopulationBasedSearch(BaseSearch):
                 return
             if candidate_private_args and dist.is_initialized():
                 self.log.warning(
-                    "Candidate-private mutated-argument isolation is unavailable "
-                    "for distributed in-process rebenchmarking."
+                    "Sacrificial allocator-address isolation is unavailable "
+                    "for distributed in-process rebenchmarking; candidate "
+                    "argument storage remains private."
                 )
             in_process_isolation = candidate_private_args and not dist.is_initialized()
 
-        if len(self.benchmark_provider.mutated_arg_indices) > 0:
-            if in_process_isolation:
-                # A single recycled clone lets a later candidate inherit L2
-                # eviction priority from an earlier candidate that touched the
-                # same addresses (for example, an ``l2_last`` store). Keep a
-                # sacrificial clone alive to absorb the allocator's recycled
-                # addresses, then give every finalist private live tensor
-                # storage, including inputs that the kernel only reads.
-                isolated_args: list[Sequence[object]] = []
-                try:
-                    isolated_args = [
-                        _clone_args(
-                            self.args,
-                            self.kernel.env.process_group_name,
-                            idx_to_clone=None,
-                        )
-                        for _ in range(len(members) + 1)
-                    ]
-                    benchmark_args_by_member = isolated_args[1:]
-                except torch.OutOfMemoryError as error:
-                    isolated_args.clear()
-                    raise exc.AutotuneError(
-                        "Unable to allocate candidate-private mutated arguments "
-                        "for in-process finalist isolation. Reduce "
-                        f"{_FINAL_REBENCHMARK_TOP_K_ENV} and retry."
-                    ) from error
-            else:
-                benchmark_args = _clone_args(
+        # Keep private storage alive for every finalist, even when its pure
+        # reference reports no mutation. A rejected candidate can write scratch
+        # or inputs that the reference never changes. The optional extra clone
+        # retains the existing allocator-address isolation policy.
+        isolated_args: list[Sequence[object]] = []
+        try:
+            isolated_args = [
+                _clone_args(
                     self.args,
                     self.kernel.env.process_group_name,
-                    idx_to_clone=self.benchmark_provider.mutated_arg_indices,
+                    idx_to_clone=None,
                 )
-                benchmark_args_by_member = [benchmark_args] * len(members)
-        else:
-            benchmark_args_by_member = [self.args] * len(members)
+                for _ in range(len(members) + int(in_process_isolation))
+            ]
+            benchmark_args_by_member = isolated_args[int(in_process_isolation) :]
+        except torch.OutOfMemoryError as error:
+            isolated_args.clear()
+            raise exc.AutotuneError(
+                "Unable to allocate candidate-private arguments "
+                "for in-process finalist isolation. Reduce "
+                f"{_FINAL_REBENCHMARK_TOP_K_ENV} and retry."
+            ) from error
 
         def make_rebenchmark_callable(
             member: PopulationMember,
@@ -2316,21 +2305,21 @@ class PopulationBasedSearch(BaseSearch):
         else:
             repeat = max(2, repeat + repeat % 2)
 
-        if self.benchmark_provider.mutated_arg_indices:
-            benchmark_args = _clone_args(
-                self.args,
-                self.kernel.env.process_group_name,
-                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
-            )
-        else:
-            benchmark_args = self.args
+        benchmark_args_by_member = [
+            _clone_args(self.args, self.kernel.env.process_group_name) for _ in members
+        ]
 
         def after_call(index: int) -> None:
             clear_jit_fast_path_caches(members[index].fn, self.log)
 
         try:
             trace = mirrored_bench_generic(
-                [functools.partial(member.fn, *benchmark_args) for member in members],
+                [
+                    functools.partial(member.fn, *benchmark_args)
+                    for member, benchmark_args in zip(
+                        members, benchmark_args_by_member, strict=True
+                    )
+                ],
                 repeat=repeat,
                 desc=desc if self.settings.autotune_progress_bar else None,
                 after_call=after_call,
@@ -2818,19 +2807,15 @@ class PopulationBasedSearch(BaseSearch):
         into ``perfs`` (those are wall-clock ms). Falls back to the absolute-median
         rebench on any error.
         """
-        if len(self.benchmark_provider.mutated_arg_indices) > 0:
-            benchmark_args = _clone_args(
-                self.args,
-                self.kernel.env.process_group_name,
-                idx_to_clone=self.benchmark_provider.mutated_arg_indices,
-            )
-        else:
-            benchmark_args = self.args
         candidate_fns: list[Callable[..., object]] = [
-            functools.partial(member.fn, *benchmark_args) for member in candidates
+            functools.partial(
+                member.fn,
+                *_clone_args(self.args, self.kernel.env.process_group_name),
+            )
+            for member in candidates
         ]
         reference_fn: Callable[..., object] = functools.partial(
-            best.fn, *benchmark_args
+            best.fn, *_clone_args(self.args, self.kernel.env.process_group_name)
         )
         desc = (
             "Final-pick verification device_micros"
