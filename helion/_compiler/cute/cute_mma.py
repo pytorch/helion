@@ -10108,13 +10108,19 @@ def _emit_mma_pipeline(
                 # store warp. The store warp is a sched consumer + the C-store
                 # ring consumer; it is NOT an acc-pipeline or AB consumer.
             )
+            # All lanes read the scheduler mailbox and arrive after their own
+            # reads. Count threads, not elected warp leaders: a leader-only
+            # release does not protect other lanes from stage reuse.
+            tcgen05_sched_consumer_thread_count = tcgen05_sched_consumer_role_count * 32
             if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
                 tcgen05_sched_consumer_arrive_count = (
-                    tcgen05_sched_consumer_role_count * tcgen05_sched_cluster_size
+                    tcgen05_sched_consumer_thread_count * tcgen05_sched_cluster_size
                 )
                 tcgen05_sched_consumer_mask_to_leader = True
             else:
-                tcgen05_sched_consumer_arrive_count = tcgen05_sched_consumer_role_count
+                tcgen05_sched_consumer_arrive_count = (
+                    tcgen05_sched_consumer_thread_count
+                )
                 tcgen05_sched_consumer_mask_to_leader = False
             prefix.extend(
                 _emit_sched_pipeline_setup(
@@ -13390,9 +13396,10 @@ def _emit_sched_pipeline_setup(
       ``consumer_mask_to_leader=True`` (Quack pattern) every CTA's
       consumer release routes to the leader CTA's empty barrier so
       this is the cluster-wide total
-      (``warps_per_cta * cluster_size``). With
+      (``warps_per_cta * 32 * cluster_size``). With
       ``consumer_mask_to_leader=False`` releases stay local so this
-      is the per-CTA count (``warps_per_cta``).
+      is the per-CTA count (``warps_per_cta * 32``). Every consumer
+      lane arrives after reading the shared scheduler mailbox.
     - ``cluster_size``: cluster-multicast factor. ``> 1`` lets
       ``defer_sync`` participate in cluster-wide barrier init.
     - ``consumer_mask_to_leader``: ``True`` emits
