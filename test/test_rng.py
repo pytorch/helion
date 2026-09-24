@@ -21,7 +21,6 @@ from helion._testing import onlyBackends
 from helion._testing import output_only
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
-from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import xfailIfPallas
 import helion.language as hl
@@ -194,7 +193,6 @@ def _nested_broadcast_rand_expected_3d(
 @onlyBackends(["triton", "pallas", "cute"])
 class TestRNG(RefEagerTestBase, TestCase):
     @xfailIfPallas("3D implicit RNG hits TPU deferred buffer materialization")
-    @skipIfXPU("RNG tests timeout on XPU")
     def test_rand_randn_3d_tensor(self):
         """Test 3D rand and randn with tiled operations using a single kernel."""
 
@@ -329,7 +327,6 @@ class TestRNG(RefEagerTestBase, TestCase):
     @xfailIfPallas(
         "multiple implicit RNG outputs hit TPU deferred buffer materialization"
     )
-    @skipIfXPU("RNG tests timeout on XPU")
     def test_multiple_rng_ops(self):
         """Test multiple RNG ops: independence, distributions, seeding behavior."""
 
@@ -650,7 +647,6 @@ class TestRNG(RefEagerTestBase, TestCase):
         with self.assertRaisesRegex(Exception, "expected .* got .*"):
             code_and_output(wrong_device_rand, (x,), block_sizes=[8, 16])
 
-    @skipIfXPU("RNG with specialized dimensions not supported on XPU")
     @xfailIfPallas("specialized-dimension rand_like hits TPU MLIR refinement mismatch")
     @skipIfRefEager("compiled codegen inspection is not applicable in ref eager mode")
     @skipIfRocm("ROCm Triton worker crashes on specialized-dimension rand_like")
