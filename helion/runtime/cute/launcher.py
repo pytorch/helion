@@ -2316,8 +2316,9 @@ def _cute_disk_cache_key(
     hash is unavailable.  The key must be computable *before* the kernel is
     compiled (so a hit can skip recompilation), so it is derived from the
     inputs that determine the lowered IR rather than from the IR itself:
-    generated device-kernel source, full input specialization (dtypes, ranks,
-    baked shapes/strides, constexpr values), launch shape (block/cluster), the
+    generated device-kernel source, Helion's source-content fingerprint, full
+    input specialization (dtypes, ranks, baked shapes/strides, constexpr values),
+    launch shape (block/cluster), the
     preferred shared-memory carveout, CuTe compile options, the IR-affecting
     ``CUTE_DSL_*`` env vars (target SM arch among them), and the cutlass version.
 
@@ -2330,6 +2331,8 @@ def _cute_disk_cache_key(
     key; for non-persistent kernels num_sm does not affect codegen, so it only
     costs an occasional cross-GPU miss, never a wrong-kernel reload.
     """
+    from ...autotuner.base_cache import helion_key
+
     source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
     if source_hash is None:
         return None
@@ -2343,6 +2346,10 @@ def _cute_disk_cache_key(
         (
             "helion-cute-cache-v1",
             source_hash,
+            # Generated kernels import device helpers and launcher wrappers.
+            # Their bodies can change without changing generated source, so a
+            # source-only key could reload stale IR after a correctness fix.
+            helion_key(),
             schema_key,
             block,
             wrapper_plans,
