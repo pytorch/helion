@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
@@ -14,9 +15,13 @@ from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from ...autotuner.config_spec import VALID_CUTE_CHAINED_POINTWISE_UNROLLS
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
+from ..cute import mma_support
+from ..cute.chained_pointwise_inplace import has_inplace_candidate
+from ..cute.chained_pointwise_unroll import has_pointwise_vector_candidate
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -3008,6 +3013,355 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
         config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = 3
         config.config["tcgen05_ab_stages"] = TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
         return config
+
+
+class CuteChainedMatmulHeuristic(AutotunerHeuristic):
+    """Search effective warp-MMA and eligible TCgen05 contraction-DAG knobs."""
+
+    name = "cute_chained_matmul"
+    backend = "cute"
+    promote_seed_to_default = True
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chained_matmul import detect_chained_matmul_search
+
+        host_function = device_ir.host_function
+        if host_function is None:
+            return frozenset()
+        with host_function:
+            if not detect_chained_matmul_search(device_ir.graphs):
+                return frozenset()
+        spec = env.config_spec
+        spec.cute_chained_matmul_search_enabled = True
+        spec.cute_tcgen05_search_enabled = False
+        spec.allowed_pid_types = ("flat",)
+        valid = set(spec.block_sizes.valid_block_ids())
+        for fact in spec.matmul_facts:
+            for block_id, minimum in (
+                (fact.m_block_id, 16),
+                (fact.n_block_id, 8),
+                (fact.k_block_id, 16),
+            ):
+                if block_id is not None and block_id in valid:
+                    block = spec.block_sizes.block_id_lookup(block_id)
+                    block.update_min(minimum)
+                    block.autotuner_min = max(block.autotuner_min, minimum)
+        spec.cute_chained_tcgen05_search_enabled = (
+            mma_support.get_cute_mma_support().tcgen05_f16bf16
+            and bool(cls._tcgen05_seed_configs(env, device_ir))
+        )
+        spec.cute_chained_direct_output_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and bool(cls._tcgen05_seed_configs_for_rows(env, device_ir, 64))
+        )
+        spec.cute_chained_pointwise_unroll_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_pointwise_vector_candidate(device_ir.graphs)
+        )
+        spec.cute_chained_pointwise_read_cache_search_enabled = (
+            spec.cute_chained_pointwise_unroll_search_enabled
+        )
+        spec.cute_chained_pointwise_inplace_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_inplace_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_initialized_accumulator import has_initialized_candidate
+
+        spec.cute_chained_initialized_accumulator_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_initialized_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_late_rhs import has_late_rhs_candidate
+
+        spec.cute_chained_late_rhs_reuse_search_enabled = (
+            spec.cute_chained_initialized_accumulator_search_enabled
+            and has_late_rhs_candidate(device_ir.graphs)
+        )
+        return frozenset()
+
+    @classmethod
+    def _tcgen05_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        # Preserve the complete old pool for every formerly admitted root.
+        # Only newly admitted M64 roots acquire a different TCgen05 family.
+        return cls._tcgen05_seed_configs_for_rows(
+            env, device_ir, 128
+        ) or cls._tcgen05_seed_configs_for_rows(env, device_ir, 64)
+
+    @classmethod
+    def _tcgen05_seed_configs_for_rows(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, rows: int
+    ) -> list[Config]:
+        """Respect semantic dot axes and fixed tiles when seeding resident UMMA.
+
+        This is an admission superset, not the codegen proof: the concrete
+        planner still validates every operand expression, layout, and resource
+        bound. Do not pad root axes or replace explicitly fixed block sizes.
+        """
+        from ...language.matmul_ops import dot
+        from ..compile_environment import FixedBlockSizeSource
+
+        spec = env.config_spec
+        if len(device_ir.task_families) != 1 or not spec.matmul_facts:
+            return []
+        if rows == 64 and (
+            len(spec.matmul_facts) != 1
+            or sum(
+                node.target is dot
+                for graph in device_ir.graphs
+                for node in graph.graph.nodes
+            )
+            != 1
+        ):
+            return []
+        family = device_ir.task_families[0]
+        seeds = []
+        valid = set(spec.block_sizes.valid_block_ids())
+        for width in (32, 64, 128, 256):
+            requirements: dict[int, int] = {}
+            compatible = True
+            for fact in spec.matmul_facts:
+                for role, block_id, static_extent, tile in (
+                    ("m", fact.m_block_id, fact.static_m, rows),
+                    ("n", fact.n_block_id, fact.static_n, width),
+                    ("k", fact.k_block_id, fact.static_k, fact.static_k),
+                ):
+                    if block_id is None or block_id not in valid:
+                        fixed = static_extent
+                        if block_id is not None and family.axis(block_id) is not None:
+                            source = env.block_sizes[block_id].block_size_source
+                            fixed = (
+                                source.value
+                                if isinstance(source, FixedBlockSizeSource)
+                                and isinstance(source.value, int)
+                                else None
+                            )
+                        if (
+                            fixed is None
+                            or fixed <= 0
+                            or (role == "m" and fixed != rows)
+                            or (role == "n" and (fixed % 32 or not 32 <= fixed <= 256))
+                            or (
+                                rows == 64
+                                and role == "n"
+                                and fixed not in (32, 64, 96, 128, 256)
+                            )
+                            or (role == "k" and fixed % 16)
+                        ):
+                            compatible = False
+                        continue
+                    if (
+                        tile is None
+                        or tile <= 0
+                        or (block_id in requirements and requirements[block_id] != tile)
+                    ):
+                        compatible = False
+                        continue
+                    requirements[block_id] = tile
+                if fact.static_k is None or fact.static_k <= 0 or fact.static_k % 16:
+                    compatible = False
+            blocks = []
+            for block in spec.block_sizes:
+                tile = requirements.get(block.block_id, block.min_size)
+                if not block.min_size <= tile <= block.max_size:
+                    compatible = False
+                blocks.append(tile)
+            by_block = {
+                block.block_id: tile
+                for block, tile in zip(spec.block_sizes, blocks, strict=True)
+            }
+            for axis in family.axes:
+                tile = by_block.get(axis.block_id)
+                if tile is None:
+                    source = env.block_sizes[axis.block_id].block_size_source
+                    tile = (
+                        source.value
+                        if isinstance(source, FixedBlockSizeSource)
+                        and isinstance(source.value, int)
+                        else None
+                    )
+                if (
+                    tile is None
+                    or tile <= 0
+                    or not axis.canonical_origin
+                    or not isinstance(axis.extent, sympy.Integer)
+                    or int(axis.extent) % tile
+                ):
+                    compatible = False
+            if compatible:
+                seeds.extend(
+                    Config(
+                        block_sizes=blocks,
+                        num_warps=4,
+                        pid_type="flat",
+                        cute_chained_mma_schedule="tcgen05_tmem",
+                        cute_chained_pointwise_vectorize=vectorize,
+                        cute_chained_auxiliary_cache=auxiliary_cache,
+                    )
+                    for vectorize in (False, True)
+                    for auxiliary_cache in (False, True)
+                )
+        return dedupe_configs(seeds)
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chained_matmul_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        import itertools
+
+        spec = env.config_spec
+        choices = [
+            tuple(
+                value
+                for value in (16, 32, 64)
+                if block.min_size <= value <= block.max_size
+            )
+            or (block.min_size,)
+            for block in spec.block_sizes
+        ]
+        seeds = [
+            Config(
+                block_sizes=list(blocks),
+                num_warps=warps,
+                pid_type="flat",
+                cute_chained_mma_schedule=schedule,
+            )
+            for warps in (4, 8, 2, 1)
+            for blocks in itertools.product(*choices)
+            for schedule in (
+                "coalesced",
+                "cp_async",
+                "cp_async_register",
+                "cp_async_register_reuse",
+                "cp_async_register_reuse_scan",
+            )
+        ][:96]
+        if spec.cute_chained_tcgen05_search_enabled:
+            tcgen_seeds = cls._tcgen05_seed_configs(env, device_ir)
+            seeds.extend(tcgen_seeds)
+        if spec.cute_chained_pointwise_unroll_search_enabled:
+            pointwise_seeds = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_unroll": factor}
+                )
+                for factor in VALID_CUTE_CHAINED_POINTWISE_UNROLLS[1:]
+                for seed in pointwise_seeds
+            )
+        if spec.cute_chained_pointwise_read_cache_search_enabled:
+            cache_parents = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_read_cache": True}
+                )
+                for seed in cache_parents
+            )
+        if spec.cute_chained_pointwise_inplace_search_enabled:
+            parents = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_inplace_async": True}
+                )
+                for seed in parents
+            )
+        ordered = seeds
+        if not spec.cute_chained_initialized_accumulator_search_enabled:
+            ordered = _with_early_tmem_release_seed(ordered)
+            if (
+                spec.cute_chained_direct_output_search_enabled
+                and not cls._tcgen05_seed_configs_for_rows(env, device_ir, 128)
+            ):
+                # Newly admitted roots get one useful direct sibling. Existing
+                # M128 pools, multiplicities, ordering and first seed are intact.
+                for index, seed in enumerate(ordered):
+                    if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+                        ordered = [
+                            *ordered[: index + 1],
+                            Config.from_dict(
+                                seed.config | {"cute_chained_direct_output": True}
+                            ),
+                            *ordered[index + 1 :],
+                        ]
+                        break
+            return _with_last_read_seed(ordered)
+        result: list[Config] = []
+        for seed in ordered:
+            result.append(seed)
+            if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+                result.append(
+                    Config.from_dict(
+                        seed.config | {"cute_chained_initialized_accumulator": True}
+                    )
+                )
+                if spec.cute_chained_late_rhs_reuse_search_enabled:
+                    result.append(
+                        Config.from_dict(
+                            seed.config
+                            | {
+                                "cute_chained_initialized_accumulator": True,
+                                "cute_chained_late_rhs_reuse": True,
+                            }
+                        )
+                    )
+        return _with_last_read_seed(_with_early_tmem_release_seed(result))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+def _with_last_read_seed(seeds: list[Config]) -> list[Config]:
+    """One default-off sibling, after ordering; preserve the full legacy pool."""
+    for index, parent in enumerate(seeds):
+        if parent.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(
+                    parent.config | {"cute_chained_tmem_free": "last_read"}
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
+
+
+def _with_early_tmem_release_seed(seeds: list[Config]) -> list[Config]:
+    """Add one release-timing sibling without reordering any existing seed."""
+    for index, seed in enumerate(seeds):
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(
+                    seed.config | {"cute_chained_tmem_early_release": True}
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
 
 
 class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):

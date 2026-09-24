@@ -11,6 +11,7 @@ from .test_cute_grid_launch_extents import _code
 from .test_cute_grid_launch_extents import _launch_block
 from .test_cute_grid_launch_extents import _tile_coordinates
 import helion
+from helion import exc
 from helion._compiler.cute import tile_ops
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_reshape import _per_thread_nd_tile_offset
@@ -293,6 +294,31 @@ def test_shape_only_views_do_not_allocate_reduction_dimensions(
         side_effect=AssertionError("shape-only views must preserve dimensions"),
     ):
         assert CuteBackend().fake_subscript_shape(tensor, index) == expected
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        [1, slice(None)],
+        [slice(1, 3), slice(None)],
+        [slice(None), slice(0, 4, 1)],
+    ],
+)
+def test_narrowing_keeps_general_index_shape_path(index: list[object]) -> None:
+    tensor = torch.empty((3, 5))
+    with patch.object(
+        SubscriptIndexing, "compute_shape", return_value=[2, 5]
+    ) as compute:
+        assert CuteBackend().fake_subscript_shape(tensor, index) == [2, 5]
+    compute.assert_called_once_with(tensor, index)
+
+
+@pytest.mark.parametrize(
+    "index", [[slice(None), slice(None, None, 2)], [-1, slice(None)]]
+)
+def test_unsupported_narrowing_still_fails_closed(index: list[object]) -> None:
+    with pytest.raises(exc.InvalidIndexingType):
+        CuteBackend().fake_subscript_shape(torch.empty((3, 5)), index)
 
 
 @pytest.mark.parametrize("topology", ["fa4", "ws_overlap"])

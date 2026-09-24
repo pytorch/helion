@@ -15523,10 +15523,21 @@ class TestAutotuneBudget(TestCase):
             backend.should_deduplicate_generated_sources(_cute_flash_test_config_spec())
         )
         self.assertFalse(
-            backend.should_deduplicate_generated_sources(
-                SimpleNamespace(cute_flash_search_enabled=False)
-            )
+            backend.should_deduplicate_generated_sources(ConfigSpec(backend=backend))
         )
+
+    def test_cute_backend_source_dedup_respects_search_families(self) -> None:
+        backend = CuteBackend()
+        config_spec = ConfigSpec(backend=backend)
+        for flash_enabled in (False, True):
+            for chained_enabled in (False, True):
+                with self.subTest(flash=flash_enabled, chained=chained_enabled):
+                    config_spec.cute_flash_search_enabled = flash_enabled
+                    config_spec.cute_chained_matmul_search_enabled = chained_enabled
+                    self.assertEqual(
+                        backend.should_deduplicate_generated_sources(config_spec),
+                        flash_enabled or chained_enabled,
+                    )
 
     def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
         """``LocalBenchmarkProvider.benchmark`` must stop compiling
