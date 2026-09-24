@@ -4379,24 +4379,24 @@ class TestCuteLowerings(unittest.TestCase):
         # cluster-deferred protocol.
         self.assertIn("defer_sync=True", sched_create_call)
 
-        # Per-CTA consumer arrive count = role_warps - scheduler_warps =
-        # 1 (ab_load) + 1 (mma) + 4 (epi) + 0 (epi_load) = 6.
+        # Per-CTA consumer arrive count = 32 * (role_warps - scheduler_warps)
+        # = 32 * (1 ab_load + 1 mma + 4 epi + 0 epi_load) = 192.
         # Multiplying by cluster_size (=2) would re-introduce the hang.
         self.assertIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(192))",
             code,
         )
-        # Negative pin: the cluster-wide count (6 * 2 = 12) must NOT
+        # Negative pin: the cluster-wide count (192 * 2 = 384) must NOT
         # appear in the sched_pipeline consumer group. Anchor on the
-        # full ``CooperativeGroup(... cutlass.Int32(12))`` literal so
-        # an unrelated 12 elsewhere in the kernel does not flake the
+        # full ``CooperativeGroup(... cutlass.Int32(384))`` literal so
+        # an unrelated 384 elsewhere in the kernel does not flake the
         # test.
         self.assertNotIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(12))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(384))",
             code,
         )
 
@@ -4486,13 +4486,13 @@ class TestCuteLowerings(unittest.TestCase):
         # cluster-deferred protocol; the cluster envelope is now 4
         # (cluster_m * cluster_n).
         self.assertIn("defer_sync=True", sched_create_call)
-        # Per-CTA consumer arrive count = role_warps - scheduler_warps
-        # = 1 + 1 + 4 + 0 = 6 (unchanged from cluster_n=1: each CTA
+        # Per-CTA consumer arrive count = 32 * (role_warps - scheduler_warps)
+        # = 32 * (1 + 1 + 4 + 0) = 192 (same as cluster_n=1: each CTA
         # in the cluster still runs its own scheduler).
         self.assertIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(192))",
             code,
         )
 
@@ -4572,25 +4572,25 @@ class TestCuteLowerings(unittest.TestCase):
             code = bound.to_triton_code(config)
 
         # Sched_pipeline consumer arrive count excludes the C-input
-        # warp: 4 epi + 1 mma + 1 ab_load = 6 (same as c_input=0).
+        # warp: (4 epi + 1 mma + 1 ab_load) * 32 = 192 (same as c_input=0).
         # If the subtraction in
         # ``cute_mma._codegen_cute_mma`` were missing, the count would
-        # become 7 (counting the inert C-input warp as a consumer)
+        # become 224 (counting the inert C-input warp as a consumer)
         # and ``producer_commit`` would block forever on the missing
         # arrival.
         self.assertIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(192))",
             code,
         )
-        # Negative pin: a count of 7 (or higher) must not appear on
+        # Negative pin: a count of 224 must not appear on
         # the sched_pipeline consumer group; that would indicate the
         # C-input subtraction was missed.
         self.assertNotIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(7))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(224))",
             code,
         )
         # The role-local TMA producer path is exercised: these
@@ -4787,12 +4787,12 @@ class TestCuteLowerings(unittest.TestCase):
         )
         # Store warp (id 7) owns the TMA-D + the c_pipeline lifecycle.
         self.assertIn("if tcgen05_warp_idx == cutlass.Int32(7):", code_store1)
-        # Sched consumer arrive count is now 7 (the store warp is a REAL sched
+        # Sched consumer arrive count is 7 * 32 (the store warp is a REAL sched
         # consumer; the cycle-91 ``- store_warp_count`` subtraction is removed).
         self.assertIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(7))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(224))",
             code_store1,
         )
         # Launch envelope unchanged (8 warps either way).
@@ -18981,9 +18981,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         )
         # Sched-pipeline arrive count under the productive-body
         # gate includes the C-input warp: 4 epi + 1 mma + 1
-        # ab_load + 1 c_input = 7 consumers.
+        # ab_load + 1 c_input = 7 consumer warps, 224 consumer threads.
         cfg = config.config
-        expected_arrive = (
+        expected_arrive = 32 * (
             int(cfg.get("tcgen05_num_epi_warps", 4))
             + int(cfg.get("tcgen05_warp_spec_mma_warps", 1))
             + int(cfg.get("tcgen05_warp_spec_ab_load_warps", 1))
@@ -19142,10 +19142,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         the per-descriptor SMEM ring variable names, the
         producer cooperative group size (per-thread = 32 lanes,
         matching the C-input warp's 32 threads), the consumer
-        cooperative group size (per-warp = ``epi_warp_count``,
-        NOT per-thread, so cycle 3's lane-0-gated
-        ``consumer_release`` does not hang on missing per-warp
-        arrivals), and the ``defer_sync=True`` flag (so the
+        cooperative group size (per-thread = ``epi_warp_count * 32``
+        for SIMT so every reader's completion precedes its arrival),
+        and the ``defer_sync=True`` flag (so the
         cluster-deferred-init protocol coordinates with the
         AB / acc / sched pipelines).
         """
@@ -19182,11 +19181,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             "cutlass.pipeline.Agent.Thread, cutlass.Int32(32))",
             code,
         )
-        # Consumer cooperative group: per-warp (epi_warp_count,
-        # NOT epi_warp_count * 32). Cycle 3's lane-0-gated
-        # ``consumer_release`` arrives once per warp.
+        # SIMT consumer cooperative group: every epilogue reader arrives.
         cfg = config.config
-        expected_consumer = int(cfg.get("tcgen05_num_epi_warps", 4))
+        expected_consumer = int(cfg.get("tcgen05_num_epi_warps", 4)) * 32
         self.assertIn(
             "tcgen05_aux_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
@@ -19597,12 +19594,12 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("tcgen05_aux_pipeline", code)
         self.assertNotIn("tcgen05_aux_smem_layout_", code)
         # Sched-pipeline arrive count subtracts the inert C-input
-        # warp: 4 epi + 1 mma + 1 ab_load = 6 consumers (matches
+        # warp: (4 epi + 1 mma + 1 ab_load) * 32 = 192 consumers (matches
         # the foundation-cycle pin).
         self.assertIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(192))",
             code,
         )
 
@@ -19717,7 +19714,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # Consumer-side: ``make_tiled_copy_D`` + ``partition_S``
         # + per-subtile ``cute.copy`` + ``tRS_rC.load()`` per
         # Quack's ``epilog_smem_load_and_partition`` pattern.
-        # Plus lane-0-gated ``consumer_release`` and state
+        # Plus per-reader SIMT ``consumer_release`` and state
         # advance.
         self.assertIn(
             "cute.make_tiled_copy_D(cute.make_copy_atom(",
@@ -20052,11 +20049,11 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         self.assertNotIn("tcgen05_c_input_warp_valid", code)
         # Sched-pipeline arrive count under the gate-closed
         # path subtracts the inert C-input warp:
-        # 4 epi + 1 mma + 1 ab_load = 6 consumers.
+        # (4 epi + 1 mma + 1 ab_load) * 32 = 192 consumers.
         self.assertIn(
             "tcgen05_sched_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
-            "cutlass.pipeline.Agent.Thread, cutlass.Int32(6))",
+            "cutlass.pipeline.Agent.Thread, cutlass.Int32(192))",
             code,
         )
 

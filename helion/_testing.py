@@ -443,10 +443,13 @@ def default_cute_mma_support(
 def patch_cute_mma_support(
     support: SimpleNamespace | None = None,
 ) -> Generator[SimpleNamespace, None, None]:
-    """Patch both ``get_cute_mma_support`` bindings.
+    """Patch the support function and its compiler-module bindings.
 
-    ``cute_mma`` re-binds the symbol from ``mma_support`` at import time.
+    Import consumers before patching so first use cannot leave a mock bound
+    in a newly imported module after this context exits.
     """
+    from ._compiler.cute import chained_matmul
+
     if support is None:
         support = default_cute_mma_support()
     with (
@@ -458,6 +461,7 @@ def patch_cute_mma_support(
             "helion._compiler.cute.mma_support.get_cute_mma_support",
             return_value=support,
         ),
+        patch.object(chained_matmul, "get_cute_mma_support", return_value=support),
     ):
         yield support
 

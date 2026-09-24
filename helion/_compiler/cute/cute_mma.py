@@ -47,7 +47,10 @@ from ..indexing_strategy import subscript_tile_info
 from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import analyze_tcgen05_matmul_store_chains
+from .aux_tensor import batched_aux_tma_output
+from .aux_tensor import batched_aux_tma_smem_bytes
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
+from .aux_tensor import staged_aux_tensor_descriptors
 from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
 from .cute_epilogue import find_tcgen05_grouped_tail_epilogue_for_mma
 from .cutedsl_compat import CUTE_TCGEN05_RUNTIME_N_PTX_VALIDATED_VERSION
@@ -111,6 +114,7 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from .tcgen05_constants import TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
@@ -118,6 +122,7 @@ from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_FULL_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
@@ -624,15 +629,11 @@ class _Tcgen05AuxPipelinePlan:
     ``aux_ring_index_by_step``) so multi-step chains within one
     store map cleanly onto the descriptor order.
 
-    Consumer cooperative group: **``epi_warp_count`` (per-warp,
-    NOT per-thread)**. The consumer-side flip in
-    ``memory_ops._aux_subtile_load_source`` gates
-    ``consumer_release(c_pipeline_aux)`` on ``elect_one()``
-    (matching the sched-pipeline pattern from
-    ``_build_role_local_while_with_scheduler``), so the consumer
-    arrive count is per-warp. Setting per-thread would hang the
-    handshake waiting for 31 missing per-warp arrivals per
-    stage.
+    Consumer cooperative group: TMA uses ``epi_warp_count`` elected
+    warp arrivals; SIMT uses ``epi_warp_count * 32`` reader arrivals.
+    The matching release in ``memory_ops._aux_subtile_load_source``
+    must keep the same distinction so SIMT stage reuse waits for every
+    reader, not just one lane of each warp.
     """
 
     barriers: str
@@ -6320,6 +6321,7 @@ def _emit_mma_pipeline(
     output_column_major = (
         candidate.output_column_major if candidate is not None else False
     )
+    batched_aux_output: torch.Tensor | None = None
 
     env = CompileEnvironment.current()
     requested_schedule = _requested_tcgen05_grouped_schedule(grouped_mode)
@@ -9309,10 +9311,103 @@ def _emit_mma_pipeline(
         aux_tensor_descriptors_value = discover_tcgen05_aux_tensor_descriptors(
             cg, fx_node
         )
-        c_input_aux_tensor_descriptors_value = tuple(
-            d
-            for d in aux_tensor_descriptors_value
-            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+        mapped_aux_descriptors = tuple(
+            desc
+            for desc in aux_tensor_descriptors_value
+            if desc.mapped_index is not None
+        )
+        if mapped_aux_descriptors and not (
+            df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+            and analysis is not None
+            and analysis.has_leading_passthrough
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "mapped auxiliaries require the full static batched AUX-TMA path",
+            )
+        batched_aux_tile_offsets = None
+        if (
+            df.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) == TCGEN05_AUX_LOAD_MODE_TMA
+            and analysis is not None
+            and analysis.has_leading_passthrough
+            and aux_tensor_descriptors_value
+        ):
+            batched_aux_output = batched_aux_tma_output(
+                cg, aux_tensor_descriptors_value
+            )
+            if not (
+                tcgen05_static_full_tiles
+                and tcgen05_cluster_m == tcgen05_cluster_n == 1
+                and not tcgen05_is_two_cta
+                and tcgen05_m_subtile_count == 1
+                and tcgen05_use_role_local_persistent_body
+                and tcgen05_persistence_model_str
+                == Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+                and tcgen05_effective_scheduler_warps == 1
+                and tcgen05_warp_spec.c_input_warps == 1
+                and tcgen05_warp_spec.store_warps == 0
+                and tcgen05_grouped_plan is None
+                and tcgen05_explicit_epi_tile_m is None
+                and tcgen05_explicit_epi_tile_n is None
+                and tcgen05_explicit_d_store_box_n is None
+                and batched_aux_output is not None
+                and len({d.store_value_node for d in aux_tensor_descriptors_value}) == 1
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "batched auxiliary TMA requires full static tiles, a "
+                    "single-CTA static-persistent scheduler and C-input warp, "
+                    "and exact row-major 16-bit auxiliaries with one output",
+                )
+            assert analysis.leading_passthrough_block_id is not None
+            assert batched_aux_output is not None
+            required_smem = batched_aux_tma_smem_bytes(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                ab_stages=tcgen05_ab_stage_count_value,
+                c_stages=tcgen05_c_stage_count_value,
+                aux_stages=_tcgen05_aux_pipeline_stage_count_from_config(df.config),
+                aux_count=len(
+                    staged_aux_tensor_descriptors(
+                        aux_tensor_descriptors_value, batched_tma=True
+                    )
+                ),
+            )
+            smem_capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                batched_aux_output.device
+            )
+            if required_smem > smem_capacity:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"batched auxiliary TMA requires {required_smem} bytes of "
+                    f"shared memory, exceeding the {smem_capacity}-byte capacity",
+                )
+            batched_aux_tile_offsets = (
+                cg.offset_var(analysis.leading_passthrough_block_id),
+                cg.offset_var(analysis.m_block_id),
+                cg.offset_var(analysis.n_block_id),
+            )
+            for desc in mapped_aux_descriptors:
+                source = desc.host_tensor_val
+                source_name = df.tensor_arg(source).name
+                df.placeholder_args.add(source_name)
+                cg.cute_wrapper_plans.append(
+                    {
+                        "kind": "tcgen05_aux_direct",
+                        "c_name": source_name,
+                        "d_name": df.tensor_arg(batched_aux_output).name,
+                        "c_shape": tuple(source.shape),
+                        "c_stride": tuple(source.stride()),
+                        "c_dtype": str(source.dtype),
+                        "d_shape": tuple(batched_aux_output.shape),
+                        "d_stride": tuple(batched_aux_output.stride()),
+                        "d_dtype": str(batched_aux_output.dtype),
+                    }
+                )
+        c_input_aux_tensor_descriptors_value = staged_aux_tensor_descriptors(
+            aux_tensor_descriptors_value,
+            batched_tma=batched_aux_tile_offsets is not None,
         )
         aux_tma_productive_body_gate_open = (
             tcgen05_warp_spec.c_input_warps > 0
@@ -9526,6 +9621,9 @@ def _emit_mma_pipeline(
             one_shot_role_scheduler=tcgen05_one_shot_role_scheduler,
             scheduler_warp_count=tcgen05_scheduler_warp_count_for_plan,
             sched_stage_count=tcgen05_sched_stage_count_for_plan,
+            aux_role_local_scheduler=bool(
+                df.config.get(TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY, False)
+            ),
             # ``c_input_warp_count`` plumbs the warp-spec slot
             # through the matmul plan (``cute_plan.md`` §7.5.3.2).
             # Validator restricts the value to ``{0, 1}`` under
@@ -9545,12 +9643,39 @@ def _emit_mma_pipeline(
             tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
             m_subtile_count=tcgen05_m_subtile_count,
             aux_tensor_descriptors=aux_tensor_descriptors_value,
+            batched_aux_tile_offsets=batched_aux_tile_offsets,
             flat_role_launch_warp_count=8
             if tcgen05_use_flat_role_coordinates
             else None,
             grouped=tcgen05_grouped_plan,
         )
         assert tcgen05_plan is not None
+        if tcgen05_matmul_plan.aux_role_local_scheduler and not (
+            tcgen05_static_full_tiles
+            and tcgen05_use_role_local_persistent_body
+            and tcgen05_matmul_plan.cluster_m == tcgen05_matmul_plan.cluster_n == 1
+            and not tcgen05_matmul_plan.is_two_cta
+            and not tcgen05_matmul_plan.is_clc_persistent
+            and tcgen05_matmul_plan.grouped is None
+            and tcgen05_matmul_plan.scheduler_warp_count == 1
+            and tcgen05_matmul_plan.c_input_warp_count == 1
+            and not tcgen05_matmul_plan.has_store_warp
+            and not tcgen05_matmul_plan.one_shot_role_scheduler
+            and not tcgen05_matmul_plan.tma_store_full_tiles_only
+            and tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+            and len(
+                {
+                    d.store_value_node
+                    for d in tcgen05_matmul_plan.c_input_aux_tensor_descriptors
+                }
+            )
+            == 1
+            and tcgen05_fragment_epilogue_has_unique_anchor(df.codegen.codegen_graphs)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "static AUX role scheduling requires one full-tile productive AUX anchor",
+            )
         tcgen05_mma_owner_active = _tcgen05_two_cta_owner_predicate(
             tcgen05_plan.exec_active,
             is_two_cta=tcgen05_is_two_cta,
@@ -9779,9 +9904,8 @@ def _emit_mma_pipeline(
             # per-thread register allocation and force a spill rather
             # than reserving at the natural 255-reg peak. The autotune
             # gate ``consumer_regs_autotune_fragments`` admits the knob
-            # only for the T8 wide-N CLC + aux-TMA seed family (same
-            # gate as ``aux_stages``), so T1-T7 stay byte-identical at
-            # the 256 default.
+            # for the existing wide-N CLC family and full-tile single-CTA
+            # role-local kernels. Unspecified configs retain the 256 default.
             consumer_regs_value = _tcgen05_consumer_regs_from_config(df.config)
             prefix.append(
                 statement_from_string(
@@ -10003,10 +10127,14 @@ def _emit_mma_pipeline(
         # scheduler_warps == 0.
         assert tcgen05_matmul_plan is not None
         if tcgen05_matmul_plan.has_scheduler_warp:
-            tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(
-                df, use_clc=tcgen05_matmul_plan.is_clc_persistent
-            )
-            df.cute_state.register_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
+            # The physical scheduler slot still locates AUX warp7. Only the
+            # metadata transport disappears with independent static schedulers.
+            tcgen05_sched_plan = None
+            if tcgen05_matmul_plan.uses_scheduler_mailbox:
+                tcgen05_sched_plan = _new_tcgen05_sched_pipeline_plan(
+                    df, use_clc=tcgen05_matmul_plan.is_clc_persistent
+                )
+                df.cute_state.register_tcgen05_sched_pipeline_plan(tcgen05_sched_plan)
             # WITH_SCHEDULER's scheduler-warp topology: every CTA in
             # the cluster runs its own scheduler warp, publishing to
             # its own SMEM mailbox. Both CTAs converge on the same
@@ -10108,28 +10236,35 @@ def _emit_mma_pipeline(
                 # store warp. The store warp is a sched consumer + the C-store
                 # ring consumer; it is NOT an acc-pipeline or AB consumer.
             )
+            # All lanes read the scheduler mailbox and arrive after their own
+            # reads. Count threads, not elected warp leaders: a leader-only
+            # release does not protect other lanes from stage reuse.
+            tcgen05_sched_consumer_thread_count = tcgen05_sched_consumer_role_count * 32
             if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
                 tcgen05_sched_consumer_arrive_count = (
-                    tcgen05_sched_consumer_role_count * tcgen05_sched_cluster_size
+                    tcgen05_sched_consumer_thread_count * tcgen05_sched_cluster_size
                 )
                 tcgen05_sched_consumer_mask_to_leader = True
             else:
-                tcgen05_sched_consumer_arrive_count = tcgen05_sched_consumer_role_count
-                tcgen05_sched_consumer_mask_to_leader = False
-            prefix.extend(
-                _emit_sched_pipeline_setup(
-                    tcgen05_sched_plan,
-                    sched_stage_count=tcgen05_matmul_plan.sched_stage_count,
-                    consumer_arrive_count=tcgen05_sched_consumer_arrive_count,
-                    cluster_size=tcgen05_sched_cluster_size,
-                    defer_sync=tcgen05_use_cluster_deferred_pipelines,
-                    consumer_mask_to_leader=tcgen05_sched_consumer_mask_to_leader,
-                    # One leader thread (lane 0 of the scheduler
-                    # warp) arrives on the full barrier per stage
-                    # via ``producer_commit``.
-                    producer_arrive_count=1,
+                tcgen05_sched_consumer_arrive_count = (
+                    tcgen05_sched_consumer_thread_count
                 )
-            )
+                tcgen05_sched_consumer_mask_to_leader = False
+            if tcgen05_sched_plan is not None:
+                prefix.extend(
+                    _emit_sched_pipeline_setup(
+                        tcgen05_sched_plan,
+                        sched_stage_count=tcgen05_matmul_plan.sched_stage_count,
+                        consumer_arrive_count=tcgen05_sched_consumer_arrive_count,
+                        cluster_size=tcgen05_sched_cluster_size,
+                        defer_sync=tcgen05_use_cluster_deferred_pipelines,
+                        consumer_mask_to_leader=tcgen05_sched_consumer_mask_to_leader,
+                        # One leader thread (lane 0 of the scheduler
+                        # warp) arrives on the full barrier per stage
+                        # via ``producer_commit``.
+                        producer_arrive_count=1,
+                    )
+                )
             # G2-H (cute_plan.md): allocate the CLC response
             # buffer + mbarrier on the CLC path. The mbarrier-init
             # call inside the scheduler-warp body (gated on
@@ -10138,6 +10273,7 @@ def _emit_mma_pipeline(
             # The SMEM allocations themselves are warp-uniform and
             # safe to emit at the kernel prefix.
             if tcgen05_matmul_plan.is_clc_persistent:
+                assert tcgen05_sched_plan is not None
                 prefix.extend(_emit_clc_smem_setup(tcgen05_sched_plan))
             # C-input warp aux SMEM ring + ``c_pipeline_aux``
             # ``PipelineAsync`` (``cute_plan.md`` §7.5.3.2 cycle 2
@@ -10307,6 +10443,12 @@ def _emit_mma_pipeline(
                                 "kernel_args": [tma_atom, tma_tensor],
                             }
                         )
+                        if desc.host_tensor_val.ndim == 3:
+                            assert batched_aux_output is not None
+                            cg.cute_wrapper_plans[-1].update(
+                                c_leading_passthrough=True,
+                                d_name=df.tensor_arg(batched_aux_output).name,
+                            )
                 df.cute_state.register_tcgen05_aux_pipeline_plan(tcgen05_aux_plan)
                 prefix.extend(
                     _emit_tcgen05_aux_pipeline_setup(
@@ -10323,8 +10465,9 @@ def _emit_mma_pipeline(
                         # consumer's per-subtile loop waits, reads
                         # the active stage with the existing
                         # ``partition_C → flat_divide(epi_tile) →
-                        # partition_D`` pipeline, then lane-0
-                        # releases. Per-subtile staging reduces the
+                        # partition_D`` pipeline, then releases
+                        # (TMA elected lanes, SIMT all readers).
+                        # Per-subtile staging reduces the
                         # epilogue SMEM footprint vs whole-tile
                         # staging, but the AB ring at ``bk=128`` plus
                         # the aux/D-store rings still overshoots the
@@ -10345,9 +10488,8 @@ def _emit_mma_pipeline(
                         c_input_warp_thread_count=(
                             tcgen05_matmul_plan.c_input_warp_count * 32
                         ),
-                        # Per-warp consumer arrive count for the
-                        # lane-0-gated release — see the emitter
-                        # docstring.
+                        # The emitter uses warp count for TMA and
+                        # thread count for SIMT releases.
                         epi_warp_count=tcgen05_matmul_plan.epi_warp_count,
                         defer_sync=tcgen05_use_cluster_deferred_pipelines,
                     )
@@ -11521,7 +11663,7 @@ def _emit_mma_pipeline(
             prefix.append(
                 statement_from_string(
                     f"{tma_pipeline_mbars} = cute.arch.alloc_smem("
-                    f"cutlass.Int64, cutlass.Int32({tcgen05_ab_stage_count_value}))"
+                    f"cutlass.Int64, cutlass.Int32({tcgen05_ab_stage_count_value * 2}))"
                 )
             )
             prefix.append(
@@ -13390,9 +13532,10 @@ def _emit_sched_pipeline_setup(
       ``consumer_mask_to_leader=True`` (Quack pattern) every CTA's
       consumer release routes to the leader CTA's empty barrier so
       this is the cluster-wide total
-      (``warps_per_cta * cluster_size``). With
+      (``warps_per_cta * 32 * cluster_size``). With
       ``consumer_mask_to_leader=False`` releases stay local so this
-      is the per-CTA count (``warps_per_cta``).
+      is the per-CTA count (``warps_per_cta * 32``). Every consumer
+      lane arrives after reading the shared scheduler mailbox.
     - ``cluster_size``: cluster-multicast factor. ``> 1`` lets
       ``defer_sync`` participate in cluster-wide barrier init.
     - ``consumer_mask_to_leader``: ``True`` emits
@@ -13511,7 +13654,10 @@ def _tcgen05_consumer_regs_from_config(config: object) -> int:
     value = cast("_ConfigLike", config).get(TCGEN05_CONSUMER_REGS_CONFIG_KEY, default)
     if not isinstance(value, int):
         return default
-    if value not in TCGEN05_CONSUMER_REGS_CHOICES:
+    if value not in (
+        *TCGEN05_CONSUMER_REGS_CHOICES,
+        *TCGEN05_CONSUMER_REGS_FULL_TILE_CHOICES,
+    ):
         return default
     return value
 
@@ -13609,7 +13755,7 @@ def _emit_tcgen05_aux_pipeline_setup(
     framed by ``producer_acquire`` / ``producer_commit`` / state
     advance; the consumer issues one ``consumer_wait`` / Quack-
     style ``tiled_copy_s2r`` ``cute.copy(SMEM_ring[stage], rmem)``
-    / lane-0 ``consumer_release`` / state advance per subtile.
+    / ``consumer_release`` / state advance per subtile.
     ``tile_shape_expr`` is the ``epi_tile`` variable name so the
     SMEM ring sizing matches the producer-side subtile copy
     extent. ``plan.stage_count`` controls the depth — cycle 10
@@ -13625,14 +13771,10 @@ def _emit_tcgen05_aux_pipeline_setup(
       arrive count is per-thread. TMA aux loads use a
       ``PipelineTmaAsync`` producer group matching the CUTLASS TMA
       pipeline convention.
-    - ``consumer_arrive_count = epi_warp_count`` (per-warp, NOT
-      per-thread). The consumer-side flip in
-      ``memory_ops._aux_subtile_load_source`` gates
-      ``consumer_release(c_pipeline_aux)`` on ``elect_one()``
-      (matching the sched-pipeline pattern from
-      ``_build_role_local_while_with_scheduler``). Setting
-      per-thread would hang the handshake waiting for 31
-      missing per-warp arrivals per stage.
+    - TMA consumers elect one arrival per warp (``epi_warp_count``).
+      SIMT consumers all arrive (``epi_warp_count * 32``), matching
+      the conditional release in ``memory_ops._aux_subtile_load_source``.
+      Both paths retain the reader fence before releasing the stage.
     - ``defer_sync`` mirrors the AB / acc / sched pipelines'
       cluster-deferred-init participation so the
       ``pipeline_init_arrive`` / ``pipeline_init_wait`` rendezvous
@@ -13713,7 +13855,7 @@ def _emit_tcgen05_aux_pipeline_setup(
                     f"{plan.consumer_group} = "
                     "cutlass.pipeline.CooperativeGroup("
                     "cutlass.pipeline.Agent.Thread, "
-                    f"cutlass.Int32({epi_warp_count}))"
+                    f"cutlass.Int32({epi_warp_count * 32}))"
                 ),
                 statement_from_string(
                     f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("

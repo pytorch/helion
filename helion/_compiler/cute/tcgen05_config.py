@@ -80,6 +80,7 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
+from .tcgen05_constants import TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
@@ -91,6 +92,7 @@ from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from .tcgen05_constants import TCGEN05_CONSUMER_REGS_FULL_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
@@ -339,6 +341,7 @@ CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
         TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
         TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
         TCGEN05_AUX_LOAD_MODE_CONFIG_KEY,
+        TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY,
         TCGEN05_AUX_STAGES_CONFIG_KEY,
         TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY,
         TCGEN05_CONSUMER_REGS_CONFIG_KEY,
@@ -1138,6 +1141,56 @@ class CuteTcgen05Config:
             and not constraints.allow_edge_k_tail_family
         )
 
+    def _batched_aux_tma_search_enabled(self) -> bool:
+        extents = self.matmul_compile_time_static_extents
+        return (
+            self.exact_shape_aux_kernel_detected
+            and self.matmul_has_leading_passthrough
+            and not self.matmul_has_non_tcgen05_operand
+            and self.matmul_input_dtype in (torch.bfloat16, torch.float16)
+            and extents is not None
+            and all(isinstance(extent, int) and extent > 0 for extent in extents)
+        )
+
+    def _is_batched_aux_tma_search_candidate(self, config: dict[str, object]) -> bool:
+        view = self._matmul_config_view(config)
+        extents = self.matmul_compile_time_static_extents
+        if (
+            not self._batched_aux_tma_search_enabled()
+            or view is None
+            or extents is None
+        ):
+            return False
+        sizes, *indices = view
+        return (
+            self._is_with_scheduler_c_input_config(config)
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and config.get("pid_type") == "persistent_interleaved"
+            and config.get(
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+            )
+            == Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            and config.get(TCGEN05_WARP_SPEC_STORE_WARPS_KEY, 0) == 0
+            and config.get("tcgen05_ab_stages", 2) == 2
+            and all(
+                config.get(key) is None
+                for key in (
+                    TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY,
+                    TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY,
+                    TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY,
+                )
+            )
+            and all(
+                isinstance(size := sizes[index], int)
+                and size > 0
+                and extent is not None
+                and extent % size == 0
+                for extent, index in zip(extents, indices, strict=True)
+            )
+        )
+
     def _aux_tma_search_enabled(self) -> bool:
         # The TMA aux producer is admitted on either the edge+K-tail family or
         # the full-tile cluster_m=2 family. Exact-shape aux tensors use the
@@ -1146,6 +1199,7 @@ class CuteTcgen05Config:
         return (
             self._aux_tma_edge_search_enabled()
             or self._aux_tma_full_tile_search_enabled()
+            or self._batched_aux_tma_search_enabled()
         )
 
     def _aux_tma_seed_config(self, c_input_seed: Config) -> Config | None:
@@ -1279,6 +1333,32 @@ class CuteTcgen05Config:
 
     def autotune_seed_configs(self) -> list[Config]:
         seeds: list[Config] = []
+        if self._batched_aux_tma_search_enabled():
+            # Keep the SIMT region searchable. These are independent TMA seeds,
+            # not a projection that forces all batched epilogues onto TMA.
+            for bm, bn in ((64, 256), (128, 128), (128, 256)):
+                block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=64)
+                if block_sizes is None:
+                    continue
+                seed: dict[str, Any] = {
+                    "block_sizes": block_sizes,
+                    "pid_type": "persistent_interleaved",
+                    "num_warps": 8,
+                    "tcgen05_cluster_m": 1,
+                    "tcgen05_cluster_n": 1,
+                    "tcgen05_ab_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_c_stages": 2,
+                    "tcgen05_num_epi_warps": 4,
+                    TCGEN05_STRATEGY_CONFIG_KEY: (
+                        Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                    ),
+                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY: 1,
+                    TCGEN05_AUX_LOAD_MODE_CONFIG_KEY: TCGEN05_AUX_LOAD_MODE_TMA,
+                }
+                if self._is_batched_aux_tma_search_candidate(seed):
+                    seeds.append(Config(**seed))
         plain_clc_seed = self._plain_clc_seed_config()
         if plain_clc_seed is not None:
             seeds.append(plain_clc_seed)
@@ -1364,7 +1444,149 @@ class CuteTcgen05Config:
                     )
                     if clc_aux_tma_narrow_n_seed is not None:
                         seeds.append(clc_aux_tma_narrow_n_seed)
-        return seeds
+        return self.aux_role_local_scheduler_seed_configs(
+            self.consumer_register_seed_configs(seeds)
+        )
+
+    def _aux_role_local_scheduler_config_supported(
+        self, config: dict[str, object]
+    ) -> bool:
+        # Reuse the full-static-tile/role-layout proof, independently of the
+        # register cap. Codegen additionally proves actual role extraction,
+        # productive TMA descriptors and complete shared-loop elimination.
+        return (
+            self.exact_shape_aux_kernel_detected
+            and self._low_consumer_regs_config_supported(config)
+            and self._is_with_scheduler_c_input_config(config)
+            and config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_MODE_TMA
+            and config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 1
+            and all(
+                value == 1
+                for value in cast("list[int]", config.get("l2_groupings", []))
+            )
+            and config.get(TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY, 1) == 1
+            and config.get(TCGEN05_WARP_SPEC_MMA_WARPS_KEY, 1) == 1
+            and not config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY)
+        )
+
+    def aux_role_local_scheduler_seed_configs(
+        self, seeds: list[Config]
+    ) -> list[Config]:
+        """Append eligible static-scheduler siblings after the entire old prefix."""
+        return [
+            *seeds,
+            *(
+                Config.from_dict(
+                    seed.config | {TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY: True}
+                )
+                for seed in seeds
+                if not seed.config.get(
+                    TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY, False
+                )
+                and self._aux_role_local_scheduler_config_supported(seed.config)
+            ),
+        ]
+
+    def _low_consumer_regs_search_enabled(self) -> bool:
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        return (
+            self.search_enabled
+            and self.matmul_input_dtype in (torch.float16, torch.bfloat16)
+            and not self.matmul_has_non_tcgen05_operand
+            and self.grouped_worklist_smem_facts is None
+            and extents is not None
+            and fragments is not None
+            and any(
+                pid in self.allowed_pid_types
+                for pid in ("persistent_blocked", "persistent_interleaved")
+            )
+            and all(
+                type(extent) is int and extent > 0 and extent % fragment.low == 0
+                for extent, fragment in zip(extents, fragments, strict=True)
+            )
+        )
+
+    def _low_consumer_regs_config_supported(self, config: dict[str, object]) -> bool:
+        """The lower cap changes allocation only, not role/scheduler admission."""
+        view = self._matmul_config_view(config)
+        extents = self.matmul_compile_time_static_extents
+        if (
+            not self._low_consumer_regs_search_enabled()
+            or view is None
+            or extents is None
+        ):
+            return False
+        sizes, *indices = view
+        strategy = config.get(
+            TCGEN05_STRATEGY_CONFIG_KEY,
+            Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
+        )
+        if self.aux_kernel_detected:
+            if not (
+                self.exact_shape_aux_kernel_detected
+                and self._is_with_scheduler_c_input_config(config)
+                and config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_MODE_TMA
+            ):
+                return False
+        elif strategy == Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value:
+            if any(
+                config.get(key, 0) != 0
+                for key in (
+                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+                )
+            ):
+                return False
+        else:
+            return False
+        return (
+            config.get("pid_type") in ("persistent_blocked", "persistent_interleaved")
+            and config.get(
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY,
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value,
+            )
+            == Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("tcgen05_cluster_n", 1) == 1
+            and config.get("tcgen05_num_epi_warps", 4) == 4
+            and config.get(TCGEN05_WARP_SPEC_STORE_WARPS_KEY, 0) == 0
+            and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is None
+            and not config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY)
+            and config.get(
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+                Tcgen05LayoutStrategy.DEFAULT.value,
+            )
+            == Tcgen05LayoutStrategy.DEFAULT.value
+            and all(config.get(key) is None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
+            and all(
+                type(size := sizes[index]) is int
+                and size > 0
+                and type(extent) is int
+                and extent % size == 0
+                for extent, index in zip(extents, indices, strict=True)
+            )
+        )
+
+    def consumer_register_seed_configs(self, seeds: list[Config]) -> list[Config]:
+        """Append one sibling per applicable seed, after all original seeds."""
+        result = list(seeds)
+        for seed in seeds:
+            if (
+                seed.config.get(
+                    TCGEN05_CONSUMER_REGS_CONFIG_KEY, TCGEN05_CONSUMER_REGS_DEFAULT
+                )
+                == TCGEN05_CONSUMER_REGS_DEFAULT
+                and self._low_consumer_regs_config_supported(seed.config)
+            ):
+                result.append(
+                    Config.from_dict(
+                        seed.config | {TCGEN05_CONSUMER_REGS_CONFIG_KEY: 128}
+                    )
+                )
+        return result
 
     def _fix_cluster_m2_search_config(self, config: dict[str, object]) -> None:
         if not (self.search_enabled and config.get("tcgen05_cluster_m") == 2):
@@ -2373,6 +2595,10 @@ class CuteTcgen05Config:
         if not self._is_with_scheduler_c_input_config(config):
             config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
             return
+        if self._batched_aux_tma_search_enabled():
+            if not self._is_batched_aux_tma_search_candidate(config):
+                config[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+            return
         if not (
             self._is_validated_cluster_m2_edge_search_candidate(config)
             or self._is_validated_cluster_m2_full_tile_search_candidate(config)
@@ -3315,18 +3541,28 @@ class CuteTcgen05Config:
     def consumer_regs_autotune_fragments(self) -> dict[str, ConfigSpecFragment]:
         """Per-config consumer-warp ``setmaxregister_increase`` ceiling knob.
 
-        Admission mirrors ``aux_stages_autotune_fragments``: the
-        ``_aux_tma_edge_search_enabled`` gate pins the search to the
-        validated wide-N CLC + aux-TMA seed family with the c-input warp +
-        aux-TMA combination. Configs outside that gate never see the
-        knob. The default value (256) is included in
-        ``TCGEN05_CONSUMER_REGS_CHOICES`` so default-with-knob emits the
-        same code as default-without-knob.
-
-        Cycle 46 intentionally keeps this scoped to the edge+K-tail gate
-        even though ``_aux_tma_search_enabled`` was widened (see
-        ``aux_stages_autotune_fragments``).
+        Full-tile single-CTA candidates search 256/128. Their concrete
+        topology is rechecked after normalization; unsupported combinations
+        retain 256. The older edge/CLC domain and compiler-seed-only values
+        keep their original search order and defaults.
         """
+        if (
+            self._low_consumer_regs_search_enabled()
+            and not self._aux_tma_edge_search_enabled()
+        ):
+            old = _compiler_seed_values(
+                self.config_spec.compiler_seed_configs,
+                TCGEN05_CONSUMER_REGS_CONFIG_KEY,
+                int,
+                lambda value: value in TCGEN05_CONSUMER_REGS_CHOICES,
+            )
+            return {
+                TCGEN05_CONSUMER_REGS_CONFIG_KEY: _enum_fragment_with_seed_values(
+                    TCGEN05_CONSUMER_REGS_FULL_TILE_CHOICES,
+                    old,
+                    search_choices=TCGEN05_CONSUMER_REGS_FULL_TILE_CHOICES,
+                )
+            }
         seed_choices = _compiler_seed_values(
             self.config_spec.compiler_seed_configs,
             TCGEN05_CONSUMER_REGS_CONFIG_KEY,
@@ -3778,7 +4014,12 @@ class CuteTcgen05Config:
         self._validate_int_enum_config(
             config,
             TCGEN05_CONSUMER_REGS_CONFIG_KEY,
-            TCGEN05_CONSUMER_REGS_CHOICES,
+            (*TCGEN05_CONSUMER_REGS_CHOICES, 128),
+            fix_invalid=fix_invalid,
+        )
+        self._validate_bool_config(
+            config,
+            TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY,
             fix_invalid=fix_invalid,
         )
         self._validate_bool_config(
@@ -4117,6 +4358,26 @@ class CuteTcgen05Config:
             # a CLC persistence model.
             self._fix_aux_tma_search_config(config)
         self._normalize_grouped_static_reserved_sms(config)
+        if config.get(
+            TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY
+        ) and not self._aux_role_local_scheduler_config_supported(config):
+            if fix_invalid:
+                config[TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY] = False
+            else:
+                raise InvalidConfig(
+                    "tcgen05_aux_role_local_scheduler requires full-static-tile "
+                    "single-CTA AUX TMA with default layout and identity L2 mapping"
+                )
+        if config.get(
+            TCGEN05_CONSUMER_REGS_CONFIG_KEY
+        ) == 128 and not self._low_consumer_regs_config_supported(config):
+            if fix_invalid:
+                config[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = TCGEN05_CONSUMER_REGS_DEFAULT
+            else:
+                raise InvalidConfig(
+                    "tcgen05_consumer_regs=128 requires a full-tile FP16/BF16 "
+                    "single-CTA static-persistent role-local kernel"
+                )
 
     def flat_fields(
         self,
@@ -4206,6 +4467,13 @@ class CuteTcgen05Config:
         fields.update(self.aux_load_mode_autotune_fragments())
         fields.update(self.aux_stages_autotune_fragments())
         fields.update(self.consumer_regs_autotune_fragments())
+        if (
+            self.exact_shape_aux_kernel_detected
+            and self._low_consumer_regs_search_enabled()
+        ):
+            fields[TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY] = EnumFragment(
+                (False, True)
+            )
         fields.update(self.persistence_model_autotune_fragments())
         if self.config_spec.supports_config_key("pid_type"):
             fields["pid_type"] = _enum_fragment_with_seed_values(

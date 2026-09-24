@@ -970,6 +970,8 @@ def _cute_register_tile_unroll_vec_store(
     value_expr: str,
     mask_expr: str | None,
     dtype: torch.dtype = torch.float16,
+    *,
+    lane_axis_pos: int | None = None,
 ) -> ast.stmt | None:
     """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
 
@@ -1001,7 +1003,11 @@ def _cute_register_tile_unroll_vec_store(
         index_dtype = CompileEnvironment.current().index_type()
         base_ptr_expr = f"({tensor_name}.iterator + {index_dtype}({base_index_var}))"
     else:
-        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        lane_pos = (
+            lane_axis_pos
+            if lane_axis_pos is not None
+            else _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        )
         base_exprs = list(index_exprs)
         base_exprs[lane_pos] = base_index_var
         base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
@@ -1117,6 +1123,8 @@ def _cute_register_tile_unroll_vec_hoist(
     index_exprs: list[str],
     vec_width: int,
     eviction_suffix: str = "",
+    *,
+    lane_axis_pos: int | None = None,
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
     ``PerThreadNDTileStrategy`` lane loops.
@@ -1151,7 +1159,11 @@ def _cute_register_tile_unroll_vec_hoist(
         # per-lane base so the vec load points at the start of the V-wide
         # chunk this thread owns.  The position is the last entry for a
         # row-major lhs, or the recorded position for a K-major rhs.
-        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        lane_pos = (
+            lane_axis_pos
+            if lane_axis_pos is not None
+            else _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        )
         base_exprs = list(index_exprs)
         base_exprs[lane_pos] = base_index_var
         base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
@@ -2360,7 +2372,7 @@ def _codegen_cute_store_tcgen05_tile(
     # (``(bm_per_cta, bn)`` under 2cta; ``(bm, bn)`` otherwise) per
     # stage per subtile iteration under ``producer_acquire`` /
     # ``producer_commit`` framing; the consumer issues one
-    # ``consumer_wait`` / lane-0-gated ``consumer_release`` pair
+    # ``consumer_wait`` / mode-specific ``consumer_release`` pair
     # per subtile and feeds the SMEM stage into Quack's
     # ``tiled_copy_s2r`` flow (``make_tiled_copy_D`` against
     # ``tiled_copy_t2r`` →  ``partition_S(sC_ring)`` → per-
@@ -2825,6 +2837,8 @@ def _codegen_cute_store_tcgen05_tile(
         for aux_idx, rec in enumerate(aux_step_records):
             staged_ring_name = aux_ring_smem_names[aux_idx]
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
+            if rec.expr.mapped_index is not None:
+                continue
             if (
                 use_aux_smem_source
                 and staged_ring_name is not None
@@ -3058,6 +3072,7 @@ def _codegen_cute_store_tcgen05_tile(
         *,
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
+        coord_layout: str = "ttr",
     ) -> str:
         """Per-subtile aux GMEM-load source lines (one per aux step).
 
@@ -3112,12 +3127,15 @@ def _codegen_cute_store_tcgen05_tile(
             # ``tSR_sC = thr_copy_s2r.partition_S(sC_ring)`` selects
             # the SMEM source; ``tSR_rC`` is a re-layout view of the
             # same register memory as ``tRS_rC``). The chain reads
-            # ``tRS_rC.load()`` (== ``aux_loaded``). The post-copy
-            # lane-0-gated release plus state advance run in the
+            # ``tRS_rC.load()`` (== ``aux_loaded``). Drain the shared
+            # reads before release; assigning their register values does
+            # not force outstanding LDS completion. SIMT pipelines count
+            # every reader's arrival. TMA pipelines retain their existing
+            # elected-warp signaling protocol.
+            # The release plus state advance run in the
             # same per-subtile iteration so the producer can refill
             # the same stage on the very next persistent tile
-            # (matches the consumer cooperative-group arrive count
-            # of ``epi_warp_count`` set by
+            # (matches the mode-specific consumer arrive count set by
             # ``_emit_tcgen05_aux_pipeline_setup``).
             #
             # Note: ``partition_D(smem_stage).load()`` on
@@ -3169,10 +3187,22 @@ def _codegen_cute_store_tcgen05_tile(
                 )
             lines.extend(
                 [
+                    # The ring may be refilled immediately after release.
+                    # A warp sync or mbarrier arrival alone need not drain
+                    # the outstanding per-thread shared loads in SASS.
+                    f"{prelude_indent}cute.arch.fence_acq_rel_cta()\n",
                     (
                         f"{prelude_indent}with cute.arch.elect_one():\n"
                         f"{prelude_indent}    {aux_pipeline_name}.consumer_release("
                         f"{aux_consumer_state_name})\n"
+                        if aux_pipeline_uses_tma_load
+                        # Each SIMT reader orders its own completed reads
+                        # before its arrival. Election alone does not hand
+                        # other lanes' read completion to the elected lane.
+                        else (
+                            f"{prelude_indent}{aux_pipeline_name}.consumer_release("
+                            f"{aux_consumer_state_name})\n"
+                        )
                     ),
                     emit_pipeline_advance(
                         aux_consumer_state_name, indent=prelude_indent
@@ -3180,6 +3210,52 @@ def _codegen_cute_store_tcgen05_tile(
                     + "\n",
                 ]
             )
+        mapped_records = [
+            rec for rec in aux_step_records if rec.expr.mapped_index is not None
+        ]
+        if mapped_records:
+            # The full static AUX-TMA admission gate excludes partial output
+            # tiles. Coordinates come from the actual accumulator/R2S layout,
+            # never inferred from lane numbers or equal tile extents.
+            from .._compiler.cute.mapped_aux_index import render_mapped_aux_indices
+
+            coordinate_setup, coordinate_name = _coord_subtile_source(
+                prelude_indent, coord_layout, include_setup=True
+            )
+            lines.append(coordinate_setup)
+            coordinate = df.new_var("tcgen05_mapped_coord")
+            element = df.new_var("tcgen05_mapped_element")
+            for rec in mapped_records:
+                lines.append(
+                    f"{prelude_indent}{rec.aux_rmem} = cute.make_rmem_tensor("
+                    f"{carrier_name}.shape, {rec.aux_dtype})\n"
+                )
+            lines.append(
+                f"{prelude_indent}for {element} in cutlass.range_constexpr("
+                f"cute.size({carrier_name}.shape)):\n"
+                f"{prelude_indent}    {coordinate} = {coordinate_name}[{element}]\n"
+            )
+            for rec in mapped_records:
+                mapped = rec.expr.mapped_index
+                assert mapped is not None
+                coordinates = [
+                    ast.parse(
+                        state.codegen.offset_var(mapped.output_block_ids[0]),
+                        mode="eval",
+                    ).body,
+                    ast.parse(f"{coordinate}[0]", mode="eval").body,
+                    ast.parse(f"{coordinate}[1]", mode="eval").body,
+                ]
+                indices = render_mapped_aux_indices(mapped, coordinates)
+                index_source = ", ".join(ast.unparse(index) for index in indices)
+                lines.append(
+                    f"{prelude_indent}    {rec.aux_rmem}[{element}] = "
+                    f"{rec.aux_tensor_name}[{index_source}]\n"
+                )
+            for rec in mapped_records:
+                lines.append(
+                    f"{prelude_indent}{rec.aux_loaded} = {rec.aux_rmem}.load()\n"
+                )
         # Broadcast auxiliaries are partitioned against the same accumulator
         # carrier, so their fragments share an index domain, coordinates, and
         # validity predicate. Load all of them in one scalar edge loop instead
@@ -3232,6 +3308,8 @@ def _codegen_cute_store_tcgen05_tile(
             return "".join(lines)
         for aux_idx, rec in enumerate(aux_step_records):
             rowvec_stage = rowvec_aux_stage_records[aux_idx]
+            if rec.expr.mapped_index is not None:
+                continue
             if (
                 use_aux_smem_source
                 and not force_simt_edge_aux
@@ -3478,6 +3556,7 @@ def _codegen_cute_store_tcgen05_tile(
             carrier_name,
             force_simt_edge_aux=force_simt_edge_aux,
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
+            coord_layout=coord_layout,
         )
         aux_locals_by_expr = {rec.expr: rec.aux_loaded for rec in aux_step_records}
         assert len(aux_locals_by_expr) == len(aux_step_records)
@@ -5481,7 +5560,7 @@ def _codegen_cute_store_tcgen05_tile(
             )
         )
     ]
-    # C-input warp aux pipeline consumer-wait + lane-0-gated
+    # C-input warp aux pipeline consumer-wait + mode-specific
     # consumer-release framing (``cute_plan.md`` §7.5.3.2 cycle 2b).
     # Gate-closed configs (default ``c_input_warps=0`` or no aux
     # residual) keep the historical GMEM aux path. When the gate
@@ -5495,10 +5574,9 @@ def _codegen_cute_store_tcgen05_tile(
     # SMEM ring); the default TMA-store path now splices that block
     # after the c_pipeline acquire and T2R copy to keep aux fragments
     # out of the store-prefix live range. The release + ``advance``
-    # happen at the bottom of the same per-subtile iteration (after
-    # the chain has consumed ``aux_loaded``). Lane-0 gating mirrors
-    # the per-warp consumer arrive count
-    # (``epi_warp_count``) allocated on the aux pipeline.
+    # follow a CTA-scoped read-completion fence, before the chain consumes
+    # ``aux_loaded``. SIMT releases from every reader with a per-thread
+    # arrival count; TMA retains elected releases and its per-warp count.
 
     # Static-full role-local stores have no dynamic full-tile branch, so all
     # C-store invariant setup can be hoisted once. Scheduler-backed hybrid

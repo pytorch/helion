@@ -39,6 +39,7 @@ from .program_id import Tcgen05PersistentProgramIDs
 from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -4160,6 +4161,9 @@ class DeviceGridState(DeviceLoopOrGridState):
     vec_lane_wrappers: dict[str, VecLaneWrapper] = dataclasses.field(
         default_factory=dict
     )
+    deferred_vector_ops: list[tuple[ast.For, ast.AST, Callable[[], ast.AST | None]]] = (
+        dataclasses.field(default_factory=list)
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -4176,7 +4180,9 @@ class DeviceGridState(DeviceLoopOrGridState):
             lane_var, frozenset()
         ) | {block_id}
 
-    def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
+    def _live_lane_setup(
+        self, body: list[ast.AST]
+    ) -> tuple[set[str], list[ast.AST], set[str]]:
         from .ast_read_writes import ReadWrites
 
         # Drop setup statements (per-lane index/mask defs) whose results the
@@ -4206,6 +4212,55 @@ class DeviceGridState(DeviceLoopOrGridState):
                 kept_setup.append(stmt)
                 needed |= set(rw.reads)
         kept_setup.reverse()
+        return needed, kept_setup, spliced_wrappers
+
+    def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
+        from .ast_read_writes import ReadWrites
+
+        needed, kept_setup, spliced_wrappers = self._live_lane_setup(body)
+        if self.deferred_vector_ops:
+            has_barrier = any(
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "cute.arch.sync_threads"
+                for stmt in body
+                for node in ast.walk(stmt)
+            )
+            # Root codegen can register synthetic reduction lanes that are
+            # subsequently unused (for example aliases of tile.index). Decide
+            # the innermost live lane only after the entire body is available.
+            innermost = None
+            for lane_var, _extent in self.lane_loops:
+                wrapper = self.vec_lane_wrappers.get(lane_var)
+                names = {lane_var}
+                if wrapper is not None:
+                    names.update((wrapper.vec_lane_var, wrapper.base_index_var))
+                if names & needed or lane_var in spliced_wrappers:
+                    innermost = wrapper
+            replacements = {}
+            for vloop, scalar, emit in self.deferred_vector_ops:
+                # Hoisting a load or delaying a store across a RAW barrier
+                # changes its value even when the lane scope is unchanged.
+                if (
+                    not has_barrier
+                    and innermost is not None
+                    and innermost.vloop is vloop
+                ):
+                    vector = emit()
+                    if vector is not None:
+                        replacements[id(scalar)] = vector
+            self.deferred_vector_ops.clear()
+
+            class ReplaceVectorOps(ast.NodeTransformer):
+                def visit(self, node: ast.AST) -> ast.AST:
+                    if replacement := replacements.get(id(node)):
+                        return replacement
+                    return super().visit(node)
+
+            replace = ReplaceVectorOps()
+            body = [replace.visit(stmt) for stmt in body]
+            # Accepted operations added vector-load/store splices, whose
+            # address and mask setup must participate in final liveness too.
+            needed, kept_setup, spliced_wrappers = self._live_lane_setup(body)
         # Place each setup at the shallowest lane scope that defines every
         # lane/base variable it reads.  Historically all setup statements were
         # placed in the innermost lane loop.  That is semantically correct for
@@ -5781,6 +5836,16 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             if uses_thread_axis and isinstance(block_size, int):
                 tracker.record(block_idx, axis, block_size)
             state.add_statement(f"{index_var} = {idx_expr}")
+            if (
+                uses_thread_axis
+                and isinstance(block_size, int)
+                and env.backend_name == "cute"
+                and env.config_spec.pointwise_facts
+                and not _cute_epilogue_subtile_active(self.fn.config)
+            ):
+                # The non-lane ND path must retain the same producer-axis
+                # evidence as PerThreadNDTileStrategy's lane-loop path.
+                self.fn.cute_state.grid_thread_extents[index_var] = (axis, block_size)
             # pyrefly: ignore [missing-attribute]
             mask_statement = self._setup_mask(
                 state,
@@ -6566,6 +6631,11 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                         f"lane_base_{block_idx}", dce=False
                     )
                     self._cute_lane_base_index_var_by_block[block_idx] = base_index_var
+                    if isinstance(static_extent, int) and env.backend_name == "cute":
+                        self.fn.cute_state.grid_thread_extents[base_index_var] = (
+                            axis,
+                            static_extent,
+                        )
                     if lane_strided:
                         # ``base = offset + (outer*NT + tid) * V``
                         base_expr = (
@@ -6597,16 +6667,21 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                     )
                     idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
                 else:
-                    # NOTE: no SCALAR strided form here — the launch-dim
-                    # recovery regex (cute/backend.py ``indices_line_re``)
-                    # reads the thread extent from the ``thread_idx()[a] *
-                    # epT`` multiplier on ``indices_*`` lines; an ``offset
-                    # + tid + lane*NT`` line parses as epT=1 and inflates
-                    # the launch to block_size, sending surplus threads
-                    # out of bounds.  ``cute_lane_layouts`` affects grid
-                    # tiles only in the vec-partitioned form (whose index
-                    # lines never mention thread_idx directly).
-                    idx_expr = f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
+                    if (
+                        lane_strided
+                        and not env.config_spec.matmul_facts
+                        and not _cute_epilogue_subtile_active(self.fn.config)
+                    ):
+                        # Collective matmul/subtile lowerings may replace the
+                        # lane body later; retain their established mapping.
+                        idx_expr = (
+                            f"{offset_var} + {env.backend.thread_index_expr(axis=axis)}"
+                            f" + {env.backend.lane_offset_expr(lane_var)} * {static_extent}"
+                        )
+                    else:
+                        idx_expr = (
+                            f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
+                        )
                 target = lane_setup_statements
             else:
                 # Setup that does not depend on a lane variable can be hoisted
@@ -6616,6 +6691,17 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 # ``offset_<n>`` that collide with helion's tile offsets.
                 target = outer_setup_statements
             target.append(statement_from_string(f"{index_var} = {idx_expr}"))
+
+            if (
+                isinstance(static_extent, int)
+                and env.backend_name == "cute"
+                and not env.config_spec.matmul_facts
+                and not _cute_epilogue_subtile_active(self.fn.config)
+            ):
+                self.fn.cute_state.grid_thread_extents[index_var] = (
+                    axis,
+                    static_extent,
+                )
 
             # Bound by the *thread* extent rather than the block size: this
             # axis advances ``elements_per_thread`` per thread, so the threads

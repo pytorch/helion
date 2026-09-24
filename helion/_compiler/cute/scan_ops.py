@@ -8,6 +8,7 @@ same eager timing as before.
 
 from __future__ import annotations
 
+import ast
 import operator
 from typing import TYPE_CHECKING
 from typing import cast
@@ -19,8 +20,6 @@ from ...language import _decorators
 from ...language.scan_ops import _associative_scan
 
 if TYPE_CHECKING:
-    import ast
-
     from ..device_ir import HelperFunctionGraphInfo
     from ..inductor_lowering import CodegenState
 
@@ -55,6 +54,12 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     input_tensor = fx_node.meta["val"]
     if dim < 0:
         dim += input_tensor.ndim
+    from .scan_value import plan_scan_value
+
+    if op == "add" and (value_plan := plan_scan_value(input_node)) is not None:
+        return _cute_codegen_computed_add_scan(
+            state, helper_graph_info, value_plan, dim, reverse
+        )
     if dim != input_tensor.ndim - 1:
         # A non-last-dim scalar scan is a single-stream serial scan; reuse the
         # dim-agnostic machinery the tuple path already relies on (it folds the
@@ -479,12 +484,6 @@ def _cute_codegen_serial_scan(
     state.codegen.add_statement(
         statement_from_string(f"{out_pos} = {index_dtype}({out_pos_expr})")
     )
-    for acc_var, val in zip(acc_vars, vals, strict=True):
-        dtype_str = env.backend.dtype_str(val.dtype)
-        state.codegen.add_statement(
-            statement_from_string(f"{acc_var} = {dtype_str}(0)")
-        )
-    state.codegen.add_statement(statement_from_string(f"{initialized} = False"))
 
     # Global scan row for this iteration: ``offset + scan_i``.
     row_line = f"    {scan_row} = cutlass.Int32({offset_expr}) + {scan_i}"
@@ -531,6 +530,36 @@ def _cute_codegen_serial_scan(
             load_expr = f"({load_expr} if {mask_expr} else {load_dtype_str}(0))"
         value_lines.append(f"    {val_var} = {scan_dtype_str}({load_expr})")
 
+    if len(loads) == 1 and _cute_can_parallelize_add_scan(
+        state,
+        helper_graph_info,
+        input_nodes[0],
+        load_nodes[0],
+        loads[0],
+        scan_block_id,
+        sort_positions[0],
+        n_hint,
+    ):
+        return [
+            _cute_codegen_warp_add_scan(
+                state,
+                n_hint,
+                reverse,
+                out_pos,
+                offset_expr,
+                scan_row,
+                value_vars[0],
+                value_lines[0],
+            )
+        ]
+
+    for acc_var, val in zip(acc_vars, vals, strict=True):
+        dtype_str = env.backend.dtype_str(val.dtype)
+        state.codegen.add_statement(
+            statement_from_string(f"{acc_var} = {dtype_str}(0)")
+        )
+    state.codegen.add_statement(statement_from_string(f"{initialized} = False"))
+
     include_expr = f"{scan_i} >= {out_pos}" if reverse else f"{scan_i} <= {out_pos}"
 
     # Inline the user's combine graph (one statement per node, 4-space
@@ -571,6 +600,336 @@ def _cute_codegen_serial_scan(
     )
 
     return [expr_from_string(acc_var) for acc_var in acc_vars]
+
+
+def _cute_codegen_computed_add_scan(
+    state: CodegenState,
+    helper_graph_info: object,
+    plan: object,
+    dim: int,
+    reverse: bool,
+) -> ast.AST:
+    from torch.fx import Node
+
+    from ...language.memory_ops import _cute_active_index_var
+    from ..ast_extension import statement_from_string
+    from ..compile_environment import CompileEnvironment
+    from ..compile_environment import _to_sympy
+    from ..device_function import _exact_thread_block_dims
+    from ..host_function import HostFunction
+    from .cute_reshape import _get_dim_local_coord
+    from .cute_reshape import _resolve_dim_block_id
+    from .indexing import CuteSortableLoad
+    from .scan_value import ScanValuePlan
+    from .scan_value import emit_scan_value
+    from .scan_value import original_load_is_in_bounds
+    from .scan_value import scan_loop_ranges
+
+    assert isinstance(plan, ScanValuePlan)
+    env = CompileEnvironment.current()
+    tensor = plan.result.meta["val"]
+    block = _resolve_dim_block_id(state.codegen, tensor, dim)
+    if block is None:
+        raise exc.BackendUnsupported("cute", "computed add scan axis")
+    extent = env.block_sizes[block].from_config(state.device_function.config)
+    physical = _exact_thread_block_dims(state.device_function.tile_strategy)
+    if (
+        not isinstance(extent, int)
+        or physical is None
+        or physical[0] != extent
+        or len(HostFunction.current().device_ir.root_ids) != 1
+    ):
+        raise exc.BackendUnsupported("cute", "computed add scan physical layout")
+    index = _cute_active_index_var(state, block)
+    if index is None:
+        raise exc.BackendUnsupported("cute", "computed add scan index")
+    ranges = scan_loop_ranges(state)
+    if ranges is None or block not in ranges:
+        raise exc.BackendUnsupported("cute", "computed add scan logical domain")
+    # Leaf masks describe source validity, not the iteration domain. A masked
+    # leaf can still contribute through e.g. zero + 1 at a valid scan position.
+    # Only the owning loop's bounds determine additive padding for the result.
+    begin, end = (state.sympy_expr(_to_sympy(value)) for value in ranges[block])
+    positions: dict[Node, int | None] = {}
+    scan_sizes: list[int | torch.SymInt] = []
+    for leaf in plan.leaves:
+        load = leaf.meta["cute_sortable_load"]
+        assert isinstance(load, CuteSortableLoad)
+        matching = [
+            pos
+            for pos, expression in enumerate(load.index_exprs)
+            if expression == index
+        ]
+        if len(matching) > 1:
+            raise exc.BackendUnsupported("cute", "computed add scan repeated axis")
+        pos = matching[0] if matching else None
+        if not _cute_can_parallelize_add_scan(
+            state,
+            helper_graph_info,
+            plan.result,
+            leaf,
+            load,
+            block,
+            pos,
+            extent,
+            require_cast_chain=False,
+        ):
+            raise exc.BackendUnsupported("cute", "computed add scan ownership or alias")
+        if not original_load_is_in_bounds(state, leaf, ranges):
+            raise exc.BackendUnsupported(
+                "cute", "computed add scan original load bounds"
+            )
+        positions[leaf] = pos
+        if pos is not None:
+            source = leaf.args[0]
+            assert isinstance(source, Node)
+            scan_sizes.append(source.meta["val"].shape[pos])
+    if not scan_sizes or any(
+        not env.known_equal(size, scan_sizes[0]) for size in scan_sizes
+    ):
+        raise exc.BackendUnsupported("cute", "computed add scan leaf domains")
+    local = _get_dim_local_coord(state.codegen, tensor, dim)
+    offset = f"({index}) - ({local})"
+    out_pos = state.device_function.new_var("scan_out_pos")
+    row = state.device_function.new_var("scan_row")
+    value = state.device_function.new_var("scan_value")
+    state.codegen.add_statement(
+        statement_from_string(f"{out_pos} = cutlass.Int32({local})")
+    )
+    domain = f"cutlass.Int32({begin}) <= {row} < cutlass.Int32({end})"
+    lines = emit_scan_value(state, plan, positions, row, value, domain)
+    return _cute_codegen_warp_add_scan(
+        state, extent, reverse, out_pos, offset, row, value, "\n".join(lines)
+    )
+
+
+def _cute_can_parallelize_add_scan(
+    state: CodegenState,
+    helper_graph_info: object,
+    input_node: object,
+    load_node: object,
+    load: object,
+    scan_block_id: int,
+    scan_index_pos: int | None,
+    extent: int,
+    *,
+    require_cast_chain: bool = True,
+) -> bool:
+    """Prove a full warp scans adjacent positions of the same input stream.
+
+    Restrict this path to a grid's unsplit x axis, without lane loops or
+    divergent control flow. Other tensor coordinates and masks must be grid
+    coordinates on different CUDA axes (or constants). Unknown layouts keep
+    the serial implementation, which does not communicate between threads.
+    """
+    from torch._dynamo.source import LocalSource
+    from torch.fx.node import Node
+
+    from ...language import _tracing_ops
+    from ...language import memory_ops
+    from ..compile_environment import CompileEnvironment
+    from ..device_ir import HelperFunctionGraphInfo
+    from ..host_function import HostFunction
+    from ..tile_strategy import NDTileStrategy
+    from .fragment_epilogue import _has_fresh_output_allocation
+    from .indexing import CuteSortableLoad
+    from .memory_ops import runtime_tensor_sources_are_proven_disjoint
+
+    assert isinstance(load, CuteSortableLoad)
+    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
+    if (
+        not isinstance(input_node, Node)
+        or input_node.meta["val"].dtype is not torch.float32
+        or load.dtype not in (torch.bfloat16, torch.float32)
+        or extent < 32
+        or extent & (extent - 1)
+    ):
+        return False
+    # A cast preserves the lane's value. Shape changes may change its logical
+    # ownership, so do not look through them for the communicating fast path.
+    current = input_node
+    while require_cast_chain and current is not load_node:
+        if (
+            current.target is not torch.ops.prims.convert_element_type.default
+            or not isinstance(current.args[0], Node)
+            or current.meta["val"].dtype is not torch.float32
+        ):
+            return False
+        current = current.args[0]
+
+    nodes = list(helper_graph_info.graph.nodes)
+    if (
+        len(nodes) != 4
+        or any(node.op != "placeholder" for node in nodes[:2])
+        or nodes[2].op != "call_function"
+        or nodes[2].target not in (operator.add, torch.add, torch.ops.aten.add.Tensor)
+        or nodes[2].args != tuple(nodes[:2])
+        or nodes[2].kwargs
+        or nodes[3].op != "output"
+        or nodes[3].args[0] not in (nodes[2], (nodes[2],), [nodes[2]])
+    ):
+        return False
+
+    cg = state.codegen
+    grid = cg.current_grid_state
+    if (
+        grid is None
+        or not isinstance(grid.strategy, NDTileStrategy)
+        or grid.has_lane_loops()
+        or cg._cute_branch_path
+        or state.fx_node is None
+        or cg.current_root_graph_info is None
+        or state.fx_node.graph is not cg.current_root_graph_info.graph
+        or grid.block_thread_axes.get(scan_block_id) != 0
+        or grid.thread_axis_sizes.get(0) != extent
+        or any(
+            loop is not grid
+            for loops in cg.active_device_loops.values()
+            for loop in loops
+        )
+    ):
+        return False
+    if scan_index_pos is not None and load.index_exprs[
+        scan_index_pos
+    ] != grid.strategy.index_var(scan_block_id):
+        return False
+
+    # Different warps finish their scans at different times. Every write in
+    # this root must target storage distinct from the scanned input, otherwise
+    # a completed warp could overwrite a group another warp still has to read.
+    assert isinstance(load_node, Node)
+    source = load_node.args[0]
+    if not isinstance(source, Node) or source.target is not _tracing_ops._host_tensor:
+        return False
+    source_tensor = source.meta["val"]
+    env = CompileEnvironment.current()
+    for node in cg.current_root_graph_info.graph.nodes:
+        if node.op != "call_function" or not node.is_impure():
+            continue
+        if node.target is not memory_ops.store:
+            return False
+        target = node.args[0]
+        if (
+            not isinstance(target, Node)
+            or target.target is not _tracing_ops._host_tensor
+        ):
+            return False
+        target_tensor = target.meta.get("val")
+        if not isinstance(target_tensor, torch.Tensor):
+            return False
+        if source_tensor.untyped_storage() is target_tensor.untyped_storage():
+            return False
+        if _has_fresh_output_allocation(target):
+            continue
+        names = (source.args[0], target.args[0])
+        if any(
+            isinstance(child, ast.Name)
+            and isinstance(child.ctx, ast.Store)
+            and child.id in names
+            for statement in HostFunction.current().body
+            for child in ast.walk(statement)
+        ) or not runtime_tensor_sources_are_proven_disjoint(
+            env,
+            LocalSource(cast("str", names[0]), is_input=True),
+            LocalSource(cast("str", names[1]), is_input=True),
+        ):
+            return False
+
+    uniform_names: set[str] = set()
+    for block_id in grid.block_ids:
+        if block_id == scan_block_id:
+            continue
+        if grid.block_thread_axes.get(block_id) == 0:
+            return False
+        uniform_names.add(grid.strategy.index_var(block_id))
+        uniform_names.add(grid.strategy.offset_var(block_id))
+        mask = grid.strategy.mask_var(block_id)
+        if mask is not None:
+            uniform_names.add(mask)
+
+    expressions = [
+        expr for pos, expr in enumerate(load.index_exprs) if pos != scan_index_pos
+    ]
+    if load.mask_expr is not None:
+        non_scan_mask = _cute_strip_mask_term(
+            load.mask_expr, grid.strategy.mask_var(scan_block_id)
+        )
+        if non_scan_mask is not None:
+            expressions.append(non_scan_mask)
+    for expression in expressions:
+        for node in ast.walk(ast.parse(expression, mode="eval")):
+            if isinstance(node, (ast.Call, ast.Attribute, ast.Subscript)):
+                return False
+            if isinstance(node, ast.Name) and node.id not in uniform_names:
+                return False
+    return True
+
+
+def _cute_codegen_warp_add_scan(
+    state: CodegenState,
+    extent: int,
+    reverse: bool,
+    out_pos: str,
+    offset_expr: str,
+    scan_row: str,
+    value: str,
+    value_line: str,
+) -> ast.AST:
+    """Scan one warp and reduce preceding warp-sized input groups locally.
+
+    Each warp reloads the other groups it needs. This trades a little duplicate
+    input traffic for avoiding CTA barriers and shared memory: an N-element
+    scan needs at most N/32 loads per thread instead of N loads per thread.
+    The load already includes the original non-scan mask and scan-tail guard.
+    """
+    import textwrap
+
+    from ..ast_extension import expr_from_string
+
+    new_var = state.device_function.new_var
+    lane = new_var("scan_lane")
+    warp_base = new_var("scan_warp_base")
+    acc = new_var("scan_warp_prefix")
+    other_groups = new_var("scan_other_groups")
+    group = new_var("scan_group")
+    shuffled = new_var("scan_shuffled")
+    statements = [
+        f"{lane} = {out_pos} % cutlass.Int32(32)",
+        f"{warp_base} = {out_pos} - {lane}",
+        f"{scan_row} = cutlass.Int32({offset_expr}) + {out_pos}",
+        textwrap.dedent(value_line),
+        f"{acc} = {value}",
+    ]
+    shuffle = "shuffle_sync_down" if reverse else "shuffle_sync_up"
+    for shift in (1, 2, 4, 8, 16):
+        guard = f"{lane} < {32 - shift}" if reverse else f"{lane} >= {shift}"
+        statements.extend(
+            [
+                f"{shuffled} = cute.arch.{shuffle}({acc}, offset={shift})",
+                f"{acc} = {acc} + ({shuffled} if {guard} else cutlass.Float32(0))",
+            ]
+        )
+    if extent > 32:
+        statements.append(f"{other_groups} = cutlass.Float32(0)")
+        start = f"{warp_base} + cutlass.Int32(32)" if reverse else "cutlass.Int32(0)"
+        stop = f"cutlass.Int32({extent})" if reverse else warp_base
+        statements.extend(
+            [
+                "\n".join(
+                    [
+                        f"for {group} in range({start}, {stop}, cutlass.Int32(32)):",
+                        f"    {scan_row} = cutlass.Int32({offset_expr}) + {group} + {lane}",
+                        value_line,
+                        f"    {other_groups} = {other_groups} + {value}",
+                    ]
+                ),
+                f"{acc} = {acc} + cute.arch.warp_reduction_sum({other_groups})",
+            ]
+        )
+    for statement in statements:
+        for item in ast.parse(statement).body:
+            state.codegen.add_statement(item)
+    return expr_from_string(acc)
 
 
 def _scan_combine_operator(helper_graph_info: HelperFunctionGraphInfo) -> str:

@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ...language import _tracing_ops
 from ...language import matmul_ops
 from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
@@ -37,6 +38,9 @@ from .cute_epilogue import _AuxiliaryTensorLoadExpr
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import reach_matmul_anchors
+from .tcgen05_constants import TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
+from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -44,6 +48,134 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..host_function import HostFunction
+    from .mapped_aux_index import MappedAuxIndex
+
+
+def batched_aux_tma_layout_supported(tensor: torch.Tensor) -> bool:
+    """A nonoverlapping, row-major B/M/N TensorMap with aligned outer strides.
+
+    Pointer alignment and overlap with the output are runtime properties and
+    are checked on every launch, including cached relaunches.
+    """
+    if tensor.ndim != 3 or tensor.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    if not all(isinstance(size, int) and size > 0 for size in tensor.shape):
+        return False
+    batch_stride, row_stride, column_stride = tensor.stride()
+    if not all(isinstance(stride, int) for stride in tensor.stride()):
+        return False
+    return (
+        column_stride == 1
+        and row_stride >= tensor.shape[2]
+        and batch_stride >= tensor.shape[1] * row_stride
+        and row_stride * tensor.element_size() % 16 == 0
+        and batch_stride * tensor.element_size() % 16 == 0
+    )
+
+
+def batched_aux_tma_smem_bytes(
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    ab_stages: int,
+    c_stages: int,
+    aux_stages: int,
+    aux_count: int,
+) -> int:
+    """Full-tile 16-bit AB, D, and auxiliary rings, plus conservative headroom.
+
+    Reuse the existing TCgen05 reservation for alignment, barriers, and
+    scheduler metadata. Ring bytes use the same default epilogue tile helper
+    as emitted code, rather than assuming a fixed subtile size.
+    """
+    epi_m, epi_n = tcgen05_default_epilogue_tile_size(
+        bm, bn, elem_width_d=16, elem_width_c=16
+    )
+    return (
+        tcgen05_ab_smem_bytes_per_cta(
+            bm=bm, bn=bn, bk=bk, dtype_bytes=2, ab_stages=ab_stages, cluster_m=1
+        )
+        + epi_m * epi_n * 2 * (c_stages + aux_count * aux_stages)
+        + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+    )
+
+
+def batched_aux_tma_output(
+    cg: GenerateAST, descriptors: tuple[Tcgen05AuxTensorDescriptor, ...]
+) -> torch.Tensor | None:
+    """Require one directly bound output and no other observable writes.
+
+    All staged sources must be exact B/M/N tensors matching that output. The
+    launcher receives the output argument too, so alias checks cannot be
+    bypassed by reusing a compiled callable with new tensor arguments.
+    """
+    staged = staged_aux_tensor_descriptors(descriptors, batched_tma=True)
+    if not staged:
+        return None
+    output: torch.Tensor | None = None
+    for graph_info in cg.codegen_graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or not node.is_impure():
+                continue
+            if _tracing_ops.is_for_loop_target(node.target) or (
+                node.target is _tracing_ops._phi
+            ):
+                continue
+            if node.target is not memory_ops.store:
+                return None
+            if (
+                len(node.args) < 3
+                or (len(node.args) > 3 and node.args[3] is not None)
+                or node.kwargs
+                or any(desc.load_node.args[1] != node.args[1] for desc in staged)
+            ):
+                return None
+            target = node.args[0]
+            if not isinstance(target, torch.fx.Node) or (
+                target.target is not _tracing_ops._host_tensor
+            ):
+                return None
+            value = target.meta.get("val")
+            if not isinstance(value, torch.Tensor):
+                return None
+            if output is not None and value is not output:
+                return None
+            output = value
+    if output is None or not batched_aux_tma_layout_supported(output):
+        return None
+    for desc in descriptors:
+        value = desc.host_tensor_val
+        if desc.mapped_index is not None:
+            if (
+                not mapped_aux_layout_supported(value)
+                or value.untyped_storage() is output.untyped_storage()
+            ):
+                return None
+            continue
+        if (
+            desc.broadcast_axis is not None
+            or not batched_aux_tma_layout_supported(value)
+            or value.shape != output.shape
+            or value.dtype != output.dtype
+            or value.untyped_storage() is output.untyped_storage()
+        ):
+            return None
+    return output
+
+
+def mapped_aux_layout_supported(tensor: torch.Tensor) -> bool:
+    """Static layouts for proven direct reads, not TensorMap-staged inputs.
+
+    FP32 and naturally aligned non-16B pointers are valid. Per-call metadata
+    and output-overlap guards preserve the mapped address proof at runtime.
+    """
+    return (
+        tensor.ndim in (1, 2, 3)
+        and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and all(isinstance(size, int) and size > 0 for size in tensor.shape)
+        and all(isinstance(stride, int) and stride >= 0 for stride in tensor.stride())
+    )
 
 
 # Mirrors ``cute_mma._TRACE_THROUGH_TARGETS`` — the data-preserving
@@ -124,6 +256,24 @@ class Tcgen05AuxTensorDescriptor:
     host_tensor_val: torch.Tensor
     broadcast_axis: int | None
     store_value_node: torch.fx.Node
+    # Direct coordinate-mapped operands never allocate a TMA ring.
+    mapped_index: MappedAuxIndex | None = None
+
+
+def staged_aux_tensor_descriptors(
+    descriptors: tuple[Tcgen05AuxTensorDescriptor, ...], *, batched_tma: bool
+) -> tuple[Tcgen05AuxTensorDescriptor, ...]:
+    """One selection shared by the admission, allocator, and producer plans."""
+    return tuple(
+        desc
+        for desc in descriptors
+        if desc.broadcast_axis is None
+        and desc.mapped_index is None
+        and (
+            desc.host_tensor_val.ndim == 2
+            or (batched_tma and desc.host_tensor_val.ndim == 3)
+        )
+    )
 
 
 def _output_global_shape_from_store(
@@ -175,8 +325,54 @@ def analyze_tcgen05_matmul_store_chains(
             chain, anchor = analyzed
             if anchor is not matmul_fx_node:
                 return None
+            if not _mapped_auxiliary_store_supported(store_node, chain):
+                return None
             analyzed_stores.append((store_node, chain))
     return tuple(analyzed_stores) if analyzed_stores else None
+
+
+def _mapped_auxiliary_store_supported(
+    store: torch.fx.Node, chain: Tcgen05UnaryEpilogueChain
+) -> bool:
+    """Keep preconfig mapped admission inside the existing batched transport.
+
+    Mapped reads need an exact staged AUX companion and a directly bound
+    rank-three output. Reject known aliases here so an unsupported mapped
+    chain cannot displace the ordinary MMA fallback. Unknown runtime overlap
+    remains guarded on every launch, including cached launches.
+    """
+    mapped = [
+        step for step in chain.auxiliary_tensor_loads if step.mapped_index is not None
+    ]
+    if not mapped:
+        return True
+    output = _output_tensor_from_store_node(store)
+    if output is None or not batched_aux_tma_layout_supported(output):
+        return False
+    if any(step.broadcast_axis is not None for step in chain.auxiliary_tensor_loads):
+        return False
+    staged = [
+        step
+        for step in chain.auxiliary_tensor_loads
+        if step.mapped_index is None and step.broadcast_axis is None
+    ]
+    if not staged:
+        return False
+    for step in staged:
+        _, source = _step_host_tensor(step)
+        if (
+            step.load_node.args[1] != store.args[1]
+            or not batched_aux_tma_layout_supported(source)
+            or not _same_static_shape(source, output)
+            or source.dtype != output.dtype
+            or source.untyped_storage() is output.untyped_storage()
+        ):
+            return False
+    return all(
+        mapped_aux_layout_supported(source)
+        and source.untyped_storage() is not output.untyped_storage()
+        for _, source in (_step_host_tensor(step) for step in mapped)
+    )
 
 
 def _step_host_tensor(
@@ -218,6 +414,7 @@ def _aux_descriptor_from_step(
         host_tensor_val=host_tensor_val,
         broadcast_axis=step.broadcast_axis,
         store_value_node=store_value_node,
+        mapped_index=step.mapped_index,
     )
 
 
@@ -335,7 +532,8 @@ def host_function_has_tcgen05_aux_kernel_pattern(
     if not mma_nodes:
         return False
     for mma_node in mma_nodes:
-        analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
+        with host_function:
+            analyzed_stores = analyze_tcgen05_matmul_store_chains(graphs, mma_node)
         if analyzed_stores is not None and any(
             chain.auxiliary_tensor_loads for _, chain in analyzed_stores
         ):
@@ -383,11 +581,12 @@ def host_function_has_tcgen05_exact_shape_aux_kernel_pattern(
     if not store_outputs:
         return False
 
-    return _has_tma_compatible_analyzed_aux_store(
-        store_outputs,
-        inner_outputs_by_graph_id=build_inner_outputs_index_from_graphs(graphs),
-        target_fx_nodes=mma_nodes,
-    )
+    with host_function:
+        return _has_tma_compatible_analyzed_aux_store(
+            store_outputs,
+            inner_outputs_by_graph_id=build_inner_outputs_index_from_graphs(graphs),
+            target_fx_nodes=mma_nodes,
+        )
 
 
 def _tcgen05_aux_detector_mma_nodes(
@@ -505,7 +704,9 @@ def _has_tma_compatible_analyzed_aux_store(
             continue
         chain, _anchor = analyzed
         exact_steps = [
-            step for step in chain.auxiliary_tensor_loads if step.broadcast_axis is None
+            step
+            for step in chain.auxiliary_tensor_loads
+            if step.broadcast_axis is None and step.mapped_index is None
         ]
         if not exact_steps:
             continue

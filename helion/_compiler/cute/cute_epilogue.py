@@ -25,7 +25,10 @@ expression for two cases:
   ``helion.language.load(aux_tensor, [...])`` calls as the other.
   Auxiliary expressions may use the same whitelisted unary and
   scalar-binary operations as the carrier chain without flattening
-  their floating-point association. Two aux load shapes are accepted: the
+  their floating-point association. Explicit FP16/BF16/FP32 conversions
+  within auxiliary expressions preserve each rounding boundary; casts on
+  the accumulator carrier remain outside the whitelist.
+  Two aux load shapes are accepted: the
   exact-shape rank-2 form (``residual[tile_m, tile_n]``) and the
   rank-1 trailing-axis (rowvec) broadcast form (``bias[tile_n]``).
   See :class:`_AuxiliaryTensorLoadExpr` for the canonical contract.
@@ -60,6 +63,7 @@ from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
 from ...language._gelu_tanh_approx import gelu_erf_epilogue_unary_step_template
+from ..compile_environment import CompileEnvironment
 from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
@@ -70,6 +74,7 @@ if TYPE_CHECKING:
 
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
+    from .mapped_aux_index import MappedAuxIndex
 
 
 # Whitelist semantics: every accepted op must (a) have exactly one tensor
@@ -121,6 +126,7 @@ class _AuxiliaryTensorLoadExpr:
     load_node: torch.fx.Node
     broadcast_axis: int | None
     template: str
+    mapped_index: MappedAuxIndex | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,6 +135,15 @@ class _UnaryTensorExpr:
 
     step: _UnaryOp
     operand: _TensorExpr
+
+
+@dataclasses.dataclass(frozen=True)
+class _CastTensorExpr:
+    """An explicit auxiliary conversion; never fold a narrowing/widening pair."""
+
+    operand: _TensorExpr
+    source_dtype: torch.dtype
+    target_dtype: torch.dtype
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,8 +157,18 @@ class _BinaryTensorExpr:
 
 
 _TensorExpr = (
-    _CurrentTensorExpr | _AuxiliaryTensorLoadExpr | _UnaryTensorExpr | _BinaryTensorExpr
+    _CurrentTensorExpr
+    | _AuxiliaryTensorLoadExpr
+    | _UnaryTensorExpr
+    | _CastTensorExpr
+    | _BinaryTensorExpr
 )
+
+_AUX_CAST_DTYPES: dict[torch.dtype, str] = {
+    torch.float16: "cutlass.Float16",
+    torch.bfloat16: "cutlass.BFloat16",
+    torch.float32: "cutlass.Float32",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -469,11 +494,46 @@ def _unmasked_helion_load_args(
     return node.args[0], node.args[1]
 
 
+def _auxiliary_cast_operand(
+    node: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.dtype, torch.dtype] | None:
+    """Validate a shape-preserving numeric cast using the traced tensor metadata.
+
+    Auxiliary conversions are separate from the accumulator-chain whitelist.
+    Integer, boolean, float8/float64, bitcasts and device/layout conversions
+    remain outside this narrow floating-point expression contract.
+    """
+    if (
+        node.op != "call_function"
+        or node.target is not torch.ops.prims.convert_element_type.default
+        or node.kwargs
+        or len(node.args) != 2
+    ):
+        return None
+    operand, target_dtype = node.args
+    if not isinstance(operand, torch.fx.Node) or not isinstance(
+        target_dtype, torch.dtype
+    ):
+        return None
+    source = operand.meta.get("val")
+    result = node.meta.get("val")
+    if (
+        not isinstance(source, torch.Tensor)
+        or not isinstance(result, torch.Tensor)
+        or source.dtype not in _AUX_CAST_DTYPES
+        or target_dtype not in _AUX_CAST_DTYPES
+        or result.dtype != target_dtype
+        or tuple(source.shape) != tuple(result.shape)
+    ):
+        return None
+    return operand, source.dtype, target_dtype
+
+
 def _canonical_aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
     """Return the underlying aux load plus its local-value template.
 
-    Canonical unwrapping currently accepts raw aux loads and fp32 casts of
-    aux loads; other dtype casts stay outside the fused aux pattern.
+    Preserve the existing raw-load/fp32-load source and hoisting fast paths.
+    Other supported conversions are explicit nodes in the auxiliary tree.
     """
     if _is_helion_load_node(node):
         return node, "{aux}"
@@ -484,6 +544,7 @@ def _canonical_aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str
         and len(node.args) == 2
         and node.args[1] is torch.float32
         and isinstance(node.args[0], torch.fx.Node)
+        and _auxiliary_cast_operand(node) is not None
     ):
         inner = node.args[0]
         if _is_helion_load_node(inner):
@@ -537,6 +598,9 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
         return True
     if node.op != "call_function" or node.kwargs:
         return False
+    cast_operand = _auxiliary_cast_operand(node)
+    if cast_operand is not None:
+        return _is_auxiliary_tensor_expr_node(cast_operand[0], depth + 1)
     unary_step = _ZERO_ARG_TARGETS.get(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:
@@ -574,7 +638,7 @@ def _auxiliary_tensor_expr_operands(
         return ()
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
         return (expr,)
-    if isinstance(expr, _UnaryTensorExpr):
+    if isinstance(expr, (_UnaryTensorExpr, _CastTensorExpr)):
         return _auxiliary_tensor_expr_operands(expr.operand)
     if isinstance(expr, _BinaryTensorExpr):
         return (
@@ -589,7 +653,7 @@ def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
         return True
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
         return False
-    if isinstance(expr, _UnaryTensorExpr):
+    if isinstance(expr, (_UnaryTensorExpr, _CastTensorExpr)):
         return _tensor_expr_contains_current(expr.operand)
     if isinstance(expr, _BinaryTensorExpr):
         return _tensor_expr_contains_current(expr.lhs) or _tensor_expr_contains_current(
@@ -617,7 +681,7 @@ def _render_auxiliary_tensor_expr(
         assert isinstance(local, str)
         rendered = expr.template.format(aux=aux_local)
         return f"{prelude_indent}{local} = {rendered}\n", local
-    if isinstance(expr, _UnaryTensorExpr):
+    if isinstance(expr, (_UnaryTensorExpr, _CastTensorExpr)):
         prelude, operand = _render_auxiliary_tensor_expr(
             expr.operand,
             carrier_name,
@@ -632,7 +696,11 @@ def _render_auxiliary_tensor_expr(
         )
         local = local_name_factory(local_prefix)  # type: ignore[operator]
         assert isinstance(local, str)
-        rendered = expr.step.template.format(inner=operand)
+        rendered = (
+            expr.step.template.format(inner=operand)
+            if isinstance(expr, _UnaryTensorExpr)
+            else f"({operand}).to({_AUX_CAST_DTYPES[expr.target_dtype]})"
+        )
         return prelude + f"{prelude_indent}{local} = {rendered}\n", local
     if isinstance(expr, _BinaryTensorExpr):
         lhs_prelude, lhs = _render_auxiliary_tensor_expr(
@@ -1058,6 +1126,44 @@ def _node_tensor_dtype(node: torch.fx.Node) -> torch.dtype | None:
     return val.dtype if isinstance(val, torch.Tensor) else None
 
 
+def _mapped_auxiliary_load(
+    load: torch.fx.Node,
+    carrier_indices: tuple[torch.fx.Node, ...] | None,
+    output_shape: tuple[object, ...] | None,
+) -> MappedAuxIndex | None:
+    if (
+        carrier_indices is None
+        or output_shape is None
+        or not all(type(size) is int for size in output_shape)
+        or not CompileEnvironment.has_current()
+        or _node_tensor_dtype(load) not in _AUX_CAST_DTYPES
+    ):
+        return None
+    env = CompileEnvironment.current()
+    static_output_shape: list[int] = []
+    for extent in output_shape:
+        assert isinstance(extent, int)
+        static_output_shape.append(extent)
+    block_ids: list[int] = []
+    for node in carrier_indices:
+        size = node.meta.get("val")
+        if not isinstance(size, (int, torch.SymInt)):
+            return None
+        block_id = env.get_block_id(size)
+        if block_id is None:
+            return None
+        block_ids.append(block_id)
+    # The index interpreter also imports language memory operations. Keep this
+    # dependency local to avoid a module-initialization cycle.
+    from .mapped_aux_index import analyze_mapped_aux_load
+
+    return analyze_mapped_aux_load(
+        load,
+        output_block_ids=block_ids,
+        output_shape=static_output_shape,
+    )
+
+
 def _classify_auxiliary_tensor_expr_impl(
     node: torch.fx.Node,
     *,
@@ -1084,8 +1190,37 @@ def _classify_auxiliary_tensor_expr_impl(
             template=aux_template,
         )
 
+    if _is_helion_load_node(load_node):
+        mapped_index = _mapped_auxiliary_load(
+            load_node, carrier_tile_index_nodes, carrier_global_shape
+        )
+        if mapped_index is not None:
+            return _AuxiliaryTensorLoadExpr(
+                load_node=load_node,
+                broadcast_axis=None,
+                template=aux_template,
+                mapped_index=mapped_index,
+            )
+
     if node.op != "call_function" or node.kwargs:
         return None
+    cast_operand = _auxiliary_cast_operand(node)
+    if cast_operand is not None:
+        operand_node, source_dtype, target_dtype = cast_operand
+        operand_expr = _classify_auxiliary_tensor_expr_impl(
+            operand_node,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+            depth=depth + 1,
+        )
+        if operand_expr is None:
+            return None
+        return _CastTensorExpr(
+            operand=operand_expr,
+            source_dtype=source_dtype,
+            target_dtype=target_dtype,
+        )
     unary_step = _ZERO_ARG_TARGETS.get(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:

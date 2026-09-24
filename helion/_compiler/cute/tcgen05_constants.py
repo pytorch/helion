@@ -423,6 +423,12 @@ TCGEN05_AUX_STAGE_COUNT_CHOICES = (2, 3)
 TCGEN05_CONSUMER_REGS_CONFIG_KEY = "tcgen05_consumer_regs"
 TCGEN05_CONSUMER_REGS_DEFAULT = 256
 TCGEN05_CONSUMER_REGS_CHOICES = (224, 232, 240, 256)
+# Full-tile, single-CTA role-local kernels additionally search a lower cap.
+# Keep the older domain separate: grouped/CLC policies retain their validation.
+TCGEN05_CONSUMER_REGS_FULL_TILE_CHOICES = (256, 128)
+
+# Keep the scheduler warp slot but compute static work coordinates in each role.
+TCGEN05_AUX_ROLE_LOCAL_SCHEDULER_CONFIG_KEY = "tcgen05_aux_role_local_scheduler"
 
 # Stage tuples that the TVM-FFI flat-role seed accepts, keyed by ``bk``. The
 # general FFI seed eligibility (``tcgen05_config.py``) consumes this table via
@@ -705,7 +711,8 @@ def tcgen05_grouped_worklist_smem_bytes(
     )
     # Fixed-TensorMap modes overpay the 384 B below at the 227-KiB boundary.
     offset = _append_aligned_tcgen05_smem(offset, 2 * 128, 128)
-    offset = _append_aligned_tcgen05_smem(offset, ab_stages * 8, 8)
+    # PipelineTmaUmma owns a full and an empty barrier for every AB stage.
+    offset = _append_aligned_tcgen05_smem(offset, ab_stages * 2 * 8, 8)
     # Mutable output TensorMap and the aligned TMA-store ring.
     offset = _append_aligned_tcgen05_smem(offset, 128, 128)
     c_smem_bytes = tcgen05_c_smem_bytes_per_cta(

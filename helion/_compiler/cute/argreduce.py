@@ -13,6 +13,7 @@ from ..compile_environment import CompileEnvironment
 from .cute_reshape import _coords_from_flat_index
 from .cute_reshape import _current_flat_index_for_value
 from .cute_reshape import _flat_index_from_coords
+from .cute_reshape import _get_dim_local_coord
 from .cute_reshape import _get_tile_shape
 from .cute_reshape import resolve_cute_shape_chain_value
 from .indexing import CuteShapeChainView
@@ -64,10 +65,10 @@ def _input_in_bounds_expr(
     cg: GenerateAST,
     value: torch.Tensor,
 ) -> str | None:
+    env = CompileEnvironment.current()
     terms: list[str] = []
     for dim, size in enumerate(value.shape):
-        coord = _current_global_coord_expr(cg, value, dim)
-        if coord is None:
+        if _current_global_coord_expr(cg, value, dim) is None:
             continue
         if not isinstance(size, (int, torch.SymInt)):
             continue
@@ -76,7 +77,22 @@ def _input_in_bounds_expr(
             if isinstance(size, int)
             else cg.device_function.sympy_expr(size._sympy_())
         )
-        terms.append(f"(({coord}) < ({size_expr}))")
+        # Tensor dimensions describe this tile, not the whole input. A global
+        # coordinate would reject every CTA after the first one. The existing
+        # loop/grid mask separately carries the true input tail (and surplus
+        # thread bounds), so padded zero loads never become valid candidates.
+        coord = _get_dim_local_coord(cg, value, dim)
+        terms.append(f"(({coord}) >= 0 and ({coord}) < ({size_expr}))")
+        block_id = env.get_block_id(size)
+        assert block_id is not None
+        loops = cg.active_device_loops.get(block_id)
+        if loops:
+            mask = loops[-1].strategy.mask_var(block_id)
+        else:
+            assert cg.current_grid_state is not None
+            mask = cg.current_grid_state.strategy.mask_var(block_id)
+        if mask is not None:
+            terms.append(mask)
     if not terms:
         return None
     return " and ".join(terms)

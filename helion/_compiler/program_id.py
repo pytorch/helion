@@ -8,6 +8,7 @@ from typing import ClassVar
 from typing import NamedTuple
 from typing import cast
 
+import sympy
 import torch
 
 from .. import exc
@@ -101,6 +102,37 @@ def _literal_mailbox_access_fields(
         and access.value.id == mailbox_name
     ]
     direct_mailbox_names = {id(access.value) for access in accesses}
+    snapshot_reads: set[int] = set()
+    for call in ast.walk(node):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_cute_inline_asm_elementwise"
+        ):
+            continue
+        # Selected-grouped mailboxes are unstaged. Recognize only our exact
+        # non-speculatable literal-field load, not arbitrary pointer escapes,
+        # inline assembly, or dynamic offsets. This preserves the publication
+        # omission proof when the consumer uses a leader-owned snapshot.
+        for pointer in ast.walk(call):
+            if not (
+                isinstance(pointer, ast.BinOp)
+                and isinstance(pointer.op, ast.Add)
+                and isinstance(pointer.left, ast.Attribute)
+                and pointer.left.attr == "iterator"
+                and isinstance(pointer.left.value, ast.Name)
+                and pointer.left.value.id == mailbox_name
+                and isinstance(pointer.right, ast.Call)
+                and len(pointer.right.args) == 1
+                and isinstance(pointer.right.args[0], ast.Constant)
+                and type(pointer.right.args[0].value) is int
+            ):
+                continue
+            field = cast("int", pointer.right.args[0].value)
+            expected = _sched_mailbox_load_expr(mailbox_name, field)
+            if ast.dump(call) == ast.dump(expected):
+                snapshot_reads.add(field)
+                direct_mailbox_names.add(id(pointer.left.value))
     assert all(
         id(name) in direct_mailbox_names
         for name in ast.walk(node)
@@ -109,7 +141,7 @@ def _literal_mailbox_access_fields(
         and isinstance(name.ctx, ast.Load)
     ), "generated mailbox use must be a direct literal field access"
 
-    reads: set[int] = set()
+    reads: set[int] = snapshot_reads
     writes: set[int] = set()
     for access in accesses:
         field_expr = access.slice
@@ -164,6 +196,95 @@ def _clone_stmt(stmt: ast.stmt) -> ast.stmt:
 _TCGEN05_WORK_TILE_MAILBOX_VALID = 3
 
 
+_SCHED_MAILBOX_LOAD_ASM = (
+    "{ .reg .pred leader; mov.u32 $0, 0; "
+    "setp.eq.u32 leader, $2, 0; @leader ld.volatile.shared.u32 $0, [$1]; }"
+)
+
+
+def _sched_mailbox_load_expr(
+    mailbox: str, field: int, stage: str | None = None
+) -> ast.AST:
+    tensor = mailbox if stage is None else f"{mailbox}[None, {stage}]"
+    return expr_from_string(
+        f"_cute_inline_asm_elementwise((("
+        f"{tensor}.iterator + cutlass.Int32({field})).toint(), "
+        "cute.arch.lane_idx()), asm={assembly}, "
+        "constraints={constraints}, dtype=cutlass.Int32, is_pure=False)",
+        assembly=create(ast.Constant, value=_SCHED_MAILBOX_LOAD_ASM),
+        # Zero initialization precedes both inputs' uses: the output must not
+        # overlap either the address or lane input register.
+        constraints=create(ast.Constant, value="=&r,r,r,~{memory}"),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _SchedMailboxSnapshot:
+    """Warp-uniform registers loaded only by the lane that acquired the stage."""
+
+    valid: str
+    fields: dict[int, str]
+
+    @classmethod
+    def create(
+        cls, device_function: DeviceFunction, prefix: str, fields: tuple[int, ...]
+    ) -> _SchedMailboxSnapshot | None:
+        if (
+            device_function.config.get(
+                TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+                TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
+            )
+            != TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+        ):
+            # Do not even allocate names in normal mode: its generated code
+            # and producer/publication protocol must remain unchanged.
+            return None
+        return cls(
+            device_function.new_var(f"{prefix}_mailbox_valid"),
+            {
+                field: device_function.new_var(f"{prefix}_mailbox_{field}")
+                for field in fields
+            },
+        )
+
+    def read_block(
+        self, mailbox: str, valid_var: str, valid_field: int, stage: str | None
+    ) -> list[ast.stmt]:
+        def read(field: int, name: str) -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    f"{name} = {{load}}",
+                    load=_sched_mailbox_load_expr(mailbox, field, stage),
+                ),
+                statement_from_string(f"{name} = cute.arch.shuffle_sync({name}, 0)"),
+            ]
+
+        # Selected-grouped sentinels initialize only valid, including on an
+        # empty work stream. Never read their uninitialized payload fields.
+        result = read(valid_field, self.valid)
+        result.append(
+            statement_from_string(f"{valid_var} = {self.valid} != cutlass.Int32(0)")
+        )
+        if self.fields:
+            result.extend(
+                statement_from_string(f"{name} = cutlass.Int32(0)")
+                for name in self.fields.values()
+            )
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(valid_var),
+                    body=[
+                        stmt
+                        for field, name in self.fields.items()
+                        for stmt in read(field, name)
+                    ],
+                    orelse=[],
+                )
+            )
+        return result
+
+
 def _build_sched_pipeline_consumer_wait_block(
     *,
     sched_pipeline: str,
@@ -172,6 +293,7 @@ def _build_sched_pipeline_consumer_wait_block(
     valid_var: str,
     valid_slot_index: int = _TCGEN05_WORK_TILE_MAILBOX_VALID,
     work_tile_stage_index: str | None = None,
+    snapshot: _SchedMailboxSnapshot | None = None,
 ) -> list[ast.stmt]:
     """Emit the consumer-side wait block for the ``ROLE_LOCAL_WITH_SCHEDULER``
     sched_pipeline: ``consumer_wait`` → ``fence_view_async_shared``
@@ -199,9 +321,10 @@ def _build_sched_pipeline_consumer_wait_block(
 
     Diagnostic ``tcgen05_sched_consumer_wait_mode="warp_leader"``
     instead gates ``consumer_wait`` to lane 0 and reconverges the warp
-    before the async-shared fence. This is a profiling-only wait topology
-    experiment; the normal whole-warp wait path remains the default because
-    B200 timing showed the lane-0 variant is slower.
+    before the async-shared fence. Only that acquiring lane may read the
+    mailbox; a valid-first register snapshot broadcasts those values to the
+    warp. Explicit predication, volatility and a memory clobber prevent LLVM
+    from speculating shared loads into non-acquiring lanes or past release.
     """
     try:
         wait_mode = DeviceFunction.current().config.get(
@@ -219,6 +342,7 @@ def _build_sched_pipeline_consumer_wait_block(
         )
     )
     if wait_mode == TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER:
+        assert snapshot is not None
         return [
             create(
                 ast.If,
@@ -233,7 +357,9 @@ def _build_sched_pipeline_consumer_wait_block(
             statement_from_string("cute.arch.sync_warp()"),
             statement_from_string("cute.arch.fence_view_async_shared()"),
             statement_from_string("cute.arch.sync_warp()"),
-            statement_from_string(f"{valid_var} = {valid_slot} != cutlass.Int32(0)"),
+            *snapshot.read_block(
+                work_tile_smem, valid_var, valid_slot_index, work_tile_stage_index
+            ),
         ]
     return [
         statement_from_string(
@@ -251,28 +377,21 @@ def _build_sched_pipeline_consumer_release_block(
     sched_consumer_state: str,
 ) -> list[ast.stmt]:
     """Emit the consumer-side release block for the
-    ``ROLE_LOCAL_WITH_SCHEDULER`` sched_pipeline: lane-0-gated
+    ``ROLE_LOCAL_WITH_SCHEDULER`` sched_pipeline: whole-warp
     ``consumer_release`` → ``advance_state`` → ``sync_warp``.
 
     Companion to ``_build_sched_pipeline_consumer_wait_block``.
-    ``consumer_release`` is gated on ``lane_idx == 0`` because the
-    per-CTA sched-pipeline empty barrier is initialized with one
-    arrival per consumer *warp* (not per-thread) — see
-    ``cute_mma._codegen_cute_mma``'s
-    ``consumer_mask_to_leader=False`` branch. The ``sync_warp``
-    after the advance keeps the warp lanes' view of the
-    register-resident consumer state consistent.
+    Every lane reads scheduler metadata, so every lane must release the
+    stage after its own reads. A lane-0 arrival alone does not order the
+    other lanes' shared-memory reads before the producer reuses the stage.
+    The matching setup counts 32 arrivals per consumer warp, including
+    cluster-routed releases. The ``sync_warp`` after the advance keeps
+    the register-resident consumer state consistent; it is not the
+    shared-memory lifetime handshake.
     """
     return [
-        create(
-            ast.If,
-            test=expr_from_string("cute.arch.lane_idx() == cutlass.Int32(0)"),
-            body=[
-                statement_from_string(
-                    f"{sched_pipeline}.consumer_release({sched_consumer_state})"
-                ),
-            ],
-            orelse=[],
+        statement_from_string(
+            f"{sched_pipeline}.consumer_release({sched_consumer_state})"
         ),
         statement_from_string(emit_pipeline_advance(sched_consumer_state)),
         statement_from_string("cute.arch.sync_warp()"),
@@ -290,8 +409,6 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 
 if TYPE_CHECKING:
-    import sympy
-
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
@@ -1372,6 +1489,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         plan = self._tcgen05_plan()
         return plan is not None and plan.has_scheduler_warp
 
+    def _tcgen05_uses_scheduler_mailbox(self) -> bool:
+        plan = self._tcgen05_plan()
+        return plan is not None and plan.uses_scheduler_mailbox
+
+    def _tcgen05_uses_aux_role_local_scheduler(self) -> bool:
+        plan = self._tcgen05_plan()
+        return plan is not None and plan.aux_role_local_scheduler
+
     def _tcgen05_uses_grouped_static_persistent(self) -> bool:
         plan = self._tcgen05_plan()
         return bool(plan is not None and plan.grouped is not None)
@@ -1428,7 +1553,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return max(plan.sched_stage_count, 0)
 
     def _tcgen05_uses_staged_work_tile_mailbox(self) -> bool:
-        return self._tcgen05_sched_stage_count() > 1
+        return (
+            not self._tcgen05_uses_aux_role_local_scheduler()
+            and self._tcgen05_sched_stage_count() > 1
+        )
 
     def _tcgen05_work_tile_slot_for_state(
         self,
@@ -1525,6 +1653,86 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
         dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         return f"({', '.join(dims[:3])})"
+
+    def _tcgen05_work_tile_padding_predicate(self, work_tile_var: str) -> str | None:
+        """Admit logical clusters, not the scheduler's swizzle-padding slots.
+
+        The raster-along-M scheduler rounds its second *cluster* extent up
+        to the swizzle size, and reports those padding slots as valid work.
+        Test this coordinate before flattening: a padded coordinate can alias
+        a valid PID in the next outer dimension. Cluster-base comparison keeps
+        every peer of a legitimate partial edge cluster on the same schedule.
+        """
+        swizzle = self._tcgen05_l2_swizzle_size()
+        if swizzle == 1:
+            return None
+        plan = self._tcgen05_plan()
+        if plan is not None and (plan.is_clc_persistent or plan.grouped is not None):
+            # CLC cancellation and grouped worklists have separate work-space
+            # contracts; this guard covers the ordinary static scheduler only.
+            return None
+        cluster_n = self._tcgen05_cluster_n()
+        if len(self.pid_info) < 2:
+            static_tiles = 1
+        else:
+            pid = self.pid_info[1]
+            static_tiles = None
+            if isinstance(pid.numel, (int, sympy.Integer)):
+                block_size = (
+                    1
+                    if pid.block_size_var == "1"
+                    else CompileEnvironment.current()
+                    .block_sizes[pid.block_id]
+                    .from_config(DeviceFunction.current().config)
+                )
+                if isinstance(block_size, int) and block_size > 0:
+                    static_tiles = (int(pid.numel) + block_size - 1) // block_size
+        if static_tiles is not None:
+            clusters = (static_tiles + cluster_n - 1) // cluster_n
+            if clusters % swizzle == 0:
+                return None
+        logical_n = self._tcgen05_scheduler_tile_dims_expr(is_device=True)[1]
+        coord = f"{work_tile_var}.tile_idx[1]"
+        if cluster_n > 1:
+            coord = (
+                f"({coord} // cutlass.Int32({cluster_n})) * cutlass.Int32({cluster_n})"
+            )
+        return f"{coord} < ({logical_n})"
+
+    def _tcgen05_guard_logical_work(
+        self, work_tile_var: str, body: list[ast.stmt]
+    ) -> list[ast.stmt]:
+        predicate = self._tcgen05_work_tile_padding_predicate(work_tile_var)
+        if predicate is None:
+            return body
+        return [create(ast.If, test=expr_from_string(predicate), body=body, orelse=[])]
+
+    def _tcgen05_skip_padding_work(
+        self, scheduler_var: str, work_tile_var: str
+    ) -> list[ast.stmt]:
+        """Seek the next logical work item before shared-mailbox publication.
+
+        Padding is not the terminating sentinel. Always advance past it, and
+        publish invalid only after the underlying scheduler is exhausted.
+        """
+        predicate = self._tcgen05_work_tile_padding_predicate(work_tile_var)
+        if predicate is None:
+            return []
+        return [
+            create(
+                ast.While,
+                test=expr_from_string(
+                    f"{work_tile_var}.is_valid_tile and not ({predicate})"
+                ),
+                body=[
+                    statement_from_string(f"{scheduler_var}.advance_to_next_work()"),
+                    statement_from_string(
+                        f"{work_tile_var} = {scheduler_var}.get_current_work()"
+                    ),
+                ],
+                orelse=[],
+            )
+        ]
 
     def _tcgen05_num_work_clusters_expr(self, *, is_device: bool) -> str:
         """Return the number of scheduler work clusters.
@@ -2358,6 +2566,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 partition, post_loop_stmts
             )
         )
+        if self._tcgen05_uses_aux_role_local_scheduler() and not omit_shared_loop:
+            raise exc.BackendUnsupported(
+                "cute",
+                "static AUX role scheduling requires complete shared-loop elimination",
+            )
         if self._tcgen05_uses_staged_work_tile_mailbox() and not omit_shared_loop:
             raise exc.InvalidConfig(
                 f"{TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY}=2 requires omitted "
@@ -2391,7 +2604,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # scheduler and residual loop.
         if not omit_shared_loop:
             setup.extend(self._build_tcgen05_persistent_prelude(layout))
-        elif self._tcgen05_has_scheduler_warp():
+        elif self._tcgen05_uses_scheduler_mailbox():
             # ``ROLE_LOCAL_WITH_SCHEDULER`` skips the shared loop but
             # *does* need the per-CTA work-tile SMEM mailbox: the
             # scheduler warp publishes per-tile coords there and
@@ -2857,6 +3070,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(
                         f"{layout.work_tile_var} = {layout.tile_sched_var}.initial_work_tile_info()"
                     ),
+                    *self._tcgen05_skip_padding_work(
+                        layout.tile_sched_var, layout.work_tile_var
+                    ),
                     *layout.work_tile_publish_stmts,
                 ],
             )
@@ -2955,6 +3171,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(
                         f"{layout.work_tile_var} = {layout.tile_sched_var}.get_current_work()"
                     ),
+                    *self._tcgen05_skip_padding_work(
+                        layout.tile_sched_var, layout.work_tile_var
+                    ),
                     *layout.work_tile_publish_stmts,
                 ],
             )
@@ -3048,7 +3267,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 emit_pdl_wait=emit_pdl_wait,
                 initialize_tile_counter=initialize_tile_counter,
             )
-        if self._tcgen05_has_scheduler_warp():
+        if self._tcgen05_uses_scheduler_mailbox():
             return self._build_role_local_while_with_scheduler(
                 device_function,
                 layout,
@@ -3148,6 +3367,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if (plan := self._tcgen05_plan()) is not None and plan.one_shot_role_scheduler:
             prelude.extend(per_tile_body)
         else:
+            per_tile_body = self._tcgen05_guard_logical_work(
+                work_tile_var, per_tile_body
+            )
             per_tile_body.extend(
                 [
                     statement_from_string(f"{sched_var}.advance_to_next_work()"),
@@ -3192,9 +3414,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             else False
         )
         if tile_counter_var is not None and initialize_tile_counter:
-            prelude.append(
-                statement_from_string(f"{tile_counter_var} = cutlass.Int32(0)")
+            counter_init = statement_from_string(
+                f"{tile_counter_var} = cutlass.Int32(0)"
             )
+            if self._tcgen05_uses_aux_role_local_scheduler():
+                # Retain the scheduler-backed epilogue's counter-before-work
+                # initialization order when replacing its metadata transport.
+                prelude.insert(0, counter_init)
+            else:
+                prelude.append(counter_init)
         prelude.extend(role_prelude_stmts or ())
         return tile_counter_var, increment_tile_counter_per_tile
 
@@ -3496,6 +3724,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_consumer_state: str | None = None
         valid_var: str | None = None
         work_tile_stage_index: str | None = None
+        snapshot: _SchedMailboxSnapshot | None = None
         if uses_pipeline:
             sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
             assert sched_pipeline_plan is not None
@@ -3506,6 +3735,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{sched_consumer_state}.index"
                 if self._tcgen05_uses_staged_work_tile_mailbox()
                 else None
+            )
+            snapshot = _SchedMailboxSnapshot.create(
+                device_function,
+                scheduler_var_prefix,
+                tuple(
+                    i
+                    for i in range(TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT)
+                    if i != _TCGEN05_GROUPED_SELECTED_MAILBOX_VALID
+                )
+                if scheduler_mailbox
+                else (2,),
             )
 
         def consumer_wait_block() -> list[ast.stmt]:
@@ -3523,6 +3763,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     else _TCGEN05_WORK_TILE_MAILBOX_VALID
                 ),
                 work_tile_stage_index=work_tile_stage_index,
+                snapshot=snapshot,
             )
 
         def consumer_release_block() -> list[ast.stmt]:
@@ -3593,7 +3834,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 assert layout is not None
                 metadata_stmts.append(
                     statement_from_string(
-                        f"{linear_idx} = {self._tcgen05_work_tile_slot(layout, 2)}"
+                        f"{linear_idx} = "
+                        f"{snapshot.fields[2] if snapshot is not None else self._tcgen05_work_tile_slot(layout, 2)}"
                     )
                 )
                 metadata_stmts.extend(consumer_release_block())
@@ -3642,6 +3884,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             assert layout is not None
 
             def slot(field: int) -> str:
+                if snapshot is not None:
+                    return snapshot.fields[field]
                 return self._tcgen05_work_tile_slot(layout, field)
 
             mailbox_fields = (
@@ -3999,8 +4243,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # reconstruct the linear pid the same way the MONOLITHIC path
         # does, just sourcing from SMEM coords instead of the
         # work_tile object.
+        snapshot = _SchedMailboxSnapshot.create(
+            device_function, scheduler_var_prefix, tuple(range(len(self.pid_info)))
+        )
         coord_terms = [
-            self._tcgen05_work_tile_slot(layout, i) for i in range(len(self.pid_info))
+            snapshot.fields[i]
+            if snapshot is not None
+            else self._tcgen05_work_tile_slot(layout, i)
+            for i in range(len(self.pid_info))
         ]
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
 
@@ -4019,6 +4269,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 work_tile_smem=layout.work_tile_smem,
                 valid_var=valid_var,
                 work_tile_stage_index=work_tile_stage_index,
+                snapshot=snapshot,
             )
 
         def _consumer_release_block() -> list[ast.stmt]:
@@ -4073,8 +4324,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 orelse=[],
             )
         )
-        # Final release + advance for the sentinel publish (lane-0
-        # gate matches the per-iteration release inside the loop).
+        # Every lane releases the sentinel, matching the per-tile handshake.
         prelude.extend(_consumer_release_block())
         # Cycle-94 merge: no post-loop aux producer tail is injected. The store
         # warp's aux producer_state advance lives inside the per-tile store-warp
@@ -4469,15 +4719,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         def per_tile_body(*, publish_if: str | None = None) -> list[ast.stmt]:
             if publish_if is None:
                 return [
-                    *publish_current_tile_stmts(),
+                    *self._tcgen05_guard_logical_work(
+                        work_tile_var, publish_current_tile_stmts()
+                    ),
                     *scheduler_advance_stmts(),
                 ]
             return [
-                create(
-                    ast.If,
-                    test=expr_from_string(publish_if),
-                    body=publish_current_tile_stmts(),
-                    orelse=[],
+                *self._tcgen05_guard_logical_work(
+                    work_tile_var,
+                    [
+                        create(
+                            ast.If,
+                            test=expr_from_string(publish_if),
+                            body=publish_current_tile_stmts(),
+                            orelse=[],
+                        )
+                    ],
                 ),
                 *scheduler_advance_stmts(),
             ]
@@ -4624,10 +4881,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
           Non-leader CTAs receive the response indirectly because
           the leader broadcasts the resulting work tile to every
           peer CTA's SMEM mailbox via ``_cute_store_shared_remote_x4``.
-          Each peer CTA's consumer warps still wait/release on the
-          per-CTA ``sched_pipeline``, so the per-CTA empty-barrier
-          arrival counts the static WITH_SCHEDULER path validates
-          stay unchanged.
+          Each peer CTA's consumer lanes wait on their local full
+          barrier and release to the leader's empty barrier. Setup
+          therefore counts consumer threads across the whole cluster,
+          unlike the static scheduler's per-CTA empty-barrier count.
 
         cluster_m collapse: the publish writes the per-CTA M
         coordinate into each peer's mailbox by adding
@@ -5177,6 +5434,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         (one cooperative ``cute.copy(GMEM_aux, SMEM_aux[stage])``
         per output tile per descriptor).
 
+        With ``aux_role_local_scheduler``, the same payload is wrapped by the
+        ordinary static role scheduler instead: identical work parameters and
+        post-L2 coordinates, no metadata mailbox, and the same AUX producer tail.
+        The scheduler warp slot stays reserved, so AUX remains warp7.
+
         Per-tile body:
 
         1. ``sched_pipeline.consumer_wait`` + valid-flag read
@@ -5201,10 +5463,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
            ``group_modes(2, rank)`` to expose a flat subtile
            axis whose extent matches the consumer's per-CTA
            subtile count.
-        5. Build the cooperative ``TiledCopy`` once per
-           descriptor: ``make_tiled_copy_tv`` with a
-           ``(M_threads=4, N_threads=8)`` ordered layout × a
-           ``(1, 128 / dtype_bits)`` val layout and a
+        5. Build the SIMT cooperative ``TiledCopy`` once per
+           descriptor, deriving a 32-thread ordered layout from the actual
+           epilogue tile and dtype (preferring M4/N8 only when it fits), with a
+           ``(1, vector_elements)`` value layout (up to 128 bits, reduced
+           when the tile requires it) and a
            ``CopyUniversalOp`` atom. ``get_slice(lane_idx)``
            per lane.
         6. Per subtile (``cutlass.range(subtile_count,
@@ -5247,13 +5510,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "descriptors (producer-body split gate must be open)"
         )
         sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
-        assert sched_pipeline_plan is not None, (
+        static_scheduler = plan.aux_role_local_scheduler
+        assert static_scheduler or sched_pipeline_plan is not None, (
             "C-input role-local while requires a registered "
             "sched_pipeline plan; was cute_state.register_tcgen05_sched_pipeline_plan "
             "called by _codegen_cute_mma?"
         )
-        sched_pipeline = sched_pipeline_plan.pipeline
-        sched_consumer_state = sched_pipeline_plan.consumer_state
         # Aux pipeline plan: the matmul-plan gate that admits this
         # builder also fires the pipeline allocation in
         # ``cute_mma._codegen_cute_mma``, so a non-None plan is
@@ -5275,45 +5537,59 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_use_tma_load = aux_pipeline_plan.use_tma_load
         aux_requires_full_tile = plan.tma_store_full_tiles_only
 
-        valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
+        valid_var = (
+            None
+            if static_scheduler
+            else device_function.new_var("tcgen05_c_input_warp_valid")
+        )
+        snapshot = (
+            None
+            if inline_aux_only or static_scheduler
+            else _SchedMailboxSnapshot.create(
+                device_function,
+                "tcgen05_c_input_warp",
+                ()
+                if aux_requires_full_tile and tile_phase == "edge"
+                else tuple(range(len(self.pid_info))),
+            )
+        )
         work_tile_stage_index = (
-            f"{sched_consumer_state}.index"
-            if self._tcgen05_uses_staged_work_tile_mailbox()
+            f"{sched_pipeline_plan.consumer_state}.index"
+            if sched_pipeline_plan is not None
+            and self._tcgen05_uses_staged_work_tile_mailbox()
             else None
         )
 
+        def _sched_consumer_wait_block() -> list[ast.stmt]:
+            assert sched_pipeline_plan is not None and valid_var is not None
+            return _build_sched_pipeline_consumer_wait_block(
+                sched_pipeline=sched_pipeline_plan.pipeline,
+                sched_consumer_state=sched_pipeline_plan.consumer_state,
+                work_tile_smem=layout.work_tile_smem,
+                valid_var=valid_var,
+                work_tile_stage_index=work_tile_stage_index,
+                snapshot=snapshot,
+            )
+
+        def _sched_consumer_release_block() -> list[ast.stmt]:
+            assert sched_pipeline_plan is not None
+            return _build_sched_pipeline_consumer_release_block(
+                sched_pipeline=sched_pipeline_plan.pipeline,
+                sched_consumer_state=sched_pipeline_plan.consumer_state,
+            )
+
         if aux_requires_full_tile and tile_phase == "edge":
+            assert not static_scheduler and valid_var is not None
             # Edge epilogues use the SIMT direct-GMEM aux path. The C-input
             # warp still participates in the scheduler pipeline so the
             # producer's consumer-arrival count remains balanced, but each
             # edge iteration is purely the sched-pipeline handshake: wait for
             # the broadcast, release it, then wait for the next one.
             prelude: list[ast.stmt] = []
-            prelude.extend(
-                _build_sched_pipeline_consumer_wait_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                    work_tile_smem=layout.work_tile_smem,
-                    valid_var=valid_var,
-                    work_tile_stage_index=work_tile_stage_index,
-                )
-            )
+            prelude.extend(_sched_consumer_wait_block())
             per_tile_body: list[ast.stmt] = []
-            per_tile_body.extend(
-                _build_sched_pipeline_consumer_release_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                )
-            )
-            per_tile_body.extend(
-                _build_sched_pipeline_consumer_wait_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                    work_tile_smem=layout.work_tile_smem,
-                    valid_var=valid_var,
-                    work_tile_stage_index=work_tile_stage_index,
-                )
-            )
+            per_tile_body.extend(_sched_consumer_release_block())
+            per_tile_body.extend(_sched_consumer_wait_block())
             prelude.append(
                 create(
                     ast.While,
@@ -5322,12 +5598,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     orelse=[],
                 )
             )
-            prelude.extend(
-                _build_sched_pipeline_consumer_release_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                )
-            )
+            prelude.extend(_sched_consumer_release_block())
             return create(
                 ast.If,
                 test=expr_from_string(self._tcgen05_c_input_role_predicate()),
@@ -5335,10 +5606,21 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 orelse=[],
             )
 
-        coord_terms = [
-            self._tcgen05_work_tile_slot(layout, i) for i in range(len(self.pid_info))
-        ]
-        linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
+        coord_terms = (
+            []
+            if static_scheduler
+            else [
+                snapshot.fields[i]
+                if snapshot is not None
+                else self._tcgen05_work_tile_slot(layout, i)
+                for i in range(len(self.pid_info))
+            ]
+        )
+        linear_pid_expr = (
+            None
+            if static_scheduler
+            else self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
+        )
         sched_coord_0 = coord_terms[0] if len(coord_terms) > 0 else "cutlass.Int32(0)"
         sched_coord_1 = coord_terms[1] if len(coord_terms) > 1 else "cutlass.Int32(0)"
 
@@ -5401,9 +5683,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # where a future strategy emits the role-local while
         # without these names, so the cycle 2b correctness
         # baseline at ``l2_grp=[1]`` cannot regress silently.
+        batched_offsets = plan.batched_aux_tile_offsets
+        aux_m_offset, aux_n_offset = (
+            batched_offsets[1:]
+            if batched_offsets
+            else ("tile_offset_0", "tile_offset_1")
+        )
+        required_offsets = batched_offsets or (aux_m_offset, aux_n_offset)
         synthetic_reads_for_l2 = [
             statement_from_string(
-                "_tcgen05_aux_l2_anchor = tile_offset_0 + tile_offset_1"
+                f"{device_function.new_var('tcgen05_aux_l2_anchor')} = "
+                + " + ".join(required_offsets)
             )
         ]
         l2_dependency_stmts: list[ast.stmt] = []
@@ -5415,10 +5705,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         for stmt in l2_dependency_stmts:
             _, writes = _stmt_name_uses(stmt)
             l2_dependency_writes.update(writes)
-        has_post_l2_coords = (
-            "tile_offset_0" in l2_dependency_writes
-            and "tile_offset_1" in l2_dependency_writes
+        has_post_l2_coords = all(
+            offset in l2_dependency_writes for offset in required_offsets
         )
+        if static_scheduler and not has_post_l2_coords:
+            raise exc.BackendUnsupported(
+                "cute",
+                "static AUX role scheduling requires complete post-L2 tile coordinates",
+            )
+        if batched_offsets is not None and not has_post_l2_coords:
+            raise exc.BackendUnsupported(
+                "cute", "batched auxiliary TMA requires semantic B/M/N tile offsets"
+            )
         # ``peer_m`` is this CTA's rank along the M axis of the cluster:
         # ``block_idx_in_cluster() % cluster_m``. The modulo is load-bearing
         # here because consumer CTAs can span the N axis: for ``cluster_m=2 +
@@ -5448,8 +5746,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # ``l2_grp=[g>1]`` because L2 remap is non-identity,
             # and under ``cluster_n=2`` because the raw
             # rank-in-cluster ≠ peer_m.
-            m_source = f"(tile_offset_0 // cutlass.Int32({bm}))"
-            n_source = f"(tile_offset_1 // cutlass.Int32({bn}))"
+            m_source = f"({aux_m_offset} // cutlass.Int32({bm}))"
+            n_source = f"({aux_n_offset} // cutlass.Int32({bn}))"
             if is_two_cta:
                 tile_m_expr = (
                     f"({m_source}) * cutlass.Int32({cluster_m}) + {peer_m_expr}"
@@ -5505,26 +5803,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # iterates the tile under the lane's get_slice(lane_idx).
         cute_lane_idx_var = device_function.new_var("tcgen05_aux_lane_idx")
 
-        # Factories mirror the consumer-side pattern in
-        # ``_build_role_local_while_with_scheduler`` — both go
-        # through the shared module-scope helpers
-        # (``_build_sched_pipeline_consumer_{wait,release}_block``)
-        # so the wait/release shape has one source of truth.
-        def _sched_consumer_wait_block() -> list[ast.stmt]:
-            return _build_sched_pipeline_consumer_wait_block(
-                sched_pipeline=sched_pipeline,
-                sched_consumer_state=sched_consumer_state,
-                work_tile_smem=layout.work_tile_smem,
-                valid_var=valid_var,
-                work_tile_stage_index=work_tile_stage_index,
-            )
-
-        def _sched_consumer_release_block() -> list[ast.stmt]:
-            return _build_sched_pipeline_consumer_release_block(
-                sched_pipeline=sched_pipeline,
-                sched_consumer_state=sched_consumer_state,
-            )
-
         # Pull aux pipeline names from the plan. The plan is the
         # ``_Tcgen05AuxPipelinePlan`` dataclass; access by name
         # without importing the type to avoid a module cycle.
@@ -5540,14 +5818,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
 
         aux_full_tile_var = device_function.new_var("tcgen05_aux_full_tile")
         aux_shape = c_input_aux_tensor_descriptors[0].host_tensor_val.shape
-        assert len(aux_shape) == 2, (
-            "C-input staged aux descriptors must be exact-shape rank-2 tensors"
-        )
-        aux_m_size = int(aux_shape[0])
-        aux_n_size = int(aux_shape[1])
+        assert len(aux_shape) == (3 if batched_offsets is not None else 2)
+        aux_m_size = int(aux_shape[-2])
+        aux_n_size = int(aux_shape[-1])
         if has_post_l2_coords:
-            aux_m_start_expr = "tile_offset_0"
-            aux_n_start_expr = "tile_offset_1"
+            aux_m_start_expr = aux_m_offset
+            aux_n_start_expr = aux_n_offset
         else:
             if is_two_cta:
                 aux_m_tile_expr = f"({sched_coord_0} // cutlass.Int32({cluster_m}))"
@@ -5574,20 +5850,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_descriptor_setup_blocks: list[list[ast.stmt]] = []
         per_descriptor_subtile_blocks: list[list[str]] = []
         per_descriptor_grouped_names: list[str] = []
-        # Same N-threads = 8 / M-threads = 4 layout the producer uses
-        # for the cooperative copy. For the matmul-plan epi tile (a
-        # rectangular sub-tile of the (bm, bn) region) the lane
-        # layout is constexpr and shared across descriptors.
-        n_threads = 8
-        m_threads = 32 // n_threads
         for desc_idx, (desc, ring) in enumerate(
             zip(c_input_aux_tensor_descriptors, aux_rings, strict=True)  # type: ignore[arg-type]
         ):
             aux_tensor_name = device_function.tensor_arg(desc.host_tensor_val).name
             aux_dtype_str = env_backend.dtype_str(desc.host_tensor_val.dtype)
             dtype_bits = desc.host_tensor_val.dtype.itemsize * 8
-            copy_bits = 128
-            num_copy_elems = max(1, copy_bits // dtype_bits)
             tma_atom = ring.tma_atom
             tma_tensor = ring.tma_tensor
             if aux_use_tma_load:
@@ -5640,16 +5908,28 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     assert gmem_source_var is not None
                 else:
                     gmem_source_var = aux_tensor_name
+                if desc.host_tensor_val.ndim == 3:
+                    assert batched_offsets is not None and aux_use_tma_load
+                    # TensorMap logical modes are M/N/B. Retain B in the
+                    # TensorMap coordinate (not an Int32 pointer offset), then
+                    # remove its unit tile mode before the shared 2-D epilogue.
+                    tile_expr = (
+                        f"cute.local_tile({gmem_aux_view_var}, "
+                        f"({bm_per_cta}, {bn}, 1), "
+                        f"({tile_m_var}, {tile_n_var}, {batched_offsets[0]}))"
+                        "[None, None, 0]"
+                    )
+                else:
+                    tile_expr = (
+                        f"cute.local_tile({gmem_aux_view_var}, "
+                        f"({bm_per_cta}, {bn}), ({tile_m_var}, {tile_n_var}))"
+                    )
                 setup.extend(
                     [
                         statement_from_string(
                             f"{gmem_aux_view_var} = {gmem_source_var}"
                         ),
-                        statement_from_string(
-                            f"{gmem_aux_tile_var} = cute.local_tile("
-                            f"{gmem_aux_view_var}, ({bm_per_cta}, {bn}), "
-                            f"({tile_m_var}, {tile_n_var}))"
-                        ),
+                        statement_from_string(f"{gmem_aux_tile_var} = {tile_expr}"),
                     ]
                 )
             else:
@@ -5726,13 +6006,34 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 # ``CopyUniversalOp`` lowers to a SIMT ld/st pair whose
                 # vectorization is driven at runtime by the host
                 # pointer's actual alignment.
+                # Use the actual shared epilogue subtile, not (bm, bn): a
+                # fixed 4x64 BF16 copy over a 128x32 subtile aliases shared
+                # destinations and reads beyond the final global N tile.
+                # Resolve each descriptor independently because its dtype
+                # determines the number of contiguous values in 128 bits.
+                m_threads = device_function.new_var(
+                    f"tcgen05_aux_copy_m_threads_{desc_idx}"
+                )
+                n_threads = device_function.new_var(
+                    f"tcgen05_aux_copy_n_threads_{desc_idx}"
+                )
+                num_copy_elems = device_function.new_var(
+                    f"tcgen05_aux_copy_values_{desc_idx}"
+                )
                 setup.extend(
                     [
+                        statement_from_string(
+                            f"{m_threads}, {n_threads}, {num_copy_elems} = "
+                            "cutlass.const_expr(_cute_aux_copy_layout("
+                            f"cute.size({aux_epi_tile_var}[0]), "
+                            f"cute.size({aux_epi_tile_var}[1]), "
+                            f"{dtype_bits}))"
+                        ),
                         statement_from_string(
                             f"{tiled_copy_var} = cute.make_tiled_copy_tv("
                             f"cute.make_copy_atom("
                             f"cute.nvgpu.CopyUniversalOp(), {aux_dtype_str}, "
-                            f"num_bits_per_copy={copy_bits}), "
+                            f"num_bits_per_copy={num_copy_elems} * {dtype_bits}), "
                             f"cute.make_ordered_layout("
                             f"({m_threads}, {n_threads}), order=(1, 0)), "
                             f"cute.make_layout((1, {num_copy_elems})))"
@@ -5949,6 +6250,27 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 inline_per_tile.extend(aux_copy_lines_inline)
             return inline_per_tile
 
+        if static_scheduler:
+            assert not inline_aux_only and tile_phase == "all" and aux_use_tma_load
+            role = self._build_role_local_while(
+                device_function,
+                layout,
+                self._PersistentRoleBlock(
+                    role_predicate=self._tcgen05_c_input_role_predicate(),
+                    stmts=_aux_copy_lines(),
+                ),
+                scheduler_var_prefix="tcgen05_aux_local",
+                dependency_stmts=l2_dependency_stmts,
+            )
+            assert isinstance(role, ast.If)
+            role.body.append(
+                statement_from_string(
+                    f"{aux_pipeline_name}.producer_tail({aux_producer_state_name})"
+                )
+            )
+            return role
+
+        assert valid_var is not None and linear_pid_expr is not None
         prelude: list[ast.stmt] = []
         prelude.extend(_sched_consumer_wait_block())
         per_tile_body: list[ast.stmt] = [
@@ -6692,7 +7014,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # Analyze after building every consumer, then restore the producer's
         # original position before any optional C-input role.
         scheduler_insert_index = len(role_local_whiles)
-        if self._tcgen05_has_scheduler_warp() and not uses_grouped_scheduler_mailbox:
+        if (
+            self._tcgen05_uses_scheduler_mailbox()
+            and not uses_grouped_scheduler_mailbox
+        ):
             role_local_whiles.append(
                 self._build_scheduler_warp_role_local_while(device_function, layout)
             )
