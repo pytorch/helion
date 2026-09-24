@@ -1,0 +1,123 @@
+{
+  "status": "COLD_FULL_ALL_SIX_PASS",
+  "device": {
+    "name": "NVIDIA GB300",
+    "uuid": "GPU-a58c8148-8e58-d9ae-d97f-3cd7322d9e02",
+    "capability": [10, 3]
+  },
+  "reference": {
+    "path": "/data/users/shangdiy/helion-kernel-library/repro/breadth/results/mamba2_ssd_experiment.json",
+    "sha256": "5b0db79a7090e74e8e56b6b40432287b8b5710267c51f24c9eb9e1e5aea1be2a",
+    "targets_us": [32.512, 48.32, 170.273, 8.704, 6.656, 7.456]
+  },
+  "geomean_speedup": 1.1181677256491889,
+  "manual_frontier_geomean_speedup": 1.1327786766648524,
+  "shapes": [
+    {
+      "shape": 0,
+      "latency_us": 31.393,
+      "target_us": 32.512,
+      "best_reference_impl": "helion-tileir",
+      "speedup": 1.035644888987991,
+      "remaining_gap_us": -1.1189999999999998,
+      "strict_pass": true,
+      "qualification": "cold_full",
+      "artifact": "../cold-prefetch-v58-shape0-seed2026092331-L80f0F2q/result.json"
+    },
+    {
+      "shape": 1,
+      "latency_us": 47.105,
+      "target_us": 48.32,
+      "best_reference_impl": "helion-tileir",
+      "speedup": 1.0257934401868167,
+      "remaining_gap_us": -1.2150000000000034,
+      "strict_pass": true,
+      "qualification": "cold_full",
+      "artifact": "../cold-final-ordinary-shape1-seed2026092411/result.json",
+      "memcheck": "../v38-integration/cold-final-shape1-memcheck-main01/sanitizer.log",
+      "racecheck": "../v38-integration/cold-final-shape1-racecheck-main01/sanitizer.log",
+      "manual_frontier": {
+        "latency_us": 48.16,
+        "speedup": 1.0033222591362128,
+        "remaining_gap_us": -0.1600000000000037,
+        "artifact": "../v38-integration/shape1-state-early-free-run-benchmark-YCeBoE67/result.json",
+        "memcheck": "../v38-integration/shape1-state-early-free-run-memcheck-YCeBoE67/sanitizer.log",
+        "racecheck": "../v38-integration/shape1-state-early-free-run-racecheck-YCeBoE67/sanitizer.log"
+      },
+      "ordinary_fixed": {
+        "latency_us": 48.288,
+        "speedup": 1.000662251655629,
+        "remaining_gap_us": -0.03200000000000358,
+        "artifact": "../v38-integration/fastpath-final-shape1-benchmark-main01/result.json"
+      }
+    },
+    {
+      "shape": 2,
+      "latency_us": 166.72,
+      "target_us": 170.273,
+      "best_reference_impl": "helion-tileir",
+      "speedup": 1.0213111804222648,
+      "remaining_gap_us": -3.5529999999999973,
+      "strict_pass": true,
+      "qualification": "cold_full",
+      "artifact": "../cold-final-ordinary-shape2-seed2026092401/result.json",
+      "memcheck": "../v38-integration/cold-final-shape2-memcheck-main03/sanitizer.log",
+      "racecheck": "../v38-integration/cold-final-shape2-racecheck-main03/sanitizer.log",
+      "manual_frontier": {
+        "latency_us": 150.848,
+        "speedup": 1.1287720089096307,
+        "remaining_gap_us": -19.424999999999983,
+        "artifact": "../v38-integration/state-output-free-run-candidate-bench-b2MJRvGe/result.json",
+        "memcheck": "../v38-integration/state-output-free-memcheck-b2MJRvGe.san",
+        "racecheck": "../v38-integration/state-output-free-racecheck-b2MJRvGe.san"
+      },
+      "ordinary_fixed": {
+        "latency_us": 168.577,
+        "speedup": 1.010060684435006,
+        "remaining_gap_us": -1.695999999999998,
+        "artifact": "../v38-integration/startup-issue-shape2-benchmark-main01/result.json",
+        "memcheck": "../v38-integration/startup-issue-shape2-memcheck-main01/sanitizer.log",
+        "racecheck": "../v38-integration/startup-issue-shape2-racecheck-main01/sanitizer.log"
+      }
+    },
+    {
+      "shape": 3,
+      "latency_us": 8.416,
+      "target_us": 8.704,
+      "best_reference_impl": "helion-tileir",
+      "speedup": 1.0342205323193916,
+      "remaining_gap_us": -0.28800000000000026,
+      "strict_pass": true,
+      "qualification": "cold_full",
+      "artifact": "../cold-native-v42-shape3-seed2026100104/result.json"
+    },
+    {
+      "shape": 4,
+      "latency_us": 4.736,
+      "target_us": 6.656,
+      "best_reference_impl": "helion-triton",
+      "speedup": 1.4054054054054055,
+      "remaining_gap_us": -1.92,
+      "strict_pass": true,
+      "qualification": "cold_full",
+      "artifact": "../cold-native-v37-shape4-seed2026100103/result.json"
+    },
+    {
+      "shape": 5,
+      "latency_us": 6.016,
+      "target_us": 7.456,
+      "best_reference_impl": "helion-triton",
+      "speedup": 1.2393617021276597,
+      "remaining_gap_us": -1.4400000000000004,
+      "strict_pass": true,
+      "qualification": "cold_full",
+      "artifact": "../cold-native-v42-shape5-seed2026100105/result.json"
+    }
+  ],
+  "cold_closure": {
+    "status": "PASS",
+    "failing_shapes_from_last_ordinary_cold_search": [],
+    "geomean_speedup": 1.1181677256491889,
+    "note": "All six shapes pass using cold-full results. Shape1 and shape2 fresh searches selected the new generic compiler paths."
+  }
+}
