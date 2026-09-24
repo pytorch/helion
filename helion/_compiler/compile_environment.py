@@ -627,7 +627,7 @@ class CompileEnvironment:
         # must not acquire a CUDA-specific runtime specialization.
         alignment_source = (
             self.tensor_descriptor_alignment_source(fake_tensor)
-            if self.device.type == "cuda"
+            if self.backend_name == "triton" and self.device.type == "cuda"
             else None
         )
         if alignment_source is not None:

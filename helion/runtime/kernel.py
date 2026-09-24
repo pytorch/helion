@@ -3081,6 +3081,12 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     tensor.stride(),
                     _element_size,
                 )
+                # Extent classes guard Triton's descriptor block-shape and
+                # int32-coordinate legality. Other backends retain the legacy
+                # layout-only key; they neither consume host descriptors nor
+                # use Triton's descriptor legality checks.
+                if self.env.backend_name != "triton":
+                    return layout
                 return (
                     layout,
                     tuple(
