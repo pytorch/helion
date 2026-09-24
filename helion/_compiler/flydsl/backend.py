@@ -591,6 +591,13 @@ class FlyDSLBackend(Backend):
                         tc = _tile_count(c)
                         if tc is not None and tc <= _CONSTEXPR_TILE_THRESHOLD:
                             _add(bs, c, v, cr=True)
+                        elif tc is not None:
+                            # Wider budgets: offer cr=True for chunks with
+                            # tile_count > default threshold but within budget.
+                            for _mt in (24, 32):
+                                if tc <= _mt:
+                                    _add(bs, c, v, cr=True, budget=_mt)
+                                    break  # only add the smallest budget that fits
                         c *= 2
                 # Persistent single-pass: chunk == N (one tile).  Combined with
                 # constexpr_range=True the in_local[] path caches the row in
@@ -623,6 +630,11 @@ class FlyDSLBackend(Backend):
                         tc = _tile_count(c)
                         if tc is not None and tc <= _CONSTEXPR_TILE_THRESHOLD:
                             _add(bs, c, None, cr=True)
+                        elif tc is not None:
+                            for _mt in (24, 32):
+                                if tc <= _mt:
+                                    _add(bs, c, None, cr=True, budget=_mt)
+                                    break
 
         # Extend candidates with cache-modifier, waves_per_eu, and maxnreg variants.
         # Take each candidate already in the list and cross it with the hardware
@@ -645,10 +657,6 @@ class FlyDSLBackend(Backend):
             for _mnr in (64, 96, 128):  # VGPR caps — force higher occupancy
                 _add(_bs, _rl, _v, cr=_cr, cm=0, wpe=0, mnr=_mnr)
                 _add(_bs, _rl, _v, cr=_cr, cm=2, wpe=0, mnr=_mnr)
-            if _cr:  # max_tiles variants — try wider unrolling than the default 16
-                for _mt in (8, 24, 32):  # 8=conservative, 32=aggressive; 16=default
-                    _add(_bs, _rl, _v, cr=True, cm=0, wpe=0, mnr=0, budget=_mt)
-                    _add(_bs, _rl, _v, cr=True, cm=2, wpe=0, mnr=0, budget=_mt)
 
         if not candidates:
             return default
@@ -786,8 +794,9 @@ class FlyDSLBackend(Backend):
                 # Fall back to scf.for if numel is dynamic (can't compute tile count).
                 if isinstance(_numel, int):
                     tile_count = (_numel + chunk - 1) // chunk
-                    _max_tiles = int(config.config.get("flydsl_cr_max_tiles", 0) or 0)  # pyrefly: ignore[bad-argument-type]
-                    _threshold = _cr_tile_threshold(_max_tiles)
+                    _threshold = _cr_tile_threshold(
+                        int(config.config.get("flydsl_cr_max_tiles", 0) or 0)  # pyrefly: ignore[bad-argument-type]
+                    )
                     if tile_count <= _threshold:
                         self._flydsl_use_constexpr_range = True
                         self._flydsl_constexpr_chunk = chunk
