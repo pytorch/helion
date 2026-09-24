@@ -121,10 +121,6 @@ class FlyDSLBackend(Backend):
             # the kernel into N VGPRs, potentially increasing occupancy at the cost
             # of register spills to scratch memory.  0 = no cap (compiler decides).
             "flydsl_maxnreg",
-            # When True, marks reduction_loops=[None] as an intentional persistent-wide
-            # config (all N/V threads active, no loop). Prevents config_spec.normalize
-            # from forcing None -> max_threads in autotune-generated candidates.
-            "flydsl_persistent_wide",
         }
     )
 
@@ -482,7 +478,6 @@ class FlyDSLBackend(Backend):
             cm: int = 0,
             wpe: int = 0,
             mnr: int = 0,
-            pw: bool = False,
         ) -> None:
             # Safety: for user-tiled reductions all column dims must be multiples
             # of 256 (one warp-pass = 64 lanes x 4 elems). Reject bad configs.
@@ -531,7 +526,7 @@ class FlyDSLBackend(Backend):
                     _SAFE_OOB_BYTES = 1536
                     if _oob_bytes > _SAFE_OOB_BYTES:
                         return
-            key = (tuple(bs), rl, v, cr, cm, wpe, mnr, pw)
+            key = (tuple(bs), rl, v, cr, cm, wpe, mnr)
             if key in seen:
                 return
             seen.add(key)
@@ -540,11 +535,6 @@ class FlyDSLBackend(Backend):
                 kw["reduction_loops"] = [rl] * n_rl
                 if v is not None:
                     kw["cute_vector_widths"] = [v] * n_rl
-            elif pw and v is not None:
-                # persistent-wide: no loop chunk, but explicit V for memory_ops
-                kw["reduction_loops"] = [None] * n_rl
-                kw["cute_vector_widths"] = [v] * n_rl
-                kw["flydsl_persistent_wide"] = True
             if cr:
                 kw["constexpr_range"] = True
             if cm:
@@ -611,23 +601,6 @@ class FlyDSLBackend(Backend):
                                 _is_pot = _vec > 0 and (_vec & (_vec - 1)) == 0
                                 if _is_pot and _vec * _elem_bits <= 128:
                                     _add(bs, _numel, v, cr=True)
-                # Persistent-wide: reduction_loops=None with all N/V threads
-                # active (PersistentReductionStrategy). Reads x once, no loop.
-                # Valid when N/V threads ∈ [128, 1024] (same range as chunk=N).
-                if rl_ids and len(spec.reduction_loops):
-                    _numel = spec.reduction_loops[0].size_hint
-                    if isinstance(_numel, int) and _numel > 64:
-                        for v in _v_choices:
-                            _tc = _looped_tc(_numel, v)
-                            if 128 <= _tc <= 1024:
-                                # Require N/thread_count to be a power of 2
-                                # and the resulting copy width ≤ 128 bits.
-                                _vec = _numel // _tc
-                                _elem_bits = 16 if v == 8 else 32
-                                _copy_bits = _vec * _elem_bits
-                                _is_pot = _vec > 0 and (_vec & (_vec - 1)) == 0
-                                if _is_pot and _copy_bits <= 128:
-                                    _add(bs, None, v, pw=True)
             else:
                 # bm>1: one warp/row (thread_count 64), V = chunk // 64 derived
                 # from the chunk. Offer chunk = 64*V for V in {1,2,4} (+8 fp16).
@@ -780,19 +753,6 @@ class FlyDSLBackend(Backend):
         W = _tc // 64 if _tc is not None else 1
         self._flydsl_warps_per_row = W
         self._flydsl_num_threads = 64 * W if W > 1 else 64 * bm
-        # Persistent wide: when PersistentReductionStrategy was selected with
-        # _thread_count > 64, override the launcher block dim to match.
-        # Read from tile_strategy directly — config.reduction_loops may have
-        # been normalized to a chunk value by config_spec.normalize.
-        from ..reduction_strategy import PersistentReductionStrategy as _PRS
-
-        for _bs in _env.block_sizes:
-            if _bs.reduction:
-                _rs = tile_strategy.block_id_to_strategy.get((_bs.block_id,))
-                if isinstance(_rs, _PRS) and _rs._thread_count > 64:
-                    self._flydsl_num_threads = _rs._thread_count
-                    self._flydsl_warps_per_row = _rs._thread_count // 64
-                break
 
         # Hybrid range strategy: use range_constexpr (unrolled, enables in_local[]
         # register caching across two passes) when the tile count is small enough

@@ -151,7 +151,6 @@ def _flydsl_buffer_setup(
     _lb = 0
     if is_rolled_col:
         from ..reduction_strategy import LoopedReductionStrategy
-        from ..reduction_strategy import PersistentReductionStrategy
 
         assert col_block_id is not None
         _rs = state.device_function.tile_strategy.block_id_to_strategy.get(
@@ -165,14 +164,6 @@ def _flydsl_buffer_setup(
             if _tc > 0 and _lb >= _tc:
                 rolled_col_vec = max(1, _lb // _tc)
                 rolled_col_offset = _rs.offset_var(col_block_id)
-        elif isinstance(_rs, PersistentReductionStrategy) and _rs._thread_count > 64:
-            # Persistent wide: all N/V threads cover the full row in one pass.
-            # chunk=N, offset=0 (no loop), vec=N//thread_count=V.
-            _tc = _rs._thread_count
-            _lb = env.block_sizes[col_block_id].size_hint()
-            if _tc > 0 and _lb >= _tc:
-                rolled_col_vec = max(1, _lb // _tc)
-                rolled_col_offset = "0"
     # Column tail: when N is not a multiple of the chunk (64*V), the last pass
     # runs past column N. Build a per-element predicate to drop those columns.
     rolled_col_pred: str | None = None
@@ -206,11 +197,7 @@ def _flydsl_buffer_setup(
         # A rolled ``:`` column that fits in one wavefront (N <= 64) has a loop
         # that is never emitted, so its outer_prefix is dead and hoisting setup
         # there drops it. Keep _hoist None so setup emits inline in the live body.
-        # Persistent-wide (rolled_col_offset=="0") also has no loop to hoist
-        # into, so treat it the same as degenerate (emit setup inline).
-        _degenerate_rolled_col = is_rolled_col and (
-            rolled_col_offset is None or rolled_col_offset == "0"
-        )
+        _degenerate_rolled_col = is_rolled_col and rolled_col_offset is None
         if (
             col_block_id is not None
             and not _degenerate_rolled_col

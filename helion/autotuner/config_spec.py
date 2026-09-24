@@ -918,9 +918,6 @@ VALID_KEYS: frozenset[str] = frozenset(
         "flydsl_waves_per_eu",
         # FlyDSL: hard VGPR cap (--amdgpu-num-vgpr=N); 0=no cap.
         "flydsl_maxnreg",
-        # FlyDSL: marks reduction_loops=None as intentional persistent-wide
-        # (all N/V threads active, no loop). Prevents config_spec from forcing None -> chunk.
-        "flydsl_persistent_wide",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_async_load_stages",
@@ -2975,21 +2972,8 @@ class ConfigSpec:
                     ):
                         block_threshold = min(block_threshold, 32)
                     if new_loops[i] is None and spec.size_hint > block_threshold:
-                        # FlyDSL persistent-wide: flydsl_persistent_wide=True marks
-                        # this as an intentional N/V-thread single-pass config.
-                        # Keep reduction_loops=None so PersistentReductionStrategy
-                        # is selected instead of forcing a looped chunk.
-                        _block_sizes = config.get("block_sizes", [])
-                        _is_wide_persistent = (
-                            config.get("flydsl_persistent_wide", False)
-                            and getattr(spec, "allow_wide_persistent", False)
-                            and isinstance(_block_sizes, list)
-                            and _block_sizes
-                            and int(_block_sizes[0]) == 1
-                        )
-                        if not _is_wide_persistent:
-                            new_loops[i] = min(spec.size_hint, block_threshold)
-                            changed = True
+                        new_loops[i] = min(spec.size_hint, block_threshold)
+                        changed = True
                     elif (
                         new_loops[i] is not None
                         and max_loop is not None
