@@ -849,6 +849,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "constexpr_range",
         "flydsl_load_cache_modifier",
         "flydsl_waves_per_eu",
+        "flydsl_cr_max_tiles",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_async_load_stages",
@@ -918,6 +919,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "flydsl_waves_per_eu",
         # FlyDSL: hard VGPR cap (--amdgpu-num-vgpr=N); 0=no cap.
         "flydsl_maxnreg",
+        # FlyDSL: max tiles to unroll with constexpr_range (0 = default 16).
+        "flydsl_cr_max_tiles",
         "cute_lane_layouts",
         "cute_reduction_reloads",
         "cute_async_load_stages",

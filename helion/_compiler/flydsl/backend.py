@@ -38,6 +38,11 @@ if TYPE_CHECKING:
 _CONSTEXPR_TILE_THRESHOLD = 16
 
 
+def _cr_tile_threshold(max_tiles: int) -> int:
+    """Max tiles for constexpr_range unrolling (0 = use hardcoded default)."""
+    return max_tiles if max_tiles > 0 else _CONSTEXPR_TILE_THRESHOLD
+
+
 def _flydsl_minimum_expr(a: str, b: str) -> str:
     # flydsl Vector has no ``.minimumf``; min(a,b) = -max(-a,-b).
     return f"(-((-({a})).maximumf((-({b})))))"
@@ -121,6 +126,9 @@ class FlyDSLBackend(Backend):
             # the kernel into N VGPRs, potentially increasing occupancy at the cost
             # of register spills to scratch memory.  0 = no cap (compiler decides).
             "flydsl_maxnreg",
+            # Max tiles to unroll with constexpr_range (0 = default 16).
+            # Autotune tries (8, 16, 32) to find the right unroll depth.
+            "flydsl_cr_max_tiles",
         }
     )
 
@@ -478,6 +486,7 @@ class FlyDSLBackend(Backend):
             cm: int = 0,
             wpe: int = 0,
             mnr: int = 0,
+            budget: int = 0,
         ) -> None:
             # Safety: for user-tiled reductions all column dims must be multiples
             # of 256 (one warp-pass = 64 lanes x 4 elems). Reject bad configs.
@@ -526,7 +535,7 @@ class FlyDSLBackend(Backend):
                     _SAFE_OOB_BYTES = 1536
                     if _oob_bytes > _SAFE_OOB_BYTES:
                         return
-            key = (tuple(bs), rl, v, cr, cm, wpe, mnr)
+            key = (tuple(bs), rl, v, cr, cm, wpe, mnr, budget)
             if key in seen:
                 return
             seen.add(key)
@@ -543,6 +552,8 @@ class FlyDSLBackend(Backend):
                 kw["flydsl_waves_per_eu"] = wpe
             if mnr:
                 kw["flydsl_maxnreg"] = mnr
+            if budget:
+                kw["flydsl_cr_max_tiles"] = budget
             candidates.append(Config(**kw))
 
         # Tile count for the first reduction dim, to decide constexpr eligibility.
@@ -634,6 +645,10 @@ class FlyDSLBackend(Backend):
             for _mnr in (64, 96, 128):  # VGPR caps — force higher occupancy
                 _add(_bs, _rl, _v, cr=_cr, cm=0, wpe=0, mnr=_mnr)
                 _add(_bs, _rl, _v, cr=_cr, cm=2, wpe=0, mnr=_mnr)
+            if _cr:  # max_tiles variants — try wider unrolling than the default 16
+                for _mt in (8, 24, 32):  # 8=conservative, 32=aggressive; 16=default
+                    _add(_bs, _rl, _v, cr=True, cm=0, wpe=0, mnr=0, budget=_mt)
+                    _add(_bs, _rl, _v, cr=True, cm=2, wpe=0, mnr=0, budget=_mt)
 
         if not candidates:
             return default
@@ -771,7 +786,9 @@ class FlyDSLBackend(Backend):
                 # Fall back to scf.for if numel is dynamic (can't compute tile count).
                 if isinstance(_numel, int):
                     tile_count = (_numel + chunk - 1) // chunk
-                    if tile_count <= _CONSTEXPR_TILE_THRESHOLD:
+                    _max_tiles = int(config.config.get("flydsl_cr_max_tiles", 0) or 0)  # pyrefly: ignore[bad-argument-type]
+                    _threshold = _cr_tile_threshold(_max_tiles)
+                    if tile_count <= _threshold:
                         self._flydsl_use_constexpr_range = True
                         self._flydsl_constexpr_chunk = chunk
                         self._flydsl_cr_numel = _numel
