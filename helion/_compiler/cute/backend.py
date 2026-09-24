@@ -1274,6 +1274,7 @@ class CuteBackend(Backend):
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_helion_tcgen05_pipeline": (
                 "from helion._compiler.cute import tcgen05_pipeline "
                 "as _helion_tcgen05_pipeline"
