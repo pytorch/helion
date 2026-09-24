@@ -479,6 +479,28 @@ class TestExamples(RefEagerTestBase, TestCase):
             max_mismatched_abs_diff=max_mismatched_abs_diff,
         )
 
+    @onlyBackends(["triton"])
+    @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
+    def test_fp8_gemm_scaled(self):
+        # Match TritonBench: non-unit tensor-wise scales and a column-major B
+        x = torch.randn([256, 128], device=DEVICE, dtype=torch.float32)
+        y = torch.randn([128, 192], device=DEVICE, dtype=torch.float32)
+        x_fp8 = x.to(torch.float8_e4m3fn)
+        y_fp8 = y.to(torch.float8_e4m3fn).T.contiguous().T
+        scale_a = torch.tensor(0.5, device=DEVICE)
+        scale_b = torch.tensor(0.25, device=DEVICE)
+        args = (x_fp8, y_fp8, scale_a, scale_b)
+
+        mod = import_path(EXAMPLES_DIR / "fp8_gemm.py")
+        check_example(
+            "fp8_gemm",
+            args,
+            mod.reference_fp8_gemm_pytorch(*args),
+            block_sizes=[16, 16, 32],
+            num_warps=4,
+            num_stages=3,
+        )
+
     def test_template_via_closure0(self):
         bias = torch.randn([1, 512], device=DEVICE, dtype=HALF_DTYPE)
         args = (
