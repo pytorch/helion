@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopState
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
+    from .chained_matmul import ChainedMatmulPlan
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from .direct_affine_plan import DirectAffinePlan
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .host_fastpath import Plan as HostFastpathPlan
+    from .serial_lane_recurrence import SerialLanePlan
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -316,6 +319,8 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     # scheduler pipeline.
     scheduler_warp_count: int = 0
     sched_stage_count: int = 0
+    # Transport choice only: preserve the scheduler slot and AUX warp IDs.
+    aux_role_local_scheduler: bool = False
     # Optional C-input / auxiliary-tensor warp. WITH_SCHEDULER may lift this
     # to one warp; launched_warp_count still rounds to a warpgroup-aligned
     # envelope, so the lifted warp occupies the previous inert padding slot.
@@ -350,6 +355,11 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     aux_tensor_descriptors: tuple[Tcgen05AuxTensorDescriptor, ...] = dataclasses.field(
         default=(), compare=False
     )
+    # Semantic B/M/N offsets, independent of tile-loop ordering and L2 remaps.
+    # Present only after the full-tile, single-CTA batched TMA proof succeeds.
+    batched_aux_tile_offsets: tuple[str, str, str] | None = dataclasses.field(
+        default=None, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.grouped is None:
@@ -382,13 +392,14 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
         """Aux descriptors staged by the C-input warp.
 
         Exact-shape rank-2 MxN aux tensors use the SMEM-ring producer.
-        Broadcast row vectors and leading-passthrough rank-3 residuals stay on
-        the direct per-thread load path; the producer scheduler is 2-D only.
+        Rank-3 sources are staged only by the explicitly admitted batched TMA
+        path. Other rank-3 sources and broadcasts retain their direct loads.
         """
-        return tuple(
-            d
-            for d in self.aux_tensor_descriptors
-            if d.broadcast_axis is None and d.host_tensor_val.ndim == 2
+        from .aux_tensor import staged_aux_tensor_descriptors
+
+        return staged_aux_tensor_descriptors(
+            self.aux_tensor_descriptors,
+            batched_tma=self.batched_aux_tile_offsets is not None,
         )
 
     @property
@@ -421,6 +432,10 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     @property
     def has_scheduler_warp(self) -> bool:
         return self.scheduler_warp_count > 0
+
+    @property
+    def uses_scheduler_mailbox(self) -> bool:
+        return self.has_scheduler_warp and not self.aux_role_local_scheduler
 
     @property
     def scheduler_warp_id(self) -> int:
@@ -508,6 +523,12 @@ class CuteDeviceFunctionState:
     """CuTe-owned state for one DeviceFunction codegen instance."""
 
     def __init__(self) -> None:
+        # Physical (axis, thread extent) for grid index/base assignments.
+        # The launcher consults only names that survive final AST lowering;
+        # this does not depend on blocked/strided index-expression spelling.
+        self.grid_thread_extents: dict[str, tuple[int, int]] = {}
+        self.serial_lane_plan: SerialLanePlan | None = None
+        self.host_fastpath_plan: HostFastpathPlan | None = None
         # SIMT reduction-kernel thread-block cluster width (from the
         # ``cute_cluster_n`` config knob, applied by
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
@@ -619,6 +640,7 @@ class CuteDeviceFunctionState:
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
         self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
+        self.chained_matmul_plan: ChainedMatmulPlan | None = None
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the

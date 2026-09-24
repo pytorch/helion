@@ -67,6 +67,7 @@ from helion.autotuner import LLMGuidedSearch
 from helion.autotuner import LLMSeededLFBOTreeSearch
 from helion.autotuner import LLMSeededSearch
 from helion.autotuner import PatternSearch
+from helion.autotuner import benchmark_provider as benchmark_provider_module
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
@@ -11272,15 +11273,20 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ]
         torch.testing.assert_close(args[3], ref_out)
 
-    def test_only_mutated_tensors_cloned_during_benchmark(self) -> None:
+    def test_all_tensor_storage_cloned_outside_benchmark(self) -> None:
         """
-        During benchmarking, only mutated tensors should be cloned.
-        Non-mutated tensors should only be cloned during initialization.
+        Accuracy and timing use private copies of every tensor, even inputs
+        whose reference values do not change. Cloning is outside the timer.
         """
         config1 = helion.Config(block_sizes=[32], num_warps=4)
         config2 = helion.Config(block_sizes=[64], num_warps=4)
 
-        @helion.kernel(configs=[config1, config2], autotune_log_level=0)
+        @helion.kernel(
+            configs=[config1, config2],
+            autotune_log_level=0,
+            autotune_precompile=None,
+            autotune_benchmark_subprocess=False,
+        )
         def inplace_add(
             a: torch.Tensor,
             b: torch.Tensor,
@@ -11300,42 +11306,63 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         non_mutated_ptrs = {a.data_ptr(), b.data_ptr()}
         mutated_clones = [0]
         non_mutated_clones = [0]
+        inside_timer = [False]
+        # Keep tracked allocations live so recycled addresses cannot move
+        # between the mutated and read-only categories while counting clones.
+        tracked_clones: list[torch.Tensor] = []
 
         original_clone = torch.Tensor.clone
 
         def tracking_clone(self, *args, **kwargs):
             result = original_clone(self, *args, **kwargs)
             if self.data_ptr() in mutated_ptrs:
+                assert not inside_timer[0]
                 mutated_ptrs.add(result.data_ptr())
                 mutated_clones[0] += 1
+                tracked_clones.append(result)
             if self.data_ptr() in non_mutated_ptrs:
+                assert not inside_timer[0]
                 non_mutated_ptrs.add(result.data_ptr())
                 non_mutated_clones[0] += 1
+                tracked_clones.append(result)
             return result
 
-        with patch.object(torch.Tensor, "clone", tracking_clone):
+        original_bench = benchmark_provider_module.do_bench
+
+        def timed_bench(*args, **kwargs):
+            inside_timer[0] = True
+            try:
+                return original_bench(*args, **kwargs)
+            finally:
+                inside_timer[0] = False
+
+        with (
+            patch.object(torch.Tensor, "clone", tracking_clone),
+            patch.object(benchmark_provider_module, "do_bench", timed_bench),
+        ):
             inplace_add(a, b, epsilon, out)
 
         # Mutated tensor (out) should be cloned during baseline AND benchmarking:
         #   _compute_baseline: 1 + baseline_post_args: 1
-        #   + 2 benchmark runs = 4 total
+        #   + 2 accuracy runs + 2 timing preparations = 6 total
         self.assertEqual(
             mutated_clones[0],
-            4,
-            f"Mutated tensor cloned {mutated_clones[0]} times, expected 4.",
+            6,
+            f"Mutated tensor cloned {mutated_clones[0]} times, expected 6.",
         )
 
-        # Non-mutated tensors (a, b) should only be cloned during baseline:
-        #   _compute_baseline: 2 = 2 total
+        # Read-only baseline arguments still require private candidate storage:
+        #   _compute_baseline: 2 + 2*(2 accuracy + 2 timing) = 10 total.
         self.assertEqual(
             non_mutated_clones[0],
-            2,
-            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 2. "
-            f"Only mutated tensors should be cloned during benchmarking.",
+            10,
+            f"Non-mutated tensors cloned {non_mutated_clones[0]} times, expected 10.",
         )
 
         expected = torch.full([128], 3.0, device=DEVICE) + epsilon
         torch.testing.assert_close(out, expected)
+        torch.testing.assert_close(a, torch.ones_like(a))
+        torch.testing.assert_close(b, torch.full_like(b, 2.0))
 
     @skipIfXPU("CUDA specific API used to check memory usage")
     def test_chunked_allclose_memory(self):
@@ -11615,6 +11642,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_cluster_n",
                 "cute_min_blocks_per_mp",
                 "load_eviction_policies",
+                "cute_host_selected_fastpath",
             },
         )
 
@@ -11639,6 +11667,7 @@ class TestCuteAutotuner(TestCase):
                     "cute_cluster_n",
                     "cute_min_blocks_per_mp",
                     "load_eviction_policies",
+                    "cute_host_selected_fastpath",
                 },
             )
             self.assertNotIn("persistent", config.pid_type)
@@ -15523,10 +15552,21 @@ class TestAutotuneBudget(TestCase):
             backend.should_deduplicate_generated_sources(_cute_flash_test_config_spec())
         )
         self.assertFalse(
-            backend.should_deduplicate_generated_sources(
-                SimpleNamespace(cute_flash_search_enabled=False)
-            )
+            backend.should_deduplicate_generated_sources(ConfigSpec(backend=backend))
         )
+
+    def test_cute_backend_source_dedup_respects_search_families(self) -> None:
+        backend = CuteBackend()
+        config_spec = ConfigSpec(backend=backend)
+        for flash_enabled in (False, True):
+            for chained_enabled in (False, True):
+                with self.subTest(flash=flash_enabled, chained=chained_enabled):
+                    config_spec.cute_flash_search_enabled = flash_enabled
+                    config_spec.cute_chained_matmul_search_enabled = chained_enabled
+                    self.assertEqual(
+                        backend.should_deduplicate_generated_sources(config_spec),
+                        flash_enabled or chained_enabled,
+                    )
 
     def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
         """``LocalBenchmarkProvider.benchmark`` must stop compiling

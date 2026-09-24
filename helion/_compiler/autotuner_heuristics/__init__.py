@@ -7,6 +7,7 @@ from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
+from .cute import CuteChainedMatmulHeuristic
 from .cute import CuteChunkPrepareHeuristic
 from .cute import CuteChunkRecurrenceHeuristic
 from .cute import CuteFixedTokenRank1Heuristic
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 # All active heuristics by backend
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
+        CuteChainedMatmulHeuristic,
         CuteAsyncStateLoadHeuristic,
         CuteFp8GemmSkinnyMHeuristic,
         CuteChunkRecurrenceHeuristic,
@@ -231,4 +233,24 @@ def compiler_seed_configs(
             # The primary (rank-0) is the promoted default.
             env.config_spec.compiler_default_config = ranked[0]
         env.config_spec.autotuner_heuristics.append(heuristic.name)
+    insertion = 1
+    if env.backend_name == "cute" and env.config_spec.cute_serial_lane_schedule_enabled:
+        from .serial_lane import serial_lane_seeds
+
+        siblings = serial_lane_seeds(env, device_ir)
+        if siblings:
+            # Keep every legacy parent's order and multiplicity, the promoted
+            # default and caller-owned seeds. Only enabled siblings are new.
+            configs[1:1] = siblings
+            insertion += len(siblings)
+            env.config_spec.autotuner_heuristics.append("cute_serial_lane")
+    if env.backend_name == "cute":
+        from .cute_guarded_siblings import guarded_schedule_siblings
+
+        additions = guarded_schedule_siblings(env, device_ir, configs)
+        if additions:
+            # After the old serial sibling block (if any), but before the
+            # potentially long chained pool: these stay visible in initial100.
+            configs[insertion:insertion] = additions
+            env.config_spec.autotuner_heuristics.append("cute_guarded_siblings")
     return dedupe_configs(configs)

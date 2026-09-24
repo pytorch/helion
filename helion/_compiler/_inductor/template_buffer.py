@@ -662,6 +662,20 @@ class HelionTemplateBuffer(TemplateBuffer):
         # normalize defaults specific to this BoundKernel's config_spec.
         config = Config(**config.config)  # pyrefly: ignore[bad-argument-type]
         self._bound_kernel.env.config_spec.normalize(config)
+        if config.config.get("cute_host_selected_fastpath", False):
+            from ... import exc
+
+            raise exc.BackendUnsupported(
+                "cute",
+                "host-selected fastpath requires eager current-call dispatch; Inductor rendering is unsupported",
+            )
+        if config.config.get("cute_serial_lane_schedule", "lane_major") != "lane_major":
+            from ... import exc
+
+            raise exc.BackendUnsupported(
+                "cute",
+                "serial lane schedule requires the original current-call host contract; Inductor template rendering is unsupported",
+            )
         extra_params = [p for p, _ in self._extra_params]
         # Prologue deduplication tracking scoped to this codegen pass.
         prologue_first_indexing: dict[str, str] = {}

@@ -1579,6 +1579,12 @@ class DeviceFunction:
                 {k: v[0] for k, v in self._variable_renames.items()},
             ),
         ]
+        if self.cute_state.chained_matmul_plan is not None:
+            # Guarded vector copies promote individual tiles to 16-byte
+            # alignment. Their scalar fallback only needs element alignment.
+            result.append(
+                statement_from_string(f"{self.name}._helion_cute_pointer_alignment = 1")
+            )
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:
             # The CuTe launcher reads this attribute to launch the kernel
@@ -1601,6 +1607,29 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_min_blocks_per_mp = {min_blocks}"
                 )
             )
+        if "cute_serial_lane_schedule" in self.config.config:
+            from .cute.serial_lane_recurrence import variant
+
+            original = next(
+                node for node in result if isinstance(node, ast.FunctionDef)
+            )
+            candidate = variant(self, original)
+            metadata = [
+                ast_rename(
+                    ast.parse(ast.unparse(node)).body[0], {self.name: candidate.name}
+                )
+                for node in result
+                if isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Attribute)
+                and isinstance(node.targets[0].value, ast.Name)
+                and node.targets[0].value.id == self.name
+            ]
+            result.extend([candidate, *metadata])
+        if self.config.config.get("cute_host_selected_fastpath", False):
+            from .cute.host_fastpath import variants
+
+            result = variants(self, result)
         return result
 
     def proven_disjoint_tensor_pairs(self) -> set[frozenset[str]]:
@@ -1822,6 +1851,10 @@ class DeviceFunction:
         assert isinstance(call_statement, ExtendedAST)
         # Mark the kernel call so we can find it in codegen_precompile_def
         call_statement._is_kernel_call = True
+        if "cute_serial_lane_schedule" in self.config.config:
+            from .cute.serial_lane_recurrence import guarded_call
+
+            call_statement = guarded_call(self, call_statement)
         return call_statement
 
     def dead_code_elimination(self) -> None:

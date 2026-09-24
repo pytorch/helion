@@ -56,6 +56,66 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def _live_grid_thread_extents(
+    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
+) -> dict[int, int]:
+    """Recover grid launch requirements from surviving named assignments."""
+    live: dict[int, int] = {}
+    for statement in statements:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in extents:
+                    axis, extent = extents[target.id]
+                    live[axis] = max(live.get(axis, 1), extent)
+    return live
+
+
+def _live_grid_thread_dims(
+    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
+) -> list[int]:
+    live = _live_grid_thread_extents(statements, extents)
+    return [live.get(axis, 1) for axis in range(3)]
+
+
+def _pointwise_grid_thread_dims(
+    live_extents: dict[int, int],
+    final_thread_axes: set[int],
+    referenced_dims: Sequence[int],
+    *,
+    has_pointwise_fact: bool,
+    has_nested_device_loops: bool,
+    has_synthetic_free_axes: bool,
+) -> tuple[int, int, int] | None:
+    if (
+        not has_pointwise_fact
+        or not live_extents
+        or not final_thread_axes.issubset(live_extents)
+        or has_nested_device_loops
+        or has_synthetic_free_axes
+    ):
+        return None
+    if any(referenced_dims[axis] > live_extents[axis] for axis in final_thread_axes):
+        # A larger reference is not evidence that every producer has a surplus
+        # mask. Do not add duplicate/out-of-tile writers to satisfy it.
+        raise exc.BackendUnsupported(
+            "cute", "pointwise grid reference exceeds its live producer extent"
+        )
+    dims = [
+        live_extents.get(axis, 1) if axis in final_thread_axes else 1
+        for axis in range(3)
+    ]
+    # CUDA's z dimension is capped independently of the total thread count.
+    # A numerically complete rectangular grid can otherwise request z=128
+    # while still fitting the 1024-thread product budget checked by the caller.
+    if any(size > limit for size, limit in zip(dims, (1024, 1024, 64), strict=True)):
+        raise exc.BackendUnsupported(
+            "cute", f"pointwise grid launch exceeds CUDA per-axis limits: {tuple(dims)}"
+        )
+    return dims[0], dims[1], dims[2]
+
+
 def _detect_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -965,6 +1025,8 @@ class CuteBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..device_ir import RootGraphInfo
+        from .chained_matmul import plan_chained_matmul
+        from .chained_scan_export import requests_scan_export
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
@@ -1006,9 +1068,60 @@ class CuteBackend(Backend):
             return
 
         device_function.cute_state.direct_affine_candidates = ()
+        chained_plan = plan_chained_matmul(graphs)
+        device_function.cute_state.chained_matmul_plan = chained_plan
+        if chained_plan is not None:
+            return
+        if config.config.get("cute_chained_leaf_pipeline", "legacy") != "legacy":
+            raise exc.BackendUnsupported(
+                "cute", "paired leaf pipeline requires a resident K128 pair"
+            )
+        if config.config.get("cute_chained_k_schedule", "full") != "full":
+            raise exc.BackendUnsupported(
+                "cute", "K64 scheduling requires a supported initialized K128 pair"
+            )
+        if config.config.get("cute_chained_coefficient_cache"):
+            raise exc.BackendUnsupported(
+                "cute", "coefficient cache requires a supported resident one-dot plan"
+            )
+        if config.config.get("cute_chained_direct_output"):
+            raise exc.BackendUnsupported(
+                "cute", "direct output requires a supported resident one-dot M64 plan"
+            )
+        if config.config.get("cute_chained_tmem_early_release"):
+            raise exc.BackendUnsupported(
+                "cute", "early TMEM release requires a supported resident chained plan"
+            )
+        if config.config.get("cute_chained_late_rhs_reuse"):
+            raise exc.BackendUnsupported(
+                "cute",
+                "late RHS reuse requires a supported initialized direct-RHS pair",
+            )
+        if config.config.get("cute_chained_initialized_accumulator"):
+            raise exc.BackendUnsupported(
+                "cute", "initialized accumulator requires a supported independent pair"
+            )
+        scan_export_requested = any(
+            requests_scan_export(tuple(graph.graph.nodes)) for graph in graphs
+        )
+        if (
+            scan_export_requested
+            and config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "unsupported chained scan export ownership or layout"
+            )
+        if config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            raise exc.BackendUnsupported(
+                "cute", "tcgen05_tmem requires a supported full-tile contraction DAG"
+            )
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
+        if scan_export_requested:
+            raise exc.BackendUnsupported(
+                "cute", "unsupported chained scan export ownership or layout"
+            )
         plan_chunk_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
             return
@@ -1028,6 +1141,23 @@ class CuteBackend(Backend):
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
+    def fake_subscript_shape(
+        self, tensor: torch.Tensor, index: list[object]
+    ) -> list[int | torch.SymInt]:
+        from ..backend import _validate_subscript_indices
+        from ..indexing_strategy import SubscriptIndexing
+
+        # Whole-root contraction DAGs evaluate resident kernel tensors at
+        # arbitrary coordinates. Other lowering paths still reject narrowing
+        # during code generation when they cannot preserve residency.
+        if not _validate_subscript_indices(index):
+            # Shape-only views must retain their existing dimensions. The
+            # general indexing path allocates reduction dimensions for slices,
+            # which changes symbolic axis identity and can leave dead host
+            # reduction-size bindings after a whole-root lowering.
+            return super().fake_subscript_shape(tensor, index)
+        return SubscriptIndexing.compute_shape(tensor, index)
+
     def supports_config_key(self, key: str) -> bool:
         if (
             key == "num_threads"
@@ -1041,6 +1171,27 @@ class CuteBackend(Backend):
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
             or key == "cute_affine_scan_schedule"
+            or key == "cute_chained_mma_schedule"
+            or key == "cute_chained_pointwise_vectorize"
+            or key == "cute_chained_startup_transfer"
+            or key == "cute_chained_tmem_free"
+            or key == "cute_chained_pointwise_unroll"
+            or key == "cute_chained_pointwise_read_cache"
+            or key == "cute_chained_pointwise_inplace_async"
+            or key == "cute_chained_coefficient_cache"
+            or key == "cute_serial_lane_schedule"
+            or key == "cute_serial_lane_load_schedule"
+            or key == "cute_serial_lane_coarsen"
+            or key == "cute_serial_lane_tail_schedule"
+            or key == "cute_host_selected_fastpath"
+            or key == "cute_chained_initialized_accumulator"
+            or key == "cute_chained_late_rhs_reuse"
+            or key == "cute_chained_k_schedule"
+            or key == "cute_chained_leaf_pipeline"
+            or key == "cute_chained_tmem_early_release"
+            or key == "cute_chained_direct_output"
+            or key == "cute_chained_auxiliary_cache"
+            or key == "cute_chained_c_smem_padding"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
@@ -1193,7 +1344,10 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        return (
+            config_spec.cute_flash_search_enabled
+            or config_spec.cute_chained_matmul_search_enabled
+        )
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or
@@ -1274,6 +1428,7 @@ class CuteBackend(Backend):
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
+            "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_helion_tcgen05_pipeline": (
                 "from helion._compiler.cute import tcgen05_pipeline "
                 "as _helion_tcgen05_pipeline"
@@ -1937,6 +2092,7 @@ class CuteBackend(Backend):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
         from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
+        from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -2024,6 +2180,11 @@ class CuteBackend(Backend):
         # The single-token rank-1 path owns the complete physical body.  The
         # original B1 schedule uses 256 threads while its batched schedule uses
         # one warp; the structural plan proves which topology was emitted.
+        chained_plan = device_function.cute_state.chained_matmul_plan
+        if chained_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({chained_plan.threads}, 1, 1)"
+            )
         single_rank1_plan = device_function.cute_state.single_token_rank1_plan
         if single_rank1_plan is not None:
             return launcher_args_with_compile_options(
@@ -2088,7 +2249,16 @@ class CuteBackend(Backend):
                 flags=re.MULTILINE,
             )
         )
-        offset_thread_dims = [1, 1, 1]
+        grid_thread_extents = device_function.cute_state.grid_thread_extents
+        live_grid_thread_extents = _live_grid_thread_extents(
+            [*device_function.preamble, *device_function.body], grid_thread_extents
+        )
+        exact_grid_thread_dims = [
+            live_grid_thread_extents.get(axis, 1) for axis in range(3)
+        ]
+        offset_thread_dims = list(exact_grid_thread_dims)
+        # Grid producers record exact extents independently of index spelling.
+        # Keep text recovery only for older/unregistered index producers.
         # When a lane loop is active for an axis the generated index expression
         # has the form
         #   ``indices_<n> = tile_offset_<n> + Int32(thread_idx()[<axis>]) * <epT> + Int32(lane_<n>)``
@@ -2125,37 +2295,42 @@ class CuteBackend(Backend):
         # without a signal. ``indices_line_assert_re`` below detects
         # the "wrapper-dropped" form so we can fail loudly instead.
         indices_line_re = re.compile(
-            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ "
-            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(\d+)\]\)"
-            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(\d+))?",
+            r"^\s*(?P<index>indices_\d+) = (?:tile_)?offset_(?P<offset>\d+) \+ "
+            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(?P<axis>\d+)\]\)"
+            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(?P<ept>\d+))?",
             flags=re.MULTILINE,
         )
         # Loose form: any ``indices_<n>`` line containing ``thread_idx``
         # under any wrapping. Used only for the wrapper-invariant
         # assertion below — never consulted for launch-dim values.
         indices_line_loose_re = re.compile(
-            r"^\s*indices_\d+ = (?:tile_)?offset_\d+ \+ "
+            r"^\s*(?P<index>indices_\d+) = (?:tile_)?offset_\d+ \+ "
             r"[^\n]*?cute\.arch\.thread_idx\(\)",
             flags=re.MULTILINE,
         )
         matched_lines = 0
         for line_match in indices_line_re.finditer(final_kernel_text):
+            if line_match.group("index") in grid_thread_extents:
+                continue
             matched_lines += 1
-            offset_id = line_match.group(1)
-            axis_text = line_match.group(2)
-            multiplier_text = line_match.group(3)
+            offset_id = line_match.group("offset")
+            axis_text = line_match.group("axis")
+            multiplier_text = line_match.group("ept")
             axis = int(axis_text)
             if not (0 <= axis < len(offset_thread_dims)):
                 continue
             block_name = offset_block_sizes.get(offset_id)
             block_size = block_size_values.get(block_name or "")
             if block_size is None and block_name is not None:
-                try:
-                    config_index = int(block_name.removeprefix("_BLOCK_SIZE_"))
-                except ValueError:
-                    config_index = -1
-                if 0 <= config_index < len(config.block_sizes):
-                    config_block_size = config.block_sizes[config_index]
+                # The generated suffix is a logical block ID, not an index
+                # into the tunable-only config list. Fixed leading axes and
+                # aliased blocks can make those indices differ. Resolve via
+                # BlockSizeInfo, as the grid producer does, so recovery cannot
+                # inflate an unmasked root using another root's tile width.
+                block_id = int(block_name.removeprefix("_BLOCK_SIZE_"))
+                block_sizes = CompileEnvironment.current().block_sizes
+                if 0 <= block_id < len(block_sizes):
+                    config_block_size = block_sizes[block_id].from_config(config)
                     if isinstance(config_block_size, int):
                         block_size = config_block_size
             if block_size is None:
@@ -2199,7 +2374,10 @@ class CuteBackend(Backend):
         # under-dimension every kernel that uses a thread axis.
         if (
             offset_block_sizes
-            and indices_line_loose_re.search(final_kernel_text)
+            and any(
+                match.group("index") not in grid_thread_extents
+                for match in indices_line_loose_re.finditer(final_kernel_text)
+            )
             and matched_lines == 0
         ):
             raise AssertionError(
@@ -2225,11 +2403,15 @@ class CuteBackend(Backend):
         root_grid_dims = [1, 1, 1]
         device_ir = HostFunction.current().device_ir
         for block_ids in device_ir.grid_block_ids:
-            strategy = tile_strategy.block_id_to_strategy.get(tuple(block_ids))
-            if strategy is None:
-                continue
-            for axis, size in enumerate(strategy.thread_block_sizes()):
-                if axis < len(root_grid_dims):
+            for block_id in block_ids:
+                # Strategy widths use local axes. Reduction/free axes can
+                # precede the root in the actual CUDA layout, so use the same
+                # physical mapping as TileStrategyDispatch.thread_block_dims.
+                # Otherwise a dead root axis can inflate a different live
+                # axis whose memory accesses correctly omitted surplus masks.
+                axis = tile_strategy.thread_axis_for_block_id(block_id)
+                size = tile_strategy.thread_extent_for_block_id(block_id)
+                if axis is not None and size is not None and 0 <= axis < 3:
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
@@ -2352,6 +2534,34 @@ class CuteBackend(Backend):
                 dims = dynamic_dims
             else:
                 dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        pointwise_dims = _pointwise_grid_thread_dims(
+            live_grid_thread_extents,
+            final_thread_axes,
+            referenced_dims,
+            has_pointwise_fact=bool(
+                CompileEnvironment.current().config_spec.pointwise_facts
+            ),
+            has_nested_device_loops=has_nested_device_loops,
+            has_synthetic_free_axes=bool(codegen.cute_synthetic_arange_axis_sizes),
+        )
+        if pointwise_dims is not None:
+            # Register broadcasts can create reduction strategies without an
+            # executable reduction. Their static axis reservation can differ
+            # from the root producer's physical mapping (especially when some
+            # reduction thread counts are one). For a proven pointwise body
+            # whose live axes all have grid producers, those emitted producers
+            # own the launch, with larger statement references rejected rather
+            # than inflating an unproved surplus mask. Keep reductions/MMA and independent
+            # nested/free-arange axes on their existing launch paths.
+            dims = pointwise_dims
+        if any(
+            required > actual
+            for required, actual in zip(exact_grid_thread_dims, dims, strict=True)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "grid thread extents cannot fit the launch thread budget",
+            )
         # Detect the silent-truncation case: codegen has already emitted
         # thread_idx[axis] references that assume a certain per-axis
         # extent (recorded in ``referenced_thread_block_dims``), but the
@@ -2767,9 +2977,18 @@ class CuteBackend(Backend):
                     n_axis = block_ids.index(specialized_mma_plan.n_block_id)
                     m_block_size = nd_block_size[m_axis]
                     n_block_size = nd_block_size[n_axis]
+                    # The generic SIMT budget above can resolve an automatic
+                    # M axis before this specialized plan is known. Preserve
+                    # the original auto setting: that temporary width is not
+                    # an explicit request for multiple lanes per warp slot.
+                    # TCgen05's role launch multiplies this width by its warp
+                    # count, so retaining (for example) 64 would double it.
+                    requested_m_threads = env.config_spec.num_threads.config_get(
+                        config.num_threads, specialized_mma_plan.m_block_id, 0
+                    )
                     root_m_threads = (
                         _tcgen05_root_m_threads(int(m_block_size), int(n_block_size))
-                        if num_threads_config[m_axis] == 0
+                        if requested_m_threads == 0
                         and isinstance(m_block_size, int)
                         and isinstance(n_block_size, int)
                         else num_threads_config[m_axis]

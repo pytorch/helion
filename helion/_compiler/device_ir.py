@@ -991,8 +991,26 @@ class DeviceIR:
         # A present reduction must keep its slot at index 0, so reduction
         # kernels register their tile slots after the reduction-loop pass below.
         if env.backend_name == "cute" and not rdims:
+            from ..language.scan_ops import _associative_scan
+            from .cute.memory_ops import register_cute_tensor_alias_specializations
+
             self._register_cute_tile_vec_slots(env)
+            # Grid scans also reorder input reads across warps and need the
+            # same cache-specialized alias facts as reduction kernels. Do not
+            # add storage-dependent dispatch guards to unrelated grid kernels.
+            if any(
+                node.op == "call_function" and node.target is _associative_scan
+                for graph_info in self.graphs
+                for node in graph_info.graph.nodes
+            ):
+                register_cute_tensor_alias_specializations(env)
         if not rdims:
+            if env.backend_name == "cute":
+                from .cute.serial_lane_recurrence import discover
+
+                env.config_spec.cute_serial_lane_schedule_enabled = (
+                    discover(self) is not None
+                )
             return
         num_original_graphs = len(self.graphs)
 

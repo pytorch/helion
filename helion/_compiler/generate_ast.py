@@ -391,6 +391,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
 
+    def _try_codegen_chained_matmul_root(self) -> bool:
+        if self.device_function.cute_state.chained_matmul_plan is None:
+            return False
+        from .cute.chained_matmul import codegen_chained_matmul
+
+        if codegen_chained_matmul(self):
+            return True
+        self.device_function.cute_state.chained_matmul_plan = None
+        raise exc.BackendUnsupported("cute", "chained matmul failed late validation")
+
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
         if plan is None:
@@ -1405,7 +1415,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     root = root_graph_info.graph
                     if (
-                        not self._try_codegen_chunk_prepare_root()
+                        not self._try_codegen_chained_matmul_root()
+                        and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
@@ -1440,6 +1451,13 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     self.statements_stack[-1].extend(
                                         grid_state.wrap_body(wrapped_body)
                                     )
+                                    if (
+                                        "cute_serial_lane_schedule"
+                                        in self.device_function.config.config
+                                    ):
+                                        from .cute.serial_lane_recurrence import capture
+
+                                        capture(self.device_function, grid_state)
                                 self.statements_stack[-1].extend(
                                     grid_state.outer_suffix
                                 )
@@ -1767,6 +1785,19 @@ def generate_ast(
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             kernel_def = codegen.device_function.codegen_function_def()
+            if codegen.device_function.config.config.get(
+                "cute_host_selected_fastpath", False
+            ):
+                from .cute.host_fastpath import guarded_call as fastpath_call
+
+                for statement in codegen.host_statements:
+                    for node in list(ast.walk(statement)):
+                        if (
+                            isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Name)
+                            and node.func.id == "_launcher"
+                        ):
+                            fastpath_call(codegen.device_function, node)
             codegen.host_dead_code_elimination()
 
             # Retarget output-only tensor allocations to ``device='meta'`` so
@@ -1960,6 +1991,25 @@ def generate_ast(
                     f"sourceless prologue params not removed by DCE: {remaining}"
                 )
 
+            if "cute_serial_lane_schedule" in codegen.device_function.config.config:
+                from .cute.serial_lane_recurrence import entry_statements
+
+                final_host_statements = [
+                    *entry_statements(
+                        codegen.device_function,
+                        codegen.device_function.sourceless_prologue_params,
+                    ),
+                    *final_host_statements,
+                ]
+            if codegen.device_function.config.config.get(
+                "cute_host_selected_fastpath", False
+            ):
+                from .cute.host_fastpath import entry_statements as fastpath_entry
+
+                final_host_statements = [
+                    *fastpath_entry(codegen.device_function),
+                    *final_host_statements,
+                ]
             host_def = func.codegen_function_def(
                 final_host_statements,
                 extra_params=codegen._extra_params,

@@ -350,6 +350,22 @@ class HelionKernelVariable(VariableTracker):
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
         """Handle a call to a Helion kernel during Dynamo tracing."""
+        if any(
+            config.config.get("cute_host_selected_fastpath", False)
+            for config in self._kernel.configs
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "host-selected fastpath requires eager current-call dispatch; Kernel/HOP tracing is unsupported",
+            )
+        if any(
+            config.config.get("cute_serial_lane_schedule", "lane_major") != "lane_major"
+            for config in self._kernel.configs
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "serial lane schedule requires the original current-call host contract; Kernel/HOP tracing is unsupported",
+            )
         # Lazy import: higher_order_ops requires PyTorch >= 2.11 (checked in wrap_helion_kernel)
         from helion._compiler._dynamo.higher_order_ops import (
             helion_kernel_wrapper_mutation,
