@@ -231,4 +231,13 @@ def compiler_seed_configs(
             # The primary (rank-0) is the promoted default.
             env.config_spec.compiler_default_config = ranked[0]
         env.config_spec.autotuner_heuristics.append(heuristic.name)
+    if env.backend_name == "cute" and env.config_spec.cute_loop_schedule_enabled:
+        from .loop_schedule import loop_schedule_seeds
+
+        siblings = loop_schedule_seeds(env, device_ir)
+        if siblings:
+            # Keep every legacy parent's order and multiplicity, the promoted
+            # default and caller-owned seeds. Only enabled siblings are new.
+            configs[1:1] = siblings
+            env.config_spec.autotuner_heuristics.append("cute_loop_schedule")
     return dedupe_configs(configs)

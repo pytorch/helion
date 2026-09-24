@@ -889,6 +889,15 @@ class Backend(abc.ABC):
     def inductor_op_overrides(self) -> InductorOpOverrides:
         raise exc.BackendUnsupported(self.name, "Inductor OpOverrides")
 
+    def supports_inductor_pointwise_fusion(self) -> bool:
+        """Whether memory lowering implements Inductor's load/store transforms.
+
+        This is independent of calling a backend kernel from torch.compile.
+        Without the transforms, surrounding pointwise operations must remain
+        separate kernels rather than being replaced by unwritten fused outputs.
+        """
+        return False
+
     def cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         return expr_from_string(
             self.cast_expr("{x}", self.dtype_str(target_dtype)),

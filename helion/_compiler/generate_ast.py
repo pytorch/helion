@@ -1202,25 +1202,33 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self.host_statements = prior
 
     @contextlib.contextmanager
+    def bind_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+        """Make assigned loop coordinates available independently of emission."""
+        for idx in device_loop.block_ids:
+            active_loops = self.active_device_loops[idx]
+            active_loops.append(device_loop)
+            if len(active_loops) > 1:
+                raise exc.NestedDeviceLoopsConflict
+        self._record_active_thread_axis_sizes()
+        self._record_statement_thread_references(device_loop.inner_statements)
+        try:
+            yield
+        finally:
+            for idx in device_loop.block_ids:
+                self.active_device_loops[idx].pop()
+
+    @contextlib.contextmanager
     def add_device_loop(
         self,
         device_loop: DeviceLoopState,
         *,
         needs_barrier_before: bool = False,
     ) -> Iterator[None]:
-        with self.set_statements(device_loop.inner_statements):
-            for idx in device_loop.block_ids:
-                active_loops = self.active_device_loops[idx]
-                active_loops.append(device_loop)
-                if len(active_loops) > 1:
-                    raise exc.NestedDeviceLoopsConflict
-            self._record_active_thread_axis_sizes()
-            self._record_statement_thread_references(device_loop.inner_statements)
-            try:
-                yield
-            finally:
-                for idx in device_loop.block_ids:
-                    self.active_device_loops[idx].pop()
+        with (
+            self.set_statements(device_loop.inner_statements),
+            self.bind_device_loop(device_loop),
+        ):
+            yield
         if needs_barrier_before:
             self.add_statement(statement_from_string("tl.debug_barrier()"))
         self.statements_stack[-1].extend(device_loop.outer_prefix)
@@ -1319,6 +1327,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # pyrefly: ignore[bad-return, bad-argument-type]
         return node.new(fields)
 
+    def _try_codegen_tile_loop_root(self) -> bool:
+        if CompileEnvironment.current().backend_name != "cute":
+            return False
+        from .cute.loop_state import codegen_root
+        from .device_ir import RootGraphInfo
+
+        grid = self.current_grid_state
+        root = self.current_root_graph_info
+        return (
+            isinstance(grid, DeviceGridState)
+            and isinstance(root, RootGraphInfo)
+            and codegen_root(self, root, grid)
+        )
+
     def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
         if node._loop_type == LoopType.GRID:
@@ -1411,6 +1433,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
                         and not self._try_codegen_attention_flash_root()
+                        and not self._try_codegen_tile_loop_root()
                     ):
                         grid_state = self.current_grid_state
                         if isinstance(grid_state, DeviceGridState):

@@ -358,6 +358,7 @@ class CompileEnvironment:
         # view of a user input cannot acquire it merely because it has no direct
         # replayable input source.
         self._symbolically_exact_layout_storages: set[torch.UntypedStorage] = set()
+        self.fresh_allocation_storages: set[torch.UntypedStorage] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -733,6 +734,7 @@ class CompileEnvironment:
         }
         if result_storage in argument_storages:
             return
+        self.fresh_allocation_storages.add(result_storage)
         is_exact = False
         if factory is torch.empty:
             is_exact = True

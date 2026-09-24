@@ -1045,6 +1045,10 @@ class DeviceIR:
             ):
                 register_cute_tensor_alias_specializations(env)
         if not rdims:
+            if env.backend_name == "cute":
+                from .cute.loop_state import find_loop
+
+                env.config_spec.cute_loop_schedule_enabled = find_loop(self) is not None
             return
         num_original_graphs = len(self.graphs)
 
