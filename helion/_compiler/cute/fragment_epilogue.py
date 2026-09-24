@@ -410,6 +410,45 @@ _SHAPE_TARGETS = {
 }
 
 
+def _is_literal_scalar(node: Node) -> bool:
+    value = node.meta.get("val")
+    return (
+        node.op == "call_function"
+        and node.target is torch.ops.aten.scalar_tensor.default
+        and len(node.args) == 1
+        and isinstance(node.args[0], (bool, int, float))
+        and isinstance(value, torch.Tensor)
+        and value.ndim == 0
+        and value.dtype
+        in (
+            torch.bool,
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        )
+    )
+
+
+def _where_inputs(node: Node) -> tuple[Node, ...] | None:
+    if node.target is not torch.ops.aten.where.self or len(node.args) != 3:
+        return None
+    if not all(
+        isinstance(arg, Node) and isinstance(arg.meta.get("val"), torch.Tensor)
+        for arg in node.args
+    ):
+        return None
+    inputs = cast("tuple[Node, ...]", node.args)
+    if inputs[0].meta["val"].dtype is not torch.bool:
+        return None
+    return inputs
+
+
 def _pointwise_inputs(node: Node) -> tuple[Node, ...] | None:
     from ..inductor_lowering import PointwiseLowering
 
@@ -753,6 +792,10 @@ def _validate_host_load(node: Node, output_node: Node) -> None:
 def _node_inputs(node: Node, output_node: Node) -> tuple[Node, ...] | None:
     if node.op != "call_function":
         return None
+    if _is_literal_scalar(node):
+        return ()
+    if (selection := _where_inputs(node)) is not None:
+        return selection
     if (pointwise := _pointwise_inputs(node)) is not None:
         return pointwise
     if node.target is tile_index:
@@ -1655,7 +1698,7 @@ def _collect_demands(
             )
         if current in region.boundaries:
             return frozenset({(current, current_flat)})
-        if current.target is tile_index:
+        if current.target is tile_index or _is_literal_scalar(current):
             return frozenset()
         source = current.args[0] if current.args else None
         if (
@@ -1681,7 +1724,9 @@ def _collect_demands(
                         )
                     )
             return frozenset(demands)
-        inputs = _pointwise_inputs(current)
+        inputs = _where_inputs(current)
+        if inputs is None:
+            inputs = _pointwise_inputs(current)
         if inputs is not None:
             demands: set[tuple[Node, _Index]] = set()
             output_shape = _shape(current, config)
@@ -2160,6 +2205,28 @@ class _Evaluator:
         self.lines.append(_render_statements(statements, self.indent))
         return self._bind("tcgen05_epi_value", result)
 
+    def _where(self, node: Node, flat: _Index, inputs: tuple[Node, ...]) -> ast.AST:
+        config = self.state.device_function.config
+        shape = _shape(node, config)
+        condition, true_value, false_value = (
+            self.evaluate(
+                input_node, _broadcast_flat(flat, shape, _shape(input_node, config))
+            )
+            for input_node in inputs
+        )
+        dtype = CompileEnvironment.current().backend.dtype_str(node.meta["val"].dtype)
+        # A typed selection preserves where's promotion and NaN masking;
+        # multiplying by a boolean mask would keep NaNs from the unused arm.
+        return self._bind(
+            "tcgen05_epi_where",
+            expr_from_string(
+                f"({dtype}({{true_value}}) if {{condition}} else {dtype}({{false_value}}))",
+                condition=condition,
+                true_value=true_value,
+                false_value=false_value,
+            ),
+        )
+
     def evaluate(
         self, node: Node, flat: _Index, projection: int | None = None
     ) -> ast.AST:
@@ -2180,6 +2247,19 @@ class _Evaluator:
                 return self._boundary(current, current_flat)
             if current.target is tile_index:
                 return self._tile_index(current, current_flat)
+            if _is_literal_scalar(current):
+                dtype = CompileEnvironment.current().backend.dtype_str(
+                    current.meta["val"].dtype
+                )
+                return self._bind(
+                    "tcgen05_epi_scalar",
+                    expr_from_string(
+                        f"{dtype}({{value}})",
+                        value=ast.Constant(cast("bool | int | float", current.args[0])),
+                    ),
+                )
+            if (selection := _where_inputs(current)) is not None:
+                return self._where(current, current_flat, selection)
             source = current.args[0] if current.args else None
             if (
                 current.target is memory_ops.load
