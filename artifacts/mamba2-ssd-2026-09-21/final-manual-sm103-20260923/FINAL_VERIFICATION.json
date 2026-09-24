@@ -1,0 +1,49 @@
+{
+  "status": "PASS_WITH_PINNED_BASELINE_FAILURES_ONLY",
+  "device": "GPU-a58c8148-8e58-d9ae-d97f-3cd7322d9e02",
+  "default_suite": {
+    "passed": 4798,
+    "skipped": 5327,
+    "failed": 2,
+    "subtests_passed": 649,
+    "classification": "exact historical Flash length-invariance failures only",
+    "log": "../final-verification/default-final05/pytest.log",
+    "junit": "../final-verification/default-final05/junit.xml",
+    "log_sha256": "ee93d2f1b3978460c20afaf8359ed5003bc3f791543816cb8ef44c936145f06a",
+    "junit_sha256": "801004e3df65e873197176b6af966992410b28a610ded08f52062ac230686435"
+  },
+  "cute_suite": {
+    "passed": 8366,
+    "skipped": 1740,
+    "xfailed": 3,
+    "failed": 5,
+    "subtests_passed": 945,
+    "classification": "exact historical two Flash and three linear-monkeypatch failures only",
+    "log": "../final-verification/cute-final03/pytest.log",
+    "junit": "../final-verification/cute-final03/junit.xml",
+    "log_sha256": "bd7928cc5620b68b52922a686553ceacde61691a69e140f7cfe7f576bdfe86ea",
+    "junit_sha256": "76c72dd05c88085b6e63db03e4e811c8822b54785a357c94a6e389c4c693a881"
+  },
+  "targeted_regression": {
+    "affected_matrix": "230 passed",
+    "affected_log": "../final-verification/affected-final01/pytest.log",
+    "scan_guard": "3 passed",
+    "serial_lane": "156 passed",
+    "serial_lane_log": "../final-verification/serial-lane-final01/pytest.log"
+  },
+  "sanitizers": {
+    "shape1_cold_memcheck": "0 errors",
+    "shape1_cold_racecheck": "0 hazards, 0 errors, 0 warnings",
+    "shape2_cold_memcheck": "0 errors",
+    "shape2_cold_racecheck": "0 hazards, 0 errors, 0 warnings"
+  },
+  "lint": {
+    "ruff": "PASS",
+    "codespell": "PASS",
+    "pyrefly": "49 pre-existing environment/baseline diagnostics; no new scoped diagnostics",
+    "log": "../final-verification/lint-final02/lint.log",
+    "log_sha256": "a70af097f8d877f484ad10fd9fcc3fe201cb6db3a2877393daf5e463174f6400"
+  },
+  "independent_review": "LGTM",
+  "post_rebase_performance": "POST_REBASE_VERIFICATION.json"
+}

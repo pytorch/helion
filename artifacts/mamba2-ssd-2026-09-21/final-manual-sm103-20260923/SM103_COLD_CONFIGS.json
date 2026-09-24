@@ -1,0 +1,21 @@
+{
+  "platform": "nvidia_sm103",
+  "source_results": {
+    "1": "../cold-final-ordinary-shape1-seed2026092411/result.json",
+    "2": "../cold-final-ordinary-shape2-seed2026092401/result.json"
+  },
+  "shapes": {
+    "1": {
+      "mamba_native_state": {"block_sizes": [64, 64], "num_warps": 4, "cute_chained_mma_schedule": "tcgen05_tmem", "cute_chained_pointwise_vectorize": true, "cute_chained_pointwise_unroll": 2, "cute_chained_auxiliary_cache": true, "cute_chained_pointwise_read_cache": false, "cute_chained_pointwise_inplace_async": true, "cute_chained_c_smem_padding": 0, "cute_chained_tmem_early_release": true, "cute_chained_direct_output": true, "cute_chained_startup_transfer": "tma", "cute_vector_widths": [1, 1, 1, 1, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"]},
+      "mamba_native_pass": {"block_sizes": [4, 64], "num_threads": [4, 16], "loop_orders": [[0, 1, 3, 2]], "load_eviction_policies": ["", ""], "cute_vector_widths": [1, 1, 1, 4, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"], "cute_serial_lane_schedule": "step_major_vector", "cute_serial_lane_load_schedule": "prefetch4", "cute_cluster_n": 1, "cute_min_blocks_per_mp": 0},
+      "mamba_native_cb": {"block_sizes": [16, 64], "num_warps": 8, "cute_chained_mma_schedule": "cp_async", "cute_chained_pointwise_vectorize": false, "cute_chained_auxiliary_cache": false, "cute_chained_c_smem_padding": 0, "cute_vector_widths": [1, 1, 1, 1, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"]},
+      "mamba_native_output": {"block_sizes": [128, 64], "num_warps": 4, "cute_chained_mma_schedule": "tcgen05_tmem", "cute_chained_pointwise_vectorize": true, "cute_chained_pointwise_unroll": 4, "cute_chained_auxiliary_cache": true, "cute_chained_pointwise_read_cache": true, "cute_chained_c_smem_padding": 0, "cute_chained_initialized_accumulator": true, "cute_chained_late_rhs_reuse": true, "cute_chained_tmem_early_release": true, "cute_chained_k_schedule": "overlap64", "cute_chained_leaf_pipeline": "paired_tma", "cute_vector_widths": [1, 1, 1, 1, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"]}
+    },
+    "2": {
+      "mamba_native_state": {"block_sizes": [128, 64], "num_warps": 4, "cute_chained_mma_schedule": "tcgen05_tmem", "cute_chained_pointwise_vectorize": true, "cute_chained_pointwise_unroll": 2, "cute_chained_auxiliary_cache": false, "cute_chained_pointwise_read_cache": false, "cute_chained_pointwise_inplace_async": true, "cute_chained_c_smem_padding": 0, "cute_chained_tmem_early_release": true, "cute_chained_direct_output": true, "cute_chained_startup_transfer": "tma", "cute_vector_widths": [1, 1, 1, 1, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"]},
+      "mamba_native_pass": {"block_sizes": [4, 64], "num_threads": [4, 16], "loop_orders": [[0, 1, 3, 2]], "load_eviction_policies": ["", ""], "cute_vector_widths": [1, 1, 1, 4, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"], "cute_serial_lane_schedule": "step_major_vector", "cute_serial_lane_load_schedule": "prefetch4", "cute_cluster_n": 1, "cute_min_blocks_per_mp": 0},
+      "mamba_native_cb": {"block_sizes": [128, 32], "num_warps": 4, "cute_chained_mma_schedule": "tcgen05_tmem", "cute_chained_pointwise_vectorize": false, "cute_chained_auxiliary_cache": true, "cute_chained_c_smem_padding": 0, "cute_chained_tmem_early_release": true, "cute_vector_widths": [1, 1, 1, 1, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"]},
+      "mamba_native_output": {"block_sizes": [128, 64], "num_warps": 4, "cute_chained_mma_schedule": "tcgen05_tmem", "cute_chained_pointwise_vectorize": true, "cute_chained_pointwise_unroll": 8, "cute_chained_auxiliary_cache": false, "cute_chained_tmem_free": "last_read", "cute_chained_pointwise_read_cache": true, "cute_chained_c_smem_padding": 0, "cute_chained_initialized_accumulator": true, "cute_chained_late_rhs_reuse": true, "cute_chained_tmem_early_release": true, "cute_chained_k_schedule": "overlap64", "cute_vector_widths": [1, 1, 1, 1, 1], "cute_lane_layouts": ["blocked", "blocked", "blocked", "blocked", "blocked"]}
+    }
+  }
+}

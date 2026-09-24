@@ -1,0 +1,84 @@
+{
+  "status": "PASS_ALL_SIX",
+  "measurement_kind": "post_rebase_fixed_config_diagnostic",
+  "origin_main": "ad71ac2a",
+  "tested_tree_commit": "265117c9",
+  "device": "GPU-a58c8148-8e58-d9ae-d97f-3cd7322d9e02",
+  "reference_sha256": "5b0db79a7090e74e8e56b6b40432287b8b5710267c51f24c9eb9e1e5aea1be2a",
+  "geomean_speedup": 1.1257700908574375,
+  "pre_rebase_geomean_speedup": 1.1181677256491889,
+  "checks": "five FP64 seeds, BF16 output, repeatability, input immutability, fresh output, and two graphs x three poisoned replays all PASS",
+  "rows": [
+    {
+      "shape": 0,
+      "latency_us": 30.720000000000002,
+      "target_us": 32.512,
+      "speedup": 1.0583333333333333,
+      "remaining_gap_us": -1.791999999999998,
+      "pre_rebase_latency_us": 31.393,
+      "speedup_vs_pre_rebase": 1.0219075520833332,
+      "artifact": "../rebase-validation/perf-final01/shape0/result.json",
+      "status": "PASS"
+    },
+    {
+      "shape": 1,
+      "latency_us": 46.879999999999995,
+      "target_us": 48.32,
+      "speedup": 1.030716723549488,
+      "remaining_gap_us": -1.4400000000000048,
+      "pre_rebase_latency_us": 47.105,
+      "speedup_vs_pre_rebase": 1.0047994880546076,
+      "artifact": "../rebase-validation/perf-final01/shape1/result.json",
+      "status": "PASS"
+    },
+    {
+      "shape": 2,
+      "latency_us": 167.00799999999998,
+      "target_us": 170.273,
+      "speedup": 1.0195499616784827,
+      "remaining_gap_us": -3.265000000000015,
+      "pre_rebase_latency_us": 166.72,
+      "speedup_vs_pre_rebase": 0.9982755317110559,
+      "artifact": "../rebase-validation/perf-final01/shape2/result.json",
+      "status": "PASS"
+    },
+    {
+      "shape": 3,
+      "latency_us": 8.384,
+      "target_us": 8.704,
+      "speedup": 1.0381679389312977,
+      "remaining_gap_us": -0.3200000000000003,
+      "pre_rebase_latency_us": 8.416,
+      "speedup_vs_pre_rebase": 1.0038167938931297,
+      "artifact": "../rebase-validation/perf-final01/shape3-single/result.json",
+      "status": "PASS"
+    },
+    {
+      "shape": 4,
+      "latency_us": 4.704,
+      "target_us": 6.656,
+      "speedup": 1.4149659863945578,
+      "remaining_gap_us": -1.952,
+      "pre_rebase_latency_us": 4.736,
+      "speedup_vs_pre_rebase": 1.0068027210884354,
+      "artifact": "../rebase-validation/perf-final01/shape4-single/result.json",
+      "status": "PASS"
+    },
+    {
+      "shape": 5,
+      "latency_us": 5.984,
+      "target_us": 7.456,
+      "speedup": 1.2459893048128343,
+      "remaining_gap_us": -1.4720000000000004,
+      "pre_rebase_latency_us": 6.016,
+      "speedup_vs_pre_rebase": 1.0053475935828877,
+      "artifact": "../rebase-validation/perf-final01/shape5-single/result.json",
+      "status": "PASS"
+    }
+  ],
+  "invalid_attempt": {
+    "shape": 3,
+    "path": "../rebase-validation/perf-final01/shape3",
+    "reason": "four-stage runner was selected for a single-chunk config; failed closed before timing"
+  }
+}

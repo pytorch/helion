@@ -1,0 +1,23 @@
+{
+  "status": "PASS_FIXED_ORDINARY_NOT_COLD",
+  "shape": 2,
+  "latency_us": 188.289,
+  "target_us": 170.273,
+  "speedup_vs_reference": 0.9043181494407534,
+  "remaining_gap_us": 18.01600000000002,
+  "device_uuid": "GPU-a58c8148-8e58-d9ae-d97f-3cd7322d9e02",
+  "validation": "../v38-integration/native-vector-run-shape2-manualcfg-validate-main01/result.json",
+  "benchmark": "../v38-integration/native-vector-run-shape2-manualcfg-benchmark-main01/result.json",
+  "prelaunch_invalidations": "../v38-integration/native-vector-run-shape2-prelaunch-invalidations-main.json",
+  "intermediates": {
+    "states": "float32",
+    "terminal": "float32",
+    "prefix": "float32",
+    "raw_dt": "float32",
+    "state_passing_output": "bfloat16",
+    "cb": "float32",
+    "output": "bfloat16"
+  },
+  "checks": "Five FP64 seeds, BF16 output, repeatability, input immutability, fresh output, and two CUDA graphs with three poison replays each passed.",
+  "qualification": "Ordinary generated-source baseline before M64 startup TMA and paired raw-leaf TMA are enabled; fixed config, not a cold-autotune winner."
+}
