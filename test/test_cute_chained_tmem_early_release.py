@@ -8,7 +8,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test.test_cute_chained_initialized_accumulator import _args as pair_args
 from test.test_cute_chained_initialized_accumulator import _cpu
+from test.test_cute_chained_initialized_accumulator import _pair as pair_kernel
 from test.test_cute_chained_late_rhs import _args as late_args
 from test.test_cute_chained_late_rhs import _config as late_config
 from test.test_cute_chained_late_rhs import _pair as late_kernel
@@ -23,6 +25,7 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import default_cute_mma_support
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY
 import helion.language as hl
 
@@ -344,3 +347,48 @@ def test_one_seed_twin_preserves_objects_and_all_old_priority() -> None:
     )
     assert heuristics._with_early_tmem_release_seed([]) == []
     assert heuristics._with_early_tmem_release_seed(seeds[:1]) == seeds[:1]
+
+
+@pytest.mark.parametrize("initialized", (False, True))
+def test_actual_initial100_flat_roundtrip_default_and_old_order(
+    initialized: bool,
+) -> None:
+    with _cpu():
+        bound = pair_kernel._bind_isolated(pair_args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        spec.cute_chained_initialized_accumulator_search_enabled = initialized
+        with bound.env:
+            new = heuristics.CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            with patch.object(
+                heuristics,
+                "_with_early_tmem_release_seed",
+                side_effect=lambda seeds: seeds,
+            ):
+                old = heuristics.CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            assert new is not None and old is not None
+            assert len(new) == len(old) + 1
+            assert [seed for seed in new if not seed.config.get(KEY)] == old
+            assert new[0] == old[0]
+            # Rebinding registration already recorded the real compiler pool.
+            generation = ConfigGeneration(spec)
+            population = [
+                generation.unflatten(item)
+                for item in generation.random_population_flat(100)
+            ]
+            selected = [seed for seed in population if seed.config.get(KEY)]
+            assert len(selected) >= 1
+            assert not population[0].config.get(KEY)
+            assert (
+                generation.unflatten(generation.flatten(selected[0])).config[KEY]
+                is True
+            )
+        new_source = bound.to_code(selected[0])
+        old_source = bound.to_code(
+            helion.Config.from_dict(selected[0].config | {KEY: False})
+        )
+        _assert_only_release(old_source, new_source)

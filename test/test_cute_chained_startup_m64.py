@@ -19,6 +19,8 @@ from helion import exc
 from helion._compiler.autotuner_heuristics.cute import _with_chained_startup_seed
 from helion._compiler.cute import chained_tcgen05
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -178,6 +180,35 @@ def test_m64_seed_adds_one_direct_sibling_preserving_legacy_objects():
     assert _with_chained_startup_seed([legacy], [legacy], prefer_direct=True) == [
         legacy
     ]
+
+
+def test_m64_actual_initial100_normalizes_and_admits():
+    with cpu_codegen():
+        bound = _one._bind_isolated(_values())
+        generation = ConfigGeneration(bound.env.config_spec)
+        search = PatternSearch.__new__(PatternSearch)
+        search.config_gen = generation
+        population = generation.random_population_flat(100)
+        expected = search.make_unbenchmarked(
+            generation.flatten(
+                next(
+                    seed
+                    for seed in bound.config_spec.compiler_seed_configs
+                    if seed.config.get(KEY) == "tma"
+                )
+            )
+        )
+        assert expected is not None
+        admitted = []
+        for position, flat in enumerate(population[:100]):
+            member = search.make_unbenchmarked(flat)
+            if member is not None and member.config == expected.config:
+                source = bound.to_code(member.config)
+                assert member.config.config["cute_chained_direct_output"]
+                assert "tcgen05.Ld16x256bOp" in source
+                assert "tma_bar_ptr=chain_start_bar" in source
+                admitted.append(position)
+        assert len(population) >= 100 and admitted
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

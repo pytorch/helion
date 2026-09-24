@@ -9,6 +9,7 @@ import torch
 from .test_cute_chained_pointwise import _args
 from .test_cute_chained_pointwise import _code
 from .test_cute_chained_pointwise import _config
+from .test_cute_chained_pointwise import _pointwise_dot
 from .test_cute_chained_pointwise_fp32 import _mixed_args
 from .test_cute_chained_scan_export import _args as scan_args
 from .test_cute_chained_scan_export import _config as scan_config
@@ -16,11 +17,13 @@ from .test_cute_chained_scan_export import _cpu_codegen
 from .test_cute_chained_scan_export import _scan_export
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.cute.chained_pointwise_inplace import PointwiseInplace
 from helion._compiler.cute.chained_pointwise_inplace import sw128_ownership
 from helion._compiler.cute.chained_tcgen05 import _VectorLeaf
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = skipUnlessBackends(["cute"])
 KEY = "cute_chained_pointwise_inplace_async"
@@ -154,6 +157,41 @@ def test_typed_selection_and_private_activation() -> None:
         )
         is None
     )
+
+
+def test_actual_initial100_and_filtered_seed_order() -> None:
+    with patch_cute_mma_support():
+        bound = _pointwise_dot._bind_isolated(_args("cpu", "dense"))
+    spec = bound.config_spec
+    assert bound.host_function is not None
+    assert spec.cute_chained_pointwise_inplace_search_enabled
+    with bound.env:
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        spec.cute_chained_pointwise_inplace_search_enabled = False
+        try:
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        finally:
+            spec.cute_chained_pointwise_inplace_search_enabled = True
+        assert new is not None and old is not None
+        assert [seed for seed in new if not seed.config.get(KEY)] == old
+        generation = ConfigGeneration(spec)
+        population = [
+            generation.unflatten(value)
+            for value in generation.random_population_flat(100)
+        ]
+        candidates = [seed for seed in population if seed.config.get(KEY)]
+        assert candidates
+        assert not population[0].config.get(KEY)
+        for candidate in candidates:
+            assert (
+                generation.unflatten(generation.flatten(candidate)).config[KEY] is True
+            )
+    with patch("test.test_cute_chained_pointwise._config", return_value=candidates[0]):
+        assert "_raw_copy =" in _code(_args("cpu", "dense"))
 
 
 def test_fp32_leaf_keeps_original_typed_load_path() -> None:

@@ -11,10 +11,12 @@ from test.test_cute_chained_initialized_accumulator import _cpu
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.cute import chained_tcgen05
 from helion._compiler.cute.chained_late_rhs import _layout_bytes
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -240,6 +242,42 @@ def test_resolved_accounting_and_exact_capacity():
 )
 def test_partial_swizzle_atom_rejects(shape, inner):
     assert _layout_bytes(shape, inner) is None
+
+
+def test_actual_seed_old_order_and_useful_first100():
+    with _cpu():
+        bound = _pair._bind_isolated(_args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env:
+            new = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            spec.cute_chained_late_rhs_reuse_search_enabled = False
+            try:
+                old = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            finally:
+                spec.cute_chained_late_rhs_reuse_search_enabled = True
+            assert new is not None and old is not None
+            assert [seed for seed in new if not seed.config.get(KEY)] == old
+            assert new[0] == old[0]
+            generation = ConfigGeneration(spec)
+            population = [
+                generation.unflatten(item)
+                for item in generation.random_population_flat(100)
+            ]
+        useful = [
+            value
+            for value in population
+            if value.config.get(KEY)
+            and value.config.get("cute_chained_pointwise_unroll") == 8
+            and value.config.get("cute_chained_pointwise_read_cache")
+        ]
+        assert useful
+        source = bound.to_code(useful[0])
+        assert "chain_output_ptr = chain_a_workspace" in source
 
 
 def test_no_cuda_initialization():
