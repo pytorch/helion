@@ -791,6 +791,7 @@ VALID_CUTE_CHAINED_MMA_SCHEDULES = (
     "coalesced_unrolled",
     "k_major",
     "k_major_padded",
+    "tcgen05_tmem",
 )
 VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc1",
@@ -1263,6 +1264,7 @@ class ConfigSpec:
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.cute_chained_matmul_search_enabled: bool = False
+        self.cute_chained_tcgen05_search_enabled: bool = False
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
         # retry. ``None`` leaves all benchmark behavior unchanged.
@@ -3946,7 +3948,11 @@ class ConfigSpec:
                 )
 
     def _cute_chained_mma_schedules(self) -> tuple[str, ...]:
-        return VALID_CUTE_CHAINED_MMA_SCHEDULES
+        return tuple(
+            schedule
+            for schedule in VALID_CUTE_CHAINED_MMA_SCHEDULES
+            if schedule != "tcgen05_tmem" or self.cute_chained_tcgen05_search_enabled
+        )
 
     def _flat_fields(
         self,
@@ -3970,6 +3976,8 @@ class ConfigSpec:
                 fields[CUTE_CHAINED_MMA_SCHEDULE_KEY] = EnumFragment(
                     choices=self._cute_chained_mma_schedules()
                 )
+                if self.cute_chained_tcgen05_search_enabled:
+                    pass
                 fields.update(self.user_defined_tunables)
                 return fields
             if self.cute_tcgen05_search_enabled:

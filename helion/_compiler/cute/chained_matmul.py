@@ -62,6 +62,7 @@ class ChainedMatmulPlan:
     tensor_aliases: dict[str, str] = dataclasses.field(
         default_factory=dict, compare=False
     )
+    strategy: str = "warp"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -415,10 +416,13 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
 
     env = CompileEnvironment.current()
     df = DeviceFunction.current()
+    tcgen = df.config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
     if env.backend.name != "cute" or df.config.pid_type != "flat":
         return None
     support = get_cute_mma_support()
-    if not (support.warp_f16bf16):
+    if not (support.tcgen05_f16bf16 if tcgen else support.warp_f16bf16):
+        return None
+    if tcgen and df.config.num_warps != 4:
         return None
     graph = _classify_chained_graph(graphs)
     if graph is None:
@@ -465,7 +469,9 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
     # Every allocation has 128-byte alignment, including the short scan warp
     # totals. Round each allocation rather than only the aggregate footprint.
     smem_bytes = sum((size + 127) // 128 * 128 for size in shared_allocations)
-    if smem_bytes > CuteTcgen05Config.per_cta_smem_capacity_bytes(first_input.device):
+    if not tcgen and smem_bytes > CuteTcgen05Config.per_cta_smem_capacity_bytes(
+        first_input.device
+    ):
         return None
     output = store.args[0]
     if not isinstance(output, Node) or output.target is not _tracing_ops._host_tensor:
@@ -499,7 +505,7 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
         axes.append((axis_id, int(extent), block_size))
     if math.prod((size + block - 1) // block for _, size, block in axes) > 2**31 - 1:
         return None
-    return ChainedMatmulPlan(
+    plan = ChainedMatmulPlan(
         graph.root.graph_id,
         dots,
         store,
@@ -508,7 +514,14 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
         dtype,
         32 * min(df.config.num_warps, 8),
         scans,
+        strategy="tcgen05_tmem" if tcgen else "warp",
     )
+    if tcgen:
+        from .chained_tcgen05 import supported_plan
+
+        if not supported_plan(plan):
+            return None
+    return plan
 
 
 def _names(node: ast.AST) -> frozenset[str]:
@@ -1646,6 +1659,10 @@ def codegen_chained_matmul(cg: GenerateAST) -> bool:
     root = cg.current_root_graph_info
     if plan is None or root is None or root.graph_id != plan.root_graph_id:
         return False
+    if plan.strategy == "tcgen05_tmem":
+        from .chained_tcgen05 import codegen_chained_tcgen05
+
+        return codegen_chained_tcgen05(cg, plan)
     dtype = "cutlass.BFloat16" if plan.dtype is torch.bfloat16 else "cutlass.Float16"
     schedule = df.config.config.get("cute_chained_mma_schedule", "coalesced")
     padding = 0 if schedule == "k_major" else 8

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
@@ -17,6 +18,7 @@ from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
+from ..cute import mma_support
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -3044,8 +3046,131 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                     block = spec.block_sizes.block_id_lookup(block_id)
                     block.update_min(minimum)
                     block.autotuner_min = max(block.autotuner_min, minimum)
+        spec.cute_chained_tcgen05_search_enabled = (
+            mma_support.get_cute_mma_support().tcgen05_f16bf16
+            and bool(cls._tcgen05_seed_configs(env, device_ir))
+        )
 
         return frozenset()
+
+    @classmethod
+    def _tcgen05_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        # Preserve the complete old pool for every formerly admitted root.
+        # Only newly admitted M64 roots acquire a different TCgen05 family.
+        return cls._tcgen05_seed_configs_for_rows(env, device_ir, 128)
+
+    @classmethod
+    def _tcgen05_seed_configs_for_rows(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, rows: int
+    ) -> list[Config]:
+        """Respect semantic dot axes and fixed tiles when seeding resident UMMA.
+
+        This is an admission superset, not the codegen proof: the concrete
+        planner still validates every operand expression, layout, and resource
+        bound. Do not pad root axes or replace explicitly fixed block sizes.
+        """
+        from ...language.matmul_ops import dot
+        from ..compile_environment import FixedBlockSizeSource
+
+        spec = env.config_spec
+        if len(device_ir.task_families) != 1 or not spec.matmul_facts:
+            return []
+        if rows == 64 and (
+            len(spec.matmul_facts) != 1
+            or sum(
+                node.target is dot
+                for graph in device_ir.graphs
+                for node in graph.graph.nodes
+            )
+            != 1
+        ):
+            return []
+        family = device_ir.task_families[0]
+        seeds = []
+        valid = set(spec.block_sizes.valid_block_ids())
+        for width in (32, 64, 128, 256):
+            requirements: dict[int, int] = {}
+            compatible = True
+            for fact in spec.matmul_facts:
+                for role, block_id, static_extent, tile in (
+                    ("m", fact.m_block_id, fact.static_m, rows),
+                    ("n", fact.n_block_id, fact.static_n, width),
+                    ("k", fact.k_block_id, fact.static_k, fact.static_k),
+                ):
+                    if block_id is None or block_id not in valid:
+                        fixed = static_extent
+                        if block_id is not None and family.axis(block_id) is not None:
+                            source = env.block_sizes[block_id].block_size_source
+                            fixed = (
+                                source.value
+                                if isinstance(source, FixedBlockSizeSource)
+                                and isinstance(source.value, int)
+                                else None
+                            )
+                        if (
+                            fixed is None
+                            or fixed <= 0
+                            or (role == "m" and fixed != rows)
+                            or (role == "n" and (fixed % 32 or not 32 <= fixed <= 256))
+                            or (
+                                rows == 64
+                                and role == "n"
+                                and fixed not in (32, 64, 96, 128, 256)
+                            )
+                            or (role == "k" and fixed % 16)
+                        ):
+                            compatible = False
+                        continue
+                    if (
+                        tile is None
+                        or tile <= 0
+                        or (block_id in requirements and requirements[block_id] != tile)
+                    ):
+                        compatible = False
+                        continue
+                    requirements[block_id] = tile
+                if fact.static_k is None or fact.static_k <= 0 or fact.static_k % 16:
+                    compatible = False
+            blocks = []
+            for block in spec.block_sizes:
+                tile = requirements.get(block.block_id, block.min_size)
+                if not block.min_size <= tile <= block.max_size:
+                    compatible = False
+                blocks.append(tile)
+            by_block = {
+                block.block_id: tile
+                for block, tile in zip(spec.block_sizes, blocks, strict=True)
+            }
+            for axis in family.axes:
+                tile = by_block.get(axis.block_id)
+                if tile is None:
+                    source = env.block_sizes[axis.block_id].block_size_source
+                    tile = (
+                        source.value
+                        if isinstance(source, FixedBlockSizeSource)
+                        and isinstance(source.value, int)
+                        else None
+                    )
+                if (
+                    tile is None
+                    or tile <= 0
+                    or not axis.canonical_origin
+                    or not isinstance(axis.extent, sympy.Integer)
+                    or int(axis.extent) % tile
+                ):
+                    compatible = False
+            if compatible:
+                seeds.append(
+                    Config(
+                        block_sizes=blocks,
+                        num_warps=4,
+                        pid_type="flat",
+                        cute_chained_mma_schedule="tcgen05_tmem",
+                    )
+                )
+        return dedupe_configs(seeds)
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -3067,7 +3192,7 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
             or (block.min_size,)
             for block in spec.block_sizes
         ]
-        return [
+        seeds = [
             Config(
                 block_sizes=list(blocks),
                 num_warps=warps,
@@ -3084,6 +3209,10 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                 "cp_async_register_reuse_scan",
             )
         ][:96]
+        if spec.cute_chained_tcgen05_search_enabled:
+            tcgen_seeds = cls._tcgen05_seed_configs(env, device_ir)
+            seeds.extend(tcgen_seeds)
+        return seeds
 
     @classmethod
     def get_seed_config(
