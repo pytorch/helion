@@ -76,6 +76,8 @@ if TYPE_CHECKING:
 
     from torch.cuda import _POOL_HANDLE
 
+    from .chunk_prefill import PrefillResources
+
 log: logging.Logger = logging.getLogger(__name__)
 
 
@@ -448,6 +450,11 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "chunk_prefill_sm100":
+        from .chunk_prefill import validate_plan
+
+        validate_plan(plan)
+        return
     if kind == "chunk_recurrence_sm100":
         outputs_scaled = plan.get("outputs_scaled")
         factor_key_xor = plan.get("factor_key_xor")
@@ -1828,6 +1835,11 @@ def _create_cute_wrapper(
             call_args.append(name)
             continue
 
+        if kind == "wrapper_host_stream":
+            (_, name) = entry
+            params.append(f"{name}: CUstream")
+            continue
+
         if kind == "wrapper_host_scalar":
             (_, name, scalar_kind) = entry
             assert isinstance(name, str)
@@ -1864,6 +1876,11 @@ def _create_cute_wrapper(
     ]
     for plan in wrapper_plans:
         _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
+    prefill_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "chunk_prefill_sm100"
+    ]
+    if prefill_plans and (len(prefill_plans) != 1 or len(wrapper_plans) != 1):
+        raise exc.BackendUnsupported("cute", "fused prefill must own one complete root")
     sm100_recurrence_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "chunk_recurrence_sm100"
     ]
@@ -1926,7 +1943,11 @@ def _create_cute_wrapper(
         launch_suffix += f", min_blocks_per_mp={explicit_min_blocks}"
     elif any(plan.get("topology") == "fa4" for plan in wrapper_plans):
         launch_suffix += ", min_blocks_per_mp=1"
-    if sm100_recurrence_plans:
+    if prefill_plans:
+        from .chunk_prefill import append_host_call
+
+        append_host_call(body, prefill_plans[0])
+    elif sm100_recurrence_plans:
         _append_sm100_chunk_recurrence_host_call(body, sm100_recurrence_plans[0])
     elif warp_dv4_recurrence_plans:
         _append_sm100_warp_dv4_host_call(body, warp_dv4_recurrence_plans[0])
@@ -1954,7 +1975,11 @@ def _create_cute_wrapper(
         "CUstream": cuda_driver.CUstream,
         "_kernel": cute_kernel,
     }
-    if sm100_recurrence_plans:
+    if prefill_plans:
+        from ..._compiler.cute.chunk_prefill_tmem import host
+
+        namespace["_helion_chunk_prefill_host"] = host
+    elif sm100_recurrence_plans:
         from ..._compiler.cute.chunk_recurrence_sm100 import host_chain_dv2
 
         namespace["_helion_sm100_chain_host"] = host_chain_dv2
@@ -2555,6 +2580,8 @@ class _CuteLaunchArgCacheEntry:
     launch_args: tuple[object, ...]
     grouped_static_metadata: tuple[_Tcgen05GroupedStaticMetadataCacheEntry, ...]
     owned_tensors: tuple[torch.Tensor, ...]
+    stream_schedule: PrefillResources | None = None
+    order_args: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 @dataclass(frozen=True)
@@ -3071,6 +3098,19 @@ def _cute_dynamic_tensormap_contexts(
         contexts.append(
             (layout.device.type, layout.device.index, stream_handle, capture_id)
         )
+    # Mutable prefix checkpoints and sequence-order buffers need the same
+    # origin/capture separation as dynamic descriptors. Both the pointer cache and last-launch guard consume
+    # these contexts, so eager warmup cannot leak scratch into a captured call.
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        if plan.get("kind") == "chunk_prefill_sm100" and (
+            plan.get("schedule", "single") != "single"
+            or plan.get("task_order") == "longest_first_precompute"
+        ):
+            initial = cast("torch.Tensor", args[cast("int", plan["initial_state_idx"])])
+            stream_handle, capture_id = _cuda_stream_capture_context(initial.device)
+            contexts.append(
+                (initial.device.type, initial.device.index, stream_handle, capture_id)
+            )
     return tuple(contexts)
 
 
@@ -4626,6 +4666,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
     if kind in {
         "helion_small_biased_attention",
         "chunk_prepare_tma",
+        "chunk_prefill_sm100",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
     }:
@@ -5446,6 +5487,37 @@ def _build_cute_schema_and_args(
             launch_args.append(address)
         owned_tensors.append(storage)
 
+    prefill_plans = [
+        plan
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "chunk_prefill_sm100"
+    ]
+    stream_schedule = None
+    order_args = None
+    for plan in prefill_plans:
+        from .chunk_prefill import prefill_resources
+        from .chunk_prefill import validate_args
+
+        validate_args(plan, args)
+        if (
+            plan.get("schedule", "single") != "single"
+            or plan.get("task_order") == "longest_first_precompute"
+        ):
+            stream_schedule = prefill_resources(cute_kernel, plan, args)
+            if stream_schedule.order is not None:
+                append_wrapper_tensor(
+                    "_prefill_order", stream_schedule.order, owned=True
+                )
+                order_args = (
+                    cast("torch.Tensor", args[cast("int", plan["cu_seqlens_idx"])]),
+                    stream_schedule.order,
+                )
+            for index, tensor in enumerate(stream_schedule.states):
+                append_wrapper_tensor(f"_prefill_state{index}", tensor, owned=True)
+            cuda_driver = importlib.import_module("cuda.bindings.driver")
+            for index, stream in enumerate(stream_schedule.streams):
+                schema.append(("wrapper_host_stream", f"_prefill_stream{index}"))
+                launch_args.append(cuda_driver.CUstream(stream.cuda_stream))
     sm100_recurrence_plans = [
         cast("dict[str, object]", plan)
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
@@ -5469,6 +5541,8 @@ def _build_cute_schema_and_args(
         launch_args=tuple(launch_args),
         grouped_static_metadata=tuple(grouped_static_metadata),
         owned_tensors=tuple(owned_tensors),
+        stream_schedule=stream_schedule,
+        order_args=order_args,
     )
 
 
@@ -6048,6 +6122,35 @@ def _set_cute_last_launch_cache_entry(
     )
 
 
+def _launch_cute_entry(compiled: object, launch: _CuteLaunchArgCacheEntry) -> object:
+    resources = launch.stream_schedule
+    if resources is None:
+        return cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
+    origin = torch.cuda.current_stream(resources.device)
+    # Serialize only host submissions sharing scratch on the same origin.
+    # Other origin streams have distinct resources and remain independent.
+    with resources.lock:
+        if launch.order_args is not None:
+            from ..._compiler.cute.sequence_order import SEQUENCE_ORDER_THREADS
+
+            # Sorting is part of every timed/captured call. The ready event
+            # is recorded afterward, so segmented workers cannot read stale order.
+            sequences = launch.order_args[1].numel()
+            default_cute_launcher(
+                resources.order_kernel,
+                ((sequences + SEQUENCE_ORDER_THREADS - 1) // SEQUENCE_ORDER_THREADS,),
+                *launch.order_args,
+                block=(SEQUENCE_ORDER_THREADS, 1, 1),
+            )
+        resources.fork(origin)
+        try:
+            return cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
+        finally:
+            # Joining on the freshly sampled origin preserves normal stream
+            # ordering and makes allocator record_stream ownership sufficient.
+            resources.join(origin)
+
+
 def default_cute_launcher(
     cute_kernel: object,
     grid: tuple[int, ...],
@@ -6105,10 +6208,7 @@ def default_cute_launcher(
             owned_tensors=last_launch.launch.owned_tensors,
         )
         _record_cute_owned_launch_tensors(last_launch.launch.owned_tensors)
-        return cast("Any", last_launch.compiled)(
-            *last_launch.launch.launch_args,
-            _cute_current_stream(),
-        )
+        return _launch_cute_entry(last_launch.compiled, last_launch.launch)
 
     launch = _build_cached_cute_schema_and_args(cute_kernel, args_tuple, grid_xyz)
     compiled = _get_compiled_cute_launcher(
@@ -6122,7 +6222,7 @@ def default_cute_launcher(
     # Append the CUDA stream fresh on every launch (never cached): under CUDA
     # graph capture the current stream is the capture stream, so the kernel must
     # be issued there and not on a stale stream baked into the cached args.
-    result = cast("Any", compiled)(*launch.launch_args, _cute_current_stream())
+    result = _launch_cute_entry(compiled, launch)
     _set_cute_last_launch_cache_entry(
         cute_kernel,
         args_tuple,

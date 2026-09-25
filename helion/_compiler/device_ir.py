@@ -94,6 +94,7 @@ if TYPE_CHECKING:
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
+    from .cute.chunk_prefill import CuteChunkPrefillRegion
     from .cute.layout import CuTeGridExecutionPlan
     from .device_ir_analysis import DeviceIRAnalysis
     from .tile_dependency import TaskFamily
@@ -815,6 +816,8 @@ class DeviceIR:
     def __init__(self) -> None:
         super().__init__()
         self.graphs: list[GraphInfo] = []
+        self.cute_semantic_graphs: tuple[GraphInfo, ...] = ()
+        self.cute_chunk_prefill_region: CuteChunkPrefillRegion | None = None
         self.root_ids: list[int] = []
         self.rolled_reductions: list[RolledReductionInfo] = []
         self.phases: list[KernelPhase] = []
@@ -3145,6 +3148,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 host_fn = HostFunction.current()
                 rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.chunk_prefill import capture_chunk_prefill_semantics
+
+            capture_chunk_prefill_semantics(device_ir)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         defer_load_masks = CompileEnvironment.current().backend.name == "pallas"
@@ -3469,6 +3476,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             ):
                 spec.flatten_loops.append(fspec)
 
+        if env.backend_name == "cute":
+            from .cute.chunk_prefill import finalize_chunk_prefill_semantics
+
+            finalize_chunk_prefill_semantics(device_ir)
         return device_ir
 
 
