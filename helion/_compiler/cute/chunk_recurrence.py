@@ -25,6 +25,9 @@ from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
 from .chunk_prepare import _packed_workspace_is_proven
 from .chunk_prepare import _register_packed_workspace_specialization
+from .chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINE_KEY
+from .chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINES
+from .chunk_recurrence_config import chunk_recurrence_pipeline
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
 from .fx_matcher import _is_matrix_transpose_of
@@ -49,7 +52,6 @@ _BT = 16
 _DK = 128
 _DV = 128
 _SM100_TMEM_THREADS = 512
-_SM100_TMEM_SMEM_BYTES = 138_240
 _SM100_TMEM_DEVICE_ABI = 2
 _SM100_WARP_DV4_THREADS = 192
 _SM100_WARP_DV4_SMEM_BYTES = 97_536
@@ -98,6 +100,7 @@ class CuteChunkRecurrencePlan:
     values: _TensorRef
     output: _TensorRef
     state: _TensorRef
+    initial_state: _TensorRef
     cu_seqlens: _TensorRef
     cu_chunks: _TensorRef
     output_scale: sympy.Expr
@@ -114,6 +117,10 @@ class CuteChunkRecurrencePlan:
     output_store_wait_groups: int
     tmem_cols: int
     dv_partitions: int
+    pipeline: str
+    compute_registers: int
+    service_registers: int
+    min_blocks_per_mp: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,6 +130,7 @@ class CuteChunkRecurrenceSearchGeometry:
     total_chunks: int
     sequences: int
     heads: int
+    fp32_state: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,6 +151,7 @@ class _CuteChunkRecurrenceMatch:
     values: _TensorRef
     output: _TensorRef
     state: _TensorRef
+    initial_state: _TensorRef
     cu_seqlens: _TensorRef
     cu_chunks: _TensorRef
     sequence_coord: torch.fx.Node
@@ -176,6 +185,7 @@ def detect_chunk_recurrence_search_geometry(
         match.total_chunks,
         match.sequences,
         match.heads,
+        match.state.fake.dtype is torch.float32,
     )
 
 
@@ -375,7 +385,9 @@ def _same_tile_index(lhs: object, rhs: object) -> bool:
     )
 
 
-def _recurrence_target_counts() -> tuple[Counter[object], Counter[object]]:
+def _recurrence_target_counts(
+    *, fp32_state: bool = False
+) -> tuple[Counter[object], Counter[object]]:
     from ...language import memory_ops
     from ...language import view_ops
     from ...language._tracing_ops import _for_loop
@@ -429,6 +441,14 @@ def _recurrence_target_counts() -> tuple[Counter[object], Counter[object]]:
             memory_ops.store: 1,
         }
     )
+    if fp32_state:
+        # FP32 adds a projection roundtrip and removes the state roundtrip,
+        # leaving the inner conversion count unchanged.
+        inner[view_ops.subscript] += 1
+        inner[torch.ops.aten.where.self] += 1
+        inner[torch.ops.aten.scalar_tensor.default] += 1
+        root[torch.ops.prims.convert_element_type.default] -= 2
+        root[_host_tensor] += 1
     return inner, root
 
 
@@ -449,6 +469,7 @@ def _validate_recurrence_semantics(
     decay_load: torch.fx.Node,
     output_store: torch.fx.Node,
     state: _TensorRef,
+    initial_state_ref: _TensorRef,
     cu_seqlens: _TensorRef,
     cu_chunks: _TensorRef,
     heads: int,
@@ -465,7 +486,8 @@ def _validate_recurrence_semantics(
 
     inner_nodes = list(loop.graph.nodes)  # type: ignore[attr-defined]
     root_nodes = list(root.graph.nodes)  # type: ignore[attr-defined]
-    expected_inner, expected_root = _recurrence_target_counts()
+    fp32_state = state.fake.dtype is torch.float32
+    expected_inner, expected_root = _recurrence_target_counts(fp32_state=fp32_state)
     if (
         Counter(node.target for node in inner_nodes if node.op == "call_function")
         != expected_inner
@@ -528,8 +550,34 @@ def _validate_recurrence_semantics(
     ):
         return False
     residual_sub = rounded_residual.args[0]
+    residual_mask = None
+    if fp32_state:
+        if not _is_call(residual_sub, torch.ops.aten.where.self):
+            return False
+        assert isinstance(residual_sub, torch.fx.Node)
+        if len(residual_sub.args) != 3:
+            return False
+        residual_mask, residual_sub, zero = residual_sub.args
+        if not (
+            isinstance(zero, torch.fx.Node)
+            and _is_call(zero, torch.ops.aten.scalar_tensor.default)
+            and zero.args == (0.0,)
+            and zero.kwargs.get("dtype") is torch.float32
+        ):
+            return False
     residual_args = _binary_args(residual_sub, (torch.ops.aten.sub.Tensor,))
-    if residual_args is None or residual_args[1] is not projection:
+    if residual_args is None:
+        return False
+    projected_value = residual_args[1]
+    if fp32_state:
+        if not _is_bf16_roundtrip(projected_value):
+            return False
+        projected_bf16 = cast(
+            "torch.fx.Node", cast("torch.fx.Node", projected_value).args[0]
+        )
+        if projected_bf16.args[0] is not projection:
+            return False
+    elif projected_value is not projection:
         return False
     value_f32 = residual_args[0]
     if not _is_convert(value_f32, value_load, torch.float32):
@@ -545,18 +593,21 @@ def _validate_recurrence_semantics(
     if not isinstance(carried, (list, tuple)) or len(carried) != 1:
         return False
     next_state = carried[0]
-    if not isinstance(next_state, torch.fx.Node) or not _is_convert(
-        next_state, next_state.args[0] if next_state.args else None, torch.float32
-    ):
-        return False
-    next_state_bf16 = next_state.args[0]
-    if not isinstance(next_state_bf16, torch.fx.Node) or not _is_convert(
-        next_state_bf16,
-        next_state_bf16.args[0] if next_state_bf16.args else None,
-        torch.bfloat16,
-    ):
-        return False
-    state_add = next_state_bf16.args[0]
+    if fp32_state:
+        state_add = next_state
+    else:
+        if not isinstance(next_state, torch.fx.Node) or not _is_convert(
+            next_state, next_state.args[0] if next_state.args else None, torch.float32
+        ):
+            return False
+        next_state_bf16 = next_state.args[0]
+        if not isinstance(next_state_bf16, torch.fx.Node) or not _is_convert(
+            next_state_bf16,
+            next_state_bf16.args[0] if next_state_bf16.args else None,
+            torch.bfloat16,
+        ):
+            return False
+        state_add = next_state_bf16.args[0]
     state_add_args = _binary_args(state_add, (torch.ops.aten.add.Tensor,))
     if state_add_args is None or state_add_args[1] is not update:
         return False
@@ -570,7 +621,9 @@ def _validate_recurrence_semantics(
 
     # Recover the root loop values, then pin the loop extent and carry order.
     root_loads = _tensor_refs(root_nodes)
-    state_loads = [node for node, ref in root_loads if _same_ref(ref, state)]
+    state_loads = [
+        node for node, ref in root_loads if _same_ref(ref, initial_state_ref)
+    ]
     seq_loads = [node for node, ref in root_loads if _same_ref(ref, cu_seqlens)]
     chunk_loads = [node for node, ref in root_loads if _same_ref(ref, cu_chunks)]
     root_stores = [node for node in root_nodes if _store_ref(node) is not None]
@@ -661,13 +714,17 @@ def _validate_recurrence_semantics(
         ),
         None,
     )
-    initial_state = next(
-        (
-            node
-            for node in state_load.users
-            if _is_convert(node, state_load, torch.float32)
-        ),
-        None,
+    initial_state = (
+        state_load
+        if fp32_state
+        else next(
+            (
+                node
+                for node in state_load.users
+                if _is_convert(node, state_load, torch.float32)
+            ),
+            None,
+        )
     )
     if any(value is None for value in (begin, end, chunk_begin, initial_state)):
         return False
@@ -883,6 +940,9 @@ def _validate_recurrence_semantics(
         value_indices[0] is not row
         or value_indices[1] is not value_size
         or value_mask is not valid
+        or (
+            fp32_state and _subscript_source(residual_mask, ("full", None)) is not valid
+        )
         or len(value_load.args) != 4
         or value_load.args[3] is not None
     ):
@@ -1000,7 +1060,11 @@ def _validate_recurrence_semantics(
         return False
     stored_state = root_stores[0].args[2]
     return bool(
-        _is_convert(stored_state, phis[0], torch.bfloat16)
+        (
+            stored_state is phis[0]
+            if fp32_state
+            else _is_convert(stored_state, phis[0], torch.bfloat16)
+        )
         and len(root_stores[0].args) == 4
         and root_stores[0].args[3] is None
     )
@@ -1125,8 +1189,8 @@ def _match_chunk_recurrence_graphs(
     if output_store is None or output is None:
         return None
 
-    # The only remaining inner load is GTotal.  Its value must feed the state
-    # update together with the fourth dot, and that result must round via BF16.
+    # The only remaining inner load is GTotal. The carry is either explicitly
+    # rounded via BF16, or an unrounded FP32 update with an FP32 state ABI.
     all_loads = _tensor_refs(inner)
     factor_and_value_nodes = {kd_load, qd_load, aq_load, ak_load, value_load}
     remaining = [
@@ -1142,7 +1206,10 @@ def _match_chunk_recurrence_graphs(
     if (
         not isinstance(carried, (list, tuple))
         or len(carried) != 1
-        or not _is_bf16_roundtrip(carried[0])
+        or not (
+            _is_bf16_roundtrip(carried[0])
+            or _binary_args(carried[0], (torch.ops.aten.add.Tensor,)) is not None
+        )
         or not _contains_target(carried[0], {operator.add, torch.ops.aten.add.Tensor})
     ):
         return None
@@ -1192,10 +1259,27 @@ def _match_chunk_recurrence_graphs(
     if len(loop_calls) != 1 or len(root_stores) != 1 or len(root_loads) != 4:
         return None
     state = _store_ref(root_stores[0])
-    state_loads = [(node, ref) for node, ref in root_loads if _same_ref(ref, state)]
+    state_loads = [(node, ref) for node, ref in root_loads if ref.fake.ndim == 4]
     if state is None or len(state_loads) != 1:
         return None
-    metadata = [(node, ref) for node, ref in root_loads if not _same_ref(ref, state)]
+    initial_state = state_loads[0][1]
+    fp32_state = state.fake.dtype is torch.float32
+    if fp32_state:
+        if initial_state.fake.dtype is not torch.float32 or _same_ref(
+            initial_state, state
+        ):
+            return None
+        if _is_bf16_roundtrip(carried[0]):
+            return None
+    elif (
+        state.fake.dtype is not torch.bfloat16
+        or not _same_ref(initial_state, state)
+        or not _is_bf16_roundtrip(carried[0])
+    ):
+        return None
+    metadata = [
+        (node, ref) for node, ref in root_loads if not _same_ref(ref, initial_state)
+    ]
     by_ref: dict[tuple[str, int], list[tuple[torch.fx.Node, _TensorRef]]] = {}
     for node, ref in metadata:
         by_ref.setdefault((ref.name, id(ref.fake)), []).append((node, ref))
@@ -1205,14 +1289,25 @@ def _match_chunk_recurrence_graphs(
     cu_seqlens = groups[0][0][1]
     cu_chunks = groups[1][0][1]
 
-    refs = (kd, qd, ak, aq, g_total, values, output, state, cu_seqlens, cu_chunks)
+    refs = (
+        kd,
+        qd,
+        ak,
+        aq,
+        g_total,
+        values,
+        output,
+        state,
+        initial_state,
+        cu_seqlens,
+        cu_chunks,
+    )
     if any(ref.fake.device.type != "cuda" for ref in refs):
         return None
     if any(not ref.fake.is_contiguous() for ref in refs):
         return None
     if any(
-        ref.fake.dtype is not torch.bfloat16
-        for ref in (kd, qd, ak, aq, values, output, state)
+        ref.fake.dtype is not torch.bfloat16 for ref in (kd, qd, ak, aq, values, output)
     ):
         return None
     if g_total.fake.dtype is not torch.float32:
@@ -1223,7 +1318,9 @@ def _match_chunk_recurrence_graphs(
     ):
         return None
 
-    if state.fake.ndim != 4:
+    if state.fake.ndim != 4 or tuple(initial_state.fake.shape) != tuple(
+        state.fake.shape
+    ):
         return None
     sequences, heads, value_size, key_size = map(int, state.fake.shape)
     if key_size != _DK or value_size != _DV or sequences <= 0 or heads <= 0:
@@ -1267,6 +1364,7 @@ def _match_chunk_recurrence_graphs(
         decay_load=decay_load,
         output_store=output_store,
         state=state,
+        initial_state_ref=initial_state,
         cu_seqlens=cu_seqlens,
         cu_chunks=cu_chunks,
         heads=heads,
@@ -1295,6 +1393,7 @@ def _match_chunk_recurrence_graphs(
         values=values,
         output=output,
         state=state,
+        initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         cu_chunks=cu_chunks,
         sequence_coord=cast("torch.fx.Node", state_indices[0]),
@@ -1363,6 +1462,14 @@ def _plan_chunk_recurrence(
         return None
     dv_partitions = configured_dv_partitions
     use_sm100_warp_dv4 = dv_partitions == 4
+    pipeline_name = DeviceFunction.current().config.get(
+        CUTE_CHUNK_RECURRENCE_PIPELINE_KEY, "wide"
+    )
+    if pipeline_name not in CUTE_CHUNK_RECURRENCE_PIPELINES or (
+        use_sm100_warp_dv4 and pipeline_name != "wide"
+    ):
+        return None
+    pipeline = chunk_recurrence_pipeline(pipeline_name)
     schedule = "sm100_warp_dv4" if use_sm100_warp_dv4 else "sm100_tmem"
     refs = (
         match.kd,
@@ -1373,6 +1480,7 @@ def _plan_chunk_recurrence(
         match.values,
         match.output,
         match.state,
+        match.initial_state,
         match.cu_seqlens,
         match.cu_chunks,
     )
@@ -1386,6 +1494,7 @@ def _plan_chunk_recurrence(
         tuple(ref.fake.numel() for ref in refs),
     ) or not _xyz_grid_fits(grid):
         return None
+    resources = pipeline.resource_plan
     return CuteChunkRecurrencePlan(
         root_graph_id=match.root_graph_id,
         heads=match.heads,
@@ -1400,28 +1509,35 @@ def _plan_chunk_recurrence(
         values=match.values,
         output=match.output,
         state=match.state,
+        initial_state=match.initial_state,
         cu_seqlens=match.cu_seqlens,
         cu_chunks=match.cu_chunks,
         output_scale=match.output_scale,
         workspace_layout_version=2,
         schedule=schedule,
-        threads=(
-            _SM100_WARP_DV4_THREADS if use_sm100_warp_dv4 else _SM100_TMEM_THREADS
-        ),
+        threads=(_SM100_WARP_DV4_THREADS if use_sm100_warp_dv4 else resources.threads),
         smem_bytes=(
-            _SM100_WARP_DV4_SMEM_BYTES if use_sm100_warp_dv4 else _SM100_TMEM_SMEM_BYTES
+            _SM100_WARP_DV4_SMEM_BYTES if use_sm100_warp_dv4 else resources.shared_bytes
         ),
         device_abi=(
             _SM100_WARP_DV4_DEVICE_ABI if use_sm100_warp_dv4 else _SM100_TMEM_DEVICE_ABI
         ),
-        input_stages=(_SM100_WARP_DV4_INPUT_STAGES if use_sm100_warp_dv4 else 8),
-        tma_stages=6,
+        input_stages=(
+            _SM100_WARP_DV4_INPUT_STAGES
+            if use_sm100_warp_dv4
+            else pipeline.input_stages
+        ),
+        tma_stages=(6 if use_sm100_warp_dv4 else pipeline.tma_stages),
         factor_tma_value_splits=(1 if use_sm100_warp_dv4 else 2),
-        output_acc_stages=2,
+        output_acc_stages=(2 if use_sm100_warp_dv4 else pipeline.output_acc_stages),
         output_smem_stages=(3 if use_sm100_warp_dv4 else 7),
         output_store_wait_groups=(0 if use_sm100_warp_dv4 else 6),
-        tmem_cols=(0 if use_sm100_warp_dv4 else 512),
+        tmem_cols=(0 if use_sm100_warp_dv4 else resources.tmem_columns),
         dv_partitions=dv_partitions,
+        pipeline=pipeline_name,
+        compute_registers=pipeline.compute_registers,
+        service_registers=pipeline.service_registers,
+        min_blocks_per_mp=resources.min_blocks_per_mp,
     )
 
 
@@ -1485,19 +1601,25 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
     kd, qd, ak, aq, gt, values, output, state, cu_seqlens, cu_chunks = names
     _emit_module_imports(cg, plan.schedule)
     if plan.schedule == "sm100_tmem":
+        pipeline = chunk_recurrence_pipeline(plan.pipeline)
+        resources = pipeline.resource_plan
         output_scale = df.literal_expr(plan.output_scale)
         if not output_scale.isidentifier():
             return False
         if (
-            plan.threads != _SM100_TMEM_THREADS
+            plan.threads != resources.threads
             or plan.device_abi != _SM100_TMEM_DEVICE_ABI
-            or plan.input_stages != 8
-            or plan.tma_stages != 6
+            or plan.smem_bytes != resources.shared_bytes
+            or plan.input_stages != pipeline.input_stages
+            or plan.tma_stages != pipeline.tma_stages
             or plan.factor_tma_value_splits != 2
-            or plan.output_acc_stages != 2
+            or plan.output_acc_stages != pipeline.output_acc_stages
             or plan.output_smem_stages != 7
             or plan.output_store_wait_groups != 6
-            or plan.tmem_cols != 512
+            or plan.tmem_cols != resources.tmem_columns
+            or plan.compute_registers != pipeline.compute_registers
+            or plan.service_registers != pipeline.service_registers
+            or plan.min_blocks_per_mp != resources.min_blocks_per_mp
         ):
             return False
         cg.cute_wrapper_plans.append(
@@ -1535,8 +1657,18 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
                 "output_store_wait_groups": plan.output_store_wait_groups,
                 "tmem_cols": plan.tmem_cols,
                 "dv_partitions": plan.dv_partitions,
+                "pipeline": plan.pipeline,
+                "compute_registers": plan.compute_registers,
+                "service_registers": plan.service_registers,
+                "min_blocks_per_mp": plan.min_blocks_per_mp,
             }
         )
+        if plan.state.fake.dtype is torch.float32:
+            initial_state = _tensor_arg(cg, plan.initial_state)
+            cg.cute_wrapper_plans[-1].update(
+                {"initial_state_name": initial_state, "state_dtype": "float32"}
+            )
+            df.placeholder_args.add(initial_state)
         df.placeholder_args.update((*names, output_scale))
         df.preamble = []
         df.body = [ast.Pass()]
@@ -1611,6 +1743,12 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
                 "dv_partitions": plan.dv_partitions,
             }
         )
+        if plan.state.fake.dtype is torch.float32:
+            initial_state = _tensor_arg(cg, plan.initial_state)
+            cg.cute_wrapper_plans[-1].update(
+                {"initial_state_name": initial_state, "state_dtype": "float32"}
+            )
+            df.placeholder_args.add(initial_state)
         df.wrapper_only_params.extend(desc_names)
         df.placeholder_args.update((*names, output_scale))
         df.preamble = []

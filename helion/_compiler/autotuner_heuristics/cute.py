@@ -11,12 +11,15 @@ from torch._inductor.runtime.triton_heuristics import (
 )
 
 from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_PREFILL_SCHEDULE_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_PREFILL_TASK_ORDER_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
+from ..cute.chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINE_KEY
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -3037,7 +3040,7 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
             num_sm=env.config_spec.num_sm,
         )
         env.config_spec.enable_cute_chunk_recurrence_search(
-            preferred_partitions=preferred
+            preferred_partitions=preferred, fp32_state=geometry.fp32_state
         )
         return cls.CACHE_SPECIALIZATION_FACTS
 
@@ -3046,6 +3049,7 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
         return (
             env.config_spec.cute_chunk_recurrence_dv_partitions is not None
             and env.config_spec.cute_chunk_recurrence_register_cap is not None
+            and env.config_spec.cute_chunk_recurrence_pipeline is not None
         )
 
     @classmethod
@@ -3054,7 +3058,12 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
     ) -> list[Config] | None:
         fragment = env.config_spec.cute_chunk_recurrence_dv_partitions
         register_cap_fragment = env.config_spec.cute_chunk_recurrence_register_cap
-        if fragment is None or register_cap_fragment is None:
+        pipeline_fragment = env.config_spec.cute_chunk_recurrence_pipeline
+        if (
+            fragment is None
+            or register_cap_fragment is None
+            or pipeline_fragment is None
+        ):
             return None
         register_caps = (
             72,
@@ -3070,11 +3079,61 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
                 {
                     CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY: partitions,
                     CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY: register_cap,
+                    CUTE_CHUNK_RECURRENCE_PIPELINE_KEY: pipeline,
                 }
             )
             for partitions in fragment.choices
             for register_cap in register_caps
             if _cute_chunk_recurrence_config_is_safe(partitions, register_cap)
+            for pipeline in pipeline_fragment.choices
+            if partitions == 2 or pipeline == "wide"
+        ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteChunkPrefillHeuristic(AutotunerHeuristic):
+    """Try effective stream schedules and sequence orders for a fused recurrence."""
+
+    name = "cute_chunk_prefill"
+    backend = "cute"
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chunk_prefill import register_chunk_prefill_search
+
+        register_chunk_prefill_search(env, device_ir)
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chunk_prefill_task_order is not None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        fragment = env.config_spec.cute_chunk_prefill_task_order
+        if fragment is None:
+            return None
+        schedule = env.config_spec.cute_chunk_prefill_schedule
+        assert schedule is not None
+        return [
+            Config.from_dict(
+                {
+                    CUTE_CHUNK_PREFILL_TASK_ORDER_KEY: order,
+                    CUTE_CHUNK_PREFILL_SCHEDULE_KEY: value,
+                }
+            )
+            for value in schedule.choices
+            for order in fragment.choices
         ]
 
     @classmethod
