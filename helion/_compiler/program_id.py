@@ -101,6 +101,37 @@ def _literal_mailbox_access_fields(
         and access.value.id == mailbox_name
     ]
     direct_mailbox_names = {id(access.value) for access in accesses}
+    snapshot_reads: set[int] = set()
+    for call in ast.walk(node):
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "_cute_inline_asm_elementwise"
+        ):
+            continue
+        # Selected-grouped mailboxes are unstaged. Recognize only our exact
+        # non-speculatable literal-field load, not arbitrary pointer escapes,
+        # inline assembly, or dynamic offsets. This preserves the publication
+        # omission proof when the consumer uses a leader-owned snapshot.
+        for pointer in ast.walk(call):
+            if not (
+                isinstance(pointer, ast.BinOp)
+                and isinstance(pointer.op, ast.Add)
+                and isinstance(pointer.left, ast.Attribute)
+                and pointer.left.attr == "iterator"
+                and isinstance(pointer.left.value, ast.Name)
+                and pointer.left.value.id == mailbox_name
+                and isinstance(pointer.right, ast.Call)
+                and len(pointer.right.args) == 1
+                and isinstance(pointer.right.args[0], ast.Constant)
+                and type(pointer.right.args[0].value) is int
+            ):
+                continue
+            field = cast("int", pointer.right.args[0].value)
+            expected = _sched_mailbox_load_expr(mailbox_name, field)
+            if ast.dump(call) == ast.dump(expected):
+                snapshot_reads.add(field)
+                direct_mailbox_names.add(id(pointer.left.value))
     assert all(
         id(name) in direct_mailbox_names
         for name in ast.walk(node)
@@ -109,7 +140,7 @@ def _literal_mailbox_access_fields(
         and isinstance(name.ctx, ast.Load)
     ), "generated mailbox use must be a direct literal field access"
 
-    reads: set[int] = set()
+    reads: set[int] = snapshot_reads
     writes: set[int] = set()
     for access in accesses:
         field_expr = access.slice
@@ -164,6 +195,95 @@ def _clone_stmt(stmt: ast.stmt) -> ast.stmt:
 _TCGEN05_WORK_TILE_MAILBOX_VALID = 3
 
 
+_SCHED_MAILBOX_LOAD_ASM = (
+    "{ .reg .pred leader; mov.u32 $0, 0; "
+    "setp.eq.u32 leader, $2, 0; @leader ld.volatile.shared.u32 $0, [$1]; }"
+)
+
+
+def _sched_mailbox_load_expr(
+    mailbox: str, field: int, stage: str | None = None
+) -> ast.AST:
+    tensor = mailbox if stage is None else f"{mailbox}[None, {stage}]"
+    return expr_from_string(
+        f"_cute_inline_asm_elementwise((("
+        f"{tensor}.iterator + cutlass.Int32({field})).toint(), "
+        "cute.arch.lane_idx()), asm={assembly}, "
+        "constraints={constraints}, dtype=cutlass.Int32, is_pure=False)",
+        assembly=create(ast.Constant, value=_SCHED_MAILBOX_LOAD_ASM),
+        # Zero initialization precedes both inputs' uses: the output must not
+        # overlap either the address or lane input register.
+        constraints=create(ast.Constant, value="=&r,r,r,~{memory}"),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _SchedMailboxSnapshot:
+    """Warp-uniform registers loaded only by the lane that acquired the stage."""
+
+    valid: str
+    fields: dict[int, str]
+
+    @classmethod
+    def create(
+        cls, device_function: DeviceFunction, prefix: str, fields: tuple[int, ...]
+    ) -> _SchedMailboxSnapshot | None:
+        if (
+            device_function.config.get(
+                TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+                TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
+            )
+            != TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
+        ):
+            # Do not even allocate names in normal mode: its generated code
+            # and producer/publication protocol must remain unchanged.
+            return None
+        return cls(
+            device_function.new_var(f"{prefix}_mailbox_valid"),
+            {
+                field: device_function.new_var(f"{prefix}_mailbox_{field}")
+                for field in fields
+            },
+        )
+
+    def read_block(
+        self, mailbox: str, valid_var: str, valid_field: int, stage: str | None
+    ) -> list[ast.stmt]:
+        def read(field: int, name: str) -> list[ast.stmt]:
+            return [
+                statement_from_string(
+                    f"{name} = {{load}}",
+                    load=_sched_mailbox_load_expr(mailbox, field, stage),
+                ),
+                statement_from_string(f"{name} = cute.arch.shuffle_sync({name}, 0)"),
+            ]
+
+        # Selected-grouped sentinels initialize only valid, including on an
+        # empty work stream. Never read their uninitialized payload fields.
+        result = read(valid_field, self.valid)
+        result.append(
+            statement_from_string(f"{valid_var} = {self.valid} != cutlass.Int32(0)")
+        )
+        if self.fields:
+            result.extend(
+                statement_from_string(f"{name} = cutlass.Int32(0)")
+                for name in self.fields.values()
+            )
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(valid_var),
+                    body=[
+                        stmt
+                        for field, name in self.fields.items()
+                        for stmt in read(field, name)
+                    ],
+                    orelse=[],
+                )
+            )
+        return result
+
+
 def _build_sched_pipeline_consumer_wait_block(
     *,
     sched_pipeline: str,
@@ -172,6 +292,7 @@ def _build_sched_pipeline_consumer_wait_block(
     valid_var: str,
     valid_slot_index: int = _TCGEN05_WORK_TILE_MAILBOX_VALID,
     work_tile_stage_index: str | None = None,
+    snapshot: _SchedMailboxSnapshot | None = None,
 ) -> list[ast.stmt]:
     """Emit the consumer-side wait block for the ``ROLE_LOCAL_WITH_SCHEDULER``
     sched_pipeline: ``consumer_wait`` → ``fence_view_async_shared``
@@ -199,9 +320,10 @@ def _build_sched_pipeline_consumer_wait_block(
 
     Diagnostic ``tcgen05_sched_consumer_wait_mode="warp_leader"``
     instead gates ``consumer_wait`` to lane 0 and reconverges the warp
-    before the async-shared fence. This is a profiling-only wait topology
-    experiment; the normal whole-warp wait path remains the default because
-    B200 timing showed the lane-0 variant is slower.
+    before the async-shared fence. Only that acquiring lane may read the
+    mailbox; a valid-first register snapshot broadcasts those values to the
+    warp. Explicit predication, volatility and a memory clobber prevent LLVM
+    from speculating shared loads into non-acquiring lanes or past release.
     """
     try:
         wait_mode = DeviceFunction.current().config.get(
@@ -219,6 +341,7 @@ def _build_sched_pipeline_consumer_wait_block(
         )
     )
     if wait_mode == TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER:
+        assert snapshot is not None
         return [
             create(
                 ast.If,
@@ -233,7 +356,9 @@ def _build_sched_pipeline_consumer_wait_block(
             statement_from_string("cute.arch.sync_warp()"),
             statement_from_string("cute.arch.fence_view_async_shared()"),
             statement_from_string("cute.arch.sync_warp()"),
-            statement_from_string(f"{valid_var} = {valid_slot} != cutlass.Int32(0)"),
+            *snapshot.read_block(
+                work_tile_smem, valid_var, valid_slot_index, work_tile_stage_index
+            ),
         ]
     return [
         statement_from_string(
@@ -251,28 +376,21 @@ def _build_sched_pipeline_consumer_release_block(
     sched_consumer_state: str,
 ) -> list[ast.stmt]:
     """Emit the consumer-side release block for the
-    ``ROLE_LOCAL_WITH_SCHEDULER`` sched_pipeline: lane-0-gated
+    ``ROLE_LOCAL_WITH_SCHEDULER`` sched_pipeline: whole-warp
     ``consumer_release`` → ``advance_state`` → ``sync_warp``.
 
     Companion to ``_build_sched_pipeline_consumer_wait_block``.
-    ``consumer_release`` is gated on ``lane_idx == 0`` because the
-    per-CTA sched-pipeline empty barrier is initialized with one
-    arrival per consumer *warp* (not per-thread) — see
-    ``cute_mma._codegen_cute_mma``'s
-    ``consumer_mask_to_leader=False`` branch. The ``sync_warp``
-    after the advance keeps the warp lanes' view of the
-    register-resident consumer state consistent.
+    Every lane reads scheduler metadata, so every lane must release the
+    stage after its own reads. A lane-0 arrival alone does not order the
+    other lanes' shared-memory reads before the producer reuses the stage.
+    The matching setup counts 32 arrivals per consumer warp, including
+    cluster-routed releases. The ``sync_warp`` after the advance keeps
+    the register-resident consumer state consistent; it is not the
+    shared-memory lifetime handshake.
     """
     return [
-        create(
-            ast.If,
-            test=expr_from_string("cute.arch.lane_idx() == cutlass.Int32(0)"),
-            body=[
-                statement_from_string(
-                    f"{sched_pipeline}.consumer_release({sched_consumer_state})"
-                ),
-            ],
-            orelse=[],
+        statement_from_string(
+            f"{sched_pipeline}.consumer_release({sched_consumer_state})"
         ),
         statement_from_string(emit_pipeline_advance(sched_consumer_state)),
         statement_from_string("cute.arch.sync_warp()"),
@@ -3496,6 +3614,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         sched_consumer_state: str | None = None
         valid_var: str | None = None
         work_tile_stage_index: str | None = None
+        snapshot: _SchedMailboxSnapshot | None = None
         if uses_pipeline:
             sched_pipeline_plan = self._tcgen05_sched_pipeline_plan()
             assert sched_pipeline_plan is not None
@@ -3506,6 +3625,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 f"{sched_consumer_state}.index"
                 if self._tcgen05_uses_staged_work_tile_mailbox()
                 else None
+            )
+            snapshot = _SchedMailboxSnapshot.create(
+                device_function,
+                scheduler_var_prefix,
+                tuple(
+                    i
+                    for i in range(TCGEN05_GROUPED_WORKLIST_MAILBOX_FIELD_COUNT)
+                    if i != _TCGEN05_GROUPED_SELECTED_MAILBOX_VALID
+                )
+                if scheduler_mailbox
+                else (2,),
             )
 
         def consumer_wait_block() -> list[ast.stmt]:
@@ -3523,6 +3653,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     else _TCGEN05_WORK_TILE_MAILBOX_VALID
                 ),
                 work_tile_stage_index=work_tile_stage_index,
+                snapshot=snapshot,
             )
 
         def consumer_release_block() -> list[ast.stmt]:
@@ -3593,7 +3724,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 assert layout is not None
                 metadata_stmts.append(
                     statement_from_string(
-                        f"{linear_idx} = {self._tcgen05_work_tile_slot(layout, 2)}"
+                        f"{linear_idx} = "
+                        f"{snapshot.fields[2] if snapshot is not None else self._tcgen05_work_tile_slot(layout, 2)}"
                     )
                 )
                 metadata_stmts.extend(consumer_release_block())
@@ -3642,6 +3774,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             assert layout is not None
 
             def slot(field: int) -> str:
+                if snapshot is not None:
+                    return snapshot.fields[field]
                 return self._tcgen05_work_tile_slot(layout, field)
 
             mailbox_fields = (
@@ -3999,8 +4133,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # reconstruct the linear pid the same way the MONOLITHIC path
         # does, just sourcing from SMEM coords instead of the
         # work_tile object.
+        snapshot = _SchedMailboxSnapshot.create(
+            device_function, scheduler_var_prefix, tuple(range(len(self.pid_info)))
+        )
         coord_terms = [
-            self._tcgen05_work_tile_slot(layout, i) for i in range(len(self.pid_info))
+            snapshot.fields[i]
+            if snapshot is not None
+            else self._tcgen05_work_tile_slot(layout, i)
+            for i in range(len(self.pid_info))
         ]
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
 
@@ -4019,6 +4159,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 work_tile_smem=layout.work_tile_smem,
                 valid_var=valid_var,
                 work_tile_stage_index=work_tile_stage_index,
+                snapshot=snapshot,
             )
 
         def _consumer_release_block() -> list[ast.stmt]:
@@ -4073,8 +4214,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 orelse=[],
             )
         )
-        # Final release + advance for the sentinel publish (lane-0
-        # gate matches the per-iteration release inside the loop).
+        # Every lane releases the sentinel, matching the per-tile handshake.
         prelude.extend(_consumer_release_block())
         # Cycle-94 merge: no post-loop aux producer tail is injected. The store
         # warp's aux producer_state advance lives inside the per-tile store-warp
@@ -4624,10 +4764,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
           Non-leader CTAs receive the response indirectly because
           the leader broadcasts the resulting work tile to every
           peer CTA's SMEM mailbox via ``_cute_store_shared_remote_x4``.
-          Each peer CTA's consumer warps still wait/release on the
-          per-CTA ``sched_pipeline``, so the per-CTA empty-barrier
-          arrival counts the static WITH_SCHEDULER path validates
-          stay unchanged.
+          Each peer CTA's consumer lanes wait on their local full
+          barrier and release to the leader's empty barrier. Setup
+          therefore counts consumer threads across the whole cluster,
+          unlike the static scheduler's per-CTA empty-barrier count.
 
         cluster_m collapse: the publish writes the per-CTA M
         coordinate into each peer's mailbox by adding
@@ -5252,8 +5392,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             "sched_pipeline plan; was cute_state.register_tcgen05_sched_pipeline_plan "
             "called by _codegen_cute_mma?"
         )
-        sched_pipeline = sched_pipeline_plan.pipeline
-        sched_consumer_state = sched_pipeline_plan.consumer_state
         # Aux pipeline plan: the matmul-plan gate that admits this
         # builder also fires the pipeline allocation in
         # ``cute_mma._codegen_cute_mma``, so a non-None plan is
@@ -5276,11 +5414,38 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_requires_full_tile = plan.tma_store_full_tiles_only
 
         valid_var = device_function.new_var("tcgen05_c_input_warp_valid")
+        snapshot = (
+            None
+            if inline_aux_only
+            else _SchedMailboxSnapshot.create(
+                device_function,
+                "tcgen05_c_input_warp",
+                ()
+                if aux_requires_full_tile and tile_phase == "edge"
+                else tuple(range(len(self.pid_info))),
+            )
+        )
         work_tile_stage_index = (
-            f"{sched_consumer_state}.index"
+            f"{sched_pipeline_plan.consumer_state}.index"
             if self._tcgen05_uses_staged_work_tile_mailbox()
             else None
         )
+
+        def _sched_consumer_wait_block() -> list[ast.stmt]:
+            return _build_sched_pipeline_consumer_wait_block(
+                sched_pipeline=sched_pipeline_plan.pipeline,
+                sched_consumer_state=sched_pipeline_plan.consumer_state,
+                work_tile_smem=layout.work_tile_smem,
+                valid_var=valid_var,
+                work_tile_stage_index=work_tile_stage_index,
+                snapshot=snapshot,
+            )
+
+        def _sched_consumer_release_block() -> list[ast.stmt]:
+            return _build_sched_pipeline_consumer_release_block(
+                sched_pipeline=sched_pipeline_plan.pipeline,
+                sched_consumer_state=sched_pipeline_plan.consumer_state,
+            )
 
         if aux_requires_full_tile and tile_phase == "edge":
             # Edge epilogues use the SIMT direct-GMEM aux path. The C-input
@@ -5289,31 +5454,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # edge iteration is purely the sched-pipeline handshake: wait for
             # the broadcast, release it, then wait for the next one.
             prelude: list[ast.stmt] = []
-            prelude.extend(
-                _build_sched_pipeline_consumer_wait_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                    work_tile_smem=layout.work_tile_smem,
-                    valid_var=valid_var,
-                    work_tile_stage_index=work_tile_stage_index,
-                )
-            )
+            prelude.extend(_sched_consumer_wait_block())
             per_tile_body: list[ast.stmt] = []
-            per_tile_body.extend(
-                _build_sched_pipeline_consumer_release_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                )
-            )
-            per_tile_body.extend(
-                _build_sched_pipeline_consumer_wait_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                    work_tile_smem=layout.work_tile_smem,
-                    valid_var=valid_var,
-                    work_tile_stage_index=work_tile_stage_index,
-                )
-            )
+            per_tile_body.extend(_sched_consumer_release_block())
+            per_tile_body.extend(_sched_consumer_wait_block())
             prelude.append(
                 create(
                     ast.While,
@@ -5322,12 +5466,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     orelse=[],
                 )
             )
-            prelude.extend(
-                _build_sched_pipeline_consumer_release_block(
-                    sched_pipeline=sched_pipeline,
-                    sched_consumer_state=sched_consumer_state,
-                )
-            )
+            prelude.extend(_sched_consumer_release_block())
             return create(
                 ast.If,
                 test=expr_from_string(self._tcgen05_c_input_role_predicate()),
@@ -5336,7 +5475,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
 
         coord_terms = [
-            self._tcgen05_work_tile_slot(layout, i) for i in range(len(self.pid_info))
+            snapshot.fields[i]
+            if snapshot is not None
+            else self._tcgen05_work_tile_slot(layout, i)
+            for i in range(len(self.pid_info))
         ]
         linear_pid_expr = self._tcgen05_linear_virtual_pid_from_coords_expr(coord_terms)
         sched_coord_0 = coord_terms[0] if len(coord_terms) > 0 else "cutlass.Int32(0)"
@@ -5504,26 +5646,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # ``(thr_layout × val_layout)`` partition and ``cute.copy``
         # iterates the tile under the lane's get_slice(lane_idx).
         cute_lane_idx_var = device_function.new_var("tcgen05_aux_lane_idx")
-
-        # Factories mirror the consumer-side pattern in
-        # ``_build_role_local_while_with_scheduler`` — both go
-        # through the shared module-scope helpers
-        # (``_build_sched_pipeline_consumer_{wait,release}_block``)
-        # so the wait/release shape has one source of truth.
-        def _sched_consumer_wait_block() -> list[ast.stmt]:
-            return _build_sched_pipeline_consumer_wait_block(
-                sched_pipeline=sched_pipeline,
-                sched_consumer_state=sched_consumer_state,
-                work_tile_smem=layout.work_tile_smem,
-                valid_var=valid_var,
-                work_tile_stage_index=work_tile_stage_index,
-            )
-
-        def _sched_consumer_release_block() -> list[ast.stmt]:
-            return _build_sched_pipeline_consumer_release_block(
-                sched_pipeline=sched_pipeline,
-                sched_consumer_state=sched_consumer_state,
-            )
 
         # Pull aux pipeline names from the plan. The plan is the
         # ``_Tcgen05AuxPipelinePlan`` dataclass; access by name
