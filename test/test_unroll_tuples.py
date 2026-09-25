@@ -935,6 +935,10 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         "Triton-MTIA: register-cache layernorm (G=8) needs >14 circular buffers; see T280008478"
     )
     def test_list_register_cache_layernorm(self):
+        for _ in range(100 if torch.version.hip else 1):
+            self._check_list_register_cache_layernorm()
+
+    def _check_list_register_cache_layernorm(self):
         """Test two-pass layernorm with register-cached list elements."""
         M, D, G = 1024 * 1024, 32, 8
         tensors = [
