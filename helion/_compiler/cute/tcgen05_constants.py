@@ -705,7 +705,8 @@ def tcgen05_grouped_worklist_smem_bytes(
     )
     # Fixed-TensorMap modes overpay the 384 B below at the 227-KiB boundary.
     offset = _append_aligned_tcgen05_smem(offset, 2 * 128, 128)
-    offset = _append_aligned_tcgen05_smem(offset, ab_stages * 8, 8)
+    # PipelineTmaUmma owns a full and an empty barrier for every AB stage.
+    offset = _append_aligned_tcgen05_smem(offset, ab_stages * 2 * 8, 8)
     # Mutable output TensorMap and the aligned TMA-store ring.
     offset = _append_aligned_tcgen05_smem(offset, 128, 128)
     c_smem_bytes = tcgen05_c_smem_bytes_per_cta(

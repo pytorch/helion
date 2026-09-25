@@ -11521,7 +11521,7 @@ def _emit_mma_pipeline(
             prefix.append(
                 statement_from_string(
                     f"{tma_pipeline_mbars} = cute.arch.alloc_smem("
-                    f"cutlass.Int64, cutlass.Int32({tcgen05_ab_stage_count_value}))"
+                    f"cutlass.Int64, cutlass.Int32({tcgen05_ab_stage_count_value * 2}))"
                 )
             )
             prefix.append(
