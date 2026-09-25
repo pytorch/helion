@@ -5,14 +5,18 @@
 The single Helion function's top-level tile loops implement residual RMSNorm
 and FP8 quantization, QKV projection, Q/K norm and RoPE, KV-cache update, split
 paged attention and merge, output projection, and the complete gated FFN.  The
-benchmark fixes the production decode shape and checks it against the
-corresponding compiled vLLM decoder layer with its default backend selection.
+benchmark fixes the production tensor capacity while sequence length, position,
+page-table entries, and slot mapping remain runtime metadata.  It checks the
+result against both a same-source, root-matched twelve-launch Helion graph with
+programmatic dependent launch (PDL) and the corresponding compiled vLLM decoder
+layer with its default backend selection.
 """
 
 from __future__ import annotations
 
 import json
 import math
+from operator import itemgetter
 from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
@@ -24,6 +28,7 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
 
 
 BATCH = 1
@@ -33,6 +38,7 @@ Q_HEADS = 32
 KV_HEADS = 8
 HEAD_DIM = 128
 CONTEXT = 8192
+CONTEXT_LENGTHS = (1001, 4093, 8191)
 CACHE_BLOCK = 16
 ATTENTION_SPLITS = 128
 GROUP = 128
@@ -76,7 +82,11 @@ QWEN3_8B_FP8_CONFIG = {
 }
 
 
-@helion.aot_kernel(static_shapes=True, backend="triton")
+@helion.aot_kernel(
+    static_shapes=False,
+    backend="triton",
+    triton_do_not_specialize=False,
+)
 def qwen3_decode_layer(
     hidden_states,
     residual,
@@ -103,6 +113,7 @@ def qwen3_decode_layer(
     w13_scale,
     w2_q,
     w2_scale,
+    context_lens,
     hidden,
     intermediate,
     q_heads,
@@ -114,6 +125,131 @@ def qwen3_decode_layer(
     group,
     eps,
 ):
+    # This kernel has one specialized physical-capacity bucket (B1/Q1 on
+    # Qwen3-8B), but runtime attention metadata.  Keep that contract explicit:
+    # ``static_shapes=False`` prevents accidental blanket specialization, while
+    # these declarations preserve the model geometry and contiguous layouts
+    # used by the pretuned body.  Tensor contents -- notably context_lens,
+    # positions, block-table entries, slot mappings, and KV data -- remain
+    # ordinary runtime loads.
+    batch_capacity = hidden_states.size(0)
+    hl.specialize(batch_capacity)
+    hl.specialize(hidden_states.size(0))
+    torch._check(hidden_states.size(0) == batch_capacity)
+    hl.specialize(residual.size(0))
+    torch._check(residual.size(0) == batch_capacity)
+    hl.specialize(pre_q.size(0))
+    torch._check(pre_q.size(0) == batch_capacity)
+    hl.specialize(pre_scale.size(0))
+    torch._check(pre_scale.size(0) == batch_capacity)
+    hl.specialize(position.size(0))
+    torch._check(position.size(0) == batch_capacity)
+    hl.specialize(block_table.size(0))
+    torch._check(block_table.size(0) == batch_capacity)
+    hl.specialize(slot_mapping.size(0))
+    torch._check(slot_mapping.size(0) == batch_capacity)
+    hl.specialize(attention_q.size(0))
+    torch._check(attention_q.size(0) == batch_capacity)
+    hl.specialize(attention_scale.size(0))
+    torch._check(attention_scale.size(0) == batch_capacity)
+    hl.specialize(ffn_q.size(0))
+    torch._check(ffn_q.size(0) == batch_capacity)
+    hl.specialize(ffn_scale.size(0))
+    torch._check(ffn_scale.size(0) == batch_capacity)
+    hl.specialize(context_lens.size(0))
+    torch._check(context_lens.size(0) == batch_capacity)
+    torch._check(batch_capacity >= 1)
+
+    # Fixed model/capacity extents.  The first dimensions above are repeated
+    # deliberately: independent input tensors can otherwise receive distinct
+    # fake-shape symbols before their equality checks are evaluated.
+    hl.specialize(hidden_states.size(1))
+    hl.specialize(residual.size(1))
+    hl.specialize(pre_weight.size(0))
+    hl.specialize(pre_q.size(1))
+    hl.specialize(pre_scale.size(1))
+    hl.specialize(qkv_weight_q.size(0))
+    hl.specialize(qkv_weight_q.size(1))
+    hl.specialize(qkv_weight_scale.size(0))
+    hl.specialize(qkv_weight_scale.size(1))
+    hl.specialize(q_weight.size(0))
+    hl.specialize(k_weight.size(0))
+    hl.specialize(cos_sin.size(0))
+    hl.specialize(cos_sin.size(1))
+    hl.specialize(kv_cache.size(0))
+    hl.specialize(kv_cache.size(1))
+    hl.specialize(kv_cache.size(2))
+    hl.specialize(kv_cache.size(3))
+    hl.specialize(block_table.size(1))
+    hl.specialize(o_weight_q.size(0))
+    hl.specialize(o_weight_q.size(1))
+    hl.specialize(o_weight_scale.size(0))
+    hl.specialize(o_weight_scale.size(1))
+    hl.specialize(attention_q.size(1))
+    hl.specialize(attention_scale.size(1))
+    hl.specialize(post_weight.size(0))
+    hl.specialize(ffn_q.size(1))
+    hl.specialize(ffn_scale.size(1))
+    hl.specialize(w13_q.size(0))
+    hl.specialize(w13_q.size(1))
+    hl.specialize(w13_scale.size(0))
+    hl.specialize(w13_scale.size(1))
+    hl.specialize(w2_q.size(0))
+    hl.specialize(w2_q.size(1))
+    hl.specialize(w2_scale.size(0))
+    hl.specialize(w2_scale.size(1))
+
+    # User tensors are required to keep the layouts used during tuning.  This
+    # avoids making their address arithmetic generic merely because runtime
+    # attention metadata is enabled.
+    hl.specialize(hidden_states.stride(0))
+    hl.specialize(hidden_states.stride(1))
+    hl.specialize(residual.stride(0))
+    hl.specialize(residual.stride(1))
+    hl.specialize(pre_weight.stride(0))
+    hl.specialize(pre_q.stride(0))
+    hl.specialize(pre_q.stride(1))
+    hl.specialize(pre_scale.stride(0))
+    hl.specialize(pre_scale.stride(1))
+    hl.specialize(qkv_weight_q.stride(0))
+    hl.specialize(qkv_weight_q.stride(1))
+    hl.specialize(qkv_weight_scale.stride(0))
+    hl.specialize(qkv_weight_scale.stride(1))
+    hl.specialize(q_weight.stride(0))
+    hl.specialize(k_weight.stride(0))
+    hl.specialize(cos_sin.stride(0))
+    hl.specialize(cos_sin.stride(1))
+    hl.specialize(position.stride(0))
+    hl.specialize(kv_cache.stride(0))
+    hl.specialize(kv_cache.stride(1))
+    hl.specialize(kv_cache.stride(2))
+    hl.specialize(kv_cache.stride(3))
+    hl.specialize(block_table.stride(0))
+    hl.specialize(block_table.stride(1))
+    hl.specialize(slot_mapping.stride(0))
+    hl.specialize(o_weight_q.stride(0))
+    hl.specialize(o_weight_q.stride(1))
+    hl.specialize(o_weight_scale.stride(0))
+    hl.specialize(o_weight_scale.stride(1))
+    hl.specialize(attention_q.stride(0))
+    hl.specialize(attention_q.stride(1))
+    hl.specialize(attention_scale.stride(0))
+    hl.specialize(attention_scale.stride(1))
+    hl.specialize(post_weight.stride(0))
+    hl.specialize(ffn_q.stride(0))
+    hl.specialize(ffn_q.stride(1))
+    hl.specialize(ffn_scale.stride(0))
+    hl.specialize(ffn_scale.stride(1))
+    hl.specialize(w13_q.stride(0))
+    hl.specialize(w13_q.stride(1))
+    hl.specialize(w13_scale.stride(0))
+    hl.specialize(w13_scale.stride(1))
+    hl.specialize(w2_q.stride(0))
+    hl.specialize(w2_q.stride(1))
+    hl.specialize(w2_scale.stride(0))
+    hl.specialize(w2_scale.stride(1))
+    hl.specialize(context_lens.stride(0))
+
     pre_result = pre_q
     pre_input = hidden_states
     pre_norm_weight = pre_weight
@@ -123,7 +259,8 @@ def qwen3_decode_layer(
     pre_residual = residual
     pre_group_size = group
     assert pre_input.ndim == 2
-    pre_num_tokens, pre_hidden_size = pre_input.shape
+    _, pre_hidden_size = pre_input.shape
+    pre_num_tokens = batch_capacity
     hl.specialize(pre_hidden_size)
     hl.specialize(pre_group_size)
     pre_groups_per_row = pre_scale_output.shape[1]
@@ -142,7 +279,8 @@ def qwen3_decode_layer(
     qkv_mm_weight_q = qkv_weight_q
     qkv_mm_weight_scale = qkv_weight_scale
     qkv_mm_group_size = group
-    qkv_mm_m, qkv_mm_k = qkv_mm_activation_q.size()
+    _, qkv_mm_k = qkv_mm_activation_q.size()
+    qkv_mm_m = batch_capacity
     qkv_mm_n, qkv_mm_weight_k = qkv_mm_weight_q.size()
     assert qkv_mm_weight_k == qkv_mm_k
     assert qkv_mm_group_size == 128
@@ -152,7 +290,7 @@ def qwen3_decode_layer(
         dtype=torch.bfloat16,
         device=qkv_mm_activation_q.device,
     )
-    batch = hidden_states.shape[0]
+    batch = batch_capacity
     query = qkv[:, : q_heads * head_dim].view(batch, q_heads, head_dim)
     key_begin = q_heads * head_dim
     key = qkv[:, key_begin : key_begin + kv_heads * head_dim].view(
@@ -172,7 +310,7 @@ def qwen3_decode_layer(
     qk_cos_sin_cache = cos_sin
     qk_is_neox = True
     qk_position_ids = position
-    qk_num_tokens = qk_qkv.shape[0]
+    qk_num_tokens = batch_capacity
     qk_total_heads = qk_num_heads_q + qk_num_heads_k + qk_num_heads_v
     hl.specialize(qk_qkv.shape[1])
     qk_rotary_dim = qk_cos_sin_cache.shape[1]
@@ -189,7 +327,8 @@ def qwen3_decode_layer(
     cache_kv_cache = kv_cache
     cache_slot_mapping = slot_mapping
     cache_block_size = cache_block
-    cache_num_tokens, cache_num_kv_heads, cache_head_dim = cache_key.shape
+    _, cache_num_kv_heads, cache_head_dim = cache_key.shape
+    cache_num_tokens = batch_capacity
     hl.specialize(cache_num_kv_heads)
     hl.specialize(cache_head_dim)
     hl.specialize(cache_block_size)
@@ -201,10 +340,11 @@ def qwen3_decode_layer(
     attention_split_q_per_kv = q_heads // kv_heads
     attention_split_splits = attention_splits
     (
-        attention_split_num_tokens,
+        _,
         attention_split_num_q_heads,
         attention_split_head_dim,
     ) = attention_split_query.shape
+    attention_split_num_tokens = batch_capacity
     attention_split_num_kv_heads = attention_split_kv_cache.shape[2]
     assert (
         attention_split_num_q_heads
@@ -304,9 +444,8 @@ def qwen3_decode_layer(
     attention_quant_fp8_min = FP8_MIN
     attention_quant_fp8_max = FP8_MAX
     attention_quant_scale_ue8m0 = False
-    attention_quant_num_tokens, attention_quant_hidden_size = (
-        attention_quant_input.shape
-    )
+    _, attention_quant_hidden_size = attention_quant_input.shape
+    attention_quant_num_tokens = batch_capacity
     hl.specialize(attention_quant_hidden_size)
     hl.specialize(attention_quant_group_size)
     attention_quant_groups_per_row = attention_quant_output_s.shape[1]
@@ -326,7 +465,8 @@ def qwen3_decode_layer(
     o_mm_weight_q = o_weight_q
     o_mm_weight_scale = o_weight_scale
     o_mm_group_size = group
-    o_mm_m, o_mm_k = o_mm_activation_q.size()
+    _, o_mm_k = o_mm_activation_q.size()
+    o_mm_m = batch_capacity
     o_mm_n, o_mm_weight_k = o_mm_weight_q.size()
     assert o_mm_weight_k == o_mm_k
     assert o_mm_group_size == 128
@@ -345,7 +485,8 @@ def qwen3_decode_layer(
     post_residual = residual
     post_group_size = group
     assert post_input.ndim == 2
-    post_num_tokens, post_hidden_size = post_input.shape
+    _, post_hidden_size = post_input.shape
+    post_num_tokens = batch_capacity
     hl.specialize(post_hidden_size)
     hl.specialize(post_group_size)
     post_groups_per_row = post_scale.shape[1]
@@ -364,7 +505,8 @@ def qwen3_decode_layer(
     w13_weight_q = w13_q
     w13_weight_scale = w13_scale
     w13_group_size = group
-    w13_m, w13_k = w13_activation_q.size()
+    _, w13_k = w13_activation_q.size()
+    w13_m = batch_capacity
     w13_n, w13_weight_k = w13_weight_q.size()
     assert w13_weight_k == w13_k
     assert w13_group_size == 128
@@ -376,7 +518,8 @@ def qwen3_decode_layer(
     )
     activation_gate_up = gate_up
     activation_group_size = group
-    activation_m, activation_twice_intermediate = activation_gate_up.size()
+    _, activation_twice_intermediate = activation_gate_up.size()
+    activation_m = batch_capacity
     activation_intermediate = activation_twice_intermediate // 2
     hl.specialize(activation_group_size)
     activation_groups = activation_intermediate // activation_group_size
@@ -395,7 +538,8 @@ def qwen3_decode_layer(
     w2_weight_q = w2_q
     w2_weight_scale = w2_scale
     w2_group_size = group
-    w2_m, w2_k = w2_activation_q.size()
+    _, w2_k = w2_activation_q.size()
+    w2_m = batch_capacity
     w2_n, w2_weight_k = w2_weight_q.size()
     assert w2_weight_k == w2_k
     assert w2_group_size == 128
@@ -557,7 +701,7 @@ def qwen3_decode_layer(
     ):
         attention_split_m_i = hl.full(
             [attention_split_tile_bg, attention_split_tile_q],
-            float("-inf"),
+            -3.4028234663852886e38,
             dtype=torch.float32,
         )
         attention_split_l_i = hl.full(
@@ -580,76 +724,95 @@ def qwen3_decode_layer(
         attention_split_kv_head = (
             attention_split_tile_bg.index % attention_split_num_kv_heads
         )
-        attention_split_query_head = (
-            attention_split_kv_head[:, None] * attention_split_q_per_kv
-            + attention_split_tile_q.index[None, :]
-        )
-        attention_split_q_blk = attention_split_query[
-            attention_split_token[:, None],
-            attention_split_query_head,
-            :,
-        ]
-        attention_split_q_blk = (attention_split_q_blk * attention_split_qk_scale).to(
-            attention_split_query.dtype
-        )
-        for attention_split_tile_local_n in hl.tile(attention_split_split_context):
-            attention_split_n = (
-                attention_split_split_idx * attention_split_split_context
-                + attention_split_tile_local_n.index
+        attention_split_context_len = hl.load(context_lens, [attention_split_token])
+        if (
+            attention_split_split_idx * attention_split_split_context
+            < attention_split_context_len
+        ):
+            attention_split_query_head = (
+                attention_split_kv_head[:, None] * attention_split_q_per_kv
+                + attention_split_tile_q.index[None, :]
             )
-            attention_split_physical_block = attention_split_block_table[
+            attention_split_q_blk = attention_split_query[
                 attention_split_token[:, None],
-                (attention_split_n // attention_split_block_size)[None, :],
+                attention_split_query_head,
+                :,
             ]
-            attention_split_block_offset = (
-                attention_split_n % attention_split_block_size
-            )
-            attention_split_d = hl.arange(attention_split_head_dim)
-            attention_split_k = hl.load(
-                attention_split_kv_cache,
-                [
-                    attention_split_physical_block[:, :, None],
-                    attention_split_block_offset[None, :, None],
-                    attention_split_kv_head[:, None, None],
-                    attention_split_d[None, None, :],
-                ],
-            )
-            attention_split_scores = torch.bmm(
-                attention_split_q_blk,
-                attention_split_k.transpose(1, 2),
-                torch.float32,
-            )
-            attention_split_m_ij = torch.maximum(
-                attention_split_m_i, torch.amax(attention_split_scores, -1)
-            )
-            attention_split_p = torch.exp2(
-                attention_split_scores - attention_split_m_ij[:, :, None]
-            )
-            attention_split_alpha = torch.exp2(
-                attention_split_m_i - attention_split_m_ij
-            )
-            attention_split_l_i = (
-                attention_split_l_i * attention_split_alpha
-                + torch.sum(attention_split_p, -1)
-            )
-            attention_split_acc = (
-                attention_split_acc * attention_split_alpha[:, :, None]
-            )
-            attention_split_v = hl.load(
-                attention_split_kv_cache,
-                [
-                    attention_split_physical_block[:, :, None],
-                    attention_split_block_offset[None, :, None],
-                    attention_split_kv_head[:, None, None],
-                    (attention_split_d + attention_split_head_dim)[None, None, :],
-                ],
-            )
-            attention_split_acc = torch.baddbmm(
-                attention_split_acc,
-                attention_split_p.to(attention_split_v.dtype),
-                attention_split_v,
-            )
-            attention_split_m_i = attention_split_m_ij
+            attention_split_q_blk = (
+                attention_split_q_blk * attention_split_qk_scale
+            ).to(attention_split_query.dtype)
+            for attention_split_tile_local_n in hl.tile(attention_split_split_context):
+                attention_split_n = (
+                    attention_split_split_idx * attention_split_split_context
+                    + attention_split_tile_local_n.index
+                )
+                attention_split_valid_n = (
+                    attention_split_n < attention_split_context_len
+                )
+                attention_split_physical_block = hl.load(
+                    attention_split_block_table,
+                    [
+                        attention_split_token[:, None],
+                        (attention_split_n // attention_split_block_size)[None, :],
+                    ],
+                    extra_mask=attention_split_valid_n[None, :],
+                )
+                attention_split_block_offset = (
+                    attention_split_n % attention_split_block_size
+                )
+                attention_split_d = hl.arange(attention_split_head_dim)
+                attention_split_k = hl.load(
+                    attention_split_kv_cache,
+                    [
+                        attention_split_physical_block[:, :, None],
+                        attention_split_block_offset[None, :, None],
+                        attention_split_kv_head[:, None, None],
+                        attention_split_d[None, None, :],
+                    ],
+                    extra_mask=attention_split_valid_n[None, :, None],
+                )
+                attention_split_scores = torch.bmm(
+                    attention_split_q_blk,
+                    attention_split_k.transpose(1, 2),
+                    torch.float32,
+                )
+                attention_split_scores = torch.where(
+                    attention_split_valid_n[None, None, :],
+                    attention_split_scores,
+                    -3.4028234663852886e38,
+                )
+                attention_split_m_ij = torch.maximum(
+                    attention_split_m_i, torch.amax(attention_split_scores, -1)
+                )
+                attention_split_p = torch.exp2(
+                    attention_split_scores - attention_split_m_ij[:, :, None]
+                )
+                attention_split_alpha = torch.exp2(
+                    attention_split_m_i - attention_split_m_ij
+                )
+                attention_split_l_i = (
+                    attention_split_l_i * attention_split_alpha
+                    + torch.sum(attention_split_p, -1)
+                )
+                attention_split_acc = (
+                    attention_split_acc * attention_split_alpha[:, :, None]
+                )
+                attention_split_v = hl.load(
+                    attention_split_kv_cache,
+                    [
+                        attention_split_physical_block[:, :, None],
+                        attention_split_block_offset[None, :, None],
+                        attention_split_kv_head[:, None, None],
+                        (attention_split_d + attention_split_head_dim)[None, None, :],
+                    ],
+                    extra_mask=attention_split_valid_n[None, :, None],
+                )
+                attention_split_acc = torch.baddbmm(
+                    attention_split_acc,
+                    attention_split_p.to(attention_split_v.dtype),
+                    attention_split_v,
+                )
+                attention_split_m_i = attention_split_m_ij
         partial_out[
             attention_split_tile_split,
             attention_split_tile_bg,
@@ -958,7 +1121,9 @@ def _make_fp8_random(shape: tuple[int, ...], scale: float = 1.0) -> torch.Tensor
     )
 
 
-def _make_inputs(seed: int = 0) -> dict[str, torch.Tensor]:
+def _make_inputs(seed: int = 0, context_len: int = CONTEXT) -> dict[str, torch.Tensor]:
+    if not 1 <= context_len <= CONTEXT:
+        raise ValueError(f"context_len must be in [1, {CONTEXT}]")
     torch.manual_seed(seed)
     hidden_groups = HIDDEN // GROUP
     intermediate_groups = INTERMEDIATE // GROUP
@@ -968,8 +1133,8 @@ def _make_inputs(seed: int = 0) -> dict[str, torch.Tensor]:
     block_table = torch.randperm(physical_blocks, device="cuda", dtype=torch.int64)[
         :logical_blocks
     ].to(torch.int32)[None, :]
-    final_logical_block = (CONTEXT - 1) // CACHE_BLOCK
-    final_block_offset = (CONTEXT - 1) % CACHE_BLOCK
+    final_logical_block = (context_len - 1) // CACHE_BLOCK
+    final_block_offset = (context_len - 1) % CACHE_BLOCK
     final_physical_block = block_table[:, final_logical_block].to(torch.int64)
     return {
         "hidden_states": torch.randn(
@@ -1006,7 +1171,12 @@ def _make_inputs(seed: int = 0) -> dict[str, torch.Tensor]:
             device="cuda",
             dtype=torch.bfloat16,
         ),
-        "position": torch.full((BATCH,), CONTEXT - 1, device="cuda", dtype=torch.int64),
+        "context_lens": torch.full(
+            (BATCH,), context_len, device="cuda", dtype=torch.int64
+        ),
+        "position": torch.full(
+            (BATCH,), context_len - 1, device="cuda", dtype=torch.int64
+        ),
         "kv_cache": torch.randn(
             (
                 physical_blocks,
@@ -1077,8 +1247,19 @@ def _make_helion_inputs(
     tensors: dict[str, torch.Tensor], use_ue8m0: bool
 ) -> dict[str, torch.Tensor]:
     cloned = dict(tensors)
-    cloned["residual"] = tensors["residual"].clone()
-    cloned["kv_cache"] = tensors["kv_cache"].clone()
+    # Persistent and separate-launch executions must never alias writable
+    # buffers: their exact comparison is the scheduler-isolation check.
+    for name in (
+        "residual",
+        "pre_q",
+        "pre_scale",
+        "kv_cache",
+        "attention_q",
+        "attention_scale",
+        "ffn_q",
+        "ffn_scale",
+    ):
+        cloned[name] = tensors[name].clone()
     if use_ue8m0:
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             requant_weight_ue8m0_inplace,
@@ -1120,6 +1301,7 @@ def _kernel_args(tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
         tensors["w13_scale"],
         tensors["w2_q"],
         tensors["w2_scale"],
+        tensors["context_lens"],
         HIDDEN,
         INTERMEDIATE,
         Q_HEADS,
@@ -1266,13 +1448,13 @@ def _make_vllm_cache(
 
 
 def _make_attention_metadata(
-    vllm_config, attention, tensors, layer_name: str
+    vllm_config, attention, tensors, layer_name: str, context_len: int
 ) -> tuple[dict[str, object], dict[str, torch.Tensor]]:
     from vllm.config import set_current_vllm_config
     from vllm.v1.attention.backend import CommonAttentionMetadata
 
     query_start_loc = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
-    seq_lens = torch.tensor([CONTEXT], device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor([context_len], device="cuda", dtype=torch.int32)
     common = CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
@@ -1281,7 +1463,7 @@ def _make_attention_metadata(
         num_reqs=1,
         num_actual_tokens=1,
         max_query_len=1,
-        max_seq_len=CONTEXT,
+        max_seq_len=context_len,
         block_table_tensor=tensors["block_table"],
         slot_mapping=tensors["slot_mapping"],
         causal=True,
@@ -1310,6 +1492,7 @@ def _make_attention_metadata(
 
 def _make_vllm_call(
     tensors: dict[str, torch.Tensor],
+    context_len: int = CONTEXT,
 ) -> tuple[
     Callable[[], tuple[torch.Tensor, torch.Tensor]],
     dict[str, torch.Tensor],
@@ -1388,7 +1571,7 @@ def _make_vllm_call(
         }
         attention.kv_cache = vllm_tensors["kv_cache"]
         attention_metadata, slot_mapping = _make_attention_metadata(
-            vllm_config, attention, vllm_tensors, layer_name
+            vllm_config, attention, vllm_tensors, layer_name, context_len
         )
         attention_backend = attention.get_attn_backend().get_name()
     except Exception:
@@ -1476,32 +1659,113 @@ def _assert_vllm_close(
     )
 
 
+def _assert_standalone_equivalent(
+    persistent_outputs: tuple[torch.Tensor, ...],
+    standalone_outputs: tuple[torch.Tensor, ...],
+    persistent_tensors: dict[str, torch.Tensor],
+    standalone_tensors: dict[str, torch.Tensor],
+) -> None:
+    """Check the same computation across its fused and separate schedules."""
+    assert len(persistent_outputs) == len(standalone_outputs)
+    # The input quantization and QKV projection have identical reduction
+    # geometry in both paths and should therefore agree bit-for-bit.
+    for index in (1, 2, 3):
+        torch.testing.assert_close(
+            persistent_outputs[index], standalone_outputs[index], atol=0, rtol=0
+        )
+    # Attention and the two later GEMMs use independently tuned tile shapes.
+    # Their FP32 reductions are mathematically equivalent but need not have the
+    # same floating-point association.  Check the externally visible values
+    # directly with a substantially tighter tolerance than the vLLM control.
+    torch.testing.assert_close(
+        persistent_outputs[0].float(),
+        standalone_outputs[0].float(),
+        atol=0.05,
+        rtol=0.01,
+    )
+    torch.testing.assert_close(
+        persistent_outputs[-1].float(),
+        standalone_outputs[-1].float(),
+        atol=0.02,
+        rtol=0.01,
+    )
+    torch.testing.assert_close(
+        persistent_tensors["kv_cache"],
+        standalone_tensors["kv_cache"],
+        atol=0,
+        rtol=0,
+    )
+
+
+def _make_standalone_call(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[Callable[[], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]:
+    """Build the matched, independently tuned twelve-launch Helion graph."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from pretuned_kernels.megakernels.qwen3_decode_layer import _standalone
+
+    return _standalone.build(
+        tensors,
+        hidden=HIDDEN,
+        intermediate=INTERMEDIATE,
+        q_heads=Q_HEADS,
+        kv_heads=KV_HEADS,
+        head_dim=HEAD_DIM,
+        context=CONTEXT,
+        cache_block=CACHE_BLOCK,
+        attention_splits=ATTENTION_SPLITS,
+        group=GROUP,
+        eps=EPS,
+    )
+
+
 @torch.inference_mode()
 def correctness_check() -> None:
-    """Check the one pretuned shape against vLLM's production decoder layer."""
+    """Check irregular runtime context lengths against production vLLM."""
     _require_sm100()
     if not has_vllm():
         raise RuntimeError("vLLM is required for the Qwen3 comparison")
-    base = _make_inputs()
-    vllm_call, vllm_tensors, use_ue8m0, _backend, close_vllm = _make_vllm_call(base)
-    try:
-        helion_tensors = _make_helion_inputs(base, use_ue8m0)
-        helion_outputs = qwen3_decode_layer(*_kernel_args(helion_tensors))
-        vllm_outputs = vllm_call()
-        torch.cuda.synchronize()
-        _assert_vllm_close(
-            helion_outputs,
-            vllm_outputs,
-            helion_tensors,
-            vllm_tensors,
+    for context_len in CONTEXT_LENGTHS:
+        base = _make_inputs(context_len=context_len)
+        vllm_call, vllm_tensors, use_ue8m0, _backend, close_vllm = _make_vllm_call(
+            base, context_len
         )
-    finally:
-        close_vllm()
+        try:
+            helion_tensors = _make_helion_inputs(base, use_ue8m0)
+            standalone_tensors = _make_helion_inputs(base, use_ue8m0)
+            helion_outputs = qwen3_decode_layer(*_kernel_args(helion_tensors))
+            _standalone_call, standalone_outputs = _make_standalone_call(
+                standalone_tensors
+            )
+            vllm_outputs = vllm_call()
+            torch.cuda.synchronize()
+            _assert_vllm_close(
+                helion_outputs,
+                vllm_outputs,
+                helion_tensors,
+                vllm_tensors,
+            )
+            _assert_vllm_close(
+                standalone_outputs,
+                vllm_outputs,
+                standalone_tensors,
+                vllm_tensors,
+            )
+            _assert_standalone_equivalent(
+                helion_outputs,
+                standalone_outputs,
+                helion_tensors,
+                standalone_tensors,
+            )
+        finally:
+            close_vllm()
 
 
 @torch.inference_mode()
 def main(verbose: bool = True) -> dict:
-    """Benchmark one production decode shape against vLLM with cold L2."""
+    """Benchmark persistent, separate Helion, and production vLLM with cold L2."""
     _require_sm100()
     if not has_vllm():
         raise RuntimeError("vLLM is required for the Qwen3 comparison")
@@ -1512,42 +1776,107 @@ def main(verbose: bool = True) -> dict:
     from _bench import capture_cuda_graph
     from _bench import run_sweep
 
-    base = _make_inputs()
-    vllm_call, vllm_tensors, use_ue8m0, backend, close_vllm = _make_vllm_call(base)
-    try:
-        helion_tensors = _make_helion_inputs(base, use_ue8m0)
-        helion_reset = _make_reset(helion_tensors)
-        vllm_reset = _make_reset(vllm_tensors, vllm_layout=True)
-
-        helion_outputs = qwen3_decode_layer(*_kernel_args(helion_tensors))
-        vllm_outputs = vllm_call()
-        torch.cuda.synchronize()
-        _assert_vllm_close(
-            helion_outputs,
-            vllm_outputs,
-            helion_tensors,
-            vllm_tensors,
-        )
-
-        helion_graph, _ = capture_cuda_graph(
-            lambda: qwen3_decode_layer(*_kernel_args(helion_tensors)),
-            helion_reset,
-        )
-        vllm_graph, _ = capture_cuda_graph(vllm_call, vllm_reset)
-
-        def make_calls(_shape: None) -> tuple:
-            return (
-                helion_graph.replay,
-                [(f"vllm_auto ({backend})", vllm_graph.replay)],
-                (f"{BATCH:>5d}  {HIDDEN:>6d}  {CONTEXT:>7d}  {ATTENTION_SPLITS:>6d}"),
+    def iter_benchmark_cases() -> Iterator[tuple[object, ...]]:
+        # Keep each vLLM context alive until its captured graph has finished
+        # replaying.  In particular, do not destroy process/model-parallel state
+        # while a backend graph may still refer to process-global workspaces.
+        for context_len in CONTEXT_LENGTHS:
+            base = _make_inputs(context_len=context_len)
+            vllm_call, vllm_tensors, use_ue8m0, backend, close_vllm = _make_vllm_call(
+                base, context_len
             )
+            try:
+                helion_tensors = _make_helion_inputs(base, use_ue8m0)
+                standalone_tensors = _make_helion_inputs(base, use_ue8m0)
+                helion_reset = _make_reset(helion_tensors)
+                standalone_reset = _make_reset(standalone_tensors)
+                vllm_reset = _make_reset(vllm_tensors, vllm_layout=True)
 
+                helion_outputs = qwen3_decode_layer(*_kernel_args(helion_tensors))
+                standalone_call, standalone_outputs = _make_standalone_call(
+                    standalone_tensors
+                )
+                vllm_outputs = vllm_call()
+                torch.cuda.synchronize()
+                _assert_vllm_close(
+                    helion_outputs,
+                    vllm_outputs,
+                    helion_tensors,
+                    vllm_tensors,
+                )
+                _assert_vllm_close(
+                    standalone_outputs,
+                    vllm_outputs,
+                    standalone_tensors,
+                    vllm_tensors,
+                )
+                _assert_standalone_equivalent(
+                    helion_outputs,
+                    standalone_outputs,
+                    helion_tensors,
+                    standalone_tensors,
+                )
+
+                helion_graph, helion_graph_outputs = capture_cuda_graph(
+                    lambda tensors=helion_tensors: qwen3_decode_layer(
+                        *_kernel_args(tensors)
+                    ),
+                    helion_reset,
+                )
+                standalone_graph, standalone_graph_outputs = capture_cuda_graph(
+                    standalone_call, standalone_reset
+                )
+                vllm_graph, vllm_graph_outputs = capture_cuda_graph(
+                    vllm_call, vllm_reset
+                )
+                yield (
+                    context_len,
+                    backend,
+                    helion_graph,
+                    standalone_graph,
+                    vllm_graph,
+                    helion_reset,
+                    standalone_reset,
+                    vllm_reset,
+                    (
+                        base,
+                        helion_tensors,
+                        standalone_tensors,
+                        vllm_tensors,
+                        standalone_call,
+                        vllm_call,
+                        helion_outputs,
+                        standalone_outputs,
+                        vllm_outputs,
+                        helion_graph_outputs,
+                        standalone_graph_outputs,
+                        vllm_graph_outputs,
+                    ),
+                )
+            finally:
+                close_vllm()
+
+    def make_calls(benchmark_case: tuple) -> tuple:
+        context_len, backend, helion_graph, standalone_graph, vllm_graph, *_ = (
+            benchmark_case
+        )
+        return (
+            helion_graph.replay,
+            [
+                ("standalone_helion_pdl", standalone_graph.replay),
+                (f"vllm_auto ({backend})", vllm_graph.replay),
+            ],
+            f"{BATCH:>5d}  {HIDDEN:>6d}  {context_len:>7d}  {ATTENTION_SPLITS:>6d}",
+        )
+
+    benchmark_cases = iter_benchmark_cases()
+    try:
         return run_sweep(
-            [None],
+            benchmark_cases,
             make_calls,
             use_cudagraph=False,
             pre_captured_cudagraph=True,
-            make_resets=lambda _shape: (helion_reset, vllm_reset),
+            make_resets=itemgetter(slice(5, 8)),
             thermal_warmup_ms=10_000,
             verbose=verbose,
             shape_header=(
@@ -1555,7 +1884,7 @@ def main(verbose: bool = True) -> dict:
             ),
         )
     finally:
-        close_vllm()
+        benchmark_cases.close()
 
 
 if __name__ == "__main__":
