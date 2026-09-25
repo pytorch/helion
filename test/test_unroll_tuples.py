@@ -950,7 +950,28 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         rstd = 1.0 / torch.sqrt(var + 1e-5)
         expected = ((concatenated - mean[:, None]) * rstd[:, None]).to(tensors[0].dtype)
 
-        torch.testing.assert_close(result, expected, atol=5 * 1e-2, rtol=5 * 1e-2)
+        try:
+            torch.testing.assert_close(result, expected, atol=5 * 1e-2, rtol=5 * 1e-2)
+        except AssertionError:
+            mismatched = ~torch.isclose(result, expected, atol=0.05, rtol=0.05)
+            rows = mismatched.any(dim=1).nonzero().flatten()[:8]
+            cpu_input = torch.cat([t[rows].cpu().double() for t in tensors], dim=1)
+            cpu_mean = cpu_input.mean(dim=-1, keepdim=True)
+            cpu_var = ((cpu_input - cpu_mean) ** 2).mean(dim=-1, keepdim=True)
+            cpu_expected = ((cpu_input - cpu_mean) / torch.sqrt(cpu_var + 1e-5)).to(
+                result.dtype
+            )
+            repeated = kernel_list_register_cache_layernorm(tensors)[rows].cpu()
+            uncached = kernel_list_no_cache_layernorm(tensors)[rows].cpu()
+            print("LayerNorm diagnostic rows:", rows.tolist())
+            print("LayerNorm diagnostic input:", cpu_input.tolist())
+            print("LayerNorm diagnostic original:", result[rows].cpu().tolist())
+            print("LayerNorm diagnostic GPU reference:", expected[rows].cpu().tolist())
+            print("LayerNorm diagnostic CPU reference:", cpu_expected.tolist())
+            print("LayerNorm diagnostic repeated:", repeated.tolist())
+            print("LayerNorm diagnostic uncached:", uncached.tolist())
+            print("LayerNorm diagnostic generated code:\n", code)
+            raise
 
         # Verify register caching: G loads in pass 1, no re-loads in pass 2
         if _get_backend() == "triton":
