@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -17,7 +19,9 @@ from helion._compiler.cute import chained_matmul
 from helion._compiler.cute import chained_tcgen05
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import skipUnlessBackends
+from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 
@@ -287,3 +291,78 @@ def test_real_codegen_rejects_injected_future_tmem_read():
         pytest.raises(exc.BackendUnsupported, match="later TMEM use"),
     ):
         _bound().to_code(_config())
+
+
+@pytest.mark.parametrize("kind", ["single", "plain", "scan", "three"])
+def test_exact_one_typed_sibling_preserves_old_pool_and_first100(kind):
+    from test.test_cute_chained_tcgen05_config import _without_startup_seed
+
+    from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
+
+    with _cpu_codegen():
+        bound = _bound(kind)
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env, bound.host_function:
+            pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            assert pool is not None
+            pool = _without_startup_seed(pool)
+            enabled = [
+                (i, seed)
+                for i, seed in enumerate(pool)
+                if seed.config.get(KEY) == "last_read"
+            ]
+            assert len(enabled) == 1
+            index, sibling = enabled[0]
+            assert index > 0
+            assert sibling.config == pool[index - 1].config | {KEY: "last_read"}
+            with patch(
+                "helion._compiler.autotuner_heuristics.cute._with_last_read_seed",
+                side_effect=lambda seeds: seeds,
+            ):
+                legacy_pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            assert legacy_pool is not None
+            legacy_pool = _without_startup_seed(legacy_pool)
+            assert len(pool) == len(legacy_pool) + 1
+            assert [dict(seed) for seed in pool if KEY not in seed.config] == [
+                dict(seed) for seed in legacy_pool
+            ]
+            assert dict(spec.default_config()).get(KEY) is None
+            generation = ConfigGeneration(spec)
+            flat = generation.random_population_flat(100)
+            user = _config("legacy")
+            priority = generation.random_population_flat(100, user_seed_configs=[user])
+            assert priority[0] == generation.default_flat()
+            assert generation.unflatten(priority[1]) == bound._normalized_config_copy(
+                user
+            )
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast(
+                        "PopulationBasedSearch", SimpleNamespace(config_gen=generation)
+                    ),
+                    row,
+                )
+                for row in flat
+            ]
+        selected = [
+            (i, member)
+            for i, member in enumerate(members)
+            if member is not None and member.config.config.get(KEY) == "last_read"
+        ]
+        assert selected and selected[0][0] < 100
+        source = bound.to_code(selected[0][1].config)
+        assert "chain_allocator.free(chain_tptr)" in source
+        assert _inverse(source) == bound.to_code(
+            helion.Config.from_dict(
+                {
+                    key: value
+                    for key, value in selected[0][1].config.config.items()
+                    if key != KEY
+                }
+            )
+        )

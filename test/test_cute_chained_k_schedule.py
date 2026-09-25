@@ -17,8 +17,10 @@ from test.test_cute_chained_late_rhs import _pair
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.cute import chained_tcgen05
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -301,6 +303,50 @@ def test_real_raw_canonical_preload_stops(mode):
                 with pytest.raises(StopBeforeLoad):
                     bound.compile_config(request, allow_print=False)
         assert observed == [expected, expected] and not bound._compile_cache
+
+
+def test_actual_pool_and_normalized_first100():
+    from types import SimpleNamespace
+
+    from helion.autotuner.base_search import PopulationBasedSearch
+
+    with _cpu():
+        bound = _pair._bind_isolated(_args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env:
+            pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            spec.cute_chained_k_schedule_search_enabled = False
+            try:
+                old = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            finally:
+                spec.cute_chained_k_schedule_search_enabled = True
+            assert pool is not None and old is not None
+            assert [seed for seed in pool if KEY not in seed.config] == old
+            assert len(pool) == len(old) + 2 and pool[0] == old[0]
+            generation = ConfigGeneration(spec)
+            flats = generation.random_population_flat(100)
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast(
+                        "PopulationBasedSearch", SimpleNamespace(config_gen=generation)
+                    ),
+                    flat,
+                )
+                for flat in flats
+            ]
+            population = [member.config for member in members if member is not None]
+            assert len(members) == 100
+        for mode in ("serial64", "overlap64"):
+            candidate = next(
+                item for item in population if item.config.get(KEY) == mode
+            )
+            assert "chain_k_half" in bound.to_code(candidate)
+            assert generation.unflatten(generation.flatten(candidate)) == candidate
 
 
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import re
 from unittest.mock import patch
 
@@ -13,11 +14,14 @@ from .test_cute_chained_pointwise import _pointwise_dot
 from .test_cute_chained_pointwise_fp32 import _mixed_args
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.cute.chained_pointwise_unroll import PointwiseUnroll
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_generation import ConfigGeneration
 
 pytestmark = skipUnlessBackends(["cute"])
 KEY = "cute_chained_pointwise_unroll"
@@ -104,6 +108,46 @@ def test_direct_and_dot_derived_operands_do_not_advertise_unroll() -> None:
     fixed = _config_unroll(2)
     spec.normalize(fixed, _fix_invalid=True)
     assert KEY not in fixed.config
+
+
+def test_search_preserves_old_order_and_reaches_both_factors() -> None:
+    with patch_cute_mma_support():
+        bound = _pointwise_dot._bind_isolated(_args("cpu", "dense"))
+    spec = bound.config_spec
+    assert spec.cute_chained_pointwise_unroll_search_enabled
+    fragment = spec._flat_fields()[KEY]
+    assert isinstance(fragment, EnumFragment)
+    assert fragment.search_values() == [1, 2, 4, 8]
+    assert bound.host_function is not None
+    with bound.env:
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        spec.cute_chained_pointwise_unroll_search_enabled = False
+        try:
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        finally:
+            spec.cute_chained_pointwise_unroll_search_enabled = True
+        assert old is not None and new is not None
+        assert [seed for seed in new if seed.config.get(KEY, 1) == 1] == old
+        assert new[0] == old[0]
+        generation = ConfigGeneration(spec)
+        population = [
+            generation.unflatten(flat)
+            for flat in generation.random_population_flat(100)
+        ]
+        factor2 = [seed for seed in population if seed.config.get(KEY) == 2]
+        assert factor2
+        for seed in factor2:
+            assert seed.config["cute_chained_mma_schedule"] == "tcgen05_tmem"
+            assert seed.config["cute_chained_pointwise_vectorize"] is True
+            canonical = generation.unflatten(generation.flatten(seed))
+            assert canonical.config[KEY] == 2
+        assert population[0].config[KEY] == 1
+    with patch("test.test_cute_chained_pointwise._config", return_value=factor2[0]):
+        assert LOOP.search(_code(_args("cpu", "dense"))) is not None
 
 
 @pytest.mark.parametrize("schedule", ["coalesced", "cp_async_register"])
@@ -203,6 +247,63 @@ def test_larger_inactive_configs_preserve_canonical_default(factor: int) -> None
         normalized = bound.config_spec.normalized_config(config)
         assert normalized.config[KEY] == 1
         assert normalized.config["cute_chained_pointwise_vectorize"] is False
+
+
+def test_larger_seed_factors_preserve_old_pool_order_and_reach_initial_population() -> (
+    None
+):
+    with patch_cute_mma_support():
+        bound = _pointwise_dot._bind_isolated(_args("cpu", "dense"))
+    assert bound.host_function is not None
+    reached_configs = []
+    with bound.env:
+        with patch(
+            "helion._compiler.autotuner_heuristics.cute.VALID_CUTE_CHAINED_POINTWISE_UNROLLS",
+            (1, 2),
+        ):
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        assert old is not None and new is not None
+        assert [seed for seed in new if seed.config.get(KEY, 1) in (1, 2)] == old
+        assert new[0] == old[0]
+        old_two = [seed for seed in old if seed.config.get(KEY) == 2]
+        assert len(new) == len(old) + 2 * len(old_two)
+        for factor in (4, 8):
+            assert Counter(
+                helion.Config.from_dict(seed.config | {KEY: 2})
+                for seed in new
+                if seed.config.get(KEY) == factor
+            ) == Counter(old_two)
+        generation = ConfigGeneration(bound.config_spec)
+        population = [
+            generation.unflatten(flat)
+            for flat in generation.random_population_flat(100)
+        ]
+        assert len(population) == 100 and population[0].config[KEY] == 1
+        for factor in (2, 4, 8):
+            reached = [
+                candidate
+                for candidate in population
+                if candidate.config.get(KEY) == factor
+                and candidate.block_sizes == [128, 64]
+            ]
+            assert reached, factor
+            assert all(
+                seed.config["cute_chained_pointwise_vectorize"]
+                and seed.config["cute_chained_mma_schedule"] == "tcgen05_tmem"
+                for seed in reached
+            )
+            config = generation.unflatten(generation.flatten(reached[0]))
+            assert config.config[KEY] == factor
+            reached_configs.append(config)
+    for config in reached_configs:
+        with patch("test.test_cute_chained_pointwise._config", return_value=config):
+            source = _code(_args("cpu", "dense"))
+        assert f"unroll={config.config[KEY]}" in source
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -6,6 +6,7 @@ import importlib
 import re
 from types import SimpleNamespace
 from typing import Any
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -159,6 +160,47 @@ def test_real_raw_canonical_stops():
                     bound.compile_config(request, allow_print=False)
         assert observed == [expected, expected]
         assert not bound._compile_cache
+
+
+def test_seed_pool_and_real_first100():
+    from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
+    from helion.autotuner.base_search import PopulationBasedSearch
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    with _cpu():
+        bound = pair._bind_isolated(args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env:
+            pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            spec.cute_chained_leaf_pipeline_search_enabled = False
+            try:
+                old = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            finally:
+                spec.cute_chained_leaf_pipeline_search_enabled = True
+            assert pool is not None and old is not None
+            assert [c for c in pool if KEY not in c.config] == old
+            assert len(pool) == len(old) + 1 and pool[0] == old[0]
+            generation = ConfigGeneration(spec)
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast(
+                        "PopulationBasedSearch", SimpleNamespace(config_gen=generation)
+                    ),
+                    flat,
+                )
+                for flat in generation.random_population_flat(100)
+            ]
+        member = next(
+            m
+            for m in members
+            if m is not None and m.config.config.get(KEY) == "paired_tma"
+        )
+        assert "chained_paired_leaf_tma" in bound.to_code(member.config)
 
 
 @pytest.mark.parametrize(

@@ -265,6 +265,30 @@ def test_guard_precedes_builder_and_cache() -> None:
     )
 
 
+def test_actual_initial_pool_admission() -> None:
+    from helion.autotuner.config_generation import ConfigGeneration
+    from helion.autotuner.pattern_search import PatternSearch
+
+    with cpu_codegen():
+        bound = _tcgen_chain._bind_isolated((*_inputs("cpu"), "decay"))
+        generation = ConfigGeneration(bound.env.config_spec)
+        search = PatternSearch.__new__(PatternSearch)
+        search.config_gen = generation
+        raw = generation.random_population_flat(100)
+        admitted = []
+        for index, flat in enumerate(raw[:100]):
+            member = search.make_unbenchmarked(flat)
+            if (
+                member is not None
+                and member.config.config.get("cute_chained_startup_transfer") == "tma"
+            ):
+                source = bound.to_code(member.config)
+                assert "chained_startup_tma" in source
+                admitted.append(index)
+                break
+        assert len(raw) >= 100 and admitted, (len(raw), admitted)
+
+
 @pytest.mark.parametrize("inner", [0, 1])
 @pytest.mark.parametrize("width", [32, 64, 96, 128, 256])
 @pytest.mark.parametrize("dtype_name", ["BFloat16", "Float16"])

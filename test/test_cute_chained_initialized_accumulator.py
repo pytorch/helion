@@ -13,10 +13,12 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.cute import chained_initialized_accumulator as initialized
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -223,6 +225,38 @@ def test_other_schedule_rejects_true_false_canonicalizes():
         spec = _pair._bind_isolated(_args()).config_spec
         config = spec.normalized_config(_config(enabled=False))
         assert KEY not in config.config
+
+
+def test_actual_initial100_and_exact_old_order():
+    with _cpu():
+        bound = _pair._bind_isolated(_args())
+    spec = bound.config_spec
+    assert spec.cute_chained_initialized_accumulator_search_enabled
+    assert bound.host_function is not None
+    with bound.env:
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        spec.cute_chained_initialized_accumulator_search_enabled = False
+        try:
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        finally:
+            spec.cute_chained_initialized_accumulator_search_enabled = True
+        assert new is not None and old is not None
+        assert [value for value in new if not value.config.get(KEY)] == old
+        generation = ConfigGeneration(spec)
+        population = [
+            generation.unflatten(value)
+            for value in generation.random_population_flat(100)
+        ]
+        candidates = [value for value in population if value.config.get(KEY)]
+        assert candidates and not population[0].config.get(KEY)
+        selected = candidates[0]
+        assert generation.unflatten(generation.flatten(selected)).config[KEY] is True
+    with _cpu():
+        assert "chain_seed_copy =" in _pair._bind_isolated(_args()).to_code(selected)
 
 
 def test_unavailable_scan_boundary_is_fail_closed():
