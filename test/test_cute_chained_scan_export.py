@@ -17,6 +17,7 @@ import torch
 from test.test_cute_chained_tcgen05 import _tcgen_compile
 
 import helion
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.cute.chained_scan_export import requests_scan_export
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
@@ -542,6 +543,28 @@ def test_scan_export_nonzero_root_rejects() -> None:
         bound = _nonzero_root_scan_export._bind_isolated((a, b, delta))
         with pytest.raises((BackendUnsupported, InvalidConfig)):
             bound.to_code(_scan_export_config())
+
+
+@pytest.mark.parametrize("cache", [False, True])
+def test_scan_export_cache_and_seed_reachability(cache: bool) -> None:
+    with _scan_export_cpu_codegen():
+        bound = _scan_export._bind_isolated((*_scan_export_args(), "normal"))
+        config = _scan_export_config()
+        config.config.update(cute_chained_auxiliary_cache=cache)
+        _export_branch(bound.to_code(config))
+        assert bound.host_function is not None
+        with bound.env:
+            seeds = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        assert seeds is not None
+        tcgen = [
+            seed
+            for seed in seeds
+            if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        ]
+        assert tcgen
+        assert any("chain_scan_0_values[127]" in bound.to_code(seed) for seed in tcgen)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

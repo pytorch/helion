@@ -785,6 +785,7 @@ VALID_CUTE_LOOP_LOAD_SCHEDULES = (
     "prefetch4",
 )
 VALID_CUTE_CHAINED_POINTWISE_UNROLLS = (1, 2, 4, 8)
+CUTE_CHAINED_AUXILIARY_CACHE_KEY = "cute_chained_auxiliary_cache"
 VALID_CUTE_CHAINED_MMA_SCHEDULES = (
     "coalesced",
     "cp_async",
@@ -873,6 +874,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
+        CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -922,6 +924,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
+        CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -3237,6 +3240,19 @@ class ConfigSpec:
                 raise InvalidConfig(
                     "pointwise unroll requires computed TCgen05 vector operands"
                 )
+        if self.cute_chained_tcgen05_search_enabled:
+            cache = config.setdefault(CUTE_CHAINED_AUXILIARY_CACHE_KEY, False)
+            if not isinstance(cache, bool):
+                raise InvalidConfig("cute_chained_auxiliary_cache must be bool")
+            if config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem":
+                config[CUTE_CHAINED_AUXILIARY_CACHE_KEY] = False
+        elif CUTE_CHAINED_AUXILIARY_CACHE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_AUXILIARY_CACHE_KEY)
+            else:
+                raise InvalidConfig(
+                    "auxiliary caches require a TCgen05 contraction DAG"
+                )
         if self.supports_config_key("num_stages"):
             config.setdefault("num_stages", self._default_num_stages())
         if self.supports_config_key("load_eviction_policies"):
@@ -4025,6 +4041,9 @@ class ConfigSpec:
                         fields[CUTE_CHAINED_POINTWISE_UNROLL_KEY] = EnumFragment(
                             choices=VALID_CUTE_CHAINED_POINTWISE_UNROLLS
                         )
+                    fields[CUTE_CHAINED_AUXILIARY_CACHE_KEY] = EnumFragment(
+                        choices=(False, True)
+                    )
                 fields.update(self.user_defined_tunables)
                 return fields
             if self.cute_tcgen05_search_enabled:

@@ -15,6 +15,7 @@ if __name__ == "__main__":
 
 import ast
 import inspect
+import itertools
 import linecache
 import math
 import operator
@@ -1371,6 +1372,45 @@ def _without_early_release_seed(
 ) -> list[helion.Config]:
     # Release siblings are introduced with the TMEM-lifetime feature.
     return seeds
+
+
+@pytest.mark.usefixtures("_cpu_support")
+def test_pointwise_seeds_and_config_roundtrip() -> None:
+    spec = _tcgen_config_bound().config_spec
+    seeds = [
+        seed
+        for seed in _without_early_release_seed(spec.compiler_seed_configs, spec)
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+    ]
+    assert {seed.config["cute_chained_pointwise_vectorize"] for seed in seeds} == {
+        False,
+        True,
+    }
+    assert len(seeds) == 16
+    assert {
+        (
+            tuple(seed.block_sizes),
+            seed.config["cute_chained_pointwise_vectorize"],
+            seed.config["cute_chained_auxiliary_cache"],
+        )
+        for seed in seeds
+    } == {
+        ((128, n), vector, cache)
+        for n, vector, cache in itertools.product(
+            (32, 64, 128, 256), (False, True), (False, True)
+        )
+    }
+    assert {seed.config["cute_chained_auxiliary_cache"] for seed in seeds} == {
+        False,
+        True,
+    }
+    for seed in seeds:
+        normalized = spec.normalized_config(seed)
+        for key, default in (
+            ("cute_chained_pointwise_vectorize", False),
+            ("cute_chained_auxiliary_cache", False),
+        ):
+            assert normalized.config[key] == seed.config.get(key, default)
 
 
 @pytest.mark.usefixtures("_cpu_support")

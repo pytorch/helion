@@ -3175,8 +3175,10 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                         pid_type="flat",
                         cute_chained_mma_schedule="tcgen05_tmem",
                         cute_chained_pointwise_vectorize=vectorize,
+                        cute_chained_auxiliary_cache=auxiliary_cache,
                     )
                     for vectorize in (False, True)
+                    for auxiliary_cache in (False, True)
                 )
         return dedupe_configs(seeds)
 

@@ -19,6 +19,9 @@ import torch
 
 from ..compile_environment import CompileEnvironment
 from . import chained_matmul as chain
+from .chained_aux_cache import make_early_auxiliary_cache
+from .chained_aux_cache import make_late_auxiliary_cache
+from .chained_aux_cache import uses_early_cache
 from .chained_pointwise_unroll import PointwiseUnroll
 from .chained_scan_export import codegen_scan_exports
 from .fx_matcher import _GeneratedCodeTemplate
@@ -303,7 +306,7 @@ def _pointwise_stage(
     leaves = [
         leaf
         for node, coordinates, indices, loaded in probe.loaded_inputs
-        if True
+        if not uses_early_cache(probe, loaded)
         if (
             leaf := _vector_leaf(
                 probe, node, coordinates, indices, (height, width), names
@@ -759,6 +762,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         )
         output_shape = plan.shapes[-1][:2]
         prefetch_b = _prefetch_final_b(plan)
+        output_storage = "chain_b_workspace" if prefetch_b else "chain_output_ptr"
         final_stage = len(plan.dots) - 1
         lines.extend(
             [
@@ -817,6 +821,21 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         if early_scan:
             lines.extend(scan_lines)
         early_cached: list[chain._ScanInput] = []
+        if df.config.config.get("cute_chained_auxiliary_cache"):
+            device = cast("Node", plan.dots[0].args[0]).meta["val"].device
+            cache_plan = plan
+            cache_lines, early_cached = make_early_auxiliary_cache(
+                cg,
+                plan,
+                scans,
+                CuteTcgen05Config.per_cta_smem_capacity_bytes(device)
+                - max(
+                    _shared_memory_bytes(plan),
+                    _shared_memory_bytes(cache_plan),
+                ),
+            )
+            lines.extend(cache_lines)
+            scans = [*scans, *early_cached]
         # Initiate the first independent operand copies before the scan prelude.
         staged: list[chain._StagedInput] = []
         for stage, (node, (m, n, k)) in enumerate(
@@ -886,6 +905,25 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                 )
                 lines.append("chain_allocator.relinquish_alloc_permit()")
             if stage in bridges:
+                if (
+                    stage == final_stage
+                    and output_storage != "chain_a_workspace"
+                    and df.config.config.get("cute_chained_auxiliary_cache")
+                ):
+                    # The previous MMA has completed and all threads passed
+                    # the barrier above. Final A is TMEM, so no later SMEM-A
+                    # consumer can observe this arena. Output is disjoint.
+                    cache_lines, cached = make_late_auxiliary_cache(
+                        cg,
+                        plan,
+                        scans,
+                        arena="chain_a_workspace",
+                        arena_bytes=2
+                        * max(rows * reduction for rows, _, reduction in plan.shapes),
+                    )
+                    lines.extend(cache_lines)
+                    # Publish only after the emitted cache-fill barrier.
+                    scans = [*scans, *cached]
                 lines.extend(_bridge(cg, plan, boundaries, scans, stage, dtype))
             offset = max_columns if stage in bridges else 0
             lines.extend(

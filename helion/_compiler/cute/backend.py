@@ -1147,6 +1147,7 @@ class CuteBackend(Backend):
             or key == "cute_chained_pointwise_unroll"
             or key == "cute_loop_vectorize"
             or key == "cute_loop_load_schedule"
+            or key == "cute_chained_auxiliary_cache"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
             or key.startswith(("tcgen05_", "cute_flash_", "cute_async_load_"))
