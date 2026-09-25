@@ -93,6 +93,8 @@ class TestTritonLauncher(unittest.TestCase):
         # Ordinary runtime extents may vary without changing the compiled
         # schedule specialization.
         self.assertEqual(first, fingerprint(torch.empty(11), 19, 64))
+        unaligned = torch.empty(12)[1:]
+        self.assertNotEqual(first, fingerprint(unaligned, 19, 64))
         # A constexpr schedule parameter must select a different fingerprint.
         self.assertNotEqual(first, fingerprint(torch.empty(11), 19, 128))
         different_helper = SimpleNamespace(

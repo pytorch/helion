@@ -831,7 +831,6 @@ class _SymmetricPeerCaptureMode(TorchDispatchMode):
         args: tuple[object, ...] = (),
         kwargs: dict[str, object] | None = None,
     ) -> object:
-        del types
         kwargs = kwargs or {}
         result = func(*args, **kwargs)  # type: ignore[operator]
         packet = getattr(torch.ops.symm_mem, "get_remote_tensors", None)

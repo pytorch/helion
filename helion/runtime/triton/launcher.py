@@ -339,17 +339,26 @@ def _distributed_launch_fingerprint(
         param = params[index] if index < len(params) else None
         if getattr(param, "is_constexpr", False):
             return ("constexpr", type(arg).__qualname__, repr(arg))
+        specialize = not getattr(param, "do_not_specialize", False)
+        specialize_alignment = specialize and not getattr(
+            param, "do_not_specialize_on_alignment", False
+        )
         if isinstance(arg, torch.Tensor):
             return (
                 "pointer",
                 str(arg.dtype),
                 arg.device.type,
+                arg.data_ptr() % 16 == 0 if specialize_alignment else None,
             )
         if isinstance(arg, int) and not isinstance(arg, bool):
             # Triton's runtime specialization distinguishes one-valued and
             # 16-byte-divisible integers; preserve those classes without
             # freezing ordinary dynamic shape values into this fingerprint.
-            return ("runtime_int", arg == 1, arg % 16 == 0)
+            return (
+                "runtime_int",
+                arg == 1 if specialize else None,
+                arg % 16 == 0 if specialize_alignment else None,
+            )
         return ("runtime", type(arg).__module__, type(arg).__qualname__)
 
     payload = (
