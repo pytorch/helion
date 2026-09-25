@@ -372,14 +372,23 @@ TCGEN05_AB_CONSUMER_PHASE_MODES = (
 TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY = "tcgen05_sched_consumer_wait_mode"
 TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL = "normal"
 # Diagnostic-only scheduler-broadcast wait topology. Lane 0 waits on the
-# sched-pipeline full barrier, then the warp reconverges before all lanes fence
-# and read the SMEM mailbox. B200 profiling measured this slower than the
-# normal whole-warp wait path; keep it opt-in for scheduler-wait experiments.
+# sched-pipeline full barrier, snapshots the SMEM mailbox with volatile loads,
+# and broadcasts the values to the warp. B200 profiling measured this slower
+# than the normal whole-warp wait path; keep it opt-in for scheduler-wait
+# experiments.
 TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER = "warp_leader"
 TCGEN05_SCHED_CONSUMER_WAIT_MODES = (
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
     TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER,
 )
+
+
+def tcgen05_sched_consumer_arrivals_per_warp(wait_mode: str) -> int:
+    """Return the scheduler empty-barrier arrivals made by one consumer warp."""
+    assert wait_mode in TCGEN05_SCHED_CONSUMER_WAIT_MODES
+    return 1 if wait_mode == TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER else 32
+
+
 TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY = "tcgen05_sched_stage_count"
 TCGEN05_SCHED_STAGE_COUNTS = (1, 2)
 TCGEN05_CUBIN_LINEINFO_CONFIG_KEY = "tcgen05_cubin_lineinfo"
