@@ -975,6 +975,17 @@ class TestSymmetricRankProvenance(unittest.TestCase):
         self.assertEqual(state.tensor_origin(merged.fake_value), origin)
         self.assertFalse(state.unresolved_symmetric_peer_provenance)
 
+    def test_tensor_alias_origin_distinguishes_dtype(self) -> None:
+        state = CompilerState()
+        storage = torch.empty(16, dtype=torch.uint8)
+        byte_view = torch.as_strided(storage, (4,), (1,))
+        word_view = torch.as_strided(storage.view(torch.uint16), (4,), (1,))
+        origin = NameOrigin("byte_view")
+        state.tensor_alias_origins[state._tensor_layout_key(byte_view)] = origin
+
+        self.assertIs(state.tensor_origin(byte_view), origin)
+        self.assertIsNone(state.tensor_origin(word_view))
+
     def test_tensor_merge_rejects_conflicting_owners(self) -> None:
         state = CompilerState()
         allocation = torch.empty(8)

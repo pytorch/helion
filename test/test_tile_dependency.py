@@ -703,6 +703,29 @@ class TestTileDependency(TestCase):
             tuple((edge.producer_root, edge.consumer_root) for edge in graph.edges),
             ((0, 1),),
         )
+        dependency = graph.edges[0].access_dependencies[0]
+        self.assertIsNotNone(dependency.rank_relation)
+        self.assertTrue(graph.has_cross_rank_dependencies())
+        self.assertEqual(copy.deepcopy(dependency), dependency)
+        self.assertEqual(pickle.loads(pickle.dumps(dependency)), dependency)
+
+        roots, sites = _configured_domains(
+            graph,
+            {10: (2, 64), 20: (2, 64)},
+        )
+        with mock.patch(
+            "helion._compiler.tile_dependency.tile_access_rank_relation",
+            side_effect=AssertionError("rank relation was recomputed"),
+        ):
+            relations = instantiate_symbolic_dependencies(
+                graph,
+                root_domains=roots,
+                site_domains=sites,
+            )
+        self.assertTrue(relations)
+        self.assertTrue(
+            all(relation.rank_relation is not None for relation in relations)
+        )
 
     def test_unresolved_allocation_is_rejected(self) -> None:
         with self.assertRaisesRegex(
@@ -3010,7 +3033,10 @@ class TestTileDependency(TestCase):
                 ),
             ),
         )
-        result = KeyPartition.from_fixed_width_publication(publication)
+        self.assertIsNone(KeyPartition.from_fixed_width_publication(publication))
+        result = KeyPartition.from_fixed_width_publication(
+            publication, allow_clipped_final_block=True
+        )
         assert result is not None
         partition, incidence = result
         self.assertEqual(
@@ -3021,6 +3047,26 @@ class TestTileDependency(TestCase):
         self.assertEqual(
             _materialize(incidence.count_by_key),
             tuple(frozenset((1,)) for _ in range(5)),
+        )
+
+    def test_fixed_width_partition_rejects_more_than_one_clipped_block(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 6),), identity=0)
+        fine = CoordinateDomain((20,), ((20, 17),), kind="event", identity=7)
+        task = coordinate_axis_symbol(10)
+        publication = CoordinateRelation(
+            producer,
+            fine,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 6, 1),), ((20, 4 * task, 4 * task + 4, 1),)
+                ),
+            ),
+        )
+
+        self.assertIsNone(
+            KeyPartition.from_fixed_width_publication(
+                publication, allow_clipped_final_block=True
+            )
         )
 
     def test_fixed_width_quotient_clips_final_fiber(self) -> None:
@@ -3037,7 +3083,10 @@ class TestTileDependency(TestCase):
                 ),
             ),
         )
-        result = KeyPartition.from_fixed_width_publication(publication)
+        self.assertIsNone(KeyPartition.from_fixed_width_publication(publication))
+        result = KeyPartition.from_fixed_width_publication(
+            publication, allow_clipped_final_block=True
+        )
         assert result is not None
         partition, incidence = result
         self.assertEqual(partition.fine_key_count_by_coarse_key.value_bounds(), (1, 1))
@@ -3062,7 +3111,10 @@ class TestTileDependency(TestCase):
                 ),
             ),
         )
-        result = KeyPartition.from_fixed_width_publication(publication)
+        self.assertIsNone(KeyPartition.from_fixed_width_publication(publication))
+        result = KeyPartition.from_fixed_width_publication(
+            publication, allow_clipped_final_block=True
+        )
         assert result is not None
         partition, incidence = result
         self.assertEqual(partition.fine_key_count_by_coarse_key.value_bounds(), (1, 1))

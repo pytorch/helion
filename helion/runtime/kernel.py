@@ -2534,9 +2534,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         requested_config = self._normalize_config(config)
         config = self._normalized_config_copy(requested_config)
         dist_check_config_consistancy(
-            config,
-            process_group_name=self._env.process_group_name,
-            force=self._env.process_group_name is not None,
+            config, process_group_name=self._env.process_group_name
         )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv

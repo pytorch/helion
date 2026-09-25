@@ -1628,11 +1628,7 @@ class DeviceIRAnalysis:
         from .tile_dependency import owner_roots_by_graph_id
 
         compiler_state = host.compiler_state
-        if (
-            len(device_ir.root_ids) <= 1
-            and not compiler_state.symmetric_rank_placements
-            and not compiler_state.unresolved_symmetric_peer_provenance
-        ):
+        if len(device_ir.root_ids) <= 1:
             return ()
 
         graph_owners = owner_roots_by_graph_id(device_ir)
@@ -1665,7 +1661,9 @@ class DeviceIRAnalysis:
                     continue
 
                 fake = _accessed_tensor_fake(node)
-                origin = host.tensor_to_origin.get(fake) if fake is not None else None
+                origin = (
+                    compiler_state.tensor_origin(fake) if fake is not None else None
+                )
                 storage_key = fake.untyped_storage() if fake is not None else None
                 symmetric_placement = (
                     symmetric_placements.get(storage_key)

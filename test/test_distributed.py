@@ -24,7 +24,6 @@ from torch.testing._internal.common_utils import run_tests
 
 import helion
 from helion._dist_utils import all_gather_object
-from helion._dist_utils import check_config_consistancy
 from helion._dist_utils import kernel_uses_symm_mem
 from helion._dist_utils import sync_object
 from helion._dist_utils import sync_seed
@@ -137,18 +136,6 @@ def pipelined_allreduce_kernel(
     return out
 
 
-def unsafe_single_root_peer_write(
-    source: torch.Tensor,
-    symmetric: torch.Tensor,
-    group_name: hl.ProcessGroupName,
-) -> torch.Tensor:
-    """Every rank writing rank zero has no same-root happens-before order."""
-    peer_zero = _remote_tensor_views(symmetric, group_name)[0]
-    for tile in hl.tile(source.size(0)):
-        peer_zero[tile] = source[tile]
-    return symmetric
-
-
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -173,25 +160,6 @@ profile = AutotuneEffortProfile(
 )
 
 
-class TestDistributedConfigAgreement(unittest.TestCase):
-    def test_mismatch_raises_on_nonzero_rank(self) -> None:
-        config = helion.Config(block_sizes=[])
-
-        def gather(output, _config, *, group):
-            output[:] = [config, helion.Config(block_sizes=[1])]
-
-        with (
-            patch.dict(os.environ, {"HELION_DIST_CHECK_CONFIG_CONSISTANCY": "1"}),
-            patch("helion._dist_utils.dist.is_initialized", return_value=True),
-            patch("helion._dist_utils._resolve_process_group", return_value="group"),
-            patch("helion._dist_utils.dist.get_world_size", return_value=2),
-            patch("helion._dist_utils.dist.get_rank", return_value=1),
-            patch("helion._dist_utils.dist.all_gather_object", side_effect=gather),
-            self.assertRaises(helion.exc.InconsistantConfigsAcrossRanks),
-        ):
-            check_config_consistancy(config, process_group_name="group")
-
-
 @onlyBackends(["triton"])
 @instantiate_parametrized_tests
 class TestDistributed(TestCase, MultiProcessTestCase):
@@ -206,10 +174,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                     "HELION_DIST_CHECK_CONFIG_CONSISTANCY": "1",
                     "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
                     "HELION_CAP_REBENCHMARK_REPEAT": "50",
-                    "NCCL_NVLS_ENABLE": "0",
-                    "NVSHMEM_DISABLE_CUDA_VMM": "1",
-                    "NVSHMEM_DISABLE_NVLS": "1",
-                    "NVSHMEM_SYMMETRIC_SIZE": "1G",
                 },
             )
         )
@@ -380,6 +344,17 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     )
     def test_pipelined_allreduce_replays(self) -> None:
         """Compiler-derived cross-rank readiness survives eager and graph replay."""
+        readiness_env = patch.dict(
+            os.environ,
+            {
+                "NCCL_NVLS_ENABLE": "0",
+                "NVSHMEM_DISABLE_CUDA_VMM": "1",
+                "NVSHMEM_DISABLE_NVLS": "1",
+                "NVSHMEM_SYMMETRIC_SIZE": "1G",
+            },
+        )
+        readiness_env.start()
+        self.addCleanup(readiness_env.stop)
         self._init_process()
         symm_mem.set_backend("NVSHMEM")
         group = dist.group.WORLD
@@ -423,6 +398,23 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         code = kernel.bind((source, symmetric, group_name)).to_triton_code()
         self.assertIn("ld.acquire.sys.global.u64", code)
+        self.assertIn("_distributed_readiness_world_size=4", code)
+        self.assertNotIn("tile_dependency_distributed_reuse_wait", code)
+        self.assertNotIn("tile_dependency_distributed_consumed", code)
+        self.assertNotIn("tile_dependency_distributed_drain_key", code)
+        self.assertEqual(
+            code.count(
+                "tile_dependency_distributed_completion_previous = tl.atomic_add"
+            ),
+            1,
+        )
+        self.assertEqual(code.count("tile_dependency_distributed_complete_peers ="), 1)
+        self.assertEqual(code.count("tile_dependency_distributed_terminal_drain ="), 2)
+        packet_count = (source.numel() + 255) // 256 + (source.numel() + 1023) // 1024
+        self.assertRegex(
+            code,
+            rf"tile_dependency_dispatch_ticket(?:_\d+)? == {packet_count - 1}",
+        )
 
         expected = source.clone()
         dist.all_reduce(expected)
@@ -437,6 +429,9 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         if self.rank == 0:
             time.sleep(0.05)
         actual = kernel(source, symmetric, group_name)
+        # Kernel completion is also a payload-lifetime boundary: a producer may
+        # reuse its local symmetric storage as soon as its launch returns.
+        symmetric.fill_(-1234)
         torch.cuda.synchronize()
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -471,37 +466,6 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
-        self._cleanup_process()
-
-    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
-    @skip_if_lt_x_gpu(4)
-    @unittest.skipUnless(
-        torch.version.cuda is not None,
-        "compiler-derived distributed readiness requires NVIDIA CUDA",
-    )
-    def test_single_root_peer_write_is_rejected(self) -> None:
-        self._init_process()
-        symm_mem.set_backend("NVSHMEM")
-        group = dist.group.WORLD
-        assert group is not None
-        source = torch.arange(256, device=self.device, dtype=torch.float32)
-        symmetric = symm_mem.empty(
-            source.shape,
-            dtype=source.dtype,
-            device=self.device,
-        )
-        symm_mem.rendezvous(symmetric, group=group.group_name)
-        kernel = helion.kernel(
-            config=helion.Config(block_sizes=[64]),
-            static_shapes=True,
-            ignore_warnings=[helion.exc.TensorOperationInWrapper],
-        )(unsafe_single_root_peer_write)
-
-        with self.assertRaisesRegex(
-            helion.exc.CrossLoopSchedulingError,
-            "unordered cross-rank store/store hazard",
-        ):
-            kernel.bind((source, symmetric, group.group_name))
         self._cleanup_process()
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")

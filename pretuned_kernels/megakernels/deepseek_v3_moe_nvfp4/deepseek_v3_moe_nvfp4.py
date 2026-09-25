@@ -28,7 +28,6 @@ import helion.language as hl
 
 FP4_MAX = 6.0
 MMA_N = 16
-W13_SPLIT_K = 7
 ROUTED_SCALE = 2.5
 OUTPUT_NAMES = (
     "output",
@@ -107,7 +106,6 @@ def deepseek_v3_moe_nvfp4(
     num_groups: int,
     topk_groups: int,
     routed_scale: float,
-    w13_split_k: int,
 ):
     # The model geometry and layouts are part of this pretuned kernel's fixed
     # contract. Tensor contents, including routing decisions, remain runtime
@@ -202,7 +200,6 @@ def deepseek_v3_moe_nvfp4(
     w2_scale_bytes = w2_scale
     topk_batch, topk_num_experts = logits.size()
     top_k = hl.specialize(top_k)
-    w13_split_k = hl.specialize(w13_split_k)
     num_groups = hl.specialize(num_groups)
     topk_groups = hl.specialize(topk_groups)
     assert top_k == 8 and topk_groups == 4
@@ -218,8 +215,6 @@ def deepseek_v3_moe_nvfp4(
     intermediate = twice_intermediate // 2
     hidden_groups = packed_hidden // 8
     activation_groups = intermediate // 16
-    assert hidden_groups % w13_split_k == 0
-    w13_groups_per_split = hidden_groups // w13_split_k
     assert tokens == 1 and packed_hidden == weight_packed_hidden
     hl.specialize(experts)
     hl.specialize(intermediate)
@@ -230,15 +225,10 @@ def deepseek_v3_moe_nvfp4(
         (top_k, activation_groups), dtype=torch.float8_e4m3fn, device=hidden_q.device
     )
     activation_q_groups = activation_q.view(top_k, activation_groups, 8)
-    w13_partial = torch.empty(
-        (top_k, activation_groups // 4, w13_split_k, 128),
-        dtype=torch.float32,
-        device=hidden_q.device,
-    )
     w13_tma = w13.view(experts * (twice_intermediate // 128), 128, packed_hidden)
     flat_w13_scale = w13_scale_bytes.view(experts * twice_intermediate, hidden_groups)
     w13_output_groups = hl.register_block_size(4, 4)
-    w13_block_groups = hl.register_block_size(16, 32)
+    w13_block_groups = hl.register_block_size(32, 32)
     w2_top_k, packed_intermediate = activation_q.size()
     w2_experts, hidden, weight_packed_intermediate = w2.size()
     w2_groups = packed_intermediate // 8
@@ -263,7 +253,7 @@ def deepseek_v3_moe_nvfp4(
     flat_shared_w2 = shared_w2.view(hidden, packed_intermediate)
     flat_shared_w2_scale = shared_w2_scale.view(hidden, w2_groups)
     w2_block_row = hl.register_block_size(128, 256)
-    w2_block_groups = hl.register_block_size(16, 32)
+    w2_block_groups = hl.register_block_size(32, 32)
     output = torch.empty((1, hidden), dtype=torch.bfloat16, device=w2.device)
     shared_w13_preactivation = torch.empty(
         (twice_intermediate,), dtype=torch.bfloat16, device=w13.device
@@ -280,11 +270,11 @@ def deepseek_v3_moe_nvfp4(
     shared_expert_output = torch.empty(
         (1, hidden), dtype=torch.bfloat16, device=w2.device
     )
-    shared_scalar_w13_row = hl.register_block_size(8, 32)
-    shared_scalar_w13_group = hl.register_block_size(16, 64)
-    shared_scalar_activation_group = hl.register_block_size(16, 64)
-    shared_scalar_w2_row = hl.register_block_size(8, 32)
-    shared_scalar_w2_group = hl.register_block_size(16, 64)
+    shared_scalar_w13_row = hl.register_block_size(16, 16)
+    shared_scalar_w13_group = hl.register_block_size(64, 64)
+    shared_scalar_activation_group = hl.register_block_size(32, 32)
+    shared_scalar_w2_row = hl.register_block_size(16, 16)
+    shared_scalar_w2_group = hl.register_block_size(64, 64)
     for tile_row, tile_expert in hl.tile(
         [rows, experts], block_size=[1, router_expert_block]
     ):
@@ -604,11 +594,11 @@ def deepseek_v3_moe_nvfp4(
         topk_ids[:, 5] = topk_id_5
         topk_ids[:, 6] = topk_id_6
         topk_ids[:, 7] = topk_id_7
-    for w13_tile_slot, w13_tile_output_group, w13_tile_split in hl.tile(
-        [top_k, activation_groups, w13_split_k],
-        block_size=[1, w13_output_groups, 1],
+    for w13_tile_slot, w13_tile_output_group in hl.tile(
+        [top_k, activation_groups], block_size=[1, w13_output_groups]
     ):
-        w13_expert = topk_ids[0, w13_tile_slot.begin]
+        w13_slot = w13_tile_slot.begin
+        w13_expert = topk_ids[0, w13_slot]
         w13_expert_address = w13_expert.to(torch.int64)
         w13_tma_row = (
             w13_expert * (twice_intermediate // 128) + w13_tile_output_group.begin // 4
@@ -620,25 +610,17 @@ def deepseek_v3_moe_nvfp4(
             w13_expert_address * twice_intermediate + w13_physical_row_index
         )
         w13_accumulator = hl.zeros([128, MMA_N], dtype=torch.float32)
-        for w13_local_group in hl.tile(
-            w13_groups_per_split, block_size=w13_block_groups
-        ):
-            w13_group_begin = (
-                w13_tile_split.begin * w13_groups_per_split + w13_local_group.begin
-            )
-            w13_group_index = (
-                w13_tile_split.begin * w13_groups_per_split + w13_local_group.index
-            )
+        for w13_tile_group in hl.tile(hidden_groups, block_size=w13_block_groups):
             w13_packed_index = (
-                w13_group_begin * 8 + hl.arange(w13_block_groups * 8)
+                w13_tile_group.begin * 8 + hl.arange(w13_block_groups * 8)
             ).to(torch.int64)
             w13_lhs = w13_tma[w13_tma_row, :, w13_packed_index]
             w13_lhs_scale = flat_w13_scale[
-                w13_weight_row[:, None], w13_group_index[None, :]
+                w13_weight_row[:, None], w13_tile_group.index[None, :]
             ]
             w13_hidden_bytes = hidden_q[0, w13_packed_index]
             w13_rhs = w13_hidden_bytes[:, None].expand(w13_hidden_bytes.size(0), MMA_N)
-            w13_hidden_scale = hidden_scale_bytes[0, w13_group_index]
+            w13_hidden_scale = hidden_scale_bytes[0, w13_tile_group]
             w13_rhs_scale = w13_hidden_scale[None, :].expand(MMA_N, w13_block_groups)
             w13_accumulator = hl.dot_scaled(
                 w13_lhs,
@@ -650,24 +632,7 @@ def deepseek_v3_moe_nvfp4(
                 acc=w13_accumulator,
                 out_dtype=torch.float32,
             )
-        w13_partial[
-            w13_tile_slot.begin,
-            w13_tile_output_group.begin // 4,
-            w13_tile_split.begin,
-            :,
-        ] = _first_mma_column(w13_accumulator)
-    for w13_tile_slot, w13_tile_output_group in hl.tile(
-        [top_k, activation_groups], block_size=[1, 4]
-    ):
-        w13_merge_slot = w13_tile_slot.begin
-        w13_expert = topk_ids[0, w13_merge_slot]
-        w13_partial_sum = w13_partial[
-            w13_merge_slot,
-            w13_tile_output_group.begin // 4,
-            :,
-            hl.arange(128),
-        ].sum(dim=0)
-        w13_preactivation = w13_partial_sum.reshape(64, 2)
+        w13_preactivation = _first_mma_column(w13_accumulator).reshape(64, 2)
         w13_pair = hl.arange(2)
         w13_gate = torch.sum(w13_preactivation * (w13_pair[None, :] == 0), dim=-1)
         w13_up = torch.sum(w13_preactivation * (w13_pair[None, :] == 1), dim=-1)
@@ -689,10 +654,10 @@ def deepseek_v3_moe_nvfp4(
         w13_nibbles = _fp4_nibble(w13_scaled)
         w13_low, w13_high = hl.split(w13_nibbles.reshape(4, 8, 2))
         w13_packed = w13_low | w13_high << 4
-        activation_q_groups[w13_merge_slot, w13_tile_output_group, :] = (
-            w13_packed.reshape(4, 8).to(torch.uint8)
-        )
-        activation_scale[w13_merge_slot, w13_tile_output_group] = w13_block_scale
+        activation_q_groups[w13_slot, w13_tile_output_group, :] = w13_packed.reshape(
+            4, 8
+        ).to(torch.uint8)
+        activation_scale[w13_slot, w13_tile_output_group] = w13_block_scale
     for shared_activation_tile_group in hl.tile(
         activation_groups, block_size=shared_scalar_activation_group
     ):
@@ -1048,11 +1013,7 @@ def _allocate(shape: Shape, seed: int = 17) -> dict[str, torch.Tensor]:
     return tensors
 
 
-def _kernel_args(
-    tensors: dict[str, torch.Tensor],
-    shape: Shape,
-    w13_split_k: int = W13_SPLIT_K,
-) -> tuple:
+def _kernel_args(tensors: dict[str, torch.Tensor], shape: Shape) -> tuple:
     return (
         tensors["hidden"],
         tensors["router_weight"],
@@ -1075,7 +1036,6 @@ def _kernel_args(
         shape.num_groups,
         shape.topk_groups,
         shape.routed_scale,
-        w13_split_k,
     )
 
 

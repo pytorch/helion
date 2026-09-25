@@ -158,6 +158,7 @@ class CompilerState:
 
         return (
             tensor.untyped_storage(),
+            tensor.dtype,
             tuple(map(hashable, tensor.shape)),
             tuple(map(hashable, tensor.stride())),
             hashable(tensor.storage_offset()),
@@ -170,12 +171,14 @@ class CompilerState:
     ) -> None:
         """Propagate exact host identity and symmetric-rank ownership."""
         output_layout = (
+            output.dtype,
             tuple(output.shape),
             tuple(output.stride()),
             output.storage_offset(),
         )
         layout_matches = all(
             (
+                tensor.dtype,
                 tuple(tensor.shape),
                 tuple(tensor.stride()),
                 tensor.storage_offset(),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import functools
 import re
@@ -965,10 +966,15 @@ class CallableType(LiteralType):
             ):
                 raise exc.ConfigSpecFragmentWithSymInt(args)
 
+        peer_capture = (
+            _SymmetricPeerCaptureMode()
+            if CompileEnvironment.current().process_group_name is not None
+            else contextlib.nullcontext()
+        )
         try:
             with (
                 patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
-                _SymmetricPeerCaptureMode(),
+                peer_capture,
             ):
                 result = _CheckForIndexCalls.retry_call(
                     self.value, proxy_args, proxy_kwargs

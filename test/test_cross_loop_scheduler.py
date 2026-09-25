@@ -795,6 +795,80 @@ class TestCrossLoopScheduler(TestCase):
             (),
         )
 
+    def test_distributed_counter_protocol_requires_static_relations(self) -> None:
+        producer_domain = _domain((10, 10, 1), identity=0)
+        consumer_domain = _domain((20, 3, 1), identity=1)
+        keys = CoordinateDomain.scalar(3, kind="event", identity=0)
+        producer = _producer(
+            0,
+            _point_pairs(
+                keys,
+                producer_domain,
+                tuple((index // 4, index) for index in range(10)),
+            ),
+        )
+        consumer = _consumer(
+            1,
+            _full_point_map(
+                consumer_domain,
+                keys,
+                coordinate_axis_symbol(consumer_domain.axis_order[0]),
+            ),
+        )
+        ranks = CoordinateDomain.scalar(4, kind="value")
+        consumer = dataclasses.replace(
+            consumer,
+            rank_relation=CoordinateRelation.total(ranks, ranks),
+        )
+        plan = ReadinessCounterPlan((producer,), (consumer,))
+        self.assertTrue(
+            cross_loop_scheduler._distributed_counter_protocol_is_static(plan)
+        )
+
+        runtime_value = sympy.Symbol(
+            "runtime_protocol_value", integer=True, nonnegative=True
+        )
+        producer_axis = coordinate_axis_symbol(producer_domain.axis_order[0])
+        dynamic_keys = _full_point_map(
+            producer_domain,
+            keys,
+            sympy.Mod(producer_axis + runtime_value, 3),
+        )
+        dynamic_producer = dataclasses.replace(
+            producer,
+            incidence=Incidence._from_constructed(
+                producer.incidence.items_by_key,
+                keys_by_item=dynamic_keys,
+                count_by_key=producer.incidence.count_by_key,
+            ),
+        )
+        self.assertFalse(
+            cross_loop_scheduler._distributed_counter_protocol_is_static(
+                dataclasses.replace(plan, producers=(dynamic_producer,))
+            )
+        )
+
+        count_domain = CoordinateDomain.scalar(9, axis=40, kind="value")
+        key_axis = coordinate_axis_symbol(keys.axis_order[0])
+        dynamic_count = _full_point_map(
+            keys,
+            count_domain,
+            sympy.Mod(key_axis + runtime_value, 8) + 1,
+        )
+        dynamic_producer = dataclasses.replace(
+            producer,
+            incidence=Incidence._from_constructed(
+                producer.incidence.items_by_key,
+                keys_by_item=producer.incidence.keys_by_item,
+                count_by_key=dynamic_count,
+            ),
+        )
+        self.assertFalse(
+            cross_loop_scheduler._distributed_counter_protocol_is_static(
+                dataclasses.replace(plan, producers=(dynamic_producer,))
+            )
+        )
+
     def test_final_arrival_continuation_rejects_cross_key_worker_strands(self) -> None:
         roots = (
             _domain((10, 8, 1), identity=0),
@@ -984,7 +1058,7 @@ class TestCrossLoopScheduler(TestCase):
         self.assertEqual(count_by_key.value_bounds(), (2, 3))
         _plan(roots, 4, counters=(counter,))
 
-    def test_consumer_partition_derives_clipped_tail_counter(self) -> None:
+    def test_distributed_consumer_partition_derives_clipped_tail_counter(self) -> None:
         roots = (
             _domain((10, 17, 256), identity=0),
             _domain((20, 5, 1024), identity=1),
@@ -1030,6 +1104,11 @@ class TestCrossLoopScheduler(TestCase):
                 ),
             ),
             obligations=frozenset(((0, None, None),)),
+        )
+        ranks = CoordinateDomain.scalar(4, kind="value")
+        consumer = dataclasses.replace(
+            consumer,
+            rank_relation=CoordinateRelation.total(ranks, ranks),
         )
         (counter,) = choose_readiness_counters(
             ReadinessGraph(roots, (ReadinessEvent((producer,), (consumer,)),)),

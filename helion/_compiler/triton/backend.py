@@ -584,8 +584,13 @@ class TritonBackend(Backend):
             )
         if device_fn.triton_distributed_readiness_signal_slots:
             device_anchor = device_fn.triton_distributed_readiness_device_anchor
+            world_size = device_fn.triton_distributed_readiness_world_size
             process_group_name = CompileEnvironment.current().process_group_name
-            if device_anchor is None or process_group_name is None:
+            if (
+                device_anchor is None
+                or world_size is None
+                or process_group_name is None
+            ):
                 raise exc.BackendUnsupported(
                     "triton",
                     "distributed readiness requires a device anchor and active "
@@ -598,6 +603,7 @@ class TritonBackend(Backend):
                         "_distributed_readiness_signal_slots="
                         f"{device_fn.triton_distributed_readiness_signal_slots}"
                     ),
+                    f"_distributed_readiness_world_size={world_size}",
                     f"_distributed_readiness_process_group_name={process_group_name!r}",
                 ]
             )

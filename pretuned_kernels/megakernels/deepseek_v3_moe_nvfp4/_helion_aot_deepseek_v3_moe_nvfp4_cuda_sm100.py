@@ -9,18 +9,18 @@ import torch
 
 CONFIG = {
     "atomic_indexing": [],
-    "block_sizes": [8, 512, 32, 4, 32, 256, 16, 16, 64, 32, 16, 32, 32],
+    "block_sizes": [8, 512, 32, 4, 32, 256, 32, 16, 64, 32, 16, 64, 32],
     "cross_loop_pipeline": "dynamic",
     "host_tensor_descriptors": True,
     "indexing": [
-        "tensor_descriptor" if index in (39, 56, 58) else "pointer"
-        for index in range(74)
+        "tensor_descriptor" if index in (39, 41, 53, 55) else "pointer"
+        for index in range(71)
     ],
-    "l2_groupings": [1, 1, 1, 1, 4],
-    "load_eviction_policies": [""] * 46,
-    "loop_orders": [[0, 1], [0, 1], [0, 1, 2], [0, 1], [1, 0]],
+    "l2_groupings": [1, 1, 1, 4],
+    "load_eviction_policies": [""] * 44,
+    "loop_orders": [[0, 1], [0, 1], [1, 0], [1, 0]],
     "maxnreg": None,
-    "num_sm_multiplier": 1,
+    "num_sm_multiplier": 2,
     "num_stages": 1,
     "num_warps": 4,
     "pid_type": "persistent_blocked",
@@ -30,7 +30,6 @@ CONFIG = {
         None,
         None,
         False,
-        None,
         None,
         None,
         False,
@@ -49,7 +48,6 @@ CONFIG = {
         True,
         None,
         None,
-        False,
         True,
         None,
         None,
@@ -58,15 +56,14 @@ CONFIG = {
         True,
         None,
     ],
-    "range_num_stages": [0, 4, 0, 0, 2, 0, 0, 2, 0, 0, 0, 2, 0, 1, 0],
-    "range_unroll_factors": [0] * 15,
+    "range_num_stages": [0, 4, 0, 0, 2, 0, 0, 3, 0, 0, 2, 0, 1, 0],
+    "range_unroll_factors": [0] * 14,
     "range_warp_specializes": [
         None,
         None,
         None,
         None,
         False,
-        None,
         None,
         None,
         False,
@@ -99,7 +96,7 @@ _TENSOR_SIGNATURES = (
     ((1,), torch.float32),
     ((1,), torch.float32),
 )
-_STATIC_ARGS = (8, 8, 4, 2.5, 7)
+_STATIC_ARGS = (8, 8, 4, 2.5)
 
 
 def key_deepseek_v3_moe_nvfp4(*args) -> int:

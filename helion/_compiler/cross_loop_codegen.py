@@ -36,7 +36,6 @@ from .tile_dependency import DenseTaskOrder
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_coordinate_domains
 from .tile_dependency import nested_logical_axes
-from .tile_dependency import tile_access_rank_relation
 from .tile_dependency import tile_dependency_site_id
 from .tile_strategy import L2GroupingProgramIDs
 
@@ -526,7 +525,9 @@ def _cross_loop_state_device_anchor(device_function: DeviceFunction) -> str | No
         )
         if descriptor is None:
             return None
-        origin = HostFunction.current().tensor_to_origin.get(descriptor.fake_value)
+        origin = HostFunction.current().compiler_state.tensor_origin(
+            descriptor.fake_value
+        )
         return None if origin is None else origin.host_str()
     return like.host_str()
 
@@ -554,6 +555,7 @@ def _register_distributed_readiness_state(
     *,
     device_anchor: str,
     slots: int,
+    world_size: int,
 ) -> tuple[str, str, str]:
     """Register hidden peer signal-pad metadata for distributed readiness."""
     signal_arg = device_function.new_var(
@@ -571,6 +573,7 @@ def _register_distributed_readiness_state(
     device_function.triton_distributed_readiness_signal_offset_arg = offset_arg
     device_function.triton_distributed_readiness_device_anchor = device_anchor
     device_function.triton_distributed_readiness_signal_slots = slots
+    device_function.triton_distributed_readiness_world_size = world_size
     return signal_arg, pointer_arg, offset_arg
 
 
@@ -664,18 +667,9 @@ def _has_opaque_distributed_protocol(device_ir: object) -> bool:
 def _has_compiler_distributed_dependency(device_ir: DeviceIR) -> bool:
     """Return whether the memory DAG contains a true cross-rank obligation."""
     dependency_graph = device_ir.tile_dependency_graph
-    if dependency_graph is None:
-        return False
-    access_by_id = {access.access_id: access for access in dependency_graph.accesses}
-    for edge in dependency_graph.edges:
-        for dependency in edge.access_dependencies:
-            relation = tile_access_rank_relation(
-                access_by_id[dependency.producer_access_id],
-                access_by_id[dependency.consumer_access_id],
-            )
-            if relation is not None and relation.source_support_is_empty() is not True:
-                return True
-    return False
+    return (
+        dependency_graph is not None and dependency_graph.has_cross_rank_dependencies()
+    )
 
 
 def emit_cross_loop_schedule(
@@ -692,7 +686,6 @@ def emit_cross_loop_schedule(
     """
     pipeline = device_function.config.cross_loop_pipeline
     device_ir = HostFunction.current().device_ir
-    has_opaque_distributed_protocol = _has_opaque_distributed_protocol(device_ir)
     has_compiler_distributed_dependency = _has_compiler_distributed_dependency(
         device_ir
     )
@@ -707,7 +700,7 @@ def emit_cross_loop_schedule(
     if pipeline not in ("static", "dynamic"):
         raise exc.InvalidConfig(f"unknown cross_loop_pipeline value {pipeline!r}")
 
-    if has_opaque_distributed_protocol:
+    if _has_opaque_distributed_protocol(device_ir):
         raise exc.InvalidConfig(
             f"cross_loop_pipeline={pipeline!r} cannot reorder roots containing "
             "explicit remote barriers or asynchronous remote-copy protocols"
@@ -842,10 +835,6 @@ def emit_cross_loop_schedule(
         for plan in all_readiness_counter_plans
         if plan not in distributed_counter_plans
     )
-    if distributed_counter_plans and pipeline != "dynamic":
-        raise exc.InvalidConfig(
-            "distributed cross-loop dependencies require dynamic dispatch"
-        )
     distributed_world_sizes = {
         cast("CoordinateRelation", consumer.rank_relation).target_domain.size
         for plan in distributed_counter_plans
@@ -912,7 +901,7 @@ def emit_cross_loop_schedule(
         readiness_counter_count += (
             plan.readiness_key_domain.size * readiness_counter_stride
         )
-    distributed_counter_offsets: dict[ReadinessCounterPlan, tuple[int, int, int]] = {}
+    distributed_counter_offsets: dict[ReadinessCounterPlan, tuple[int, int]] = {}
     distributed_counter_count = 0
     for plan in distributed_counter_plans:
         bank_size = (
@@ -921,9 +910,18 @@ def emit_cross_loop_schedule(
         distributed_counter_offsets[plan] = (
             distributed_counter_count,
             distributed_counter_count + bank_size,
-            distributed_counter_count + 2 * bank_size,
         )
-        distributed_counter_count += 3 * bank_size
+        distributed_counter_count += 2 * bank_size
+    distributed_terminal_counter_offset = (
+        distributed_counter_count if distributed_counter_plans else None
+    )
+    if distributed_terminal_counter_offset is not None:
+        distributed_counter_count += _DISTRIBUTED_COUNTER_ALIGNMENT_WORDS
+    distributed_consumer_count = sum(
+        plan.readiness_key_domain.size for plan in distributed_counter_plans
+    )
+    if distributed_counter_plans and distributed_consumer_count <= 0:
+        raise AssertionError("distributed completion requires at least one consumer")
     root_barrier_indices = {
         root: index for index, root in enumerate(root_barrier_producer_roots)
     }
@@ -973,11 +971,22 @@ def emit_cross_loop_schedule(
         if uses_packet_dispatch
         else None
     )
+    distributed_completion_arg = (
+        _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_distributed_completion",
+            numel="1",
+            dtype=torch.uint64,
+        )
+        if distributed_counter_plans
+        else None
+    )
     distributed_signal_args = (
         _register_distributed_readiness_state(
             device_function,
             device_anchor=cast("str", distributed_device_anchor),
             slots=distributed_counter_count,
+            world_size=cast("int", distributed_world_size),
         )
         if distributed_counter_count
         else None
@@ -1610,17 +1619,15 @@ def emit_cross_loop_schedule(
             f"({readiness_key}) * {_DISTRIBUTED_COUNTER_ALIGNMENT_WORDS}"
         )
 
-    def publish_distributed_counter(
-        plan: ReadinessCounterPlan,
-        bank: int,
-        readiness_key: str,
+    def publish_distributed_signal(
+        offset: int,
+        index: str,
         *,
         prefix: str,
     ) -> list[ast.stmt]:
         if distributed_signal_args is None or distributed_world_size is None:
             raise AssertionError("distributed readiness state was not registered")
         _signal, signal_ptrs, signal_offset = distributed_signal_args
-        offset = distributed_counter_offsets[plan][bank]
         physical_world_size = 1 << (distributed_world_size - 1).bit_length()
         peers = device_function.new_var(f"{prefix}_peers", dce=True)
         bases = device_function.new_var(f"{prefix}_bases", dce=True)
@@ -1634,22 +1641,30 @@ def emit_cross_loop_schedule(
             ),
             statement_from_string(
                 f"tl.atomic_add({bases} + ({signal_offset}) + {offset} + "
-                f"({readiness_key}) * {_DISTRIBUTED_COUNTER_ALIGNMENT_WORDS}, "
+                f"({index}) * {_DISTRIBUTED_COUNTER_ALIGNMENT_WORDS}, "
                 f"tl.cast(1, tl.uint64), mask={peers} < {distributed_world_size}, "
                 "sem='release', scope='sys')"
             ),
         ]
 
-    def distributed_target(epoch_offset: int = 0) -> str:
+    def publish_distributed_counter(
+        plan: ReadinessCounterPlan,
+        bank: int,
+        readiness_key: str,
+        *,
+        prefix: str,
+    ) -> list[ast.stmt]:
+        return publish_distributed_signal(
+            distributed_counter_offsets[plan][bank],
+            readiness_key,
+            prefix=prefix,
+        )
+
+    def distributed_target() -> str:
         if distributed_world_size is None:
             raise AssertionError("distributed world size is unavailable")
-        epoch = (
-            f"({epoch_var})"
-            if epoch_offset == 0
-            else f"(({epoch_var}) - {abs(epoch_offset)})"
-        )
         return (
-            f"tl.cast({epoch}, tl.uint64) * "
+            f"tl.cast({epoch_var}, tl.uint64) * "
             f"tl.cast({distributed_world_size}, tl.uint64)"
         )
 
@@ -1851,59 +1866,42 @@ def emit_cross_loop_schedule(
             )
         ]
 
-    def emit_distributed_reuse_wait_from_producer(
-        plan: ReadinessCounterPlan,
-        readiness_producer: ReadinessProducer,
-        producer_coordinates: dict[int, str],
-    ) -> list[ast.stmt]:
-        publication = readiness_producer.incidence.keys_by_item
-        if publication is None:
-            raise AssertionError("distributed readiness publication is unavailable")
-        readiness_key, membership = relation_flat_target(
-            publication,
-            producer_coordinates,
-            trusted_single_valued=True,
-        )
-        wait = _wait_for_distributed_counter(
-            device_function=device_function,
-            counter=distributed_counter(plan, 2, readiness_key),
-            target=distributed_target(-1),
-            prefix="tile_dependency_distributed_reuse_wait",
-        )
-        conditions = [f"{epoch_var} > 1"]
-        if membership != "True":
-            conditions.append(f"({membership})")
-        return [
-            create(
-                ast.If,
-                test=expr_from_string(" and ".join(conditions)),
-                body=wait,
-                orelse=[],
-            )
-        ]
-
-    def emit_distributed_consumed(
-        plan: ReadinessCounterPlan,
+    def emit_distributed_completion(
         consumer: ReadinessConsumer,
         consumer_coordinates: dict[int, str],
     ) -> list[ast.stmt]:
-        readiness_key, membership = relation_flat_target(
+        if (
+            distributed_completion_arg is None
+            or distributed_terminal_counter_offset is None
+        ):
+            raise AssertionError("distributed completion state was not registered")
+        _readiness_key, membership = relation_flat_target(
             consumer.keys_by_consumer,
             consumer_coordinates,
         )
-        publications = publish_distributed_counter(
-            plan,
-            2,
-            readiness_key,
-            prefix="tile_dependency_distributed_consumed",
+        previous = device_function.new_var(
+            "tile_dependency_distributed_completion_previous", dce=False
+        )
+        completion = _emit_final_arrival_continuation(
+            counter=distributed_completion_arg,
+            target=(
+                f"tl.cast({epoch_var}, tl.uint64) * "
+                f"tl.cast({distributed_consumer_count}, tl.uint64)"
+            ),
+            previous=previous,
+            continuation_body=publish_distributed_signal(
+                distributed_terminal_counter_offset,
+                "0",
+                prefix="tile_dependency_distributed_complete",
+            ),
         )
         if membership == "True":
-            return publications
+            return completion
         return [
             create(
                 ast.If,
                 test=expr_from_string(membership),
-                body=publications,
+                body=completion,
                 orelse=[],
             )
         ]
@@ -2031,15 +2029,6 @@ def emit_cross_loop_schedule(
         )
         if execution_membership != "True":
             raise AssertionError("proved root execution order is not total")
-        for producer_counter_plan, readiness_producer in producer_counters:
-            if producer_counter_plan in distributed_counter_offsets:
-                body.extend(
-                    emit_distributed_reuse_wait_from_producer(
-                        producer_counter_plan,
-                        readiness_producer,
-                        scheduled_coordinates,
-                    )
-                )
         if producer_counters or root in nested_producer_roots:
             has_task_scheduling = True
         if root in scheduled_task_roots:
@@ -2166,10 +2155,9 @@ def emit_cross_loop_schedule(
         if producer_counters or distributed_consumers:
             has_task_scheduling = True
             body.append(_publication_sync(device_function))
-        for consumer_plan, readiness_consumer in distributed_consumers:
+        for _consumer_plan, readiness_consumer in distributed_consumers:
             body.extend(
-                emit_distributed_consumed(
-                    consumer_plan,
+                emit_distributed_completion(
                     readiness_consumer,
                     scheduled_coordinates,
                 )
@@ -2348,6 +2336,33 @@ def emit_cross_loop_schedule(
         else:
             result.extend(
                 branch for _begin, _requires_kernel_scope, branch in packet_branches
+            )
+        if distributed_counter_plans:
+            if (
+                distributed_terminal_counter_offset is None
+                or distributed_signal_args is None
+            ):
+                raise AssertionError("distributed terminal counter is unavailable")
+            terminal_signal, _terminal_signal_ptrs, terminal_signal_offset = (
+                distributed_signal_args
+            )
+            terminal_drain = _wait_for_distributed_counter(
+                device_function=device_function,
+                counter=(
+                    f"({terminal_signal}).to(tl.pointer_type(tl.uint64)) + "
+                    f"({terminal_signal_offset}) + "
+                    f"{distributed_terminal_counter_offset}"
+                ),
+                target=distributed_target(),
+                prefix="tile_dependency_distributed_terminal_drain",
+            )
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"{dispatch_ticket} == {packet_count - 1}"),
+                    body=terminal_drain,
+                    orelse=[],
+                )
             )
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)

@@ -137,14 +137,12 @@ def check_config_consistancy(
     config: helion.Config,
     print_config: bool = False,
     process_group_name: str | None = None,
-    *,
-    force: bool = False,
 ) -> None:
     """
     Check the consistency of configs across ranks.
     """
     if (
-        (not force and os.getenv("HELION_DIST_CHECK_CONFIG_CONSISTANCY") != "1")
+        os.getenv("HELION_DIST_CHECK_CONFIG_CONSISTANCY") != "1"
         or not dist.is_initialized()
         or process_group_name is None
     ):
@@ -154,15 +152,16 @@ def check_config_consistancy(
     all_configs = [None] * dist.get_world_size(group)
     # pyrefly: ignore[bad-argument-type]
     dist.all_gather_object(all_configs, config, group=group)
-    if all_configs != all_configs[:1] * len(all_configs):
-        if print_config and dist.get_rank(group) == 0:
+    if dist.get_rank() == 0:
+        # do the check on rank 0
+        if all_configs != all_configs[:1] * len(all_configs):
+            if print_config:
+                for idx, c in enumerate(all_configs):
+                    print("FAIL", idx, c)
+            raise exc.InconsistantConfigsAcrossRanks
+        if print_config:
             for idx, c in enumerate(all_configs):
-                print("FAIL", idx, c)
-        # Every rank must fail before any peer can enter a mismatched kernel.
-        raise exc.InconsistantConfigsAcrossRanks
-    if print_config and dist.get_rank(group) == 0:
-        for idx, c in enumerate(all_configs):
-            print("PASS", idx, c)
+                print("PASS", idx, c)
 
 
 def print_with_rank(*args: object, **kwargs: object) -> None:
