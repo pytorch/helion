@@ -210,6 +210,7 @@ def test_prepare_device_exposes_only_the_matched_gate_contract() -> None:
 
 
 def test_prepare_uses_shared_device_primitives() -> None:
+    from helion._compiler.cute import affine_recurrence_primitives as affine
     from helion._compiler.cute import chunk_prepare_split_alias_device as device
     from helion._compiler.cute import kda_device_primitives as primitives
 
@@ -227,6 +228,15 @@ def test_prepare_uses_shared_device_primitives() -> None:
         "warp_arrive",
     ):
         assert getattr(device, name) is getattr(primitives, name)
+    for name in (
+        "acc_coord",
+        "f16_round",
+        "mma_m16n8k16_f16",
+        "mma_blockdiag_8x8_f16",
+        "pack_f16x2",
+    ):
+        shared_name = "accumulator_coordinate" if name == "acc_coord" else name
+        assert getattr(device, name) is getattr(affine, shared_name)
 
 
 def test_prepare_exact_lowering_requires_fast_math_policy() -> None:

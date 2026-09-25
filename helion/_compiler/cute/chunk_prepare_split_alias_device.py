@@ -22,10 +22,14 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils
 
-from .kda_device_primitives import _mma_m16n8k16
-from .kda_device_primitives import mma_m16n8k16_bf16
-from .kda_device_primitives import movmatrix_b16
-from .kda_device_primitives import pack_bf16x2
+from .affine_recurrence_primitives import accumulator_coordinate as acc_coord
+from .affine_recurrence_primitives import f16_round
+from .affine_recurrence_primitives import mma_blockdiag_8x8_f16
+from .affine_recurrence_primitives import mma_m16n8k16_bf16
+from .affine_recurrence_primitives import mma_m16n8k16_f16
+from .affine_recurrence_primitives import movmatrix_b16
+from .affine_recurrence_primitives import pack_bf16x2
+from .affine_recurrence_primitives import pack_f16x2
 from .kda_device_primitives import store_vec8_bf16
 from .kda_device_primitives import tma_store_3d
 from .kda_device_primitives import tma_store_commit_group
@@ -109,43 +113,6 @@ def stmatrix_x4(smem_ptr, r0, r1, r2, r3, *, loc=None, ip=None):
         asm_dialect=llvm.AsmDialect.AD_ATT,
         loc=loc,
         ip=ip,
-    )
-
-
-@dsl_user_op
-def mma_m16n8k16_f16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
-    """``mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32``."""
-
-    return _mma_m16n8k16("f16", a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def pack_f16x2(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
-    """Round two FP32 values to FP16 and pack them into one b32 register.
-
-    The FP16 twin of :func:`pack_bf16x2`, with the same half ordering:
-    ``cvt.rn.f16x2.f32 d, hi, lo`` places ``lo`` in the low half.  Used by the
-    inverse chain, whose operands are FP16 regardless of the kernel's input
-    dtype -- FP16's 10-bit significand against BF16's 7 is worth 4-8x there,
-    and the chain is the one stage where the extra bits survive.
-    """
-    from cutlass._mlir.extras import types as _T
-
-    return cutlass.Int32(
-        llvm.inline_asm(
-            _T.IntegerType.get_signless(32),
-            [
-                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
-                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
-            ],
-            "cvt.rn.f16x2.f32 $0, $1, $2;",
-            "=r,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
     )
 
 
@@ -296,11 +263,6 @@ def bf16_round(x: cutlass.Float32):
     return x.to(cutlass.BFloat16).to(cutlass.Float32)
 
 
-def f16_round(x: cutlass.Float32):
-    """Round through FP16, the inverse chain's operand dtype (Section 8.2)."""
-    return x.to(cutlass.Float16).to(cutlass.Float32)
-
-
 # ---------------------------------------------------------------------------
 # Fragment helpers
 # ---------------------------------------------------------------------------
@@ -373,31 +335,6 @@ def mma_16x16(a0, a1, a2, a3, b0, b1, b2, b3, c):
 
 
 @cute.jit
-def mma_blockdiag_8x8_f16(a0, a3, b0, b3):
-    """Multiply two packed 8x8 block diagonals with one native MMA.
-
-    ``a0``/``b0`` carry the upper-left block and ``a3``/``b3`` the
-    lower-right block. Packing both right-hand blocks into the same N=8
-    operand lets one m16n8 instruction compute the two independent 8x8
-    products: accumulator slots 0:2 are the upper block and 2:4 the lower.
-    """
-    zero_i32 = cutlass.Int32(0)
-    zero_f32 = cutlass.Float32(0.0)
-    return mma_m16n8k16_f16(
-        a0,
-        zero_i32,
-        zero_i32,
-        a3,
-        movmatrix_b16(b0),
-        movmatrix_b16(b3),
-        zero_f32,
-        zero_f32,
-        zero_f32,
-        zero_f32,
-    )
-
-
-@cute.jit
 def acc_to_a_fragment(c):
     """Register-local accumulator -> A-layout pack."""
     return (
@@ -452,16 +389,6 @@ def prepare_stmatrix_coord(lane):
     matrix_id = lane // 8
     row = (lane - matrix_id * 8) + 8 * (matrix_id - (matrix_id // 2) * 2)
     col = 8 * (matrix_id // 2)
-    return row, col
-
-
-@cute.jit
-def acc_coord(lane, slot):
-    """``(row, col)`` of accumulator slot ``slot`` in ``[0, 8)``."""
-    n_block = slot // 4
-    reg = slot - n_block * 4
-    row = (lane // 4) + 8 * (reg // 2)
-    col = 8 * n_block + 2 * (lane % 4) + (reg % 2)
     return row, col
 
 

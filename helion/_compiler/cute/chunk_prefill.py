@@ -276,6 +276,8 @@ def codegen_chunk_prefill(cg: GenerateAST) -> bool:
 
 def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
     """Emit the implemented centered-BT32 single-stream schedules."""
+    from .chunk_prefill_bt32.config import PIPELINE_PLAN
+
     df = cg.device_function
     region = df.cute_state.chunk_prefill_plan
     root = cg.current_root_graph_info
@@ -327,7 +329,10 @@ def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
             "heads": region.heads,
             "sequences": region.sequences,
             "total_tokens": region.total_tokens,
-            "threads": 1024,
+            "threads": PIPELINE_PLAN.threads,
+            "smem_bytes": PIPELINE_PLAN.shared_bytes,
+            "tmem_columns": PIPELINE_PLAN.tmem_columns,
+            "min_blocks_per_mp": PIPELINE_PLAN.min_blocks_per_mp,
             "task_order": df.config.get(CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, "identity"),
             "schedule": "single",
             "prefix_count": 0,

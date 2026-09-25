@@ -406,6 +406,9 @@ def test_bt32_codegen_and_search_space(bt32_bound: BoundKernel, order: str) -> N
     source = bt32_bound.to_triton_code(config)
     assert "'device_abi': 2" in source
     assert "'threads': 1024" in source
+    assert "'smem_bytes': 227968" in source
+    assert "'tmem_columns': 256" in source
+    assert "'min_blocks_per_mp': 1" in source
     assert "'chunk_size': 32" in source
     assert "'numerical_policy': 'centered_bt32_fp32_rhs_v2'" in source
     assert f"'task_order': '{order}'" in source

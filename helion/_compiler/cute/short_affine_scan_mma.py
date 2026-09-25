@@ -39,6 +39,9 @@ from .affine_recurrence_primitives import mma_m16n8k16_bf16
 from .affine_recurrence_primitives import pack_bf16x2
 from .affine_recurrence_primitives import store_u32x4_if_valid as _store_u32x4_if_valid
 from .affine_recurrence_primitives import vec8_bf16
+from .warp_specialized_primitives import copy_b16x8_async
+from .warp_specialized_primitives import segmented_swizzle_b16_element_index
+from .warp_specialized_primitives import swizzle_b16_element_index
 
 MMA_M = 16
 MMA_N = 8
@@ -51,8 +54,7 @@ DIRECT_STATE_SEGMENT_FEATURES = 64
 def _swizzle_128b_b16(logical_element):
     """Apply CUTLASS's 128-byte XOR swizzle to one 16-bit element index."""
 
-    byte_offset = logical_element * 2
-    return (byte_offset ^ (((byte_offset >> 7) & 7) << 4)) // 2
+    return swizzle_b16_element_index(logical_element, 7)
 
 
 def direct_factor_index(feature, column, column_extent):
@@ -64,11 +66,13 @@ def direct_factor_index(feature, column, column_extent):
 def direct_state_index(row, feature, row_extent):
     """S128 index for a row-major state split into 64-feature segments."""
 
-    segment = feature // DIRECT_STATE_SEGMENT_FEATURES
-    local_feature = feature - segment * DIRECT_STATE_SEGMENT_FEATURES
-    logical = row * DIRECT_STATE_SEGMENT_FEATURES + local_feature
-    return segment * row_extent * DIRECT_STATE_SEGMENT_FEATURES + _swizzle_128b_b16(
-        logical
+    return segmented_swizzle_b16_element_index(
+        row,
+        feature,
+        row_extent,
+        DIRECT_STATE_SEGMENT_FEATURES,
+        8,
+        7,
     )
 
 
@@ -263,21 +267,6 @@ def stage_state_tile8x8_async_bf16(
     the CTA barrier, which permits independent work to overlap the copies.
     """
 
-    aligned_source = cute.make_ptr(
-        source_ptr.dtype,
-        source_ptr.toint(),
-        source_ptr.memspace,
-        assumed_align=16,
-    )
-    aligned_state = cute.make_ptr(
-        state_smem.dtype,
-        state_smem.toint(),
-        state_smem.memspace,
-        assumed_align=16,
-    )
-    copy_size = cutlass.Int32(0)
-    if valid:
-        copy_size = cutlass.Int32(16)
     for row_offset in cutlass.range_constexpr(8):
         source_index = cutlass.Int32(source_base_index) + cutlass.Int32(
             row_offset
@@ -287,12 +276,10 @@ def stage_state_tile8x8_async_bf16(
             state_feature,
             ROW_EXTENT,
         )
-        cute.arch.cp_async_shared_global(
-            aligned_state + cute.assume(cutlass.Int32(state_index), divby=8),
-            aligned_source + source_index,
-            16,
-            "cg",
-            cp_size=copy_size,
+        copy_b16x8_async(
+            state_smem + cute.assume(cutlass.Int32(state_index), divby=8),
+            source_ptr + source_index,
+            valid,
         )
     cute.arch.cp_async_commit_group()
 

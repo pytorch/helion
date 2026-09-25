@@ -12,6 +12,9 @@ mma = importlib.import_module("helion._compiler.cute.short_affine_scan_mma")
 primitives = importlib.import_module(
     "helion._compiler.cute.affine_recurrence_primitives"
 )
+pipeline_primitives = importlib.import_module(
+    "helion._compiler.cute.warp_specialized_primitives"
+)
 rank1 = importlib.import_module("helion._compiler.cute.single_token_rank1_recurrence")
 
 
@@ -395,15 +398,25 @@ def test_device_helpers_reuse_shared_primitives() -> None:
     assert mma._store_u32x4_if_valid is primitives.store_u32x4_if_valid
     assert mma.vec8_bf16 is primitives.vec8_bf16
     assert rank1.rank1_store_u32x4_if_valid is primitives.store_u32x4_if_valid
+    assert mma.copy_b16x8_async is pipeline_primitives.copy_b16x8_async
+    assert (
+        mma.segmented_swizzle_b16_element_index
+        is pipeline_primitives.segmented_swizzle_b16_element_index
+    )
 
 
 def test_async_ingress_leaves_wait_and_barrier_to_caller() -> None:
     source = inspect.getsource(mma.stage_state_tile8x8_async_bf16)
-    assert "cp_async_shared_global" in source
-    assert "cp_size=copy_size" in source
+    primitive_source = inspect.getsource(pipeline_primitives.copy_b16x8_async)
+    assert "copy_b16x8_async(" in source
     assert "cp_async_commit_group" in source
     assert "cp_async_wait_group" not in source
     assert "sync_threads" not in source
+    assert "cp_async_shared_global" in primitive_source
+    assert "cp_size=copy_size" in primitive_source
+    assert "assumed_align=16" in primitive_source
+    assert "cp_async_wait_group" not in primitive_source
+    assert "sync_threads" not in primitive_source
 
 
 def test_packed_store_delegates_to_shared_predicated_primitive() -> None:

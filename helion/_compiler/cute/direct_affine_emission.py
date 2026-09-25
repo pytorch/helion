@@ -45,6 +45,8 @@ from .direct_affine_templates import _has_lane_reduce_marker
 from .direct_affine_templates import _template_components
 from .direct_affine_templates import _validate_direct_affine_templates
 from .direct_affine_templates import resolve_direct_affine_templates
+from .warp_specialized_plan import SharedBufferRequest
+from .warp_specialized_plan import allocate_shared_regions
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -106,10 +108,6 @@ def _store(pointer: ast.expr, index: ast.expr, value: ast.expr) -> ast.Expr:
     return ast.Expr(value=_call(_attr(address, "store"), value))
 
 
-def _align(value: int, alignment: int = _SMEM_ALIGNMENT) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
 def _shared_layout(
     plan: DirectAffinePlan, prefix: str
 ) -> tuple[tuple[DirectAffineSharedBuffer, ...], int]:
@@ -125,21 +123,24 @@ def _shared_layout(
         ("update_scale", "Float32", plan.step_count, 4),
         ("residual", "Float32", plan.step_count * plan.row_extent, 4),
     )
-    offset = 0
-    buffers: list[DirectAffineSharedBuffer] = []
-    for role, dtype_name, count, item_size in sizes:
-        offset = _align(offset)
-        buffers.append(
-            DirectAffineSharedBuffer(
-                role=role,
-                name=f"{prefix}_{role}",
-                dtype_name=dtype_name,
-                element_count=count,
-                byte_offset=offset,
-            )
+    layout = allocate_shared_regions(
+        tuple(
+            SharedBufferRequest(role, count * item_size, _SMEM_ALIGNMENT)
+            for role, _dtype_name, count, item_size in sizes
+        ),
+        final_alignment=_SMEM_ALIGNMENT,
+    )
+    buffers = tuple(
+        DirectAffineSharedBuffer(
+            role=role,
+            name=f"{prefix}_{role}",
+            dtype_name=dtype_name,
+            element_count=count,
+            byte_offset=layout.region(role).byte_offset,
         )
-        offset += count * item_size
-    return tuple(buffers), _align(offset)
+        for role, dtype_name, count, _item_size in sizes
+    )
+    return buffers, layout.allocated_bytes
 
 
 def _buffer_setup(

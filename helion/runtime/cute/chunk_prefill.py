@@ -22,8 +22,13 @@ if TYPE_CHECKING:
 
 def validate_plan(plan: dict[str, object]) -> None:
     if plan.get("device_abi") == 2:
+        from ..._compiler.cute.chunk_prefill_bt32.config import PIPELINE_PLAN
+
         if (
-            plan.get("threads") != 1024
+            plan.get("threads") != PIPELINE_PLAN.threads
+            or plan.get("smem_bytes") != PIPELINE_PLAN.shared_bytes
+            or plan.get("tmem_columns") != PIPELINE_PLAN.tmem_columns
+            or plan.get("min_blocks_per_mp") != PIPELINE_PLAN.min_blocks_per_mp
             or plan.get("chunk_size") != 32
             or plan.get("numerical_policy") != "centered_bt32_fp32_rhs_v2"
             or plan.get("task_order", "identity")
