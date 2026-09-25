@@ -2387,7 +2387,8 @@ class CuteBackend(Backend):
             return None
         padded_size = next_power_of_2(max(1, size_hint))
         if padded_size > thread_count:
-            return padded_size // thread_count
+            # Whole-warp thread counts need not divide the padded extent.
+            return (padded_size + thread_count - 1) // thread_count
         return None
 
     def reduction_axis_first(self) -> bool:

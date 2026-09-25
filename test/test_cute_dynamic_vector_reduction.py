@@ -33,22 +33,30 @@ Now:
 from __future__ import annotations
 
 import ast
+from types import MethodType
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import cast
 from unittest.mock import patch
 
 from examples.aot_example import rms_norm_batched
 import pytest
+import sympy
 import torch
 
 from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_native_compile
 from test._cute_binding import _mock_cuda_unavailable
 
 import helion
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.fuse_two_pass_loads import fuse_two_pass_loads
 from helion._compiler.cute.memory_ops import cute_known_multiple
 from helion._compiler.cute.pipeline_inner_loads import pipeline_inner_loads
+from helion._compiler.host_function import HostFunction
+from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -300,6 +308,125 @@ def _fused_and_fallback(code: str, budget: str) -> tuple[str, str]:
     (_test, declaration, _no_declaration), (_test, fused, fallback) = branches
     assert "cute.make_rmem_tensor(" in declaration
     return fused, fallback
+
+
+def _assert_roll_ranges_cover_width(
+    code: str, *, width: int, chunk: int, cluster_n: int
+) -> None:
+    rolls = [
+        node
+        for node in ast.walk(_kernel_def(code))
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id.startswith("roffset_")
+    ]
+    assert len(rolls) == 2
+    for loop in rolls:
+        assert isinstance(loop.iter, ast.Call)
+        covered = []
+        for rank in range(cluster_n):
+            scope = {
+                "__builtins__": {},
+                "cutlass": SimpleNamespace(Int32=int),
+                "cute": SimpleNamespace(
+                    arch=SimpleNamespace(block_idx=lambda rank=rank: (0, rank, 0))
+                ),
+                "_REDUCTION_BLOCK_1": chunk,
+                TRIPS: (width + chunk - 1) // chunk,
+            }
+            controls = [
+                eval(compile(ast.Expression(arg), "<roll range>", "eval"), scope)
+                for arg in loop.iter.args
+            ]
+            for offset in range(*controls):
+                covered.extend(range(offset, min(offset + chunk, width)))
+        assert sorted(covered) == list(range(width))
+
+
+@skipUnlessBackends(["cute"])
+def test_guarded_cluster_keeps_single_cta_reductions_dynamic() -> None:
+    width, chunk = 8192, 2048
+    bound, _arguments = _bind_rms_norm(torch.empty((4, width), dtype=torch.bfloat16))
+    assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
+    plain_config = _rolled_config(bound, threads=128, vec=8, chunk=chunk, reload="gmem")
+    cluster_config = helion.Config.from_dict(
+        {**plain_config.config, "cute_cluster_n": 2}
+    )
+    with _forbid_native_compile():
+        plain = bound.to_code(plain_config)
+        clustered = bound.to_code(cluster_config)
+        plain_again = bound.to_code(plain_config)
+    assert TRIPS in [arg.arg for arg in _kernel_def(plain).args.args]
+    assert "_cute_grouped_reduce_cluster(" not in plain
+    assert ast.dump(ast.parse(plain)) == ast.dump(ast.parse(plain_again))
+    assert not bound.env.specialized_vars
+    assert "_cute_grouped_reduce_cluster(" in clustered
+    assert "_helion_cute_cluster_shape = (1, 2, 1)" in clustered
+    assert TRIPS not in clustered
+    assert "mask_1" not in clustered
+    _assert_roll_ranges_cover_width(plain, width=width, chunk=chunk, cluster_n=1)
+    _assert_roll_ranges_cover_width(clustered, width=width, chunk=chunk, cluster_n=2)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("width,cluster_n", [(6144, 4), (8196, 2)])
+def test_guarded_cluster_declines_partial_slices(width: int, cluster_n: int) -> None:
+    chunk = 2048
+    bound, _arguments = _bind_rms_norm(torch.empty((4, width), dtype=torch.bfloat16))
+    plain_config = _rolled_config(bound, threads=128, vec=8, chunk=chunk, reload="gmem")
+    config = helion.Config.from_dict(
+        {**plain_config.config, "cute_cluster_n": cluster_n}
+    )
+    with _forbid_native_compile():
+        code = bound.to_code(config)
+    assert TRIPS in [arg.arg for arg in _kernel_def(code).args.args]
+    assert "_cute_grouped_reduce_cluster(" not in code
+    assert "_helion_cute_cluster_shape" not in code
+    assert "mask_1" in code
+    _assert_roll_ranges_cover_width(code, width=width, chunk=chunk, cluster_n=1)
+
+
+@pytest.mark.parametrize("unbacked", [False, True])
+def test_cluster_proof_refuses_unguarded_or_unbacked_extents(unbacked: bool) -> None:
+    # Even an exact-looking hint must not retire the mask without a replayable
+    # proof. The real specialization helper rejects both cases before using it.
+    extent = sympy.Symbol("u0" if unbacked else "s0", integer=True)
+    env = SimpleNamespace(
+        backend=SimpleNamespace(name="cute"),
+        block_sizes=[SimpleNamespace(numel=extent)],
+        config_spec=SimpleNamespace(cute_indexed_reduction_block_ids=set()),
+        compiler_fact_specialization_facts={"input_tensor_metadata"}
+        if unbacked
+        else set(),
+        specialize_expr=lambda expr: expr,
+    )
+    env.specialized_multiple = MethodType(CompileEnvironment.specialized_multiple, env)
+    fn = SimpleNamespace(
+        config=helion.Config(cute_cluster_n=2),
+        cute_state=SimpleNamespace(simt_cluster_n=1),
+    )
+    strategy = cast("Any", object.__new__(LoopedReductionStrategy))
+    strategy._fn = lambda: fn
+    strategy.block_ids = [0]
+    strategy._thread_count = 128
+    strategy._loop_block_size = 2048
+    strategy._mask_var = "mask_0"
+    strategy._cute_rolled_cluster_n = 1
+    strategy._cute_rolled_cluster_checked = False
+    state = SimpleNamespace(
+        codegen=SimpleNamespace(
+            current_grid_state=SimpleNamespace(thread_axis_sizes={})
+        )
+    )
+    host = SimpleNamespace(device_ir=SimpleNamespace(has_atomic_ops=lambda: False))
+    with (
+        patch.object(CompileEnvironment, "current", return_value=env),
+        patch.object(HostFunction, "current", return_value=host),
+    ):
+        strategy._maybe_apply_cute_rolled_cluster(state)
+    assert strategy._cute_rolled_cluster_n == 1
+    assert fn.cute_state.simt_cluster_n == 1
+    assert strategy._mask_var == "mask_0"
 
 
 @skipUnlessBackends(["cute"])
