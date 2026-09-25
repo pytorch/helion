@@ -56,6 +56,66 @@ if TYPE_CHECKING:
     InductorOpOverrides = OpsHandler[Any]
 
 
+def _live_grid_thread_extents(
+    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
+) -> dict[int, int]:
+    """Recover grid launch requirements from surviving named assignments."""
+    live: dict[int, int] = {}
+    for statement in statements:
+        for node in ast.walk(statement):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in extents:
+                    axis, extent = extents[target.id]
+                    live[axis] = max(live.get(axis, 1), extent)
+    return live
+
+
+def _live_grid_thread_dims(
+    statements: Sequence[ast.AST], extents: dict[str, tuple[int, int]]
+) -> list[int]:
+    live = _live_grid_thread_extents(statements, extents)
+    return [live.get(axis, 1) for axis in range(3)]
+
+
+def _pointwise_grid_thread_dims(
+    live_extents: dict[int, int],
+    final_thread_axes: set[int],
+    referenced_dims: Sequence[int],
+    *,
+    has_pointwise_fact: bool,
+    has_nested_device_loops: bool,
+    has_synthetic_free_axes: bool,
+) -> tuple[int, int, int] | None:
+    if (
+        not has_pointwise_fact
+        or not live_extents
+        or not final_thread_axes.issubset(live_extents)
+        or has_nested_device_loops
+        or has_synthetic_free_axes
+    ):
+        return None
+    if any(referenced_dims[axis] > live_extents[axis] for axis in final_thread_axes):
+        # A larger reference is not evidence that every producer has a surplus
+        # mask. Do not add duplicate/out-of-tile writers to satisfy it.
+        raise exc.BackendUnsupported(
+            "cute", "pointwise grid reference exceeds its live producer extent"
+        )
+    dims = [
+        live_extents.get(axis, 1) if axis in final_thread_axes else 1
+        for axis in range(3)
+    ]
+    # CUDA's z dimension is capped independently of the total thread count.
+    # A numerically complete rectangular grid can otherwise request z=128
+    # while still fitting the 1024-thread product budget checked by the caller.
+    if any(size > limit for size, limit in zip(dims, (1024, 1024, 64), strict=True)):
+        raise exc.BackendUnsupported(
+            "cute", f"pointwise grid launch exceeds CUDA per-axis limits: {tuple(dims)}"
+        )
+    return dims[0], dims[1], dims[2]
+
+
 def _detect_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -1938,6 +1998,7 @@ class CuteBackend(Backend):
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
         from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
         from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
+        from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -2089,7 +2150,16 @@ class CuteBackend(Backend):
                 flags=re.MULTILINE,
             )
         )
-        offset_thread_dims = [1, 1, 1]
+        grid_thread_extents = device_function.cute_state.grid_thread_extents
+        live_grid_thread_extents = _live_grid_thread_extents(
+            [*device_function.preamble, *device_function.body], grid_thread_extents
+        )
+        exact_grid_thread_dims = [
+            live_grid_thread_extents.get(axis, 1) for axis in range(3)
+        ]
+        offset_thread_dims = list(exact_grid_thread_dims)
+        # Grid producers record exact extents independently of index spelling.
+        # Keep text recovery only for older/unregistered index producers.
         # When a lane loop is active for an axis the generated index expression
         # has the form
         #   ``indices_<n> = tile_offset_<n> + Int32(thread_idx()[<axis>]) * <epT> + Int32(lane_<n>)``
@@ -2126,37 +2196,42 @@ class CuteBackend(Backend):
         # without a signal. ``indices_line_assert_re`` below detects
         # the "wrapper-dropped" form so we can fail loudly instead.
         indices_line_re = re.compile(
-            r"^\s*indices_\d+ = (?:tile_)?offset_(\d+) \+ "
-            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(\d+)\]\)"
-            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(\d+))?",
+            r"^\s*(?P<index>indices_\d+) = (?:tile_)?offset_(?P<offset>\d+) \+ "
+            r"[^\n]*?cute\.arch\.thread_idx\(\)\[(?P<axis>\d+)\]\)"
+            r"(?:\s*\*\s*(?:cutlass\.Int32\()?(?P<ept>\d+))?",
             flags=re.MULTILINE,
         )
         # Loose form: any ``indices_<n>`` line containing ``thread_idx``
         # under any wrapping. Used only for the wrapper-invariant
         # assertion below — never consulted for launch-dim values.
         indices_line_loose_re = re.compile(
-            r"^\s*indices_\d+ = (?:tile_)?offset_\d+ \+ "
+            r"^\s*(?P<index>indices_\d+) = (?:tile_)?offset_\d+ \+ "
             r"[^\n]*?cute\.arch\.thread_idx\(\)",
             flags=re.MULTILINE,
         )
         matched_lines = 0
         for line_match in indices_line_re.finditer(final_kernel_text):
+            if line_match.group("index") in grid_thread_extents:
+                continue
             matched_lines += 1
-            offset_id = line_match.group(1)
-            axis_text = line_match.group(2)
-            multiplier_text = line_match.group(3)
+            offset_id = line_match.group("offset")
+            axis_text = line_match.group("axis")
+            multiplier_text = line_match.group("ept")
             axis = int(axis_text)
             if not (0 <= axis < len(offset_thread_dims)):
                 continue
             block_name = offset_block_sizes.get(offset_id)
             block_size = block_size_values.get(block_name or "")
             if block_size is None and block_name is not None:
-                try:
-                    config_index = int(block_name.removeprefix("_BLOCK_SIZE_"))
-                except ValueError:
-                    config_index = -1
-                if 0 <= config_index < len(config.block_sizes):
-                    config_block_size = config.block_sizes[config_index]
+                # The generated suffix is a logical block ID, not an index
+                # into the tunable-only config list. Fixed leading axes and
+                # aliased blocks can make those indices differ. Resolve via
+                # BlockSizeInfo, as the grid producer does, so recovery cannot
+                # inflate an unmasked root using another root's tile width.
+                block_id = int(block_name.removeprefix("_BLOCK_SIZE_"))
+                block_sizes = CompileEnvironment.current().block_sizes
+                if 0 <= block_id < len(block_sizes):
+                    config_block_size = block_sizes[block_id].from_config(config)
                     if isinstance(config_block_size, int):
                         block_size = config_block_size
             if block_size is None:
@@ -2200,7 +2275,10 @@ class CuteBackend(Backend):
         # under-dimension every kernel that uses a thread axis.
         if (
             offset_block_sizes
-            and indices_line_loose_re.search(final_kernel_text)
+            and any(
+                match.group("index") not in grid_thread_extents
+                for match in indices_line_loose_re.finditer(final_kernel_text)
+            )
             and matched_lines == 0
         ):
             raise AssertionError(
@@ -2226,11 +2304,15 @@ class CuteBackend(Backend):
         root_grid_dims = [1, 1, 1]
         device_ir = HostFunction.current().device_ir
         for block_ids in device_ir.grid_block_ids:
-            strategy = tile_strategy.block_id_to_strategy.get(tuple(block_ids))
-            if strategy is None:
-                continue
-            for axis, size in enumerate(strategy.thread_block_sizes()):
-                if axis < len(root_grid_dims):
+            for block_id in block_ids:
+                # Strategy widths use local axes. Reduction/free axes can
+                # precede the root in the actual CUDA layout, so use the same
+                # physical mapping as TileStrategyDispatch.thread_block_dims.
+                # Otherwise a dead root axis can inflate a different live
+                # axis whose memory accesses correctly omitted surplus masks.
+                axis = tile_strategy.thread_axis_for_block_id(block_id)
+                size = tile_strategy.thread_extent_for_block_id(block_id)
+                if axis is not None and size is not None and 0 <= axis < 3:
                     root_grid_dims[axis] = max(root_grid_dims[axis], size)
         root_static_dims = tuple(root_grid_dims)
         root_static_threads = functools.reduce(operator.mul, root_static_dims, 1)
@@ -2353,6 +2435,34 @@ class CuteBackend(Backend):
                 dims = dynamic_dims
             else:
                 dims = DeviceFunction.current().tile_strategy.thread_block_dims()
+        pointwise_dims = _pointwise_grid_thread_dims(
+            live_grid_thread_extents,
+            final_thread_axes,
+            referenced_dims,
+            has_pointwise_fact=bool(
+                CompileEnvironment.current().config_spec.pointwise_facts
+            ),
+            has_nested_device_loops=has_nested_device_loops,
+            has_synthetic_free_axes=bool(codegen.cute_synthetic_arange_axis_sizes),
+        )
+        if pointwise_dims is not None:
+            # Register broadcasts can create reduction strategies without an
+            # executable reduction. Their static axis reservation can differ
+            # from the root producer's physical mapping (especially when some
+            # reduction thread counts are one). For a proven pointwise body
+            # whose live axes all have grid producers, those emitted producers
+            # own the launch, with larger statement references rejected rather
+            # than inflating an unproved surplus mask. Keep reductions/MMA and independent
+            # nested/free-arange axes on their existing launch paths.
+            dims = pointwise_dims
+        if any(
+            required > actual
+            for required, actual in zip(exact_grid_thread_dims, dims, strict=True)
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "grid thread extents cannot fit the launch thread budget",
+            )
         # Detect the silent-truncation case: codegen has already emitted
         # thread_idx[axis] references that assume a certain per-axis
         # extent (recorded in ``referenced_thread_block_dims``), but the
@@ -2768,9 +2878,18 @@ class CuteBackend(Backend):
                     n_axis = block_ids.index(specialized_mma_plan.n_block_id)
                     m_block_size = nd_block_size[m_axis]
                     n_block_size = nd_block_size[n_axis]
+                    # The generic SIMT budget above can resolve an automatic
+                    # M axis before this specialized plan is known. Preserve
+                    # the original auto setting: that temporary width is not
+                    # an explicit request for multiple lanes per warp slot.
+                    # TCgen05's role launch multiplies this width by its warp
+                    # count, so retaining (for example) 64 would double it.
+                    requested_m_threads = env.config_spec.num_threads.config_get(
+                        config.num_threads, specialized_mma_plan.m_block_id, 0
+                    )
                     root_m_threads = (
                         _tcgen05_root_m_threads(int(m_block_size), int(n_block_size))
-                        if num_threads_config[m_axis] == 0
+                        if requested_m_threads == 0
                         and isinstance(m_block_size, int)
                         and isinstance(n_block_size, int)
                         else num_threads_config[m_axis]

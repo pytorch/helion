@@ -1925,6 +1925,7 @@ def _cute_block_tile_begin_expr(state: CodegenState, block_id: int) -> str | Non
     the block id has no active thread axis in this scope.
     """
     from .cute_reshape import _grid_local_coord_expr
+    from .cute_reshape import _per_thread_nd_tile_offset
 
     loops = state.codegen.active_device_loops.get(block_id)
     if not loops:
@@ -1934,6 +1935,9 @@ def _cute_block_tile_begin_expr(state: CodegenState, block_id: int) -> str | Non
     global_index = loop_state.strategy.index_var(block_id)
     if thread_axis is None or global_index is None:
         return None
+    tile_offset = _per_thread_nd_tile_offset(loop_state.strategy, block_id)
+    if tile_offset is not None:
+        return tile_offset
     local_coord = _grid_local_coord_expr(state.codegen, block_id, thread_axis)
     return state.codegen.lift(
         expr_from_string(f"({global_index}) - ({local_coord})"),

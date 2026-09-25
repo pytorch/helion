@@ -508,6 +508,10 @@ class CuteDeviceFunctionState:
     """CuTe-owned state for one DeviceFunction codegen instance."""
 
     def __init__(self) -> None:
+        # Physical (axis, thread extent) for grid index/base assignments.
+        # The launcher consults only names that survive final AST lowering;
+        # this does not depend on blocked/strided index-expression spelling.
+        self.grid_thread_extents: dict[str, tuple[int, int]] = {}
         # SIMT reduction-kernel thread-block cluster width (from the
         # ``cute_cluster_n`` config knob, applied by
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
