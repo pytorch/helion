@@ -3010,6 +3010,89 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
         return config
 
 
+class CuteChainedMatmulHeuristic(AutotunerHeuristic):
+    """Search effective warp-MMA and eligible TCgen05 contraction-DAG knobs."""
+
+    name = "cute_chained_matmul"
+    backend = "cute"
+    promote_seed_to_default = True
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chained_matmul import detect_chained_matmul_search
+
+        host_function = device_ir.host_function
+        if host_function is None:
+            return frozenset()
+        with host_function:
+            if not detect_chained_matmul_search(device_ir.graphs):
+                return frozenset()
+        spec = env.config_spec
+        spec.cute_chained_matmul_search_enabled = True
+        spec.cute_tcgen05_search_enabled = False
+        spec.allowed_pid_types = ("flat",)
+        valid = set(spec.block_sizes.valid_block_ids())
+        for fact in spec.matmul_facts:
+            for block_id, minimum in (
+                (fact.m_block_id, 16),
+                (fact.n_block_id, 8),
+                (fact.k_block_id, 16),
+            ):
+                if block_id is not None and block_id in valid:
+                    block = spec.block_sizes.block_id_lookup(block_id)
+                    block.update_min(minimum)
+                    block.autotuner_min = max(block.autotuner_min, minimum)
+
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chained_matmul_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        import itertools
+
+        spec = env.config_spec
+        choices = [
+            tuple(
+                value
+                for value in (16, 32, 64)
+                if block.min_size <= value <= block.max_size
+            )
+            or (block.min_size,)
+            for block in spec.block_sizes
+        ]
+        return [
+            Config(
+                block_sizes=list(blocks),
+                num_warps=warps,
+                pid_type="flat",
+                cute_chained_mma_schedule=schedule,
+            )
+            for warps in (4, 8, 2, 1)
+            for blocks in itertools.product(*choices)
+            for schedule in (
+                "coalesced",
+                "cp_async",
+                "cp_async_register",
+                "cp_async_register_reuse",
+                "cp_async_register_reuse_scan",
+            )
+        ][:96]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
 class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
     """Expose legal BT16 recurrence schedules and register caps."""
 

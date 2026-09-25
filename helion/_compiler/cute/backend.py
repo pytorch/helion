@@ -1025,6 +1025,7 @@ class CuteBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
         from ..device_ir import RootGraphInfo
+        from .chained_matmul import plan_chained_matmul
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
@@ -1066,6 +1067,14 @@ class CuteBackend(Backend):
             return
 
         device_function.cute_state.direct_affine_candidates = ()
+        chained_plan = plan_chained_matmul(graphs)
+        device_function.cute_state.chained_matmul_plan = chained_plan
+        if chained_plan is not None:
+            return
+        if config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            raise exc.BackendUnsupported(
+                "cute", "tcgen05_tmem requires a supported full-tile contraction DAG"
+            )
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
@@ -1088,6 +1097,23 @@ class CuteBackend(Backend):
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
+    def fake_subscript_shape(
+        self, tensor: torch.Tensor, index: list[object]
+    ) -> list[int | torch.SymInt]:
+        from ..backend import _validate_subscript_indices
+        from ..indexing_strategy import SubscriptIndexing
+
+        # Whole-root contraction DAGs evaluate resident kernel tensors at
+        # arbitrary coordinates. Other lowering paths still reject narrowing
+        # during code generation when they cannot preserve residency.
+        if not _validate_subscript_indices(index):
+            # Shape-only views must retain their existing dimensions. The
+            # general indexing path allocates reduction dimensions for slices,
+            # which changes symbolic axis identity and can leave dead host
+            # reduction-size bindings after a whole-root lowering.
+            return super().fake_subscript_shape(tensor, index)
+        return SubscriptIndexing.compute_shape(tensor, index)
+
     def supports_config_key(self, key: str) -> bool:
         if (
             key == "num_threads"
@@ -1101,6 +1127,7 @@ class CuteBackend(Backend):
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
             or key == "cute_affine_scan_schedule"
+            or key == "cute_chained_mma_schedule"
             or key == "cute_loop_vectorize"
             or key == "cute_loop_load_schedule"
             or key == "cute_cluster_n"
@@ -1255,7 +1282,10 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        return (
+            config_spec.cute_flash_search_enabled
+            or config_spec.cute_chained_matmul_search_enabled
+        )
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or
@@ -2088,6 +2118,11 @@ class CuteBackend(Backend):
         # The single-token rank-1 path owns the complete physical body.  The
         # original B1 schedule uses 256 threads while its batched schedule uses
         # one warp; the structural plan proves which topology was emitted.
+        chained_plan = device_function.cute_state.chained_matmul_plan
+        if chained_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({chained_plan.threads}, 1, 1)"
+            )
         single_rank1_plan = device_function.cute_state.single_token_rank1_plan
         if single_rank1_plan is not None:
             return launcher_args_with_compile_options(

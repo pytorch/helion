@@ -391,6 +391,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
 
+    def _try_codegen_chained_matmul_root(self) -> bool:
+        if self.device_function.cute_state.chained_matmul_plan is None:
+            return False
+        from .cute.chained_matmul import codegen_chained_matmul
+
+        if codegen_chained_matmul(self):
+            return True
+        self.device_function.cute_state.chained_matmul_plan = None
+        raise exc.BackendUnsupported("cute", "chained matmul failed late validation")
+
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
         if plan is None:
@@ -1427,7 +1437,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     root = root_graph_info.graph
                     if (
-                        not self._try_codegen_chunk_prepare_root()
+                        not self._try_codegen_chained_matmul_root()
+                        and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
