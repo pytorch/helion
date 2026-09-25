@@ -66,7 +66,7 @@ def _args(
     return (*values[:-2], prefix, delta)
 
 
-def _config(cache: bool | None = True, schedule: str = "full") -> helion.Config:
+def _config(cache: bool | None = True, schedule: str = "serial64") -> helion.Config:
     values: dict[str, object] = {
         "block_sizes": [128],
         "num_warps": 4,
@@ -74,6 +74,7 @@ def _config(cache: bool | None = True, schedule: str = "full") -> helion.Config:
         "cute_chained_pointwise_vectorize": True,
         "cute_chained_initialized_accumulator": True,
         "cute_chained_late_rhs_reuse": True,
+        "cute_chained_k_schedule": schedule,
         "cute_chained_auxiliary_cache": False,
     }
     if cache is not None:
@@ -81,7 +82,7 @@ def _config(cache: bool | None = True, schedule: str = "full") -> helion.Config:
     return helion.Config.from_dict(values)
 
 
-def _source(args: tuple[torch.Tensor, ...], cache=True, schedule="full") -> str:
+def _source(args: tuple[torch.Tensor, ...], cache=True, schedule="serial64") -> str:
     with _cpu_codegen():
         return _pair._bind_isolated(args).to_code(_config(cache, schedule))
 
@@ -131,7 +132,7 @@ def _inverse_vector_hoist(source: str) -> str:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("n", [32, 64, 128])
-@pytest.mark.parametrize("schedule", ["full"])
+@pytest.mark.parametrize("schedule", ["full", "serial64", "overlap64"])
 def test_whole_source_inverse_and_defaults(dtype, n, schedule) -> None:
     args = _args(dtype, n)
     disabled = _source(args, False, schedule)

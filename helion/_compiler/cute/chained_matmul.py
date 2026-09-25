@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .chained_initialized_accumulator import InitializedAccumulator
+    from .chained_k_schedule import KSchedule
     from .chained_late_rhs import LateRhsArenaPlan
     from .chained_scan_export import ScanExport
 
@@ -70,6 +71,7 @@ class ChainedMatmulPlan:
     initialized_accumulator: InitializedAccumulator | None = None
     late_rhs_reuse: LateRhsArenaPlan | None = None
     direct_output: bool = False
+    k_schedule: KSchedule | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -559,6 +561,14 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
         if not tcgen or arena is None:
             return None
         plan = dataclasses.replace(plan, late_rhs_reuse=arena)
+    k_mode = df.config.config.get("cute_chained_k_schedule", "full")
+    if k_mode != "full":
+        from .chained_k_schedule import resolve_k_schedule
+
+        schedule = resolve_k_schedule(plan, cast("str", k_mode))
+        if schedule is None:
+            return None
+        plan = dataclasses.replace(plan, k_schedule=schedule)
     if tcgen:
         from .chained_tcgen05 import supported_plan
 

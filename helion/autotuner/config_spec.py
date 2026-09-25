@@ -884,6 +884,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_STARTUP_TRANSFER_KEY,
         CUTE_CHAINED_TMEM_FREE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
@@ -892,6 +893,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
         CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_K_SCHEDULE_KEY,
+        CUTE_CHAINED_LEAF_PIPELINE_KEY,
         CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
         CUTE_CHAINED_DIRECT_OUTPUT_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
@@ -941,6 +944,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_STARTUP_TRANSFER_KEY,
         CUTE_CHAINED_TMEM_FREE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
@@ -949,6 +953,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
         CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_K_SCHEDULE_KEY,
+        CUTE_CHAINED_LEAF_PIPELINE_KEY,
         CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
         CUTE_CHAINED_DIRECT_OUTPUT_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
@@ -4290,6 +4296,10 @@ class ConfigSpec:
                 if self.cute_chained_k_schedule_search_enabled:
                     fields[CUTE_CHAINED_K_SCHEDULE_KEY] = EnumFragment(
                         choices=VALID_CUTE_CHAINED_K_SCHEDULES
+                    )
+                if self.cute_chained_tcgen05_search_enabled:
+                    fields[CUTE_CHAINED_STARTUP_TRANSFER_KEY] = EnumFragment(
+                        choices=("legacy", "tma")
                     )
                 if self.cute_chained_leaf_pipeline_search_enabled:
                     fields[CUTE_CHAINED_LEAF_PIPELINE_KEY] = EnumFragment(
