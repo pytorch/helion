@@ -8,6 +8,7 @@ from typing import ClassVar
 from typing import NamedTuple
 from typing import cast
 
+import sympy
 import torch
 
 from .. import exc
@@ -408,8 +409,6 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K = 7
 _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 
 if TYPE_CHECKING:
-    import sympy
-
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
     from .inductor_lowering import CodegenState
@@ -1643,6 +1642,86 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
     def _tcgen05_num_tiles_expr(self, *, is_device: bool) -> str:
         dims = self._tcgen05_scheduler_tile_dims_expr(is_device=is_device)
         return f"({', '.join(dims[:3])})"
+
+    def _tcgen05_work_tile_padding_predicate(self, work_tile_var: str) -> str | None:
+        """Admit logical clusters, not the scheduler's swizzle-padding slots.
+
+        The raster-along-M scheduler rounds its second *cluster* extent up
+        to the swizzle size, and reports those padding slots as valid work.
+        Test this coordinate before flattening: a padded coordinate can alias
+        a valid PID in the next outer dimension. Cluster-base comparison keeps
+        every peer of a legitimate partial edge cluster on the same schedule.
+        """
+        swizzle = self._tcgen05_l2_swizzle_size()
+        if swizzle == 1:
+            return None
+        plan = self._tcgen05_plan()
+        if plan is not None and (plan.is_clc_persistent or plan.grouped is not None):
+            # CLC cancellation and grouped worklists have separate work-space
+            # contracts; this guard covers the ordinary static scheduler only.
+            return None
+        cluster_n = self._tcgen05_cluster_n()
+        if len(self.pid_info) < 2:
+            static_tiles = 1
+        else:
+            pid = self.pid_info[1]
+            static_tiles = None
+            if isinstance(pid.numel, (int, sympy.Integer)):
+                block_size = (
+                    1
+                    if pid.block_size_var == "1"
+                    else CompileEnvironment.current()
+                    .block_sizes[pid.block_id]
+                    .from_config(DeviceFunction.current().config)
+                )
+                if isinstance(block_size, int) and block_size > 0:
+                    static_tiles = (int(pid.numel) + block_size - 1) // block_size
+        if static_tiles is not None:
+            clusters = (static_tiles + cluster_n - 1) // cluster_n
+            if clusters % swizzle == 0:
+                return None
+        logical_n = self._tcgen05_scheduler_tile_dims_expr(is_device=True)[1]
+        coord = f"{work_tile_var}.tile_idx[1]"
+        if cluster_n > 1:
+            coord = (
+                f"({coord} // cutlass.Int32({cluster_n})) * cutlass.Int32({cluster_n})"
+            )
+        return f"{coord} < ({logical_n})"
+
+    def _tcgen05_guard_logical_work(
+        self, work_tile_var: str, body: list[ast.stmt]
+    ) -> list[ast.stmt]:
+        predicate = self._tcgen05_work_tile_padding_predicate(work_tile_var)
+        if predicate is None:
+            return body
+        return [create(ast.If, test=expr_from_string(predicate), body=body, orelse=[])]
+
+    def _tcgen05_skip_padding_work(
+        self, scheduler_var: str, work_tile_var: str
+    ) -> list[ast.stmt]:
+        """Seek the next logical work item before shared-mailbox publication.
+
+        Padding is not the terminating sentinel. Always advance past it, and
+        publish invalid only after the underlying scheduler is exhausted.
+        """
+        predicate = self._tcgen05_work_tile_padding_predicate(work_tile_var)
+        if predicate is None:
+            return []
+        return [
+            create(
+                ast.While,
+                test=expr_from_string(
+                    f"{work_tile_var}.is_valid_tile and not ({predicate})"
+                ),
+                body=[
+                    statement_from_string(f"{scheduler_var}.advance_to_next_work()"),
+                    statement_from_string(
+                        f"{work_tile_var} = {scheduler_var}.get_current_work()"
+                    ),
+                ],
+                orelse=[],
+            )
+        ]
 
     def _tcgen05_num_work_clusters_expr(self, *, is_device: bool) -> str:
         """Return the number of scheduler work clusters.
@@ -2975,6 +3054,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(
                         f"{layout.work_tile_var} = {layout.tile_sched_var}.initial_work_tile_info()"
                     ),
+                    *self._tcgen05_skip_padding_work(
+                        layout.tile_sched_var, layout.work_tile_var
+                    ),
                     *layout.work_tile_publish_stmts,
                 ],
             )
@@ -3072,6 +3154,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     ),
                     statement_from_string(
                         f"{layout.work_tile_var} = {layout.tile_sched_var}.get_current_work()"
+                    ),
+                    *self._tcgen05_skip_padding_work(
+                        layout.tile_sched_var, layout.work_tile_var
                     ),
                     *layout.work_tile_publish_stmts,
                 ],
@@ -3266,6 +3351,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if (plan := self._tcgen05_plan()) is not None and plan.one_shot_role_scheduler:
             prelude.extend(per_tile_body)
         else:
+            per_tile_body = self._tcgen05_guard_logical_work(
+                work_tile_var, per_tile_body
+            )
             per_tile_body.extend(
                 [
                     statement_from_string(f"{sched_var}.advance_to_next_work()"),
@@ -4609,15 +4697,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         def per_tile_body(*, publish_if: str | None = None) -> list[ast.stmt]:
             if publish_if is None:
                 return [
-                    *publish_current_tile_stmts(),
+                    *self._tcgen05_guard_logical_work(
+                        work_tile_var, publish_current_tile_stmts()
+                    ),
                     *scheduler_advance_stmts(),
                 ]
             return [
-                create(
-                    ast.If,
-                    test=expr_from_string(publish_if),
-                    body=publish_current_tile_stmts(),
-                    orelse=[],
+                *self._tcgen05_guard_logical_work(
+                    work_tile_var,
+                    [
+                        create(
+                            ast.If,
+                            test=expr_from_string(publish_if),
+                            body=publish_current_tile_stmts(),
+                            orelse=[],
+                        )
+                    ],
                 ),
                 *scheduler_advance_stmts(),
             ]
