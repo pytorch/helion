@@ -22,6 +22,10 @@ from . import chained_matmul as chain
 from .chained_aux_cache import make_early_auxiliary_cache
 from .chained_aux_cache import make_late_auxiliary_cache
 from .chained_aux_cache import uses_early_cache
+from .chained_pointwise_cache import PointwiseReadCache
+from .chained_pointwise_inplace import PointwiseInplace
+from .chained_pointwise_inplace import raw_preload
+from .chained_pointwise_inplace import sw128_ownership
 from .chained_pointwise_unroll import PointwiseUnroll
 from .chained_scan_export import codegen_scan_exports
 from .fx_matcher import _GeneratedCodeTemplate
@@ -113,6 +117,9 @@ def _stage(
     inner: int,
     dtype: str,
     pointwise_unroll: PointwiseUnroll,
+    pointwise_cache: PointwiseReadCache,
+    pointwise_inplace: PointwiseInplace,
+    prestaged_leaf: Node | None = None,
 ) -> list[str]:
     prefix = f"chain_{stage}"
     m, n, k = plan.shapes[stage]
@@ -170,6 +177,9 @@ def _stage(
             target,
             fallback,
             pointwise_unroll,
+            pointwise_cache,
+            pointwise_inplace,
+            prestaged_leaf=prestaged_leaf,
         )
         or fallback
     )
@@ -273,6 +283,9 @@ def _pointwise_stage(
     target: str,
     fallback: list[str],
     pointwise_unroll: PointwiseUnroll,
+    pointwise_cache: PointwiseReadCache,
+    pointwise_inplace: PointwiseInplace,
+    prestaged_leaf: Node | None = None,
 ) -> list[str] | None:
     """Vectorize dense leaves, then evaluate the unchanged pointwise graph.
 
@@ -316,17 +329,31 @@ def _pointwise_stage(
     ]
     if not leaves:
         return None
-    reusable = set()
+    reusable = pointwise_cache.vector_reads(probe, names, height // rows)
     cached_vectors = {
         index
         for index, leaf in enumerate(leaves)
         if leaf.outer_stride == 0 and (leaf.node, leaf.coordinates) in reusable
     }
     if cached_vectors:
-        pass
-    raw_leaf = None
+        pointwise_cache.activated = True
+    raw_leaf = pointwise_inplace.select(leaves, shape, inner, plan.dtype)
+    if prestaged_leaf is not None:
+        matches = [i for i, leaf in enumerate(leaves) if leaf.node is prestaged_leaf]
+        if (
+            len(matches) != 1
+            or sum(node is prestaged_leaf for node, *_ in probe.loaded_inputs) != 1
+            or not sw128_ownership(shape, inner)
+            or leaves[matches[0]].dtype != plan.dtype
+            or (raw_leaf is not None and raw_leaf != matches[0])
+        ):
+            raise chain._UnsupportedChain(
+                "pre-staged leaf requires a unique same-dtype bijective vector map"
+            )
+        raw_leaf = matches[0]
     raw = f"{prefix}_{role}_raw"
     expression = chain._Expression(cg, plan, boundaries)
+    expression.bind_scan_reads = pointwise_cache.enabled
     expression.scan_inputs = scans
     expression.coordinate_names.update(names)
     element = f"{tag}_element"
@@ -336,7 +363,15 @@ def _pointwise_stage(
         )
     value = expression.value(operand, coords)
     domain = chain._operand_domain(cg, operand, coords, plan)
-    cached_reads = []
+    cached_reads = pointwise_cache.prepare(
+        expression,
+        names,
+        element,
+        tag,
+        columns,
+        height // rows,
+        column_base=None,
+    )
     invariant, varying = _hoist(expression, {names[1], element})
     pointer_lines, bounds, descriptors, loads, vector_preloads = [], [], [], [], []
     for index, leaf in enumerate(leaves):
@@ -380,6 +415,16 @@ def _pointwise_stage(
         *descriptors,
         *cached_reads,
         *vector_preloads,
+        *(
+            [
+                f"{raw}_target = {target}",
+                f"{raw}_partition = {tag}_thread.partition_S({raw}_target)",
+            ]
+            if prestaged_leaf is not None
+            else raw_preload(tag, raw, target, rows, columns, dtype, raw_leaf)
+            if raw_leaf is not None
+            else []
+        ),
         f"for {tag}_step in cutlass.range({height // rows}, unroll={pointwise_unroll.loop_factor(height // rows)}):",
         f"    {names[0]} = chain_thread // {columns} + {tag}_step * {rows}",
         chain._indent(loads),
@@ -707,6 +752,14 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
     pointwise_unroll = PointwiseUnroll(
         cast("int", df.config.config.get("cute_chained_pointwise_unroll", 1))
     )
+    pointwise_cache = PointwiseReadCache(
+        cast("bool", df.config.config.get("cute_chained_pointwise_read_cache", False))
+    )
+    pointwise_inplace = PointwiseInplace(
+        cast(
+            "bool", df.config.config.get("cute_chained_pointwise_inplace_async", False)
+        )
+    )
     dtype = CompileEnvironment.current().backend.dtype_str(plan.dtype)
     index_dtype = CompileEnvironment.current().backend.dtype_str(
         CompileEnvironment.current().index_dtype
@@ -805,12 +858,14 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     cg,
                     plan,
                     boundaries,
-                    [],
+                    [],  # Scan cache storage is not live during prefetch.
                     final_stage,
                     "b",
                     inner_axes[final_stage, "b"],
                     dtype,
                     pointwise_unroll,
+                    pointwise_cache,
+                    pointwise_inplace,
                 ),
             ]
             lines.extend(prefetch_lines)
@@ -862,6 +917,8 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                         inner_axes[stage, role],
                         dtype,
                         pointwise_unroll,
+                        pointwise_cache,
+                        pointwise_inplace,
                     )
                     lines.extend(
                         [
@@ -986,6 +1043,8 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         lines.extend(epilogue)
         lines.extend(["cute.arch.sync_threads()", "chain_allocator.free(chain_tptr)"])
         pointwise_unroll.validate()
+        pointwise_cache.validate()
+        pointwise_inplace.validate()
     except chain._UnsupportedChain as error:
         from ... import exc
 

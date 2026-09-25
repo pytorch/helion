@@ -1145,6 +1145,8 @@ class CuteBackend(Backend):
             or key == "cute_chained_mma_schedule"
             or key == "cute_chained_pointwise_vectorize"
             or key == "cute_chained_pointwise_unroll"
+            or key == "cute_chained_pointwise_read_cache"
+            or key == "cute_chained_pointwise_inplace_async"
             or key == "cute_loop_vectorize"
             or key == "cute_loop_load_schedule"
             or key == "cute_chained_auxiliary_cache"

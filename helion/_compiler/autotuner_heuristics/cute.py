@@ -20,6 +20,7 @@ from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
 from ..cute import mma_support
+from ..cute.chained_pointwise_inplace import has_inplace_candidate
 from ..cute.chained_pointwise_unroll import has_pointwise_vector_candidate
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
@@ -3056,6 +3057,13 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
             spec.cute_chained_tcgen05_search_enabled
             and has_pointwise_vector_candidate(device_ir.graphs)
         )
+        spec.cute_chained_pointwise_read_cache_search_enabled = (
+            spec.cute_chained_pointwise_unroll_search_enabled
+        )
+        spec.cute_chained_pointwise_inplace_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_inplace_candidate(device_ir.graphs)
+        )
 
         return frozenset()
 
@@ -3235,6 +3243,32 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                 )
                 for factor in VALID_CUTE_CHAINED_POINTWISE_UNROLLS[1:]
                 for seed in pointwise_seeds
+            )
+        if spec.cute_chained_pointwise_read_cache_search_enabled:
+            cache_parents = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_read_cache": True}
+                )
+                for seed in cache_parents
+            )
+        if spec.cute_chained_pointwise_inplace_search_enabled:
+            parents = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_inplace_async": True}
+                )
+                for seed in parents
             )
         return seeds
 

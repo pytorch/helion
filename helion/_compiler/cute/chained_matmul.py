@@ -544,6 +544,19 @@ class _Statement:
     inputs: frozenset[str]
 
 
+@dataclasses.dataclass(frozen=True)
+class _ReadAccess:
+    """A typed, completely masked read and its explicit scalar binding."""
+
+    expression: ast.expr
+    dtype: torch.dtype
+    statement: _Statement
+
+    @property
+    def inputs(self) -> frozenset[str]:
+        return self.statement.inputs
+
+
 class _Expression:
     """Evaluate an admitted FX expression at arbitrary logical coordinates."""
 
@@ -560,6 +573,8 @@ class _Expression:
         self.memo: dict[tuple[Node, tuple[str, ...]], str] = {}
         self.definitions: dict[str, str] = {}
         self.definition_inputs: dict[str, frozenset[str]] = {}
+        self.reads: dict[str, _ReadAccess] = {}
+        self.bind_scan_reads = False
         self.accesses: list[tuple[list[str], tuple[int, ...]]] = []
         self.global_accesses: list[tuple[Node, list[str]]] = []
         self.loaded_inputs: list[tuple[Node, tuple[str, ...], list[str], str]] = []
@@ -607,6 +622,24 @@ class _Expression:
         # Preserve spelling used by the existing symbolic index proofs.
         self.definitions[name] = expression
         return name
+
+    def bind_read(self, node: Node, expression: str) -> str:
+        value = self.bind(expression)
+        self.reads[value] = _ReadAccess(
+            ast.parse(expression, mode="eval").body,
+            node.meta["val"].dtype,
+            self.statements[-1],
+        )
+        return value
+
+    def replace_read(self, read: _ReadAccess, value: str) -> None:
+        """Redirect exactly this read binding; no emitted AST search is needed."""
+        statement = read.statement
+        assert statement.target is not None
+        statement.code = f"{statement.target} = {value}"
+        statement.inputs = _names(expr_from_string(value))
+        self.definitions[statement.target] = value
+        self.definition_inputs[statement.target] = statement.inputs
 
     def tensor_name(self, node: Node) -> str:
         df = self.cg.device_function
@@ -795,13 +828,14 @@ class _Expression:
         value = _cute_scalar_load_expr(name, indices, tensor.dtype)
         dtype = CompileEnvironment.current().backend.dtype_str(tensor.dtype)
         fallback = f"({value} if {' and '.join(bounds)} else {dtype}(0))"
-        result = self.bind(
+        result = self.bind_read(
+            node,
             _scan_input_value(
                 self,
                 source,
                 indices,
                 _staged_input_value(self, source, indices, fallback),
-            )
+            ),
         )
         self.loaded_inputs.append((node, coordinates, indices, result))
         return result
@@ -906,6 +940,8 @@ class _Expression:
                 node.meta["val"].dtype
             )
             value = f"({self.boundaries[node]}[{', '.join(coordinates)}] if {bounds} else {dtype}(0))"
+            if self.bind_scan_reads and node in self.plan.scans:
+                value = self.bind_read(node, value)
         elif node.target is memory_ops.load:
             value = self._load(node, coordinates)
         elif node.target in _VIEWS:

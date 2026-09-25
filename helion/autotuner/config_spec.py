@@ -775,6 +775,8 @@ CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
 CUTE_CHAINED_MMA_SCHEDULE_KEY = "cute_chained_mma_schedule"
 CUTE_CHAINED_POINTWISE_VECTORIZE_KEY = "cute_chained_pointwise_vectorize"
 CUTE_CHAINED_POINTWISE_UNROLL_KEY = "cute_chained_pointwise_unroll"
+CUTE_CHAINED_POINTWISE_READ_CACHE_KEY = "cute_chained_pointwise_read_cache"
+CUTE_CHAINED_POINTWISE_INPLACE_KEY = "cute_chained_pointwise_inplace_async"
 CUTE_LOOP_VECTORIZATION_KEY = "cute_loop_vectorize"
 CUTE_LOOP_LOAD_SCHEDULE_KEY = "cute_loop_load_schedule"
 VALID_CUTE_LOOP_LOAD_SCHEDULES = (
@@ -872,6 +874,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
+        CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
+        CUTE_CHAINED_POINTWISE_INPLACE_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
@@ -922,6 +926,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
+        CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
+        CUTE_CHAINED_POINTWISE_INPLACE_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
@@ -1276,6 +1282,8 @@ class ConfigSpec:
         self.cute_chained_matmul_search_enabled: bool = False
         self.cute_chained_tcgen05_search_enabled: bool = False
         self.cute_chained_pointwise_unroll_search_enabled: bool = False
+        self.cute_chained_pointwise_read_cache_search_enabled: bool = False
+        self.cute_chained_pointwise_inplace_search_enabled: bool = False
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
         # retry. ``None`` leaves all benchmark behavior unchanged.
@@ -3240,6 +3248,36 @@ class ConfigSpec:
                 raise InvalidConfig(
                     "pointwise unroll requires computed TCgen05 vector operands"
                 )
+        if self.cute_chained_pointwise_read_cache_search_enabled:
+            read_cache = config.setdefault(CUTE_CHAINED_POINTWISE_READ_CACHE_KEY, False)
+            if not isinstance(read_cache, bool):
+                raise InvalidConfig("cute_chained_pointwise_read_cache must be bool")
+            if config.get(
+                CUTE_CHAINED_MMA_SCHEDULE_KEY
+            ) != "tcgen05_tmem" or not config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY):
+                config[CUTE_CHAINED_POINTWISE_READ_CACHE_KEY] = False
+        elif CUTE_CHAINED_POINTWISE_READ_CACHE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_READ_CACHE_KEY)
+            else:
+                raise InvalidConfig(
+                    "pointwise read cache requires computed TCgen05 vector operands"
+                )
+        if self.cute_chained_pointwise_inplace_search_enabled:
+            inplace = config.setdefault(CUTE_CHAINED_POINTWISE_INPLACE_KEY, False)
+            if not isinstance(inplace, bool):
+                raise InvalidConfig("cute_chained_pointwise_inplace_async must be bool")
+            if config.get(
+                CUTE_CHAINED_MMA_SCHEDULE_KEY
+            ) != "tcgen05_tmem" or not config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY):
+                config[CUTE_CHAINED_POINTWISE_INPLACE_KEY] = False
+        elif CUTE_CHAINED_POINTWISE_INPLACE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_INPLACE_KEY)
+            else:
+                raise InvalidConfig(
+                    "inplace async requires computed same-dtype TCgen05 operands"
+                )
         if self.cute_chained_tcgen05_search_enabled:
             cache = config.setdefault(CUTE_CHAINED_AUXILIARY_CACHE_KEY, False)
             if not isinstance(cache, bool):
@@ -4044,6 +4082,14 @@ class ConfigSpec:
                     fields[CUTE_CHAINED_AUXILIARY_CACHE_KEY] = EnumFragment(
                         choices=(False, True)
                     )
+                    if self.cute_chained_pointwise_read_cache_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_READ_CACHE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_pointwise_inplace_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_INPLACE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
                 fields.update(self.user_defined_tunables)
                 return fields
             if self.cute_tcgen05_search_enabled:
