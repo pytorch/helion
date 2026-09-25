@@ -16,11 +16,30 @@ from ... import exc
 
 if TYPE_CHECKING:
     from _thread import LockType
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 
 def validate_plan(plan: dict[str, object]) -> None:
-    if plan.get("device_abi") != 1 or plan.get("threads") != 512:
+    if plan.get("device_abi") == 2:
+        if (
+            plan.get("threads") != 1024
+            or plan.get("chunk_size") != 32
+            or plan.get("numerical_policy") != "centered_bt32_fp32_rhs_v2"
+            or plan.get("task_order", "identity")
+            not in ("identity", "longest_first_precompute")
+            or plan.get("schedule", "single") != "single"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "unsupported centered BT32 schedule ABI"
+            )
+    elif (
+        plan.get("device_abi") != 1
+        or plan.get("threads") != 512
+        or plan.get("chunk_size", 16) != 16
+        or plan.get("numerical_policy", "native_bt16_bf16_rhs_v1")
+        != "native_bt16_bf16_rhs_v1"
+    ):
         raise exc.BackendUnsupported("cute", "unsupported fused prefill schedule ABI")
     if plan.get("task_order", "identity") not in (
         "identity",
@@ -123,14 +142,38 @@ def validate_args(plan: dict[str, object], args: Sequence[object]) -> None:
         raise exc.BackendUnsupported(
             "cute", "fused prefill tensor ABI does not match the proved region"
         )
+    if plan.get("device_abi") == 2 and (
+        tensors[8].dtype is not torch.int64
+        or cast("int", heads) % 8
+        or any(not tensor.is_contiguous() for tensor in tensors)
+        or any(tensor.data_ptr() % 16 for tensor in tensors)
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "centered BT32 requires contiguous 16-byte-aligned tensors, "
+            "int64 cu_seqlens, and a head count divisible by 8",
+        )
     if not _disjoint_storage(tensors):
         raise exc.BackendUnsupported(
             "cute", "fused prefill requires disjoint aligned output storage"
         )
 
 
+def get_host(plan: dict[str, object]) -> Callable[..., object]:
+    """Resolve the device implementation only from a validated numerical ABI."""
+    validate_plan(plan)
+    if plan.get("device_abi") == 2:
+        from ..._compiler.cute.chunk_prefill_bt32.device import host
+    else:
+        from ..._compiler.cute.chunk_prefill_tmem import host
+    return host
+
+
 def append_host_call(body: list[str], plan: dict[str, object]) -> None:
     validate_plan(plan)
+    if plan.get("device_abi") == 2:
+        _append_bt32_host_call(body, plan)
+        return
     heads, tokens = plan["heads"], plan["total_tokens"]
     assert isinstance(heads, int) and isinstance(tokens, int)
 
@@ -219,6 +262,71 @@ def append_host_call(body: list[str], plan: dict[str, object]) -> None:
                 )
             )
             body.append(f"    _helion_chunk_prefill_host({', '.join(stage_args)})")
+
+
+def _append_bt32_host_call(body: list[str], plan: dict[str, object]) -> None:
+    validate_plan(plan)
+    heads, tokens = plan["heads"], plan["total_tokens"]
+    assert isinstance(heads, int) and isinstance(tokens, int)
+
+    def arg(key: str) -> str:
+        index = plan[f"{key}_idx"]
+        assert type(index) is int
+        return f"arg{index}"
+
+    def view(key: str, shape: tuple[int, ...], stride: tuple[int, ...]) -> str:
+        name = f"_prefill_{key}"
+        body.append(
+            f"    {name} = cute.make_tensor({arg(key)}.iterator, "
+            f"cute.make_layout({shape!r}, stride={stride!r}))"
+        )
+        return name
+
+    activation_shape = (1, tokens, heads, 128)
+    activation_stride = (128, heads * 128, 128, 1)
+    q, k, v, gate, output = (
+        view(key, activation_shape, activation_stride)
+        for key in ("q", "k", "v", "g", "out")
+    )
+    beta = view("beta", (1, tokens, heads), (heads, heads, 1))
+    call_args = (
+        q,
+        k,
+        v,
+        gate,
+        arg("a_log"),
+        arg("dt"),
+        beta,
+        arg("cu_seqlens"),
+        "_prefill_order"
+        if plan.get("task_order") == "longest_first_precompute"
+        else "None",
+        "None",
+        arg("initial_state"),
+        output,
+        arg("final_state"),
+        "stream",
+        f"cutlass.Float32({arg('scale')})",
+        "None",
+        "None",
+        "None",
+        "0",
+        "True",
+        f"cutlass.Float32({arg('gate_scale')})",
+        "1024",
+        "cutlass.BFloat16",
+        repr(
+            "identity"
+            if plan.get("task_order") == "longest_first_precompute"
+            else plan.get("task_order", "identity")
+        ),
+    )
+    body.extend(
+        (
+            "    _helion_cute_kernel_tag = 'chunk_prefill_sm100'",
+            f"    _helion_chunk_prefill_host({', '.join(call_args)})",
+        )
+    )
 
 
 @dataclass(eq=False)

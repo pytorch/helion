@@ -26,6 +26,7 @@ from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _get_symnode
 from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _phi
+from ...language.creation_ops import full
 from ...language.matmul_ops import dot
 from ...language.memory_ops import load
 from ...language.memory_ops import store
@@ -132,6 +133,7 @@ def _chunk_prefill_static_eligible(
     target = env.config_spec.target_device_capability
     if (
         region is None
+        or not _has_chunk_prefill_engine(region)
         or env.backend_name != "cute"
         or not env.settings.fast_math
         or target is None
@@ -150,6 +152,12 @@ def _chunk_prefill_static_eligible(
         region.output,
         region.final_state,
     )
+    if region.chunk_size == 32 and (
+        region.heads % 8
+        or region.cu_seqlens.fake.dtype is not torch.int64
+        or any(not ref.fake.is_contiguous() for ref in refs)
+    ):
+        return False
     return _linear_offsets_fit_i32(
         region.total_tokens * region.heads, tuple(ref.fake.numel() for ref in refs)
     ) and _xyz_grid_fits((region.heads, region.sequences, 1))
@@ -172,7 +180,14 @@ def register_chunk_prefill_search(env: CompileEnvironment, device_ir: DeviceIR) 
         for source in specialization.sources
     )
     if specialization.classifier(values) is True:
-        env.config_spec.enable_cute_chunk_prefill_task_order_search()
+        assert region is not None
+        if region.chunk_size == 32:
+            env.config_spec.enable_cute_chunk_prefill_task_order_search(
+                schedules=("single",),
+                task_orders=("identity", "longest_first_precompute"),
+            )
+        else:
+            env.config_spec.enable_cute_chunk_prefill_task_order_search()
 
 
 def plan_chunk_prefill() -> None:
@@ -198,8 +213,15 @@ def codegen_chunk_prefill(cg: GenerateAST) -> bool:
     df = cg.device_function
     region = df.cute_state.chunk_prefill_plan
     root = cg.current_root_graph_info
-    if region is None or root is None or root.graph_id != region.root_graph_id:
+    if (
+        region is None
+        or not _has_chunk_prefill_engine(region)
+        or root is None
+        or root.graph_id != region.root_graph_id
+    ):
         return False
+    if region.chunk_size == 32:
+        return _codegen_chunk_prefill_bt32(cg)
     refs = (
         *region.inputs,
         region.initial_state,
@@ -243,6 +265,76 @@ def codegen_chunk_prefill(cg: GenerateAST) -> bool:
             ],
             "sequence_groups": min(4, region.sequences),
             "device_abi": 1,
+        }
+    )
+    df.placeholder_args.update((*names, output_scale, gate_scale))
+    df.preamble = []
+    df.body = [ast.Pass()]
+    cg.cute_uses_matmul = True
+    return True
+
+
+def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
+    """Emit the implemented centered-BT32 single-stream schedules."""
+    df = cg.device_function
+    region = df.cute_state.chunk_prefill_plan
+    root = cg.current_root_graph_info
+    if (
+        region is None
+        or not _has_chunk_prefill_engine(region)
+        or root is None
+        or root.graph_id != region.root_graph_id
+    ):
+        return False
+    if (
+        region.chunk_size != 32
+        or df.config.get(CUTE_CHUNK_PREFILL_SCHEDULE_KEY, "single") != "single"
+        or df.config.get(CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, "identity")
+        not in ("identity", "longest_first_precompute")
+    ):
+        return False
+    refs = (
+        *region.inputs,
+        region.initial_state,
+        region.cu_seqlens,
+        region.output,
+        region.final_state,
+    )
+    names = tuple(df.tensor_arg(r.fake, prefer_name=r.name).name for r in refs)
+    output_scale = df.literal_expr(region.step.output_scale.meta["val"]._sympy_())
+    gate_scale = df.literal_expr(region.step.gate_scale.meta["val"]._sympy_())
+    if not output_scale.isidentifier() or not gate_scale.isidentifier():
+        return False
+    keys = (
+        "q",
+        "k",
+        "v",
+        "g",
+        "beta",
+        "a_log",
+        "dt",
+        "initial_state",
+        "cu_seqlens",
+        "out",
+        "final_state",
+    )
+    cg.cute_wrapper_plans.append(
+        {
+            "kind": "chunk_prefill_sm100",
+            **{f"{key}_name": name for key, name in zip(keys, names, strict=True)},
+            "scale_name": output_scale,
+            "gate_scale_name": gate_scale,
+            "heads": region.heads,
+            "sequences": region.sequences,
+            "total_tokens": region.total_tokens,
+            "threads": 1024,
+            "task_order": df.config.get(CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, "identity"),
+            "schedule": "single",
+            "prefix_count": 0,
+            "sequence_groups": 1,
+            "device_abi": 2,
+            "chunk_size": 32,
+            "numerical_policy": region.numerical_policy,
         }
     )
     df.placeholder_args.update((*names, output_scale, gate_scale))
@@ -517,6 +609,8 @@ class CuteChunkPrefillStep:
     value_coordinate: torch.fx.Node
     valid: torch.fx.Node
     arithmetic_nodes: frozenset[torch.fx.Node]
+    chunk_size: int
+    numerical_policy: str
 
 
 @dataclass(frozen=True)
@@ -541,6 +635,25 @@ class CuteChunkPrefillRegion:
     output: _TensorRef
     cu_seqlens: _TensorRef
     inputs: tuple[_TensorRef, ...]
+
+    @property
+    def chunk_size(self) -> int:
+        return self.step.chunk_size
+
+    @property
+    def numerical_policy(self) -> str:
+        return self.step.numerical_policy
+
+
+def _has_chunk_prefill_engine(region: CuteChunkPrefillRegion) -> bool:
+    policy = (region.chunk_size, region.numerical_policy)
+    if policy == (16, "native_bt16_bf16_rhs_v1"):
+        return True
+    if policy == (32, "centered_bt32_fp32_rhs_v2"):
+        from .chunk_prefill_bt32 import ENGINE_AVAILABLE
+
+        return ENGINE_AVAILABLE
+    return False
 
 
 def _is_iota(node: torch.fx.Node, size: int) -> bool:
@@ -753,7 +866,7 @@ def match_chunk_prefill_region(
     token = _add(
         _add(
             _call(_new_var, _Capture("begin_placeholder")),
-            _call(operator.mul, chunk_id, 16),
+            _call(operator.mul, chunk_id, step.chunk_size),
         ),
         _Capture("token_lane"),
     )
@@ -773,9 +886,13 @@ def match_chunk_prefill_region(
         bindings,
     ):
         return None
-    if not _match(_call(tile_id, _call(_get_symnode, "16")), bindings["chunk_id"], {}):
+    if not _match(
+        _call(tile_id, _call(_get_symnode, str(step.chunk_size))),
+        bindings["chunk_id"],
+        {},
+    ):
         return None
-    if not _is_iota(step.token_coordinate, 16) or not _is_iota(
+    if not _is_iota(step.token_coordinate, step.chunk_size) or not _is_iota(
         step.feature_coordinate, key_width
     ):
         return None
@@ -853,7 +970,9 @@ def match_chunk_prefill_region(
     )
 
 
-def match_chunk_prefill_step(graph: torch.fx.Graph) -> CuteChunkPrefillStep | None:
+def _match_chunk_prefill_step_bt16(
+    graph: torch.fx.Graph,
+) -> CuteChunkPrefillStep | None:
     """Prove local-factor arithmetic without using names or workload shapes.
 
     Supported semantics retain the authoritative state in FP32.  State MMA
@@ -1111,4 +1230,368 @@ def match_chunk_prefill_step(graph: torch.fx.Graph) -> CuteChunkPrefillStep | No
         bindings["value_coordinate"],
         bindings["valid"],
         frozenset(arithmetic),
+        16,
+        "native_bt16_bf16_rhs_v1",
+    )
+
+
+def _block_inverse32(lower: object) -> object:
+    """Prove the centered BT32 carrier's two-level rounded inverse exactly."""
+    index = _Capture(
+        "inverse_index", lambda n: isinstance(n, torch.fx.Node) and _is_iota(n, 32)
+    )
+    row = _call(torch.ops.aten.unsqueeze.default, index, 1)
+    col = _call(torch.ops.aten.unsqueeze.default, index, 0)
+
+    def divide(value: object, divisor: int) -> object:
+        return _Call(
+            torch.ops.aten.div.Tensor_mode,
+            (value, divisor),
+            (("rounding_mode", "floor"),),
+        )
+
+    same_eight = _call(torch.ops.aten.eq.Tensor, divide(row, 8), divide(col, 8))
+    same_sixteen = _call(torch.ops.aten.eq.Tensor, divide(row, 16), divide(col, 16))
+    lower_eight = _call(
+        torch.ops.aten.bitwise_and.Tensor,
+        _call(
+            torch.ops.aten.bitwise_and.Tensor,
+            same_sixteen,
+            _call(
+                torch.ops.aten.ge.Scalar,
+                _call(torch.ops.aten.remainder.Scalar, row, 16),
+                8,
+            ),
+        ),
+        _call(
+            torch.ops.aten.lt.Scalar, _call(torch.ops.aten.remainder.Scalar, col, 16), 8
+        ),
+    )
+    diagonal = _where(same_eight, lower)
+    coupling = _where(lower_eight, lower)
+    diagonal2 = _dot(_cast(diagonal, torch.float16), _cast(diagonal, torch.float16))
+    diagonal4 = _dot(_cast(diagonal2, torch.float16), _cast(diagonal2, torch.float16))
+    eye = _cast(_call(torch.ops.aten.eq.Tensor, row, col), torch.float32)
+    inverse0 = _call(torch.ops.aten.sub.Tensor, eye, diagonal)
+    inverse1 = _add(
+        inverse0, _dot(_cast(inverse0, torch.float16), _cast(diagonal2, torch.float16))
+    )
+    coupling_inverse = _cast(inverse1, torch.float16)
+    inverse2 = _add(inverse1, _dot(coupling_inverse, _cast(diagonal4, torch.float16)))
+    first = _call(
+        torch.ops.aten.neg.default,
+        _dot(coupling_inverse, _cast(coupling, torch.float16)),
+    )
+    lower_left = _dot(_cast(first, torch.float16), coupling_inverse)
+    inverse16 = _cast(
+        _call(torch.ops.aten.where.self, lower_eight, lower_left, inverse2),
+        torch.bfloat16,
+    )
+    outer_mask = _call(
+        torch.ops.aten.bitwise_and.Tensor,
+        _call(torch.ops.aten.ge.Scalar, row, 16),
+        _call(torch.ops.aten.lt.Scalar, col, 16),
+    )
+    outer = _cast(_where(outer_mask, lower), torch.bfloat16)
+    first32 = _cast(
+        _call(torch.ops.aten.neg.default, _dot(inverse16, outer)), torch.bfloat16
+    )
+    lower32 = _cast(_dot(first32, inverse16), torch.bfloat16)
+    return _call(torch.ops.aten.where.self, outer_mask, lower32, inverse16)
+
+
+def _match_chunk_prefill_step_bt32(
+    graph: torch.fx.Graph,
+) -> CuteChunkPrefillStep | None:
+    """Recognize centered BT32 with FP32 residual/beta and exact cast placement.
+
+    This is an independent arithmetic policy, not a 16-to-32 tile rewrite.
+    Recognition deliberately does not make the existing BT16 emitter eligible.
+    """
+    nodes = list(graph.nodes)
+    outputs = [n for n in nodes if n.op == "output"]
+    stores = [n for n in nodes if n.op == "call_function" and n.target is store]
+    if len(outputs) != 1 or len(stores) != 1:
+        return None
+    returned = outputs[0].args[0]
+    if not isinstance(returned, (tuple, list)) or len(returned) != 1:
+        return None
+    state_output = returned[0]
+    output_store = stores[0]
+    bindings: _Bindings = {}
+    state = _Capture("state", lambda n: _dtype(n, torch.float32))
+    gamma, solved, key_restore = (
+        _Capture("gamma"),
+        _Capture("solved"),
+        _Capture("key_restore"),
+    )
+    if not _match(
+        _dot(_transpose(solved), key_restore, _mul(state, _row(gamma))),
+        state_output,
+        bindings,
+    ):
+        return None
+    inverse, rhs = _Capture("inverse"), _Capture("rhs")
+    if not _match(
+        _cast(_dot(inverse, rhs), torch.bfloat16), bindings["solved"], bindings
+    ):
+        return None
+    q_decay, k_decay = _Capture("q_decay"), _Capture("k_decay")
+    q_restore, qk = _Capture("q_restore"), _Capture("qk")
+    scale = _Capture("scale", _host_float_scalar)
+    result = _dot(qk, solved, _dot(q_restore, _cast(_transpose(state), torch.bfloat16)))
+    if len(output_store.args) != 4 or not _match(
+        _cast(result, torch.bfloat16), output_store.args[2], bindings
+    ):
+        return None
+    center_scale = _Capture("center_scale")
+    beta, raw_value = _Capture("beta"), _Capture("value")
+    projection = _mul(
+        _dot(k_decay, _cast(_transpose(state), torch.bfloat16)), center_scale
+    )
+    residual = _call(
+        torch.ops.aten.sub.Tensor, _cast(raw_value, torch.float32), projection
+    )
+    if not _match(
+        _cast(_mul(_column(beta), residual), torch.bfloat16), bindings["rhs"], bindings
+    ):
+        return None
+    token, key_inverse = _Capture("token"), _Capture("key_inverse")
+    causal = _call(torch.ops.aten.ge.Tensor, _column(token), _row(token))
+    if not _match(
+        _cast(_where(causal, _dot(q_decay, _transpose(key_inverse))), torch.bfloat16),
+        bindings["qk"],
+        bindings,
+    ):
+        return None
+    lower_pattern = _round(
+        _where(
+            _call(torch.ops.aten.gt.Tensor, _column(token), _row(token)),
+            _mul(_dot(k_decay, _transpose(key_inverse)), _column(beta)),
+        ),
+        torch.bfloat16,
+    )
+    inverse_node = bindings["inverse"]
+    if not _match(_block_inverse32(lower_pattern), inverse_node, bindings):
+        return None
+    exp_gate = _Capture("exp_gate")
+    normalized_q, normalized_k = _Capture("normalized_q"), _Capture("normalized_k")
+    restore = _Capture("restore")
+    ki_fp32 = _mul(normalized_k, _call(torch.ops.aten.reciprocal.default, exp_gate))
+    for pattern, name in (
+        (_cast(_mul(_mul(normalized_q, scale), exp_gate), torch.bfloat16), "q_decay"),
+        (_cast(_mul(normalized_k, exp_gate), torch.bfloat16), "k_decay"),
+        (_cast(ki_fp32, torch.bfloat16), "key_inverse"),
+        (
+            _cast(
+                _mul(_cast(key_inverse, torch.float32), _row(restore)), torch.bfloat16
+            ),
+            "key_restore",
+        ),
+        (
+            _cast(_mul(_cast(q_decay, torch.float32), center_scale), torch.bfloat16),
+            "q_restore",
+        ),
+    ):
+        if not _match(pattern, bindings[name], bindings):
+            return None
+    for name, raw_name in (("normalized_q", "q"), ("normalized_k", "k")):
+        raw = _cast(_Capture(raw_name), torch.float32)
+        norm = _call(
+            torch.ops.aten.rsqrt.default,
+            _add(_call(torch.ops.aten.sum.dim_IntList, _mul(raw, raw), [-1]), 1e-6),
+        )
+        if not _match(_mul(raw, _column(norm)), bindings[name], bindings):
+            return None
+    prefix, center = _Capture("prefix"), _Capture("center")
+    last_prefix = _call(
+        torch.ops.aten.sum.dim_IntList,
+        _where(_column(_call(torch.ops.aten.eq.Scalar, token, 31)), prefix),
+        [0],
+    )
+    for pattern, name in (
+        (_call(torch.ops.aten.exp2.default, last_prefix), "gamma"),
+        (
+            _call(
+                torch.ops.aten.exp2.default,
+                _call(torch.ops.aten.sub.Tensor, last_prefix, center),
+            ),
+            "restore",
+        ),
+        (
+            _call(
+                torch.ops.aten.exp2.default,
+                _call(torch.ops.aten.sub.Tensor, prefix, center),
+            ),
+            "exp_gate",
+        ),
+        (
+            _call(
+                torch.ops.aten.exp2.default,
+                _call(full, [], center, torch.float32, None),
+            ),
+            "center_scale",
+        ),
+    ):
+        if not _match(pattern, bindings[name], bindings):
+            return None
+    gate, bias, a_log = _Capture("gate"), _Capture("bias"), _Capture("a_log")
+    log2_e = _Capture("log2_e", lambda n: _static_float(n) == 1.4426950408889634)
+    gate_scale = _Capture("gate_scale", _host_float_scalar)
+    valid = _Capture("valid")
+    increment = _mul(
+        gate_scale,
+        _add(
+            _mul(
+                _call(
+                    torch.ops.aten.tanh.default,
+                    _mul(
+                        _mul(
+                            _call(torch.ops.aten.exp2.default, _mul(a_log, log2_e)),
+                            _add(_cast(gate, torch.float32), _row(bias)),
+                        ),
+                        0.5,
+                    ),
+                ),
+                0.5,
+            ),
+            0.5,
+        ),
+    )
+    scan = _call(
+        _associative_scan,
+        _Capture("scan_id"),
+        _where(_column(valid), increment),
+        0,
+        False,
+        False,
+    )
+    if not _match(scan, bindings["prefix"], bindings):
+        return None
+    # Reuse the exact gate-scale producer, not merely an equal-valued scalar.
+    if not _match(_call(operator.mul, gate_scale, 16.0), bindings["center"], bindings):
+        return None
+    if not _match(
+        _call(
+            torch.ops.aten.sigmoid.default, _cast(_Capture("beta_raw"), torch.float32)
+        ),
+        bindings["beta"],
+        bindings,
+    ):
+        return None
+    # Memory boundary proof: factors above are local SSA values.  The caller
+    # must prove row/feature coordinates against its enclosing sequential loop.
+    row, feature = _Capture("row"), _Capture("feature")
+    for name in ("q", "k", "gate"):
+        if not _match(
+            _call(
+                load,
+                _Capture(name + "_tensor"),
+                _Either(([row, feature], [_column(row), _row(feature)])),
+                _column(valid),
+                None,
+            ),
+            bindings[name],
+            bindings,
+        ):
+            return None
+    if not _match(
+        _call(load, _Capture("beta_tensor"), [row], valid, None),
+        bindings["beta_raw"],
+        bindings,
+    ):
+        return None
+    value_coordinate = _Capture("value_coordinate", equivalent=_same_tile_index)
+    if (
+        not _match(
+            _call(
+                load,
+                _Capture("value_tensor"),
+                _Either(([row, value_coordinate], [_column(row), value_coordinate])),
+                _column(valid),
+                None,
+            ),
+            bindings["value"],
+            bindings,
+        )
+        or not _match(
+            _Either(([row, value_coordinate], [_column(row), value_coordinate])),
+            output_store.args[1],
+            bindings,
+        )
+        or not _match(_column(valid), output_store.args[3], bindings)
+    ):
+        return None
+    head = _Capture("head")
+    if not _match(
+        _call(load, _Capture("bias_tensor"), [head, feature], None, None),
+        bindings["bias"],
+        bindings,
+    ):
+        return None
+    if not _match(
+        _call(load, _Capture("a_log_tensor"), [head], None, None),
+        bindings["a_log"],
+        bindings,
+    ):
+        return None
+    required_nodes = (
+        "q",
+        "k",
+        "value",
+        "gate",
+        "beta_raw",
+        "a_log",
+        "bias",
+        "gate_scale",
+        "scale",
+        "row",
+        "token",
+        "feature",
+        "valid",
+    )
+    if any(not isinstance(bindings[name], torch.fx.Node) for name in required_nodes):
+        return None
+    if any(
+        not _dtype(bindings[name], torch.bfloat16)
+        for name in ("q", "k", "value", "gate", "beta_raw")
+    ):
+        return None
+    if any(not _dtype(bindings[name], torch.float32) for name in ("a_log", "bias")):
+        return None
+    arithmetic = _ancestors(state_output) | _ancestors(output_store)
+    # No extra side effects or live numerical work may escape the proved DAG.
+    if any(
+        n not in arithmetic and n.op not in ("output", "placeholder") for n in nodes
+    ):
+        return None
+    return CuteChunkPrefillStep(
+        bindings["state"],
+        state_output,
+        output_store,
+        bindings["q"],
+        bindings["k"],
+        bindings["value"],
+        bindings["gate"],
+        bindings["beta_raw"],
+        bindings["a_log"],
+        bindings["bias"],
+        inverse_node,
+        bindings["gate_scale"],
+        bindings["scale"],
+        bindings["prefix"],
+        bindings["row"],
+        bindings["token"],
+        bindings["feature"],
+        bindings["value_coordinate"],
+        bindings["valid"],
+        frozenset(arithmetic),
+        32,
+        "centered_bt32_fp32_rhs_v2",
+    )
+
+
+def match_chunk_prefill_step(graph: torch.fx.Graph) -> CuteChunkPrefillStep | None:
+    return _match_chunk_prefill_step_bt16(graph) or _match_chunk_prefill_step_bt32(
+        graph
     )

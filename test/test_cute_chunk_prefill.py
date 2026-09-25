@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib
 from typing import TYPE_CHECKING
+from typing import Any
 
 from benchmarks.cute.kda_prefill_fused import kda_prefill_native_math
+from benchmarks.cute.kda_prefill_fused_bt32 import kda_prefill_native_math_bt32
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -41,6 +43,7 @@ def _inputs(
     *,
     key_width: int = 128,
     value_width: int = 128,
+    cu_dtype: torch.dtype = torch.int64,
     device: torch.device = DEVICE,
 ) -> tuple[object, ...]:
     with FakeTensorMode():
@@ -60,7 +63,7 @@ def _inputs(
             dtype=torch.float32,
         )
         output, final = torch.empty_like(v), torch.empty_like(state)
-        cu = torch.empty((sequences + 1,), device=device, dtype=torch.int64)
+        cu = torch.empty((sequences + 1,), device=device, dtype=cu_dtype)
     return (
         q,
         k,
@@ -81,6 +84,13 @@ def _inputs(
 @pytest.fixture(scope="module")
 def bound() -> BoundKernel:
     return kda_prefill_native_math._bind_isolated(_inputs())
+
+
+@pytest.fixture
+def bt32_bound(prefill_cpu_target: None) -> BoundKernel:
+    return kda_prefill_native_math_bt32._bind_isolated(
+        _inputs(heads=8, device=torch.device("cpu"))
+    )
 
 
 def _mutated_plan(
@@ -357,6 +367,69 @@ def test_prefill_full_search_population_obeys_tensor_constraints(
     )["block_sizes"] == [64]
 
 
+@pytest.mark.parametrize("order", ["identity", "longest_first_precompute"])
+def test_bt32_codegen_and_search_space(bt32_bound: BoundKernel, order: str) -> None:
+    assert bt32_bound.host_function is not None
+    region = bt32_bound.host_function.device_ir.cute_chunk_prefill_region
+    assert region is not None
+    assert (region.chunk_size, region.numerical_policy) == (
+        32,
+        "centered_bt32_fp32_rhs_v2",
+    )
+    spec = bt32_bound.config_spec
+    assert spec.cute_chunk_prefill_schedule is not None
+    assert spec.cute_chunk_prefill_task_order is not None
+    assert spec.cute_chunk_prefill_schedule.choices == ("single",)
+    assert spec.cute_chunk_prefill_task_order.choices == (
+        "identity",
+        "longest_first_precompute",
+    )
+    seeds = CuteChunkPrefillHeuristic.get_seed_configs(
+        bt32_bound.env, bt32_bound.host_function.device_ir
+    )
+    assert seeds is not None
+    assert {
+        (
+            seed[CUTE_CHUNK_PREFILL_TASK_ORDER_KEY],
+            seed[CUTE_CHUNK_PREFILL_SCHEDULE_KEY],
+        )
+        for seed in seeds
+    } == {
+        ("identity", "single"),
+        ("longest_first_precompute", "single"),
+    }
+    config = helion.Config(
+        block_sizes=[64],
+        cute_chunk_prefill_task_order=order,
+        cute_chunk_prefill_schedule="single",
+    )
+    source = bt32_bound.to_triton_code(config)
+    assert "'device_abi': 2" in source
+    assert "'threads': 1024" in source
+    assert "'chunk_size': 32" in source
+    assert "'numerical_policy': 'centered_bt32_fp32_rhs_v2'" in source
+    assert f"'task_order': '{order}'" in source
+    assert "'schedule': 'single'" in source
+    assert "prefix_tail" not in source
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        (CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, "longest_first"),
+        (CUTE_CHUNK_PREFILL_SCHEDULE_KEY, "prefix_tail_2"),
+        (CUTE_CHUNK_PREFILL_SCHEDULE_KEY, "prefix_tail_4"),
+    ],
+)
+def test_bt32_rejects_unimplemented_configs(
+    bt32_bound: BoundKernel, key: str, value: str
+) -> None:
+    with pytest.raises(InvalidConfig, match="must be one of"):
+        bt32_bound.config_spec.normalized_config(
+            helion.Config.from_dict({"block_sizes": [64], key: value})
+        )
+
+
 @pytest.fixture
 def prefill_cpu_target(monkeypatch: pytest.MonkeyPatch) -> None:
     # Fake CPU tensors and an explicit target let these admission/cache tests
@@ -374,9 +447,13 @@ def prefill_cpu_target(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("helion._compat._is_hip", lambda: False)
 
 
-def _assert_prefill_generic_search(bound: BoundKernel) -> None:
+def _assert_prefill_generic_search(
+    bound: BoundKernel, *, expect_matched_region: bool = True
+) -> None:
     assert bound.host_function is not None
-    assert bound.host_function.device_ir.cute_chunk_prefill_region is not None
+    assert (
+        bound.host_function.device_ir.cute_chunk_prefill_region is not None
+    ) is expect_matched_region
     spec = bound.config_spec
     assert spec.cute_chunk_prefill_task_order is None
     assert spec.cute_chunk_prefill_schedule is None
@@ -387,7 +464,28 @@ def _assert_prefill_generic_search(bound: BoundKernel) -> None:
     assert spec.block_sizes[0].autotuner_min < spec.block_sizes[0].max_size
     assert spec.block_sizes[0].max_size >= 128
     generation = spec.create_config_generation()
-    assert generation.flat_spec[generation.block_size_indices[0]].cardinality() > 1
+    cardinality = generation.flat_spec[generation.block_size_indices[0]].cardinality()
+    assert cardinality is not None and cardinality > 1
+
+
+@pytest.mark.usefixtures("prefill_cpu_target")
+@pytest.mark.parametrize(
+    ("heads", "cu_dtype", "expect_matched_region"),
+    [(7, torch.int64, True), (8, torch.int32, False)],
+)
+def test_bt32_static_guards_keep_generic_search(
+    heads: int, cu_dtype: torch.dtype, expect_matched_region: bool
+) -> None:
+    kernel = helion.kernel(
+        kda_prefill_native_math_bt32.fn,
+        backend="cute",
+        static_shapes=True,
+        fast_math=True,
+    )
+    bound = kernel._bind_isolated(
+        _inputs(heads=heads, cu_dtype=cu_dtype, device=torch.device("cpu"))
+    )
+    _assert_prefill_generic_search(bound, expect_matched_region=expect_matched_region)
 
 
 @pytest.mark.usefixtures("prefill_cpu_target")
@@ -408,12 +506,12 @@ def _assert_prefill_generic_search(bound: BoundKernel) -> None:
 def test_prefill_fallback_keeps_generic_search(
     denied: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    settings: dict[str, object] = {
+    settings: dict[str, Any] = {
         "backend": "cute",
         "static_shapes": True,
         "fast_math": True,
     }
-    geometry: dict[str, int] = {}
+    geometry: dict[str, Any] = {}
     if denied == "fast_math":
         settings["fast_math"] = False
     elif denied in ("sm90", "sm110"):
@@ -647,3 +745,91 @@ def test_prefill_segmented_concurrent_streams_and_capture(
     for tensor, snapshot in zip((*args[:8], cu), frozen, strict=True):
         assert torch.equal(tensor, snapshot)
     graph.reset()
+
+
+def test_bt32_mixed_tails_and_task_orders() -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires SM100")
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(29)
+    lengths = [0, 1, 31, 32, 33, 193]
+    tokens, heads = sum(lengths), 8
+    shape = (1, tokens, heads, 128)
+    q, k, v = (
+        torch.randn(shape, generator=generator, device=device).bfloat16()
+        for _ in range(3)
+    )
+    gate = torch.full_like(q, -8.0)
+    beta = torch.randn(shape[:-1], generator=generator, device=device).bfloat16()
+    a_log = torch.zeros(heads, device=device)
+    dt = torch.zeros((heads, 128), device=device)
+    initial = torch.randn(
+        (len(lengths), heads, 128, 128), generator=generator, device=device
+    ).mul_(0.1)
+    output, final = torch.empty_like(v), torch.empty_like(initial)
+    cu = torch.tensor([0, 0, 1, 32, 64, 97, tokens], device=device, dtype=torch.int64)
+    args = (
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        a_log,
+        dt,
+        initial,
+        output,
+        final,
+        cu,
+        128**-0.5,
+        -5 * 1.4426950408889634,
+    )
+    frozen = [tensor.clone() for tensor in (*args[:8], cu)]
+    reference_output, reference_final = torch.empty_like(v), torch.empty_like(initial)
+    reference_args = (
+        *args[:8],
+        reference_output,
+        reference_final,
+        *args[10:],
+    )
+    reference_kernel = helion.kernel(
+        kda_prefill_native_math_bt32.fn,
+        backend="triton",
+        static_shapes=True,
+        fast_math=True,
+    )
+    reference = reference_kernel._bind_isolated(reference_args).compile_config(
+        helion.Config(
+            block_sizes=[64],
+            num_warps=4,
+            num_stages=2,
+            indexing="pointer",
+            pid_type="flat",
+        )
+    )
+    reference(*reference_args)
+    bound = kda_prefill_native_math_bt32._bind_isolated(args)
+    compiled = {
+        order: bound.compile_config(
+            helion.Config(
+                block_sizes=[64],
+                cute_chunk_prefill_schedule="single",
+                cute_chunk_prefill_task_order=order,
+            )
+        )
+        for order in ("identity", "longest_first_precompute")
+    }
+    compiled["identity"](*args)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, reference_output, atol=0.005, rtol=0.02)
+    torch.testing.assert_close(final, reference_final, atol=0.01, rtol=0.02)
+    assert torch.equal(final[0], initial[0])
+    expected_output, expected_state = output.clone(), final.clone()
+    for _ in range(5):
+        output.fill_(float("nan"))
+        final.fill_(float("nan"))
+        compiled["longest_first_precompute"](*args)
+        torch.cuda.synchronize()
+        assert torch.equal(output, expected_output)
+        assert torch.equal(final, expected_state)
+    for tensor, snapshot in zip((*args[:8], cu), frozen, strict=True):
+        assert torch.equal(tensor, snapshot)
