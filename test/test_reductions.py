@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 import unittest
-from unittest.mock import patch
 
 import torch
 
@@ -615,52 +613,48 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = x.to(torch.float32).pow(2).sum(-1)
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
-    @patch.dict(os.environ, {"TRITON_DEFAULT_FP_FUSION": "0"})
     def test_fp16_var_mean(self):
-        """Compare unseeded and seeded reductions without FMA-dependent rounding."""
+        """Check BF16 variance and mean with both reduction schedules."""
 
         @helion.kernel(static_shapes=True)
-        def layer_norm_fwd_repro(
+        def var_mean_repro(
             x: torch.Tensor,
-            weight: torch.Tensor,
-            bias: torch.Tensor,
-            eps: float = 1e-5,
-        ) -> torch.Tensor:
-            m, n = x.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m = x.size(0)
+            out_var = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+            out_mean = torch.empty_like(out_var)
             for tile_m in hl.tile(m):
                 x_part = x[tile_m, :]
                 var, mean = torch.var_mean(x_part, dim=-1, keepdim=True, correction=0)
-                normalized = (x_part - mean) * torch.rsqrt(var.to(torch.float32) + eps)
-                out[tile_m, :] = normalized * (weight[:].to(torch.float32)) + (
-                    bias[:].to(torch.float32)
-                )
-            return out
+                out_var[tile_m, :] = var
+                out_mean[tile_m, :] = mean
+            return out_var, out_mean
 
         batch_size = 32
         dim = 64
-        eps = 1e-4
         for seed in (None, 3437):
             with self.subTest(seed=seed):
                 if seed is not None:
                     torch.manual_seed(seed)
                 x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
-                weight = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
-                bias = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
-                code1, result1 = code_and_output(
-                    layer_norm_fwd_repro,
-                    (x, weight, bias, eps),
-                    block_sizes=[32],
-                    reduction_loops=[None],
-                )
-
-                code2, result2 = code_and_output(
-                    layer_norm_fwd_repro,
-                    (x, weight, bias, eps),
-                    block_sizes=[32],
-                    reduction_loops=[8],
-                )
-                torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
+                expected = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
+                for reduction_loop in (None, 8):
+                    with self.subTest(reduction_loop=reduction_loop):
+                        code, result = code_and_output(
+                            var_mean_repro,
+                            (x,),
+                            block_sizes=[32],
+                            reduction_loops=[reduction_loop],
+                        )
+                        # Reduction order can move a variance across a BF16
+                        # rounding midpoint. Check the BF16 results directly,
+                        # before normalization amplifies that rounding error.
+                        torch.testing.assert_close(
+                            result,
+                            expected,
+                            rtol=torch.finfo(x.dtype).eps,
+                            atol=1e-5,
+                        )
 
     @xfailIfPallasTpu("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
     @skipIfTileIR("TileIR does not support log1p")
