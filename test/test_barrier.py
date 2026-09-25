@@ -264,7 +264,8 @@ class TestBarrier(RefEagerTestBase, TestCase):
         original_graph_count = len(device_ir.graphs)
 
         fake_backend = SimpleNamespace(
-            register_reduction_loop_config_slots=lambda *_: None
+            register_reduction_loop_config_slots=lambda *_: None,
+            allow_wide_persistent_reduction=lambda: False,
         )
         fake_env = SimpleNamespace(
             block_sizes=[_FakeRDim()],
