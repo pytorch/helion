@@ -768,6 +768,48 @@ class TestTileDependency(TestCase):
         assert relation is not None
         self.assertEqual(tuple(map(len, _materialize(relation))), (2, 2, 2))
 
+    def test_symbolic_multidimensional_tail_covers_small_outer_dimension(self) -> None:
+        shape = (8, 4099)
+        strides = (4099, 1)
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    shape=shape,
+                    strides=strides,
+                    block_ids=(10, 11),
+                    scales=(1, 1),
+                    offsets=(0, 0),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    shape=shape,
+                    strides=strides,
+                    block_ids=(20, 21),
+                    scales=(1, 1),
+                    offsets=(0, 0),
+                ),
+            ),
+            [[10, 11], [20, 21]],
+        )
+        relation = _symbolic_root_relation(
+            plan,
+            {
+                10: (1, 16),
+                11: (17, 256),
+                20: (1, 16),
+                21: (5, 1024),
+            },
+        )
+
+        self.assertIsNotNone(relation)
+        assert relation is not None
+        self.assertEqual(tuple(map(len, _materialize(relation))), (4, 4, 4, 4, 1))
+
     def test_symbolic_muse_group_widths_keep_affine_fan_in(self) -> None:
         producer_block = 256
         for groups, group_width in ((16, 1248), (13, 1536)):
@@ -2602,6 +2644,82 @@ class TestTileDependency(TestCase):
                 frozenset((1,)),
                 frozenset((0,)),
             ),
+        )
+
+    def test_fixed_width_partition_clips_final_range(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 5),), identity=0)
+        fine = CoordinateDomain((20,), ((20, 17),), kind="event", identity=7)
+        task = coordinate_axis_symbol(10)
+        publication = CoordinateRelation(
+            producer,
+            fine,
+            (
+                _CoordinateRelationPiece(
+                    ((10, 0, 5, 1),), ((20, 4 * task, 4 * task + 4, 1),)
+                ),
+            ),
+        )
+        result = KeyPartition.from_fixed_width_publication(publication)
+        assert result is not None
+        partition, incidence = result
+        self.assertEqual(
+            _materialize(partition.fine_key_count_by_coarse_key),
+            tuple(frozenset((count,)) for count in (4, 4, 4, 4, 1)),
+        )
+        assert incidence.count_by_key is not None
+        self.assertEqual(
+            _materialize(incidence.count_by_key),
+            tuple(frozenset((1,)) for _ in range(5)),
+        )
+
+    def test_fixed_width_quotient_clips_final_fiber(self) -> None:
+        producer = CoordinateDomain((10,), ((10, 17),), identity=0)
+        fine = CoordinateDomain((20,), ((20, 5),), kind="event", identity=7)
+        task = coordinate_axis_symbol(10)
+        publication = CoordinateRelation.point_map(
+            producer,
+            fine,
+            (
+                (
+                    ((10, 0, 17, 1),),
+                    (FloorDiv(task, 4),),
+                ),
+            ),
+        )
+        result = KeyPartition.from_fixed_width_publication(publication)
+        assert result is not None
+        partition, incidence = result
+        self.assertEqual(partition.fine_key_count_by_coarse_key.value_bounds(), (1, 1))
+        assert incidence.count_by_key is not None
+        self.assertEqual(
+            _materialize(incidence.count_by_key),
+            tuple(frozenset((count,)) for count in (4, 4, 4, 4, 1)),
+        )
+
+    def test_fixed_width_quotient_preserves_full_outer_axis(self) -> None:
+        producer = CoordinateDomain((10, 11), ((10, 4), (11, 17)), identity=0)
+        fine = CoordinateDomain((20, 21), ((20, 4), (21, 5)), kind="event", identity=7)
+        row = coordinate_axis_symbol(10)
+        column = coordinate_axis_symbol(11)
+        publication = CoordinateRelation.point_map(
+            producer,
+            fine,
+            (
+                (
+                    ((10, 0, 4, 1), (11, 0, 17, 1)),
+                    (row, FloorDiv(column, 4)),
+                ),
+            ),
+        )
+        result = KeyPartition.from_fixed_width_publication(publication)
+        assert result is not None
+        partition, incidence = result
+        self.assertEqual(partition.fine_key_count_by_coarse_key.value_bounds(), (1, 1))
+        assert incidence.count_by_key is not None
+        self.assertEqual(incidence.count_by_key.value_bounds(), (1, 4))
+        self.assertEqual(
+            _materialize(incidence.count_by_key),
+            tuple(frozenset((count,)) for count in (*([4] * 16), *([1] * 4))),
         )
 
     def test_separable_block_and_quotient_fibers_coarsen_exactly(self) -> None:

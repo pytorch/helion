@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 from typing import Literal
 from typing import cast
 
+import sympy
+
 from .. import exc
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
@@ -24,8 +26,6 @@ from .tile_dependency import nested_logical_axes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    import sympy
 
     _StaticProducerResolver = Callable[
         [tuple["ReadinessProducer", ...]], tuple[tuple[int, Incidence], ...] | None
@@ -47,6 +47,40 @@ def _new_relation_work_budget() -> Callable[[int], bool]:
         return remaining >= 0
 
     return charge
+
+
+def _canonical_all_rank_relation(
+    relation: CoordinateRelation,
+) -> CoordinateRelation:
+    """Collapse a union of constant peer views to one exact all-rank relation."""
+    source = relation.source_domain
+    target = relation.target_domain
+    if len(source.axis_order) != 1 or len(target.axis_order) != 1:
+        return relation
+    source_axis = source.axis_order[0]
+    target_axis = target.axis_order[0]
+    source_count = source.axis_count_expressions[source_axis]
+    target_count = target.axis_count_expressions[target_axis]
+    if source_count != target_count or not target_count.is_number:
+        return relation
+    ranks: set[int] = set()
+    for piece in relation.pieces:
+        if piece.source_bounds_items != ((source_axis, 0, source_count, 1),):
+            return relation
+        if len(piece.target_ranges) != 1:
+            return relation
+        axis, begin, end, step = piece.target_ranges[0]
+        if (
+            axis != target_axis
+            or step != 1
+            or not begin.is_number
+            or sympy.simplify(end - begin) != 1  # pyrefly: ignore[unsupported-operation]
+        ):
+            return relation
+        ranks.add(int(begin))
+    if ranks != set(range(int(target_count))):
+        return relation
+    return CoordinateRelation.total(source, target)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -103,6 +137,9 @@ class ReadinessConsumer:
     consumer_id: int
     covered_obligations: frozenset[DependencyObligation] = frozenset()
     consumer_site_id: int | None = None
+    # Consumer execution rank -> producer execution ranks for a certified
+    # symmetric-memory dependency.  Local dependencies keep ``None``.
+    rank_relation: CoordinateRelation | None = None
 
     def __post_init__(self) -> None:
         if self.incidence.keys_by_item is None:
@@ -203,7 +240,8 @@ class ReadinessEvent:
     @property
     def root_barrier_producer_root(self) -> int | None:
         if (
-            self.readiness_key_domain.size == 1
+            all(consumer.rank_relation is None for consumer in self.consumers)
+            and self.readiness_key_domain.size == 1
             and len(self.producers) == 1
             and self.producers[0].producer_site_id is None
             and self.producers[0].incidence.items_by_key.is_total()
@@ -307,6 +345,7 @@ def _record_readiness_event(
                 if previous.consumer_root == readiness_consumer.consumer_root
                 and previous.consumer_site_id == readiness_consumer.consumer_site_id
                 and previous.keys_by_consumer == readiness_consumer.keys_by_consumer
+                and previous.rank_relation == readiness_consumer.rank_relation
             ),
             None,
         )
@@ -371,6 +410,7 @@ class ReadinessCounterPlan:
         """Return whether this counter is exactly a set of root barriers."""
         if (
             self.continuation_consumer_index is not None
+            or any(consumer.rank_relation is not None for consumer in self.consumers)
             or self.readiness_key_domain.size != 1
             or len(self.producers) != 1
         ):
@@ -1643,9 +1683,16 @@ def choose_readiness_counters(
                 _supports_readiness_counter_lowering(producer)
                 for producer in event.producers
             )
+            and all(
+                consumer.consumer_site_id is not None
+                or consumer.keys_by_consumer.canonical_single_valued() is not None
+                for consumer in event.consumers
+            )
             else None
         )
-        candidates: list[tuple[KeyPartition, dict[int, Incidence]]] = []
+        candidates: list[
+            tuple[KeyPartition, dict[int, Incidence], dict[int, Incidence]]
+        ] = []
         if lowering_relations is None:
             for producer_index, producer in enumerate(event.producers):
                 if _supports_readiness_counter_lowering(producer):
@@ -1658,12 +1705,28 @@ def choose_readiness_counters(
                 )
                 if quotient is not None:
                     partition, incidence = quotient
-                    candidates.append((partition, {producer_index: incidence}))
-            for partition, known_incidences in candidates:
+                    candidates.append((partition, {producer_index: incidence}, {}))
+            for consumer_index, consumer in enumerate(event.consumers):
+                if (
+                    consumer.consumer_site_id is not None
+                    or consumer.keys_by_consumer.canonical_single_valued() is not None
+                ):
+                    continue
+                publication = consumer.incidence.keys_by_item
+                quotient = (
+                    None
+                    if publication is None or not charge(1 + len(publication.pieces))
+                    else KeyPartition.from_fixed_width_publication(publication)
+                )
+                if quotient is not None:
+                    partition, incidence = quotient
+                    candidates.append((partition, {}, {consumer_index: incidence}))
+            for partition, known_incidences, known_consumer_incidences in candidates:
                 lowering_relations = _coarsen_event(
                     event,
                     partition,
                     known_incidences=known_incidences,
+                    known_consumer_incidences=known_consumer_incidences,
                     charge=charge,
                 )
                 if lowering_relations is not None:
@@ -1746,6 +1809,43 @@ def _build_readiness_events(
         prove_nonnegative=prove_nonnegative,
     )
     site_by_id = {site.site_id: site for site in dependency_graph.execution_sites}
+    distributed_dependencies = tuple(
+        dependency
+        for dependency in symbolic_dependencies
+        if dependency.rank_relation is not None
+    )
+    invalid_distributed_dependencies = tuple(
+        dependency
+        for dependency in distributed_dependencies
+        if (
+            dependency.incidence is None
+            or (
+                dependency.producer_site_id is not None
+                and not site_by_id[dependency.producer_site_id].is_root
+            )
+            or (
+                dependency.consumer_site_id is not None
+                and not site_by_id[dependency.consumer_site_id].is_root
+            )
+            or dependency.producer_root >= dependency.consumer_root
+        )
+    )
+    if invalid_distributed_dependencies:
+        details = tuple(
+            (
+                dependency.dependency_id,
+                dependency.producer_root,
+                dependency.consumer_root,
+                dependency.producer_site_id,
+                dependency.consumer_site_id,
+                dependency.incidence is not None,
+            )
+            for dependency in invalid_distributed_dependencies
+        )
+        raise exc.CrossLoopSchedulingError(
+            "because distributed readiness currently requires an exact all-rank "
+            f"dependency between unconditional top-level roots; invalid={details}"
+        )
     exact_dependencies = tuple(
         dependency
         for dependency in symbolic_dependencies
@@ -1787,6 +1887,7 @@ def _build_readiness_events(
                 later_dependency is preceding_dependency
                 or later_site_id is None
                 or later_producers is None
+                or preceding_dependency.rank_relation != later_dependency.rank_relation
                 or preceding_dependency.consumer_root != later_dependency.consumer_root
                 or preceding_dependency.producer_root != later_dependency.producer_root
                 or not charge(
@@ -1857,7 +1958,13 @@ def _build_readiness_events(
         tuple[int, int | None, CoordinateDomain],
         dict[
             tuple[int, int | None, CoordinateDomain],
-            list[tuple[Incidence, DependencyObligation]],
+            list[
+                tuple[
+                    Incidence,
+                    DependencyObligation,
+                    CoordinateRelation | None,
+                ]
+            ],
         ],
     ] = {}
 
@@ -1869,12 +1976,13 @@ def _build_readiness_events(
         consumer_site_id: int | None,
         incidence: Incidence,
         covered_obligations: frozenset[DependencyObligation],
+        rank_relation: CoordinateRelation | None,
     ) -> None:
         relation = incidence.items_by_key
         consumer = (consumer_root, consumer_site_id, relation.source_domain)
         producer = (producer_root, producer_site_id, relation.target_domain)
         exact_relations.setdefault(consumer, {}).setdefault(producer, []).extend(
-            (incidence, obligation) for obligation in covered_obligations
+            (incidence, obligation, rank_relation) for obligation in covered_obligations
         )
 
     for dependency in exact_dependencies:
@@ -1923,6 +2031,7 @@ def _build_readiness_events(
                 ),
                 incidence=incidence,
                 covered_obligations=exact_obligations,
+                rank_relation=dependency.rank_relation,
             )
 
         if producer_is_root and consumer_is_root:
@@ -1949,6 +2058,7 @@ def _build_readiness_events(
             consumer_site_id=None,
             incidence=root_incidence,
             covered_obligations=exact_obligations,
+            rank_relation=dependency.rank_relation,
         )
 
     pending_events: dict[
@@ -1965,11 +2075,12 @@ def _build_readiness_events(
                 tuple[int, int | None, CoordinateDomain],
                 Incidence,
                 frozenset[DependencyObligation],
+                CoordinateRelation | None,
             ]
         ],
     ) -> None:
         """Keep finer readiness keys when a consumer quotient needs fanout."""
-        for producer, incidence, obligations in relations:
+        for producer, incidence, obligations, rank_relation in relations:
             producer_root, producer_site_id, producer_domain = producer
             readiness_key_domain = dataclasses.replace(
                 producer_domain,
@@ -2005,6 +2116,7 @@ def _build_readiness_events(
                         0,
                         obligations,
                         consumer_site_id,
+                        rank_relation,
                     ),
                 ),
             )
@@ -2022,6 +2134,7 @@ def _build_readiness_events(
                 tuple[int, int | None, CoordinateDomain],
                 Incidence,
                 frozenset[DependencyObligation],
+                CoordinateRelation | None,
             ]
         ] = []
         readiness_key_axis_set: set[int] = set()
@@ -2033,9 +2146,9 @@ def _build_readiness_events(
                 -1 if item[0][1] is None else item[0][1],
             ),
         ):
-            incidence, first_point = relation_points[0]
+            incidence, first_point, rank_relation = relation_points[0]
             obligations = {first_point}
-            for next_incidence, obligation in relation_points[1:]:
+            for next_incidence, obligation, next_rank_relation in relation_points[1:]:
                 if not charge(
                     1
                     + len(incidence.items_by_key.pieces)
@@ -2048,6 +2161,17 @@ def _build_readiness_events(
                     quotient_is_supported = False
                     break
                 incidence = union
+                if rank_relation != next_rank_relation:
+                    if rank_relation is None or next_rank_relation is None:
+                        quotient_is_supported = False
+                        break
+                    rank_union = CoordinateRelation.union_all(
+                        (rank_relation, next_rank_relation)
+                    )
+                    if rank_union is None:
+                        quotient_is_supported = False
+                        break
+                    rank_relation = _canonical_all_rank_relation(rank_union)
                 obligations.add(obligation)
             if not quotient_is_supported:
                 break
@@ -2056,14 +2180,16 @@ def _build_readiness_events(
                 quotient_is_supported = False
                 break
             readiness_key_axis_set.update(used_axes)
-            merged_relations.append((producer, incidence, frozenset(obligations)))
+            merged_relations.append(
+                (producer, incidence, frozenset(obligations), rank_relation)
+            )
 
         if not quotient_is_supported:
             add_producer_key_events(
                 consumer_root=consumer_root,
                 consumer_site_id=consumer_site_id,
                 relations=[
-                    (producer, incidence, frozenset((obligation,)))
+                    (producer, incidence, frozenset((obligation,)), rank_relation)
                     for producer, relation_points in sorted(
                         producers.items(),
                         key=lambda item: (
@@ -2071,17 +2197,20 @@ def _build_readiness_events(
                             -1 if item[0][1] is None else item[0][1],
                         ),
                     )
-                    for incidence, obligation in relation_points
+                    for incidence, obligation, rank_relation in relation_points
                 ],
             )
             continue
 
         if any(
             left_points & right_points
-            for left_index, (_left, _left_incidence, left_points) in enumerate(
-                merged_relations
-            )
-            for _right, _right_incidence, right_points in merged_relations[
+            for left_index, (
+                _left,
+                _left_incidence,
+                left_points,
+                _left_rank,
+            ) in enumerate(merged_relations)
+            for _right, _right_incidence, right_points, _right_rank in merged_relations[
                 left_index + 1 :
             ]
         ):
@@ -2130,8 +2259,15 @@ def _build_readiness_events(
         )
         event_producers: list[ReadinessProducer] = []
         covered_obligations: set[DependencyObligation] = set()
-        for producer, incidence, relation_points in merged_relations:
+        consumer_rank_relation: CoordinateRelation | None = None
+        rank_relation_initialized = False
+        for producer, incidence, relation_points, rank_relation in merged_relations:
             producer_root, producer_site_id, _producer_domain = producer
+            if not rank_relation_initialized:
+                consumer_rank_relation = rank_relation
+                rank_relation_initialized = True
+            elif consumer_rank_relation != rank_relation:
+                break
             if not charge(
                 1
                 + len(incidence.items_by_key.pieces)
@@ -2157,6 +2293,7 @@ def _build_readiness_events(
                         0,
                         frozenset(covered_obligations),
                         consumer_site_id,
+                        consumer_rank_relation,
                     ),
                 ),
             )
@@ -2263,7 +2400,10 @@ def derive_final_arrival_continuations(
         if len(readiness_graph.events[event_id].consumers) != 1:
             continue
         (readiness_consumer,) = plan.consumers
-        if readiness_consumer.consumer_site_id is not None:
+        if (
+            readiness_consumer.consumer_site_id is not None
+            or readiness_consumer.rank_relation is not None
+        ):
             continue
         candidate_plan = dataclasses.replace(plan, continuation_consumer_index=0)
         if not _supports_emitted_counter_plan_lowering(
@@ -2682,6 +2822,28 @@ def _supports_emitted_counter_plan_lowering(
     if not plan.consumers:
         return False
     continuation_index = plan.continuation_consumer_index
+    distributed_consumers = tuple(
+        consumer for consumer in plan.consumers if consumer.rank_relation is not None
+    )
+    if distributed_consumers:
+        if (
+            len(plan.consumers) != 1
+            or continuation_index is not None
+            or any(producer.producer_site_id is not None for producer in plan.producers)
+            or (arrival_bounds := _arrival_count_bounds(plan.producers)) is None
+            or arrival_bounds[0] <= 0
+        ):
+            return False
+        (distributed_consumer,) = distributed_consumers
+        consumer_count = distributed_consumer.incidence.count_by_key
+        if (
+            distributed_consumer.consumer_site_id is not None
+            or distributed_consumer.rank_relation is None
+            or not distributed_consumer.rank_relation.is_total()
+            or consumer_count is None
+            or consumer_count.value_bounds() != (1, 1)
+        ):
+            return False
     for producer in plan.producers:
         if not endpoint_has_supported_domain(
             producer.producer_root,
@@ -2731,6 +2893,19 @@ def _finalize_emitted_synchronization(
         if _supports_emitted_counter_plan_lowering(plan, readiness_graph.root_domains)
     )
     covered_obligations = _covered_obligations(readiness_counters)
+    distributed_obligations = frozenset(
+        obligation
+        for event in readiness_graph.events
+        for consumer in event.consumers
+        if consumer.rank_relation is not None
+        for obligation in consumer.covered_obligations
+    )
+    missing_distributed = distributed_obligations - covered_obligations
+    if missing_distributed:
+        raise exc.CrossLoopSchedulingError(
+            "distributed dependencies require exact readiness counters; "
+            f"unsupported obligations: {tuple(sorted(missing_distributed))!r}"
+        )
     root_barrier_edges = _select_root_barrier_edges(
         obligations_by_root_pair=obligations_by_root_pair,
         covered_obligations=covered_obligations,
@@ -2741,7 +2916,8 @@ def _finalize_emitted_synchronization(
         kept = tuple(
             (index, consumer)
             for index, consumer in enumerate(plan.consumers)
-            if index == plan.continuation_consumer_index
+            if consumer.rank_relation is not None
+            or index == plan.continuation_consumer_index
             or not all(
                 (producer.producer_root, consumer.consumer_root) in root_order_edges
                 for producer in plan.producers
@@ -2951,6 +3127,15 @@ def build_static_pipeline_plan(
             charge=charge,
         ),
     )
+    if cross_loop_dispatch_mode != "dynamic" and any(
+        consumer.rank_relation is not None
+        for event in readiness_graph.events
+        for consumer in event.consumers
+    ):
+        raise exc.InvalidConfig(
+            "distributed cross-loop dependencies currently require "
+            "cross_loop_pipeline='dynamic'"
+        )
     obligations_by_root_pair = dependency_graph.obligations_by_root_pair()
 
     def try_plan(

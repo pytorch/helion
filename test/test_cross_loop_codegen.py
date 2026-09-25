@@ -638,6 +638,27 @@ def specialized_quotient_chain(
 
 
 class TestCrossLoopCodegenHelpers(TestCase):
+    def test_opaque_distributed_protocol_detection(self) -> None:
+        from helion.language import distributed_ops
+
+        empty = SimpleNamespace(graphs=(SimpleNamespace(graph=torch.fx.Graph()),))
+        self.assertFalse(cross_loop_codegen._has_opaque_distributed_protocol(empty))
+
+        for target in (
+            distributed_ops.remote_barrier,
+            distributed_ops.make_async_remote_copy,
+            distributed_ops.start_async_remote_copy_descriptor,
+            distributed_ops.wait_async_remote_copy,
+            distributed_ops.wait_send_async_remote_copy,
+            distributed_ops.wait_recv_async_remote_copy,
+        ):
+            graph = torch.fx.Graph()
+            graph.call_function(target, ())
+            device_ir = SimpleNamespace(graphs=(SimpleNamespace(graph=graph),))
+            self.assertTrue(
+                cross_loop_codegen._has_opaque_distributed_protocol(device_ir)
+            )
+
     def test_blackwell_dot_root_stays_in_kernel_scope(self) -> None:
         dot_body = ast.parse("acc = tl.dot(lhs, rhs, acc=acc)\n").body
         scaled_body = ast.parse(
@@ -1283,12 +1304,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     )
                     torch.testing.assert_close(out, ((x + launch) + 1) * 2)
                 self.assertNotIn("tile_dependency_task_wait", code)
-                if producer_width < consumer_width:
-                    self.assertNotIn("tile_dependency_root_barrier", code)
-                    self.assertUsesExactReadiness(code)
-                else:
-                    self.assertIn("tile_dependency_root_barrier_wait", code)
-                    self.assertNotIn("tile_dependency_readiness_wait", code)
+                self.assertNotIn("tile_dependency_root_barrier", code)
+                self.assertUsesExactReadiness(code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -1375,8 +1392,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
-        self.assertNotIn("tile_dependency_readiness_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        self.assertUsesExactReadiness(code)
+        self.assertIn("tl.minimum(2,", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
