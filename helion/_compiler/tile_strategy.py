@@ -39,6 +39,7 @@ from .program_id import Tcgen05PersistentProgramIDs
 from .program_id import XYZProgramIDs
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -4160,6 +4161,9 @@ class DeviceGridState(DeviceLoopOrGridState):
     vec_lane_wrappers: dict[str, VecLaneWrapper] = dataclasses.field(
         default_factory=dict
     )
+    deferred_vector_ops: list[tuple[ast.For, ast.AST, Callable[[], ast.AST | None]]] = (
+        dataclasses.field(default_factory=list)
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -4176,7 +4180,9 @@ class DeviceGridState(DeviceLoopOrGridState):
             lane_var, frozenset()
         ) | {block_id}
 
-    def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
+    def _live_lane_setup(
+        self, body: list[ast.AST]
+    ) -> tuple[set[str], list[ast.AST], set[str]]:
         from .ast_read_writes import ReadWrites
 
         # Drop setup statements (per-lane index/mask defs) whose results the
@@ -4206,6 +4212,55 @@ class DeviceGridState(DeviceLoopOrGridState):
                 kept_setup.append(stmt)
                 needed |= set(rw.reads)
         kept_setup.reverse()
+        return needed, kept_setup, spliced_wrappers
+
+    def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
+        from .ast_read_writes import ReadWrites
+
+        needed, kept_setup, spliced_wrappers = self._live_lane_setup(body)
+        if self.deferred_vector_ops:
+            has_barrier = any(
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "cute.arch.sync_threads"
+                for stmt in body
+                for node in ast.walk(stmt)
+            )
+            # Root codegen can register synthetic reduction lanes that are
+            # subsequently unused (for example aliases of tile.index). Decide
+            # the innermost live lane only after the entire body is available.
+            innermost = None
+            for lane_var, _extent in self.lane_loops:
+                wrapper = self.vec_lane_wrappers.get(lane_var)
+                names = {lane_var}
+                if wrapper is not None:
+                    names.update((wrapper.vec_lane_var, wrapper.base_index_var))
+                if names & needed or lane_var in spliced_wrappers:
+                    innermost = wrapper
+            replacements = {}
+            for vloop, scalar, emit in self.deferred_vector_ops:
+                # Hoisting a load or delaying a store across a RAW barrier
+                # changes its value even when the lane scope is unchanged.
+                if (
+                    not has_barrier
+                    and innermost is not None
+                    and innermost.vloop is vloop
+                ):
+                    vector = emit()
+                    if vector is not None:
+                        replacements[id(scalar)] = vector
+            self.deferred_vector_ops.clear()
+
+            class ReplaceVectorOps(ast.NodeTransformer):
+                def visit(self, node: ast.AST) -> ast.AST:
+                    if replacement := replacements.get(id(node)):
+                        return replacement
+                    return super().visit(node)
+
+            replace = ReplaceVectorOps()
+            body = [replace.visit(stmt) for stmt in body]
+            # Accepted operations added vector-load/store splices, whose
+            # address and mask setup must participate in final liveness too.
+            needed, kept_setup, spliced_wrappers = self._live_lane_setup(body)
         # Place each setup at the shallowest lane scope that defines every
         # lane/base variable it reads.  Historically all setup statements were
         # placed in the innermost lane loop.  That is semantically correct for

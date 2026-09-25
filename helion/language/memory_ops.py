@@ -970,6 +970,8 @@ def _cute_register_tile_unroll_vec_store(
     value_expr: str,
     mask_expr: str | None,
     dtype: torch.dtype = torch.float16,
+    *,
+    lane_axis_pos: int | None = None,
 ) -> ast.stmt | None:
     """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
 
@@ -1001,7 +1003,11 @@ def _cute_register_tile_unroll_vec_store(
         index_dtype = CompileEnvironment.current().index_type()
         base_ptr_expr = f"({tensor_name}.iterator + {index_dtype}({base_index_var}))"
     else:
-        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        lane_pos = (
+            lane_axis_pos
+            if lane_axis_pos is not None
+            else _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        )
         base_exprs = list(index_exprs)
         base_exprs[lane_pos] = base_index_var
         base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
@@ -1117,6 +1123,8 @@ def _cute_register_tile_unroll_vec_hoist(
     index_exprs: list[str],
     vec_width: int,
     eviction_suffix: str = "",
+    *,
+    lane_axis_pos: int | None = None,
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
     ``PerThreadNDTileStrategy`` lane loops.
@@ -1151,7 +1159,11 @@ def _cute_register_tile_unroll_vec_hoist(
         # per-lane base so the vec load points at the start of the V-wide
         # chunk this thread owns.  The position is the last entry for a
         # row-major lhs, or the recorded position for a K-major rhs.
-        lane_pos = _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        lane_pos = (
+            lane_axis_pos
+            if lane_axis_pos is not None
+            else _cute_lane_axis_pos(strategy, block_id, index_exprs)
+        )
         base_exprs = list(index_exprs)
         base_exprs[lane_pos] = base_index_var
         base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
