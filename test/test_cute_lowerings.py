@@ -19142,10 +19142,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         the per-descriptor SMEM ring variable names, the
         producer cooperative group size (per-thread = 32 lanes,
         matching the C-input warp's 32 threads), the consumer
-        cooperative group size (per-warp = ``epi_warp_count``,
-        NOT per-thread, so cycle 3's lane-0-gated
-        ``consumer_release`` does not hang on missing per-warp
-        arrivals), and the ``defer_sync=True`` flag (so the
+        cooperative group size (per-thread = ``epi_warp_count * 32``
+        for SIMT so every reader's completion precedes its arrival),
+        and the ``defer_sync=True`` flag (so the
         cluster-deferred-init protocol coordinates with the
         AB / acc / sched pipelines).
         """
@@ -19182,11 +19181,9 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
             "cutlass.pipeline.Agent.Thread, cutlass.Int32(32))",
             code,
         )
-        # Consumer cooperative group: per-warp (epi_warp_count,
-        # NOT epi_warp_count * 32). Cycle 3's lane-0-gated
-        # ``consumer_release`` arrives once per warp.
+        # SIMT consumer cooperative group: every epilogue reader arrives.
         cfg = config.config
-        expected_consumer = int(cfg.get("tcgen05_num_epi_warps", 4))
+        expected_consumer = int(cfg.get("tcgen05_num_epi_warps", 4)) * 32
         self.assertIn(
             "tcgen05_aux_pipeline_consumer_group = "
             "cutlass.pipeline.CooperativeGroup("
@@ -19717,7 +19714,7 @@ class TestCuteTcgen05AuxPipelineCycle2a(unittest.TestCase):
         # Consumer-side: ``make_tiled_copy_D`` + ``partition_S``
         # + per-subtile ``cute.copy`` + ``tRS_rC.load()`` per
         # Quack's ``epilog_smem_load_and_partition`` pattern.
-        # Plus lane-0-gated ``consumer_release`` and state
+        # Plus per-reader SIMT ``consumer_release`` and state
         # advance.
         self.assertIn(
             "cute.make_tiled_copy_D(cute.make_copy_atom(",

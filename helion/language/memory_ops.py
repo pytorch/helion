@@ -2360,7 +2360,7 @@ def _codegen_cute_store_tcgen05_tile(
     # (``(bm_per_cta, bn)`` under 2cta; ``(bm, bn)`` otherwise) per
     # stage per subtile iteration under ``producer_acquire`` /
     # ``producer_commit`` framing; the consumer issues one
-    # ``consumer_wait`` / lane-0-gated ``consumer_release`` pair
+    # ``consumer_wait`` / mode-specific ``consumer_release`` pair
     # per subtile and feeds the SMEM stage into Quack's
     # ``tiled_copy_s2r`` flow (``make_tiled_copy_D`` against
     # ``tiled_copy_t2r`` →  ``partition_S(sC_ring)`` → per-
@@ -3112,12 +3112,15 @@ def _codegen_cute_store_tcgen05_tile(
             # ``tSR_sC = thr_copy_s2r.partition_S(sC_ring)`` selects
             # the SMEM source; ``tSR_rC`` is a re-layout view of the
             # same register memory as ``tRS_rC``). The chain reads
-            # ``tRS_rC.load()`` (== ``aux_loaded``). The post-copy
-            # lane-0-gated release plus state advance run in the
+            # ``tRS_rC.load()`` (== ``aux_loaded``). Drain the shared
+            # reads before release; assigning their register values does
+            # not force outstanding LDS completion. SIMT pipelines count
+            # every reader's arrival. TMA pipelines retain their existing
+            # elected-warp signaling protocol.
+            # The release plus state advance run in the
             # same per-subtile iteration so the producer can refill
             # the same stage on the very next persistent tile
-            # (matches the consumer cooperative-group arrive count
-            # of ``epi_warp_count`` set by
+            # (matches the mode-specific consumer arrive count set by
             # ``_emit_tcgen05_aux_pipeline_setup``).
             #
             # Note: ``partition_D(smem_stage).load()`` on
@@ -3169,10 +3172,22 @@ def _codegen_cute_store_tcgen05_tile(
                 )
             lines.extend(
                 [
+                    # The ring may be refilled immediately after release.
+                    # A warp sync or mbarrier arrival alone need not drain
+                    # the outstanding per-thread shared loads in SASS.
+                    f"{prelude_indent}cute.arch.fence_acq_rel_cta()\n",
                     (
                         f"{prelude_indent}with cute.arch.elect_one():\n"
                         f"{prelude_indent}    {aux_pipeline_name}.consumer_release("
                         f"{aux_consumer_state_name})\n"
+                        if aux_pipeline_uses_tma_load
+                        # Each SIMT reader orders its own completed reads
+                        # before its arrival. Election alone does not hand
+                        # other lanes' read completion to the elected lane.
+                        else (
+                            f"{prelude_indent}{aux_pipeline_name}.consumer_release("
+                            f"{aux_consumer_state_name})\n"
+                        )
                     ),
                     emit_pipeline_advance(
                         aux_consumer_state_name, indent=prelude_indent
@@ -5481,7 +5496,7 @@ def _codegen_cute_store_tcgen05_tile(
             )
         )
     ]
-    # C-input warp aux pipeline consumer-wait + lane-0-gated
+    # C-input warp aux pipeline consumer-wait + mode-specific
     # consumer-release framing (``cute_plan.md`` §7.5.3.2 cycle 2b).
     # Gate-closed configs (default ``c_input_warps=0`` or no aux
     # residual) keep the historical GMEM aux path. When the gate
@@ -5495,10 +5510,9 @@ def _codegen_cute_store_tcgen05_tile(
     # SMEM ring); the default TMA-store path now splices that block
     # after the c_pipeline acquire and T2R copy to keep aux fragments
     # out of the store-prefix live range. The release + ``advance``
-    # happen at the bottom of the same per-subtile iteration (after
-    # the chain has consumed ``aux_loaded``). Lane-0 gating mirrors
-    # the per-warp consumer arrive count
-    # (``epi_warp_count``) allocated on the aux pipeline.
+    # follow a CTA-scoped read-completion fence, before the chain consumes
+    # ``aux_loaded``. SIMT releases from every reader with a per-thread
+    # arrival count; TMA retains elected releases and its per-warp count.
 
     # Static-full role-local stores have no dynamic full-tile branch, so all
     # C-store invariant setup can be hoisted once. Scheduler-backed hybrid

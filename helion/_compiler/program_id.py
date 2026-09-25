@@ -5436,10 +5436,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
            ``group_modes(2, rank)`` to expose a flat subtile
            axis whose extent matches the consumer's per-CTA
            subtile count.
-        5. Build the cooperative ``TiledCopy`` once per
-           descriptor: ``make_tiled_copy_tv`` with a
-           ``(M_threads=4, N_threads=8)`` ordered layout × a
-           ``(1, 128 / dtype_bits)`` val layout and a
+        5. Build the SIMT cooperative ``TiledCopy`` once per
+           descriptor, deriving a 32-thread ordered layout from the actual
+           epilogue tile and dtype (preferring M4/N8 only when it fits), with a
+           ``(1, vector_elements)`` value layout (up to 128 bits, reduced
+           when the tile requires it) and a
            ``CopyUniversalOp`` atom. ``get_slice(lane_idx)``
            per lane.
         6. Per subtile (``cutlass.range(subtile_count,
@@ -5791,20 +5792,12 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         per_descriptor_setup_blocks: list[list[ast.stmt]] = []
         per_descriptor_subtile_blocks: list[list[str]] = []
         per_descriptor_grouped_names: list[str] = []
-        # Same N-threads = 8 / M-threads = 4 layout the producer uses
-        # for the cooperative copy. For the matmul-plan epi tile (a
-        # rectangular sub-tile of the (bm, bn) region) the lane
-        # layout is constexpr and shared across descriptors.
-        n_threads = 8
-        m_threads = 32 // n_threads
         for desc_idx, (desc, ring) in enumerate(
             zip(c_input_aux_tensor_descriptors, aux_rings, strict=True)  # type: ignore[arg-type]
         ):
             aux_tensor_name = device_function.tensor_arg(desc.host_tensor_val).name
             aux_dtype_str = env_backend.dtype_str(desc.host_tensor_val.dtype)
             dtype_bits = desc.host_tensor_val.dtype.itemsize * 8
-            copy_bits = 128
-            num_copy_elems = max(1, copy_bits // dtype_bits)
             tma_atom = ring.tma_atom
             tma_tensor = ring.tma_tensor
             if aux_use_tma_load:
@@ -5943,13 +5936,34 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 # ``CopyUniversalOp`` lowers to a SIMT ld/st pair whose
                 # vectorization is driven at runtime by the host
                 # pointer's actual alignment.
+                # Use the actual shared epilogue subtile, not (bm, bn): a
+                # fixed 4x64 BF16 copy over a 128x32 subtile aliases shared
+                # destinations and reads beyond the final global N tile.
+                # Resolve each descriptor independently because its dtype
+                # determines the number of contiguous values in 128 bits.
+                m_threads = device_function.new_var(
+                    f"tcgen05_aux_copy_m_threads_{desc_idx}"
+                )
+                n_threads = device_function.new_var(
+                    f"tcgen05_aux_copy_n_threads_{desc_idx}"
+                )
+                num_copy_elems = device_function.new_var(
+                    f"tcgen05_aux_copy_values_{desc_idx}"
+                )
                 setup.extend(
                     [
+                        statement_from_string(
+                            f"{m_threads}, {n_threads}, {num_copy_elems} = "
+                            "cutlass.const_expr(_cute_aux_copy_layout("
+                            f"cute.size({aux_epi_tile_var}[0]), "
+                            f"cute.size({aux_epi_tile_var}[1]), "
+                            f"{dtype_bits}))"
+                        ),
                         statement_from_string(
                             f"{tiled_copy_var} = cute.make_tiled_copy_tv("
                             f"cute.make_copy_atom("
                             f"cute.nvgpu.CopyUniversalOp(), {aux_dtype_str}, "
-                            f"num_bits_per_copy={copy_bits}), "
+                            f"num_bits_per_copy={num_copy_elems} * {dtype_bits}), "
                             f"cute.make_ordered_layout("
                             f"({m_threads}, {n_threads}), order=(1, 0)), "
                             f"cute.make_layout((1, {num_copy_elems})))"

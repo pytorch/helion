@@ -624,15 +624,11 @@ class _Tcgen05AuxPipelinePlan:
     ``aux_ring_index_by_step``) so multi-step chains within one
     store map cleanly onto the descriptor order.
 
-    Consumer cooperative group: **``epi_warp_count`` (per-warp,
-    NOT per-thread)**. The consumer-side flip in
-    ``memory_ops._aux_subtile_load_source`` gates
-    ``consumer_release(c_pipeline_aux)`` on ``elect_one()``
-    (matching the sched-pipeline pattern from
-    ``_build_role_local_while_with_scheduler``), so the consumer
-    arrive count is per-warp. Setting per-thread would hang the
-    handshake waiting for 31 missing per-warp arrivals per
-    stage.
+    Consumer cooperative group: TMA uses ``epi_warp_count`` elected
+    warp arrivals; SIMT uses ``epi_warp_count * 32`` reader arrivals.
+    The matching release in ``memory_ops._aux_subtile_load_source``
+    must keep the same distinction so SIMT stage reuse waits for every
+    reader, not just one lane of each warp.
     """
 
     barriers: str
@@ -10329,8 +10325,9 @@ def _emit_mma_pipeline(
                         # consumer's per-subtile loop waits, reads
                         # the active stage with the existing
                         # ``partition_C → flat_divide(epi_tile) →
-                        # partition_D`` pipeline, then lane-0
-                        # releases. Per-subtile staging reduces the
+                        # partition_D`` pipeline, then releases
+                        # (TMA elected lanes, SIMT all readers).
+                        # Per-subtile staging reduces the
                         # epilogue SMEM footprint vs whole-tile
                         # staging, but the AB ring at ``bk=128`` plus
                         # the aux/D-store rings still overshoots the
@@ -10351,9 +10348,8 @@ def _emit_mma_pipeline(
                         c_input_warp_thread_count=(
                             tcgen05_matmul_plan.c_input_warp_count * 32
                         ),
-                        # Per-warp consumer arrive count for the
-                        # lane-0-gated release — see the emitter
-                        # docstring.
+                        # The emitter uses warp count for TMA and
+                        # thread count for SIMT releases.
                         epi_warp_count=tcgen05_matmul_plan.epi_warp_count,
                         defer_sync=tcgen05_use_cluster_deferred_pipelines,
                     )
@@ -13616,7 +13612,7 @@ def _emit_tcgen05_aux_pipeline_setup(
     framed by ``producer_acquire`` / ``producer_commit`` / state
     advance; the consumer issues one ``consumer_wait`` / Quack-
     style ``tiled_copy_s2r`` ``cute.copy(SMEM_ring[stage], rmem)``
-    / lane-0 ``consumer_release`` / state advance per subtile.
+    / ``consumer_release`` / state advance per subtile.
     ``tile_shape_expr`` is the ``epi_tile`` variable name so the
     SMEM ring sizing matches the producer-side subtile copy
     extent. ``plan.stage_count`` controls the depth — cycle 10
@@ -13632,14 +13628,10 @@ def _emit_tcgen05_aux_pipeline_setup(
       arrive count is per-thread. TMA aux loads use a
       ``PipelineTmaAsync`` producer group matching the CUTLASS TMA
       pipeline convention.
-    - ``consumer_arrive_count = epi_warp_count`` (per-warp, NOT
-      per-thread). The consumer-side flip in
-      ``memory_ops._aux_subtile_load_source`` gates
-      ``consumer_release(c_pipeline_aux)`` on ``elect_one()``
-      (matching the sched-pipeline pattern from
-      ``_build_role_local_while_with_scheduler``). Setting
-      per-thread would hang the handshake waiting for 31
-      missing per-warp arrivals per stage.
+    - TMA consumers elect one arrival per warp (``epi_warp_count``).
+      SIMT consumers all arrive (``epi_warp_count * 32``), matching
+      the conditional release in ``memory_ops._aux_subtile_load_source``.
+      Both paths retain the reader fence before releasing the stage.
     - ``defer_sync`` mirrors the AB / acc / sched pipelines'
       cluster-deferred-init participation so the
       ``pipeline_init_arrive`` / ``pipeline_init_wait`` rendezvous
@@ -13720,7 +13712,7 @@ def _emit_tcgen05_aux_pipeline_setup(
                     f"{plan.consumer_group} = "
                     "cutlass.pipeline.CooperativeGroup("
                     "cutlass.pipeline.Agent.Thread, "
-                    f"cutlass.Int32({epi_warp_count}))"
+                    f"cutlass.Int32({epi_warp_count * 32}))"
                 ),
                 statement_from_string(
                     f"{plan.pipeline} = cutlass.pipeline.PipelineAsync.create("
