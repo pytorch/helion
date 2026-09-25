@@ -1687,8 +1687,12 @@ class CompileEnvironment:
         return result is sympy.true
 
     def known_multiple(self, a: sympy.Expr, b: int | torch.SymInt) -> bool:
-        if isinstance(a, (int, sympy.Integer)) and isinstance(b, int):
-            return (int(a) % b) == 0
+        a = self.specialize_expr(_to_sympy(a))
+        b_expr = self.specialize_expr(_to_sympy(b))
+        if isinstance(a, (int, sympy.Integer)) and isinstance(
+            b_expr, (int, sympy.Integer)
+        ):
+            return (int(a) % int(b_expr)) == 0
         return False
 
     @property

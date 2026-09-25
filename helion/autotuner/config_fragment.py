@@ -466,8 +466,9 @@ class NumThreadsFragment(ConfigSpecFragment):
 
     The value ``0`` means "auto": let the CuTe backend derive a thread count
     from the selected block size and shrink it as needed for the 1024-thread
-    CTA limit. Positive values are powers of two and are repaired against the
-    paired block size by ConfigGeneration before benchmarking.
+    CTA limit. Randomly sampled positive values are powers of two. Explicit
+    heuristic seeds may use any whole-warp multiple and are repaired against
+    the paired block size by ConfigGeneration before benchmarking.
     """
 
     def __init__(self, high: int) -> None:
@@ -484,7 +485,8 @@ class NumThreadsFragment(ConfigSpecFragment):
     def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
         if current == 0:
             return [1] if self.high == 1 else [1, self.high]
-        assert_integer_power_of_two(current)
+        if type(current) is not int or current < 1:
+            raise TypeError(f"Expected positive int, got {current!r}")
         neighbors = PowerOfTwoFragment(1, self.high, self.high).pattern_neighbors(
             current, radius
         )
@@ -519,7 +521,6 @@ class NumThreadsFragment(ConfigSpecFragment):
             raise TypeError(
                 f"Expected int for NumThreadsFragment, got {type(value).__name__}: {value!r}"
             )
-        assert_integer_power_of_two(value)
         return [math.log2(float(value)) + 1.0]
 
     def get_minimum(self) -> int:
