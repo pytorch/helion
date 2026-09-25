@@ -2009,14 +2009,19 @@ class ConfigSpec:
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = max(spec.autotuner_min, target)
 
-    def enable_cute_chunk_prefill_task_order_search(self) -> None:
+    def enable_cute_chunk_prefill_task_order_search(
+        self,
+        *,
+        schedules: tuple[str, ...] = ("single", "prefix_tail_2", "prefix_tail_4"),
+        task_orders: tuple[str, ...] = (
+            "identity",
+            "longest_first",
+            "longest_first_precompute",
+        ),
+    ) -> None:
         """Expose effective schedules only for a proved fused recurrence."""
-        self.cute_chunk_prefill_schedule = EnumFragment(
-            choices=("single", "prefix_tail_2", "prefix_tail_4")
-        )
-        self.cute_chunk_prefill_task_order = EnumFragment(
-            choices=("identity", "longest_first", "longest_first_precompute")
-        )
+        self.cute_chunk_prefill_schedule = EnumFragment(choices=schedules)
+        self.cute_chunk_prefill_task_order = EnumFragment(choices=task_orders)
         # Tensor-numel constraints index the frontend block coordinates. Keep
         # these coordinates in flat configs, fixed to one representative tile,
         # even though the complete-root emitter owns device geometry.

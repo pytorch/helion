@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 from types import SimpleNamespace
+from typing import cast
 import weakref
 
 import pytest
@@ -8,6 +10,8 @@ import torch
 
 from helion import exc
 from helion.runtime.cute import launcher
+from helion.runtime.cute.chunk_prefill import append_host_call
+from helion.runtime.cute.chunk_prefill import get_host
 from helion.runtime.cute.chunk_prefill import prefill_resources
 from helion.runtime.cute.chunk_prefill import validate_args
 
@@ -63,6 +67,65 @@ def _args() -> tuple[torch.Tensor, ...]:
     )
 
 
+def _bt32_plan(task_order: str = "identity", *, heads: int = 8) -> dict[str, object]:
+    return {
+        "kind": "chunk_prefill_sm100",
+        "device_abi": 2,
+        "threads": 1024,
+        "chunk_size": 32,
+        "numerical_policy": "centered_bt32_fp32_rhs_v2",
+        "heads": heads,
+        "sequences": 2,
+        "total_tokens": 16,
+        "task_order": task_order,
+        "schedule": "single",
+        "prefix_count": 0,
+        "sequence_groups": 1,
+        **{
+            f"{name}_idx": index
+            for index, name in enumerate(
+                (
+                    "q",
+                    "k",
+                    "v",
+                    "g",
+                    "beta",
+                    "a_log",
+                    "dt",
+                    "initial_state",
+                    "cu_seqlens",
+                    "out",
+                    "final_state",
+                    "scale",
+                    "gate_scale",
+                )
+            )
+        },
+    }
+
+
+def _bt32_args(*, heads: int = 8) -> tuple[object, ...]:
+    tokens, sequences = 16, 2
+    rows = tokens * heads
+    activation = torch.empty((rows, 128), dtype=torch.bfloat16)
+    state = torch.empty((sequences, heads, 128, 128), dtype=torch.float32)
+    return (
+        activation,
+        torch.empty_like(activation),
+        torch.empty_like(activation),
+        torch.empty_like(activation),
+        torch.empty((rows,), dtype=torch.bfloat16),
+        torch.empty((heads,), dtype=torch.float32),
+        torch.empty((heads, 128), dtype=torch.float32),
+        state,
+        torch.tensor([0, 0, tokens], dtype=torch.int64),
+        torch.empty_like(activation),
+        torch.empty_like(state),
+        128**-0.5,
+        -5 * 1.4426950408889634,
+    )
+
+
 def test_prefill_segmented_abi_rejects_state_rounding_and_aliases() -> None:
     args = _args()
     validate_args(_plan(), args)
@@ -71,6 +134,90 @@ def test_prefill_segmented_abi_rejects_state_rounding_and_aliases() -> None:
         invalid[index] = replacement
         with pytest.raises(exc.BackendUnsupported):
             validate_args(_plan(), invalid)
+
+
+@pytest.mark.parametrize("task_order", ["identity", "longest_first_precompute"])
+def test_bt32_plan_and_host_resolution(task_order: str) -> None:
+    pytest.importorskip("cutlass.cute")
+    plan = _bt32_plan(task_order)
+    validate_args(plan, _bt32_args())
+    assert (
+        get_host(plan).__module__ == "helion._compiler.cute.chunk_prefill_bt32.device"
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("device_abi", 1),
+        ("device_abi", 3),
+        ("threads", 512),
+        ("chunk_size", 16),
+        ("numerical_policy", "native_bt16_bf16_rhs_v1"),
+        ("task_order", "longest_first"),
+        ("schedule", "prefix_tail_2"),
+    ],
+)
+def test_bt32_rejects_forged_plan(key: str, value: object) -> None:
+    plan = _bt32_plan() | {key: value}
+    with pytest.raises(exc.BackendUnsupported):
+        append_host_call([], plan)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["int32_cu", "heads", "noncontiguous", "misaligned", "output_alias"],
+)
+def test_bt32_argument_guards(invalid: str) -> None:
+    validate_args(_bt32_plan(), _bt32_args())
+    heads = 7 if invalid == "heads" else 8
+    plan = _bt32_plan(heads=heads)
+    args = list(_bt32_args(heads=heads))
+    q = args[0]
+    assert isinstance(q, torch.Tensor)
+    if invalid == "int32_cu":
+        cu = args[8]
+        assert isinstance(cu, torch.Tensor)
+        args[8] = cu.to(torch.int32)
+    elif invalid == "noncontiguous":
+        args[0] = torch.empty((q.shape[0], 256), dtype=q.dtype)[:, ::2]
+    elif invalid == "misaligned":
+        args[0] = torch.empty(q.numel() + 1, dtype=q.dtype)[1:].view_as(q)
+    elif invalid == "output_alias":
+        args[9] = q
+    with pytest.raises(exc.BackendUnsupported):
+        validate_args(plan, args)
+
+
+@pytest.mark.parametrize("task_order", ["identity", "longest_first_precompute"])
+def test_bt32_host_call_arguments(task_order: str) -> None:
+    body: list[str] = []
+    append_host_call(body, _bt32_plan(task_order))
+    tree = ast.parse("def wrapper():\n" + "\n".join(body))
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_helion_chunk_prefill_host"
+    )
+    assert len(call.args) == 24
+    if task_order == "longest_first_precompute":
+        assert ast.unparse(call.args[8]) == "_prefill_order"
+    else:
+        assert ast.literal_eval(call.args[8]) is None
+    assert all(ast.literal_eval(call.args[index]) is None for index in (9, 15, 16, 17))
+    assert ast.unparse(call.args[10]) == "arg7"
+    assert ast.unparse(call.args[12]) == "arg10"
+    assert isinstance(call.args[18], ast.Constant)
+    assert ast.literal_eval(call.args[18]) == 0
+    assert ast.literal_eval(call.args[19]) is True
+    assert ast.literal_eval(call.args[21]) == 1024
+    assert ast.unparse(call.args[22]) == "cutlass.BFloat16"
+    assert ast.literal_eval(call.args[23]) == "identity"
+    code = "\n".join(body)
+    assert "cute.make_layout((1, 16, 8, 128), stride=(128, 1024, 128, 1))" in code
+    assert "cute.make_layout((1, 16, 8), stride=(8, 8, 1))" in code
 
 
 def test_prefill_resources_isolate_streams_and_captures(
@@ -128,7 +275,7 @@ def test_prefill_stream_fork_join_samples_origin(
 ) -> None:
     from helion.runtime.cute.chunk_prefill import PrefillResources
 
-    events = []
+    events: list[tuple[str, ...]] = []
 
     class Event:
         def __init__(self, name: str) -> None:
@@ -148,9 +295,9 @@ def test_prefill_stream_fork_join_samples_origin(
     workers = (Stream("worker0"), Stream("worker1"))
     resources = PrefillResources(
         (torch.empty(1), torch.empty(1)),
-        workers,
-        Event("ready"),
-        (Event("done0"), Event("done1")),
+        cast("tuple[torch.cuda.Stream, ...]", workers),
+        cast("torch.cuda.Event", Event("ready")),
+        cast("tuple[torch.cuda.Event, ...]", (Event("done0"), Event("done1"))),
     )
     entry = launcher._CuteLaunchArgCacheEntry((), (), (), resources.states, resources)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: origin)
@@ -198,9 +345,9 @@ def test_prefill_managed_capture_retains_stream_owners_until_reset(
     def populate():
         resource = PrefillResources(
             (torch.empty(1), torch.empty(1)),
-            (StreamOrEvent(),),
-            StreamOrEvent(),
-            (StreamOrEvent(),),
+            cast("tuple[torch.cuda.Stream, ...]", (StreamOrEvent(),)),
+            cast("torch.cuda.Event", StreamOrEvent()),
+            cast("tuple[torch.cuda.Event, ...]", (StreamOrEvent(),)),
             order=torch.empty(2, dtype=torch.int32),
         )
         kernel._helion_cute_prefill_resources["capture"] = resource
@@ -255,6 +402,8 @@ def test_prefill_precompute_single_owns_only_order(
     guard = launcher._cute_last_launch_arg_guard(kernel, args, (1, 2, 1))
     context[0] = 18
     other = prefill_resources(kernel, plan, args)
+    assert other.order is not None
+    assert resource.order is not None
     assert other.order.data_ptr() != resource.order.data_ptr()
     assert launcher._cute_launch_arg_cache_key(kernel, args, (1, 2, 1)) != key
     assert not guard.matches(kernel, args, (1, 2, 1))

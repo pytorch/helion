@@ -1976,9 +1976,9 @@ def _create_cute_wrapper(
         "_kernel": cute_kernel,
     }
     if prefill_plans:
-        from ..._compiler.cute.chunk_prefill_tmem import host
+        from .chunk_prefill import get_host
 
-        namespace["_helion_chunk_prefill_host"] = host
+        namespace["_helion_chunk_prefill_host"] = get_host(prefill_plans[0])
     elif sm100_recurrence_plans:
         from ..._compiler.cute.chunk_recurrence_sm100 import host_chain_dv2
 
