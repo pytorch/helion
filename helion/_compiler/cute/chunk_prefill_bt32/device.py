@@ -16,6 +16,7 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from ..warp_specialized_primitives import initialize_mbarrier_region
 from . import common as cm
 from .factor import factor_loop
 from .issuer import issuer_loop
@@ -32,10 +33,20 @@ NUMERICAL_POLICY = "centered_bt32_fp32_rhs_v2"
 @cute.jit
 def init_barriers(smem_base, lane):
     """Initialize the packed barrier regions cooperatively in one warp."""
-    for index in cutlass.range(lane, 9 * cm.STAGES, 32, unroll=1):
-        prims.mbarrier_init(cm.sptr(smem_base, index * 8, cutlass.Int64), 1)
-    for index in cutlass.range(lane, 4 * cm.STAGES, 32, unroll=1):
-        prims.mbarrier_init(cm.sptr(smem_base, cm.V_FREE + index * 8, cutlass.Int64), 4)
+    initialize_mbarrier_region(
+        smem_base,
+        cm.SINGLE_PRODUCER_BARRIER_OFFSET,
+        cm.SINGLE_PRODUCER_BARRIER_STAGES,
+        cm.SINGLE_PRODUCER_BARRIER_ARRIVALS,
+        lane,
+    )
+    initialize_mbarrier_region(
+        smem_base,
+        cm.FACTOR_TEAM_BARRIER_OFFSET,
+        cm.FACTOR_TEAM_BARRIER_STAGES,
+        cm.FACTOR_TEAM_BARRIER_ARRIVALS,
+        lane,
+    )
     if lane == 0:
         prims.mbarrier_init(cm.sptr(smem_base, cm.OUT_EMPTY, cutlass.Int64), 1)
         prims.mbarrier_init(cm.sptr(smem_base, cm.DONE, cutlass.Int64), 8)
@@ -96,8 +107,8 @@ def kernel(
     prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
     tmem_base = cm.sptr(smem_base, cm.TMEM_ADDR, cutlass.Int32).load()
     tmem_base = cute.arch.make_warp_uniform(tmem_base)
-    if warp < 4:
-        prims.setmaxregister(144, prims.SetMaxRegisterAction.INCREASE)
+    if warp < cm.STATE_LAST_WARP:
+        prims.setmaxregister(cm.STATE_REGISTERS, prims.SetMaxRegisterAction.INCREASE)
         state_loop(
             smem_base,
             tmem_base,
@@ -111,8 +122,8 @@ def kernel(
             lane,
             gate_scale_log2,
         )
-    elif warp < 8:
-        prims.setmaxregister(48, prims.SetMaxRegisterAction.DECREASE)
+    elif warp < cm.OUTPUT_LAST_WARP:
+        prims.setmaxregister(cm.OUTPUT_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
         output_loop(
             smem_base,
             tmem_base,
@@ -125,12 +136,12 @@ def kernel(
             warp,
             lane,
         )
-    elif warp < 12:
-        prims.setmaxregister(32, prims.SetMaxRegisterAction.DECREASE)
+    elif warp < cm.SERVICE_LAST_WARP:
+        prims.setmaxregister(cm.SERVICE_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
         if warp == 9:
             issuer_loop(smem_base, tmem_base, num_chunks)
     else:
-        prims.setmaxregister(56, prims.SetMaxRegisterAction.DECREASE)
+        prims.setmaxregister(cm.FACTOR_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
         factor_loop(
             smem_base,
             q,
@@ -150,8 +161,8 @@ def kernel(
             head,
             heads,
             num_chunks,
-            (warp - 12) // 4,
-            (warp - 12) % 4,
+            (warp - cm.FACTOR_FIRST_WARP) // 4,
+            (warp - cm.FACTOR_FIRST_WARP) % 4,
             lane,
             scale,
             gate_scale_log2,
@@ -384,5 +395,5 @@ def host(
             grid=(heads, sequences, 1),
             block=(THREADS, 1, 1),
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=cm.MIN_BLOCKS_PER_MP,
         )

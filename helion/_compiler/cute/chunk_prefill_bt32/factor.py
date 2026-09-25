@@ -18,26 +18,15 @@ from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.experimental.primitives as prims
 
 from . import common as cm
-from helion._compiler.cute.chunk_prefill_tmem import movmatrix_b16
-from helion._compiler.cute.chunk_prefill_tmem import pack_input_b16x2_to_i32
-from helion._compiler.cute.chunk_prepare_split_alias_device import mma_blockdiag_8x8_f16
-from helion._compiler.cute.chunk_prepare_split_alias_device import mma_m16n8k16_f16
-from helion._compiler.cute.chunk_prepare_split_alias_device import pack_f16x2
-from helion._compiler.cute.kda_device_primitives import mma_m16n8k16_bf16
-
-
-@cute.jit
-def sw128(row, col):
-    """BT32 segment-major SW128 byte offset, 64 BF16 features per segment."""
-    offset = (col // 64) * 4096 + row * 128 + (col % 64) * 2
-    return offset ^ (((offset >> 7) & 7) << 4)
-
-
-@cute.jit
-def sw32(row, col):
-    """32x32 inverse, 16 BF16 columns per SW32 segment."""
-    offset = (col // 16) * 1024 + row * 32 + (col % 16) * 2
-    return offset ^ (((offset >> 7) & 1) << 4)
+from helion._compiler.cute.affine_recurrence_primitives import mma_blockdiag_8x8_f16
+from helion._compiler.cute.affine_recurrence_primitives import mma_m16n8k16_bf16
+from helion._compiler.cute.affine_recurrence_primitives import mma_m16n8k16_f16
+from helion._compiler.cute.affine_recurrence_primitives import (
+    movmatrix_b16_inline as movmatrix_b16,
+)
+from helion._compiler.cute.affine_recurrence_primitives import pack_f16x2
+from helion._compiler.cute.affine_recurrence_primitives import pack_input_b16x2_to_i32
+from helion._compiler.cute.warp_specialized_primitives import copy_b16x8_async
 
 
 @cute.jit
@@ -85,12 +74,12 @@ def pairwise16(smem_base, lhs_offset, rhs_offset, row_base, col_base, lane):
         b_row = col_base + (lane // 16) * 8 + lane % 8
         b_col = k_slice * 16 + ((lane // 8) % 2) * 8
         a = prims.ldmatrix(
-            cm.sptr(smem_base, lhs_offset + sw128(a_row, a_col), cutlass.BFloat16),
+            cm.sptr(smem_base, lhs_offset + cm.sw128(a_row, a_col), cutlass.BFloat16),
             4,
             prims.MMALayout.ROW,
         )
         b = prims.ldmatrix(
-            cm.sptr(smem_base, rhs_offset + sw128(b_row, b_col), cutlass.BFloat16),
+            cm.sptr(smem_base, rhs_offset + cm.sw128(b_row, b_col), cutlass.BFloat16),
             4,
             prims.MMALayout.ROW,
         )
@@ -190,7 +179,7 @@ def store_qk_transpose(smem_base, combined_offset, acc, row_base, col_base, lane
     for pair in cutlass.range_constexpr(2):
         row = col_base + pair * 8 + lane % 8
         col = 128 + row_base + (lane // 8) * 8
-        ptr = cm.sptr(smem_base, combined_offset + sw128(row, col), cutlass.BFloat16)
+        ptr = cm.sptr(smem_base, combined_offset + cm.sw128(row, col), cutlass.BFloat16)
         prims.stmatrix(
             ptr,
             [packed[pair * 2], packed[pair * 2 + 1]],
@@ -277,7 +266,7 @@ def finish_inverse32(smem_base, work_offset, inverse_offset, lane):
     prims.stmatrix(
         cm.sptr(
             smem_base,
-            inverse_offset + sw32(16 + store_row, 16 + store_col),
+            inverse_offset + cm.sw32(16 + store_row, 16 + store_col),
             cutlass.BFloat16,
         ),
         d,
@@ -286,7 +275,9 @@ def finish_inverse32(smem_base, work_offset, inverse_offset, lane):
     )
     prims.stmatrix(
         cm.sptr(
-            smem_base, inverse_offset + sw32(store_row, store_col), cutlass.BFloat16
+            smem_base,
+            inverse_offset + cm.sw32(store_row, store_col),
+            cutlass.BFloat16,
         ),
         a,
         prims.MMALayout.COL,
@@ -295,7 +286,7 @@ def finish_inverse32(smem_base, work_offset, inverse_offset, lane):
     prims.stmatrix(
         cm.sptr(
             smem_base,
-            inverse_offset + sw32(16 + store_row, store_col),
+            inverse_offset + cm.sw32(16 + store_row, store_col),
             cutlass.BFloat16,
         ),
         bf16_pack8(coupled),
@@ -306,39 +297,12 @@ def finish_inverse32(smem_base, work_offset, inverse_offset, lane):
     prims.stmatrix(
         cm.sptr(
             smem_base,
-            inverse_offset + sw32(store_row, 16 + store_col),
+            inverse_offset + cm.sw32(store_row, 16 + store_col),
             cutlass.BFloat16,
         ),
         [zi, zi, zi, zi],
         prims.MMALayout.ROW,
         shape=prims.StoreShape.M8N8,
-    )
-
-
-@cute.jit
-def cp_async_bf16x8(destination, source, valid):
-    """Copy one aligned eight-element BF16 vector, zero-filling invalid rows."""
-    aligned_destination = cute.make_ptr(
-        destination.dtype,
-        destination.toint(),
-        destination.memspace,
-        assumed_align=16,
-    )
-    aligned_source = cute.make_ptr(
-        source.dtype,
-        source.toint(),
-        source.memspace,
-        assumed_align=16,
-    )
-    copy_size = cutlass.Int32(0)
-    if valid:
-        copy_size = cutlass.Int32(16)
-    cute.arch.cp_async_shared_global(
-        aligned_destination,
-        aligned_source,
-        16,
-        "cg",
-        cp_size=copy_size,
     )
 
 
@@ -354,25 +318,25 @@ def tail_copy_qkg(
         token = begin + cutlass.Int64(chunk * cm.BT + row)
         valid = chunk * cm.BT + row < seqlen
         source_offset = (token * heads + head) * 128 + col
-        cp_async_bf16x8(
+        copy_b16x8_async(
             cm.sptr(
                 smem_base,
-                cm.Q_RAW_PREFETCH + stage_bytes + sw128(row, col),
+                cm.Q_RAW_PREFETCH + stage_bytes + cm.sw128(row, col),
                 cutlass.BFloat16,
             ),
             q.iterator + source_offset,
             valid,
         )
-        cp_async_bf16x8(
+        copy_b16x8_async(
             cm.sptr(
                 smem_base,
-                cm.KD + stage_bytes + sw128(row, col),
+                cm.KD + stage_bytes + cm.sw128(row, col),
                 cutlass.BFloat16,
             ),
             k.iterator + source_offset,
             valid,
         )
-        cp_async_bf16x8(
+        copy_b16x8_async(
             cm.sptr(
                 smem_base,
                 cm.GATE_RAW + stage_bytes + (row * 128 + col) * 2,
@@ -394,7 +358,7 @@ def tail_copy_v(smem_base, v, begin, seqlen, head, chunk, stage_bytes, tid):
         token = begin + cutlass.Int64(chunk * cm.BT + row)
         valid = chunk * cm.BT + row < seqlen
         source_offset = (token * cutlass.Int64(v.shape[2]) + head) * 128 + col
-        cp_async_bf16x8(
+        copy_b16x8_async(
             cm.sptr(
                 smem_base,
                 cm.V + stage_bytes + (row * 128 + col) * 2,
@@ -417,7 +381,7 @@ def materialize_centered(
         item = work_pass * 128 + tid
         row = item // 16
         col = (item % 16) * 8
-        offset = sw128(row, col)
+        offset = cm.sw128(row, col)
         qv = (
             cm.sptr(
                 smem_base, cm.Q_RAW_PREFETCH + stage_bytes + offset, cutlass.BFloat16

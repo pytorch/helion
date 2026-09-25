@@ -11,6 +11,7 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from ..warp_specialized_primitives import matrix_16x16_transposed_lane_coordinates
 from . import common as cm
 from .state import tptr
 
@@ -29,11 +30,10 @@ def stage_half(
     packed = cutlass.Array(cutlass.Int32, 8, alignment=16)
     for pair in cutlass.range_constexpr(8):
         packed[pair] = cm.pack_bf16(values[pair * 2], values[pair * 2 + 1])
+    row, column = matrix_16x16_transposed_lane_coordinates(lane)
     for token_group in cutlass.range_constexpr(2):
-        matrix_id = lane // 8
-        row_in_matrix = lane & 7
-        value = local_warp * 32 + HALF * 16 + (matrix_id & 1) * 8
-        token = token_group * 16 + (matrix_id // 2) * 8 + row_in_matrix
+        value = local_warp * 32 + HALF * 16 + column
+        token = token_group * 16 + row
         pointer = cm.sptr(
             smem_base,
             cm.OUT + output_stage * 8192 + cm.sw128(token, value),

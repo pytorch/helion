@@ -1494,6 +1494,7 @@ def _plan_chunk_recurrence(
         tuple(ref.fake.numel() for ref in refs),
     ) or not _xyz_grid_fits(grid):
         return None
+    resources = pipeline.resource_plan
     return CuteChunkRecurrencePlan(
         root_graph_id=match.root_graph_id,
         heads=match.heads,
@@ -1514,11 +1515,9 @@ def _plan_chunk_recurrence(
         output_scale=match.output_scale,
         workspace_layout_version=2,
         schedule=schedule,
-        threads=(
-            _SM100_WARP_DV4_THREADS if use_sm100_warp_dv4 else _SM100_TMEM_THREADS
-        ),
+        threads=(_SM100_WARP_DV4_THREADS if use_sm100_warp_dv4 else resources.threads),
         smem_bytes=(
-            _SM100_WARP_DV4_SMEM_BYTES if use_sm100_warp_dv4 else pipeline.smem_bytes
+            _SM100_WARP_DV4_SMEM_BYTES if use_sm100_warp_dv4 else resources.shared_bytes
         ),
         device_abi=(
             _SM100_WARP_DV4_DEVICE_ABI if use_sm100_warp_dv4 else _SM100_TMEM_DEVICE_ABI
@@ -1533,12 +1532,12 @@ def _plan_chunk_recurrence(
         output_acc_stages=(2 if use_sm100_warp_dv4 else pipeline.output_acc_stages),
         output_smem_stages=(3 if use_sm100_warp_dv4 else 7),
         output_store_wait_groups=(0 if use_sm100_warp_dv4 else 6),
-        tmem_cols=(0 if use_sm100_warp_dv4 else pipeline.tmem_cols),
+        tmem_cols=(0 if use_sm100_warp_dv4 else resources.tmem_columns),
         dv_partitions=dv_partitions,
         pipeline=pipeline_name,
         compute_registers=pipeline.compute_registers,
         service_registers=pipeline.service_registers,
-        min_blocks_per_mp=pipeline.min_blocks_per_mp,
+        min_blocks_per_mp=resources.min_blocks_per_mp,
     )
 
 
@@ -1603,23 +1602,24 @@ def codegen_chunk_recurrence(cg: GenerateAST) -> bool:
     _emit_module_imports(cg, plan.schedule)
     if plan.schedule == "sm100_tmem":
         pipeline = chunk_recurrence_pipeline(plan.pipeline)
+        resources = pipeline.resource_plan
         output_scale = df.literal_expr(plan.output_scale)
         if not output_scale.isidentifier():
             return False
         if (
-            plan.threads != _SM100_TMEM_THREADS
+            plan.threads != resources.threads
             or plan.device_abi != _SM100_TMEM_DEVICE_ABI
-            or plan.smem_bytes != pipeline.smem_bytes
+            or plan.smem_bytes != resources.shared_bytes
             or plan.input_stages != pipeline.input_stages
             or plan.tma_stages != pipeline.tma_stages
             or plan.factor_tma_value_splits != 2
             or plan.output_acc_stages != pipeline.output_acc_stages
             or plan.output_smem_stages != 7
             or plan.output_store_wait_groups != 6
-            or plan.tmem_cols != pipeline.tmem_cols
+            or plan.tmem_cols != resources.tmem_columns
             or plan.compute_registers != pipeline.compute_registers
             or plan.service_registers != pipeline.service_registers
-            or plan.min_blocks_per_mp != pipeline.min_blocks_per_mp
+            or plan.min_blocks_per_mp != resources.min_blocks_per_mp
         ):
             return False
         cg.cute_wrapper_plans.append(
