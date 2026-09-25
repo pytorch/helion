@@ -19,6 +19,7 @@ import torch
 
 from .. import exc
 from .._compat import shape_env_size_hint
+from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
@@ -4448,11 +4449,17 @@ class TileStrategy:
         )
         num_stages = config.num_stages
 
-        if "tensor_descriptor" in config.indexing:
-            # Tensor descriptor + multi-stage pipelines in addition to unrolling tend to cause
-            # CUDA "misaligned address" or "unspecified launch failure" errors.
-            if range_num_stages > 0:
+        if indexing_uses_tensor_descriptor(
+            config.indexing
+        ) or indexing_uses_tensor_descriptor(config.atomic_indexing):
+            # Device-created tensor descriptors combined with multi-stage
+            # range pipelines tend to cause CUDA "misaligned address" or
+            # "unspecified launch failure" errors. Host-created descriptors
+            # do not carry that per-program construction through the range.
+            if range_num_stages > 0 and not config.host_tensor_descriptors:
                 range_num_stages = 0
+            # Host construction has not established that descriptor indexing
+            # is safe with both unrolling and a separate kernel-level pipeline.
             if range_unroll_factor > 0 and num_stages > 1:
                 range_unroll_factor = 0
         elif (

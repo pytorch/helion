@@ -48,6 +48,9 @@ from .variable_origin import TensorSizeOrigin
 log = logging.getLogger(__name__)
 
 TensorDescriptorLayoutSignature = tuple[int | None, tuple[bool, ...]]
+# CUDA TMA limits each box dimension to 256 elements. Other descriptor
+# backends have their own legality checks and must not inherit this cap.
+CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE = 256
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +90,14 @@ class TensorDescriptorLayoutGuard:
     element_size: int
     memory_op_indices: set[int] = dataclasses.field(default_factory=set)
     atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+    has_derived_block_extent: bool = False
+
+
+@dataclasses.dataclass
+class TensorDescriptorAlignmentGuard:
+    memory_op_indices: set[int] = dataclasses.field(default_factory=set)
+    atomic_op_indices: set[int] = dataclasses.field(default_factory=set)
+    requires_zero_storage_offset: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -124,24 +135,28 @@ def _is_supported_tensor_input_source(source: Source) -> bool:
     return False
 
 
-def _is_supported_tensor_descriptor_layout_guard_source(
-    source: Source,
-    root_values: typing.Mapping[str, object],
+def tensor_descriptor_runtime_alignment_signature(
+    value: object,
+) -> tuple[bool, bool]:
+    """Return the runtime alignment predicates used by descriptor codegen."""
+    if not isinstance(value, torch.Tensor) or type(value).__name__ in (
+        "FakeTensor",
+        "FunctionalTensor",
+    ):
+        return False, False
+    offset = value.storage_offset()
+    return value.data_ptr() % 16 == 0, isinstance(offset, int) and offset == 0
+
+
+def _concrete_tensor_base_is_aligned(value: object) -> bool:
+    return tensor_descriptor_runtime_alignment_signature(value)[0]
+
+
+def _concrete_tensor_satisfies_alignment_guard(
+    value: object, requires_zero_storage_offset: bool
 ) -> bool:
-    if isinstance(source, LocalSource):
-        return True
-    if isinstance(source, GetItemSource):
-        return (
-            isinstance(source.index, int)
-            and not source.index_is_slice
-            and _is_supported_tensor_descriptor_layout_guard_source(
-                source.base, root_values
-            )
-            and isinstance(
-                _replay_tensor_input_source(source.base, root_values), (list, tuple)
-            )
-        )
-    return False
+    aligned, zero_storage_offset = tensor_descriptor_runtime_alignment_signature(value)
+    return aligned and (not requires_zero_storage_offset or zero_storage_offset)
 
 
 def _replay_tensor_input_source(
@@ -411,6 +426,10 @@ class CompileEnvironment:
         self.tensor_descriptor_layout_guards: dict[
             Source, TensorDescriptorLayoutGuard
         ] = {}
+        self.tensor_descriptor_alignment_guards: dict[
+            Source, TensorDescriptorAlignmentGuard
+        ] = {}
+        self.bound_tensor_descriptor_alignments: dict[Source, bool] = {}
         self.runtime_input_specializations: dict[str, RuntimeInputSpecialization] = {}
         # Immutable classifier outputs captured from the arguments that created
         # this BoundKernel.  Codegen may run later and obtain those arguments
@@ -596,13 +615,34 @@ class CompileEnvironment:
         *,
         memory_op_index: int | None = None,
         atomic_op_index: int | None = None,
+        has_derived_block_extent: bool = False,
     ) -> None:
-        """Specialize dynamic kernels on TD-relevant stride layout predicates."""
-        if self.settings.static_shapes:
-            return
+        """Specialize kernels on replayable tensor-descriptor predicates."""
         source = self.tensor_input_source(fake_tensor)
-        if source is None or not self._is_tensor_descriptor_layout_guard_source(source):
+        has_direct_source = source is not None and _is_supported_tensor_input_source(
+            source
+        )
+        # The 16-byte base-address requirement belongs to CUDA TMA. Other
+        # tensor-descriptor backends retain their existing legality checks and
+        # must not acquire a CUDA-specific runtime specialization.
+        alignment_source = (
+            self.tensor_descriptor_alignment_source(fake_tensor)
+            if self.backend_name == "triton" and self.device.type == "cuda"
+            else None
+        )
+        if alignment_source is not None:
+            alignment_guard = self.tensor_descriptor_alignment_guards.setdefault(
+                alignment_source, TensorDescriptorAlignmentGuard()
+            )
+            if memory_op_index is not None:
+                alignment_guard.memory_op_indices.add(memory_op_index)
+            if atomic_op_index is not None:
+                alignment_guard.atomic_op_indices.add(atomic_op_index)
+            alignment_guard.requires_zero_storage_offset |= not has_direct_source
+
+        if not has_direct_source:
             return
+        assert source is not None
         guard = self.tensor_descriptor_layout_guards.setdefault(
             source,
             TensorDescriptorLayoutGuard(
@@ -614,24 +654,89 @@ class CompileEnvironment:
             guard.memory_op_indices.add(memory_op_index)
         if atomic_op_index is not None:
             guard.atomic_op_indices.add(atomic_op_index)
+        guard.has_derived_block_extent |= has_derived_block_extent
 
     def has_tensor_descriptor_layout_guard(self, fake_tensor: torch.Tensor) -> bool:
-        if self.settings.static_shapes:
-            return True
         source = self.tensor_input_source(fake_tensor)
         return (
             source is not None
-            and self._is_tensor_descriptor_layout_guard_source(source)
+            and _is_supported_tensor_input_source(source)
             and source in self.tensor_descriptor_layout_guards
         )
 
-    def _is_tensor_descriptor_layout_guard_source(self, source: Source) -> bool:
-        from .host_function import HostFunction
-
-        return _is_supported_tensor_descriptor_layout_guard_source(
-            source,
-            HostFunction.current().params.arguments,
+    def tensor_descriptor_base_is_aligned(self, fake_tensor: torch.Tensor) -> bool:
+        """Whether a tensor descriptor can prove its runtime base is 16B aligned."""
+        source = self.tensor_descriptor_alignment_source(fake_tensor)
+        if source in self.bound_tensor_descriptor_alignments:
+            return self.bound_tensor_descriptor_alignments[source]
+        runtime_value = self.runtime_value_for_tensor(fake_tensor)
+        if _concrete_tensor_base_is_aligned(runtime_value):
+            return True
+        if isinstance(runtime_value, torch.Tensor):
+            return False
+        if (
+            fake_tensor.untyped_storage()
+            not in self._symbolically_exact_layout_storages
+        ):
+            return False
+        storage_offset = fake_tensor.storage_offset()
+        return (
+            isinstance(storage_offset, int)
+            and (storage_offset * fake_tensor.element_size()) % 16 == 0
         )
+
+    def tensor_descriptor_alignment_source(
+        self, fake_tensor: torch.Tensor
+    ) -> Source | None:
+        """Find the input whose base-alignment predicate applies to ``fake_tensor``.
+
+        A zero-offset, statically exact view has the same data pointer as its
+        unique input storage owner.  Layout legality remains a separate proof;
+        this only lets the descriptor reuse that owner's runtime alignment guard.
+        """
+        source = self.tensor_input_source(fake_tensor)
+        if source is not None and _is_supported_tensor_input_source(source):
+            return source
+        storage_offset = fake_tensor.storage_offset()
+        if (
+            not isinstance(storage_offset, int)
+            or storage_offset != 0
+            or not (
+                self.settings.static_shapes
+                or self.tensor_layout_is_symbolically_exact(fake_tensor)
+            )
+            or not all(isinstance(value, int) for value in fake_tensor.size())
+            or not all(isinstance(value, int) for value in fake_tensor.stride())
+        ):
+            return None
+
+        def is_zero_offset(tensor: torch.Tensor) -> bool:
+            offset = tensor.storage_offset()
+            return isinstance(offset, int) and offset == 0
+
+        owners = tuple(
+            (tensor, candidate)
+            for tensor, candidate in self.input_sources.items()
+            if tensor.untyped_storage() == fake_tensor.untyped_storage()
+            and is_zero_offset(tensor)
+            and _is_supported_tensor_input_source(candidate)
+            and id(tensor) not in self._ambiguous_tensor_input_source_ids
+        )
+        if len(owners) != 1:
+            return None
+        return owners[0][1]
+
+    def snapshot_tensor_descriptor_alignments(
+        self, root_values: typing.Mapping[str, object]
+    ) -> None:
+        """Capture descriptor base-alignment facts for this bound kernel."""
+        self.bound_tensor_descriptor_alignments = {
+            source: _concrete_tensor_satisfies_alignment_guard(
+                value, guard.requires_zero_storage_offset
+            )
+            for source, guard in self.tensor_descriptor_alignment_guards.items()
+            if (value := _replay_tensor_input_source(source, root_values)) is not None
+        }
 
     def tensor_input_source(self, fake_tensor: torch.Tensor) -> Source | None:
         """Return a replayable source for a direct or container tensor input."""
@@ -738,9 +843,10 @@ class CompileEnvironment:
             is_exact = True
         elif factory is torch.empty_like:
             like_input = args[0] if args else kwargs.get("input")
-            is_exact = isinstance(
-                like_input, torch.Tensor
-            ) and self.tensor_layout_is_symbolically_exact(like_input)
+            is_exact = self.settings.static_shapes or (
+                isinstance(like_input, torch.Tensor)
+                and self.tensor_layout_is_symbolically_exact(like_input)
+            )
         if is_exact:
             self._symbolically_exact_layout_storages.add(result_storage)
 

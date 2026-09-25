@@ -81,7 +81,9 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
@@ -172,6 +174,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
             "cross_loop_pipeline": st.sampled_from(["barrier", "static", "dynamic"]),
+            "host_tensor_descriptors": st.booleans(),
             "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
             "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
             "cute_chunk_prepare_schedule": st.sampled_from(
@@ -510,6 +513,7 @@ class TestConfigAPI(TestCase):
             "num_stages",
             "pid_type",
             "cross_loop_pipeline",
+            "host_tensor_descriptors",
             "indexing",
         }
         compiler_internal = {
@@ -645,6 +649,79 @@ class TestConfigAPI(TestCase):
                 num_sm=1,
             )
             self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
+
+    def test_host_tensor_descriptors_require_cuda_host_support(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            xpu_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("xpu"),
+                num_sm=1,
+            )
+            self.assertTrue(cuda_spec.supports_config_key("host_tensor_descriptors"))
+            self.assertFalse(xpu_spec.supports_config_key("host_tensor_descriptors"))
+            pre_hopper_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(8, 0),
+            )
+            self.assertFalse(
+                pre_hopper_spec.supports_config_key("host_tensor_descriptors")
+            )
+
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=False,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            self.assertFalse(cuda_spec.supports_config_key("host_tensor_descriptors"))
+
+    def test_host_tensor_descriptors_autotune_and_normalize(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            choices = EnumFragment(("pointer", "tensor_descriptor"))
+            spec.indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
+
+            pointer = helion.Config(indexing="pointer", host_tensor_descriptors=True)
+            spec.normalize(pointer)
+            self.assertFalse(pointer.host_tensor_descriptors)
+
+            descriptor = helion.Config(
+                indexing="tensor_descriptor", host_tensor_descriptors=True
+            )
+            spec.normalize(descriptor)
+            self.assertTrue(descriptor.host_tensor_descriptors)
+
+            spec.indexing = ListOf(choices, length=0)
+            spec.atomic_indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
 
     def test_cute_chunk_internal_config_mapping_serialization(self) -> None:
         from helion.autotuner.local_cache import parse_cache_entry

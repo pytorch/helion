@@ -3576,9 +3576,14 @@ class TestAutotunerHeuristic(TestCase):
             zero = plain_matmul.bind(make_args(128, 0))
             first = plain_matmul.bind(make_args(128))
             rebound = plain_matmul.bind(make_args(256))
+            storage = torch.empty([128 * 128 + 1], device=DEVICE, dtype=torch.bfloat16)
+            unaligned = plain_matmul.bind(
+                (storage[1:].view(128, 128), make_args(128)[1])
+            )
 
         self.assertIsNot(first, zero)
         self.assertIs(rebound, first)
+        self.assertIs(unaligned, first)
         self.assertEqual(len(plain_matmul._bound_kernels), 2)
         self.assertEqual(zero._compiler_seed_specialization_extractors, ())
         self.assertEqual(first._compiler_seed_specialization_extractors, ())

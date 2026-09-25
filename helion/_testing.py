@@ -34,7 +34,9 @@ from ._compat import get_mtia_tunable_fragments
 from ._compat import get_tensor_descriptor_fn_name
 from ._compat import requires_torch_version
 from ._compat import supports_amd_cdna_tunables
+from ._compat import supports_host_tensor_descriptor
 from ._compat import supports_tensor_descriptor
+from ._compat import target_device_capability
 from ._dist_utils import is_master_rank
 from ._dist_utils import sync_object as sync_object
 from ._utils import counters
@@ -510,6 +512,18 @@ def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
     """Skip test unless tensor descriptors are supported."""
     # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
     return skipIfFn(lambda: not is_cuda() or not supports_tensor_descriptor(), reason)
+
+
+def skipUnlessHostTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless Triton's host tensor descriptor API is supported."""
+    return skipIfFn(
+        lambda: (
+            not is_cuda()
+            or not supports_host_tensor_descriptor()
+            or (target_device_capability() or (0, 0)) < (9, 0)
+        ),
+        reason,
+    )
 
 
 def skipUnlessTf32Supported(

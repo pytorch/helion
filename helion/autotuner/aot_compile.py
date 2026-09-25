@@ -13,10 +13,10 @@ Usage::
         -- python examples/aot_compile_example.py
 
 Writes ``<source>_<kernel>_standalone.py`` next to each kernel source file.
-Static dispatch keys include tensor dtype, shape, and stride, but never tensor
-contents. Any tensor-derived value that affects generated code must therefore
-also be exposed as a scalar/container argument or checked by the emitted runtime
-wrapper.
+Static dispatch keys include tensor dtype, shape, stride, and any descriptor
+safety predicates relevant to the generated file, but never tensor contents.
+Any tensor-derived value that affects generated code must therefore also be
+exposed as a scalar/container argument or checked by the emitted runtime wrapper.
 """
 
 from __future__ import annotations
@@ -31,21 +31,29 @@ import textwrap
 
 import torch
 
+from .._compiler.compile_environment import (
+    tensor_descriptor_runtime_alignment_signature,
+)
 from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
 from .._compiler.output_code_utils import dependency_free_runtime_source
 
 log: logging.Logger = logging.getLogger(__name__)
 
 
-def _standalone_value_key(value: object) -> tuple[object, ...]:
+def _standalone_value_key(
+    value: object, *, tensor_descriptor_guards: bool = False
+) -> tuple[object, ...]:
     """Normalize one static call value into a deterministic literal-safe key."""
     if isinstance(value, torch.Tensor):
-        return (
+        result = (
             "tensor",
             str(value.dtype),
             tuple(value.shape),
             tuple(value.stride()),
         )
+        if tensor_descriptor_guards:
+            return (*result, *tensor_descriptor_runtime_alignment_signature(value))
+        return result
     if value is None:
         return ("none",)
     if type(value) is bool:
@@ -61,12 +69,35 @@ def _standalone_value_key(value: object) -> tuple[object, ...]:
     if isinstance(value, torch.device):
         return ("device", str(value))
     if type(value) is tuple:
-        return ("tuple", tuple(_standalone_value_key(item) for item in value))
+        return (
+            "tuple",
+            tuple(
+                _standalone_value_key(
+                    item, tensor_descriptor_guards=tensor_descriptor_guards
+                )
+                for item in value
+            ),
+        )
     if type(value) is list:
-        return ("list", tuple(_standalone_value_key(item) for item in value))
+        return (
+            "list",
+            tuple(
+                _standalone_value_key(
+                    item, tensor_descriptor_guards=tensor_descriptor_guards
+                )
+                for item in value
+            ),
+        )
     if type(value) is dict:
         items = [
-            (_standalone_value_key(key), _standalone_value_key(item))
+            (
+                _standalone_value_key(
+                    key, tensor_descriptor_guards=tensor_descriptor_guards
+                ),
+                _standalone_value_key(
+                    item, tensor_descriptor_guards=tensor_descriptor_guards
+                ),
+            )
             for key, item in value.items()
         ]
         return ("dict", tuple(sorted(items, key=repr)))
@@ -76,9 +107,13 @@ def _standalone_value_key(value: object) -> tuple[object, ...]:
     )
 
 
-def _standalone_call_key(args: tuple[object, ...]) -> tuple[object, ...]:
+def _standalone_call_key(
+    args: tuple[object, ...], *, tensor_descriptor_guards: bool = False
+) -> tuple[object, ...]:
     """Return the static key for signature-normalized positional arguments."""
-    return _standalone_value_key(args)
+    return _standalone_value_key(
+        args, tensor_descriptor_guards=tensor_descriptor_guards
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -234,6 +269,7 @@ def generate_standalone_file(
     output_dir: Path,
     kernel_source_file: str | None = None,
     dispatch_keys: list[tuple[object, ...]] | None = None,
+    tensor_descriptor_guards: bool = False,
 ) -> Path:
     """
     Generate one standalone ``.py`` file containing every selected config.
@@ -252,6 +288,8 @@ def generate_standalone_file(
         output_dir: Fallback directory when *kernel_source_file* is ``None``.
         kernel_source_file: When set, writes next to the source file.
         dispatch_keys: Optional static call keys parallel to *triton_codes*.
+        tensor_descriptor_guards: Include tensor-descriptor runtime predicates in
+            static dispatch keys.
 
     Returns:
         Path to the generated file.
@@ -341,6 +379,9 @@ def generate_standalone_file(
     if dispatch_keys is not None:
         parts.extend(
             [
+                textwrap.dedent(
+                    inspect.getsource(tensor_descriptor_runtime_alignment_signature)
+                ),
                 textwrap.dedent(inspect.getsource(_standalone_value_key)),
                 textwrap.dedent(inspect.getsource(_standalone_call_key)),
             ]
@@ -376,7 +417,8 @@ def generate_standalone_file(
                 "    bound = _STANDALONE_SIGNATURE.bind(*args, **kwargs)",
                 "    bound.apply_defaults()",
                 "    key = _standalone_call_key(",
-                "        tuple(bound.arguments[name] for name in _STANDALONE_PARAMETER_NAMES)",
+                "        tuple(bound.arguments[name] for name in _STANDALONE_PARAMETER_NAMES),",
+                f"        tensor_descriptor_guards={tensor_descriptor_guards!r},",
                 "    )",
                 "    try:",
                 "        fn = _STANDALONE_VARIANTS[key]",

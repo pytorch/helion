@@ -10,6 +10,7 @@ from unittest import mock
 import torch
 
 import helion
+from helion._compat import supports_host_tensor_descriptor
 from helion._compiler import cross_loop_codegen
 from helion._compiler import cross_loop_scheduler
 from helion._compiler.compile_environment import CompileEnvironment
@@ -34,6 +35,7 @@ from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 
 
@@ -821,6 +823,50 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("_minimum_resident_programs=", code)
+
+    @skipIfNotCUDA()
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_pipeline_with_host_tensor_descriptors(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def two_stage(x: torch.Tensor) -> torch.Tensor:
+            tmp = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for producer_m in hl.tile(x.size(0), block_size=32):
+                for producer_n in hl.tile(x.size(1), block_size=32):
+                    tmp[producer_m, producer_n] = x[producer_m, producer_n] + 1
+            for consumer_m, consumer_n in hl.tile(x.size(), block_size=[32, 32]):
+                out[consumer_m, consumer_n] = tmp[consumer_m, consumer_n] * 2
+            return out
+
+        x = torch.arange(64 * 128, device=DEVICE, dtype=torch.float32).reshape(64, 128)
+        for host_descriptors in (False, True):
+            if host_descriptors and not supports_host_tensor_descriptor():
+                continue
+            with self.subTest(host_descriptors=host_descriptors):
+                code, out = code_and_output(
+                    two_stage,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                    range_num_stages=[0, 4, 0],
+                    indexing="tensor_descriptor",
+                    host_tensor_descriptors=host_descriptors,
+                )
+
+                torch.testing.assert_close(out, (x + 1) * 2)
+                if host_descriptors:
+                    self.assertIn("_helion_tensor_descriptor(", code)
+                    self.assertNotIn("tl.make_tensor_descriptor", code)
+                    self.assertIn("num_stages=4", code)
+                else:
+                    self.assertIn("tl.make_tensor_descriptor", code)
+                    self.assertNotIn("num_stages=4", code)
+                self.assertIn("tile_dependency_raw_dispatch_ticket", code)
+                self.assertIn("tile_dependency_root_0_scheduled_task", code)
+                self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
