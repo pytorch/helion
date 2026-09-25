@@ -637,7 +637,6 @@ class TestReductions(RefEagerTestBase, TestCase):
                 )
             return out
 
-        torch.manual_seed(3437)
         batch_size = 32
         dim = 64
         x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
