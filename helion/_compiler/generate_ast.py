@@ -1903,6 +1903,8 @@ def generate_ast(
                         "o_name",
                         "out_name",
                         "state_name",
+                        "initial_state_name",
+                        "final_state_name",
                         "do_name",
                         "delta_name",
                         "dq_name",

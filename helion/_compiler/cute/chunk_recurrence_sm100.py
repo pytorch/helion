@@ -9,9 +9,10 @@ Adapted from FlashInfer's ``kda_chunked_bt16.py`` at pinned commit
 workspace layout, schedule selection, and launch integration around this device
 schedule.  The recurrence keeps FP32 state in TMEM and splits the 16 warps into
 output-drain, state-left, state-right, two tcgen05 issuers, TMA, and service
-roles.  The Helion schedule uses an eight-slot raw-input ring, a six-slot TMA
-completion ring, two TMEM output accumulators, rank-4 factor loads, and a
-seven-slot asynchronous output-SMEM ring.  These choices are explicit in the
+roles. The wide pipeline uses eight raw-input slots, six TMA completion slots,
+and two TMEM output accumulators. The compact pipeline uses six, four, and one
+respectively, with resource budgets for two resident CTAs. Both use rank-4
+factor loads and seven output-SMEM slots. These choices are explicit in the
 wrapper plan, with workspace-layout and device-ABI checks kept separate.
 """
 
@@ -613,7 +614,7 @@ def tcgen05_store_initial_state_tmem(
     warp_idx,
     lane,
 ) -> None:
-    """Initialize recurrent TMEM from the exact DV2 BF16 state."""
+    """Initialize recurrent TMEM from the declared BF16 or FP32 state."""
 
     base_col_id = tmem_raw_addr & 0xFFFF
     base_row_id = tmem_raw_addr >> 16
@@ -895,7 +896,7 @@ def tcgen05_store_final_state_tmem(
     warp_idx,
     lane,
 ) -> None:
-    """Store the live recurrent TMEM state to the exact DV2 BF16 state."""
+    """Store live recurrent TMEM in the declared output state precision."""
 
     base_col_id = tmem_raw_addr & 0xFFFF
     base_row_id = tmem_raw_addr >> 16
@@ -1096,6 +1097,7 @@ def tcgen05_chain_stage_vmx_input_tmem(
     shared_acc_stage,
     shared_input_stage,
     input_dtype: cutlass.Constexpr,
+    valid_tokens=None,
 ) -> None:
     """M=64 (v - X) fused repack staging.
 
@@ -1140,6 +1142,19 @@ def tcgen05_chain_stage_vmx_input_tmem(
             pack_input_b16x2_to_i32(val0, val1, input_dtype),
             input_dtype,
         )
+
+    if cutlass.const_expr(valid_tokens is not None):
+        valid_token_count = cast("cutlass.Int32", valid_tokens)
+        if valid_token_count < BT:
+            # The transposed V fragments pair adjacent token rows. Registers
+            # 0/1 hold tokens 8..15 and registers 2/3 hold tokens 0..7;
+            # lane%4 selects an adjacent pair within that eight-token group.
+            for reg_idx in cutlass.range_constexpr(4):
+                token = (1 - reg_idx // 2) * 8 + (lane % 4) * 2
+                if token >= valid_token_count:
+                    packed0[reg_idx] = cutlass.Int32(0)
+                elif token + 1 >= valid_token_count:
+                    packed0[reg_idx] = packed0[reg_idx] & cutlass.Int32(0xFFFF)
 
     input_block_addr0 = (base_row_id << 16) | input_col_id
     input_block_ptr0 = prims.make_tmem_ptr(input_block_addr0, cutlass.Int8)
@@ -1358,10 +1373,17 @@ def kernel_chain_dv2(
     v: cute.Tensor,
     cu_seqlens: cute.Tensor,
     cu_chunks: cute.Tensor,
+    initial_state: cute.Tensor,
     state: cute.Tensor,
     out: cute.Tensor,
     head_base: cutlass.Int32,
     SCALE: cutlass.Float32,
+    K2_RAW_STAGE_COUNT: cutlass.Constexpr,
+    K2_TMA_MBAR_STAGE_COUNT: cutlass.Constexpr,
+    K2_QSTATE_STAGE_COUNT: cutlass.Constexpr,
+    TMEM_ALLOC_COLS: cutlass.Constexpr,
+    KDA_CG1_REGS: cutlass.Constexpr,
+    KDA_SERVICE_REGS: cutlass.Constexpr,
 ) -> None:
     """kernel 2, DV-split: each CTA owns half the hidden dimension.
 
@@ -1736,7 +1758,7 @@ def kernel_chain_dv2(
         tmem_raw_addr = tmem_ptr_i32.load()
         tcgen05_store_initial_state_tmem(
             tmem_raw_addr,
-            state,
+            initial_state,
             bidx,
             bidy,
             dv_half,
@@ -1784,6 +1806,9 @@ def kernel_chain_dv2(
                 0,
                 0,
                 input_dtype,
+                seqlen
+                if cutlass.const_expr(state.element_type == cutlass.Float32)
+                else None,
             )
             update_ready_arrive(update_ready_mbar)
         for chunk in cutlass.range(1, num_chunks, 1, unroll=1):
@@ -1829,6 +1854,9 @@ def kernel_chain_dv2(
                 acc_stage,
                 acc_stage,
                 input_dtype,
+                seqlen - chunk * BT
+                if cutlass.const_expr(state.element_type == cutlass.Float32)
+                else None,
             )
             update_ready_arrive(update_ready_mbar)
         if num_chunks > 0:
@@ -1978,8 +2006,19 @@ def host_chain_dv2(
     launch_heads: cutlass.Int32,
     SCALE: cutlass.Float32,
     THREADS: cutlass.Constexpr,
+    K2_RAW_STAGE_COUNT: cutlass.Constexpr = 8,
+    K2_TMA_MBAR_STAGE_COUNT: cutlass.Constexpr = 6,
+    K2_QSTATE_STAGE_COUNT: cutlass.Constexpr = 2,
+    TMEM_ALLOC_COLS: cutlass.Constexpr = 512,
+    KDA_CG1_REGS: cutlass.Constexpr = 136,
+    KDA_SERVICE_REGS: cutlass.Constexpr = 56,
+    MIN_BLOCKS_PER_MP: cutlass.Constexpr = 1,
+    initial_state: cute.Tensor | None = None,
 ) -> None:
     """DV2 host: identical tensor maps to the base chain host, doubled grid-y."""
+
+    if cutlass.const_expr(initial_state is None):
+        initial_state = state
 
     cu_seqlens_shape = cast("tuple[int | cutlass.Integer, ...]", cu_seqlens.shape)
     v_shape = cast("tuple[int | cutlass.Integer, ...]", v.shape)
@@ -2084,15 +2123,22 @@ def host_chain_dv2(
         v,
         cu_seqlens,
         cu_chunks,
+        initial_state,
         state,
         out,
         head_base,
         SCALE,
+        K2_RAW_STAGE_COUNT,
+        K2_TMA_MBAR_STAGE_COUNT,
+        K2_QSTATE_STAGE_COUNT,
+        TMEM_ALLOC_COLS,
+        KDA_CG1_REGS,
+        KDA_SERVICE_REGS,
     ).launch(
         grid=(num_sequences, launch_heads * 2, 1),
         block=(THREADS, 1, 1),
         stream=stream,
-        min_blocks_per_mp=1,
+        min_blocks_per_mp=MIN_BLOCKS_PER_MP,
         preferred_smem_carveout=100,
     )
 
