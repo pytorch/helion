@@ -4,6 +4,7 @@ import ast
 import unittest
 
 import pytest
+import sympy
 import torch
 
 import helion
@@ -379,6 +380,10 @@ class TestTritonTileDependencyLowering(TestCase):
                 for access in dependency_graph.accesses
             )
         )
+        x_access = next(
+            access for access in dependency_graph.accesses if access.tensor_name == "x"
+        )
+        self.assertTrue(x_access.tensor_shape[0].free_symbols)
         code, output = code_and_output(
             dynamic_implicit_tile_dependency_chain,
             (x,),
@@ -421,6 +426,32 @@ class TestTritonTileDependencyLowering(TestCase):
             ),
             self.assertRaisesRegex(
                 exc.InvalidConfig, "explicit remote barriers or asynchronous"
+            ),
+        ):
+            bound.to_code(config)
+
+    def test_barrier_rejects_inferred_distributed_dependency_with_opaque_op(
+        self,
+    ) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        bound = implicit_tile_dependency_chain.bind((x,))
+        config = helion.Config(
+            block_sizes=[8, 8],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="barrier",
+            num_warps=1,
+        )
+        with (
+            unittest.mock.patch(
+                "helion._compiler.cross_loop_codegen._has_opaque_distributed_protocol",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "helion._compiler.cross_loop_codegen._has_compiler_distributed_dependency",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                exc.InvalidConfig, "local grid barrier is insufficient"
             ),
         ):
             bound.to_code(config)
@@ -511,6 +542,22 @@ class TestTritonTileDependencyLowering(TestCase):
         first_metadata = torch.zeros_like(x)
         second_metadata = torch.arange(65, device=DEVICE, dtype=torch.float32)
         bound = fixed_capacity_runtime_metadata_chain.bind((x, first_metadata))
+        assert bound.host_function is not None
+        dependency_graph = bound.host_function.device_ir.tile_dependency_graph
+        assert dependency_graph is not None
+        input_accesses = tuple(
+            access
+            for access in dependency_graph.accesses
+            if access.tensor_name in ("x", "runtime_metadata")
+        )
+        self.assertTrue(input_accesses)
+        self.assertTrue(
+            all(
+                access.tensor_shape == (sympy.Integer(65),)
+                and access.tensor_strides == (sympy.Integer(1),)
+                for access in input_accesses
+            )
+        )
         config = helion.Config(
             block_sizes=[16, 16],
             pid_type="persistent_blocked",

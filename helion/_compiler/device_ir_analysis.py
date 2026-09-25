@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import dataclasses
 from itertools import starmap
 import logging
@@ -210,74 +209,6 @@ def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
         if isinstance(value, torch.Tensor):
             return value
     return None
-
-
-@dataclasses.dataclass(frozen=True)
-class _SymmetricRankPlacement:
-    """Certified placement of one view returned by get_remote_tensors."""
-
-    allocation: torch.Tensor
-    owner_rank: int | None
-    world_size: int
-
-
-def _symmetric_rank_placements(
-    host: HostFunction,
-) -> dict[int, _SymmetricRankPlacement]:
-    """Recover exact rank ownership from direct symmetric peer-view creation.
-
-    ``torch.ops.symm_mem.get_remote_tensors`` is itself the certification that
-    its input and returned views belong to one symmetric allocation.  Keeping
-    this fact here avoids a second remote-tensor abstraction and leaves generic
-    StackTensor pointers conservative.
-    """
-    from .type_info import SequenceType
-    from .type_info import TensorType
-
-    local_types = host.local_types or {}
-    result: dict[int, _SymmetricRankPlacement] = {}
-    for statement in host.body:
-        if (
-            not isinstance(statement, ast.Assign)
-            or len(statement.targets) != 1
-            or not isinstance(statement.targets[0], ast.Name)
-            or not isinstance(statement.value, ast.Call)
-            or ast.unparse(statement.value.func)
-            != "torch.ops.symm_mem.get_remote_tensors"
-            or not statement.value.args
-            or not isinstance(statement.value.args[0], ast.Name)
-        ):
-            continue
-        peers_type = local_types.get(statement.targets[0].id)
-        allocation_type = local_types.get(statement.value.args[0].id)
-        if not isinstance(peers_type, SequenceType) or not isinstance(
-            allocation_type, TensorType
-        ):
-            continue
-        peer_types = tuple(peers_type.element_types)
-        if not peer_types or not all(
-            isinstance(peer, TensorType) for peer in peer_types
-        ):
-            continue
-        world_size = len(peer_types)
-        allocation = allocation_type.fake_value
-        placement = _SymmetricRankPlacement(allocation, None, world_size)
-        storage_key = int(allocation.untyped_storage()._cdata)
-        previous = result.setdefault(storage_key, placement)
-        if previous != placement:
-            raise exc.CrossLoopSchedulingError(
-                "because one symmetric allocation has inconsistent rank provenance"
-            )
-        for owner_rank, peer_type in enumerate(peer_types):
-            assert isinstance(peer_type, TensorType)
-            placement = _SymmetricRankPlacement(allocation, owner_rank, world_size)
-            storage_key = int(peer_type.fake_value.untyped_storage()._cdata)
-            previous = result.setdefault(storage_key, placement)
-            if previous != placement:
-                raise exc.CrossLoopSchedulingError(
-                    "because one remote tensor has inconsistent rank provenance"
-                )
-    return result
 
 
 def _subscript_block_id(env: CompileEnvironment, subscript: object) -> int | None:
@@ -1696,11 +1627,29 @@ class DeviceIRAnalysis:
         from .tile_dependency import TileAccess
         from .tile_dependency import owner_roots_by_graph_id
 
-        if len(device_ir.root_ids) <= 1:
+        compiler_state = host.compiler_state
+        if (
+            len(device_ir.root_ids) <= 1
+            and not compiler_state.symmetric_rank_placements
+            and not compiler_state.unresolved_symmetric_peer_provenance
+        ):
             return ()
 
         graph_owners = owner_roots_by_graph_id(device_ir)
-        symmetric_placements = _symmetric_rank_placements(host)
+        if compiler_state.unresolved_symmetric_peer_provenance:
+            raise exc.CrossLoopSchedulingError(
+                "because symmetric peer ownership could not be proven exactly"
+            )
+        symmetric_placements = compiler_state.symmetric_rank_placements
+        placement_groups = {
+            placement.process_group_name for placement in symmetric_placements.values()
+        }
+        if placement_groups and placement_groups != {env.process_group_name}:
+            raise exc.CrossLoopSchedulingError(
+                "because symmetric peer views must use the kernel's selected "
+                f"process group; views={placement_groups!r}, "
+                f"kernel={env.process_group_name!r}"
+            )
         allocation_ids: dict[int, int] = {}
         accesses: list[TileAccess] = []
         memory_op_index = 0
@@ -1717,9 +1666,7 @@ class DeviceIRAnalysis:
 
                 fake = _accessed_tensor_fake(node)
                 origin = host.tensor_to_origin.get(fake) if fake is not None else None
-                storage_key = (
-                    int(fake.untyped_storage()._cdata) if fake is not None else None
-                )
+                storage_key = fake.untyped_storage() if fake is not None else None
                 symmetric_placement = (
                     symmetric_placements.get(storage_key)
                     if storage_key is not None

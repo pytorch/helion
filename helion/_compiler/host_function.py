@@ -69,6 +69,23 @@ class SymbolOrigin(NamedTuple):
         return self.origin.depth()
 
 
+class SymmetricRankPlacement(NamedTuple):
+    """Exact owner of one fake-tensor storage in a symmetric allocation."""
+
+    allocation: torch.Tensor
+    owner_rank: int | None
+    world_size: int
+    process_group_name: str
+
+    def signature(self) -> tuple[int, int | None, int, str]:
+        return (
+            int(self.allocation.untyped_storage()._cdata),
+            self.owner_rank,
+            self.world_size,
+            self.process_group_name,
+        )
+
+
 @dataclasses.dataclass
 class KernelDefinition:
     """The kernel's structural definition.
@@ -101,8 +118,101 @@ class CompilerState:
     tensor_to_origin: dict[torch.Tensor, Origin] = dataclasses.field(
         default_factory=dict
     )
+    # SSA fake tensors may be cloned between tracing and codegen. Keep their
+    # exact storage/layout identity separate so tracing never mistakes an SSA
+    # temporary for a host tensor argument.
+    tensor_alias_origins: dict[tuple[object, ...], Origin | None] = dataclasses.field(
+        default_factory=dict
+    )
+    # Storage objects are strong keys: integer StorageImpl addresses can be
+    # reused after a temporary peer view is collected.
+    symmetric_rank_placements: dict[torch.UntypedStorage, SymmetricRankPlacement] = (
+        dataclasses.field(default_factory=dict)
+    )
+    unresolved_symmetric_peer_provenance: bool = False
     global_imports: dict[str, GlobalImport] = dataclasses.field(default_factory=dict)
     rng_seed_slot_count: int = 0
+
+    def record_symmetric_rank_placement(
+        self,
+        tensor: torch.Tensor,
+        placement: SymmetricRankPlacement,
+    ) -> None:
+        storage = tensor.untyped_storage()
+        previous = self.symmetric_rank_placements.setdefault(storage, placement)
+        if previous.signature() != placement.signature():
+            self.unresolved_symmetric_peer_provenance = True
+
+    def tensor_origin(self, tensor: torch.Tensor) -> Origin | None:
+        """Resolve origin through tensor identity or an exact SSA storage view."""
+        if (origin := self.tensor_to_origin.get(tensor)) is not None:
+            return origin
+        if not self.tensor_alias_origins:
+            return None
+        return self.tensor_alias_origins.get(self._tensor_layout_key(tensor))
+
+    @staticmethod
+    def _tensor_layout_key(tensor: torch.Tensor) -> tuple[object, ...]:
+        def hashable(value: int | torch.SymInt) -> object:
+            return value._sympy_() if isinstance(value, torch.SymInt) else value
+
+        return (
+            tensor.untyped_storage(),
+            tuple(map(hashable, tensor.shape)),
+            tuple(map(hashable, tensor.stride())),
+            hashable(tensor.storage_offset()),
+        )
+
+    def merge_tensor_provenance(
+        self,
+        output: torch.Tensor,
+        inputs: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Propagate exact host identity and symmetric-rank ownership."""
+        output_layout = (
+            tuple(output.shape),
+            tuple(output.stride()),
+            output.storage_offset(),
+        )
+        layout_matches = all(
+            (
+                tuple(tensor.shape),
+                tuple(tensor.stride()),
+                tensor.storage_offset(),
+            )
+            == output_layout
+            for tensor in inputs
+        )
+        origins = tuple(self.tensor_origin(tensor) for tensor in inputs)
+        if (
+            layout_matches
+            and origins
+            and all(origin is not None and origin == origins[0] for origin in origins)
+        ):
+            assert origins[0] is not None
+            key = self._tensor_layout_key(output)
+            if key not in self.tensor_alias_origins:
+                self.tensor_alias_origins[key] = origins[0]
+            elif self.tensor_alias_origins[key] != origins[0]:
+                self.tensor_alias_origins[key] = None
+
+        placements = tuple(
+            self.symmetric_rank_placements.get(tensor.untyped_storage())
+            for tensor in inputs
+        )
+        if not any(placement is not None for placement in placements):
+            return
+        if not layout_matches:
+            self.unresolved_symmetric_peer_provenance = True
+            return
+        concrete = tuple(placement for placement in placements if placement is not None)
+        if (
+            len(concrete) != len(placements)
+            or len({placement.signature() for placement in concrete}) != 1
+        ):
+            self.unresolved_symmetric_peer_provenance = True
+            return
+        self.record_symmetric_rank_placement(output, concrete[0])
 
 
 class HostFunction:

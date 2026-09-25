@@ -1632,6 +1632,32 @@ def _is_static_slice_bound(bound: object) -> bool:
     return False
 
 
+def _new_var_with_symmetric_placement(value: object) -> object:
+    result = _new_var(value)
+    if isinstance(result, torch.Tensor) and isinstance(value, torch.Tensor):
+        state = HostFunction.current().compiler_state
+        state.merge_tensor_provenance(
+            result,
+            (value,),
+        )
+    return result
+
+
+def _phi_with_symmetric_placement(lhs: object, rhs: object) -> object:
+    result = _tracing_ops._phi(lhs, rhs)
+    if (
+        isinstance(result, torch.Tensor)
+        and isinstance(lhs, torch.Tensor)
+        and isinstance(rhs, torch.Tensor)
+    ):
+        state = HostFunction.current().compiler_state
+        state.merge_tensor_provenance(
+            result,
+            (lhs, rhs),
+        )
+    return result
+
+
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
@@ -2062,7 +2088,9 @@ class WalkDeviceAST(NodeVisitor):
                     continue
                 if name in self.scope:
                     try:
-                        self.scope[name] = _tracing_ops._phi(self.scope[name], value)
+                        self.scope[name] = _phi_with_symmetric_placement(
+                            self.scope[name], value
+                        )
                     except Exception as e:
                         raise exc.CantCombineTypesInControlFlow(
                             name, self.scope[name], value
@@ -2139,7 +2167,9 @@ class WalkDeviceAST(NodeVisitor):
                 continue
             if name in self.scope:
                 try:
-                    self.scope[name] = _tracing_ops._phi(self.scope[name], value)
+                    self.scope[name] = _phi_with_symmetric_placement(
+                        self.scope[name], value
+                    )
                 except Exception as e:
                     raise exc.CantCombineTypesInControlFlow(
                         name, self.scope[name], value
@@ -2291,20 +2321,20 @@ class WalkDeviceAST(NodeVisitor):
         for name in common_output_names:
             if_value = if_output_values[name]
             else_value = else_output_values[name]
-            self.scope[name] = _tracing_ops._phi(if_value, else_value)
+            self.scope[name] = _phi_with_symmetric_placement(if_value, else_value)
             if_output_index = get_output_idx(name, if_output_values)
             else_output_index = get_output_idx(name, else_output_values)
             if_graph.branches_outputs.append((if_output_index, else_output_index))
 
         for name in if_nonlocal_outputs_names:
-            self.scope[name] = _tracing_ops._phi(
+            self.scope[name] = _phi_with_symmetric_placement(
                 self.scope[name], if_output_values[name]
             )
             if_output_index = get_output_idx(name, if_output_values)
             if_graph.branches_outputs.append((if_output_index, name))
 
         for name in else_nonlocal_output_names:
-            self.scope[name] = _tracing_ops._phi(
+            self.scope[name] = _phi_with_symmetric_placement(
                 self.scope[name], else_output_values[name]
             )
             else_output_index = get_output_idx(name, else_output_values)
@@ -2461,7 +2491,7 @@ class WalkDeviceAST(NodeVisitor):
             if isinstance(node.value, ast.Name) and (
                 isinstance(value, torch.Tensor) and not isinstance(value, Tile)
             ):
-                value = _new_var(value)
+                value = _new_var_with_symmetric_placement(value)
             self._assign(target, value)
             return None
         if isinstance(target, ast.Tuple):
@@ -2687,7 +2717,7 @@ class LiftTensorArgs:
         flat_values = [*self.flat_values]
         assert len(self.tensor_indices) == len(args)
         for i, v in zip(self.tensor_indices, args, strict=False):
-            flat_values[i] = _new_var(v) if copy_tensors else v
+            flat_values[i] = _new_var_with_symmetric_placement(v) if copy_tensors else v
         return pytree.tree_unflatten(flat_values, self.spec)
 
     def get_tensor_args(self) -> list[object]:
@@ -3416,6 +3446,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 )
                 env.require_persistent_blocked(reason)
                 config_spec.enable_cross_loop_pipeline()
+        elif tile_accesses:
+            # A one-root kernel has no schedule to build, but peer accesses can
+            # still race across ranks within that root.
+            build_tile_dependency_graph(
+                tile_accesses,
+                device_ir=device_ir,
+                root_phases=source_root_phases,
+            )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()

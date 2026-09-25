@@ -68,6 +68,7 @@ class TestTritonLauncher(unittest.TestCase):
                 kernel,
                 (8,),
                 (tensor, dynamic_size, block),
+                process_group_name="group-a",
                 num_warps=4,
                 num_stages=2,
                 ptx_options=None,
@@ -83,8 +84,24 @@ class TestTritonLauncher(unittest.TestCase):
         self.assertEqual(first, fingerprint(torch.empty(11), 19, 64))
         # A constexpr schedule parameter must select a different fingerprint.
         self.assertNotEqual(first, fingerprint(torch.empty(11), 19, 128))
+        self.assertNotEqual(
+            first,
+            _distributed_launch_fingerprint(
+                kernel,
+                (8,),
+                (torch.empty(7), 17, 64),
+                process_group_name="group-b",
+                num_warps=4,
+                num_stages=2,
+                ptx_options=None,
+                launch_cooperative_grid=False,
+                launch_options={},
+                state_schema=((64, "torch.uint32"),),
+                readiness_slots=32,
+            ),
+        )
 
-    def test_distributed_readiness_reserves_below_remote_copy_slots(self) -> None:
+    def test_distributed_readiness_uses_independent_signal_state(self) -> None:
         class FakeJITFunction:
             def run(self, *args: object, **kwargs: object) -> object:
                 return "launched"
@@ -97,7 +114,7 @@ class TestTritonLauncher(unittest.TestCase):
             ) as remote_copy_signal,
             patch(
                 "helion.runtime.triton.launcher._get_distributed_readiness_signal",
-                return_value=(1234, 16),
+                return_value=(object(), 1234, 16),
             ) as readiness_signal,
         ):
             result = triton_default_launcher(
@@ -108,7 +125,7 @@ class TestTritonLauncher(unittest.TestCase):
                 _remote_copy_signal_dst=payload,
                 _remote_copy_signal_slots_per_program=2,
                 _remote_copy_process_group_name="group",
-                _distributed_readiness_signal_dst=payload,
+                _distributed_readiness_device_anchor=payload,
                 _distributed_readiness_signal_slots=8,
                 _distributed_readiness_process_group_name="group",
             )
@@ -121,7 +138,6 @@ class TestTritonLauncher(unittest.TestCase):
             "group",
             8,
             launch_fingerprint=ANY,
-            reserved_tail_slots=6,
         )
 
     def test_residency_check_uses_exact_compiled_specialization(self) -> None:
@@ -193,6 +209,55 @@ class TestTritonLauncher(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestPersistentTritonState(unittest.TestCase):
+    def test_distributed_readiness_capacity_failure_is_collective(self) -> None:
+        class FakeHandle:
+            rank = 0
+            signal_pad_ptrs_dev = 1234
+
+            def get_signal_pad(self, rank: int, *, dtype: torch.dtype) -> torch.Tensor:
+                assert rank == self.rank
+                assert dtype is torch.uint64
+                return torch.zeros(4, dtype=torch.uint64)
+
+        kernel = SimpleNamespace()
+        base = torch.empty(8, device=DEVICE)
+        stream = SimpleNamespace(cuda_stream=1, synchronize=MagicMock())
+
+        def gather_statuses(output, value, *, group):
+            self.assertEqual(group, "resolved-group")
+            stream.synchronize.assert_called_once_with()
+            output[:] = [value, (value[0], 64)]
+
+        with (
+            patch(
+                "torch.distributed._symmetric_memory.empty",
+                return_value=torch.empty(1, dtype=torch.uint8, device=DEVICE),
+            ),
+            patch(
+                "torch.distributed._symmetric_memory.rendezvous",
+                return_value=FakeHandle(),
+            ),
+            patch(
+                "torch.distributed.distributed_c10d._resolve_process_group",
+                return_value="resolved-group",
+            ),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch(
+                "torch.distributed.all_gather_object",
+                side_effect=gather_statuses,
+            ) as all_gather,
+            patch("torch.cuda.current_stream", return_value=stream),
+            self.assertRaisesRegex(RuntimeError, "signal pad capacities"),
+        ):
+            _get_distributed_readiness_signal(
+                kernel,
+                base,
+                "group",
+                8,
+                launch_fingerprint="fingerprint",
+            )
+        all_gather.assert_called_once()
+
     def test_distributed_readiness_rejects_rank_fingerprint_mismatch(self) -> None:
         class FakeHandle:
             rank = 0
@@ -209,9 +274,13 @@ class TestPersistentTritonState(unittest.TestCase):
 
         def gather_fingerprints(output, value, *, group):
             self.assertEqual(group, "resolved-group")
-            output[:] = [value, "different-rank-fingerprint"]
+            output[:] = [value, ("different-rank-fingerprint", value[1])]
 
         with (
+            patch(
+                "torch.distributed._symmetric_memory.empty",
+                return_value=torch.empty(1, dtype=torch.uint8, device=DEVICE),
+            ),
             patch(
                 "torch.distributed._symmetric_memory.rendezvous",
                 return_value=FakeHandle(),
@@ -239,7 +308,7 @@ class TestPersistentTritonState(unittest.TestCase):
                 launch_fingerprint="this-rank-fingerprint",
             )
 
-    def test_distributed_readiness_state_is_stream_local_and_below_tail(self) -> None:
+    def test_distributed_readiness_state_is_stream_local_and_dedicated(self) -> None:
         class FakeHandle:
             rank = 0
 
@@ -253,20 +322,54 @@ class TestPersistentTritonState(unittest.TestCase):
                 return self.signal_pad
 
         kernel = SimpleNamespace()
+        other_kernel = SimpleNamespace()
         base = torch.empty(8, device=DEVICE)
         first_stream = SimpleNamespace(cuda_stream=1, synchronize=MagicMock())
         second_stream = SimpleNamespace(cuda_stream=2, synchronize=MagicMock())
         first_handle = FakeHandle(1234)
+        second_handle = FakeHandle(5678)
+        other_kernel_handle = FakeHandle(9012)
+        variant_handle = FakeHandle(3456)
+        workspaces = (
+            torch.empty(1, dtype=torch.uint8, device=DEVICE),
+            torch.empty(1, dtype=torch.uint8, device=DEVICE),
+            torch.empty(1, dtype=torch.uint8, device=DEVICE),
+            torch.empty(1, dtype=torch.uint8, device=DEVICE),
+        )
+        gathered = 0
 
         def gather_fingerprints(output, value, *, group):
+            nonlocal gathered
             self.assertEqual(group, "resolved-group")
+            handle = (
+                first_handle,
+                second_handle,
+                other_kernel_handle,
+                variant_handle,
+            )[gathered]
+            self.assertTrue(torch.all(handle.signal_pad[-8:] == 0))
+            self.assertGreaterEqual(
+                first_stream.synchronize.call_count
+                + second_stream.synchronize.call_count,
+                1,
+            )
+            gathered += 1
             output[:] = [value, value]
 
         with (
             patch(
                 "torch.distributed._symmetric_memory.rendezvous",
-                return_value=first_handle,
+                side_effect=(
+                    first_handle,
+                    second_handle,
+                    other_kernel_handle,
+                    variant_handle,
+                ),
             ) as rendezvous,
+            patch(
+                "torch.distributed._symmetric_memory.empty",
+                side_effect=workspaces,
+            ) as allocate,
             patch(
                 "torch.distributed.distributed_c10d._resolve_process_group",
                 return_value="resolved-group",
@@ -278,29 +381,42 @@ class TestPersistentTritonState(unittest.TestCase):
             ) as all_gather,
             patch(
                 "torch.cuda.current_stream",
-                side_effect=(first_stream, first_stream, second_stream),
+                side_effect=(
+                    first_stream,
+                    first_stream,
+                    second_stream,
+                    first_stream,
+                    first_stream,
+                ),
             ),
         ):
-            first = _get_distributed_readiness_signal(
-                kernel, base, "group", 8, reserved_tail_slots=8
-            )
+            first = _get_distributed_readiness_signal(kernel, base, "group", 8)
             first_handle.signal_pad[-8:].fill_(7)
-            retained = _get_distributed_readiness_signal(
-                kernel, base, "group", 8, reserved_tail_slots=8
+            retained = _get_distributed_readiness_signal(kernel, base, "group", 8)
+            second = _get_distributed_readiness_signal(kernel, base, "group", 8)
+            independent = _get_distributed_readiness_signal(
+                other_kernel, base, "group", 8
             )
-            second = _get_distributed_readiness_signal(
-                kernel, base, "group", 8, reserved_tail_slots=8
+            variant = _get_distributed_readiness_signal(
+                kernel,
+                base,
+                "group",
+                8,
+                launch_fingerprint="different-config",
             )
 
-        self.assertEqual(first, retained)
-        self.assertNotEqual(first, second)
-        self.assertEqual(first, (1234, 48))
-        self.assertEqual(second, (1234, 40))
-        self.assertEqual(rendezvous.call_count, 1)
-        self.assertEqual(all_gather.call_count, 2)
+        self.assertEqual(first[0].data_ptr(), retained[0].data_ptr())
+        self.assertEqual(first[1:], (1234, 56))
+        self.assertEqual(second[1:], (5678, 56))
+        self.assertEqual(independent[1:], (9012, 56))
+        self.assertEqual(variant[1:], (3456, 56))
+        self.assertNotEqual(first[0].data_ptr(), second[0].data_ptr())
+        self.assertNotEqual(first[0].data_ptr(), independent[0].data_ptr())
+        self.assertEqual(rendezvous.call_count, 4)
+        self.assertEqual(allocate.call_count, 4)
+        self.assertEqual(all_gather.call_count, 4)
         self.assertTrue(torch.all(first_handle.signal_pad[-8:] == 7))
-        self.assertTrue(torch.all(first_handle.signal_pad[-16:-8] == 0))
-        self.assertTrue(torch.all(first_handle.signal_pad[-24:-16] == 0))
+        self.assertTrue(torch.all(second_handle.signal_pad[-8:] == 0))
 
     def test_is_retained_and_namespaced_by_launch_configuration(self) -> None:
         kernel = SimpleNamespace()

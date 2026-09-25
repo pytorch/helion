@@ -93,7 +93,14 @@ def _host_tensor(debug_name: str) -> torch.Tensor:
 
 @_decorators.codegen(_host_tensor, "common")
 def _(state: CodegenState) -> ast.AST:
-    return expr_from_string("_host_tensor")  # should be unused
+    # Most consumers lower host tensors directly from FX metadata.  Control-flow
+    # SSA helpers, however, materialize their operands as ordinary expressions.
+    # Resolve those through the same canonical kernel argument here.
+    assert state.fx_node is not None
+    value = state.fx_node.meta["val"]
+    assert isinstance(value, torch.Tensor)
+    name = state.device_function.tensor_arg(value).name
+    return expr_from_string(name)
 
 
 @_decorators.api()

@@ -96,6 +96,13 @@ def one_shot_allreduce_kernel(
     return out
 
 
+def _remote_tensor_views(
+    symmetric: torch.Tensor, group_name: str
+) -> tuple[torch.Tensor, ...]:
+    """Exercise provenance capture through an ordinary Python helper."""
+    return torch.ops.symm_mem.get_remote_tensors.default(symmetric, group_name)
+
+
 def pipelined_allreduce_kernel(
     source: torch.Tensor,
     symmetric: torch.Tensor,
@@ -104,10 +111,23 @@ def pipelined_allreduce_kernel(
     """Publish local tiles, then consume every rank as each tile becomes ready."""
     out = torch.empty_like(source)
     local = symmetric.view(-1)
-    remotes = torch.ops.symm_mem.get_remote_tensors(symmetric, group_name)
+    symmetric = torch.as_strided(
+        symmetric,
+        source.size(),
+        symmetric.stride(),
+        storage_offset=0,
+    )
+    # Exercise provenance capture through a Python helper around the explicit
+    # overload as well as the packet spelling used by one_shot_allreduce_kernel.
+    remotes = _remote_tensor_views(symmetric, group_name)
 
     for producer_tile in hl.tile(source.size(0)):
-        local[producer_tile] = source[producer_tile]
+        # Carry the view through nested-loop SSA construction.  The compiler
+        # must preserve its exact local-rank placement through _new_var/_phi.
+        carried_local = local
+        for _carry in hl.tile(1, block_size=1):
+            carried_local = carried_local
+        carried_local[producer_tile] = source[producer_tile]
 
     for consumer_tile in hl.tile(source.size(0)):
         total = hl.zeros([consumer_tile], dtype=torch.float32)
@@ -115,6 +135,18 @@ def pipelined_allreduce_kernel(
             total += remote[consumer_tile].to(torch.float32)
         out[consumer_tile] = total.to(source.dtype)
     return out
+
+
+def unsafe_single_root_peer_write(
+    source: torch.Tensor,
+    symmetric: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    """Every rank writing rank zero has no same-root happens-before order."""
+    peer_zero = _remote_tensor_views(symmetric, group_name)[0]
+    for tile in hl.tile(source.size(0)):
+        peer_zero[tile] = source[tile]
+    return symmetric
 
 
 # make it easy to use a 'smaller' profile than 'quick' in unit test
@@ -361,6 +393,22 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             device=self.device,
         )
         symm_mem.rendezvous(symmetric, group=group_name)
+        barrier_kernel = helion.kernel(
+            config=helion.Config(
+                block_sizes=[256, 1024],
+                cross_loop_pipeline="barrier",
+                num_sm_multiplier=1,
+                num_warps=4,
+                pid_type="persistent_blocked",
+            ),
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )(pipelined_allreduce_kernel)
+        with self.assertRaisesRegex(
+            helion.exc.InvalidConfig,
+            "cross-rank dependencies require cross_loop_pipeline='dynamic'",
+        ):
+            barrier_kernel(source, symmetric, group_name)
         kernel = helion.kernel(
             config=helion.Config(
                 block_sizes=[256, 1024],
@@ -372,6 +420,9 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             static_shapes=True,
             ignore_warnings=[helion.exc.TensorOperationInWrapper],
         )(pipelined_allreduce_kernel)
+
+        code = kernel.bind((source, symmetric, group_name)).to_triton_code()
+        self.assertIn("ld.acquire.sys.global.u64", code)
 
         expected = source.clone()
         dist.all_reduce(expected)
@@ -420,6 +471,37 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
+        self._cleanup_process()
+
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @unittest.skipUnless(
+        torch.version.cuda is not None,
+        "compiler-derived distributed readiness requires NVIDIA CUDA",
+    )
+    def test_single_root_peer_write_is_rejected(self) -> None:
+        self._init_process()
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        assert group is not None
+        source = torch.arange(256, device=self.device, dtype=torch.float32)
+        symmetric = symm_mem.empty(
+            source.shape,
+            dtype=source.dtype,
+            device=self.device,
+        )
+        symm_mem.rendezvous(symmetric, group=group.group_name)
+        kernel = helion.kernel(
+            config=helion.Config(block_sizes=[64]),
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )(unsafe_single_root_peer_write)
+
+        with self.assertRaisesRegex(
+            helion.exc.CrossLoopSchedulingError,
+            "unordered cross-rank store/store hazard",
+        ):
+            kernel.bind((source, symmetric, group.group_name))
         self._cleanup_process()
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")

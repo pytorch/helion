@@ -13,6 +13,7 @@ from unittest.mock import patch
 import sympy
 import torch
 from torch.fx.experimental import proxy_tensor
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_map_only
 
 from .. import exc
@@ -34,6 +35,7 @@ from .compile_environment import warning
 from .device_function import contains_only_block_size_symbols
 from .host_function import HostFunction
 from .host_function import SymbolOrigin
+from .host_function import SymmetricRankPlacement
 from .utils import compute_slice_size
 from .variable_origin import AttributeOrigin
 from .variable_origin import GetItemOrigin
@@ -253,8 +255,14 @@ class TypeInfo:
         except NotImplementedError:
             pass
         else:
+            if origin.is_device():
+                return functools.reduce(lambda x, y: x.merge_for_iteration(y), values)
             return functools.reduce(lambda x, y: x.merge(y), values)
         raise exc.TypeInferenceError(f"Iteration over {self!s} is not supported")
+
+    def merge_for_iteration(self, other: TypeInfo) -> TypeInfo:
+        """Merge element types without treating iteration as a runtime phi."""
+        return self.merge(other)
 
     def unpack(self) -> list[TypeInfo]:
         raise NotImplementedError
@@ -484,7 +492,13 @@ class TensorType(TypeInfo):
 
         return TensorType(origin, new_fake)
 
-    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+    def _merge_tensor(
+        self,
+        other: TypeInfo,
+        var_name: str | None,
+        *,
+        track_provenance: bool,
+    ) -> TypeInfo:
         if isinstance(other, TensorType):
             if self.fake_value is other.fake_value:
                 return self
@@ -510,8 +524,20 @@ class TensorType(TypeInfo):
                 )
             # TODO(jansel): handle symbolic shapes
             # TODO(jansel): stride check?
-            return TensorType(other.origin, torch.empty_like(self.fake_value))
+            result = TensorType(other.origin, torch.empty_like(self.fake_value))
+            if track_provenance:
+                HostFunction.current().compiler_state.merge_tensor_provenance(
+                    result.fake_value,
+                    (self.fake_value, other.fake_value),
+                )
+            return result
         return super().merge(other, var_name=var_name)
+
+    def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
+        return self._merge_tensor(other, var_name, track_provenance=True)
+
+    def merge_for_iteration(self, other: TypeInfo) -> TypeInfo:
+        return self._merge_tensor(other, None, track_provenance=False)
 
     def populate_symbol_origins(self, origin: Origin) -> None:
         shape_env = CompileEnvironment.current().shape_env
@@ -765,6 +791,60 @@ class ConfigFragmentType(LiteralType):
         super().__init__(origin, fragment)
 
 
+def _record_symmetric_peer_tensors(
+    allocation: object,
+    group_name: object,
+    peers: object,
+) -> None:
+    """Record exact peer ownership at the dispatcher boundary."""
+    state = HostFunction.current().compiler_state
+    if (
+        not isinstance(allocation, torch.Tensor)
+        or not isinstance(group_name, str)
+        or not isinstance(peers, (list, tuple))
+        or not peers
+        or not all(isinstance(peer, torch.Tensor) for peer in peers)
+    ):
+        state.unresolved_symmetric_peer_provenance = True
+        return
+    world_size = len(peers)
+    placements = (
+        SymmetricRankPlacement(allocation, None, world_size, group_name),
+        *(
+            SymmetricRankPlacement(allocation, rank, world_size, group_name)
+            for rank in range(world_size)
+        ),
+    )
+    tensors = (allocation, *peers)
+    for tensor, placement in zip(tensors, placements, strict=True):
+        state.record_symmetric_rank_placement(tensor, placement)
+
+
+class _SymmetricPeerCaptureMode(TorchDispatchMode):
+    """Observe remote-view ops even when a Python helper wraps them."""
+
+    def __torch_dispatch__(
+        self,
+        func: object,
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        del types
+        kwargs = kwargs or {}
+        result = func(*args, **kwargs)  # type: ignore[operator]
+        packet = getattr(torch.ops.symm_mem, "get_remote_tensors", None)
+        if func is getattr(packet, "default", None):
+            allocation = args[0] if args else kwargs.get("x")
+            group_name = (
+                args[1]
+                if len(args) > 1
+                else kwargs.get("group_name", kwargs.get("group"))
+            )
+            _record_symmetric_peer_tensors(allocation, group_name, result)
+        return result
+
+
 class CallableType(LiteralType):
     # pyrefly: ignore [bad-override]
     value: Callable[..., object]
@@ -886,7 +966,10 @@ class CallableType(LiteralType):
                 raise exc.ConfigSpecFragmentWithSymInt(args)
 
         try:
-            with patch.object(torch.SymInt, "__index__", _raise_shape_specializing):
+            with (
+                patch.object(torch.SymInt, "__index__", _raise_shape_specializing),
+                _SymmetricPeerCaptureMode(),
+            ):
                 result = _CheckForIndexCalls.retry_call(
                     self.value, proxy_args, proxy_kwargs
                 )
@@ -1512,7 +1595,17 @@ class SequenceType(CollectionType):
                 raise exc.TypeInferenceError(
                     "Sequence indexing with non-literal index requires all elements to have the same type"
                 )
-            return first_type
+            if origin.is_device():
+                return functools.reduce(
+                    lambda left, right: left.merge_for_iteration(right),
+                    self.element_types,
+                )
+            return functools.reduce(
+                lambda left, right: left.merge(
+                    right, var_name="dynamically indexed sequence"
+                ),
+                self.element_types,
+            )
 
         return super().propagate_getitem(key, origin)
 
@@ -1522,7 +1615,14 @@ class SequenceType(CollectionType):
         if self.python_type is list and isinstance(key, SymIntType):
             if not self.element_types:
                 raise exc.TypeInferenceError("Cannot index empty sequence")
-            new_elements = [elem.merge(value) for elem in self.element_types]
+            new_elements = [
+                (
+                    elem.merge_for_iteration(value)
+                    if origin.is_device()
+                    else elem.merge(value)
+                )
+                for elem in self.element_types
+            ]
             return SequenceType(origin=origin, element_types=new_elements)
         return super().propagate_setitem(key, value, origin)
 
@@ -1541,6 +1641,25 @@ class SequenceType(CollectionType):
                     ),
                 )
         return super().merge(other, var_name=var_name)
+
+    def merge_for_iteration(self, other: TypeInfo) -> TypeInfo:
+        if isinstance(other, SequenceType) and len(self.element_types) == len(
+            other.element_types
+        ):
+            return SequenceType(
+                origin=other.origin,
+                element_types=self._maybe_tuple(
+                    [
+                        left.merge_for_iteration(right)
+                        for left, right in zip(
+                            self.element_types,
+                            other.element_types,
+                            strict=True,
+                        )
+                    ]
+                ),
+            )
+        return super().merge_for_iteration(other)
 
     def tree_map(
         self, fn: Callable[[TypeInfo], object]
@@ -1585,6 +1704,19 @@ class DictType(CollectionType):
                     },
                 )
         return super().merge(other, var_name=var_name)
+
+    def merge_for_iteration(self, other: TypeInfo) -> TypeInfo:
+        if type(self) is type(other):
+            assert isinstance(other, DictType)
+            if self.element_types.keys() == other.element_types.keys():
+                return type(self)(
+                    origin=other.origin,
+                    element_types={
+                        key: value.merge_for_iteration(other.element_types[key])
+                        for key, value in self.element_types.items()
+                    },
+                )
+        return super().merge_for_iteration(other)
 
     def tree_map(self, fn: Callable[[TypeInfo], object]) -> dict[str | int, object]:
         return {k: v.tree_map(fn) for k, v in self.element_types.items()}

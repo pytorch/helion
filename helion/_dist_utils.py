@@ -137,12 +137,14 @@ def check_config_consistancy(
     config: helion.Config,
     print_config: bool = False,
     process_group_name: str | None = None,
+    *,
+    force: bool = False,
 ) -> None:
     """
     Check the consistency of configs across ranks.
     """
     if (
-        os.getenv("HELION_DIST_CHECK_CONFIG_CONSISTANCY") != "1"
+        (not force and os.getenv("HELION_DIST_CHECK_CONFIG_CONSISTANCY") != "1")
         or not dist.is_initialized()
         or process_group_name is None
     ):

@@ -256,6 +256,7 @@ class ReadinessGraph:
 
     root_domains: tuple[CoordinateDomain, ...]
     events: tuple[ReadinessEvent, ...]
+    distributed_obligations: frozenset[DependencyObligation] = frozenset()
 
     def __post_init__(self) -> None:
         if tuple(event.event_id for event in self.events) != tuple(
@@ -1800,7 +1801,7 @@ def _build_readiness_events(
     publishable_site_ids: frozenset[int] | None = None,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
     charge: Callable[[int], bool],
-) -> tuple[ReadinessEvent, ...]:
+) -> tuple[tuple[ReadinessEvent, ...], frozenset[DependencyObligation]]:
     """Build canonical readiness events from the dependency graph."""
     symbolic_dependencies = instantiate_symbolic_dependencies(
         dependency_graph,
@@ -1813,6 +1814,14 @@ def _build_readiness_events(
         dependency
         for dependency in symbolic_dependencies
         if dependency.rank_relation is not None
+    )
+    distributed_obligations = frozenset(
+        (
+            dependency.dependency_id,
+            dependency.producer_site_id,
+            dependency.consumer_site_id,
+        )
+        for dependency in distributed_dependencies
     )
     invalid_distributed_dependencies = tuple(
         dependency
@@ -2372,7 +2381,7 @@ def _build_readiness_events(
         raise AssertionError(
             "readiness events must cover the dependency manifest exactly"
         )
-    return events
+    return events, distributed_obligations
 
 
 def derive_final_arrival_continuations(
@@ -2380,6 +2389,12 @@ def derive_final_arrival_continuations(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
 ) -> tuple[FinalArrivalContinuation, ...]:
     """Derive complete one-task-per-readiness-key continuation candidates."""
+    distributed_producer_roots = frozenset(
+        producer.producer_root
+        for event in readiness_graph.events
+        if any(consumer.rank_relation is not None for consumer in event.consumers)
+        for producer in event.producers
+    )
     required_obligations_by_root: dict[int, set[DependencyObligation]] = {}
     for event in readiness_graph.events:
         for readiness_consumer in event.consumers:
@@ -2403,6 +2418,7 @@ def derive_final_arrival_continuations(
         if (
             readiness_consumer.consumer_site_id is not None
             or readiness_consumer.rank_relation is not None
+            or readiness_consumer.consumer_root in distributed_producer_roots
         ):
             continue
         candidate_plan = dataclasses.replace(plan, continuation_consumer_index=0)
@@ -2893,14 +2909,16 @@ def _finalize_emitted_synchronization(
         if _supports_emitted_counter_plan_lowering(plan, readiness_graph.root_domains)
     )
     covered_obligations = _covered_obligations(readiness_counters)
-    distributed_obligations = frozenset(
+    covered_distributed_obligations = frozenset(
         obligation
-        for event in readiness_graph.events
-        for consumer in event.consumers
+        for plan in readiness_counters
+        for consumer in plan.consumers
         if consumer.rank_relation is not None
         for obligation in consumer.covered_obligations
     )
-    missing_distributed = distributed_obligations - covered_obligations
+    missing_distributed = (
+        readiness_graph.distributed_obligations - covered_distributed_obligations
+    )
     if missing_distributed:
         raise exc.CrossLoopSchedulingError(
             "distributed dependencies require exact readiness counters; "
@@ -3116,22 +3134,20 @@ def build_static_pipeline_plan(
     root_domains = tuple(
         order.tasks_by_ordinal.target_domain for order in root_task_orders
     )
+    readiness_events, distributed_obligations = _build_readiness_events(
+        dependency_graph,
+        root_domains=root_domains,
+        site_domains=site_domains,
+        publishable_site_ids=publishable_site_ids,
+        prove_nonnegative=prove_nonnegative,
+        charge=charge,
+    )
     readiness_graph = ReadinessGraph(
         root_domains,
-        _build_readiness_events(
-            dependency_graph,
-            root_domains=root_domains,
-            site_domains=site_domains,
-            publishable_site_ids=publishable_site_ids,
-            prove_nonnegative=prove_nonnegative,
-            charge=charge,
-        ),
+        readiness_events,
+        distributed_obligations,
     )
-    if cross_loop_dispatch_mode != "dynamic" and any(
-        consumer.rank_relation is not None
-        for event in readiness_graph.events
-        for consumer in event.consumers
-    ):
+    if cross_loop_dispatch_mode != "dynamic" and distributed_obligations:
         raise exc.InvalidConfig(
             "distributed cross-loop dependencies currently require "
             "cross_loop_pipeline='dynamic'"

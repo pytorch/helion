@@ -383,20 +383,100 @@ def _configured_readiness_graph(
     )
     assert all(root is not None for root in roots)
     root_domains = tuple(root for root in roots if root is not None)
+    events, distributed_obligations = cross_loop_scheduler._build_readiness_events(
+        dependency_graph,
+        root_domains=root_domains,
+        site_domains=sites,
+        publishable_site_ids=None,
+        prove_nonnegative=None,
+        charge=cross_loop_scheduler._new_relation_work_budget(),
+    )
     return ReadinessGraph(
         root_domains,
-        cross_loop_scheduler._build_readiness_events(
-            dependency_graph,
-            root_domains=root_domains,
-            site_domains=sites,
-            publishable_site_ids=None,
-            prove_nonnegative=None,
-            charge=cross_loop_scheduler._new_relation_work_budget(),
-        ),
+        events,
+        distributed_obligations,
     )
 
 
 class TestCrossLoopScheduler(TestCase):
+    def test_rank_disjoint_dependency_needs_no_readiness_event(self) -> None:
+        ranks = CoordinateDomain.scalar(2, kind="value", identity=0)
+        (rank_axis,) = ranks.axis_order
+
+        def owner(executor: int, rank: int) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                ranks,
+                ranks,
+                (
+                    (
+                        ((rank_axis, executor, executor + 1, 1),),
+                        (sympy.Integer(rank),),
+                    ),
+                ),
+            )
+
+        graph = _dependency_graph(
+            [[10], [20]],
+            dataclasses.replace(
+                _access(root=0, kind="store", block_id=10),
+                owner_rank_relation=owner(0, 0),
+            ),
+            dataclasses.replace(
+                _access(root=1, kind="load", block_id=20),
+                owner_rank_relation=owner(1, 1),
+            ),
+        )
+        self.assertEqual(graph.edges, ())
+        readiness = _configured_readiness_graph(
+            graph,
+            {10: (8, 16), 20: (8, 16)},
+        )
+
+        self.assertEqual(readiness.events, ())
+        self.assertEqual(readiness.distributed_obligations, frozenset())
+        plan = build_static_pipeline_plan(
+            dependency_graph=graph,
+            root_task_orders=(
+                _dense(_domain((10, 8, 16), identity=0)),
+                _dense(_domain((20, 8, 16), identity=1)),
+            ),
+            site_domains=(),
+            worker_count=8,
+            cross_loop_dispatch_mode="dynamic",
+        )
+        self.assertEqual(plan.readiness_counters, ())
+        self.assertEqual(plan.root_barrier_edges, frozenset())
+
+    def test_distributed_obligation_cannot_fall_back_to_local_counter(self) -> None:
+        roots = (
+            _domain((10, 2, 1), identity=0),
+            _domain((20, 2, 1), identity=1),
+        )
+        obligation = (0, None, None)
+        event = _pointwise_event(
+            roots,
+            0,
+            1,
+            0,
+            obligations=frozenset((obligation,)),
+        )
+        readiness = ReadinessGraph(
+            roots,
+            (event,),
+            distributed_obligations=frozenset((obligation,)),
+        )
+        with self.assertRaisesRegex(
+            exc.CrossLoopSchedulingError,
+            "distributed dependencies require exact readiness counters",
+        ):
+            cross_loop_scheduler._finalize_emitted_synchronization(
+                readiness_graph=readiness,
+                obligations_by_root_pair=(((0, 1), frozenset((obligation,))),),
+                readiness_counters=(
+                    ReadinessCounterPlan(event.producers, event.consumers),
+                ),
+            )
+
     def test_all_rank_union_canonicalizes_only_complete_peer_set(self) -> None:
         ranks = CoordinateDomain.scalar(4, kind="value", identity=0)
         (axis,) = ranks.axis_order
@@ -680,6 +760,39 @@ class TestCrossLoopScheduler(TestCase):
                 charge=charge,
             ),
             candidates,
+        )
+
+    def test_distributed_producer_is_not_a_final_arrival_continuation(self) -> None:
+        roots = tuple(
+            _domain((axis, 8, 1), identity=root)
+            for root, axis in enumerate((10, 20, 30))
+        )
+        local_event = _pointwise_event(roots, 0, 1, 0)
+        remote_event = _pointwise_event(roots, 1, 2, 1)
+        rank_domain = CoordinateDomain.scalar(2, kind="value")
+        remote_consumer = dataclasses.replace(
+            remote_event.consumers[0],
+            rank_relation=CoordinateRelation.total(rank_domain, rank_domain),
+        )
+        graph = ReadinessGraph(
+            roots,
+            (
+                local_event,
+                dataclasses.replace(remote_event, consumers=(remote_consumer,)),
+            ),
+        )
+
+        self.assertEqual(
+            derive_final_arrival_continuations(
+                graph,
+                (
+                    ReadinessCounterPlan(
+                        local_event.producers,
+                        local_event.consumers,
+                    ),
+                ),
+            ),
+            (),
         )
 
     def test_final_arrival_continuation_rejects_cross_key_worker_strands(self) -> None:
@@ -1499,14 +1612,16 @@ class TestCrossLoopScheduler(TestCase):
         )
         assert all(root is not None for root in roots)
         root_domains = tuple(root for root in roots if root is not None)
+        events, distributed_obligations = cross_loop_scheduler._build_readiness_events(
+            graph,
+            root_domains=root_domains,
+            site_domains=sites,
+            charge=cross_loop_scheduler._new_relation_work_budget(),
+        )
         readiness = ReadinessGraph(
             root_domains,
-            cross_loop_scheduler._build_readiness_events(
-                graph,
-                root_domains=root_domains,
-                site_domains=sites,
-                charge=cross_loop_scheduler._new_relation_work_budget(),
-            ),
+            events,
+            distributed_obligations,
         )
 
         self.assertEqual(len(readiness.events), 1)

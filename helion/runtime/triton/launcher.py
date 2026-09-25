@@ -24,6 +24,7 @@ import contextvars
 import hashlib
 from itertools import starmap
 import math
+from typing import cast
 import weakref
 
 import torch
@@ -168,7 +169,7 @@ def default_launcher(
     _remote_copy_process_group_name: str | None = None,
     _remote_barrier_signal_slots_per_program: int = 0,
     _remote_barrier_process_group_name: str | None = None,
-    _distributed_readiness_signal_dst: torch.Tensor | None = None,
+    _distributed_readiness_device_anchor: torch.Tensor | None = None,
     _distributed_readiness_signal_slots: int = 0,
     _distributed_readiness_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
@@ -210,48 +211,42 @@ def default_launcher(
             math.prod(grid) * _remote_barrier_signal_slots_per_program,
         )
         args = (*args, signal)
+    distributed_launch_fingerprint: str | None = None
     if _distributed_readiness_signal_slots:
         if (
-            _distributed_readiness_signal_dst is None
+            _distributed_readiness_device_anchor is None
             or _distributed_readiness_process_group_name is None
         ):
             raise RuntimeError(
-                "distributed readiness requires a symmetric payload and process group"
+                "distributed readiness requires a CUDA tensor and process group"
             )
-        signal_ptrs, signal_offset = _get_distributed_readiness_signal(
+        distributed_launch_fingerprint = _distributed_launch_fingerprint(
             triton_kernel,
-            _distributed_readiness_signal_dst,
+            grid,
+            original_args,
+            process_group_name=_distributed_readiness_process_group_name,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            ptx_options=ptx_options,
+            launch_cooperative_grid=launch_cooperative_grid,
+            launch_options=kwargs,
+            state_schema=tuple(
+                (numel, str(dtype)) for _, numel, dtype in _persistent_state_specs
+            ),
+            remote_copy_slots=remote_copy_signal_slots,
+            remote_barrier_slots=(
+                math.prod(grid) * _remote_barrier_signal_slots_per_program
+            ),
+            readiness_slots=_distributed_readiness_signal_slots,
+        )
+        signal, signal_ptrs, signal_offset = _get_distributed_readiness_signal(
+            triton_kernel,
+            _distributed_readiness_device_anchor,
             _distributed_readiness_process_group_name,
             _distributed_readiness_signal_slots,
-            launch_fingerprint=_distributed_launch_fingerprint(
-                triton_kernel,
-                grid,
-                original_args,
-                num_warps=num_warps,
-                num_stages=num_stages,
-                ptx_options=ptx_options,
-                launch_cooperative_grid=launch_cooperative_grid,
-                launch_options=kwargs,
-                state_schema=tuple(
-                    (numel, str(dtype)) for _, numel, dtype in _persistent_state_specs
-                ),
-                remote_copy_slots=remote_copy_signal_slots,
-                remote_barrier_slots=(
-                    math.prod(grid) * _remote_barrier_signal_slots_per_program
-                ),
-                readiness_slots=_distributed_readiness_signal_slots,
-            ),
-            reserved_tail_slots=(
-                remote_copy_signal_slots
-                if _remote_copy_signal_dst is not None
-                and _remote_copy_process_group_name
-                == _distributed_readiness_process_group_name
-                and _remote_copy_signal_dst.untyped_storage()._cdata
-                == _distributed_readiness_signal_dst.untyped_storage()._cdata
-                else 0
-            ),
+            launch_fingerprint=distributed_launch_fingerprint,
         )
-        args = (*args, signal_ptrs, signal_offset)
+        args = (*args, signal, signal_ptrs, signal_offset)
     for slot, (scratch_like, numel_per_program) in enumerate(
         _remote_copy_scratch_specs
     ):
@@ -264,13 +259,17 @@ def default_launcher(
         args = (*args, scratch)
     if _persistent_state_specs:
         persistent_state_namespace = (
-            tuple(grid),
-            num_warps,
-            num_stages,
-            ptx_options,
-            launch_cooperative_grid,
-            tuple(sorted((name, repr(value)) for name, value in kwargs.items())),
-            tuple((numel, dtype) for _, numel, dtype in _persistent_state_specs),
+            ("distributed_readiness", distributed_launch_fingerprint)
+            if distributed_launch_fingerprint is not None
+            else (
+                tuple(grid),
+                num_warps,
+                num_stages,
+                ptx_options,
+                launch_cooperative_grid,
+                tuple(sorted((name, repr(value)) for name, value in kwargs.items())),
+                tuple((numel, dtype) for _, numel, dtype in _persistent_state_specs),
+            )
         )
         for slot, (state_like, numel, dtype) in enumerate(_persistent_state_specs):
             state = _get_persistent_state(
@@ -318,6 +317,7 @@ def _distributed_launch_fingerprint(
     grid: tuple[int, ...],
     args: tuple[object, ...],
     *,
+    process_group_name: str,
     num_warps: int,
     num_stages: int,
     ptx_options: str | None,
@@ -351,6 +351,7 @@ def _distributed_launch_fingerprint(
 
     payload = (
         getattr(triton_kernel, "src", None),
+        process_group_name,
         tuple(grid),
         tuple(starmap(argument_signature, enumerate(args))),
         num_warps,
@@ -446,9 +447,13 @@ def _get_distributed_readiness_signal(
     required_slots: int,
     *,
     launch_fingerprint: str | None = None,
-    reserved_tail_slots: int = 0,
-) -> tuple[int, int]:
-    """Return a stream-local slice below any existing tail reservation."""
+) -> tuple[torch.Tensor, int, int]:
+    """Return dedicated symmetric readiness state for one protocol stream.
+
+    First use is an SPMD collective: every rank must initialize protocol/stream
+    instances in the same order.  Cache hits have no host synchronization and
+    are safe for CUDA graph replay.
+    """
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
     import torch.distributed.distributed_c10d as c10d
@@ -457,77 +462,85 @@ def _get_distributed_readiness_signal(
         "_helion_distributed_readiness_signal_cache", {}
     )
     stream = torch.cuda.current_stream(dst.device)
-    storage = dst.untyped_storage()
-    key = (id(storage), process_group_name)
+    key = (
+        dst.device,
+        process_group_name,
+        launch_fingerprint,
+        stream.cuda_stream,
+    )
     entry = cache.get(key)
-    if entry is not None and entry[0]() is storage:
-        (
-            handle,
-            signal_pad,
-            allocations,
-            cached_tail_slots,
-            cached_fingerprint,
-        ) = entry[1:]
-        if cached_tail_slots != reserved_tail_slots:
-            raise RuntimeError(
-                "distributed readiness signal reservations changed for one "
-                "compiled kernel"
+    if entry is not None:
+        _workspace, handle, signal_pad, offset = entry
+        return signal_pad, handle.signal_pad_ptrs_dev, offset
+
+    with torch.cuda.device(dst.device):
+        allocation_device = dst.device
+        # PyTorch currently keys its symmetric pool by the spelling originally
+        # passed to symm_mem.empty (for example ``cuda`` versus ``cuda:0``), while
+        # NVSHMEM's process-global team manager requires that spelling to remain
+        # stable. Reuse the established spelling for this physical device.
+        for pool_device in getattr(symm_mem, "_symm_mem_pools", {}):
+            candidate = torch.device(pool_device)
+            candidate_index = (
+                torch.cuda.current_device()
+                if candidate.index is None
+                else candidate.index
             )
-        if cached_fingerprint != launch_fingerprint:
-            raise RuntimeError(
-                "distributed readiness launch metadata changed for one compiled kernel"
-            )
-    else:
+            if (
+                candidate.type == dst.device.type
+                and candidate_index == dst.device.index
+            ):
+                allocation_device = candidate
+                break
+        workspace = symm_mem.empty(1, dtype=torch.uint8, device=allocation_device)
         handle = symm_mem.rendezvous(
-            dst,
+            workspace,
             group=process_group_name,  # pyrefly: ignore[bad-argument-type]
         )
+    with torch.cuda.device(dst.device):
         signal_pad = handle.get_signal_pad(handle.rank, dtype=torch.uint64)
-        allocations = {}
-
-        def remove_from_cache(_ref: object) -> None:
-            cache.pop(key, None)
-
-        cache[key] = (
-            weakref.ref(storage, remove_from_cache),
-            handle,
-            signal_pad,
-            allocations,
-            reserved_tail_slots,
-            launch_fingerprint,
+        capacity = signal_pad.numel()
+        capacity_ok = required_slots <= capacity
+        offset = capacity - required_slots if capacity_ok else 0
+        if capacity_ok:
+            signal_pad.narrow(0, offset, required_slots).zero_()
+        # Complete initialization before any peer may publish into this workspace.
+        stream.synchronize()
+        group = c10d._resolve_process_group(
+            process_group_name  # pyrefly: ignore[bad-argument-type]
         )
-    stream_key = stream.cuda_stream
-    if stream_key in allocations:
-        return handle.signal_pad_ptrs_dev, allocations[stream_key]
-
-    capacity = signal_pad.numel()
-    used_slots = reserved_tail_slots + len(allocations) * required_slots
-    if used_slots + required_slots > capacity:
-        raise RuntimeError(
-            "Helion distributed readiness requires "
-            f"{required_slots} uint64 signal slots per stream, but the symmetric-memory "
-            f"signal pad has capacity {capacity}. Increase the signal pad size "
-            "before allocating symmetric tensors."
+        statuses: list[tuple[str | None, int] | None] = [None] * dist.get_world_size(
+            group
         )
-    offset = capacity - used_slots - required_slots
-    signal_pad.narrow(0, offset, required_slots).zero_()
-    # Complete the asynchronous memset before the host-visible group barrier;
-    # after it returns, every peer may safely publish into every signal pad.
-    stream.synchronize()
-    group = c10d._resolve_process_group(
-        process_group_name  # pyrefly: ignore[bad-argument-type]
-    )
-    fingerprints: list[str | None] = [None] * dist.get_world_size(group)
-    dist.all_gather_object(fingerprints, launch_fingerprint, group=group)
+        dist.all_gather_object(
+            statuses,
+            (launch_fingerprint, capacity),
+            group=group,
+        )
+    if any(status is None for status in statuses):
+        raise RuntimeError("distributed readiness initialization did not complete")
+    concrete_statuses = cast("list[tuple[str | None, int]]", statuses)
+    fingerprints = [fingerprint for fingerprint, _capacity in concrete_statuses]
     if fingerprints != fingerprints[:1] * len(fingerprints):
         raise RuntimeError(
             "distributed readiness requires identical kernel schedules and "
             f"launch geometry on every rank; got {fingerprints!r}"
         )
-
-    pointer_table = handle.signal_pad_ptrs_dev
-    allocations[stream_key] = offset
-    return pointer_table, offset
+    capacities = [peer_capacity for _fingerprint, peer_capacity in concrete_statuses]
+    if capacities != capacities[:1] * len(capacities):
+        raise RuntimeError(
+            "distributed readiness requires identical signal pad capacities "
+            f"on every rank; got {capacities!r}"
+        )
+    if any(required_slots > peer_capacity for peer_capacity in capacities):
+        raise RuntimeError(
+            "Helion distributed readiness requires "
+            f"{required_slots} uint64 signal slots per stream, but the symmetric-memory "
+            f"signal pad capacities are {capacities!r}. Increase the signal pad size "
+            "before launching the kernel."
+        )
+    cache[key] = (workspace, handle, signal_pad, offset)
+    return signal_pad, handle.signal_pad_ptrs_dev, offset
 
 
 def _get_remote_copy_scratch(

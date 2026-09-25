@@ -2534,7 +2534,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         requested_config = self._normalize_config(config)
         config = self._normalized_config_copy(requested_config)
         dist_check_config_consistancy(
-            config, process_group_name=self._env.process_group_name
+            config,
+            process_group_name=self._env.process_group_name,
+            force=self._env.process_group_name is not None,
         )
         if (rv := self._compile_cache.get(config)) is not None:
             return rv
@@ -2901,9 +2903,24 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
 
         def make_extractor(v: Source) -> Callable[[Sequence[object]], Hashable]:
             if isinstance(v, TensorPropertySource):
+                inner = make_extractor(v.base)
+                if v.prop == TensorProperty.STORAGE_OFFSET:
+
+                    def storage_offset_extractor(
+                        args: Sequence[object],
+                        _inner: Callable[[Sequence[object]], Hashable] = inner,
+                    ) -> Hashable:
+                        result = _inner(args)
+                        if isinstance(result, (list, tuple)):
+                            return tuple(
+                                cast("torch.Tensor", tensor).storage_offset()
+                                for tensor in result
+                            )
+                        return cast("torch.Tensor", result).storage_offset()
+
+                    return storage_offset_extractor
                 index = v.idx
                 assert index is not None
-                inner = make_extractor(v.base)
                 if v.prop == TensorProperty.SIZE:
 
                     def size_extractor(
@@ -3037,7 +3054,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 for config in candidate_configs
                 if _td_guard_active_for_config(guard, config)
             )
-            with self.env:
+            host_function = self.host_function
+            assert host_function is not None
+            with self.env, host_function:
                 resolved_block_sizes = (
                     block_size.from_config(config)
                     for config in active_configs
