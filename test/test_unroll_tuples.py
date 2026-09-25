@@ -935,10 +935,6 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         "Triton-MTIA: register-cache layernorm (G=8) needs >14 circular buffers; see T280008478"
     )
     def test_list_register_cache_layernorm(self):
-        for _ in range(100 if torch.version.hip else 1):
-            self._check_list_register_cache_layernorm()
-
-    def _check_list_register_cache_layernorm(self):
         """Test two-pass layernorm with register-cached list elements."""
         M, D, G = 1024 * 1024, 32, 8
         tensors = [
@@ -954,28 +950,7 @@ class TestUnrollTuples(RefEagerTestBase, TestCase):
         rstd = 1.0 / torch.sqrt(var + 1e-5)
         expected = ((concatenated - mean[:, None]) * rstd[:, None]).to(tensors[0].dtype)
 
-        try:
-            torch.testing.assert_close(result, expected, atol=5 * 1e-2, rtol=5 * 1e-2)
-        except AssertionError:
-            mismatched = ~torch.isclose(result, expected, atol=0.05, rtol=0.05)
-            rows = mismatched.any(dim=1).nonzero().flatten()[:8]
-            cpu_input = torch.cat([t[rows].cpu().double() for t in tensors], dim=1)
-            cpu_mean = cpu_input.mean(dim=-1, keepdim=True)
-            cpu_var = ((cpu_input - cpu_mean) ** 2).mean(dim=-1, keepdim=True)
-            cpu_expected = ((cpu_input - cpu_mean) / torch.sqrt(cpu_var + 1e-5)).to(
-                result.dtype
-            )
-            repeated = kernel_list_register_cache_layernorm(tensors)[rows].cpu()
-            uncached = kernel_list_no_cache_layernorm(tensors)[rows].cpu()
-            print("LayerNorm diagnostic rows:", rows.tolist())
-            print("LayerNorm diagnostic input:", cpu_input.tolist())
-            print("LayerNorm diagnostic original:", result[rows].cpu().tolist())
-            print("LayerNorm diagnostic GPU reference:", expected[rows].cpu().tolist())
-            print("LayerNorm diagnostic CPU reference:", cpu_expected.tolist())
-            print("LayerNorm diagnostic repeated:", repeated.tolist())
-            print("LayerNorm diagnostic uncached:", uncached.tolist())
-            print("LayerNorm diagnostic generated code:\n", code)
-            raise
+        torch.testing.assert_close(result, expected, atol=5 * 1e-2, rtol=5 * 1e-2)
 
         # Verify register caching: G loads in pass 1, no re-loads in pass 2
         if _get_backend() == "triton":
