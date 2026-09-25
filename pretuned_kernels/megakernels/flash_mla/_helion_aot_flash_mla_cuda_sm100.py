@@ -1,4 +1,4 @@
-"""Checked-in B200 config for the runtime-topology FlashMLA megakernel."""
+"""Checked-in B200 config for the runtime-ragged FlashMLA megakernel."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ CONFIG = {
     "range_multi_buffers": [None, None, None, None, None, None, None],
     "range_flattens": [None, None, None, None, None, None, None],
     "static_ranges": [False, False],
-    "load_eviction_policies": [""] * 16,
+    "load_eviction_policies": [""] * 13,
     "num_warps": 4,
     "num_stages": 1,
-    "indexing": ["pointer"] * 25,
+    "indexing": ["pointer"] * 22,
     "pid_type": "persistent_blocked",
     "cross_loop_pipeline": "dynamic",
     "num_sm_multiplier": 1,
@@ -38,16 +38,12 @@ _TENSOR_SIGNATURES = (
     ((1111, 1, 64, 576), torch.bfloat16),
     ((4, 802), torch.int32),
     ((4,), torch.int32),
-    ((608,), torch.int32),
-    ((608,), torch.int32),
-    ((38,), torch.int32),
-    ((5,), torch.int32),
 )
 _STATIC_ARGS = (1.0 / 24.0, 128)
 
 
 def key_flash_mla(*args) -> int:
-    """Validate the fixed B4 envelope; topology and lengths remain runtime."""
+    """Validate the fixed B4 envelope; sequence lengths remain runtime."""
     tensor_count = len(_TENSOR_SIGNATURES)
     if (
         len(args) != tensor_count + len(_STATIC_ARGS)
@@ -56,7 +52,7 @@ def key_flash_mla(*args) -> int:
         or args[tensor_count:] != _STATIC_ARGS
     ):
         raise ValueError(
-            "flash_mla is pretuned for the B4/Q4/H16 runtime-topology envelope"
+            "flash_mla is pretuned for the B4/Q4/H16 runtime-ragged envelope"
         )
     return 0
 

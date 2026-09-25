@@ -12,6 +12,10 @@ from pretuned_kernels.megakernels._pdl import signal_dependents
 from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
 import torch
 
+from .flash_mla import RADIX_FAN_IN
+from .flash_mla import _runtime_group_assignment
+from .flash_mla import _runtime_group_interval
+from .flash_mla import _runtime_request_value
 import helion
 import helion.language as hl
 
@@ -27,8 +31,7 @@ def flash_mla_partial(
     kv_cache: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    task_requests: torch.Tensor,
-    task_starts: torch.Tensor,
+    task_counts: tuple[int, int, int, int],
     scale: float,
     block_n: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -46,7 +49,8 @@ def flash_mla_partial(
     heads_per_group = hl.specialize(16)
     num_head_groups = hl.specialize(num_heads // heads_per_group)
     query_rows = hl.specialize(query_len * heads_per_group)
-    num_tasks = hl.specialize(task_requests.shape[0])
+    task_count_0, task_count_1, task_count_2, _task_count_3 = task_counts
+    num_tasks = sum(task_counts)
     num_columns = hl.specialize(block_tables.shape[1])
     cache_1d = kv_cache.view(-1)
     query_1d = query.view(-1)
@@ -73,8 +77,19 @@ def flash_mla_partial(
         [num_tasks, num_head_groups], block_size=[1, 1]
     ):
         signal_dependents()
-        request = hl.load(task_requests, [tile_task.begin])
-        task_start = hl.load(task_starts, [tile_task.begin])
+        task_begin_1 = task_count_0
+        task_begin_2 = task_begin_1 + task_count_1
+        task_begin_3 = task_begin_2 + task_count_2
+        task = torch.sum(tile_task.index)
+        request = (
+            (task >= task_begin_1).to(torch.int32)
+            + (task >= task_begin_2).to(torch.int32)
+            + (task >= task_begin_3).to(torch.int32)
+        )
+        request_task_begin = _runtime_request_value(
+            request, 0, task_begin_1, task_begin_2, task_begin_3
+        )
+        task_start = (task - request_task_begin) * block_n
         sequence_length = hl.load(seq_lens, [request])
         query_indices = hl.arange(query_len)
         causal_lengths = sequence_length - (query_len - query_indices - 1)
@@ -158,7 +173,7 @@ def flash_mla_partial(
 def flash_mla_final(
     partial: torch.Tensor,
     partial_lse: torch.Tensor,
-    task_offsets: torch.Tensor,
+    task_counts: tuple[int, int, int, int],
 ) -> torch.Tensor:
     """Online reduction over each request's contiguous compact-task interval."""
     (
@@ -168,7 +183,7 @@ def flash_mla_final(
         heads_per_group,
         value_dim,
     ) = partial.shape
-    batch_size = hl.specialize(task_offsets.shape[0] - 1)
+    batch_size = len(task_counts)
     num_heads = hl.specialize(num_head_groups * heads_per_group)
     output = torch.empty(
         (batch_size, query_len, num_head_groups, heads_per_group, value_dim),
@@ -181,8 +196,15 @@ def flash_mla_final(
         block_size=[1, None, 1, 1, None],
     ):
         wait_and_launch_dependents()
-        task_begin = hl.load(task_offsets, [tile_b.begin])
-        task_end = hl.load(task_offsets, [tile_b.begin + 1])
+        task_count_0, task_count_1, task_count_2, task_count_3 = task_counts
+        request = torch.sum(tile_b.index)
+        task_begin, task_end = _runtime_group_interval(
+            request,
+            task_count_0,
+            task_count_1,
+            task_count_2,
+            task_count_3,
+        )
         task_count = task_end - task_begin
         running_max = hl.full([tile_h.block_size], float("-inf"), torch.float32)
         running_sum = hl.zeros([tile_h.block_size], dtype=torch.float32)
@@ -212,8 +234,7 @@ def flash_mla_final(
 def flash_mla_radix(
     partial: torch.Tensor,
     partial_lse: torch.Tensor,
-    group_starts: torch.Tensor,
-    group_counts: torch.Tensor,
+    task_counts: tuple[int, int, int, int],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Merge one bounded contiguous group while streaming child states."""
     (
@@ -223,7 +244,9 @@ def flash_mla_radix(
         heads_per_group,
         value_dim,
     ) = partial.shape
-    num_groups = hl.specialize(group_starts.shape[0])
+    num_groups = sum(
+        (task_count + RADIX_FAN_IN - 1) // RADIX_FAN_IN for task_count in task_counts
+    )
     output = torch.empty(
         (
             num_groups,
@@ -252,8 +275,24 @@ def flash_mla_radix(
         block_size=[1, 1, 1, None, None],
     ):
         wait_and_launch_dependents()
-        child_begin = hl.load(group_starts, [tile_group.begin])
-        child_count = hl.load(group_counts, [tile_group.begin])
+        task_count_0, task_count_1, task_count_2, task_count_3 = task_counts
+        task_begin_1 = task_count_0
+        task_begin_2 = task_begin_1 + task_count_1
+        task_begin_3 = task_begin_2 + task_count_2
+        group = torch.sum(tile_group.index)
+        request, request_group_begin, child_count, _group_end = (
+            _runtime_group_assignment(
+                group,
+                task_count_0,
+                task_count_1,
+                task_count_2,
+                task_count_3,
+            )
+        )
+        request_task_begin = _runtime_request_value(
+            request, 0, task_begin_1, task_begin_2, task_begin_3
+        )
+        child_begin = request_task_begin + (group - request_group_begin) * RADIX_FAN_IN
         best = hl.full([tile_h.block_size], float("-inf"), torch.float32)
         # Determine the common normalization before touching the value tensor.
         # This production-style two-pass form avoids rescaling the entire
@@ -316,10 +355,10 @@ CONFIGS: dict[str, dict[str, object]] = {
         "range_multi_buffers": [None, None, None],
         "range_flattens": [None, None, None],
         "static_ranges": [False, False],
-        "load_eviction_policies": ["", "", "", "", "", ""],
+        "load_eviction_policies": [""] * 4,
         "num_warps": 8,
         "num_stages": 1,
-        "indexing": ["pointer"] * 10,
+        "indexing": ["pointer"] * 8,
         "pid_type": "flat",
         "atomic_indexing": [],
     },
@@ -332,10 +371,10 @@ CONFIGS: dict[str, dict[str, object]] = {
         "range_num_stages": [0, 1, 1],
         "range_multi_buffers": [None, True, True],
         "range_flattens": [None, True, True],
-        "load_eviction_policies": ["", "", "", "", ""],
+        "load_eviction_policies": [""] * 3,
         "num_warps": 8,
         "num_stages": 2,
-        "indexing": ["pointer"] * 7,
+        "indexing": ["pointer"] * 5,
         "pid_type": "flat",
         "atomic_indexing": [],
     },
@@ -348,10 +387,10 @@ CONFIGS: dict[str, dict[str, object]] = {
         "range_num_stages": [0, 4],
         "range_multi_buffers": [None, True],
         "range_flattens": [None, True],
-        "load_eviction_policies": ["", "", "", ""],
+        "load_eviction_policies": [""] * 2,
         "num_warps": 4,
         "num_stages": 8,
-        "indexing": ["pointer"] * 5,
+        "indexing": ["pointer"] * 3,
         "pid_type": "persistent_interleaved",
         "num_sm_multiplier": 16,
         "maxnreg": 128,
@@ -372,17 +411,19 @@ def _compile(kernel, args, config_values: dict[str, object]) -> CompiledConfig:
 def build(
     tensors: dict[str, torch.Tensor],
     *,
+    sequence_lengths: tuple[int, ...],
     scale: float,
     block_n: int,
 ) -> tuple[Callable[[], torch.Tensor], tuple[CompiledConfig, ...], torch.Tensor]:
     """Compile the independently tuned, PDL-chained attention launches."""
+    task_counts = tuple(math.ceil(length / block_n) for length in sequence_lengths)
+    static_task_counts = hl.constexpr(task_counts)
     partial_args = (
         tensors["query"],
         tensors["kv_cache"],
         tensors["block_tables"],
         tensors["seq_lens"],
-        tensors["task_requests"],
-        tensors["task_starts"],
+        static_task_counts,
         scale,
         block_n,
     )
@@ -392,13 +433,12 @@ def build(
     radix_args = (
         partial,
         partial_lse,
-        tensors["group_starts"],
-        tensors["group_counts"],
+        static_task_counts,
     )
     radix_call = _compile(flash_mla_radix, radix_args, CONFIGS["radix"])
     grouped, grouped_lse = launch_dependent(radix_call, *radix_args)
 
-    final_args = (grouped, grouped_lse, tensors["group_offsets"])
+    final_args = (grouped, grouped_lse, static_task_counts)
     final_call = _compile(flash_mla_final, final_args, CONFIGS["final"])
 
     def launch() -> torch.Tensor:
@@ -407,14 +447,13 @@ def build(
             radix_call,
             partial_value,
             partial_lse_value,
-            tensors["group_starts"],
-            tensors["group_counts"],
+            static_task_counts,
         )
         return launch_dependent(
             final_call,
             grouped_value,
             grouped_lse_value,
-            tensors["group_offsets"],
+            static_task_counts,
         )
 
     output = launch()

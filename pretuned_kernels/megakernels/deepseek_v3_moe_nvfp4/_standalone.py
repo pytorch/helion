@@ -14,30 +14,17 @@ from typing import Any
 from pretuned_kernels.megakernels._pdl import launch_dependent
 from pretuned_kernels.megakernels._pdl import signal_dependents
 from pretuned_kernels.megakernels._pdl import wait_and_launch_dependents
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import FP4_MAX
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import MMA_N
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import first_mma_column
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import fp4_nibble
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import (
+    take_stable_argmax,
+)
 import torch
 
 import helion
 import helion.language as hl
-
-FP4_MAX = 6.0
-MMA_N = 16
-
-
-def _fp4_nibble(value: torch.Tensor) -> torch.Tensor:
-    magnitude = torch.abs(value)
-    code = (magnitude > 0.25).to(torch.int32)
-    code += (magnitude >= 0.75).to(torch.int32)
-    code += (magnitude > 1.25).to(torch.int32)
-    code += (magnitude >= 1.75).to(torch.int32)
-    code += (magnitude > 2.5).to(torch.int32)
-    code += (magnitude >= 3.5).to(torch.int32)
-    code += (magnitude > 5.0).to(torch.int32)
-    return code | ((value < 0).to(torch.int32) << 3)
-
-
-def _first_mma_column(value: torch.Tensor) -> torch.Tensor:
-    column = hl.arange(MMA_N)
-    return torch.sum(value * (column[None, :] == 0).to(torch.float32), dim=-1)
 
 
 @helion.kernel(static_shapes=True, autotune_effort="none", backend="triton")
@@ -96,8 +83,8 @@ def standalone_input_quant(
         block_scale = block_scale_f32.to(torch.float8_e4m3fn)
         actual_scale = block_scale.to(torch.float32)
         divisor = torch.where(actual_scale > 0, actual_scale, 1.0)
-        low = _fp4_nibble(low_values * global_scale / divisor[:, :, None])
-        high = _fp4_nibble(high_values * global_scale / divisor[:, :, None])
+        low = fp4_nibble(low_values * global_scale / divisor[:, :, None])
+        high = fp4_nibble(high_values * global_scale / divisor[:, :, None])
         packed = (low | (high << 4)).to(torch.uint8)
         hidden_q_groups[tile_row, tile_group, :] = packed
         hidden_scale[tile_row, tile_group] = block_scale
@@ -156,212 +143,32 @@ def grouped_topk(
         group_best_2 = torch.amax(group_without_best, dim=-1)
         group_scores = group_best_1.view(batch, num_groups) + group_best_2
         group_indices = hl.arange(num_groups)[None, :].to(torch.int32)
-        group_max_1 = torch.amax(group_scores, dim=-1, keepdim=True)
-        group_id_1 = torch.amin(
-            torch.where(
-                group_scores == group_max_1,
-                group_indices,
-                torch.full_like(group_indices, num_groups),
-            ),
-            dim=-1,
+        group_id, remaining_groups = take_stable_argmax(
+            group_scores, group_indices, num_groups
         )
-        remaining_groups = torch.where(
-            group_indices == group_id_1[:, None],
-            torch.full_like(group_scores, float("-inf")),
-            group_scores,
-        )
-        group_max_2 = torch.amax(remaining_groups, dim=-1, keepdim=True)
-        group_id_2 = torch.amin(
-            torch.where(
-                remaining_groups == group_max_2,
-                group_indices,
-                torch.full_like(group_indices, num_groups),
-            ),
-            dim=-1,
-        )
-        remaining_groups = torch.where(
-            group_indices == group_id_2[:, None],
-            torch.full_like(group_scores, float("-inf")),
-            remaining_groups,
-        )
-        group_max_3 = torch.amax(remaining_groups, dim=-1, keepdim=True)
-        group_id_3 = torch.amin(
-            torch.where(
-                remaining_groups == group_max_3,
-                group_indices,
-                torch.full_like(group_indices, num_groups),
-            ),
-            dim=-1,
-        )
-        remaining_groups = torch.where(
-            group_indices == group_id_3[:, None],
-            torch.full_like(group_scores, float("-inf")),
-            remaining_groups,
-        )
-        group_max_4 = torch.amax(remaining_groups, dim=-1, keepdim=True)
-        group_id_4 = torch.amin(
-            torch.where(
-                remaining_groups == group_max_4,
-                group_indices,
-                torch.full_like(group_indices, num_groups),
-            ),
-            dim=-1,
-        )
-        allowed = (
-            (group_indices == group_id_1[:, None])
-            | (group_indices == group_id_2[:, None])
-            | (group_indices == group_id_3[:, None])
-            | (group_indices == group_id_4[:, None])
-        ).view(batch, num_groups, 1)
-        masked = torch.where(allowed, grouped, negative_infinity).view(
+        allowed = group_indices == group_id[:, None]
+        for _group_rank in hl.static_range(1, topk_groups):
+            group_id, remaining_groups = take_stable_argmax(
+                remaining_groups, group_indices, num_groups
+            )
+            allowed = allowed | (group_indices == group_id[:, None])
+        allowed_groups = allowed.view(batch, num_groups, 1)
+        masked = torch.where(allowed_groups, grouped, negative_infinity).view(
             batch, num_experts
         )
         expert_indices = hl.arange(num_experts)[None, :].to(torch.int32)
-        masked_1 = masked
-        value_0 = torch.amax(masked_1, dim=-1, keepdim=True)
-        candidates_0 = masked_1 == value_0
-        id_0 = torch.amin(
-            torch.where(
-                candidates_0,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        selected_0 = expert_indices == id_0[:, None]
-        masked_2 = torch.where(
-            selected_0, torch.full_like(masked, float("-inf")), masked_1
-        )
-        value_1 = torch.amax(masked_2, dim=-1, keepdim=True)
-        candidates_1 = masked_2 == value_1
-        id_1 = torch.amin(
-            torch.where(
-                candidates_1,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        selected_1 = expert_indices == id_1[:, None]
-        masked_3 = torch.where(
-            selected_1, torch.full_like(masked, float("-inf")), masked_2
-        )
-        value_2 = torch.amax(masked_3, dim=-1, keepdim=True)
-        candidates_2 = masked_3 == value_2
-        id_2 = torch.amin(
-            torch.where(
-                candidates_2,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        selected_2 = expert_indices == id_2[:, None]
-        masked_4 = torch.where(
-            selected_2, torch.full_like(masked, float("-inf")), masked_3
-        )
-        value_3 = torch.amax(masked_4, dim=-1, keepdim=True)
-        candidates_3 = masked_4 == value_3
-        id_3 = torch.amin(
-            torch.where(
-                candidates_3,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        selected_3 = expert_indices == id_3[:, None]
-        masked_5 = torch.where(
-            selected_3, torch.full_like(masked, float("-inf")), masked_4
-        )
-        value_4 = torch.amax(masked_5, dim=-1, keepdim=True)
-        candidates_4 = masked_5 == value_4
-        id_4 = torch.amin(
-            torch.where(
-                candidates_4,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        selected_4 = expert_indices == id_4[:, None]
-        masked_6 = torch.where(
-            selected_4, torch.full_like(masked, float("-inf")), masked_5
-        )
-        value_5 = torch.amax(masked_6, dim=-1, keepdim=True)
-        candidates_5 = masked_6 == value_5
-        id_5 = torch.amin(
-            torch.where(
-                candidates_5,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        selected_5 = expert_indices == id_5[:, None]
-        masked_7 = torch.where(
-            selected_5, torch.full_like(masked, float("-inf")), masked_6
-        )
-        value_6 = torch.amax(masked_7, dim=-1, keepdim=True)
-        candidates_6 = masked_7 == value_6
-        id_6 = torch.amin(
-            torch.where(
-                candidates_6,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        selected_6 = expert_indices == id_6[:, None]
-        masked_8 = torch.where(
-            selected_6, torch.full_like(masked, float("-inf")), masked_7
-        )
-        value_7 = torch.amax(masked_8, dim=-1, keepdim=True)
-        candidates_7 = masked_8 == value_7
-        id_7 = torch.amin(
-            torch.where(
-                candidates_7,
-                expert_indices,
-                torch.full_like(expert_indices, num_experts),
-            ),
-            dim=-1,
-        )
-        # The selected IDs are unique, so load their scores directly instead of
-        # running eight full-width one-hot reductions over all experts.
-        weight_0 = torch.sigmoid(torch.sum(logits[:, id_0].float(), dim=-1))
-        weight_1 = torch.sigmoid(torch.sum(logits[:, id_1].float(), dim=-1))
-        weight_2 = torch.sigmoid(torch.sum(logits[:, id_2].float(), dim=-1))
-        weight_3 = torch.sigmoid(torch.sum(logits[:, id_3].float(), dim=-1))
-        weight_4 = torch.sigmoid(torch.sum(logits[:, id_4].float(), dim=-1))
-        weight_5 = torch.sigmoid(torch.sum(logits[:, id_5].float(), dim=-1))
-        weight_6 = torch.sigmoid(torch.sum(logits[:, id_6].float(), dim=-1))
-        weight_7 = torch.sigmoid(torch.sum(logits[:, id_7].float(), dim=-1))
-        denominator = (
-            weight_0
-            + weight_1
-            + weight_2
-            + weight_3
-            + weight_4
-            + weight_5
-            + weight_6
-            + weight_7
-        )
-        weights[:, 0] = weight_0 / denominator * routed_scale
-        weights[:, 1] = weight_1 / denominator * routed_scale
-        weights[:, 2] = weight_2 / denominator * routed_scale
-        weights[:, 3] = weight_3 / denominator * routed_scale
-        weights[:, 4] = weight_4 / denominator * routed_scale
-        weights[:, 5] = weight_5 / denominator * routed_scale
-        weights[:, 6] = weight_6 / denominator * routed_scale
-        weights[:, 7] = weight_7 / denominator * routed_scale
-        ids[:, 0] = id_0
-        ids[:, 1] = id_1
-        ids[:, 2] = id_2
-        ids[:, 3] = id_3
-        ids[:, 4] = id_4
-        ids[:, 5] = id_5
-        ids[:, 6] = id_6
-        ids[:, 7] = id_7
+        remaining_experts = masked
+        for rank in hl.static_range(top_k):
+            selected_id, remaining_experts = take_stable_argmax(
+                remaining_experts, expert_indices, num_experts
+            )
+            ids[:, rank] = selected_id
+            weights[:, rank] = torch.sigmoid(
+                torch.sum(logits[:, selected_id].float(), dim=-1)
+            )
+        selected_weights = weights[:, :]
+        denominator = torch.sum(selected_weights, dim=-1, keepdim=True)
+        weights[:, :] = selected_weights / denominator * routed_scale
     return weights, ids
 
 
@@ -399,10 +206,8 @@ def selected_w13_swiglu_nvfp4(
     flat_weight_scale = w13_scale_bytes.view(
         experts * twice_intermediate, hidden_groups
     )
-    output_groups = hl.register_block_size(4, 4)
-    block_groups = hl.register_block_size(32, 32)
     for tile_slot, tile_output_group in hl.tile(
-        [top_k, activation_groups], block_size=[1, output_groups]
+        [top_k, activation_groups], block_size=[1, 4]
     ):
         wait_and_launch_dependents()
         slot = tile_slot.begin
@@ -416,10 +221,10 @@ def selected_w13_swiglu_nvfp4(
         )
         weight_row = expert_address * twice_intermediate + physical_row_index
         accumulator = hl.zeros([128, MMA_N], dtype=torch.float32)
-        for tile_group in hl.tile(hidden_groups, block_size=block_groups):
-            packed_index = (tile_group.begin * 8 + hl.arange(block_groups * 8)).to(
-                torch.int64
-            )
+        for tile_group in hl.tile(hidden_groups, block_size=32):
+            packed_index = (
+                tile_group.begin * 8 + hl.arange(tile_group.block_size * 8)
+            ).to(torch.int64)
             lhs = weight_tma[descriptor_row, :, packed_index]
             lhs_scale = flat_weight_scale[
                 weight_row[:, None], tile_group.index[None, :]
@@ -427,7 +232,7 @@ def selected_w13_swiglu_nvfp4(
             hidden_bytes = hidden_q[0, packed_index]
             rhs = hidden_bytes[:, None].expand(hidden_bytes.size(0), MMA_N)
             hidden_scale = hidden_scale_bytes[0, tile_group]
-            rhs_scale = hidden_scale[None, :].expand(MMA_N, block_groups)
+            rhs_scale = hidden_scale[None, :].expand(MMA_N, tile_group.block_size)
             accumulator = hl.dot_scaled(
                 lhs,
                 lhs_scale,
@@ -439,7 +244,7 @@ def selected_w13_swiglu_nvfp4(
                 out_dtype=torch.float32,
             )
         logical_rows = 64
-        preactivation = _first_mma_column(accumulator).reshape(logical_rows, 2)
+        preactivation = first_mma_column(accumulator).reshape(logical_rows, 2)
         pair = hl.arange(2)
         gate = torch.sum(preactivation * (pair[None, :] == 0), dim=-1)
         up = torch.sum(preactivation * (pair[None, :] == 1), dim=-1)
@@ -456,7 +261,7 @@ def selected_w13_swiglu_nvfp4(
         actual_scale = block_scale.to(torch.float32)
         divisor = torch.where(actual_scale > 0, actual_scale, 1.0)
         scaled = activated_groups * global_scale / divisor[:, None]
-        nibbles = _fp4_nibble(scaled)
+        nibbles = fp4_nibble(scaled)
         low, high = hl.split(nibbles.reshape(logical_rows // 16, 8, 2))
         packed = low | (high << 4)
         output_q_groups[slot, tile_output_group, :] = packed.reshape(4, 8).to(
@@ -486,7 +291,6 @@ def selected_w2_nvfp4(
     groups = packed_intermediate // 8
     flat_weight_scale = w2_scale_bytes.view(experts * hidden, groups)
     block_rows = hl.register_block_size(128, 256)
-    block_groups = hl.register_block_size(32, 32)
     for tile_slot, tile_row in hl.tile([top_k, hidden], block_size=[1, block_rows]):
         wait_and_launch_dependents()
         slot = tile_slot.begin
@@ -495,10 +299,10 @@ def selected_w2_nvfp4(
         row_index = tile_row.index.to(torch.int32)
         weight_row = expert_address * hidden + row_index
         accumulator = hl.zeros([tile_row, MMA_N], dtype=torch.float32)
-        for tile_group in hl.tile(groups, block_size=block_groups):
-            packed_index = (tile_group.begin * 8 + hl.arange(block_groups * 8)).to(
-                torch.int64
-            )
+        for tile_group in hl.tile(groups, block_size=32):
+            packed_index = (
+                tile_group.begin * 8 + hl.arange(tile_group.block_size * 8)
+            ).to(torch.int64)
             lhs = w2[expert, tile_row, packed_index]
             lhs_scale = flat_weight_scale[
                 weight_row[:, None], tile_group.index[None, :]
@@ -506,7 +310,7 @@ def selected_w2_nvfp4(
             activation_bytes = activation_q[slot, packed_index]
             rhs = activation_bytes[:, None].expand(activation_bytes.size(0), MMA_N)
             activation_scale = activation_scale_bytes[slot, tile_group]
-            rhs_scale = activation_scale[None, :].expand(MMA_N, block_groups)
+            rhs_scale = activation_scale[None, :].expand(MMA_N, tile_group.block_size)
             accumulator = hl.dot_scaled(
                 lhs,
                 lhs_scale,
@@ -518,7 +322,7 @@ def selected_w2_nvfp4(
                 out_dtype=torch.float32,
             )
         output[tile_slot, tile_row] = (
-            (_first_mma_column(accumulator) * alpha2[expert])
+            (first_mma_column(accumulator) * alpha2[expert])
             .reshape(1, tile_row.block_size)
             .to(torch.bfloat16)
         )
@@ -544,13 +348,11 @@ def shared_w13_nvfp4(
     flat_weight = weight.view(twice_intermediate, packed_hidden)
     flat_scale = weight_scale.view(twice_intermediate, hidden_groups)
     flat_hidden = hidden_q.view(packed_hidden)
-    row_block = hl.register_block_size(16, 16)
-    group_block = hl.register_block_size(64, 64)
-    for tile_row in hl.tile(twice_intermediate, block_size=row_block):
+    for tile_row in hl.tile(twice_intermediate, block_size=16):
         signal_dependents()
         weight_row = tile_row.index.to(torch.int64)
-        accumulator = hl.zeros([row_block], dtype=torch.float32)
-        for tile_group in hl.tile(hidden_groups, block_size=group_block):
+        accumulator = hl.zeros([tile_row], dtype=torch.float32)
+        for tile_group in hl.tile(hidden_groups, block_size=64):
             group_mask = tile_group.index < hidden_groups
             offsets = weight_row[:, None] * hidden_groups + tile_group.index[None, :]
             mask = (tile_row.index[:, None] < twice_intermediate) & group_mask[None, :]
@@ -560,7 +362,7 @@ def shared_w13_nvfp4(
             hidden_values = hl.load_float4_e2m1fn_x16_to_float16(
                 flat_hidden, tile_group.index, extra_mask=group_mask
             )
-            contribution = hl.zeros([row_block, group_block], dtype=torch.float32)
+            contribution = hl.zeros([tile_row, tile_group], dtype=torch.float32)
             for lane in hl.static_range(16):
                 contribution += values[lane] * hidden_values[lane][None, :]
             scale = flat_scale[weight_row[:, None], tile_group.index[None, :]].to(
@@ -589,8 +391,7 @@ def shared_swiglu_quant_nvfp4(
         (1, groups), dtype=torch.float8_e4m3fn, device=preactivation.device
     )
     output_q_groups = output_q.view(1, groups, 8)
-    group_block = hl.register_block_size(32, 32)
-    for tile_group in hl.tile(groups, block_size=group_block):
+    for tile_group in hl.tile(groups, block_size=32):
         wait_and_launch_dependents()
         index = tile_group.index[:, None] * 16 + hl.arange(16)[None, :]
         gate = preactivation[index * 2].to(torch.float32)
@@ -604,10 +405,10 @@ def shared_swiglu_quant_nvfp4(
         scale = scale_f32.to(torch.float8_e4m3fn)
         actual_scale = scale.to(torch.float32)
         divisor = torch.where(actual_scale > 0, actual_scale, 1.0)
-        nibbles = _fp4_nibble(activated * global_scale / divisor[:, None])
-        low, high = hl.split(nibbles.reshape(group_block, 8, 2))
+        nibbles = fp4_nibble(activated * global_scale / divisor[:, None])
+        low, high = hl.split(nibbles.reshape(tile_group.block_size, 8, 2))
         output_q_groups[0, tile_group, :] = (
-            (low | (high << 4)).reshape(group_block, 8).to(torch.uint8)
+            (low | (high << 4)).reshape(tile_group.block_size, 8).to(torch.uint8)
         )
         output_scale[0, tile_group] = scale
     return output_q, output_scale
@@ -630,13 +431,11 @@ def shared_w2_nvfp4(
     flat_weight = weight.view(hidden, packed_intermediate)
     flat_scale = weight_scale.view(hidden, groups)
     flat_activation = activation_q.view(packed_intermediate)
-    row_block = hl.register_block_size(16, 16)
-    group_block = hl.register_block_size(64, 64)
-    for tile_row in hl.tile(hidden, block_size=row_block):
+    for tile_row in hl.tile(hidden, block_size=16):
         wait_and_launch_dependents()
         weight_row = tile_row.index.to(torch.int64)
-        accumulator = hl.zeros([row_block], dtype=torch.float32)
-        for tile_group in hl.tile(groups, block_size=group_block):
+        accumulator = hl.zeros([tile_row], dtype=torch.float32)
+        for tile_group in hl.tile(groups, block_size=64):
             group_mask = tile_group.index < groups
             offsets = weight_row[:, None] * groups + tile_group.index[None, :]
             mask = (tile_row.index[:, None] < hidden) & group_mask[None, :]
@@ -646,7 +445,7 @@ def shared_w2_nvfp4(
             activation_values = hl.load_float4_e2m1fn_x16_to_float16(
                 flat_activation, tile_group.index, extra_mask=group_mask
             )
-            contribution = hl.zeros([row_block, group_block], dtype=torch.float32)
+            contribution = hl.zeros([tile_row, tile_group], dtype=torch.float32)
             for lane in hl.static_range(16):
                 contribution += values[lane] * activation_values[lane][None, :]
             scale = flat_scale[weight_row[:, None], tile_group.index[None, :]].to(
@@ -706,7 +505,7 @@ CONFIGS: dict[str, dict[str, Any]] = {
         "range_multi_buffers": [True],
     },
     "routed_w13": {
-        "block_sizes": [4, 32],
+        "block_sizes": [],
         "loop_orders": [[0, 1]],
         "l2_groupings": [1],
         "range_unroll_factors": [0, 1],
@@ -717,7 +516,7 @@ CONFIGS: dict[str, dict[str, Any]] = {
         "num_warps": 4,
     },
     "routed_w2": {
-        "block_sizes": [128, 32],
+        "block_sizes": [128],
         "loop_orders": [[0, 1]],
         "l2_groupings": [1],
         "range_unroll_factors": [0, 0],
@@ -728,7 +527,7 @@ CONFIGS: dict[str, dict[str, Any]] = {
         "num_warps": 4,
     },
     "shared_w13": {
-        "block_sizes": [16, 64],
+        "block_sizes": [],
         "range_unroll_factors": [0, 0],
         "range_num_stages": [0, 3],
         "range_multi_buffers": [None, True],
@@ -736,13 +535,13 @@ CONFIGS: dict[str, dict[str, Any]] = {
         "num_warps": 8,
     },
     "shared_activation": {
-        "block_sizes": [32],
+        "block_sizes": [],
         "range_num_stages": [0],
         "num_stages": 1,
         "num_warps": 4,
     },
     "shared_w2": {
-        "block_sizes": [16, 64],
+        "block_sizes": [],
         "range_unroll_factors": [0, 0],
         "range_num_stages": [0, 0],
         "num_stages": 1,

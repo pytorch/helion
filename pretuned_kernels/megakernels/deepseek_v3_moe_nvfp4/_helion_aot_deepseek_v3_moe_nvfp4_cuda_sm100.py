@@ -9,15 +9,15 @@ import torch
 
 CONFIG = {
     "atomic_indexing": [],
-    "block_sizes": [8, 512, 32, 4, 32, 256, 32, 16, 64, 32, 16, 64, 32],
+    "block_sizes": [8, 512, 32, 256, 32],
     "cross_loop_pipeline": "dynamic",
     "host_tensor_descriptors": True,
     "indexing": [
-        "tensor_descriptor" if index in (39, 41, 53, 55) else "pointer"
-        for index in range(71)
+        "tensor_descriptor" if index in (41, 43, 55, 57) else "pointer"
+        for index in range(73)
     ],
     "l2_groupings": [1, 1, 1, 4],
-    "load_eviction_policies": [""] * 44,
+    "load_eviction_policies": [""] * 45,
     "loop_orders": [[0, 1], [0, 1], [1, 0], [1, 0]],
     "maxnreg": None,
     "num_sm_multiplier": 2,

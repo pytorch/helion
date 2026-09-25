@@ -248,26 +248,23 @@ def test_flash_mla_uses_existing_tuning_surface() -> None:
     assert "cuFuncSetCacheConfig" in inspect.getsource(
         module._prefer_no_cuda_cache_partition
     )
-    task_topologies = {
+    task_count_cases = {
         tuple(math.ceil(length / module.BLOCK_N) for length in lengths)
         for _label, lengths, _seed in module.SEQUENCE_LENGTH_CASES
     }
-    group_counts = {
-        sum(math.ceil(tasks / module.RADIX_FAN_IN) for tasks in topology)
-        for topology in task_topologies
+    radix_group_totals = {
+        sum(math.ceil(tasks / module.RADIX_FAN_IN) for tasks in task_counts)
+        for task_counts in task_count_cases
     }
     assert len(module.SEQUENCE_LENGTH_CASES) == 4
-    assert len(task_topologies) > 1
-    assert len(group_counts) > 1
+    assert len(task_count_cases) > 1
+    assert len(radix_group_totals) > 1
 
     signatures = heuristic._TENSOR_SIGNATURES
     assert signatures[1][0][0] == module.KV_BLOCK_CAPACITY
     assert signatures[2][0] == (module.BATCH, module.BLOCK_TABLE_CAPACITY)
     assert signatures[3][0] == (module.BATCH,)
-    assert signatures[4][0] == (module.TASK_CAPACITY,)
-    assert signatures[5][0] == (module.TASK_CAPACITY,)
-    assert signatures[6][0] == (module.GROUP_CAPACITY,)
-    assert signatures[7][0] == (module.BATCH + 1,)
+    assert len(signatures) == 4
 
     source = inspect.getsource(module.flash_mla.fn)
     assert "partial_ready" in source

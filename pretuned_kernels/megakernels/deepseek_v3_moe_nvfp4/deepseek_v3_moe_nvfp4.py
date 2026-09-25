@@ -24,10 +24,15 @@ import torch
 
 import helion
 import helion.language as hl
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import FP4_MAX
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import MMA_N
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import first_mma_column
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import fp4_nibble
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import (
+    take_stable_argmax,
+)
 
 
-FP4_MAX = 6.0
-MMA_N = 16
 ROUTED_SCALE = 2.5
 OUTPUT_NAMES = (
     "output",
@@ -62,25 +67,6 @@ class Shape:
     num_groups: int = 8
     topk_groups: int = 4
     routed_scale: float = ROUTED_SCALE
-
-
-def _fp4_nibble(value: torch.Tensor) -> torch.Tensor:
-    """Round scaled values to E2M1 with FlashInfer's tie convention."""
-    magnitude = torch.abs(value)
-    code = (magnitude > 0.25).to(torch.int32)
-    code += (magnitude >= 0.75).to(torch.int32)
-    code += (magnitude > 1.25).to(torch.int32)
-    code += (magnitude >= 1.75).to(torch.int32)
-    code += (magnitude > 2.5).to(torch.int32)
-    code += (magnitude >= 3.5).to(torch.int32)
-    code += (magnitude > 5.0).to(torch.int32)
-    return code | ((value < 0).to(torch.int32) << 3)
-
-
-def _first_mma_column(value: torch.Tensor) -> torch.Tensor:
-    """Select the real token column from the padded native-MMA N tile."""
-    column = hl.arange(MMA_N)
-    return torch.sum(value * (column[None, :] == 0).to(torch.float32), dim=-1)
 
 
 @helion.aot_kernel(static_shapes=False, backend="triton")
@@ -227,8 +213,6 @@ def deepseek_v3_moe_nvfp4(
     activation_q_groups = activation_q.view(top_k, activation_groups, 8)
     w13_tma = w13.view(experts * (twice_intermediate // 128), 128, packed_hidden)
     flat_w13_scale = w13_scale_bytes.view(experts * twice_intermediate, hidden_groups)
-    w13_output_groups = hl.register_block_size(4, 4)
-    w13_block_groups = hl.register_block_size(32, 32)
     w2_top_k, packed_intermediate = activation_q.size()
     w2_experts, hidden, weight_packed_intermediate = w2.size()
     w2_groups = packed_intermediate // 8
@@ -253,7 +237,6 @@ def deepseek_v3_moe_nvfp4(
     flat_shared_w2 = shared_w2.view(hidden, packed_intermediate)
     flat_shared_w2_scale = shared_w2_scale.view(hidden, w2_groups)
     w2_block_row = hl.register_block_size(128, 256)
-    w2_block_groups = hl.register_block_size(32, 32)
     output = torch.empty((1, hidden), dtype=torch.bfloat16, device=w2.device)
     shared_w13_preactivation = torch.empty(
         (twice_intermediate,), dtype=torch.bfloat16, device=w13.device
@@ -270,11 +253,6 @@ def deepseek_v3_moe_nvfp4(
     shared_expert_output = torch.empty(
         (1, hidden), dtype=torch.bfloat16, device=w2.device
     )
-    shared_scalar_w13_row = hl.register_block_size(16, 16)
-    shared_scalar_w13_group = hl.register_block_size(64, 64)
-    shared_scalar_activation_group = hl.register_block_size(32, 32)
-    shared_scalar_w2_row = hl.register_block_size(16, 16)
-    shared_scalar_w2_group = hl.register_block_size(64, 64)
     for tile_row, tile_expert in hl.tile(
         [rows, experts], block_size=[1, router_expert_block]
     ):
@@ -309,19 +287,15 @@ def deepseek_v3_moe_nvfp4(
         block_scale = block_scale_f32.to(torch.float8_e4m3fn)
         actual_scale = block_scale.to(torch.float32)
         divisor = torch.where(actual_scale > 0, actual_scale, 1.0)
-        low = _fp4_nibble(low_values * global_scale / divisor[:, :, None])
-        high = _fp4_nibble(high_values * global_scale / divisor[:, :, None])
+        low = fp4_nibble(low_values * global_scale / divisor[:, :, None])
+        high = fp4_nibble(high_values * global_scale / divisor[:, :, None])
         packed = (low | high << 4).to(torch.uint8)
         input_hidden_q_groups[tile_row, tile_group, :] = packed
         input_hidden_scale[tile_row, tile_group] = block_scale
-    for shared_w13_tile_row in hl.tile(
-        twice_intermediate, block_size=shared_scalar_w13_row
-    ):
+    for shared_w13_tile_row in hl.tile(twice_intermediate, block_size=16):
         shared_w13_weight_row = shared_w13_tile_row.index.to(torch.int64)
-        shared_w13_accumulator = hl.zeros([shared_scalar_w13_row], dtype=torch.float32)
-        for shared_w13_tile_group in hl.tile(
-            hidden_groups, block_size=shared_scalar_w13_group
-        ):
+        shared_w13_accumulator = hl.zeros([shared_w13_tile_row], dtype=torch.float32)
+        for shared_w13_tile_group in hl.tile(hidden_groups, block_size=64):
             shared_w13_group_mask = shared_w13_tile_group.index < hidden_groups
             shared_w13_group_offsets = (
                 shared_w13_weight_row[:, None] * hidden_groups
@@ -341,7 +315,7 @@ def deepseek_v3_moe_nvfp4(
                 extra_mask=shared_w13_group_mask,
             )
             shared_w13_contribution = hl.zeros(
-                [shared_scalar_w13_row, shared_scalar_w13_group], dtype=torch.float32
+                [shared_w13_tile_row, shared_w13_tile_group], dtype=torch.float32
             )
             for shared_w13_lane in hl.static_range(16):
                 shared_w13_contribution = (
@@ -372,230 +346,53 @@ def deepseek_v3_moe_nvfp4(
         topk_within_group_indices = hl.arange(topk_experts_per_group)[None, None, :].to(
             torch.int32
         )
-        topk_group_best_1 = torch.amax(topk_grouped, dim=-1, keepdim=True)
-        topk_group_best_id_1 = torch.amin(
+        topk_group_best = torch.amax(topk_grouped, dim=-1, keepdim=True)
+        topk_group_best_id = torch.amin(
             torch.where(
-                topk_grouped == topk_group_best_1,
+                topk_grouped == topk_group_best,
                 topk_within_group_indices,
                 torch.full_like(topk_within_group_indices, topk_experts_per_group),
             ),
             dim=-1,
         )
         topk_group_without_best = torch.where(
-            topk_within_group_indices == topk_group_best_id_1[:, :, None],
+            topk_within_group_indices == topk_group_best_id[:, :, None],
             topk_negative_infinity,
             topk_grouped,
         )
-        topk_group_scores = topk_group_best_1.view(topk_batch, num_groups) + torch.amax(
+        topk_group_scores = topk_group_best.view(topk_batch, num_groups) + torch.amax(
             topk_group_without_best, dim=-1
         )
         topk_group_indices = hl.arange(num_groups)[None, :].to(torch.int32)
-        topk_group_max_1 = torch.amax(topk_group_scores, dim=-1, keepdim=True)
-        topk_group_id_1 = torch.amin(
-            torch.where(
-                topk_group_scores == topk_group_max_1,
-                topk_group_indices,
-                torch.full_like(topk_group_indices, num_groups),
-            ),
-            dim=-1,
+        topk_group_id, topk_remaining_groups = take_stable_argmax(
+            topk_group_scores, topk_group_indices, num_groups
         )
-        topk_remaining_groups = torch.where(
-            topk_group_indices == topk_group_id_1[:, None],
-            torch.full_like(topk_group_scores, float("-inf")),
-            topk_group_scores,
-        )
-        topk_group_max_2 = torch.amax(topk_remaining_groups, dim=-1, keepdim=True)
-        topk_group_id_2 = torch.amin(
-            torch.where(
-                topk_remaining_groups == topk_group_max_2,
-                topk_group_indices,
-                torch.full_like(topk_group_indices, num_groups),
-            ),
-            dim=-1,
-        )
-        topk_remaining_groups = torch.where(
-            topk_group_indices == topk_group_id_2[:, None],
-            torch.full_like(topk_group_scores, float("-inf")),
-            topk_remaining_groups,
-        )
-        topk_group_max_3 = torch.amax(topk_remaining_groups, dim=-1, keepdim=True)
-        topk_group_id_3 = torch.amin(
-            torch.where(
-                topk_remaining_groups == topk_group_max_3,
-                topk_group_indices,
-                torch.full_like(topk_group_indices, num_groups),
-            ),
-            dim=-1,
-        )
-        topk_remaining_groups = torch.where(
-            topk_group_indices == topk_group_id_3[:, None],
-            torch.full_like(topk_group_scores, float("-inf")),
-            topk_remaining_groups,
-        )
-        topk_group_max_4 = torch.amax(topk_remaining_groups, dim=-1, keepdim=True)
-        topk_group_id_4 = torch.amin(
-            torch.where(
-                topk_remaining_groups == topk_group_max_4,
-                topk_group_indices,
-                torch.full_like(topk_group_indices, num_groups),
-            ),
-            dim=-1,
-        )
-        topk_allowed = (
-            (topk_group_indices == topk_group_id_1[:, None])
-            | (topk_group_indices == topk_group_id_2[:, None])
-            | (topk_group_indices == topk_group_id_3[:, None])
-            | (topk_group_indices == topk_group_id_4[:, None])
-        )
+        topk_allowed = topk_group_indices == topk_group_id[:, None]
+        for _topk_group_rank in hl.static_range(1, topk_groups):
+            topk_group_id, topk_remaining_groups = take_stable_argmax(
+                topk_remaining_groups, topk_group_indices, num_groups
+            )
+            topk_allowed = topk_allowed | (topk_group_indices == topk_group_id[:, None])
         topk_masked = torch.where(
             topk_allowed.view(topk_batch, num_groups, 1),
             topk_grouped,
             topk_negative_infinity,
         ).view(topk_batch, topk_num_experts)
         topk_expert_indices = hl.arange(topk_num_experts)[None, :].to(torch.int32)
-        topk_value_0 = torch.amax(topk_masked, dim=-1, keepdim=True)
-        topk_id_0 = torch.amin(
-            torch.where(
-                topk_masked == topk_value_0,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_masked_1 = torch.where(
-            topk_expert_indices == topk_id_0[:, None],
-            torch.full_like(topk_masked, float("-inf")),
-            topk_masked,
-        )
-        topk_value_1 = torch.amax(topk_masked_1, dim=-1, keepdim=True)
-        topk_id_1 = torch.amin(
-            torch.where(
-                topk_masked_1 == topk_value_1,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_masked_2 = torch.where(
-            topk_expert_indices == topk_id_1[:, None],
-            torch.full_like(topk_masked, float("-inf")),
-            topk_masked_1,
-        )
-        topk_value_2 = torch.amax(topk_masked_2, dim=-1, keepdim=True)
-        topk_id_2 = torch.amin(
-            torch.where(
-                topk_masked_2 == topk_value_2,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_masked_3 = torch.where(
-            topk_expert_indices == topk_id_2[:, None],
-            torch.full_like(topk_masked, float("-inf")),
-            topk_masked_2,
-        )
-        topk_value_3 = torch.amax(topk_masked_3, dim=-1, keepdim=True)
-        topk_id_3 = torch.amin(
-            torch.where(
-                topk_masked_3 == topk_value_3,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_masked_4 = torch.where(
-            topk_expert_indices == topk_id_3[:, None],
-            torch.full_like(topk_masked, float("-inf")),
-            topk_masked_3,
-        )
-        topk_value_4 = torch.amax(topk_masked_4, dim=-1, keepdim=True)
-        topk_id_4 = torch.amin(
-            torch.where(
-                topk_masked_4 == topk_value_4,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_masked_5 = torch.where(
-            topk_expert_indices == topk_id_4[:, None],
-            torch.full_like(topk_masked, float("-inf")),
-            topk_masked_4,
-        )
-        topk_value_5 = torch.amax(topk_masked_5, dim=-1, keepdim=True)
-        topk_id_5 = torch.amin(
-            torch.where(
-                topk_masked_5 == topk_value_5,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_masked_6 = torch.where(
-            topk_expert_indices == topk_id_5[:, None],
-            torch.full_like(topk_masked, float("-inf")),
-            topk_masked_5,
-        )
-        topk_value_6 = torch.amax(topk_masked_6, dim=-1, keepdim=True)
-        topk_id_6 = torch.amin(
-            torch.where(
-                topk_masked_6 == topk_value_6,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_masked_7 = torch.where(
-            topk_expert_indices == topk_id_6[:, None],
-            torch.full_like(topk_masked, float("-inf")),
-            topk_masked_6,
-        )
-        topk_value_7 = torch.amax(topk_masked_7, dim=-1, keepdim=True)
-        topk_id_7 = torch.amin(
-            torch.where(
-                topk_masked_7 == topk_value_7,
-                topk_expert_indices,
-                torch.full_like(topk_expert_indices, topk_num_experts),
-            ),
-            dim=-1,
-        )
-        topk_weight_0 = torch.sigmoid(torch.sum(logits[:, topk_id_0].float(), dim=-1))
-        topk_weight_1 = torch.sigmoid(torch.sum(logits[:, topk_id_1].float(), dim=-1))
-        topk_weight_2 = torch.sigmoid(torch.sum(logits[:, topk_id_2].float(), dim=-1))
-        topk_weight_3 = torch.sigmoid(torch.sum(logits[:, topk_id_3].float(), dim=-1))
-        topk_weight_4 = torch.sigmoid(torch.sum(logits[:, topk_id_4].float(), dim=-1))
-        topk_weight_5 = torch.sigmoid(torch.sum(logits[:, topk_id_5].float(), dim=-1))
-        topk_weight_6 = torch.sigmoid(torch.sum(logits[:, topk_id_6].float(), dim=-1))
-        topk_weight_7 = torch.sigmoid(torch.sum(logits[:, topk_id_7].float(), dim=-1))
-        topk_denominator = (
-            topk_weight_0
-            + topk_weight_1
-            + topk_weight_2
-            + topk_weight_3
-            + topk_weight_4
-            + topk_weight_5
-            + topk_weight_6
-            + topk_weight_7
-        )
-        topk_weights[:, 0] = topk_weight_0 / topk_denominator * routed_scale
-        topk_weights[:, 1] = topk_weight_1 / topk_denominator * routed_scale
-        topk_weights[:, 2] = topk_weight_2 / topk_denominator * routed_scale
-        topk_weights[:, 3] = topk_weight_3 / topk_denominator * routed_scale
-        topk_weights[:, 4] = topk_weight_4 / topk_denominator * routed_scale
-        topk_weights[:, 5] = topk_weight_5 / topk_denominator * routed_scale
-        topk_weights[:, 6] = topk_weight_6 / topk_denominator * routed_scale
-        topk_weights[:, 7] = topk_weight_7 / topk_denominator * routed_scale
-        topk_ids[:, 0] = topk_id_0
-        topk_ids[:, 1] = topk_id_1
-        topk_ids[:, 2] = topk_id_2
-        topk_ids[:, 3] = topk_id_3
-        topk_ids[:, 4] = topk_id_4
-        topk_ids[:, 5] = topk_id_5
-        topk_ids[:, 6] = topk_id_6
-        topk_ids[:, 7] = topk_id_7
+        topk_remaining_experts = topk_masked
+        for topk_rank in hl.static_range(top_k):
+            topk_id, topk_remaining_experts = take_stable_argmax(
+                topk_remaining_experts, topk_expert_indices, topk_num_experts
+            )
+            topk_ids[:, topk_rank] = topk_id
+            topk_weights[:, topk_rank] = torch.sigmoid(
+                torch.sum(logits[:, topk_id].float(), dim=-1)
+            )
+        selected_weights = topk_weights[:, :]
+        topk_denominator = torch.sum(selected_weights, dim=-1, keepdim=True)
+        topk_weights[:, :] = selected_weights / topk_denominator * routed_scale
     for w13_tile_slot, w13_tile_output_group in hl.tile(
-        [top_k, activation_groups], block_size=[1, w13_output_groups]
+        [top_k, activation_groups], block_size=[1, 4]
     ):
         w13_slot = w13_tile_slot.begin
         w13_expert = topk_ids[0, w13_slot]
@@ -610,9 +407,9 @@ def deepseek_v3_moe_nvfp4(
             w13_expert_address * twice_intermediate + w13_physical_row_index
         )
         w13_accumulator = hl.zeros([128, MMA_N], dtype=torch.float32)
-        for w13_tile_group in hl.tile(hidden_groups, block_size=w13_block_groups):
+        for w13_tile_group in hl.tile(hidden_groups, block_size=32):
             w13_packed_index = (
-                w13_tile_group.begin * 8 + hl.arange(w13_block_groups * 8)
+                w13_tile_group.begin * 8 + hl.arange(w13_tile_group.block_size * 8)
             ).to(torch.int64)
             w13_lhs = w13_tma[w13_tma_row, :, w13_packed_index]
             w13_lhs_scale = flat_w13_scale[
@@ -621,7 +418,9 @@ def deepseek_v3_moe_nvfp4(
             w13_hidden_bytes = hidden_q[0, w13_packed_index]
             w13_rhs = w13_hidden_bytes[:, None].expand(w13_hidden_bytes.size(0), MMA_N)
             w13_hidden_scale = hidden_scale_bytes[0, w13_tile_group]
-            w13_rhs_scale = w13_hidden_scale[None, :].expand(MMA_N, w13_block_groups)
+            w13_rhs_scale = w13_hidden_scale[None, :].expand(
+                MMA_N, w13_tile_group.block_size
+            )
             w13_accumulator = hl.dot_scaled(
                 w13_lhs,
                 w13_lhs_scale,
@@ -632,7 +431,7 @@ def deepseek_v3_moe_nvfp4(
                 acc=w13_accumulator,
                 out_dtype=torch.float32,
             )
-        w13_preactivation = _first_mma_column(w13_accumulator).reshape(64, 2)
+        w13_preactivation = first_mma_column(w13_accumulator).reshape(64, 2)
         w13_pair = hl.arange(2)
         w13_gate = torch.sum(w13_preactivation * (w13_pair[None, :] == 0), dim=-1)
         w13_up = torch.sum(w13_preactivation * (w13_pair[None, :] == 1), dim=-1)
@@ -651,16 +450,14 @@ def deepseek_v3_moe_nvfp4(
         w13_actual_scale = w13_block_scale.to(torch.float32)
         w13_divisor = torch.where(w13_actual_scale > 0, w13_actual_scale, 1.0)
         w13_scaled = w13_activated_groups * w13_global_scale / w13_divisor[:, None]
-        w13_nibbles = _fp4_nibble(w13_scaled)
+        w13_nibbles = fp4_nibble(w13_scaled)
         w13_low, w13_high = hl.split(w13_nibbles.reshape(4, 8, 2))
         w13_packed = w13_low | w13_high << 4
         activation_q_groups[w13_slot, w13_tile_output_group, :] = w13_packed.reshape(
             4, 8
         ).to(torch.uint8)
         activation_scale[w13_slot, w13_tile_output_group] = w13_block_scale
-    for shared_activation_tile_group in hl.tile(
-        activation_groups, block_size=shared_scalar_activation_group
-    ):
+    for shared_activation_tile_group in hl.tile(activation_groups, block_size=32):
         shared_activation_index = (
             shared_activation_tile_group.index[:, None] * 16 + hl.arange(16)[None, :]
         )
@@ -685,13 +482,15 @@ def deepseek_v3_moe_nvfp4(
         shared_actual_scale = shared_block_scale.to(torch.float32)
         shared_divisor = torch.where(shared_actual_scale > 0, shared_actual_scale, 1.0)
         shared_scaled = shared_activated * shared_global_scale / shared_divisor[:, None]
-        shared_nibbles = _fp4_nibble(shared_scaled)
+        shared_nibbles = fp4_nibble(shared_scaled)
         shared_low, shared_high = hl.split(
-            shared_nibbles.reshape(shared_scalar_activation_group, 8, 2)
+            shared_nibbles.reshape(shared_activation_tile_group.block_size, 8, 2)
         )
         shared_packed = shared_low | shared_high << 4
         shared_activation_q_groups[0, shared_activation_tile_group, :] = (
-            shared_packed.reshape(shared_scalar_activation_group, 8).to(torch.uint8)
+            shared_packed.reshape(shared_activation_tile_group.block_size, 8).to(
+                torch.uint8
+            )
         )
         shared_activation_scale[0, shared_activation_tile_group] = shared_block_scale
     for w2_tile_slot, w2_tile_row in hl.tile(
@@ -703,9 +502,9 @@ def deepseek_v3_moe_nvfp4(
         w2_row_index = w2_tile_row.index.to(torch.int32)
         w2_weight_row = w2_expert_address * hidden + w2_row_index
         w2_accumulator = hl.zeros([w2_block_row, MMA_N], dtype=torch.float32)
-        for w2_tile_group in hl.tile(w2_groups, block_size=w2_block_groups):
+        for w2_tile_group in hl.tile(w2_groups, block_size=32):
             w2_packed_index = (
-                w2_tile_group.begin * 8 + hl.arange(w2_block_groups * 8)
+                w2_tile_group.begin * 8 + hl.arange(w2_tile_group.block_size * 8)
             ).to(torch.int64)
             w2_lhs = w2[w2_expert, w2_tile_row, w2_packed_index]
             w2_lhs_scale = flat_w2_scale[
@@ -716,7 +515,9 @@ def deepseek_v3_moe_nvfp4(
                 w2_activation_bytes.size(0), MMA_N
             )
             w2_activation_scale = activation_scale[w2_slot, w2_tile_group]
-            w2_rhs_scale = w2_activation_scale[None, :].expand(MMA_N, w2_block_groups)
+            w2_rhs_scale = w2_activation_scale[None, :].expand(
+                MMA_N, w2_tile_group.block_size
+            )
             w2_accumulator = hl.dot_scaled(
                 w2_lhs,
                 w2_lhs_scale,
@@ -728,16 +529,14 @@ def deepseek_v3_moe_nvfp4(
                 out_dtype=torch.float32,
             )
         expert_output[w2_tile_slot, w2_tile_row] = (
-            (_first_mma_column(w2_accumulator) * alpha2[w2_expert])
+            (first_mma_column(w2_accumulator) * alpha2[w2_expert])
             .reshape(1, w2_block_row)
             .to(torch.bfloat16)
         )
-    for shared_w2_tile_row in hl.tile(hidden, block_size=shared_scalar_w2_row):
+    for shared_w2_tile_row in hl.tile(hidden, block_size=16):
         shared_w2_weight_row = shared_w2_tile_row.index.to(torch.int64)
-        shared_w2_accumulator = hl.zeros([shared_scalar_w2_row], dtype=torch.float32)
-        for shared_w2_tile_group in hl.tile(
-            w2_groups, block_size=shared_scalar_w2_group
-        ):
+        shared_w2_accumulator = hl.zeros([shared_w2_tile_row], dtype=torch.float32)
+        for shared_w2_tile_group in hl.tile(w2_groups, block_size=64):
             shared_w2_group_mask = shared_w2_tile_group.index < w2_groups
             shared_w2_group_offsets = (
                 shared_w2_weight_row[:, None] * w2_groups
@@ -757,7 +556,7 @@ def deepseek_v3_moe_nvfp4(
                 extra_mask=shared_w2_group_mask,
             )
             shared_w2_contribution = hl.zeros(
-                [shared_scalar_w2_row, shared_scalar_w2_group], dtype=torch.float32
+                [shared_w2_tile_row, shared_w2_tile_group], dtype=torch.float32
             )
             for shared_w2_lane in hl.static_range(16):
                 shared_w2_contribution = (

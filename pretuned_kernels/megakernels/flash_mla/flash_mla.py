@@ -2,8 +2,8 @@
 
 The kernel preserves ThunderMLA's prepared-query/paged-cache boundary and its
 BF16 operands/output with FP32 softmax, MMA accumulation, LSE, and reduction
-state. It uses a fixed N128/radix-16 capacity envelope whose runtime descriptors
-select the active attention topology. The benchmark compares against both the
+state. It derives the active work mapping from runtime sequence lengths inside a
+fixed N128/radix-16 capacity envelope. The benchmark compares against both the
 root-matched three-launch Helion implementation with programmatic dependent
 launch (PDL) and vLLM's production FlashInfer MLA decode entry point.
 """
@@ -13,6 +13,8 @@ from __future__ import annotations
 import math
 from pathlib import Path
 from typing import TYPE_CHECKING
+from typing import Any
+from typing import cast
 
 import torch
 
@@ -42,8 +44,6 @@ CACHE_BLOCK_SIZE = 64
 BLOCK_N = 128
 RADIX_FAN_IN = 16
 MLA_SCALE = QK_DIM**-0.5
-GROUP_CAPACITY = 38
-TASK_CAPACITY = GROUP_CAPACITY * RADIX_FAN_IN
 KV_BLOCK_CAPACITY = max(
     sum(math.ceil(length / CACHE_BLOCK_SIZE) for length in sequence_lengths)
     for _label, sequence_lengths, _seed in SEQUENCE_LENGTH_CASES
@@ -57,6 +57,93 @@ MAX_REQUEST_BLOCKS = max(
 BLOCK_TABLE_CAPACITY = math.ceil(MAX_REQUEST_BLOCKS / 2) * 2
 
 
+def _split_b4(values: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Split the fixed B4 runtime vector without scalar tensor indexing."""
+    even, odd = hl.split(values.reshape(2, 2))
+    value_0, value_2 = hl.split(even)
+    value_1, value_3 = hl.split(odd)
+    return value_0, value_1, value_2, value_3
+
+
+def _runtime_request_value(
+    request: torch.Tensor,
+    value_0: torch.Tensor | int,
+    value_1: torch.Tensor | int,
+    value_2: torch.Tensor | int,
+    value_3: torch.Tensor | int,
+) -> torch.Tensor:
+    """Select one scalar from the fixed B4 request vector."""
+    return torch.where(
+        request == 0,
+        value_0,
+        torch.where(
+            request == 1,
+            value_1,
+            torch.where(request == 2, value_2, value_3),
+        ),
+    )
+
+
+def _runtime_group_assignment(
+    group: torch.Tensor,
+    task_count_0: torch.Tensor | int,
+    task_count_1: torch.Tensor | int,
+    task_count_2: torch.Tensor | int,
+    task_count_3: torch.Tensor | int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | int]:
+    """Map one fixed-envelope group to its runtime request and child count."""
+    group_count_0 = (task_count_0 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_count_1 = (task_count_1 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_count_2 = (task_count_2 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_count_3 = (task_count_3 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_begin_1 = group_count_0
+    group_begin_2 = group_begin_1 + group_count_1
+    group_begin_3 = group_begin_2 + group_count_2
+    group_end = group_begin_3 + group_count_3
+    request = (
+        (group >= group_begin_1).to(torch.int32)
+        + (group >= group_begin_2).to(torch.int32)
+        + (group >= group_begin_3).to(torch.int32)
+    )
+    request_group_begin = _runtime_request_value(
+        request, 0, group_begin_1, group_begin_2, group_begin_3
+    )
+    request_task_count = _runtime_request_value(
+        request, task_count_0, task_count_1, task_count_2, task_count_3
+    )
+    child_count = torch.clamp(
+        request_task_count - (group - request_group_begin) * RADIX_FAN_IN,
+        0,
+        RADIX_FAN_IN,
+    )
+    return request, request_group_begin, child_count, group_end
+
+
+def _runtime_group_interval(
+    request: torch.Tensor,
+    task_count_0: torch.Tensor | int,
+    task_count_1: torch.Tensor | int,
+    task_count_2: torch.Tensor | int,
+    task_count_3: torch.Tensor | int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return one request's runtime radix-group interval."""
+    group_count_0 = (task_count_0 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_count_1 = (task_count_1 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_count_2 = (task_count_2 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_count_3 = (task_count_3 + RADIX_FAN_IN - 1) // RADIX_FAN_IN
+    group_begin_1 = group_count_0
+    group_begin_2 = group_begin_1 + group_count_1
+    group_begin_3 = group_begin_2 + group_count_2
+    group_end = group_begin_3 + group_count_3
+    begin = _runtime_request_value(
+        request, 0, group_begin_1, group_begin_2, group_begin_3
+    )
+    end = _runtime_request_value(
+        request, group_begin_1, group_begin_2, group_begin_3, group_end
+    )
+    return begin, end
+
+
 @helion.aot_kernel(
     static_shapes=False,
     backend="triton",
@@ -67,14 +154,10 @@ def flash_mla(
     kv_cache: torch.Tensor,
     block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
-    task_requests: torch.Tensor,
-    task_starts: torch.Tensor,
-    group_counts: torch.Tensor,
-    group_offsets: torch.Tensor,
     scale: float,
     block_n: int,
 ) -> torch.Tensor:
-    """Fuse partial, radix, and final roots for a runtime attention topology."""
+    """Fuse partial, radix, and final roots for runtime sequence lengths."""
     batch_size, query_len, num_heads, query_dim = query.shape
     _num_blocks, cache_heads, cache_block_size, cache_dim = kv_cache.shape
     batch_size = hl.specialize(batch_size)
@@ -97,20 +180,13 @@ def flash_mla(
     assert cache_dim == QK_DIM
     assert value_dim == KV_LORA_RANK
     assert block_n == BLOCK_N
-    task_capacity = hl.specialize(task_requests.size(0))
-    group_capacity = hl.specialize(group_counts.size(0))
-    group_offset_count = hl.specialize(group_offsets.size(0))
+    group_capacity = 38
+    task_capacity = group_capacity * 16
     num_columns = hl.specialize(block_tables.size(1))
-    assert task_capacity == group_capacity * RADIX_FAN_IN
-    assert group_offset_count == batch_size + 1
     hl.specialize(query.stride())
     hl.specialize(kv_cache.stride())
     hl.specialize(block_tables.stride())
     hl.specialize(seq_lens.stride())
-    hl.specialize(task_requests.stride())
-    hl.specialize(task_starts.stride())
-    hl.specialize(group_counts.stride())
-    hl.specialize(group_offsets.stride())
     cache_1d = kv_cache.view(-1)
     query_1d = query.view(-1)
     block_table_1d = block_tables.view(-1)
@@ -201,21 +277,40 @@ def flash_mla(
     qk_scale = scale * math.log2(math.e)
 
     # A fixed global envelope keeps every producer/consumer relation affine.
-    # Runtime descriptors identify real tasks and request-local tail padding.
+    # Runtime sequence lengths identify real tasks and request-local padding.
     for producer_group, producer_child, tile_group in hl.tile(
         [group_capacity, RADIX_FAN_IN, num_head_groups], block_size=[1, 1, 1]
     ):
-        request = hl.load(
-            task_requests,
-            [producer_group.begin * RADIX_FAN_IN + producer_child.begin],
+        sequence_length_0, sequence_length_1, sequence_length_2, sequence_length_3 = (
+            _split_b4(hl.load(seq_lens, [hl.arange(4)]))
+        )
+        task_count_0 = (sequence_length_0 + block_n - 1) // block_n
+        task_count_1 = (sequence_length_1 + block_n - 1) // block_n
+        task_count_2 = (sequence_length_2 + block_n - 1) // block_n
+        task_count_3 = (sequence_length_3 + block_n - 1) // block_n
+        runtime_group = sequence_length_0 * 0 + producer_group.begin
+        request, request_group_begin, child_count, runtime_group_count = (
+            _runtime_group_assignment(
+                runtime_group,
+                task_count_0,
+                task_count_1,
+                task_count_2,
+                task_count_3,
+            )
         )
         query_indices = hl.arange(query_len)
-        if request >= 0:
-            task_start = hl.load(
-                task_starts,
-                [producer_group.begin * RADIX_FAN_IN + producer_child.begin],
+        if (runtime_group < runtime_group_count) & (producer_child.begin < child_count):
+            task_start = (
+                (runtime_group - request_group_begin) * RADIX_FAN_IN
+                + producer_child.begin
+            ) * block_n
+            sequence_length = _runtime_request_value(
+                request,
+                sequence_length_0,
+                sequence_length_1,
+                sequence_length_2,
+                sequence_length_3,
             )
-            sequence_length = hl.load(seq_lens, [request])
             causal_lengths = sequence_length - (query_len - query_indices - 1)
             head_indices = tile_group.begin * heads_per_group + hl.arange(
                 heads_per_group
@@ -315,7 +410,21 @@ def flash_mla(
         ],
         block_size=[1, 1, 1, 16, 512],
     ):
-        child_count = hl.load(group_counts, [radix_group.begin])
+        sequence_length_0, sequence_length_1, sequence_length_2, sequence_length_3 = (
+            _split_b4(hl.load(seq_lens, [hl.arange(4)]))
+        )
+        task_count_0 = (sequence_length_0 + block_n - 1) // block_n
+        task_count_1 = (sequence_length_1 + block_n - 1) // block_n
+        task_count_2 = (sequence_length_2 + block_n - 1) // block_n
+        task_count_3 = (sequence_length_3 + block_n - 1) // block_n
+        runtime_group = sequence_length_0 * 0 + radix_group.begin
+        _request, _group_begin, child_count, _group_end = _runtime_group_assignment(
+            runtime_group,
+            task_count_0,
+            task_count_1,
+            task_count_2,
+            task_count_3,
+        )
         best = hl.full([tile_h.block_size], float("-inf"), torch.float32)
         for child_tile in hl.tile(RADIX_FAN_IN, block_size=1):
             child_ready = partial_ready_groups[
@@ -388,8 +497,21 @@ def flash_mla(
         [batch_size, query_len, num_head_groups, heads_per_group, value_dim],
         block_size=[1, 1, 1, 1, 512],
     ):
-        group_begin = hl.load(group_offsets, [tile_b.begin])
-        group_end = hl.load(group_offsets, [tile_b.begin + 1])
+        sequence_length_0, sequence_length_1, sequence_length_2, sequence_length_3 = (
+            _split_b4(hl.load(seq_lens, [hl.arange(4)]))
+        )
+        task_count_0 = (sequence_length_0 + block_n - 1) // block_n
+        task_count_1 = (sequence_length_1 + block_n - 1) // block_n
+        task_count_2 = (sequence_length_2 + block_n - 1) // block_n
+        task_count_3 = (sequence_length_3 + block_n - 1) // block_n
+        runtime_request = sequence_length_0 * 0 + tile_b.begin
+        group_begin, group_end = _runtime_group_interval(
+            runtime_request,
+            task_count_0,
+            task_count_1,
+            task_count_2,
+            task_count_3,
+        )
         running_max = hl.full([tile_h.block_size], float("-inf"), torch.float32)
         running_sum = hl.zeros([tile_h.block_size], dtype=torch.float32)
         accumulator = hl.zeros(
@@ -467,71 +589,11 @@ def _require_sm100() -> None:
         raise RuntimeError("flash_mla is pretuned only for NVIDIA SM100")
 
 
-def _topology_descriptors(lengths: tuple[int, ...]) -> dict[str, torch.Tensor]:
-    """Build compact standalone metadata and the fixed persistent envelope."""
-    compact_task_requests: list[int] = []
-    compact_task_starts: list[int] = []
-    task_offsets = [0]
-    group_starts: list[int] = []
-    compact_group_counts: list[int] = []
-    group_offsets = [0]
-    task_counts = tuple(math.ceil(length / BLOCK_N) for length in lengths)
-
-    for request, task_count in enumerate(task_counts):
-        task_begin = len(compact_task_requests)
-        compact_task_requests.extend([request] * task_count)
-        compact_task_starts.extend(task * BLOCK_N for task in range(task_count))
-        task_offsets.append(len(compact_task_requests))
-        for local_begin in range(0, task_count, RADIX_FAN_IN):
-            group_starts.append(task_begin + local_begin)
-            compact_group_counts.append(min(RADIX_FAN_IN, task_count - local_begin))
-        group_offsets.append(len(compact_group_counts))
-
-    if len(compact_group_counts) > GROUP_CAPACITY:
-        raise ValueError(
-            f"topology needs {len(compact_group_counts)} radix groups, "
-            f"but the pretuned envelope has {GROUP_CAPACITY}"
-        )
-
-    # Each runtime group owns one full radix interval. Inactive tail and
-    # envelope tickets still publish their tiny completion value, but skip the
-    # attention body.
-    task_requests: list[int] = []
-    task_starts: list[int] = []
-    for request, task_count in enumerate(task_counts):
-        for local_begin in range(0, task_count, RADIX_FAN_IN):
-            children = min(RADIX_FAN_IN, task_count - local_begin)
-            for child in range(RADIX_FAN_IN):
-                active = child < children
-                task_requests.append(request if active else -1)
-                task_starts.append((local_begin + child) * BLOCK_N if active else 0)
-    task_requests.extend([-1] * (TASK_CAPACITY - len(task_requests)))
-    task_starts.extend([0] * (TASK_CAPACITY - len(task_starts)))
-    group_counts = compact_group_counts + [0] * (
-        GROUP_CAPACITY - len(compact_group_counts)
-    )
-
-    def int_tensor(values: list[int]) -> torch.Tensor:
-        return torch.tensor(values, dtype=torch.int32, device="cuda")
-
-    return {
-        "task_requests": int_tensor(task_requests),
-        "task_starts": int_tensor(task_starts),
-        "group_counts": int_tensor(group_counts),
-        "group_offsets": int_tensor(group_offsets),
-        "compact_task_requests": int_tensor(compact_task_requests),
-        "compact_task_starts": int_tensor(compact_task_starts),
-        "task_offsets": int_tensor(task_offsets),
-        "group_starts": int_tensor(group_starts),
-        "compact_group_counts": int_tensor(compact_group_counts),
-    }
-
-
 def _make_inputs(
     sequence_lengths: tuple[int, ...] = SEQUENCE_LENGTHS,
     seed: int = 0,
 ) -> dict[str, torch.Tensor]:
-    """Create one runtime topology inside the fixed B4 physical envelope."""
+    """Create one ragged input inside the fixed B4 physical envelope."""
     if len(sequence_lengths) != BATCH:
         raise ValueError(f"expected {BATCH} sequence lengths, got {sequence_lengths}")
     torch.manual_seed(seed)
@@ -569,7 +631,6 @@ def _make_inputs(
         "kv_cache": kv_cache,
         "block_tables": block_tables,
         "seq_lens": torch.tensor(sequence_lengths, device="cuda", dtype=torch.int32),
-        **_topology_descriptors(sequence_lengths),
     }
 
 
@@ -579,10 +640,6 @@ def _kernel_args(tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
         tensors["kv_cache"],
         tensors["block_tables"],
         tensors["seq_lens"],
-        tensors["task_requests"],
-        tensors["task_starts"],
-        tensors["group_counts"],
-        tensors["group_offsets"],
         MLA_SCALE,
         BLOCK_N,
     )
@@ -590,19 +647,19 @@ def _kernel_args(tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
 
 def _make_standalone_call(
     tensors: dict[str, torch.Tensor],
+    sequence_lengths: tuple[int, ...],
 ) -> tuple[Callable[[], torch.Tensor], tuple[CompiledConfig, ...], torch.Tensor]:
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from pretuned_kernels.megakernels.flash_mla import _standalone
 
-    standalone_tensors = {
-        **tensors,
-        "task_requests": tensors["compact_task_requests"],
-        "task_starts": tensors["compact_task_starts"],
-        "group_counts": tensors["compact_group_counts"],
-    }
-    return _standalone.build(standalone_tensors, scale=MLA_SCALE, block_n=BLOCK_N)
+    return _standalone.build(
+        tensors,
+        sequence_lengths=sequence_lengths,
+        scale=MLA_SCALE,
+        block_n=BLOCK_N,
+    )
 
 
 def _compiled_triton_kernels(call: object) -> tuple[object, ...]:
@@ -647,7 +704,7 @@ def _prefer_no_cuda_cache_partition(call: object, tensor: torch.Tensor) -> None:
     preference = cuda_driver.CUfunc_cache.CU_FUNC_CACHE_PREFER_NONE
     with torch.cuda.device(tensor.device):
         for compiled in kernels:
-            function = cuda_driver.CUfunction(int(compiled.function))
+            function = cuda_driver.CUfunction(int(cast("Any", compiled).function))
             error = cuda_driver.cuFuncSetCacheConfig(function, preference)[0]
             if error != cuda_driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(
@@ -733,10 +790,10 @@ def correctness_check() -> None:
         if dispatch_signature is None:
             dispatch_signature = current_signature
         elif current_signature != dispatch_signature:
-            raise AssertionError("runtime MLA metadata triggered a recompilation")
+            raise AssertionError("runtime sequence lengths triggered a recompilation")
         persistent_replay = flash_mla(*args)
         standalone_call, _standalone_kernels, standalone = _make_standalone_call(
-            tensors
+            tensors, sequence_lengths
         )
         vllm_call, _backend = _make_vllm_call(tensors, sequence_lengths)
         vllm = vllm_call()
@@ -770,9 +827,9 @@ def main(verbose: bool = True) -> dict:
         if dispatch_signature is None:
             dispatch_signature = current_signature
         elif current_signature != dispatch_signature:
-            raise AssertionError("runtime MLA metadata triggered a recompilation")
+            raise AssertionError("runtime sequence lengths triggered a recompilation")
         standalone_call, standalone_kernels, standalone_output = _make_standalone_call(
-            tensors
+            tensors, sequence_lengths
         )
         vllm_call, backend = _make_vllm_call(tensors, sequence_lengths)
         vllm_output = vllm_call()
