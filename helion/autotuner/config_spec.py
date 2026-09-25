@@ -773,6 +773,8 @@ CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
 CUTE_CHAINED_MMA_SCHEDULE_KEY = "cute_chained_mma_schedule"
+CUTE_CHAINED_POINTWISE_VECTORIZE_KEY = "cute_chained_pointwise_vectorize"
+CUTE_CHAINED_POINTWISE_UNROLL_KEY = "cute_chained_pointwise_unroll"
 CUTE_LOOP_VECTORIZATION_KEY = "cute_loop_vectorize"
 CUTE_LOOP_LOAD_SCHEDULE_KEY = "cute_loop_load_schedule"
 VALID_CUTE_LOOP_LOAD_SCHEDULES = (
@@ -782,6 +784,7 @@ VALID_CUTE_LOOP_LOAD_SCHEDULES = (
     "group4",
     "prefetch4",
 )
+VALID_CUTE_CHAINED_POINTWISE_UNROLLS = (1, 2, 4, 8)
 VALID_CUTE_CHAINED_MMA_SCHEDULES = (
     "coalesced",
     "cp_async",
@@ -866,6 +869,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
+        CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         "num_threads",
@@ -913,6 +918,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
+        CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         "num_warps",
@@ -1265,6 +1272,7 @@ class ConfigSpec:
         self.compiler_default_config: helion.Config | None = None
         self.cute_chained_matmul_search_enabled: bool = False
         self.cute_chained_tcgen05_search_enabled: bool = False
+        self.cute_chained_pointwise_unroll_search_enabled: bool = False
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
         # retry. ``None`` leaves all benchmark behavior unchanged.
@@ -3196,6 +3204,39 @@ class ConfigSpec:
                 config.pop(CUTE_CHAINED_MMA_SCHEDULE_KEY)
             else:
                 raise InvalidConfig("chained MMA schedules require a contraction DAG")
+        if self.cute_chained_tcgen05_search_enabled:
+            vectorize = config.setdefault(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY, False)
+            if not isinstance(vectorize, bool):
+                raise InvalidConfig("cute_chained_pointwise_vectorize must be bool")
+            if config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem":
+                config[CUTE_CHAINED_POINTWISE_VECTORIZE_KEY] = False
+        elif CUTE_CHAINED_POINTWISE_VECTORIZE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY)
+            else:
+                raise InvalidConfig(
+                    "vector pointwise staging requires a TCgen05 contraction DAG"
+                )
+        if self.cute_chained_pointwise_unroll_search_enabled:
+            unroll = config.setdefault(CUTE_CHAINED_POINTWISE_UNROLL_KEY, 1)
+            if (
+                type(unroll) is not int
+                or unroll not in VALID_CUTE_CHAINED_POINTWISE_UNROLLS
+            ):
+                raise InvalidConfig(
+                    "cute_chained_pointwise_unroll must be 1, 2, 4 or 8"
+                )
+            if config.get(
+                CUTE_CHAINED_MMA_SCHEDULE_KEY
+            ) != "tcgen05_tmem" or not config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY):
+                config[CUTE_CHAINED_POINTWISE_UNROLL_KEY] = 1
+        elif CUTE_CHAINED_POINTWISE_UNROLL_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_UNROLL_KEY)
+            else:
+                raise InvalidConfig(
+                    "pointwise unroll requires computed TCgen05 vector operands"
+                )
         if self.supports_config_key("num_stages"):
             config.setdefault("num_stages", self._default_num_stages())
         if self.supports_config_key("load_eviction_policies"):
@@ -3977,7 +4018,13 @@ class ConfigSpec:
                     choices=self._cute_chained_mma_schedules()
                 )
                 if self.cute_chained_tcgen05_search_enabled:
-                    pass
+                    fields[CUTE_CHAINED_POINTWISE_VECTORIZE_KEY] = EnumFragment(
+                        choices=(False, True)
+                    )
+                    if self.cute_chained_pointwise_unroll_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_UNROLL_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_POINTWISE_UNROLLS
+                        )
                 fields.update(self.user_defined_tunables)
                 return fields
             if self.cute_tcgen05_search_enabled:

@@ -1128,6 +1128,8 @@ class CuteBackend(Backend):
             or key == "cute_chunk_prepare_schedule"
             or key == "cute_affine_scan_schedule"
             or key == "cute_chained_mma_schedule"
+            or key == "cute_chained_pointwise_vectorize"
+            or key == "cute_chained_pointwise_unroll"
             or key == "cute_loop_vectorize"
             or key == "cute_loop_load_schedule"
             or key == "cute_cluster_n"

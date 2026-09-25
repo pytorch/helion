@@ -9,14 +9,17 @@ M128 uses the full datapath family.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import math
 from typing import TYPE_CHECKING
 from typing import cast
 
 import sympy
+import torch
 
 from ..compile_environment import CompileEnvironment
 from . import chained_matmul as chain
+from .chained_pointwise_unroll import PointwiseUnroll
 from .fx_matcher import _GeneratedCodeTemplate
 from .tcgen05_config import CuteTcgen05Config
 
@@ -105,6 +108,7 @@ def _stage(
     role: str,
     inner: int,
     dtype: str,
+    pointwise_unroll: PointwiseUnroll,
 ) -> list[str]:
     prefix = f"chain_{stage}"
     m, n, k = plan.shapes[stage]
@@ -148,8 +152,247 @@ def _stage(
             fallback,
             target,
         )
+        or _pointwise_stage(
+            cg,
+            plan,
+            boundaries,
+            scans,
+            operand,
+            prefix,
+            role,
+            shape,
+            inner,
+            dtype,
+            target,
+            fallback,
+            pointwise_unroll,
+        )
         or fallback
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class _VectorLeaf:
+    node: Node
+    coordinates: tuple[str, ...]
+    tensor: str
+    offset: str
+    outer_stride: int
+    bounds: tuple[str, ...]
+    dtype: torch.dtype
+
+
+def _vector_leaf(
+    expression: chain._Expression,
+    node: Node,
+    coordinates: tuple[str, ...],
+    indices: list[str],
+    shape: tuple[int, int],
+    names: tuple[str, str],
+) -> _VectorLeaf | None:
+    """Prove a dense, fully bounded vector load, preserving runtime strides."""
+    source = cast("Node", node.args[0])
+    fake = source.meta["val"]
+    if fake.dtype not in (expression.plan.dtype, torch.float32):
+        return None
+    symbols = {
+        name: sympy.Symbol(name, integer=True)
+        for name in (*names, *expression.origins.values())
+    }
+    row, col = (symbols[name] for name in names)
+    bases, coefficients, bounds = [], [], []
+    try:
+        for index, extent in zip(indices, fake.shape, strict=True):
+            value = sympy.expand(
+                chain._copy_index(index, expression.definitions, symbols)
+            )
+            base = value.subs({row: 0, col: 0})
+            slopes = (sympy.diff(value, row), sympy.diff(value, col))
+            if any(not isinstance(slope, sympy.Integer) for slope in slopes):
+                return None
+            pair = (int(slopes[0]), int(slopes[1]))
+            if (
+                sympy.expand(
+                    value - base - sympy.Mul(pair[0], row) - sympy.Mul(pair[1], col)
+                )
+                != 0
+            ):
+                return None
+            bases.append(base)
+            coefficients.append(pair)
+            low = sum(min(0, s * (e - 1)) for s, e in zip(pair, shape, strict=True))
+            high = sum(max(0, s * (e - 1)) for s, e in zip(pair, shape, strict=True))
+            bounds.extend(
+                (
+                    f"0 <= ({chain._copy_code(base + low)})",
+                    f"({chain._copy_code(base + high)}) < {extent}",
+                )
+            )
+        strides = tuple(fake.stride())
+        physical = tuple(
+            sum(
+                pair[axis] * stride
+                for pair, stride in zip(coefficients, strides, strict=True)
+            )
+            for axis in (0, 1)
+        )
+        if physical[1] != 1 or physical[0] < 0 or physical[0] % 8:
+            return None
+        offset = chain._copy_code(
+            sympy.Add(
+                *(base * stride for base, stride in zip(bases, strides, strict=True))
+            )
+        )
+    except chain._UnsupportedChain:
+        return None
+    tensor = expression.tensor_name(source)
+    bounds.extend(
+        f"{tensor}.layout.stride[{axis}] == {stride}"
+        for axis, stride in enumerate(strides)
+    )
+    return _VectorLeaf(
+        node, coordinates, tensor, offset, physical[0], tuple(bounds), fake.dtype
+    )
+
+
+def _pointwise_stage(
+    cg: GenerateAST,
+    plan: ChainedMatmulPlan,
+    boundaries: dict[Node, str],
+    scans: list[chain._ScanInput],
+    operand: Node,
+    prefix: str,
+    role: str,
+    shape: tuple[int, int],
+    inner: int,
+    dtype: str,
+    target: str,
+    fallback: list[str],
+    pointwise_unroll: PointwiseUnroll,
+) -> list[str] | None:
+    """Vectorize dense leaves, then evaluate the unchanged pointwise graph.
+
+    Each source iteration uses eight values per leaf. Broadcast subexpressions are
+    evaluated once per vector; arbitrary remaining loads retain scalar masks.
+    The final logical-domain mask is applied after all pointwise operations.
+    """
+    if not cg.device_function.config.config.get("cute_chained_pointwise_vectorize"):
+        return None
+    if chain._direct_operand(operand) or chain._ancestors(operand) & set(plan.dots):
+        return None
+    width, height = shape[inner], shape[1 - inner]
+    columns = (width) // 8
+    if (
+        width % 8
+        or columns < 1
+        or columns > 128
+        or columns & (columns - 1)
+        or height % (128 // columns)
+    ):
+        return None
+    rows = 128 // columns
+    tag = f"{prefix}_{role}_pointwise"
+    names = (f"{tag}_row", f"{tag}_col")
+    stored = names if inner == 1 else names[::-1]
+    coords = stored if role == "a" else stored[::-1]
+    probe = chain._Expression(cg, plan, boundaries)
+    probe.scan_inputs = scans
+    probe.coordinate_names.update(names)
+    probe.value(operand, coords)
+    leaves = [
+        leaf
+        for node, coordinates, indices, loaded in probe.loaded_inputs
+        if True
+        if (
+            leaf := _vector_leaf(
+                probe, node, coordinates, indices, (height, width), names
+            )
+        )
+        is not None
+    ]
+    if not leaves:
+        return None
+    reusable = set()
+    cached_vectors = {
+        index
+        for index, leaf in enumerate(leaves)
+        if leaf.outer_stride == 0 and (leaf.node, leaf.coordinates) in reusable
+    }
+    if cached_vectors:
+        pass
+    raw_leaf = None
+    raw = f"{prefix}_{role}_raw"
+    expression = chain._Expression(cg, plan, boundaries)
+    expression.scan_inputs = scans
+    expression.coordinate_names.update(names)
+    element = f"{tag}_element"
+    for index, leaf in enumerate(leaves):
+        expression.memo[leaf.node, leaf.coordinates] = (
+            f"{tag}_leaf_{index}_values[{element}]"
+        )
+    value = expression.value(operand, coords)
+    domain = chain._operand_domain(cg, operand, coords, plan)
+    cached_reads = []
+    invariant, varying = _hoist(expression, {names[1], element})
+    pointer_lines, bounds, descriptors, loads, vector_preloads = [], [], [], [], []
+    for index, leaf in enumerate(leaves):
+        name = f"{tag}_leaf_{index}"
+        leaf_dtype = CompileEnvironment.current().backend.dtype_str(leaf.dtype)
+        copy, thread = f"{tag}_copy", f"{tag}_thread"
+        if leaf.dtype != plan.dtype:
+            # Preserve the source precision through the pointwise expression.
+            # The same TV layout owns eight logical values for either dtype;
+            # FP32 uses two 128-bit copies instead of a BF16 narrowing load.
+            copy, thread = f"{name}_copy", f"{name}_thread"
+            descriptors.extend(
+                (
+                    f"{copy} = cute.make_tiled_copy_tv(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {leaf_dtype}, num_bits_per_copy=128), cute.make_layout(({rows}, {columns}), stride=({columns}, 1)), cute.make_layout((1, 8)))",
+                    f"{thread} = {copy}.get_slice(chain_thread)",
+                )
+            )
+        pointer_lines.append(
+            f"{name}_pointer = {leaf.tensor}.iterator + ({leaf.offset})"
+        )
+        bounds.extend((*leaf.bounds, f"{name}_pointer.toint() % 16 == 0"))
+        descriptors.extend(
+            (
+                f"{name}_source = cute.make_tensor({name}_pointer.align(16), cute.make_layout(({height}, {width}), stride=({leaf.outer_stride}, 1)))",
+                f"{name}_partition = {thread}.partition_S({name}_source)",
+                f"{name}_values = cute.make_rmem_tensor({name}_partition[None, 0, 0].shape, {leaf_dtype})",
+            )
+        )
+        # These vectors have the same typed address and complete load mask for
+        # every row. Keep all original pointer/stride/bounds guards and the
+        # untouched scalar fallback; only move their existing copy outside the
+        # row loop, still inside this guarded branch.
+        (vector_preloads if index in cached_vectors else loads).append(
+            f"cute.copy({copy}, {raw if index == raw_leaf else name}_partition[None, {'0' if index in cached_vectors else f'{tag}_step'}, 0], {name}_values)"
+        )
+    fast = [
+        f"{tag}_copy = cute.make_tiled_copy_tv(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {dtype}, num_bits_per_copy=128), cute.make_layout(({rows}, {columns}), stride=({columns}, 1)), cute.make_layout((1, 8)))",
+        f"{tag}_thread = {tag}_copy.get_slice(chain_thread)",
+        f"{tag}_target = {tag}_thread.partition_D({target})",
+        f"{tag}_values = cute.make_rmem_tensor({tag}_target[None, 0, 0].shape, {dtype})",
+        *descriptors,
+        *cached_reads,
+        *vector_preloads,
+        f"for {tag}_step in cutlass.range({height // rows}, unroll={pointwise_unroll.loop_factor(height // rows)}):",
+        f"    {names[0]} = chain_thread // {columns} + {tag}_step * {rows}",
+        chain._indent(loads),
+        chain._indent(invariant),
+        f"    for {element} in cutlass.range_constexpr(8):",
+        f"        {names[1]} = chain_thread % {columns} * 8 + {element}",
+        chain._indent(varying, 8),
+        f"        {tag}_values[{element}] = {chain._masked_operand(value, dtype, domain)}",
+        f"    cute.copy({tag}_copy, {tag}_values, {tag}_target[None, {tag}_step, 0])",
+    ]
+    return [
+        *pointer_lines,
+        f"if {' & '.join(f'({bound})' for bound in dict.fromkeys(bounds))}:",
+        chain._indent(fast),
+        "else:",
+        chain._indent(fallback),
+    ]
 
 
 def _load_result(prefix: str, shape: tuple[int, int]) -> list[str]:
@@ -457,6 +700,9 @@ def _epilogue(
 
 def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
     df = cg.device_function
+    pointwise_unroll = PointwiseUnroll(
+        cast("int", df.config.config.get("cute_chained_pointwise_unroll", 1))
+    )
     dtype = CompileEnvironment.current().backend.dtype_str(plan.dtype)
     index_dtype = CompileEnvironment.current().backend.dtype_str(
         CompileEnvironment.current().index_dtype
@@ -559,6 +805,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     "b",
                     inner_axes[final_stage, "b"],
                     dtype,
+                    pointwise_unroll,
                 ),
             ]
             lines.extend(prefetch_lines)
@@ -594,6 +841,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                         role,
                         inner_axes[stage, role],
                         dtype,
+                        pointwise_unroll,
                     )
                     lines.extend(
                         [
@@ -697,6 +945,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         ]
         lines.extend(epilogue)
         lines.extend(["cute.arch.sync_threads()", "chain_allocator.free(chain_tptr)"])
+        pointwise_unroll.validate()
     except chain._UnsupportedChain as error:
         from ... import exc
 

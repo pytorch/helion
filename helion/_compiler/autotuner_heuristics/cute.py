@@ -15,10 +15,12 @@ from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from ...autotuner.config_spec import VALID_CUTE_CHAINED_POINTWISE_UNROLLS
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...runtime.config import Config
 from ..cute import mma_support
+from ..cute.chained_pointwise_unroll import has_pointwise_vector_candidate
 from ..cute.cutedsl_compat import cp_async_supported
 from ..cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ..cute.cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -3050,6 +3052,10 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
             mma_support.get_cute_mma_support().tcgen05_f16bf16
             and bool(cls._tcgen05_seed_configs(env, device_ir))
         )
+        spec.cute_chained_pointwise_unroll_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_pointwise_vector_candidate(device_ir.graphs)
+        )
 
         return frozenset()
 
@@ -3162,13 +3168,15 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                 ):
                     compatible = False
             if compatible:
-                seeds.append(
+                seeds.extend(
                     Config(
                         block_sizes=blocks,
                         num_warps=4,
                         pid_type="flat",
                         cute_chained_mma_schedule="tcgen05_tmem",
+                        cute_chained_pointwise_vectorize=vectorize,
                     )
+                    for vectorize in (False, True)
                 )
         return dedupe_configs(seeds)
 
@@ -3212,6 +3220,20 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
         if spec.cute_chained_tcgen05_search_enabled:
             tcgen_seeds = cls._tcgen05_seed_configs(env, device_ir)
             seeds.extend(tcgen_seeds)
+        if spec.cute_chained_pointwise_unroll_search_enabled:
+            pointwise_seeds = tuple(
+                seed
+                for seed in seeds
+                if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+                and seed.config.get("cute_chained_pointwise_vectorize")
+            )
+            seeds.extend(
+                Config.from_dict(
+                    seed.config | {"cute_chained_pointwise_unroll": factor}
+                )
+                for factor in VALID_CUTE_CHAINED_POINTWISE_UNROLLS[1:]
+                for seed in pointwise_seeds
+            )
         return seeds
 
     @classmethod
