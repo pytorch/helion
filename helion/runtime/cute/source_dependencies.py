@@ -12,10 +12,12 @@ if TYPE_CHECKING:
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 # Ordinary generated kernels import these helpers without a wrapper plan.
-# Include their implementations and the L2 compatibility helper in every key;
+# Include their implementations and transitive cluster support in every key;
 # a generated import statement alone cannot identify the compiled device code.
 _COMMON_DEPENDENCIES = (
     "runtime/cute/launcher.py",
+    "_compiler/cute/reduce_helpers.py",
+    "_compiler/cute/cluster_helpers.py",
     "_compiler/cute/vec_utils.py",
     "_compiler/cute/l2_policy.py",
     "_compiler/cute/cutedsl_compat.py",
