@@ -84,6 +84,7 @@ def flash_fa4_shared_storage(
     use_clc_scheduler: bool = False,
     clc_stages: int = 1,
     separate_kv: bool = False,
+    kv_tile_n: int = 128,
 ) -> type:
     """FA4-topology SharedStorage (faithful port of the spike struct).
 
@@ -130,10 +131,10 @@ def flash_fa4_shared_storage(
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+                cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
             ]
             sV: cute.struct.Align[
-                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+                cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
             ]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, separate_o_size], 1024]
 
@@ -171,7 +172,7 @@ def flash_fa4_shared_storage(
                 cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+                cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
             ]
             sO: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim * 2], 1024]
 
@@ -206,7 +207,7 @@ def flash_fa4_shared_storage(
             cute.struct.MemRange[dtype, 128 * head_dim * q_stage], 1024
         ]
         sK: cute.struct.Align[
-            cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+            cute.struct.MemRange[dtype, kv_tile_n * head_dim * kv_stage], 1024
         ]
 
     return SharedStorage

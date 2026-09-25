@@ -23,6 +23,31 @@ if TYPE_CHECKING:
 
 
 @dataclasses.dataclass(frozen=True)
+class _MPPOperandLayout:
+    """How one MPP matmul operand occupies device memory.
+
+    MPP ``tensor_inline`` handles are packed by construction, so the physical
+    row width is derived from the operand's strides instead of assuming it:
+
+    - packed row-major (the common case): the handle covers the logical
+      ``(rows, cols)`` matrix exactly.
+    - transposed (column-major strides ``(1, rows)``): the handle covers the
+      storage as ``(rows, cols)`` and the descriptor's transpose flag tells
+      MPP to read it transposed.
+    - row-padded (strides ``(ld, 1)`` with ``ld >= cols``): the handle covers
+      the storage with row width ``ld``.  Our K-loop stays within the
+      logical range, but MPP's own edge masking follows the storage extents,
+      so the padded side needs tail-free tiles (checked at emission).
+
+    Metal binds each tensor argument at the view's first logical element, so a
+    storage offset is deliberately not part of this description.
+    """
+
+    transposed: bool
+    storage_row_width: int | torch.SymInt
+
+
+@dataclasses.dataclass(frozen=True)
 class MPPSetupParams:
     """Arguments for ``_metal_mpp_setup(...)`` consumed by the MSL walker.
 
@@ -53,6 +78,10 @@ class MPPSetupParams:
     bias: str | None
     bias_dtype: str | None
     fx_name: str | None
+    lhs_transposed: bool
+    rhs_transposed: bool
+    lhs_storage_row_width: int
+    rhs_storage_row_width: int
     m_offset: str
     n_offset: str
 
@@ -63,7 +92,10 @@ class MPPSetupParams:
             f"{self.TILE_M}, {self.TILE_N}, {self.TILE_K}, {self.NUM_SG}, "
             f'"{self.in_dtype}", "{self.acc_dtype}", '
             f'"{self.bias or ""}", "{self.bias_dtype or ""}", '
-            f'"{self.fx_name or ""}", {self.m_offset}, {self.n_offset})'
+            f'"{self.fx_name or ""}", '
+            f"{int(self.lhs_transposed)}, {int(self.rhs_transposed)}, "
+            f"{self.lhs_storage_row_width}, {self.rhs_storage_row_width}, "
+            f"{self.m_offset}, {self.n_offset})"
         )
 
 
@@ -164,6 +196,8 @@ class MPPGraphInfo(NodeArgsGraphInfo):
     out_tensor: torch.Tensor | None = None
     out_dtype: torch.dtype | None = None
     needs_store_barrier: bool = False
+    lhs_layout: _MPPOperandLayout | None = None
+    rhs_layout: _MPPOperandLayout | None = None
     m_block_id: int | None = None
     n_block_id: int | None = None
 
@@ -187,6 +221,8 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             "out_tensor": self.out_tensor,
             "out_dtype": self.out_dtype,
             "needs_store_barrier": self.needs_store_barrier,
+            "lhs_layout": self.lhs_layout,
+            "rhs_layout": self.rhs_layout,
             "m_block_id": self.m_block_id,
             "n_block_id": self.n_block_id,
         }
@@ -287,6 +323,51 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             codegen.add_statement(_mpp_threadgroup_barrier_stmt())
         return []
 
+    def _check_mpp_operand_layout(
+        self,
+        tile_n: int,
+        tile_k: int,
+        *,
+        n: int,
+        k: int,
+        lhs_storage_row_width: int,
+        rhs_storage_row_width: int,
+    ) -> None:
+        """Reject row-padded operands whose tail MPP cannot mask correctly.
+
+        When padding makes an operand's storage row wider than its logical K/N
+        range, MPP's edge masking follows the storage width.  The corresponding
+        logical range must therefore be exactly divisible by its tile.
+        """
+        assert self.lhs_layout is not None
+        assert self.rhs_layout is not None
+        if (
+            not self.lhs_layout.transposed
+            and lhs_storage_row_width != k
+            and k % tile_k != 0
+        ):
+            raise exc.BackendUnsupported(
+                "metal",
+                "row-padded MPP lhs with storage row width "
+                f"{lhs_storage_row_width} for "
+                f"logical K={k}: MPP edge masking follows the storage "
+                "extents, so K must be an exact multiple of "
+                f"TILE_K ({tile_k})",
+            )
+        if (
+            not self.rhs_layout.transposed
+            and rhs_storage_row_width != n
+            and n % tile_n != 0
+        ):
+            raise exc.BackendUnsupported(
+                "metal",
+                "row-padded MPP rhs with storage row width "
+                f"{rhs_storage_row_width} for "
+                f"logical N={n}: MPP edge masking follows the storage "
+                "extents, so N must be an exact multiple of "
+                f"TILE_N ({tile_n})",
+            )
+
     def _emit_setup_and_k_loop(self, state: CodegenState) -> str:
         """Emit MPP setup plus the K-loop and return the setup variable name."""
         assert self.lhs_tensor is not None
@@ -338,6 +419,22 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         if not isinstance(bk, int):
             raise exc.BackendUnsupported("metal", "dynamic MPP K block size")
 
+        m = int(env.size_hint(self.lhs_tensor.shape[0]))
+        n = int(env.size_hint(self.rhs_tensor.shape[1]))
+        k = int(env.size_hint(self.lhs_tensor.shape[1]))
+        assert self.lhs_layout is not None
+        assert self.rhs_layout is not None
+        lhs_storage_row_width = int(env.size_hint(self.lhs_layout.storage_row_width))
+        rhs_storage_row_width = int(env.size_hint(self.rhs_layout.storage_row_width))
+        self._check_mpp_operand_layout(
+            n_axis.block_size,
+            bk,
+            n=n,
+            k=k,
+            lhs_storage_row_width=lhs_storage_row_width,
+            rhs_storage_row_width=rhs_storage_row_width,
+        )
+
         num_sg = df.config.num_warps if df.config.num_warps is not None else 4
         codegen.max_thread_block_dims[0] = max(
             codegen.max_thread_block_dims[0], num_sg * 32
@@ -358,9 +455,9 @@ class MPPGraphInfo(NodeArgsGraphInfo):
         setup = MPPSetupParams(
             lhs=lhs_arg_name,
             rhs=rhs_arg_name,
-            M=int(env.size_hint(self.lhs_tensor.shape[0])),
-            N=int(env.size_hint(self.rhs_tensor.shape[1])),
-            K=int(env.size_hint(self.lhs_tensor.shape[1])),
+            M=m,
+            N=n,
+            K=k,
             TILE_M=m_axis.block_size,
             TILE_N=n_axis.block_size,
             TILE_K=bk,
@@ -370,6 +467,10 @@ class MPPGraphInfo(NodeArgsGraphInfo):
             bias=acc_arg_name or None,
             bias_dtype=acc_metal_dtype or None,
             fx_name=self.result_name,
+            lhs_transposed=self.lhs_layout.transposed,
+            rhs_transposed=self.rhs_layout.transposed,
+            lhs_storage_row_width=lhs_storage_row_width,
+            rhs_storage_row_width=rhs_storage_row_width,
             m_offset=m_axis.offset_var,
             n_offset=n_axis.offset_var,
         )

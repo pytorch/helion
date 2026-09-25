@@ -540,9 +540,36 @@ class TileStrategyDispatch:
             axis = base_axis + local_axis
             # ``size is None`` means the extent is dynamic; the static launch
             # dims cannot prove the launch matches, so keep the mask.
-            if size is None or axis >= len(dims) or dims[axis] > size:
+            if (
+                size is None
+                or axis >= len(dims)
+                or dims[axis] > size
+                or self._may_have_multigrid_surplus(size)
+            ):
                 return True
         return False
+
+    def _may_have_multigrid_surplus(self, extent: int) -> bool:
+        """Bound surplus without assuming branch-local axes agree globally.
+
+        CuTe root execution plans may reserve different synthetic/reduction
+        axes. The final launch follows the emitted indices, while dispatch's
+        axis map is scoped to the current root. Until all emitted mappings are
+        available, a grid mask can be elided only if *every* potential physical
+        axis fits its extent. Equal-width roots retain mask elision.
+        """
+        if (
+            CompileEnvironment.current().backend_name != "cute"
+            or len(HostFunction.current().device_ir.grid_block_ids) <= 1
+        ):
+            return False
+        return any(
+            size is None or size > extent
+            for strategy in self.strategies
+            for _block_id, _axis, size, _expr in self._iter_strategy_thread_axes(
+                strategy
+            )
+        )
 
     def has_surplus_threads_for_block_id(self, target_block_id: int) -> bool:
         """Per-block variant of :meth:`has_surplus_threads_for_strategy`.
@@ -571,7 +598,7 @@ class TileStrategyDispatch:
                 axis = base_axis + local_axis
                 if size is None or axis >= len(dims):
                     return True
-                return dims[axis] > size
+                return dims[axis] > size or self._may_have_multigrid_surplus(size)
             return False
         return False
 
