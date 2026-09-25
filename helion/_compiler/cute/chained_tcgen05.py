@@ -20,6 +20,7 @@ import torch
 from ..compile_environment import CompileEnvironment
 from . import chained_matmul as chain
 from .chained_pointwise_unroll import PointwiseUnroll
+from .chained_scan_export import codegen_scan_exports
 from .fx_matcher import _GeneratedCodeTemplate
 from .tcgen05_config import CuteTcgen05Config
 
@@ -942,6 +943,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             boundaries[node] = f"{prefix}_c"
         epilogue = [
             *_epilogue(cg, plan, boundaries, scans, staged),
+            *codegen_scan_exports(cg, plan, boundaries, scans),
         ]
         lines.extend(epilogue)
         lines.extend(["cute.arch.sync_threads()", "chain_allocator.free(chain_tptr)"])

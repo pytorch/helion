@@ -1026,6 +1026,7 @@ class CuteBackend(Backend):
         from ..device_function import DeviceFunction
         from ..device_ir import RootGraphInfo
         from .chained_matmul import plan_chained_matmul
+        from .chained_scan_export import requests_scan_export
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
@@ -1071,6 +1072,16 @@ class CuteBackend(Backend):
         device_function.cute_state.chained_matmul_plan = chained_plan
         if chained_plan is not None:
             return
+        scan_export_requested = any(
+            requests_scan_export(tuple(graph.graph.nodes)) for graph in graphs
+        )
+        if (
+            scan_export_requested
+            and config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "unsupported chained scan export ownership or layout"
+            )
         if config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
             raise exc.BackendUnsupported(
                 "cute", "tcgen05_tmem requires a supported full-tile contraction DAG"
@@ -1078,6 +1089,10 @@ class CuteBackend(Backend):
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
+        if scan_export_requested:
+            raise exc.BackendUnsupported(
+                "cute", "unsupported chained scan export ownership or layout"
+            )
         plan_chunk_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
             return

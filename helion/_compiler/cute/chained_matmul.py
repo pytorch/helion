@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from .chained_scan_export import ScanExport
+    from .chained_scan_export import ScanExportStores
 
 
 class _UnsupportedChain(Exception):
@@ -63,6 +65,7 @@ class ChainedMatmulPlan:
         default_factory=dict, compare=False
     )
     strategy: str = "warp"
+    scan_exports: tuple[ScanExport, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -350,7 +353,7 @@ class _ChainedGraph:
     dots: tuple[Node, ...]
     scans: tuple[Node, ...]
     store: Node
-    exports: None
+    exports: ScanExportStores | None
 
 
 def _classify_chained_graph(graphs: Sequence[GraphInfo]) -> _ChainedGraph | None:
@@ -366,17 +369,19 @@ def _classify_chained_graph(graphs: Sequence[GraphInfo]) -> _ChainedGraph | None
     dots = tuple(node for node in nodes if node.target is dot)
     scans = tuple(node for node in nodes if node.target is scan_ops._associative_scan)
     stores = tuple(node for node in nodes if node.target is memory_ops.store)
+    from .chained_scan_export import classify_scan_exports
 
-    allowed = frozenset()
+    exports = classify_scan_exports(nodes) if len(stores) != 1 else None
+    allowed = exports.permitted_nodes if exports is not None else frozenset()
     if (
         not dots
-        or (len(stores) != 1)
+        or (len(stores) != 1 and exports is None)
         or not all(_supported(node) or node in allowed for node in nodes)
     ):
         return None
     if not all(map(_additive_scan, scans)):
         return None
-    store = stores[0]
+    store = exports.primary if exports is not None else stores[0]
     if not isinstance(store.args[0], Node) or not _has_fresh_output_allocation(
         store.args[0]
     ):
@@ -402,7 +407,7 @@ def _classify_chained_graph(graphs: Sequence[GraphInfo]) -> _ChainedGraph | None
         and _ordinary_mma_supported(dots[0])
     ):
         return None
-    return _ChainedGraph(root, nodes, dots, scans, store, None)
+    return _ChainedGraph(root, nodes, dots, scans, store, exports)
 
 
 def detect_chained_matmul_search(graphs: Sequence[GraphInfo]) -> bool:
@@ -413,6 +418,7 @@ def detect_chained_matmul_search(graphs: Sequence[GraphInfo]) -> bool:
 def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None:
     from ..device_function import DeviceFunction
     from ..host_function import HostFunction
+    from .chained_scan_export import valid_scan_exports
 
     env = CompileEnvironment.current()
     df = DeviceFunction.current()
@@ -515,7 +521,10 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
         32 * min(df.config.num_warps, 8),
         scans,
         strategy="tcgen05_tmem" if tcgen else "warp",
+        scan_exports=graph.exports.exports if graph.exports is not None else (),
     )
+    if not valid_scan_exports(plan):
+        return None
     if tcgen:
         from .chained_tcgen05 import supported_plan
 
