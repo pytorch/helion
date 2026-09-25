@@ -582,6 +582,25 @@ class TritonBackend(Backend):
                     f"_remote_barrier_process_group_name={process_group_name!r}",
                 ]
             )
+        if device_fn.triton_distributed_readiness_signal_slots:
+            signal_dst = device_fn.triton_distributed_readiness_signal_dst
+            process_group_name = CompileEnvironment.current().process_group_name
+            if signal_dst is None or process_group_name is None:
+                raise exc.BackendUnsupported(
+                    "triton",
+                    "distributed readiness requires a symmetric payload and "
+                    "active process group",
+                )
+            out.extend(
+                [
+                    f"_distributed_readiness_signal_dst={signal_dst}",
+                    (
+                        "_distributed_readiness_signal_slots="
+                        f"{device_fn.triton_distributed_readiness_signal_slots}"
+                    ),
+                    f"_distributed_readiness_process_group_name={process_group_name!r}",
+                ]
+            )
         if device_fn.triton_remote_copy_scratch_specs:
             specs = ", ".join(
                 f"({tensor}, {numel})"

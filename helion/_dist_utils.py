@@ -152,16 +152,15 @@ def check_config_consistancy(
     all_configs = [None] * dist.get_world_size(group)
     # pyrefly: ignore[bad-argument-type]
     dist.all_gather_object(all_configs, config, group=group)
-    if dist.get_rank() == 0:
-        # do the check on rank 0
-        if all_configs != all_configs[:1] * len(all_configs):
-            if print_config:
-                for idx, c in enumerate(all_configs):
-                    print("FAIL", idx, c)
-            raise exc.InconsistantConfigsAcrossRanks
-        if print_config:
+    if all_configs != all_configs[:1] * len(all_configs):
+        if print_config and dist.get_rank(group) == 0:
             for idx, c in enumerate(all_configs):
-                print("PASS", idx, c)
+                print("FAIL", idx, c)
+        # Every rank must fail before any peer can enter a mismatched kernel.
+        raise exc.InconsistantConfigsAcrossRanks
+    if print_config and dist.get_rank(group) == 0:
+        for idx, c in enumerate(all_configs):
+            print("PASS", idx, c)
 
 
 def print_with_rank(*args: object, **kwargs: object) -> None:

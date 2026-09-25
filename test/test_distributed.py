@@ -4,6 +4,7 @@ import contextlib
 from datetime import timedelta
 import io
 import os
+import time
 import unittest
 from unittest.mock import patch
 import warnings
@@ -23,6 +24,7 @@ from torch.testing._internal.common_utils import run_tests
 
 import helion
 from helion._dist_utils import all_gather_object
+from helion._dist_utils import check_config_consistancy
 from helion._dist_utils import kernel_uses_symm_mem
 from helion._dist_utils import sync_object
 from helion._dist_utils import sync_seed
@@ -94,6 +96,27 @@ def one_shot_allreduce_kernel(
     return out
 
 
+def pipelined_allreduce_kernel(
+    source: torch.Tensor,
+    symmetric: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    """Publish local tiles, then consume every rank as each tile becomes ready."""
+    out = torch.empty_like(source)
+    local = symmetric.view(-1)
+    remotes = torch.ops.symm_mem.get_remote_tensors(symmetric, group_name)
+
+    for producer_tile in hl.tile(source.size(0)):
+        local[producer_tile] = source[producer_tile]
+
+    for consumer_tile in hl.tile(source.size(0)):
+        total = hl.zeros([consumer_tile], dtype=torch.float32)
+        for remote in remotes:
+            total += remote[consumer_tile].to(torch.float32)
+        out[consumer_tile] = total.to(source.dtype)
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -118,6 +141,25 @@ profile = AutotuneEffortProfile(
 )
 
 
+class TestDistributedConfigAgreement(unittest.TestCase):
+    def test_mismatch_raises_on_nonzero_rank(self) -> None:
+        config = helion.Config(block_sizes=[])
+
+        def gather(output, _config, *, group):
+            output[:] = [config, helion.Config(block_sizes=[1])]
+
+        with (
+            patch.dict(os.environ, {"HELION_DIST_CHECK_CONFIG_CONSISTANCY": "1"}),
+            patch("helion._dist_utils.dist.is_initialized", return_value=True),
+            patch("helion._dist_utils._resolve_process_group", return_value="group"),
+            patch("helion._dist_utils.dist.get_world_size", return_value=2),
+            patch("helion._dist_utils.dist.get_rank", return_value=1),
+            patch("helion._dist_utils.dist.all_gather_object", side_effect=gather),
+            self.assertRaises(helion.exc.InconsistantConfigsAcrossRanks),
+        ):
+            check_config_consistancy(config, process_group_name="group")
+
+
 @onlyBackends(["triton"])
 @instantiate_parametrized_tests
 class TestDistributed(TestCase, MultiProcessTestCase):
@@ -132,6 +174,10 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                     "HELION_DIST_CHECK_CONFIG_CONSISTANCY": "1",
                     "HELION_CAP_AUTOTUNE_NUM_NEIGHBORS": "50",
                     "HELION_CAP_REBENCHMARK_REPEAT": "50",
+                    "NCCL_NVLS_ENABLE": "0",
+                    "NVSHMEM_DISABLE_CUDA_VMM": "1",
+                    "NVSHMEM_DISABLE_NVLS": "1",
+                    "NVSHMEM_SYMMETRIC_SIZE": "1G",
                 },
             )
         )
@@ -293,6 +339,88 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         dist.all_reduce(expected, op=dist.ReduceOp.SUM)
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @unittest.skipUnless(
+        torch.version.cuda is not None,
+        "compiler-derived distributed readiness requires NVIDIA CUDA",
+    )
+    def test_pipelined_allreduce_replays(self) -> None:
+        """Compiler-derived cross-rank readiness survives eager and graph replay."""
+        self._init_process()
+        symm_mem.set_backend("NVSHMEM")
+        group = dist.group.WORLD
+        assert group is not None
+        group_name = group.group_name
+        source = torch.arange(4099, device=self.device, dtype=torch.float32)
+        source += self.rank
+        symmetric = symm_mem.empty(
+            source.shape,
+            dtype=source.dtype,
+            device=self.device,
+        )
+        symm_mem.rendezvous(symmetric, group=group_name)
+        kernel = helion.kernel(
+            config=helion.Config(
+                block_sizes=[256, 1024],
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=4,
+                pid_type="persistent_blocked",
+            ),
+            static_shapes=True,
+            ignore_warnings=[helion.exc.TensorOperationInWrapper],
+        )(pipelined_allreduce_kernel)
+
+        expected = source.clone()
+        dist.all_reduce(expected)
+        for _ in range(2):
+            actual = kernel(source, symmetric, group_name)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        # A peer may enter the persistent kernel while another rank is delayed
+        # by unrelated stream work.  Exact readiness must tolerate that skew.
+        dist.barrier()
+        if self.rank == 0:
+            time.sleep(0.05)
+        actual = kernel(source, symmetric, group_name)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            captured = kernel(source, symmetric, group_name)
+            torch.cuda.synchronize()
+            dist.barrier()
+            with torch.cuda.graph(graph, stream=stream):
+                captured = kernel(source, symmetric, group_name)
+        torch.cuda.synchronize()
+        dist.barrier()
+        for _ in range(2):
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+        dist.barrier()
+        if self.rank == 0:
+            time.sleep(0.05)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+        # The eager and captured paths own independent epoch/counter state and
+        # remain valid when a serving runtime alternates between them.
+        actual = kernel(source, symmetric, group_name)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+
+        self._cleanup_process()
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)

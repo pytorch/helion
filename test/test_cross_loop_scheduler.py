@@ -397,6 +397,29 @@ def _configured_readiness_graph(
 
 
 class TestCrossLoopScheduler(TestCase):
+    def test_all_rank_union_canonicalizes_only_complete_peer_set(self) -> None:
+        ranks = CoordinateDomain.scalar(4, kind="value", identity=0)
+        (axis,) = ranks.axis_order
+
+        def peer(rank: int) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                ranks,
+                ranks,
+                ((((axis, 0, 4, 1),), (sympy.Integer(rank),)),),
+            )
+
+        complete = CoordinateRelation.union_all(tuple(peer(rank) for rank in range(4)))
+        incomplete = CoordinateRelation.union_all(
+            tuple(peer(rank) for rank in range(3))
+        )
+        assert complete is not None and incomplete is not None
+        self.assertTrue(
+            cross_loop_scheduler._canonical_all_rank_relation(complete).is_total()
+        )
+        self.assertFalse(
+            cross_loop_scheduler._canonical_all_rank_relation(incomplete).is_total()
+        )
+
     def test_dispatch_mode_changes_only_physical_root_ownership(self) -> None:
         roots = tuple(
             _domain((axis, count, 1), identity=root)
@@ -847,6 +870,68 @@ class TestCrossLoopScheduler(TestCase):
         assert count_by_key is not None
         self.assertEqual(count_by_key.value_bounds(), (2, 3))
         _plan(roots, 4, counters=(counter,))
+
+    def test_consumer_partition_derives_clipped_tail_counter(self) -> None:
+        roots = (
+            _domain((10, 17, 256), identity=0),
+            _domain((20, 5, 1024), identity=1),
+        )
+        fine_keys = CoordinateDomain.scalar(17, kind="event", identity=0)
+        consumer_task = coordinate_axis_symbol(20)
+        fine_key = coordinate_axis_symbol(0)
+        producer = _producer(
+            0,
+            _point_pairs(
+                fine_keys,
+                roots[0],
+                tuple((index, index) for index in range(17)),
+            ),
+        )
+        consumer = _consumer(
+            1,
+            CoordinateRelation(
+                roots[1],
+                fine_keys,
+                (
+                    _CoordinateRelationPiece(
+                        ((20, 0, 5, 1),),
+                        ((0, 4 * consumer_task, 4 * consumer_task + 4, 1),),
+                    ),
+                ),
+            ),
+            consumers_by_key=CoordinateRelation(
+                fine_keys,
+                roots[1],
+                (
+                    _CoordinateRelationPiece(
+                        ((0, 0, 17, 1),),
+                        (
+                            (
+                                20,
+                                sympy.floor(fine_key / 4),
+                                sympy.floor(fine_key / 4) + 1,
+                                1,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            obligations=frozenset(((0, None, None),)),
+        )
+        (counter,) = choose_readiness_counters(
+            ReadinessGraph(roots, (ReadinessEvent((producer,), (consumer,)),)),
+            (),
+            charge=cross_loop_scheduler._new_relation_work_budget(),
+        )
+
+        self.assertEqual(counter.readiness_key_domain.size, 5)
+        self.assertIsNone(counter.uniform_arrival_count())
+        count_by_key = counter.producers[0].incidence.count_by_key
+        assert count_by_key is not None
+        self.assertEqual(
+            _relation_pairs(count_by_key),
+            ((0, 4), (1, 4), (2, 4), (3, 4), (4, 1)),
+        )
 
     def test_paired_incidence_composition_preserves_widening_chain(self) -> None:
         first = _domain((0, 1), (1, 4), kind="event", identity=0)

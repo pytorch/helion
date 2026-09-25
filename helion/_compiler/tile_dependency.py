@@ -811,6 +811,15 @@ class CoordinateRelation:
         )
 
     @classmethod
+    def total(
+        cls,
+        source_domain: CoordinateDomain,
+        target_domain: CoordinateDomain,
+    ) -> CoordinateRelation:
+        """Return the complete Cartesian relation between two domains."""
+        return _total_relation(source_domain, target_domain)
+
+    @classmethod
     def point_map(
         cls,
         source_domain: CoordinateDomain,
@@ -2786,8 +2795,12 @@ def _rectangular_fiber_spec(
                 or offset
                 or width != stride
                 or width <= 0
-                or not _is_provably_nonnegative(remaining, None)
-                or (not allow_block_tail and remaining != 0)
+                or (
+                    not allow_block_tail
+                    and (
+                        not _is_provably_nonnegative(remaining, None) or remaining != 0
+                    )
+                )
             ):
                 return normalized, None
             used_sources.add(source_axis)
@@ -2814,9 +2827,15 @@ def _rectangular_fiber_spec(
                 else None
             )
         )
-        if width is None or not _integer_partition_expressions_equal(
-            normalized.source_domain.axis_count_expressions[source_axis],
-            width * target_count,
+        source_count = normalized.source_domain.axis_count_expressions[source_axis]
+        if width is None or not (
+            _integer_partition_expressions_equal(source_count, width * target_count)
+            or (
+                allow_block_tail
+                and _integer_partition_expressions_equal(
+                    target_count, _ceil_div(source_count, width)
+                )
+            )
         ):
             return normalized, None
         used_sources.add(source_axis)
@@ -3124,7 +3143,14 @@ class KeyPartition:
             coarse_by_fine,
             partition_widths,
             frozenset(full_axes),
-            clipped_axes=frozenset(axes) - frozenset(full_axes),
+            clipped_axes=frozenset(
+                axis
+                for axis in axes
+                if not _integer_partition_expressions_equal(
+                    fine_counts[axis],
+                    partition_widths[axis] * coarse.axis_count_expressions[axis],
+                )
+            ),
             other_axes=producer.axis_order,
         )
         source_axes = tuple(source for source, _target, _mode, _width in mappings)
@@ -3159,7 +3185,13 @@ class KeyPartition:
             },
             frozenset(producer.axis_order) - frozenset(source_axes),
             clipped_axes=frozenset(
-                source for source, _target, mode, _width in mappings if mode == "block"
+                source
+                for source, _target, mode, width in mappings
+                if not _integer_partition_expressions_equal(
+                    producer.axis_count_expressions[source],
+                    (1 if mode == "block" else width)
+                    * producer_keys.axis_count_expressions[source],
+                )
             ),
             other_axes=fine.axis_order,
         )
@@ -4567,6 +4599,10 @@ class TileAccess:
     # one exact dense span.  Keep that distinct from a genuinely unknown
     # indirect index, which this module must conservatively widen.
     subscript_dense_spans: tuple[tuple[int, int, int] | None, ...] = ()
+    # For a certified symmetric allocation, map the executing rank to the
+    # physical rank whose allocation this access names.  ``None`` preserves
+    # the ordinary rank-local path byte-for-byte.
+    owner_rank_relation: CoordinateRelation | None = None
 
     def __post_init__(self) -> None:
         """Canonicalize layout values once at the dependency-analysis boundary."""
@@ -4659,6 +4695,10 @@ class TileDependencyRelation:
     producer_site_id: int | None
     consumer_site_id: int | None
     incidence: Incidence | None
+    # Consumer execution rank -> producer execution ranks.  This is derived
+    # from the endpoint TileAccess placement relations; it never expands the
+    # local task DAG or WorkerSchedule by world size.
+    rank_relation: CoordinateRelation | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5275,9 +5315,17 @@ def _rectangular_overlap_sources(
             query_begin, query_end, query_step = query_ranges[allocation_axis]
             if owner_step != 1 or query_step != 1:
                 return None
-            if (
-                sympy.simplify(owner_begin) == 0
-                and sympy.simplify(owner_end - allocation_counts[allocation_axis]) == 0
+            owner_begin_expr = _integer_expression(
+                owner_begin, description="owner range begin"
+            )
+            owner_end_expr = _integer_expression(
+                owner_end, description="owner range end"
+            )
+            if _is_provably_nonnegative(
+                -owner_begin_expr, None
+            ) and _is_provably_nonnegative(
+                sympy.simplify(owner_end_expr - allocation_counts[allocation_axis]),
+                None,
             ):
                 continue
             interval = _single_axis_interval(
@@ -5687,6 +5735,30 @@ def instantiate_symbolic_dependencies(
         raise ValueError("site domain count disagrees with the dependency graph")
     access_by_id = {access.access_id: access for access in dependency_graph.accesses}
 
+    def dependency_rank_relation(
+        producer_access: TileAccess,
+        consumer_access: TileAccess,
+    ) -> CoordinateRelation | None:
+        producer_owner = producer_access.owner_rank_relation
+        consumer_owner = consumer_access.owner_rank_relation
+        if producer_owner is None and consumer_owner is None:
+            return None
+        if producer_owner is None or consumer_owner is None:
+            raise exc.CrossLoopSchedulingError(
+                "because a symmetric allocation access has incomplete rank provenance"
+            )
+        producer_by_owner = producer_owner.converse()
+        relation = (
+            None
+            if producer_by_owner is None
+            else consumer_owner.then(producer_by_owner)
+        )
+        if relation is None:
+            raise exc.CrossLoopSchedulingError(
+                "because the symmetric allocation rank relation is not exact"
+            )
+        return relation
+
     def endpoints(
         access: TileAccess,
     ) -> tuple[tuple[int | None, CoordinateDomain], ...]:
@@ -5730,11 +5802,25 @@ def instantiate_symbolic_dependencies(
                         producer_site_id=None,
                         consumer_site_id=None,
                         incidence=None,
+                        rank_relation=dependency_rank_relation(
+                            producer_access, consumer_access
+                        ),
                     )
                 )
                 continue
             for producer_site_id, producer_domain in producer_endpoints:
                 for consumer_site_id, consumer_domain in consumer_endpoints:
+                    incidence = (
+                        _symbolic_dependency_incidence(
+                            producer_access=producer_access,
+                            producer_domain=producer_domain,
+                            consumer_access=consumer_access,
+                            consumer_domain=consumer_domain,
+                            prove_nonnegative=prove_nonnegative,
+                        )
+                        if axes_have_canonical_origins
+                        else None
+                    )
                     result.append(
                         TileDependencyRelation(
                             dependency_id=access_dependency.dependency_id,
@@ -5743,17 +5829,10 @@ def instantiate_symbolic_dependencies(
                             consumer_root=edge.consumer_root,
                             producer_site_id=producer_site_id,
                             consumer_site_id=consumer_site_id,
-                            incidence=(
-                                _symbolic_dependency_incidence(
-                                    producer_access=producer_access,
-                                    producer_domain=producer_domain,
-                                    consumer_access=consumer_access,
-                                    consumer_domain=consumer_domain,
-                                    prove_nonnegative=prove_nonnegative,
-                                )
-                                if axes_have_canonical_origins
-                                else None
+                            rank_relation=dependency_rank_relation(
+                                producer_access, consumer_access
                             ),
+                            incidence=incidence,
                         )
                     )
     return tuple(result)

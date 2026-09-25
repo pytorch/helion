@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from .device_function import DeviceFunction
+    from .device_ir import DeviceIR
     from .program_id import ForEachProgramID
     from .program_id import PersistentProgramIDs
     from .program_id import PIDInfo
@@ -59,6 +60,10 @@ _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES = 128
 _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
+)
+_DISTRIBUTED_COUNTER_DTYPE = torch.uint64
+_DISTRIBUTED_COUNTER_ALIGNMENT_WORDS = (
+    _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _DISTRIBUTED_COUNTER_DTYPE.itemsize
 )
 
 
@@ -418,6 +423,33 @@ def _wait_for_counter(
     ]
 
 
+def _wait_for_distributed_counter(
+    *,
+    device_function: DeviceFunction,
+    counter: str,
+    target: str,
+    prefix: str,
+) -> list[ast.stmt]:
+    """Wait monotonically on a system-scope uint64 readiness counter."""
+    value = device_function.new_var(prefix, dce=False)
+    load = (
+        "tl.inline_asm_elementwise("
+        "asm='ld.acquire.sys.global.u64 $0, [$1];', "
+        "constraints='=l,l', "
+        f"args=[{counter}], dtype=tl.uint64, is_pure=False, pack=1)"
+    )
+    return [
+        statement_from_string(f"{value} = {load}"),
+        create(
+            ast.While,
+            test=expr_from_string(f"{value} < ({target})"),
+            body=[statement_from_string(f"{value} = {load}")],
+            orelse=[],
+        ),
+        _publication_sync(device_function),
+    ]
+
+
 def _wait_for_dependencies(
     *,
     device_function: DeviceFunction,
@@ -506,6 +538,28 @@ def _register_cross_loop_state(
     return name
 
 
+def _register_distributed_readiness_state(
+    device_function: DeviceFunction,
+    *,
+    payload: str,
+    slots: int,
+) -> tuple[str, str]:
+    """Register hidden peer signal-pad metadata for distributed readiness."""
+    pointer_arg = device_function.new_var(
+        "tile_dependency_distributed_signal_ptrs", dce=False
+    )
+    offset_arg = device_function.new_var(
+        "tile_dependency_distributed_signal_offset", dce=False
+    )
+    device_function.wrapper_only_params.extend((pointer_arg, offset_arg))
+    device_function.triton_distributed_readiness_signal_ptrs_arg = pointer_arg
+    device_function.triton_distributed_readiness_signal_offset_arg = offset_arg
+    device_function.triton_distributed_readiness_signal_dst = payload
+    device_function.triton_distributed_readiness_signal_slots = slots
+    device_function.requires_nvshmem = True
+    return pointer_arg, offset_arg
+
+
 def _outline_cross_loop_region(
     device_function: DeviceFunction,
     *,
@@ -574,6 +628,25 @@ def _triton_root_requires_kernel_scope(
     )
 
 
+def _has_opaque_distributed_protocol(device_ir: object) -> bool:
+    """Return whether scheduled roots contain an explicit cross-rank protocol."""
+    from ..language import distributed_ops
+
+    targets = {
+        distributed_ops.remote_barrier,
+        distributed_ops.make_async_remote_copy,
+        distributed_ops.start_async_remote_copy_descriptor,
+        distributed_ops.wait_async_remote_copy,
+        distributed_ops.wait_send_async_remote_copy,
+        distributed_ops.wait_recv_async_remote_copy,
+    }
+    return any(
+        node.op == "call_function" and node.target in targets
+        for graph_info in cast("DeviceIR", device_ir).graphs
+        for node in graph_info.graph.nodes
+    )
+
+
 def emit_cross_loop_schedule(
     owner: ForEachProgramID,
     strategy: PersistentProgramIDs,
@@ -592,6 +665,13 @@ def emit_cross_loop_schedule(
         return owner._emit_phase_loops(strategy, device_function, total_expr)
     if pipeline not in ("static", "dynamic"):
         raise exc.InvalidConfig(f"unknown cross_loop_pipeline value {pipeline!r}")
+
+    device_ir = HostFunction.current().device_ir
+    if _has_opaque_distributed_protocol(device_ir):
+        raise exc.InvalidConfig(
+            f"cross_loop_pipeline={pipeline!r} cannot reorder roots containing "
+            "explicit remote barriers or asynchronous remote-copy protocols"
+        )
 
     configured_case_geometries = tuple(
         _static_case_geometry(owner, root, device_function)
@@ -625,7 +705,7 @@ def emit_cross_loop_schedule(
         for root, body in enumerate(case_bodies)
         if _triton_root_requires_kernel_scope(body, target_device_capability)
     )
-    dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
+    dependency_graph = device_ir.tile_dependency_graph
     assert dependency_graph is not None
     indexing = device_function.config.get("indexing", ())
 
@@ -712,6 +792,58 @@ def emit_cross_loop_schedule(
         running_offset += domain.size
     case_offset_strings = [str(offset) for offset in case_offsets]
     all_readiness_counter_plans = static_pipeline_plan.readiness_counters
+    distributed_counter_plans = tuple(
+        plan
+        for plan in all_readiness_counter_plans
+        if any(consumer.rank_relation is not None for consumer in plan.consumers)
+    )
+    local_counter_plans = tuple(
+        plan
+        for plan in all_readiness_counter_plans
+        if plan not in distributed_counter_plans
+    )
+    if distributed_counter_plans and pipeline != "dynamic":
+        raise exc.InvalidConfig(
+            "distributed cross-loop dependencies require dynamic dispatch"
+        )
+    distributed_world_sizes = {
+        cast("CoordinateRelation", consumer.rank_relation).target_domain.size
+        for plan in distributed_counter_plans
+        for consumer in plan.consumers
+        if consumer.rank_relation is not None
+    }
+    if len(distributed_world_sizes) > 1:
+        raise exc.InvalidConfig(
+            "distributed readiness currently supports one process-group size"
+        )
+    distributed_world_size = (
+        next(iter(distributed_world_sizes)) if distributed_world_sizes else None
+    )
+    access_dependency_by_id = {
+        dependency.dependency_id: dependency
+        for edge in dependency_graph.edges
+        for dependency in edge.access_dependencies
+    }
+    access_by_id = {access.access_id: access for access in dependency_graph.accesses}
+    distributed_payload_names = {
+        access_by_id[
+            access_dependency_by_id[obligation[0]].producer_access_id
+        ].tensor_name
+        for plan in distributed_counter_plans
+        for consumer in plan.consumers
+        for obligation in consumer.covered_obligations
+    }
+    if distributed_counter_plans and (
+        len(distributed_payload_names) != 1 or None in distributed_payload_names
+    ):
+        raise exc.InvalidConfig(
+            "distributed readiness currently requires one named symmetric payload"
+        )
+    distributed_payload = (
+        cast("str", next(iter(distributed_payload_names)))
+        if distributed_payload_names
+        else None
+    )
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     nested_loop_counter_plans = tuple(
         plan
@@ -755,11 +887,23 @@ def emit_cross_loop_schedule(
     readiness_counter_offsets: dict[ReadinessCounterPlan, int] = {}
     readiness_counter_count = 0
     readiness_counter_stride = _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
-    for plan in all_readiness_counter_plans:
+    for plan in local_counter_plans:
         readiness_counter_offsets[plan] = readiness_counter_count
         readiness_counter_count += (
             plan.readiness_key_domain.size * readiness_counter_stride
         )
+    distributed_counter_offsets: dict[ReadinessCounterPlan, tuple[int, int, int]] = {}
+    distributed_counter_count = 0
+    for plan in distributed_counter_plans:
+        bank_size = (
+            plan.readiness_key_domain.size * _DISTRIBUTED_COUNTER_ALIGNMENT_WORDS
+        )
+        distributed_counter_offsets[plan] = (
+            distributed_counter_count,
+            distributed_counter_count + bank_size,
+            distributed_counter_count + 2 * bank_size,
+        )
+        distributed_counter_count += 3 * bank_size
     root_barrier_indices = {
         root: index for index, root in enumerate(root_barrier_producer_roots)
     }
@@ -809,6 +953,15 @@ def emit_cross_loop_schedule(
         if uses_packet_dispatch
         else None
     )
+    distributed_signal_args = (
+        _register_distributed_readiness_state(
+            device_function,
+            payload=cast("str", distributed_payload),
+            slots=distributed_counter_count,
+        )
+        if distributed_counter_count
+        else None
+    )
 
     def state_section(offset: int | None) -> str | None:
         if offset is None:
@@ -847,7 +1000,8 @@ def emit_cross_loop_schedule(
             statement_from_string(
                 f"{epoch_var} = tl.cast("
                 f"{raw_dispatch_ticket} // tl.cast("
-                f"{packet_count}, tl.uint64) + 1, tl.uint32)"
+                f"{packet_count}, tl.uint64) + 1, "
+                f"{'tl.uint64' if distributed_counter_plans else 'tl.uint32'})"
             ),
         ]
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
@@ -1412,11 +1566,73 @@ def emit_cross_loop_schedule(
         plan: ReadinessCounterPlan,
         readiness_key: str,
     ) -> str:
+        if plan in distributed_counter_offsets:
+            raise AssertionError("distributed readiness uses symmetric counters")
         assert readiness_counter_arg is not None
         offset = readiness_counter_offsets[plan]
         return (
             f"{readiness_counter_arg} + {offset} + "
             f"({readiness_key}) * {readiness_counter_stride}"
+        )
+
+    def distributed_counter(
+        plan: ReadinessCounterPlan,
+        bank: int,
+        readiness_key: str,
+    ) -> str:
+        if distributed_signal_args is None:
+            raise AssertionError("distributed readiness state was not registered")
+        signal_ptrs, signal_offset = distributed_signal_args
+        offsets = distributed_counter_offsets[plan]
+        return (
+            "tl.load("
+            f"({signal_ptrs}).to(tl.pointer_type(tl.uint64)) + nvshmem.my_pe()"
+            ").to(tl.pointer_type(tl.uint64)) + "
+            f"({signal_offset}) + {offsets[bank]} + "
+            f"({readiness_key}) * {_DISTRIBUTED_COUNTER_ALIGNMENT_WORDS}"
+        )
+
+    def publish_distributed_counter(
+        plan: ReadinessCounterPlan,
+        bank: int,
+        readiness_key: str,
+        *,
+        prefix: str,
+    ) -> list[ast.stmt]:
+        if distributed_signal_args is None or distributed_world_size is None:
+            raise AssertionError("distributed readiness state was not registered")
+        signal_ptrs, signal_offset = distributed_signal_args
+        offset = distributed_counter_offsets[plan][bank]
+        physical_world_size = 1 << (distributed_world_size - 1).bit_length()
+        peers = device_function.new_var(f"{prefix}_peers", dce=True)
+        bases = device_function.new_var(f"{prefix}_bases", dce=True)
+        return [
+            statement_from_string(f"{peers} = tl.arange(0, {physical_world_size})"),
+            statement_from_string(
+                f"{bases} = tl.load("
+                f"({signal_ptrs}).to(tl.pointer_type(tl.uint64)) + {peers}, "
+                f"mask={peers} < {distributed_world_size}, other=0"
+                ").to(tl.pointer_type(tl.uint64))"
+            ),
+            statement_from_string(
+                f"tl.atomic_add({bases} + ({signal_offset}) + {offset} + "
+                f"({readiness_key}) * {_DISTRIBUTED_COUNTER_ALIGNMENT_WORDS}, "
+                f"tl.cast(1, tl.uint64), mask={peers} < {distributed_world_size}, "
+                "sem='release', scope='sys')"
+            ),
+        ]
+
+    def distributed_target(epoch_offset: int = 0) -> str:
+        if distributed_world_size is None:
+            raise AssertionError("distributed world size is unavailable")
+        epoch = (
+            f"({epoch_var})"
+            if epoch_offset == 0
+            else f"(({epoch_var}) - {abs(epoch_offset)})"
+        )
+        return (
+            f"tl.cast({epoch}, tl.uint64) * "
+            f"tl.cast({distributed_world_size}, tl.uint64)"
         )
 
     def readiness_expected_arrivals(
@@ -1447,6 +1663,8 @@ def emit_cross_loop_schedule(
         plan: ReadinessCounterPlan,
         readiness_key: str,
     ) -> str:
+        if plan in distributed_counter_offsets:
+            return distributed_target()
         arrivals = readiness_expected_arrivals(plan, readiness_key)
         return f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)"
 
@@ -1454,6 +1672,32 @@ def emit_cross_loop_schedule(
         plan: ReadinessCounterPlan,
         readiness_key: str,
     ) -> list[ast.stmt]:
+        if plan in distributed_counter_offsets:
+            expected_arrivals = readiness_expected_arrivals(plan, readiness_key)
+            counter = distributed_counter(plan, 0, readiness_key)
+            previous = device_function.new_var(
+                "tile_dependency_distributed_previous", dce=False
+            )
+            return [
+                statement_from_string(
+                    f"{previous} = tl.atomic_add({counter}, "
+                    "tl.cast(1, tl.uint64), sem='acq_rel', scope='gpu')"
+                ),
+                create(
+                    ast.If,
+                    test=expr_from_string(
+                        f"{previous} == tl.cast({epoch_var}, tl.uint64) * "
+                        f"tl.cast({expected_arrivals}, tl.uint64) - 1"
+                    ),
+                    body=publish_distributed_counter(
+                        plan,
+                        1,
+                        readiness_key,
+                        prefix="tile_dependency_distributed_ready",
+                    ),
+                    orelse=[],
+                ),
+            ]
         continuation_consumer = plan.continuation_consumer
         if continuation_consumer is None:
             counter = readiness_counter(plan, readiness_key)
@@ -1589,6 +1833,63 @@ def emit_cross_loop_schedule(
             )
         ]
 
+    def emit_distributed_reuse_wait_from_producer(
+        plan: ReadinessCounterPlan,
+        readiness_producer: ReadinessProducer,
+        producer_coordinates: dict[int, str],
+    ) -> list[ast.stmt]:
+        publication = readiness_producer.incidence.keys_by_item
+        if publication is None:
+            raise AssertionError("distributed readiness publication is unavailable")
+        readiness_key, membership = relation_flat_target(
+            publication,
+            producer_coordinates,
+            trusted_single_valued=True,
+        )
+        wait = _wait_for_distributed_counter(
+            device_function=device_function,
+            counter=distributed_counter(plan, 2, readiness_key),
+            target=distributed_target(-1),
+            prefix="tile_dependency_distributed_reuse_wait",
+        )
+        conditions = [f"{epoch_var} > 1"]
+        if membership != "True":
+            conditions.append(f"({membership})")
+        return [
+            create(
+                ast.If,
+                test=expr_from_string(" and ".join(conditions)),
+                body=wait,
+                orelse=[],
+            )
+        ]
+
+    def emit_distributed_consumed(
+        plan: ReadinessCounterPlan,
+        consumer: ReadinessConsumer,
+        consumer_coordinates: dict[int, str],
+    ) -> list[ast.stmt]:
+        readiness_key, membership = relation_flat_target(
+            consumer.keys_by_consumer,
+            consumer_coordinates,
+        )
+        publications = publish_distributed_counter(
+            plan,
+            2,
+            readiness_key,
+            prefix="tile_dependency_distributed_consumed",
+        )
+        if membership == "True":
+            return publications
+        return [
+            create(
+                ast.If,
+                test=expr_from_string(membership),
+                body=publications,
+                orelse=[],
+            )
+        ]
+
     def body_with_nested_loop_publications(
         root: int,
         body: list[ast.stmt],
@@ -1712,6 +2013,15 @@ def emit_cross_loop_schedule(
         )
         if execution_membership != "True":
             raise AssertionError("proved root execution order is not total")
+        for producer_counter_plan, readiness_producer in producer_counters:
+            if producer_counter_plan in distributed_counter_offsets:
+                body.extend(
+                    emit_distributed_reuse_wait_from_producer(
+                        producer_counter_plan,
+                        readiness_producer,
+                        scheduled_coordinates,
+                    )
+                )
         if producer_counters or root in nested_producer_roots:
             has_task_scheduling = True
         if root in scheduled_task_roots:
@@ -1727,27 +2037,42 @@ def emit_cross_loop_schedule(
                 raise AssertionError("body PID ABI is not total")
             body.append(statement_from_string(f"{pid_task} = {pid_task_expression}"))
             scheduled_logical_pid = f"{case_offset_strings[root]} + {pid_task}"
+        incoming_consumers = tuple(readiness_consumers_by_root.get(root, ()))
         for (
             incoming_readiness_counter,
             incoming_consumer,
-        ) in readiness_consumers_by_root.get(root, ()):
+        ) in incoming_consumers:
             has_task_scheduling = True
-            assert readiness_counter_arg is not None
+            if incoming_consumer.rank_relation is None:
+                assert readiness_counter_arg is not None
             readiness_key, membership = relation_flat_target(
                 incoming_consumer.keys_by_consumer,
                 scheduled_coordinates,
             )
-            wait = _wait_for_counter(
-                device_function=device_function,
-                counter=readiness_counter(
-                    incoming_readiness_counter,
-                    readiness_key,
-                ),
-                target=readiness_target(
-                    incoming_readiness_counter,
-                    readiness_key,
-                ),
-                prefix="tile_dependency_readiness_wait",
+            wait = (
+                _wait_for_distributed_counter(
+                    device_function=device_function,
+                    counter=distributed_counter(
+                        incoming_readiness_counter,
+                        1,
+                        readiness_key,
+                    ),
+                    target=distributed_target(),
+                    prefix="tile_dependency_distributed_readiness_wait",
+                )
+                if incoming_consumer.rank_relation is not None
+                else _wait_for_counter(
+                    device_function=device_function,
+                    counter=readiness_counter(
+                        incoming_readiness_counter,
+                        readiness_key,
+                    ),
+                    target=readiness_target(
+                        incoming_readiness_counter,
+                        readiness_key,
+                    ),
+                    prefix="tile_dependency_readiness_wait",
+                )
             )
             if not incoming_consumer.keys_by_consumer.is_total_function():
                 body.append(
@@ -1815,9 +2140,22 @@ def emit_cross_loop_schedule(
                     noinline=force_noinline,
                 )
             )
-        if producer_counters:
+        distributed_consumers = tuple(
+            (plan, consumer)
+            for plan, consumer in incoming_consumers
+            if consumer.rank_relation is not None
+        )
+        if producer_counters or distributed_consumers:
             has_task_scheduling = True
             body.append(_publication_sync(device_function))
+        for consumer_plan, readiness_consumer in distributed_consumers:
+            body.extend(
+                emit_distributed_consumed(
+                    consumer_plan,
+                    readiness_consumer,
+                    scheduled_coordinates,
+                )
+            )
         for producer_counter_plan, readiness_producer in producer_counters:
             body.extend(
                 emit_readiness_arrivals_from_producer(

@@ -405,6 +405,26 @@ class TestTritonTileDependencyLowering(TestCase):
         self.assertNotIn("triton_helpers.x_grid_barrier(", code)
         self.assertIn("_minimum_resident_programs=", code)
 
+    def test_pipeline_rejects_opaque_distributed_protocols(self) -> None:
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        bound = implicit_tile_dependency_chain.bind((x,))
+        config = helion.Config(
+            block_sizes=[8, 8],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_warps=1,
+        )
+        with (
+            unittest.mock.patch(
+                "helion._compiler.cross_loop_codegen._has_opaque_distributed_protocol",
+                return_value=True,
+            ),
+            self.assertRaisesRegex(
+                exc.InvalidConfig, "explicit remote barriers or asynchronous"
+            ),
+        ):
+            bound.to_code(config)
+
     def test_codegen_schedule_order_does_not_leak_barrier_state(self) -> None:
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)
         bound = implicit_tile_dependency_chain.bind((x,))
