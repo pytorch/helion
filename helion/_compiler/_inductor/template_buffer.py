@@ -1169,7 +1169,10 @@ def lower_helion_kernel(
             if name in realized
         },
         on_tensor_leaf=on_tensor_leaf,
-        fusion_enabled=kernel.settings.torch_compile_fusion,
+        fusion_enabled=(
+            kernel.settings.torch_compile_fusion
+            and bound.env.backend.supports_inductor_pointwise_fusion()
+        ),
         kernel=kernel,
         bound_kernel=bound,
         constant_args=constant_args,

@@ -164,6 +164,34 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
+    def test_parallel_loop_carried_inputs(self):
+        @helion.kernel(autotune_effort="none")
+        def recurrence(values, steps):
+            steps = hl.specialize(steps)
+            out = torch.empty(
+                (values.size(1),), dtype=values.dtype, device=values.device
+            )
+            for tile in hl.tile(values.size(1)):
+                first = hl.full([tile], 0.25, dtype=torch.float32)
+                second = values[0, tile]
+                for step in hl.grid(steps):
+                    first, second = second, first + values[step, tile]
+                out[tile] = first - second
+            return out
+
+        values = (
+            torch.arange(7 * 64, device=DEVICE, dtype=torch.float32).view(7, 64) / 16
+        )
+        for steps in (0, 1, 7):
+            with self.subTest(steps=steps):
+                _, actual = code_and_output(
+                    recurrence, (values, steps), block_size=[32]
+                )
+                first, second = torch.full_like(values[0], 0.25), values[0]
+                for step in range(steps):
+                    first, second = second, first + values[step]
+                torch.testing.assert_close(actual, first - second, atol=0, rtol=0)
+
     @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
     def test_static_unroller_rejects_multiple_counter_updates(self) -> None:
         node = ast.parse("while i < 4:\n    i += 1\n    i += 1\n").body[0]
