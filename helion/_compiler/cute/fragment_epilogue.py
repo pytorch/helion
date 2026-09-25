@@ -609,6 +609,61 @@ def _extent_matches_block(extent: int | torch.SymInt, block_id: int) -> bool:
     return isinstance(size, (int, torch.SymInt)) and env.known_equal(extent, size)
 
 
+def _has_fresh_output_allocation(node: Node) -> bool:
+    """Prove a direct allocation cannot alias inputs or other host tensors."""
+    from ..host_function import HostFunction
+
+    name = node.args[0]
+    body = HostFunction.current().body
+    bindings = [
+        child
+        for statement in body
+        for child in ast.walk(statement)
+        if isinstance(child, ast.Name)
+        and isinstance(child.ctx, ast.Store)
+        and child.id == name
+    ]
+    if len(bindings) != 1:
+        return False
+    if any(
+        isinstance(child, ast.Name)
+        and isinstance(child.ctx, ast.Load)
+        and child.id == name
+        for statement in body
+        if not isinstance(statement, ast.Return)
+        and not (
+            isinstance(statement, ast.For)
+            and isinstance(statement.iter, ast.Call)
+            and ast.unparse(statement.iter.func) in {"hl.tile", "hl.grid"}
+        )
+        for child in ast.walk(statement)
+    ):
+        return False
+    for statement in body:
+        if (
+            isinstance(statement, ast.Assign)
+            and statement.targets == bindings
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+            and isinstance(statement.value.func.value, ast.Name)
+            and statement.value.func.value.id == "torch"
+            and statement.value.func.attr in {"empty", "empty_like"}
+            and all(
+                keyword.arg is not None
+                and (
+                    keyword.arg != "out"
+                    or (
+                        isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value is None
+                    )
+                )
+                for keyword in statement.value.keywords
+            )
+        ):
+            return True
+    return False
+
+
 def _validate_host_load(node: Node, output_node: Node) -> None:
     source = node.args[0] if node.args else None
     indices = node.args[1] if len(node.args) > 1 else None
@@ -640,6 +695,20 @@ def _validate_host_load(node: Node, output_node: Node) -> None:
         block_ids: set[int] = set()
         if isinstance(index, Node) and isinstance(index.meta.get("val"), torch.Tensor):
             block_ids = _tile_index_block_ids(index)
+            if block_ids and _tile_index_uses_arithmetic(index):
+                # Computed addresses can combine tile axes or index a different
+                # source extent. The provenance check above still rejects data
+                # dependencies; the renderer evaluates these addresses per
+                # output element and predicates them against source bounds.
+                # A fresh output excludes cross-element read/write aliases,
+                # including host reassignments and overlapping input views
+                # that need not preserve fake-tensor storage identity.
+                if not _has_fresh_output_allocation(output_node) or (
+                    source_value.untyped_storage()
+                    is output_node.meta["val"].untyped_storage()
+                ):
+                    raise _UnsupportedFragment
+                continue
         elif isinstance(index, Node) and isinstance(
             index.meta.get("val"), torch.SymInt
         ):

@@ -3222,6 +3222,15 @@ class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
     promote_seed_to_default = True
 
     @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        seed = cls.get_seed_config(env, device_ir)
+        if seed is None:
+            return []
+        return [seed]
+
+    @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         from ..cute.cute_mma import tcgen05_fragment_epilogue_has_unique_anchor
         from ..cute.cute_mma import tcgen05_fragment_epilogue_present
