@@ -617,7 +617,7 @@ class TestReductions(RefEagerTestBase, TestCase):
 
     @patch.dict(os.environ, {"TRITON_DEFAULT_FP_FUSION": "0"})
     def test_fp16_var_mean(self):
-        """Avoid FMA-dependent variance rounding across a BF16 midpoint."""
+        """Compare unseeded and seeded reductions without FMA-dependent rounding."""
 
         @helion.kernel(static_shapes=True)
         def layer_norm_fwd_repro(
@@ -639,24 +639,28 @@ class TestReductions(RefEagerTestBase, TestCase):
 
         batch_size = 32
         dim = 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
-        bias = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
         eps = 1e-4
-        code1, result1 = code_and_output(
-            layer_norm_fwd_repro,
-            (x, weight, bias, eps),
-            block_sizes=[32],
-            reduction_loops=[None],
-        )
+        for seed in (None, 3437):
+            with self.subTest(seed=seed):
+                if seed is not None:
+                    torch.manual_seed(seed)
+                x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
+                weight = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
+                bias = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
+                code1, result1 = code_and_output(
+                    layer_norm_fwd_repro,
+                    (x, weight, bias, eps),
+                    block_sizes=[32],
+                    reduction_loops=[None],
+                )
 
-        code2, result2 = code_and_output(
-            layer_norm_fwd_repro,
-            (x, weight, bias, eps),
-            block_sizes=[32],
-            reduction_loops=[8],
-        )
-        torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
+                code2, result2 = code_and_output(
+                    layer_norm_fwd_repro,
+                    (x, weight, bias, eps),
+                    block_sizes=[32],
+                    reduction_loops=[8],
+                )
+                torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
 
     @xfailIfPallasTpu("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
     @skipIfTileIR("TileIR does not support log1p")
