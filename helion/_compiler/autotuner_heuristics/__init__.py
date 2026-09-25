@@ -7,6 +7,7 @@ from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
+from .cute import CuteChunkPrefillHeuristic
 from .cute import CuteChunkPrepareHeuristic
 from .cute import CuteChunkRecurrenceHeuristic
 from .cute import CuteFixedTokenRank1Heuristic
@@ -60,6 +61,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFp8GemmSkinnyMHeuristic,
         CuteChunkRecurrenceHeuristic,
         CuteChunkPrepareHeuristic,
+        CuteChunkPrefillHeuristic,
         CuteAffineScanHeuristic,
         CuteFlashAttentionHeuristic,
         CutePackedSingleTokenRank1Heuristic,

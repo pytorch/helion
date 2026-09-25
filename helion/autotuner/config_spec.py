@@ -774,6 +774,8 @@ CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
+CUTE_CHUNK_PREFILL_TASK_ORDER_KEY = "cute_chunk_prefill_task_order"
+CUTE_CHUNK_PREFILL_SCHEDULE_KEY = "cute_chunk_prefill_schedule"
 VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc1",
     "split_alias_cpc2",
@@ -846,6 +848,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_RECURRENCE_PIPELINE_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
+        CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_threads",
         "cute_vector_widths",
@@ -891,6 +895,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_RECURRENCE_PIPELINE_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
+        CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_warps",
         "num_stages",
@@ -1193,6 +1199,8 @@ class ConfigSpec:
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
+        self.cute_chunk_prefill_task_order: EnumFragment | None = None
+        self.cute_chunk_prefill_schedule: EnumFragment | None = None
         # Enabled only after a generic matcher proves a compatible affine scan.
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
@@ -2001,6 +2009,21 @@ class ConfigSpec:
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = max(spec.autotuner_min, target)
 
+    def enable_cute_chunk_prefill_task_order_search(self) -> None:
+        """Expose effective schedules only for a proved fused recurrence."""
+        self.cute_chunk_prefill_schedule = EnumFragment(
+            choices=("single", "prefix_tail_2", "prefix_tail_4")
+        )
+        self.cute_chunk_prefill_task_order = EnumFragment(
+            choices=("identity", "longest_first", "longest_first_precompute")
+        )
+        # Tensor-numel constraints index the frontend block coordinates. Keep
+        # these coordinates in flat configs, fixed to one representative tile,
+        # even though the complete-root emitter owns device geometry.
+        for spec in self.block_sizes:
+            spec.autotuner_min = 64
+            spec.max_size = 64
+
     def enable_cute_chunk_prepare_schedule_search(
         self, *, preferred_schedule: str
     ) -> None:
@@ -2702,6 +2725,17 @@ class ConfigSpec:
             self.normalize(config.config, _fix_invalid=_fix_invalid)
             return
 
+        if (
+            self.cute_chunk_prefill_task_order is not None
+            and "block_sizes" not in config
+        ):
+            # The fused schedule owns the complete value dimension. A nominal
+            # frontend tile is still needed to normalize the bound DSL graph,
+            # but does not affect this emitter's launch or device code.
+            config["block_sizes"] = self.block_sizes._flat_config(
+                self, lambda fragment: fragment.default()
+            )
+
         # ``cross_loop_schedule`` was the former public name. Accept old configs
         # only at this boundary, then keep ``cross_loop_pipeline`` as the sole
         # internal key.
@@ -2819,6 +2853,16 @@ class ConfigSpec:
                     f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} is available only for "
                     "matched BT16 chunk-prepare kernels"
                 )
+
+        for key, fragment in (
+            (CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, self.cute_chunk_prefill_task_order),
+            (CUTE_CHUNK_PREFILL_SCHEDULE_KEY, self.cute_chunk_prefill_schedule),
+        ):
+            if key in config and fragment is None and self.supports_config_key(key):
+                if _fix_invalid:
+                    config.pop(key)
+                else:
+                    raise InvalidConfig(f"{key} requires a matched fused recurrence")
 
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
@@ -3263,6 +3307,32 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"{CUTE_CHUNK_RECURRENCE_PIPELINE_KEY} must be 'wide' for "
                         f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY}=4"
+                    )
+        prefill_task_order = self.cute_chunk_prefill_task_order
+        if prefill_task_order is not None:
+            task_order = config.setdefault(
+                CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, prefill_task_order.default()
+            )
+            if task_order not in prefill_task_order.choices:
+                if _fix_invalid:
+                    config[CUTE_CHUNK_PREFILL_TASK_ORDER_KEY] = (
+                        prefill_task_order.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_PREFILL_TASK_ORDER_KEY} must be one of {prefill_task_order.choices!r}"
+                    )
+        prefill_schedule = self.cute_chunk_prefill_schedule
+        if prefill_schedule is not None:
+            schedule = config.setdefault(
+                CUTE_CHUNK_PREFILL_SCHEDULE_KEY, prefill_schedule.default()
+            )
+            if schedule not in prefill_schedule.choices:
+                if _fix_invalid:
+                    config[CUTE_CHUNK_PREFILL_SCHEDULE_KEY] = prefill_schedule.default()
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_PREFILL_SCHEDULE_KEY} must be one of {prefill_schedule.choices!r}"
                     )
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
@@ -3926,6 +3996,20 @@ class ConfigSpec:
 
         This is the single source of truth for field ordering.
         """
+        # A whole-root asynchronous emitter does not consume generic SIMT
+        # geometry/layout knobs. Keep its flat search restricted to choices
+        # that change the emitted schedule rather than timing duplicate code.
+        if (
+            self.backend_name == "cute"
+            and self.cute_chunk_prefill_task_order is not None
+        ):
+            assert self.cute_chunk_prefill_schedule is not None
+            return {
+                "block_sizes": self.block_sizes,
+                CUTE_CHUNK_PREFILL_TASK_ORDER_KEY: self.cute_chunk_prefill_task_order,
+                CUTE_CHUNK_PREFILL_SCHEDULE_KEY: self.cute_chunk_prefill_schedule,
+                **self.user_defined_tunables,
+            }
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
         }
@@ -4102,6 +4186,14 @@ class ConfigSpec:
             if self.cute_chunk_recurrence_pipeline is not None:
                 fields[CUTE_CHUNK_RECURRENCE_PIPELINE_KEY] = (
                     self.cute_chunk_recurrence_pipeline
+                )
+            if self.cute_chunk_prefill_task_order is not None:
+                fields[CUTE_CHUNK_PREFILL_TASK_ORDER_KEY] = (
+                    self.cute_chunk_prefill_task_order
+                )
+            if self.cute_chunk_prefill_schedule is not None:
+                fields[CUTE_CHUNK_PREFILL_SCHEDULE_KEY] = (
+                    self.cute_chunk_prefill_schedule
                 )
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (

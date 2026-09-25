@@ -11,6 +11,8 @@ from torch._inductor.runtime.triton_heuristics import (
 )
 
 from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_PREFILL_SCHEDULE_KEY
+from ...autotuner.config_spec import CUTE_CHUNK_PREFILL_TASK_ORDER_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
@@ -3085,6 +3087,53 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
             if _cute_chunk_recurrence_config_is_safe(partitions, register_cap)
             for pipeline in pipeline_fragment.choices
             if partitions == 2 or pipeline == "wide"
+        ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteChunkPrefillHeuristic(AutotunerHeuristic):
+    """Try effective stream schedules and sequence orders for a fused recurrence."""
+
+    name = "cute_chunk_prefill"
+    backend = "cute"
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.chunk_prefill import register_chunk_prefill_search
+
+        register_chunk_prefill_search(env, device_ir)
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chunk_prefill_task_order is not None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        fragment = env.config_spec.cute_chunk_prefill_task_order
+        if fragment is None:
+            return None
+        schedule = env.config_spec.cute_chunk_prefill_schedule
+        assert schedule is not None
+        return [
+            Config.from_dict(
+                {
+                    CUTE_CHUNK_PREFILL_TASK_ORDER_KEY: order,
+                    CUTE_CHUNK_PREFILL_SCHEDULE_KEY: value,
+                }
+            )
+            for value in schedule.choices
+            for order in fragment.choices
         ]
 
     @classmethod
