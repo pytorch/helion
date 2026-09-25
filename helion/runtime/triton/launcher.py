@@ -171,6 +171,7 @@ def default_launcher(
     _remote_barrier_process_group_name: str | None = None,
     _distributed_readiness_device_anchor: torch.Tensor | None = None,
     _distributed_readiness_signal_slots: int = 0,
+    _distributed_readiness_world_size: int = 0,
     _distributed_readiness_process_group_name: str | None = None,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
@@ -216,6 +217,7 @@ def default_launcher(
         if (
             _distributed_readiness_device_anchor is None
             or _distributed_readiness_process_group_name is None
+            or _distributed_readiness_world_size <= 0
         ):
             raise RuntimeError(
                 "distributed readiness requires a CUDA tensor and process group"
@@ -244,6 +246,7 @@ def default_launcher(
             _distributed_readiness_device_anchor,
             _distributed_readiness_process_group_name,
             _distributed_readiness_signal_slots,
+            expected_world_size=_distributed_readiness_world_size,
             launch_fingerprint=distributed_launch_fingerprint,
         )
         args = (*args, signal, signal_ptrs, signal_offset)
@@ -350,7 +353,11 @@ def _distributed_launch_fingerprint(
         return ("runtime", type(arg).__module__, type(arg).__qualname__)
 
     payload = (
-        getattr(triton_kernel, "src", None),
+        getattr(
+            triton_kernel,
+            "cache_key",
+            getattr(triton_kernel, "src", None),
+        ),
         process_group_name,
         tuple(grid),
         tuple(starmap(argument_signature, enumerate(args))),
@@ -446,6 +453,7 @@ def _get_distributed_readiness_signal(
     process_group_name: str,
     required_slots: int,
     *,
+    expected_world_size: int | None = None,
     launch_fingerprint: str | None = None,
 ) -> tuple[torch.Tensor, int, int]:
     """Return dedicated symmetric readiness state for one protocol stream.
@@ -454,10 +462,24 @@ def _get_distributed_readiness_signal(
     instances in the same order.  Cache hits have no host synchronization and
     are safe for CUDA graph replay.
     """
+    if dst.device.type != "cuda" or torch.version.hip is not None:
+        raise RuntimeError(
+            "compiler-derived distributed readiness requires NVIDIA CUDA"
+        )
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
     import torch.distributed.distributed_c10d as c10d
 
+    group = c10d._resolve_process_group(
+        process_group_name  # pyrefly: ignore[bad-argument-type]
+    )
+    actual_world_size = dist.get_world_size(group)
+    if expected_world_size is not None and actual_world_size != expected_world_size:
+        raise RuntimeError(
+            "distributed readiness was compiled for "
+            f"world size {expected_world_size}, but process group "
+            f"{process_group_name!r} has world size {actual_world_size}"
+        )
     cache = vars(triton_kernel).setdefault(
         "_helion_distributed_readiness_signal_cache", {}
     )
@@ -465,12 +487,14 @@ def _get_distributed_readiness_signal(
     key = (
         dst.device,
         process_group_name,
+        id(group),
         launch_fingerprint,
+        required_slots,
         stream.cuda_stream,
     )
     entry = cache.get(key)
     if entry is not None:
-        _workspace, handle, signal_pad, offset = entry
+        _group, _workspace, handle, signal_pad, offset = entry
         return signal_pad, handle.signal_pad_ptrs_dev, offset
 
     with torch.cuda.device(dst.device):
@@ -506,12 +530,7 @@ def _get_distributed_readiness_signal(
             signal_pad.narrow(0, offset, required_slots).zero_()
         # Complete initialization before any peer may publish into this workspace.
         stream.synchronize()
-        group = c10d._resolve_process_group(
-            process_group_name  # pyrefly: ignore[bad-argument-type]
-        )
-        statuses: list[tuple[str | None, int] | None] = [None] * dist.get_world_size(
-            group
-        )
+        statuses: list[tuple[str | None, int] | None] = [None] * actual_world_size
         dist.all_gather_object(
             statuses,
             (launch_fingerprint, capacity),
@@ -539,7 +558,7 @@ def _get_distributed_readiness_signal(
             f"signal pad capacities are {capacities!r}. Increase the signal pad size "
             "before launching the kernel."
         )
-    cache[key] = (workspace, handle, signal_pad, offset)
+    cache[key] = (group, workspace, handle, signal_pad, offset)
     return signal_pad, handle.signal_pad_ptrs_dev, offset
 
 

@@ -395,6 +395,7 @@ class DeviceFunction:
         self.triton_distributed_readiness_signal_offset_arg: str | None = None
         self.triton_distributed_readiness_device_anchor: str | None = None
         self.triton_distributed_readiness_signal_slots = 0
+        self.triton_distributed_readiness_world_size: int | None = None
         # NVSHMEM takes pointer sources. Computed Triton tiles are materialized
         # into compiler-owned global scratch before the transfer starts.
         self.triton_remote_copy_scratch_args: list[str] = []

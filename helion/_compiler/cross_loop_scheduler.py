@@ -1678,6 +1678,9 @@ def choose_readiness_counters(
             )
         ):
             continue
+        has_distributed_consumer = any(
+            consumer.rank_relation is not None for consumer in event.consumers
+        )
         lowering_relations = (
             (event.producers, event.consumers)
             if all(
@@ -1685,7 +1688,8 @@ def choose_readiness_counters(
                 for producer in event.producers
             )
             and all(
-                consumer.consumer_site_id is not None
+                consumer.rank_relation is None
+                or consumer.consumer_site_id is not None
                 or consumer.keys_by_consumer.canonical_single_valued() is not None
                 for consumer in event.consumers
             )
@@ -1702,14 +1706,18 @@ def choose_readiness_counters(
                 quotient = (
                     None
                     if publication is None or not charge(1 + len(publication.pieces))
-                    else KeyPartition.from_fixed_width_publication(publication)
+                    else KeyPartition.from_fixed_width_publication(
+                        publication,
+                        allow_clipped_final_block=has_distributed_consumer,
+                    )
                 )
                 if quotient is not None:
                     partition, incidence = quotient
                     candidates.append((partition, {producer_index: incidence}, {}))
             for consumer_index, consumer in enumerate(event.consumers):
                 if (
-                    consumer.consumer_site_id is not None
+                    consumer.rank_relation is None
+                    or consumer.consumer_site_id is not None
                     or consumer.keys_by_consumer.canonical_single_valued() is not None
                 ):
                     continue
@@ -1717,7 +1725,10 @@ def choose_readiness_counters(
                 quotient = (
                     None
                     if publication is None or not charge(1 + len(publication.pieces))
-                    else KeyPartition.from_fixed_width_publication(publication)
+                    else KeyPartition.from_fixed_width_publication(
+                        publication,
+                        allow_clipped_final_block=True,
+                    )
                 )
                 if quotient is not None:
                     partition, incidence = quotient
@@ -2848,6 +2859,7 @@ def _supports_emitted_counter_plan_lowering(
             or any(producer.producer_site_id is not None for producer in plan.producers)
             or (arrival_bounds := _arrival_count_bounds(plan.producers)) is None
             or arrival_bounds[0] <= 0
+            or not _distributed_counter_protocol_is_static(plan)
         ):
             return False
         (distributed_consumer,) = distributed_consumers
@@ -2894,6 +2906,53 @@ def _supports_emitted_counter_plan_lowering(
         and continuation_consumer.keys_by_consumer.is_total_function()
         and continuation_consumer.incidence.items_by_key.is_total_function()
     )
+
+
+def _distributed_counter_protocol_is_static(plan: ReadinessCounterPlan) -> bool:
+    """Return whether every emitted cross-rank protocol expression is static.
+
+    Coordinate symbols describe a task or readiness key and are safe to
+    evaluate on device.  Any other free symbol could vary independently across
+    ranks or replays while the launch fingerprint stays unchanged.
+    """
+
+    def relation_is_static(relation: CoordinateRelation) -> bool:
+        if any(
+            count.free_symbols
+            for domain in (relation.source_domain, relation.target_domain)
+            for count in domain.shape_expr
+        ):
+            return False
+        coordinate_symbols = {
+            coordinate_axis_symbol(axis) for axis in relation.source_domain.axis_order
+        }
+        return all(
+            expression.free_symbols <= coordinate_symbols
+            for piece in relation.pieces
+            for _axis, begin, end, _step in (
+                piece.source_bounds_items + piece.target_ranges
+            )
+            for expression in (begin, end)
+        )
+
+    if any(count.free_symbols for count in plan.readiness_key_domain.shape_expr):
+        return False
+    relations = [
+        relation
+        for producer in plan.producers
+        for relation in (
+            producer.incidence.keys_by_item,
+            producer.incidence.count_by_key,
+        )
+        if relation is not None
+    ]
+    relations.extend(consumer.keys_by_consumer for consumer in plan.consumers)
+    relations.extend(
+        consumer.rank_relation
+        for consumer in plan.consumers
+        if consumer.rank_relation is not None
+    )
+    return all(relation_is_static(relation) for relation in relations)
 
 
 def _finalize_emitted_synchronization(

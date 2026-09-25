@@ -10,6 +10,7 @@ from unittest.mock import patch
 import torch
 
 from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
 import helion.runtime
 from helion.runtime.triton.launcher import _distributed_launch_fingerprint
 from helion.runtime.triton.launcher import _get_distributed_readiness_signal
@@ -51,11 +52,21 @@ class TestRuntimeGetNumSm(unittest.TestCase):
 
 
 class TestTritonLauncher(unittest.TestCase):
+    def test_distributed_readiness_rejects_non_cuda_device(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "requires NVIDIA CUDA"):
+            _get_distributed_readiness_signal(
+                SimpleNamespace(),
+                torch.empty(1),
+                "group",
+                1,
+            )
+
     def test_distributed_fingerprint_tracks_specialization_not_dynamic_shape(
         self,
     ) -> None:
         kernel = SimpleNamespace(
             src="kernel source",
+            cache_key="kernel plus outlined helpers",
             params=(
                 SimpleNamespace(is_constexpr=False),
                 SimpleNamespace(is_constexpr=False),
@@ -84,6 +95,27 @@ class TestTritonLauncher(unittest.TestCase):
         self.assertEqual(first, fingerprint(torch.empty(11), 19, 64))
         # A constexpr schedule parameter must select a different fingerprint.
         self.assertNotEqual(first, fingerprint(torch.empty(11), 19, 128))
+        different_helper = SimpleNamespace(
+            src=kernel.src,
+            cache_key="different outlined helper",
+            params=kernel.params,
+        )
+        self.assertNotEqual(
+            first,
+            _distributed_launch_fingerprint(
+                different_helper,
+                (8,),
+                (torch.empty(7), 17, 64),
+                process_group_name="group-a",
+                num_warps=4,
+                num_stages=2,
+                ptx_options=None,
+                launch_cooperative_grid=False,
+                launch_options={},
+                state_schema=((64, "torch.uint32"),),
+                readiness_slots=32,
+            ),
+        )
         self.assertNotEqual(
             first,
             _distributed_launch_fingerprint(
@@ -127,6 +159,7 @@ class TestTritonLauncher(unittest.TestCase):
                 _remote_copy_process_group_name="group",
                 _distributed_readiness_device_anchor=payload,
                 _distributed_readiness_signal_slots=8,
+                _distributed_readiness_world_size=4,
                 _distributed_readiness_process_group_name="group",
             )
 
@@ -137,6 +170,7 @@ class TestTritonLauncher(unittest.TestCase):
             payload,
             "group",
             8,
+            expected_world_size=4,
             launch_fingerprint=ANY,
         )
 
@@ -209,6 +243,31 @@ class TestTritonLauncher(unittest.TestCase):
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestPersistentTritonState(unittest.TestCase):
+    @skipIfNotCUDA()
+    def test_distributed_readiness_rejects_changed_world_size(self) -> None:
+        kernel = SimpleNamespace()
+        base = torch.empty(8, device=DEVICE)
+        group = object()
+
+        with (
+            patch(
+                "torch.distributed.distributed_c10d._resolve_process_group",
+                return_value=group,
+            ),
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed._symmetric_memory.empty") as allocate,
+            self.assertRaisesRegex(RuntimeError, "compiled for world size 4"),
+        ):
+            _get_distributed_readiness_signal(
+                kernel,
+                base,
+                "group",
+                8,
+                expected_world_size=4,
+            )
+        allocate.assert_not_called()
+
+    @skipIfNotCUDA()
     def test_distributed_readiness_capacity_failure_is_collective(self) -> None:
         class FakeHandle:
             rank = 0
@@ -258,6 +317,7 @@ class TestPersistentTritonState(unittest.TestCase):
             )
         all_gather.assert_called_once()
 
+    @skipIfNotCUDA()
     def test_distributed_readiness_rejects_rank_fingerprint_mismatch(self) -> None:
         class FakeHandle:
             rank = 0
@@ -308,6 +368,7 @@ class TestPersistentTritonState(unittest.TestCase):
                 launch_fingerprint="this-rank-fingerprint",
             )
 
+    @skipIfNotCUDA()
     def test_distributed_readiness_state_is_stream_local_and_dedicated(self) -> None:
         class FakeHandle:
             rank = 0
@@ -417,6 +478,58 @@ class TestPersistentTritonState(unittest.TestCase):
         self.assertEqual(all_gather.call_count, 4)
         self.assertTrue(torch.all(first_handle.signal_pad[-8:] == 7))
         self.assertTrue(torch.all(second_handle.signal_pad[-8:] == 0))
+
+    @skipIfNotCUDA()
+    def test_distributed_readiness_cache_tracks_process_group_identity(self) -> None:
+        class FakeHandle:
+            rank = 0
+
+            def __init__(self, pointer: int) -> None:
+                self.signal_pad_ptrs_dev = pointer
+                self.signal_pad = torch.zeros(64, dtype=torch.uint64)
+
+            def get_signal_pad(self, rank: int, *, dtype: torch.dtype) -> torch.Tensor:
+                assert rank == self.rank
+                assert dtype is torch.uint64
+                return self.signal_pad
+
+        kernel = SimpleNamespace()
+        base = torch.empty(8, device=DEVICE)
+        stream = SimpleNamespace(cuda_stream=1, synchronize=MagicMock())
+        first_group = object()
+        replacement_group = object()
+        first_handle = FakeHandle(1234)
+        replacement_handle = FakeHandle(5678)
+
+        def gather(output, value, *, group):
+            output[:] = [value]
+
+        with (
+            patch(
+                "torch.distributed._symmetric_memory.empty",
+                side_effect=(torch.empty(1), torch.empty(1)),
+            ) as allocate,
+            patch(
+                "torch.distributed._symmetric_memory.rendezvous",
+                side_effect=(first_handle, replacement_handle),
+            ),
+            patch(
+                "torch.distributed.distributed_c10d._resolve_process_group",
+                side_effect=(first_group, first_group, replacement_group),
+            ),
+            patch("torch.distributed.get_world_size", return_value=1),
+            patch("torch.distributed.all_gather_object", side_effect=gather),
+            patch("torch.cuda.current_stream", return_value=stream),
+        ):
+            first = _get_distributed_readiness_signal(kernel, base, "group", 8)
+            retained = _get_distributed_readiness_signal(kernel, base, "group", 8)
+            replacement = _get_distributed_readiness_signal(kernel, base, "group", 8)
+
+        self.assertEqual(first[0].data_ptr(), retained[0].data_ptr())
+        self.assertEqual(first[1:], retained[1:])
+        self.assertEqual(first[1], 1234)
+        self.assertEqual(replacement[1], 5678)
+        self.assertEqual(allocate.call_count, 2)
 
     def test_is_retained_and_namespaced_by_launch_configuration(self) -> None:
         kernel = SimpleNamespace()

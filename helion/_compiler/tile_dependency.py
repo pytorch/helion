@@ -2741,6 +2741,7 @@ def _rectangular_fiber_spec(
     *,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
     allow_block_tail: bool = False,
+    allow_clipped_final_block: bool = False,
 ) -> tuple[CoordinateRelation, RectangularFiberSpec | None]:
     """Normalize rectangular fibers and recognize their separable axes."""
     pieces = list(dict.fromkeys(relation.pieces))
@@ -2837,10 +2838,8 @@ def _rectangular_fiber_spec(
         interval = _single_axis_interval(begin, end, domain=normalized.source_domain)
         if interval is not None:
             source_axis, stride, offset, width = interval
-            remaining = sympy.simplify(
-                target_count
-                - width * normalized.source_domain.axis_count_expressions[source_axis]
-            )
+            source_count = normalized.source_domain.axis_count_expressions[source_axis]
+            remaining = sympy.simplify(target_count - width * source_count)
             if (
                 step != 1
                 or source_axis in used_sources
@@ -2848,11 +2847,15 @@ def _rectangular_fiber_spec(
                 or width != stride
                 or width <= 0
                 or (
-                    not allow_block_tail
+                    not _is_provably_nonnegative(remaining, None)
                     and (
-                        not _is_provably_nonnegative(remaining, None) or remaining != 0
+                        not allow_clipped_final_block
+                        or not _integer_partition_expressions_equal(
+                            source_count, _ceil_div(target_count, width)
+                        )
                     )
                 )
+                or (not allow_block_tail and remaining != 0)
             ):
                 return normalized, None
             used_sources.add(source_axis)
@@ -2883,7 +2886,7 @@ def _rectangular_fiber_spec(
         if width is None or not (
             _integer_partition_expressions_equal(source_count, width * target_count)
             or (
-                allow_block_tail
+                allow_clipped_final_block
                 and _integer_partition_expressions_equal(
                     target_count, _ceil_div(source_count, width)
                 )
@@ -3152,11 +3155,16 @@ class KeyPartition:
 
     @classmethod
     def from_fixed_width_publication(
-        cls, publication: CoordinateRelation
+        cls,
+        publication: CoordinateRelation,
+        *,
+        allow_clipped_final_block: bool = False,
     ) -> tuple[KeyPartition, Incidence] | None:
         """Construct a fixed-width key quotient with exact clipped-tail counts."""
         publication, structure = _rectangular_fiber_spec(
-            publication, allow_block_tail=True
+            publication,
+            allow_block_tail=True,
+            allow_clipped_final_block=allow_clipped_final_block,
         )
         if structure is None:
             return None
@@ -3195,13 +3203,17 @@ class KeyPartition:
             coarse_by_fine,
             partition_widths,
             frozenset(full_axes),
-            clipped_axes=frozenset(
-                axis
-                for axis in axes
-                if not _integer_partition_expressions_equal(
-                    fine_counts[axis],
-                    partition_widths[axis] * coarse.axis_count_expressions[axis],
+            clipped_axes=(
+                frozenset(
+                    axis
+                    for axis in axes
+                    if not _integer_partition_expressions_equal(
+                        fine_counts[axis],
+                        partition_widths[axis] * coarse.axis_count_expressions[axis],
+                    )
                 )
+                if allow_clipped_final_block
+                else frozenset(axes) - frozenset(full_axes)
             ),
             other_axes=producer.axis_order,
         )
@@ -3236,13 +3248,21 @@ class KeyPartition:
                 for source, _target, mode, width in mappings
             },
             frozenset(producer.axis_order) - frozenset(source_axes),
-            clipped_axes=frozenset(
-                source
-                for source, _target, mode, width in mappings
-                if not _integer_partition_expressions_equal(
-                    producer.axis_count_expressions[source],
-                    (1 if mode == "block" else width)
-                    * producer_keys.axis_count_expressions[source],
+            clipped_axes=(
+                frozenset(
+                    source
+                    for source, _target, mode, width in mappings
+                    if not _integer_partition_expressions_equal(
+                        producer.axis_count_expressions[source],
+                        (1 if mode == "block" else width)
+                        * producer_keys.axis_count_expressions[source],
+                    )
+                )
+                if allow_clipped_final_block
+                else frozenset(
+                    source
+                    for source, _target, mode, _width in mappings
+                    if mode == "block"
                 )
             ),
             other_axes=fine.axis_order,
@@ -4734,6 +4754,10 @@ class AccessDependency:
     consumer_access_id: int
     region: AllocationRegion
     dependency_id: int = -1
+    # Consumer execution rank -> producer execution ranks.  ``None`` denotes
+    # an ordinary rank-local hazard.  The graph builder computes this once so
+    # scheduling and lowering cannot derive different distributed protocols.
+    rank_relation: CoordinateRelation | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4804,6 +4828,14 @@ class TileDependencyGraph:
                     for consumer_site in consumer_sites or (None,)
                 )
         return tuple((pair, frozenset(grouped[pair])) for pair in sorted(grouped))
+
+    def has_cross_rank_dependencies(self) -> bool:
+        """Return whether any memory hazard requires peer-rank readiness."""
+        return any(
+            dependency.rank_relation is not None
+            for edge in self.edges
+            for dependency in edge.access_dependencies
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5850,12 +5882,7 @@ def instantiate_symbolic_dependencies(
         for access_dependency in edge.access_dependencies:
             producer_access = access_by_id[access_dependency.producer_access_id]
             consumer_access = access_by_id[access_dependency.consumer_access_id]
-            rank_relation = tile_access_rank_relation(producer_access, consumer_access)
-            if (
-                rank_relation is not None
-                and rank_relation.source_support_is_empty() is True
-            ):
-                continue
+            rank_relation = access_dependency.rank_relation
             producer_endpoints = endpoints(producer_access)
             consumer_endpoints = endpoints(consumer_access)
             if not producer_endpoints or not consumer_endpoints:
@@ -6353,17 +6380,12 @@ def build_tile_dependency_graph(
         consumer: _ReachingAccess,
         kind: TileDependencyKind,
     ) -> None:
-        rank_relation = None
+        rank_relation = tile_access_rank_relation(producer.access, consumer.access)
         if (
-            producer.access.owner_rank_relation is not None
-            or consumer.access.owner_rank_relation is not None
+            rank_relation is not None
+            and rank_relation.source_support_is_empty() is True
         ):
-            rank_relation = tile_access_rank_relation(producer.access, consumer.access)
-            if (
-                rank_relation is not None
-                and rank_relation.source_support_is_empty() is True
-            ):
-                return
+            return
         # A grid barrier discharges same-rank hazards, but cannot order a peer
         # access. Keep only the latter across explicit source phases.
         if (
@@ -6379,6 +6401,7 @@ def build_tile_dependency_graph(
                 producer_access_id=producer.access.access_id,
                 consumer_access_id=consumer.access.access_id,
                 region=_intersect_regions(producer.region, consumer.region),
+                rank_relation=rank_relation,
             )
         )
 
