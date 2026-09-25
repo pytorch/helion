@@ -28,6 +28,7 @@ from .cute.tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_WARP_LEADER
 from .cute.tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from .cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
+from .cute.tcgen05_constants import tcgen05_sched_consumer_arrivals_per_warp
 from .device_function import DeviceFunction
 from .device_function import TensorArg
 from .host_function import HostFunction
@@ -284,6 +285,16 @@ class _SchedMailboxSnapshot:
         return result
 
 
+def _sched_pipeline_consumer_wait_mode() -> str:
+    try:
+        return DeviceFunction.current().config.get(
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+            TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
+        )
+    except NoCurrentFunction:
+        return TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
+
+
 def _build_sched_pipeline_consumer_wait_block(
     *,
     sched_pipeline: str,
@@ -325,13 +336,7 @@ def _build_sched_pipeline_consumer_wait_block(
     warp. Explicit predication, volatility and a memory clobber prevent LLVM
     from speculating shared loads into non-acquiring lanes or past release.
     """
-    try:
-        wait_mode = DeviceFunction.current().config.get(
-            TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
-            TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
-        )
-    except NoCurrentFunction:
-        wait_mode = TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
+    wait_mode = _sched_pipeline_consumer_wait_mode()
     valid_slot = (
         f"{work_tile_smem}[cutlass.Int32({valid_slot_index})]"
         if work_tile_stage_index is None
@@ -375,23 +380,34 @@ def _build_sched_pipeline_consumer_release_block(
     sched_pipeline: str,
     sched_consumer_state: str,
 ) -> list[ast.stmt]:
-    """Emit the consumer-side release block for the
-    ``ROLE_LOCAL_WITH_SCHEDULER`` sched_pipeline: whole-warp
-    ``consumer_release`` → ``advance_state`` → ``sync_warp``.
+    """Emit the consumer-side release block for the scheduler pipeline.
 
     Companion to ``_build_sched_pipeline_consumer_wait_block``.
-    Every lane reads scheduler metadata, so every lane must release the
-    stage after its own reads. A lane-0 arrival alone does not order the
-    other lanes' shared-memory reads before the producer reuses the stage.
-    The matching setup counts 32 arrivals per consumer warp, including
-    cluster-routed releases. The ``sync_warp`` after the advance keeps
-    the register-resident consumer state consistent; it is not the
-    shared-memory lifetime handshake.
+    Normal mode releases from every lane after that lane's mailbox reads.
+    Warp-leader mode releases only from lane 0 after the leader's volatile
+    snapshot loads and their warp broadcasts. The shared arrival policy also
+    drives the matching pipeline setup count, including cluster-routed CLC
+    releases. Pipeline state still advances on every lane, and the trailing
+    ``sync_warp`` keeps those register-resident states consistent.
     """
+    release = statement_from_string(
+        f"{sched_pipeline}.consumer_release({sched_consumer_state})"
+    )
+    wait_mode = _sched_pipeline_consumer_wait_mode()
+    release_block = (
+        [
+            create(
+                ast.If,
+                test=expr_from_string("cute.arch.lane_idx() == cutlass.Int32(0)"),
+                body=[release],
+                orelse=[],
+            )
+        ]
+        if tcgen05_sched_consumer_arrivals_per_warp(wait_mode) == 1
+        else [release]
+    )
     return [
-        statement_from_string(
-            f"{sched_pipeline}.consumer_release({sched_consumer_state})"
-        ),
+        *release_block,
         statement_from_string(emit_pipeline_advance(sched_consumer_state)),
         statement_from_string("cute.arch.sync_warp()"),
     ]
@@ -4214,7 +4230,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 orelse=[],
             )
         )
-        # Every lane releases the sentinel, matching the per-tile handshake.
+        # Release the sentinel with the same mode-specific policy as each tile.
         prelude.extend(_consumer_release_block())
         # Cycle-94 merge: no post-loop aux producer tail is injected. The store
         # warp's aux producer_state advance lives inside the per-tile store-warp
@@ -4766,8 +4782,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
           peer CTA's SMEM mailbox via ``_cute_store_shared_remote_x4``.
           Each peer CTA's consumer lanes wait on their local full
           barrier and release to the leader's empty barrier. Setup
-          therefore counts consumer threads across the whole cluster,
-          unlike the static scheduler's per-CTA empty-barrier count.
+          therefore counts consumer arrivals across the whole cluster,
+          unlike the static scheduler's per-CTA empty-barrier count. Normal
+          mode contributes one arrival per lane; warp-leader mode contributes
+          one arrival per consumer warp.
 
         cluster_m collapse: the publish writes the per-CTA M
         coordinate into each peer's mailbox by adding

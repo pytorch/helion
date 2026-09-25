@@ -147,6 +147,8 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -154,6 +156,7 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from .tcgen05_constants import tcgen05_sched_consumer_arrivals_per_warp
 from .tcgen05_lifecycle import Tcgen05LifecycleContext
 from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
 
@@ -10108,18 +10111,32 @@ def _emit_mma_pipeline(
                 # store warp. The store warp is a sched consumer + the C-store
                 # ring consumer; it is NOT an acc-pipeline or AB consumer.
             )
-            # All lanes read the scheduler mailbox and arrive after their own
-            # reads. Count threads, not elected warp leaders: a leader-only
-            # release does not protect other lanes from stage reuse.
-            tcgen05_sched_consumer_thread_count = tcgen05_sched_consumer_role_count * 32
+            # Keep the empty-barrier count coupled to the generated mailbox
+            # lifetime protocol. Normal mode has every lane read and release;
+            # warp-leader mode snapshots and broadcasts all fields before one
+            # elected lane releases on behalf of its warp.
+            tcgen05_sched_consumer_wait_mode = df.config.get(
+                TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+                TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL,
+            )
+            tcgen05_sched_consumer_arrivals_per_role = (
+                tcgen05_sched_consumer_arrivals_per_warp(
+                    tcgen05_sched_consumer_wait_mode
+                )
+            )
+            tcgen05_sched_consumer_local_arrive_count = (
+                tcgen05_sched_consumer_role_count
+                * tcgen05_sched_consumer_arrivals_per_role
+            )
             if tcgen05_matmul_plan.is_clc_persistent and tcgen05_sched_cluster_size > 1:
                 tcgen05_sched_consumer_arrive_count = (
-                    tcgen05_sched_consumer_thread_count * tcgen05_sched_cluster_size
+                    tcgen05_sched_consumer_local_arrive_count
+                    * tcgen05_sched_cluster_size
                 )
                 tcgen05_sched_consumer_mask_to_leader = True
             else:
                 tcgen05_sched_consumer_arrive_count = (
-                    tcgen05_sched_consumer_thread_count
+                    tcgen05_sched_consumer_local_arrive_count
                 )
                 tcgen05_sched_consumer_mask_to_leader = False
             prefix.extend(
