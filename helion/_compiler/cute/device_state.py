@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopState
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
+    from .chained_matmul import ChainedMatmulPlan
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
@@ -626,6 +627,7 @@ class CuteDeviceFunctionState:
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
         self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
+        self.chained_matmul_plan: ChainedMatmulPlan | None = None
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the

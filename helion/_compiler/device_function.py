@@ -1579,6 +1579,12 @@ class DeviceFunction:
                 {k: v[0] for k, v in self._variable_renames.items()},
             ),
         ]
+        if self.cute_state.chained_matmul_plan is not None:
+            # Guarded vector copies promote individual tiles to 16-byte
+            # alignment. Their scalar fallback only needs element alignment.
+            result.append(
+                statement_from_string(f"{self.name}._helion_cute_pointer_alignment = 1")
+            )
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:
             # The CuTe launcher reads this attribute to launch the kernel
