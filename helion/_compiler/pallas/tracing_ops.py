@@ -3218,14 +3218,11 @@ def _record_aligned_tiles(
     from .backend import _slice_addressing
     from .plan_tiling import NonePattern
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
+    from helion._compiler.pallas.ordered_carry import aligned_window_sublane
     from helion._compiler.pallas.ordered_carry import needs_ordered_carry
 
-    sublanes = [
-        env.backend.sublane_tiling(t.dtype)  # pyrefly: ignore[missing-attribute]
-        for t in HostFunction.current().tensor_to_origin
-        if isinstance(t, torch.Tensor) and t.is_floating_point()
-    ]
-    if not sublanes:
+    sublane = aligned_window_sublane(env)
+    if sublane is None:
         return
 
     # Strictest addressing each row needs over the tensors it slices.
@@ -3261,7 +3258,6 @@ def _record_aligned_tiles(
             else:
                 addressing.setdefault(dim_bid, SliceAddressing.DIRECT)
 
-    sublane = max(sublanes)
     for i, bid in enumerate(block_ids):
         if not _loop_dim_is_dynamic(state, i):
             continue  # static begin or end: not a fully-dynamic jagged tile
