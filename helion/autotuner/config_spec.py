@@ -786,6 +786,8 @@ VALID_CUTE_LOOP_LOAD_SCHEDULES = (
     "group4",
     "prefetch4",
 )
+CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY = "cute_chained_initialized_accumulator"
+CUTE_CHAINED_LATE_RHS_REUSE_KEY = "cute_chained_late_rhs_reuse"
 VALID_CUTE_CHAINED_POINTWISE_UNROLLS = (1, 2, 4, 8)
 CUTE_CHAINED_AUXILIARY_CACHE_KEY = "cute_chained_auxiliary_cache"
 VALID_CUTE_CHAINED_MMA_SCHEDULES = (
@@ -878,6 +880,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHAINED_POINTWISE_INPLACE_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
+        CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
+        CUTE_CHAINED_LATE_RHS_REUSE_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_threads",
         "cute_vector_widths",
@@ -930,6 +934,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHAINED_POINTWISE_INPLACE_KEY,
         CUTE_LOOP_VECTORIZATION_KEY,
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
+        CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
+        CUTE_CHAINED_LATE_RHS_REUSE_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_warps",
         "num_stages",
@@ -1284,6 +1290,8 @@ class ConfigSpec:
         self.cute_chained_pointwise_unroll_search_enabled: bool = False
         self.cute_chained_pointwise_read_cache_search_enabled: bool = False
         self.cute_chained_pointwise_inplace_search_enabled: bool = False
+        self.cute_chained_initialized_accumulator_search_enabled: bool = False
+        self.cute_chained_late_rhs_reuse_search_enabled: bool = False
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
         # retry. ``None`` leaves all benchmark behavior unchanged.
@@ -3215,6 +3223,20 @@ class ConfigSpec:
                 config.pop(CUTE_CHAINED_MMA_SCHEDULE_KEY)
             else:
                 raise InvalidConfig("chained MMA schedules require a contraction DAG")
+        if CUTE_CHAINED_LATE_RHS_REUSE_KEY in config:
+            late_rhs = config[CUTE_CHAINED_LATE_RHS_REUSE_KEY]
+            if type(late_rhs) is not bool:
+                raise InvalidConfig("cute_chained_late_rhs_reuse must be bool")
+            if not late_rhs:
+                config.pop(CUTE_CHAINED_LATE_RHS_REUSE_KEY)
+            elif (
+                not self.cute_chained_late_rhs_reuse_search_enabled
+                or not config.get(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY)
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "late RHS reuse requires an initialized direct-RHS TCgen05 pair"
+                )
         if self.cute_chained_tcgen05_search_enabled:
             vectorize = config.setdefault(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY, False)
             if not isinstance(vectorize, bool):
@@ -3277,6 +3299,19 @@ class ConfigSpec:
             else:
                 raise InvalidConfig(
                     "inplace async requires computed same-dtype TCgen05 operands"
+                )
+        if CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY in config:
+            initialized = config[CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY]
+            if type(initialized) is not bool:
+                raise InvalidConfig("cute_chained_initialized_accumulator must be bool")
+            if not initialized:
+                config.pop(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY)
+            elif (
+                not self.cute_chained_initialized_accumulator_search_enabled
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "initialized accumulator requires an independent FP32 TCgen05 pair"
                 )
         if self.cute_chained_tcgen05_search_enabled:
             cache = config.setdefault(CUTE_CHAINED_AUXILIARY_CACHE_KEY, False)
@@ -4088,6 +4123,14 @@ class ConfigSpec:
                         )
                     if self.cute_chained_pointwise_inplace_search_enabled:
                         fields[CUTE_CHAINED_POINTWISE_INPLACE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_initialized_accumulator_search_enabled:
+                        fields[CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_late_rhs_reuse_search_enabled:
+                        fields[CUTE_CHAINED_LATE_RHS_REUSE_KEY] = EnumFragment(
                             choices=(False, True)
                         )
                 fields.update(self.user_defined_tunables)

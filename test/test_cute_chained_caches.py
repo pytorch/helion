@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import importlib
 import os
 import subprocess
@@ -22,6 +23,7 @@ from test.test_cute_chained_tcgen05 import _tcgen_compile
 from test.test_cute_chained_tcgen05 import _tcgen_inputs
 from test.test_cute_chained_tcgen05 import _without_early_release_seed
 
+from ._cute_aux import _cpu_codegen
 import helion
 from helion import exc
 from helion._compiler.cute.chained_aux_cache import make_late_auxiliary_cache
@@ -820,6 +822,149 @@ def test_search_knob_default_and_seed_siblings() -> None:
             for other in seeds
             if not other.config.get(POINTWISE_CACHE_KEY, False)
         )
+
+
+# Vector read cache.
+
+VECTOR_READ_KEY = "cute_chained_pointwise_read_cache"
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _vector_read_pair(a, b, raw, x, prefix, delta):
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for row, col in hl.tile([m, n], block_size=[None, n]):
+        kk = hl.arange(k)
+        ll = hl.arange(raw.size(1))
+        first = hl.dot(a[row, kk], b[kk, col])
+        seed = first * torch.exp(prefix[row])[:, None]
+        scale = torch.exp((prefix[row][:, None] - prefix[ll][None, :]).clamp(max=0.0))
+        weighted = raw[row, ll] * scale
+        weighted = weighted * delta[ll][None, :]
+        weighted = torch.where(row.index[:, None] >= ll[None, :], weighted, 0.0)
+        second = hl.dot(weighted.to(a.dtype), x[ll, col])
+        out[row, col] = (seed + second + x[row, col].float()).to(out.dtype)
+    return out
+
+
+def _vector_read_args(
+    dtype: torch.dtype = torch.bfloat16,
+    n: int = 64,
+    view: str = "dense",
+) -> tuple[torch.Tensor, ...]:
+    values = (
+        torch.empty((128, 128), dtype=dtype),
+        torch.empty((128, n), dtype=dtype),
+        torch.empty((128, 128), dtype=torch.float32),
+        torch.empty((128, n), dtype=dtype),
+        torch.empty(128, dtype=torch.float32),
+        torch.empty(128, dtype=torch.float32),
+    )
+    prefix, delta = values[-2:]
+    if view == "offset":
+        prefix = torch.empty(132)[4:]
+        delta = torch.empty(132)[4:]
+    elif view == "unaligned":
+        prefix = torch.empty(129)[1:]
+        delta = torch.empty(129)[1:]
+    elif view == "stride":
+        prefix = torch.empty(256)[::2]
+        delta = torch.empty(256)[::2]
+    elif view == "alias":
+        delta = prefix
+    return (*values[:-2], prefix, delta)
+
+
+def _vector_read_config(
+    cache: bool | None = True, schedule: str = "full"
+) -> helion.Config:
+    values: dict[str, object] = {
+        "block_sizes": [128],
+        "num_warps": 4,
+        "cute_chained_mma_schedule": "tcgen05_tmem",
+        "cute_chained_pointwise_vectorize": True,
+        "cute_chained_initialized_accumulator": True,
+        "cute_chained_late_rhs_reuse": True,
+        "cute_chained_auxiliary_cache": False,
+    }
+    if cache is not None:
+        values[VECTOR_READ_KEY] = cache
+    return helion.Config.from_dict(values)
+
+
+def _source(args: tuple[torch.Tensor, ...], cache=True, schedule="full") -> str:
+    with _cpu_codegen():
+        return _vector_read_pair._bind_isolated(args).to_code(
+            _vector_read_config(cache, schedule)
+        )
+
+
+def _inverse_vector_hoist(source: str) -> str:
+    tree = ast.parse(source)
+    changed = 0
+    for branch in ast.walk(tree):
+        if not isinstance(branch, ast.If):
+            continue
+        loops = [
+            (i, node)
+            for i, node in enumerate(branch.body)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id.endswith("_pointwise_step")
+        ]
+        if not loops:
+            continue
+        loop_index, loop = loops[0]
+        preloads = [
+            node
+            for node in branch.body[:loop_index]
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and ast.unparse(node.value.func) == "cute.copy"
+            and "_leaf_" in ast.unparse(node.value.args[1])
+        ]
+        if not preloads:
+            continue
+        changed += len(preloads)
+        for node in preloads:
+            assert isinstance(node.value, ast.Call)
+            source_arg = node.value.args[1]
+            assert isinstance(source_arg, ast.Subscript)
+            assert isinstance(source_arg.slice, ast.Tuple)
+            assert ast.unparse(source_arg.slice.elts[1]) == "0"
+            source_arg.slice.elts[1] = copy.deepcopy(loop.target)
+            branch.body.remove(node)
+        # Existing row-dependent raw load remains first; original vectors are
+        # ordered after it. No other statement may move in this inverse.
+        assert ast.unparse(loop.body[1]).startswith("cute.copy(")
+        loop.body[2:2] = preloads
+    assert changed == 2
+    return ast.unparse(ast.fix_missing_locations(tree))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("n", [32, 64, 128])
+@pytest.mark.parametrize("schedule", ["full"])
+def test_whole_source_inverse_and_defaults(dtype, n, schedule) -> None:
+    args = _vector_read_args(dtype, n)
+    disabled = _source(args, False, schedule)
+    assert disabled == _source(args, None, schedule)
+    enabled = _source(args, True, schedule)
+    assert _inverse_vector_hoist(enabled) == ast.unparse(ast.parse(disabled))
+
+
+@pytest.mark.parametrize("view", ["offset", "unaligned", "alias"])
+def test_guard_fallback_and_readonly_alias_are_unchanged(view: str) -> None:
+    args = _vector_read_args(view=view)
+    old, new = _source(args, False), _source(args, True)
+    assert _inverse_vector_hoist(new) == ast.unparse(ast.parse(old))
+    assert "toint() % 16 == 0" in new and "layout.stride[0] == 1" in new
+
+
+def test_strided_vectors_keep_original_scalar_cache() -> None:
+    source = _source(_vector_read_args(view="stride"), True)
+    assert "_read_cache_" in source and "layout.stride[0]" in source
 
 
 @pytest.mark.parametrize(

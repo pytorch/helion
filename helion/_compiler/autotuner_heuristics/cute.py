@@ -3064,7 +3064,18 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
             spec.cute_chained_tcgen05_search_enabled
             and has_inplace_candidate(device_ir.graphs)
         )
+        from ..cute.chained_initialized_accumulator import has_initialized_candidate
 
+        spec.cute_chained_initialized_accumulator_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and has_initialized_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_late_rhs import has_late_rhs_candidate
+
+        spec.cute_chained_late_rhs_reuse_search_enabled = (
+            spec.cute_chained_initialized_accumulator_search_enabled
+            and has_late_rhs_candidate(device_ir.graphs)
+        )
         return frozenset()
 
     @classmethod
@@ -3270,7 +3281,29 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                 )
                 for seed in parents
             )
-        return seeds
+        ordered = seeds
+        if not spec.cute_chained_initialized_accumulator_search_enabled:
+            return ordered
+        result: list[Config] = []
+        for seed in ordered:
+            result.append(seed)
+            if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+                result.append(
+                    Config.from_dict(
+                        seed.config | {"cute_chained_initialized_accumulator": True}
+                    )
+                )
+                if spec.cute_chained_late_rhs_reuse_search_enabled:
+                    result.append(
+                        Config.from_dict(
+                            seed.config
+                            | {
+                                "cute_chained_initialized_accumulator": True,
+                                "cute_chained_late_rhs_reuse": True,
+                            }
+                        )
+                    )
+        return result
 
     @classmethod
     def get_seed_config(

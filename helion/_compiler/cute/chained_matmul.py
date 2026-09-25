@@ -43,6 +43,8 @@ if TYPE_CHECKING:
 
     from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
+    from .chained_initialized_accumulator import InitializedAccumulator
+    from .chained_late_rhs import LateRhsArenaPlan
     from .chained_scan_export import ScanExport
     from .chained_scan_export import ScanExportStores
 
@@ -66,6 +68,8 @@ class ChainedMatmulPlan:
     )
     strategy: str = "warp"
     scan_exports: tuple[ScanExport, ...] = ()
+    initialized_accumulator: InitializedAccumulator | None = None
+    late_rhs_reuse: LateRhsArenaPlan | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -525,6 +529,20 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
     )
     if not valid_scan_exports(plan):
         return None
+    if df.config.config.get("cute_chained_initialized_accumulator"):
+        from .chained_initialized_accumulator import classify_initialized_accumulator
+
+        initialized = classify_initialized_accumulator(nodes)
+        if not tcgen or initialized is None or plan.scan_exports:
+            return None
+        plan = dataclasses.replace(plan, initialized_accumulator=initialized)
+    if df.config.config.get("cute_chained_late_rhs_reuse"):
+        from .chained_late_rhs import resolve_late_rhs
+
+        arena = resolve_late_rhs(plan)
+        if not tcgen or arena is None:
+            return None
+        plan = dataclasses.replace(plan, late_rhs_reuse=arena)
     if tcgen:
         from .chained_tcgen05 import supported_plan
 

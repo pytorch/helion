@@ -1072,6 +1072,15 @@ class CuteBackend(Backend):
         device_function.cute_state.chained_matmul_plan = chained_plan
         if chained_plan is not None:
             return
+        if config.config.get("cute_chained_late_rhs_reuse"):
+            raise exc.BackendUnsupported(
+                "cute",
+                "late RHS reuse requires a supported initialized direct-RHS pair",
+            )
+        if config.config.get("cute_chained_initialized_accumulator"):
+            raise exc.BackendUnsupported(
+                "cute", "initialized accumulator requires a supported independent pair"
+            )
         scan_export_requested = any(
             requests_scan_export(tuple(graph.graph.nodes)) for graph in graphs
         )
@@ -1149,6 +1158,8 @@ class CuteBackend(Backend):
             or key == "cute_chained_pointwise_inplace_async"
             or key == "cute_loop_vectorize"
             or key == "cute_loop_load_schedule"
+            or key == "cute_chained_initialized_accumulator"
+            or key == "cute_chained_late_rhs_reuse"
             or key == "cute_chained_auxiliary_cache"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"

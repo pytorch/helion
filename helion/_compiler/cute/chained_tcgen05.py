@@ -2,7 +2,9 @@
 
 Pointwise semantics and indexing come from the common chain interpreter. Only
 an exclusive, coordinate-preserving edge into operand A uses packed TMEM;
-other live results retain an FP32 shared boundary. The schedule performs no graph reassociation.
+other live results retain an FP32 shared boundary. The default performs no graph
+reassociation; initialized-accumulator reuse is an explicit FP32 reassociation
+option.
 M128 uses the full datapath family.
 """
 
@@ -73,15 +75,25 @@ def _shared_memory_bytes(plan: ChainedMatmulPlan) -> int:
     # Each swizzled operand has a power-of-two contiguous atom, tiled exactly
     # by the admitted dimensions. Its cosize is the logical element count.
     allocations = [
-        2 * max(m * k for m, _, k in plan.shapes),
-        2 * max(n * k for _, n, k in plan.shapes),
+        plan.late_rhs_reuse.a_bytes
+        if plan.late_rhs_reuse is not None
+        else 2 * max(m * k for m, _, k in plan.shapes),
+        plan.late_rhs_reuse.b_bytes
+        if plan.late_rhs_reuse is not None
+        else 2 * max(n * k for _, n, k in plan.shapes),
         (
-            2 * plan.shapes[-1][1] * plan.shapes[-1][2]
+            0
+            if plan.late_rhs_reuse is not None
+            else 2 * plan.shapes[-1][1] * plan.shapes[-1][2]
             if _prefetch_final_b(plan)
             else math.prod(final_shape)
             * cast("Node", plan.store.args[0]).meta["val"].element_size()
         ),
-        *(4 * m * n for m, n, _ in plan.shapes[:-1]),
+        *(
+            4 * m * n
+            for index, (m, n, _) in enumerate(plan.shapes[:-1])
+            if plan.initialized_accumulator is None or index != 0
+        ),
         *(4 * (chain._shape(scan)[0] + 4) for scan in plan.scans),
         *(
             chain._shape(scan)[0] * leaf.meta["val"].element_size()
@@ -694,12 +706,33 @@ def _epilogue(
     expression = chain._Expression(cg, plan, boundaries)
     expression.scan_inputs = scans
     expression.coordinate_names.update(coords)
-    fragment = plan.dots[-1]
+    fragment = (
+        plan.dots[-1]
+        if plan.initialized_accumulator is None
+        else plan.initialized_accumulator.join
+    )
     expression.fragments[fragment] = (coords, f"{prefix}_values[{index}]")
     expression.value(node, coords)
     reused: dict[tuple[Node, tuple[str, ...]], str] = {}
     lines: list[str] = []
     for leaf, leaf_coords, indices, _ in expression.loaded_inputs:
+        if (
+            plan.late_rhs_reuse is not None
+            and _shared_leaf(
+                expression,
+                cast("Node", leaf.args[0]),
+                indices,
+                [item for item in staged if item.role == "a"],
+                coords,
+                shape,
+            )
+            is not None
+        ):
+            # The final collective copy writes A. A staged-A reader in
+            # another warp need not have completed without a new barrier.
+            raise chain._UnsupportedChain(
+                "late RHS output arena has an epilogue reader"
+            )
         shared = _shared_leaf(
             expression, cast("Node", leaf.args[0]), indices, staged, coords, shape
         )
@@ -804,8 +837,18 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     cast("Node", operand),
                 )
                 inner_axes[stage, role] = inner if role == "a" else 1 - inner
+        seed_lines: list[str] = []
+        if plan.initialized_accumulator is not None:
+            from .chained_initialized_accumulator import codegen_seed
+
+            if bridges:
+                raise chain._UnsupportedChain("initialized accumulator with bridge")
+            seed_lines = codegen_seed(cg, plan, boundaries, scans, inner_axes)
         a_size = max(m * k for m, _, k in plan.shapes)
         b_size = max(n * k for _, n, k in plan.shapes)
+        if plan.late_rhs_reuse is not None:
+            a_size = plan.late_rhs_reuse.a_bytes // 2
+            b_size = plan.late_rhs_reuse.b_bytes // 2
         max_columns = max(n for _, n, _ in plan.shapes)
         tmem_columns = max(
             32, 2 ** ((max_columns * (2 if bridges else 1) - 1).bit_length())
@@ -816,6 +859,8 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         output_shape = plan.shapes[-1][:2]
         prefetch_b = _prefetch_final_b(plan)
         output_storage = "chain_b_workspace" if prefetch_b else "chain_output_ptr"
+        if plan.late_rhs_reuse is not None:
+            output_storage = "chain_a_workspace"
         final_stage = len(plan.dots) - 1
         lines.extend(
             [
@@ -824,7 +869,9 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                 *(
                     [
                         (
-                            "chain_output_ptr = chain_b_workspace"
+                            "chain_output_ptr = chain_a_workspace"
+                            if plan.late_rhs_reuse is not None
+                            else "chain_output_ptr = chain_b_workspace"
                             if prefetch_b
                             else f"chain_output_ptr = cute.arch.alloc_smem({output_dtype}, {math.prod(output_shape)}, alignment=128)"
                         ),
@@ -844,12 +891,17 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                 f"chain_allocator.allocate({tmem_columns})",
             ]
         )
+        deferred_rhs: list[str] = []
+        prefetch_position = len(lines)
+        deferred_position = 0
         if prefetch_b:
             _, columns, reduction = plan.shapes[-1]
             tag = f"chain_{final_stage}_b"
             prefetch_lines = [
                 (
-                    f"{tag}_ptr = cute.arch.alloc_smem({dtype}, {columns * reduction}, alignment=128)"
+                    f"{tag}_ptr = chain_b_workspace"
+                    if plan.late_rhs_reuse is not None
+                    else f"{tag}_ptr = cute.arch.alloc_smem({dtype}, {columns * reduction}, alignment=128)"
                 ),
                 *_layout(
                     tag, (columns, reduction), inner_axes[final_stage, "b"], dtype
@@ -868,7 +920,10 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     pointwise_inplace,
                 ),
             ]
-            lines.extend(prefetch_lines)
+            if plan.late_rhs_reuse is not None:
+                deferred_rhs = prefetch_lines
+            else:
+                lines.extend(prefetch_lines)
         early_scan = any(
             chain._ancestors(cast("Node", operand)) & set(plan.scans)
             for operand in plan.dots[0].args[:2]
@@ -878,7 +933,11 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         early_cached: list[chain._ScanInput] = []
         if df.config.config.get("cute_chained_auxiliary_cache"):
             device = cast("Node", plan.dots[0].args[0]).meta["val"].device
-            cache_plan = plan
+            cache_plan = (
+                dataclasses.replace(plan, late_rhs_reuse=None)
+                if plan.late_rhs_reuse is not None
+                else plan
+            )
             cache_lines, early_cached = make_early_auxiliary_cache(
                 cg,
                 plan,
@@ -1012,7 +1071,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                 [
                     f"{prefix}_rb = {prefix}_mma.make_fragment_B({prefix}_slice.partition_B({prefix}_b))",
                     "if chain_warp == 0:",
-                    f"    {prefix}_mma.set(tcgen05.Field.ACCUMULATE, {False})",
+                    f"    {prefix}_mma.set(tcgen05.Field.ACCUMULATE, {stage == 1 and plan.initialized_accumulator is not None})",
                     f"    for {prefix}_kk in cutlass.range_constexpr(cute.size({prefix}_ra, mode=[2])):",
                     f"        cute.gemm({prefix}_mma, {prefix}_acc, {a_slice}, {prefix}_rb[None, None, {prefix}_kk], {prefix}_acc)",
                     f"        {prefix}_mma.set(tcgen05.Field.ACCUMULATE, True)",
@@ -1022,7 +1081,9 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     *_load_result(prefix, (m, n)),
                 ]
             )
-            if stage < len(plan.dots) - 1 and stage + 1 not in bridges:
+            if stage == 0 and plan.initialized_accumulator is not None:
+                lines.extend(seed_lines)
+            elif stage < len(plan.dots) - 1 and stage + 1 not in bridges:
                 lines.extend(
                     [
                         f"{prefix}_c = cute.make_tensor(cute.arch.alloc_smem(cutlass.Float32, {m * n}, alignment=128), cute.make_layout(({m}, {n}), stride=({n}, 1)))",
@@ -1034,8 +1095,10 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             if stage == 0:
                 # First B is dead, and the FP32 seed store fence plus CTA
                 # boundary has published it before any final-RHS overwrite.
-                pass
-            boundaries[node] = f"{prefix}_c"
+                deferred_position = len(lines)
+                lines.extend(deferred_rhs)
+            if stage != 0 or plan.initialized_accumulator is None:
+                boundaries[node] = f"{prefix}_c"
         epilogue = [
             *_epilogue(cg, plan, boundaries, scans, staged),
             *codegen_scan_exports(cg, plan, boundaries, scans),
@@ -1053,6 +1116,18 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         ) from error
     df.preamble = []
     template = _GeneratedCodeTemplate("chain", tuple(plan.tensor_aliases), df.new_var)
+    if plan.late_rhs_reuse is not None:
+        # Allocate local names in the legacy order. The common renderer names
+        # by first occurrence, so relocation otherwise renumbers unrelated
+        # arithmetic even though all expression construction is unchanged.
+        template.render(
+            "\n".join(
+                lines[:prefetch_position]
+                + deferred_rhs
+                + lines[prefetch_position:deferred_position]
+                + lines[deferred_position + len(deferred_rhs) :]
+            )
+        )
     body = ast.parse(template.render("\n".join(lines))).body
     aliases = ast.parse(
         "\n".join(f"{alias} = {name}" for name, alias in plan.tensor_aliases.items())
