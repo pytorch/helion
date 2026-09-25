@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -613,7 +615,10 @@ class TestReductions(RefEagerTestBase, TestCase):
         expected = x.to(torch.float32).pow(2).sum(-1)
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
+    @patch.dict(os.environ, {"TRITON_DEFAULT_FP_FUSION": "0"})
     def test_fp16_var_mean(self):
+        """Avoid FMA-dependent variance rounding across a BF16 midpoint."""
+
         @helion.kernel(static_shapes=True)
         def layer_norm_fwd_repro(
             x: torch.Tensor,
@@ -632,6 +637,7 @@ class TestReductions(RefEagerTestBase, TestCase):
                 )
             return out
 
+        torch.manual_seed(3437)
         batch_size = 32
         dim = 64
         x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
