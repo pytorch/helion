@@ -583,17 +583,17 @@ class TritonBackend(Backend):
                 ]
             )
         if device_fn.triton_distributed_readiness_signal_slots:
-            signal_dst = device_fn.triton_distributed_readiness_signal_dst
+            device_anchor = device_fn.triton_distributed_readiness_device_anchor
             process_group_name = CompileEnvironment.current().process_group_name
-            if signal_dst is None or process_group_name is None:
+            if device_anchor is None or process_group_name is None:
                 raise exc.BackendUnsupported(
                     "triton",
-                    "distributed readiness requires a symmetric payload and "
-                    "active process group",
+                    "distributed readiness requires a device anchor and active "
+                    "process group",
                 )
             out.extend(
                 [
-                    f"_distributed_readiness_signal_dst={signal_dst}",
+                    f"_distributed_readiness_device_anchor={device_anchor}",
                     (
                         "_distributed_readiness_signal_slots="
                         f"{device_fn.triton_distributed_readiness_signal_slots}"

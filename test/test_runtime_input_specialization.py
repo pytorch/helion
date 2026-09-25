@@ -38,11 +38,17 @@ from helion._compiler.cute.memory_ops import runtime_tensors_are_proven_disjoint
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import StaticShape
 from helion._compiler.device_ir import _finalize_cute_tcgen05_search_planning
+from helion._compiler.host_function import CompilerState
+from helion._compiler.host_function import SymmetricRankPlacement
 from helion._compiler.type_info import CallableType
+from helion._compiler.type_info import DictType
+from helion._compiler.type_info import SequenceType
+from helion._compiler.type_info import SymIntType
 from helion._compiler.type_info import TensorType
 from helion._compiler.type_info import TypeInfo
 from helion._compiler.variable_origin import ArgumentOrigin
 from helion._compiler.variable_origin import NameOrigin
+from helion._compiler.variable_origin import Origin
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
@@ -859,6 +865,26 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         self.assertEqual(results(entries), expected)
         self.assertEqual(results(tuple(reversed(entries))), expected)
 
+    def test_storage_offset_specialization_is_replayable(self) -> None:
+        symbol = sympy.Symbol("storage_offset", integer=True, nonnegative=True)
+        source = TensorPropertySource(
+            LocalSource("tensor", is_input=True),
+            TensorProperty.STORAGE_OFFSET,
+        )
+        env = SimpleNamespace(
+            specialized_vars={symbol},
+            specialized_strides=set(),
+            tensor_descriptor_layout_guards={},
+            runtime_input_specializations={},
+            shape_env=SimpleNamespace(var_to_sources={symbol: (source,)}),
+        )
+        kernel = SimpleNamespace(signature=inspect.signature(lambda tensor: None))
+        bound = SimpleNamespace(_env=env, env=env, kernel=kernel)
+
+        (extractor,) = BoundKernel._specialize_extra(cast("BoundKernel[object]", bound))
+        base = torch.empty(16)
+        self.assertEqual(extractor((base[3:],)), 3)
+
     def test_equivalent_registration_is_idempotent(self) -> None:
         env = object.__new__(CompileEnvironment)
         env.runtime_input_specializations = {}
@@ -912,6 +938,269 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 ),
             ):
                 env.register_runtime_input_specialization("key", conflict)
+
+
+class TestSymmetricRankProvenance(unittest.TestCase):
+    @staticmethod
+    def _placement(allocation: torch.Tensor, owner_rank: int) -> SymmetricRankPlacement:
+        return SymmetricRankPlacement(allocation, owner_rank, 2, "group")
+
+    def test_tensor_merge_preserves_matching_owner(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        placement = self._placement(allocation, 0)
+        state.record_symmetric_rank_placement(left, placement)
+        state.record_symmetric_rank_placement(right, placement)
+        origin = NameOrigin("peer")
+        state.tensor_to_origin[left] = origin
+        state.tensor_to_origin[right] = origin
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            merged = TensorType(NameOrigin("left"), left).merge(
+                TensorType(NameOrigin("right"), right)
+            )
+
+        assert isinstance(merged, TensorType)
+        self.assertEqual(
+            state.symmetric_rank_placements[
+                merged.fake_value.untyped_storage()
+            ].signature(),
+            placement.signature(),
+        )
+        self.assertEqual(state.tensor_origin(merged.fake_value), origin)
+        self.assertFalse(state.unresolved_symmetric_peer_provenance)
+
+    def test_tensor_merge_rejects_conflicting_owners(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            TensorType(NameOrigin("left"), left).merge(
+                TensorType(NameOrigin("right"), right)
+            )
+
+        self.assertTrue(state.unresolved_symmetric_peer_provenance)
+
+    def test_tensor_merge_rejects_changed_storage_offset(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(5)[1:]
+        right = torch.empty(5)[1:]
+        placement = self._placement(allocation, 0)
+        state.record_symmetric_rank_placement(left, placement)
+        state.record_symmetric_rank_placement(right, placement)
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            TensorType(NameOrigin("left"), left).merge(
+                TensorType(NameOrigin("right"), right)
+            )
+
+        self.assertTrue(state.unresolved_symmetric_peer_provenance)
+
+    def test_host_iteration_merges_peer_ownership(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+        peers = SequenceType(
+            NameOrigin("peers"),
+            (
+                TensorType(NameOrigin("left"), left),
+                TensorType(NameOrigin("right"), right),
+            ),
+        )
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            peers.propagate_iter(NameOrigin("selected"))
+
+        self.assertTrue(state.unresolved_symmetric_peer_provenance)
+
+    def test_device_iteration_does_not_create_runtime_peer_phi(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+        peers = SequenceType(
+            NameOrigin("peers"),
+            (
+                TensorType(NameOrigin("left"), left),
+                TensorType(NameOrigin("right"), right),
+            ),
+        )
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            merged = peers.propagate_iter(Origin())
+
+        self.assertIsInstance(merged, TensorType)
+        assert isinstance(merged, TensorType)
+        self.assertNotIn(
+            merged.fake_value.untyped_storage(), state.symmetric_rank_placements
+        )
+        self.assertFalse(state.unresolved_symmetric_peer_provenance)
+
+    def test_nested_device_iteration_does_not_create_runtime_peer_phi(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+        peers = SequenceType(
+            NameOrigin("enumerated_peers"),
+            (
+                SequenceType(
+                    NameOrigin("left_pair"),
+                    (TensorType(NameOrigin("left"), left),),
+                ),
+                SequenceType(
+                    NameOrigin("right_pair"),
+                    (TensorType(NameOrigin("right"), right),),
+                ),
+            ),
+        )
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            peers.propagate_iter(Origin())
+
+        self.assertFalse(state.unresolved_symmetric_peer_provenance)
+
+    def test_device_static_index_does_not_create_runtime_peer_phi(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+        peers = SequenceType(
+            NameOrigin("peers"),
+            (
+                TensorType(NameOrigin("left"), left),
+                TensorType(NameOrigin("right"), right),
+            ),
+        )
+        dynamic_index = object.__new__(SymIntType)
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            merged = peers.propagate_getitem(dynamic_index, Origin())
+
+        self.assertIsInstance(merged, TensorType)
+        assert isinstance(merged, TensorType)
+        self.assertNotIn(
+            merged.fake_value.untyped_storage(), state.symmetric_rank_placements
+        )
+        self.assertFalse(state.unresolved_symmetric_peer_provenance)
+
+    def test_device_static_setitem_does_not_create_runtime_peer_phi(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+        peers = SequenceType(
+            NameOrigin("peers"),
+            [
+                TensorType(NameOrigin("left"), left),
+                TensorType(NameOrigin("right"), right),
+            ],
+        )
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            updated = peers.propagate_setitem(
+                object.__new__(SymIntType),
+                TensorType(NameOrigin("replacement"), left),
+                Origin(),
+            )
+
+        self.assertIsInstance(updated, SequenceType)
+        self.assertFalse(state.unresolved_symmetric_peer_provenance)
+
+    def test_host_dynamic_index_merges_peer_ownership(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+        peers = SequenceType(
+            NameOrigin("peers"),
+            (
+                TensorType(NameOrigin("left"), left),
+                TensorType(NameOrigin("right"), right),
+            ),
+        )
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            peers.propagate_getitem(object.__new__(SymIntType), NameOrigin("selected"))
+
+        self.assertTrue(state.unresolved_symmetric_peer_provenance)
+
+    def test_nested_dict_device_iteration_suppresses_artificial_phi(self) -> None:
+        state = CompilerState()
+        allocation = torch.empty(8)
+        left = torch.empty(4)
+        right = torch.empty(4)
+        state.record_symmetric_rank_placement(left, self._placement(allocation, 0))
+        state.record_symmetric_rank_placement(right, self._placement(allocation, 1))
+        records = SequenceType(
+            NameOrigin("records"),
+            (
+                DictType(
+                    NameOrigin("left_record"),
+                    {"peer": TensorType(NameOrigin("left"), left)},
+                ),
+                DictType(
+                    NameOrigin("right_record"),
+                    {"peer": TensorType(NameOrigin("right"), right)},
+                ),
+            ),
+        )
+
+        host = SimpleNamespace(compiler_state=state)
+        with patch(
+            "helion._compiler.type_info.HostFunction.current", return_value=host
+        ):
+            merged = records.propagate_iter(Origin())
+
+        self.assertIsInstance(merged, DictType)
+        self.assertFalse(state.unresolved_symmetric_peer_provenance)
 
 
 class _StrideHarness:

@@ -388,11 +388,12 @@ class DeviceFunction:
         self.triton_remote_barrier_signal_arg: str | None = None
         self.triton_remote_barrier_signal_slots = 0
         # Cross-rank tile readiness uses a compiler-reserved tail slice of the
-        # symmetric payload's signal pad.  The launcher appends its peer pointer
-        # table and the runtime-dependent tail offset.
+        # protocol's dedicated symmetric signal pad.  The launcher appends its
+        # local tensor, peer pointer table, and tail offset.
+        self.triton_distributed_readiness_signal_arg: str | None = None
         self.triton_distributed_readiness_signal_ptrs_arg: str | None = None
         self.triton_distributed_readiness_signal_offset_arg: str | None = None
-        self.triton_distributed_readiness_signal_dst: str | None = None
+        self.triton_distributed_readiness_device_anchor: str | None = None
         self.triton_distributed_readiness_signal_slots = 0
         # NVSHMEM takes pointer sources. Computed Triton tiles are materialized
         # into compiler-owned global scratch before the transfer starts.
@@ -803,7 +804,9 @@ class DeviceFunction:
         self, fake_value: torch.Tensor, prefer_name: str | None = None
     ) -> TensorArg:
         if fake_value not in self._tensor_args:
-            origin = HostFunction.current().tensor_to_origin[fake_value]
+            origin = HostFunction.current().compiler_state.tensor_origin(fake_value)
+            if origin is None:
+                raise KeyError(fake_value)
             arg = TensorArg(
                 self.new_var(prefer_name or origin.suggest_var_name()),
                 fake_value,
@@ -1098,6 +1101,8 @@ class DeviceFunction:
             remote_copy_params.add(self.triton_remote_barrier_signal_arg)
         if self.triton_distributed_readiness_signal_ptrs_arg is not None:
             remote_copy_params.add(self.triton_distributed_readiness_signal_ptrs_arg)
+        if self.triton_distributed_readiness_signal_arg is not None:
+            remote_copy_params.add(self.triton_distributed_readiness_signal_arg)
         if self.triton_distributed_readiness_signal_offset_arg is not None:
             remote_copy_params.add(self.triton_distributed_readiness_signal_offset_arg)
         wrapper_only_params = [
@@ -1107,6 +1112,8 @@ class DeviceFunction:
             wrapper_only_params.append(self.triton_remote_copy_signal_arg)
         if self.triton_remote_barrier_signal_arg is not None:
             wrapper_only_params.append(self.triton_remote_barrier_signal_arg)
+        if self.triton_distributed_readiness_signal_arg is not None:
+            wrapper_only_params.append(self.triton_distributed_readiness_signal_arg)
         if self.triton_distributed_readiness_signal_ptrs_arg is not None:
             wrapper_only_params.append(
                 self.triton_distributed_readiness_signal_ptrs_arg

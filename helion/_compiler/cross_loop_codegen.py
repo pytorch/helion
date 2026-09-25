@@ -36,6 +36,7 @@ from .tile_dependency import DenseTaskOrder
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_coordinate_domains
 from .tile_dependency import nested_logical_axes
+from .tile_dependency import tile_access_rank_relation
 from .tile_dependency import tile_dependency_site_id
 from .tile_strategy import L2GroupingProgramIDs
 
@@ -502,14 +503,8 @@ def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
     )
 
 
-def _register_cross_loop_state(
-    device_function: DeviceFunction,
-    *,
-    name_hint: str,
-    numel: str,
-    dtype: torch.dtype,
-) -> str:
-    """Register launch-persistent global state owned by the Triton launcher."""
+def _cross_loop_state_device_anchor(device_function: DeviceFunction) -> str | None:
+    """Return a host tensor expression identifying the launch device."""
     like = next(
         (
             argument
@@ -522,15 +517,31 @@ def _register_cross_loop_state(
     )
     if like is None:
         descriptor = next(
-            argument
-            for argument in device_function.arguments
-            if isinstance(argument, TensorDescriptorArg)
+            (
+                argument
+                for argument in device_function.arguments
+                if isinstance(argument, TensorDescriptorArg)
+            ),
+            None,
         )
-        like_host = (
-            HostFunction.current().tensor_to_origin[descriptor.fake_value].host_str()
-        )
-    else:
-        like_host = like.host_str()
+        if descriptor is None:
+            return None
+        origin = HostFunction.current().tensor_to_origin.get(descriptor.fake_value)
+        return None if origin is None else origin.host_str()
+    return like.host_str()
+
+
+def _register_cross_loop_state(
+    device_function: DeviceFunction,
+    *,
+    name_hint: str,
+    numel: str,
+    dtype: torch.dtype,
+) -> str:
+    """Register launch-persistent global state owned by the Triton launcher."""
+    like_host = _cross_loop_state_device_anchor(device_function)
+    if like_host is None:
+        raise AssertionError("cross-loop state requires a host-visible tensor")
     name = device_function.new_var(name_hint, dce=False)
     device_function.wrapper_only_params.append(name)
     device_function.triton_persistent_state_args.append(name)
@@ -541,23 +552,26 @@ def _register_cross_loop_state(
 def _register_distributed_readiness_state(
     device_function: DeviceFunction,
     *,
-    payload: str,
+    device_anchor: str,
     slots: int,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Register hidden peer signal-pad metadata for distributed readiness."""
+    signal_arg = device_function.new_var(
+        "tile_dependency_distributed_signal", dce=False
+    )
     pointer_arg = device_function.new_var(
         "tile_dependency_distributed_signal_ptrs", dce=False
     )
     offset_arg = device_function.new_var(
         "tile_dependency_distributed_signal_offset", dce=False
     )
-    device_function.wrapper_only_params.extend((pointer_arg, offset_arg))
+    device_function.wrapper_only_params.extend((signal_arg, pointer_arg, offset_arg))
+    device_function.triton_distributed_readiness_signal_arg = signal_arg
     device_function.triton_distributed_readiness_signal_ptrs_arg = pointer_arg
     device_function.triton_distributed_readiness_signal_offset_arg = offset_arg
-    device_function.triton_distributed_readiness_signal_dst = payload
+    device_function.triton_distributed_readiness_device_anchor = device_anchor
     device_function.triton_distributed_readiness_signal_slots = slots
-    device_function.requires_nvshmem = True
-    return pointer_arg, offset_arg
+    return signal_arg, pointer_arg, offset_arg
 
 
 def _outline_cross_loop_region(
@@ -647,6 +661,23 @@ def _has_opaque_distributed_protocol(device_ir: object) -> bool:
     )
 
 
+def _has_compiler_distributed_dependency(device_ir: DeviceIR) -> bool:
+    """Return whether the memory DAG contains a true cross-rank obligation."""
+    dependency_graph = device_ir.tile_dependency_graph
+    if dependency_graph is None:
+        return False
+    access_by_id = {access.access_id: access for access in dependency_graph.accesses}
+    for edge in dependency_graph.edges:
+        for dependency in edge.access_dependencies:
+            relation = tile_access_rank_relation(
+                access_by_id[dependency.producer_access_id],
+                access_by_id[dependency.consumer_access_id],
+            )
+            if relation is not None and relation.source_support_is_empty() is not True:
+                return True
+    return False
+
+
 def emit_cross_loop_schedule(
     owner: ForEachProgramID,
     strategy: PersistentProgramIDs,
@@ -660,14 +691,23 @@ def emit_cross_loop_schedule(
     Graph arguments need neither a reset kernel nor a host-side epoch update.
     """
     pipeline = device_function.config.cross_loop_pipeline
+    device_ir = HostFunction.current().device_ir
+    has_opaque_distributed_protocol = _has_opaque_distributed_protocol(device_ir)
+    has_compiler_distributed_dependency = _has_compiler_distributed_dependency(
+        device_ir
+    )
     if pipeline == "barrier":
+        if has_compiler_distributed_dependency:
+            raise exc.InvalidConfig(
+                "compiler-derived cross-rank dependencies require "
+                "cross_loop_pipeline='dynamic'; a local grid barrier is insufficient"
+            )
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
     if pipeline not in ("static", "dynamic"):
         raise exc.InvalidConfig(f"unknown cross_loop_pipeline value {pipeline!r}")
 
-    device_ir = HostFunction.current().device_ir
-    if _has_opaque_distributed_protocol(device_ir):
+    if has_opaque_distributed_protocol:
         raise exc.InvalidConfig(
             f"cross_loop_pipeline={pipeline!r} cannot reorder roots containing "
             "explicit remote barriers or asynchronous remote-copy protocols"
@@ -819,31 +859,11 @@ def emit_cross_loop_schedule(
     distributed_world_size = (
         next(iter(distributed_world_sizes)) if distributed_world_sizes else None
     )
-    access_dependency_by_id = {
-        dependency.dependency_id: dependency
-        for edge in dependency_graph.edges
-        for dependency in edge.access_dependencies
-    }
-    access_by_id = {access.access_id: access for access in dependency_graph.accesses}
-    distributed_payload_names = {
-        access_by_id[
-            access_dependency_by_id[obligation[0]].producer_access_id
-        ].tensor_name
-        for plan in distributed_counter_plans
-        for consumer in plan.consumers
-        for obligation in consumer.covered_obligations
-    }
-    if distributed_counter_plans and (
-        len(distributed_payload_names) != 1 or None in distributed_payload_names
-    ):
+    distributed_device_anchor = _cross_loop_state_device_anchor(device_function)
+    if distributed_counter_plans and distributed_device_anchor is None:
         raise exc.InvalidConfig(
-            "distributed readiness currently requires one named symmetric payload"
+            "distributed readiness requires a tensor argument as a device anchor"
         )
-    distributed_payload = (
-        cast("str", next(iter(distributed_payload_names)))
-        if distributed_payload_names
-        else None
-    )
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     nested_loop_counter_plans = tuple(
         plan
@@ -956,7 +976,7 @@ def emit_cross_loop_schedule(
     distributed_signal_args = (
         _register_distributed_readiness_state(
             device_function,
-            payload=cast("str", distributed_payload),
+            device_anchor=cast("str", distributed_device_anchor),
             slots=distributed_counter_count,
         )
         if distributed_counter_count
@@ -1582,13 +1602,11 @@ def emit_cross_loop_schedule(
     ) -> str:
         if distributed_signal_args is None:
             raise AssertionError("distributed readiness state was not registered")
-        signal_ptrs, signal_offset = distributed_signal_args
+        signal, _signal_ptrs, signal_offset = distributed_signal_args
         offsets = distributed_counter_offsets[plan]
         return (
-            "tl.load("
-            f"({signal_ptrs}).to(tl.pointer_type(tl.uint64)) + nvshmem.my_pe()"
-            ").to(tl.pointer_type(tl.uint64)) + "
-            f"({signal_offset}) + {offsets[bank]} + "
+            f"({signal}).to(tl.pointer_type(tl.uint64)) + ({signal_offset}) + "
+            f"{offsets[bank]} + "
             f"({readiness_key}) * {_DISTRIBUTED_COUNTER_ALIGNMENT_WORDS}"
         )
 
@@ -1601,7 +1619,7 @@ def emit_cross_loop_schedule(
     ) -> list[ast.stmt]:
         if distributed_signal_args is None or distributed_world_size is None:
             raise AssertionError("distributed readiness state was not registered")
-        signal_ptrs, signal_offset = distributed_signal_args
+        _signal, signal_ptrs, signal_offset = distributed_signal_args
         offset = distributed_counter_offsets[plan][bank]
         physical_world_size = 1 << (distributed_world_size - 1).bit_length()
         peers = device_function.new_var(f"{prefix}_peers", dce=True)

@@ -37,6 +37,7 @@ from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.tile_dependency import instantiate_symbolic_dependencies
 from helion._compiler.tile_dependency import owner_roots_by_graph_id
+from helion._compiler.tile_dependency import tile_access_rank_relation
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfNotCUDA
@@ -165,6 +166,7 @@ def _access(
     tensor_name: str = "tmp",
     storage_offset: int = 0,
     layout_is_static: bool = True,
+    owner_rank_relation: CoordinateRelation | None = None,
 ) -> TileAccess:
     return TileAccess(
         access_id=access_id,
@@ -187,6 +189,7 @@ def _access(
         subscript_static_extents=static_extents or (),
         subscript_dense_spans=dense_spans or (),
         layout_is_symbolically_exact=layout_is_static,
+        owner_rank_relation=owner_rank_relation,
     )
 
 
@@ -353,6 +356,354 @@ def _dependency_kinds(edge: TileDependency) -> frozenset[TileDependencyKind]:
 
 
 class TestTileDependency(TestCase):
+    def test_constant_map_converse_preserves_complete_source_fiber(self) -> None:
+        sources = CoordinateDomain.scalar(4, axis=10, kind="site")
+        targets = CoordinateDomain.scalar(3, axis=20, kind="value")
+        constant = CoordinateRelation.point_map(
+            sources,
+            targets,
+            ((((10, 0, 4, 1),), (sympy.Integer(1),)),),
+        )
+
+        converse = constant.converse()
+        self.assertIsNotNone(converse)
+        assert converse is not None
+        self.assertEqual(
+            _materialize(converse),
+            (frozenset(), frozenset(range(4)), frozenset()),
+        )
+
+    def test_rank_relation_normalizes_local_and_empty_dependencies(self) -> None:
+        ranks = CoordinateDomain.scalar(4, kind="value", identity=0)
+        (rank_axis,) = ranks.axis_order
+        identity = CoordinateRelation.identity(ranks, ranks)
+        local = tile_access_rank_relation(
+            _access(0, root=0, kind="store", owner_rank_relation=identity),
+            _access(1, root=1, kind="load", owner_rank_relation=identity),
+        )
+        self.assertIsNone(local)
+
+        def fixed_owner(rank: int) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                ranks,
+                ranks,
+                ((((rank_axis, 0, 4, 1),), (sympy.Integer(rank),)),),
+            )
+
+        empty = tile_access_rank_relation(
+            _access(0, root=0, kind="store", owner_rank_relation=fixed_owner(0)),
+            _access(1, root=1, kind="load", owner_rank_relation=fixed_owner(1)),
+        )
+        self.assertIsNotNone(empty)
+        assert empty is not None
+        self.assertTrue(empty.source_support_is_empty())
+
+        for producer_owner, consumer_owner in (
+            (identity, fixed_owner(0)),
+            (fixed_owner(0), identity),
+            (fixed_owner(0), fixed_owner(0)),
+        ):
+            relation = tile_access_rank_relation(
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    owner_rank_relation=producer_owner,
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    owner_rank_relation=consumer_owner,
+                ),
+            )
+            self.assertIsNotNone(relation)
+            assert relation is not None
+            self.assertIsNot(relation.source_support_is_empty(), True)
+
+        with self.assertRaisesRegex(
+            exc.CrossLoopSchedulingError,
+            "incomplete rank provenance",
+        ):
+            tile_access_rank_relation(
+                _access(0, root=0, kind="store"),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    owner_rank_relation=fixed_owner(0),
+                ),
+            )
+
+        singleton = CoordinateDomain.scalar(1, kind="value", identity=0)
+        (singleton_axis,) = singleton.axis_order
+        singleton_fixed = CoordinateRelation.point_map(
+            singleton,
+            singleton,
+            ((((singleton_axis, 0, 1, 1),), (sympy.Integer(0),)),),
+        )
+        self.assertIsNone(
+            tile_access_rank_relation(
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    owner_rank_relation=singleton_fixed,
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    owner_rank_relation=singleton_fixed,
+                ),
+            )
+        )
+
+    def test_same_root_cross_rank_hazards_fail_closed(self) -> None:
+        ranks = CoordinateDomain.scalar(2, kind="value", identity=0)
+        (rank_axis,) = ranks.axis_order
+        identity = CoordinateRelation.identity(ranks, ranks)
+
+        def fixed_owner(rank: int) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                ranks,
+                ranks,
+                ((((rank_axis, 0, 2, 1),), (sympy.Integer(rank),)),),
+            )
+
+        partial_identity = CoordinateRelation.point_map(
+            ranks,
+            ranks,
+            ((((rank_axis, 0, 1, 1),), (sympy.Integer(0),)),),
+        )
+
+        def build(*accesses: TileAccess) -> None:
+            build_tile_dependency_graph(accesses, [[0], [1]])
+
+        build(
+            _access(0, root=0, kind="store", owner_rank_relation=identity),
+            _access(1, root=0, kind="load", owner_rank_relation=identity),
+        )
+        build(
+            _access(0, root=0, kind="load", owner_rank_relation=fixed_owner(0)),
+            _access(1, root=0, kind="load", owner_rank_relation=fixed_owner(0)),
+        )
+        build(
+            _access(
+                0,
+                root=0,
+                kind="store",
+                owner_rank_relation=partial_identity,
+            )
+        )
+        build(
+            _access(
+                0,
+                root=0,
+                kind="store",
+                block_ids=(None,),
+                static_extents=(16,),
+                owner_rank_relation=identity,
+            ),
+            _access(
+                1,
+                root=0,
+                kind="load",
+                block_ids=(None,),
+                offsets=(32,),
+                static_extents=(16,),
+                owner_rank_relation=fixed_owner(0),
+            ),
+        )
+
+        for accesses in (
+            (
+                _access(0, root=0, kind="store", owner_rank_relation=identity),
+                _access(
+                    1,
+                    root=0,
+                    kind="load",
+                    owner_rank_relation=fixed_owner(0),
+                ),
+            ),
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="load",
+                    owner_rank_relation=fixed_owner(0),
+                ),
+                _access(1, root=0, kind="store", owner_rank_relation=identity),
+            ),
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    owner_rank_relation=fixed_owner(0),
+                ),
+            ),
+            (
+                dataclasses.replace(
+                    _access(
+                        0,
+                        root=0,
+                        kind="store",
+                        owner_rank_relation=fixed_owner(0),
+                    ),
+                    is_atomic=True,
+                ),
+            ),
+        ):
+            with (
+                self.subTest(accesses=accesses),
+                self.assertRaisesRegex(
+                    exc.CrossLoopSchedulingError,
+                    "unordered cross-rank",
+                ),
+            ):
+                build(*accesses)
+
+    def test_rank_disjoint_write_does_not_kill_reaching_definition(self) -> None:
+        ranks = CoordinateDomain.scalar(2, kind="value", identity=0)
+        (rank_axis,) = ranks.axis_order
+
+        def owner(executor: int, rank: int) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                ranks,
+                ranks,
+                (
+                    (
+                        ((rank_axis, executor, executor + 1, 1),),
+                        (sympy.Integer(rank),),
+                    ),
+                ),
+            )
+
+        graph = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    block_ids=(10,),
+                    owner_rank_relation=owner(0, 0),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="store",
+                    block_ids=(20,),
+                    owner_rank_relation=owner(1, 1),
+                ),
+                _access(
+                    2,
+                    root=2,
+                    kind="load",
+                    block_ids=(30,),
+                    owner_rank_relation=owner(0, 0),
+                ),
+            ),
+            [[10], [20], [30]],
+        )
+
+        self.assertIn(
+            (0, 2),
+            tuple((edge.producer_root, edge.consumer_root) for edge in graph.edges),
+        )
+
+    def test_rank_disjoint_write_does_not_kill_reaching_read(self) -> None:
+        ranks = CoordinateDomain.scalar(2, kind="value", identity=0)
+        (rank_axis,) = ranks.axis_order
+
+        def owner(executor: int, rank: int) -> CoordinateRelation:
+            return CoordinateRelation.point_map(
+                ranks,
+                ranks,
+                (
+                    (
+                        ((rank_axis, executor, executor + 1, 1),),
+                        (sympy.Integer(rank),),
+                    ),
+                ),
+            )
+
+        graph = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="load",
+                    block_ids=(10,),
+                    owner_rank_relation=owner(0, 0),
+                ),
+                _access(
+                    1,
+                    root=0,
+                    kind="store",
+                    block_ids=(10,),
+                    owner_rank_relation=owner(1, 1),
+                ),
+                _access(
+                    2,
+                    root=1,
+                    kind="store",
+                    block_ids=(20,),
+                    owner_rank_relation=owner(0, 0),
+                ),
+            ),
+            [[10], [20]],
+        )
+
+        edge = next(
+            edge
+            for edge in graph.edges
+            if (edge.producer_root, edge.consumer_root) == (0, 1)
+        )
+        self.assertTrue(
+            any(
+                dependency.kind is TileDependencyKind.WRITE_AFTER_READ
+                and dependency.producer_access_id == 0
+                and dependency.consumer_access_id == 2
+                for dependency in edge.access_dependencies
+            )
+        )
+
+    def test_grid_barrier_does_not_kill_cross_rank_dependency(self) -> None:
+        ranks = CoordinateDomain.scalar(2, kind="value", identity=0)
+        (rank_axis,) = ranks.axis_order
+        identity = CoordinateRelation.identity(ranks, ranks)
+        peer_zero = CoordinateRelation.point_map(
+            ranks,
+            ranks,
+            ((((rank_axis, 0, 2, 1),), (sympy.Integer(0),)),),
+        )
+        graph = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    block_ids=(10,),
+                    owner_rank_relation=identity,
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    block_ids=(20,),
+                    owner_rank_relation=peer_zero,
+                ),
+            ),
+            [[10], [20]],
+            root_phases=(0, 1),
+        )
+
+        self.assertEqual(
+            tuple((edge.producer_root, edge.consumer_root) for edge in graph.edges),
+            ((0, 1),),
+        )
+
     def test_unresolved_allocation_is_rejected(self) -> None:
         with self.assertRaisesRegex(
             exc.CrossLoopSchedulingError,

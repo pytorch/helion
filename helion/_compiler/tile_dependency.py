@@ -871,7 +871,34 @@ class CoordinateRelation:
         dense_inverse = _dense_point_fiber_inverse(self)
         if dense_inverse is not None:
             return dense_inverse
+        source_symbols = {coordinate_axis_symbol(axis) for axis in source.axis_order}
         parameters = source.parameter_symbols | self.target_domain.parameter_symbols
+        if all(
+            step == 1
+            and sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
+            and not (begin.free_symbols & source_symbols)
+            and begin.free_symbols <= parameters
+            for piece in self.pieces
+            for _axis, begin, end, step in piece.target_ranges
+        ) and all(
+            begin.free_symbols <= parameters and end.free_symbols <= parameters
+            for piece in self.pieces
+            for _axis, begin, end, _step in piece.source_bounds_items
+        ):
+            # A constant owner map (every execution rank names one peer) is
+            # many-to-one, but its converse is still an exact relation: that
+            # owner rank maps back to the complete guarded execution fiber.
+            return CoordinateRelation(
+                self.target_domain,
+                source,
+                tuple(
+                    _CoordinateRelationPiece(
+                        piece.target_ranges,
+                        piece.source_bounds_items,
+                    )
+                    for piece in self.pieces
+                ),
+            )
         pieces = []
         for piece in self.pieces:
             if any(
@@ -1279,6 +1306,31 @@ class CoordinateRelation:
             )
             for needed in required.pieces
         )
+
+    def is_identity_subset(self) -> bool:
+        """Prove that every related pair names the same coordinate."""
+        if self.source_domain != self.target_domain:
+            return False
+        for piece in self.pieces:
+            ranges = {
+                axis: (begin, end, step)
+                for axis, begin, end, step in piece.target_ranges
+            }
+            if ranges.keys() != self.source_domain.axis_count_expressions.keys():
+                return False
+            for axis, (begin, end, step) in ranges.items():
+                coordinate = coordinate_axis_symbol(axis)
+                if step != 1 or any(
+                    _simplify_logical_expression(
+                        expression,
+                        domain=self.source_domain,
+                        source_bounds=piece.source_bounds_items,
+                    )
+                    != 0
+                    for expression in (begin - coordinate, end - coordinate - 1)  # pyrefly: ignore[unsupported-operation]
+                ):
+                    return False
+        return True
 
     def source_axes_affecting_targets(self) -> tuple[int, ...] | None:
         """Return source axes that can change the related target set."""
@@ -5721,6 +5773,38 @@ def instantiate_coordinate_domains(
     return root_domains, site_domains
 
 
+def tile_access_rank_relation(
+    producer_access: TileAccess,
+    consumer_access: TileAccess,
+) -> CoordinateRelation | None:
+    """Map a consumer rank to the ranks owning its producer access."""
+    producer_owner = producer_access.owner_rank_relation
+    consumer_owner = consumer_access.owner_rank_relation
+    if producer_owner is None and consumer_owner is None:
+        return None
+    if producer_owner is None or consumer_owner is None:
+        raise exc.CrossLoopSchedulingError(
+            "because a symmetric allocation access has incomplete rank provenance"
+        )
+    producer_by_owner = producer_owner.converse()
+    relation = (
+        None if producer_by_owner is None else consumer_owner.then(producer_by_owner)
+    )
+    if relation is None:
+        raise exc.CrossLoopSchedulingError(
+            "because the symmetric allocation rank relation is not exact"
+        )
+    if relation.source_domain == relation.target_domain:
+        identity = CoordinateRelation.identity(
+            relation.source_domain, relation.target_domain
+        )
+        if relation == identity or (
+            relation.source_domain.size_expr == 1 and relation.is_total()
+        ):
+            return None
+    return relation
+
+
 def instantiate_symbolic_dependencies(
     dependency_graph: TileDependencyGraph,
     *,
@@ -5734,30 +5818,6 @@ def instantiate_symbolic_dependencies(
     if len(site_domains) != len(dependency_graph.execution_sites):
         raise ValueError("site domain count disagrees with the dependency graph")
     access_by_id = {access.access_id: access for access in dependency_graph.accesses}
-
-    def dependency_rank_relation(
-        producer_access: TileAccess,
-        consumer_access: TileAccess,
-    ) -> CoordinateRelation | None:
-        producer_owner = producer_access.owner_rank_relation
-        consumer_owner = consumer_access.owner_rank_relation
-        if producer_owner is None and consumer_owner is None:
-            return None
-        if producer_owner is None or consumer_owner is None:
-            raise exc.CrossLoopSchedulingError(
-                "because a symmetric allocation access has incomplete rank provenance"
-            )
-        producer_by_owner = producer_owner.converse()
-        relation = (
-            None
-            if producer_by_owner is None
-            else consumer_owner.then(producer_by_owner)
-        )
-        if relation is None:
-            raise exc.CrossLoopSchedulingError(
-                "because the symmetric allocation rank relation is not exact"
-            )
-        return relation
 
     def endpoints(
         access: TileAccess,
@@ -5790,6 +5850,12 @@ def instantiate_symbolic_dependencies(
         for access_dependency in edge.access_dependencies:
             producer_access = access_by_id[access_dependency.producer_access_id]
             consumer_access = access_by_id[access_dependency.consumer_access_id]
+            rank_relation = tile_access_rank_relation(producer_access, consumer_access)
+            if (
+                rank_relation is not None
+                and rank_relation.source_support_is_empty() is True
+            ):
+                continue
             producer_endpoints = endpoints(producer_access)
             consumer_endpoints = endpoints(consumer_access)
             if not producer_endpoints or not consumer_endpoints:
@@ -5802,9 +5868,7 @@ def instantiate_symbolic_dependencies(
                         producer_site_id=None,
                         consumer_site_id=None,
                         incidence=None,
-                        rank_relation=dependency_rank_relation(
-                            producer_access, consumer_access
-                        ),
+                        rank_relation=rank_relation,
                     )
                 )
                 continue
@@ -5829,9 +5893,7 @@ def instantiate_symbolic_dependencies(
                             consumer_root=edge.consumer_root,
                             producer_site_id=producer_site_id,
                             consumer_site_id=consumer_site_id,
-                            rank_relation=dependency_rank_relation(
-                                producer_access, consumer_access
-                            ),
+                            rank_relation=rank_relation,
                             incidence=incidence,
                         )
                     )
@@ -6142,11 +6204,20 @@ def _subtract_reaching_accesses(
     reaching: list[_ReachingAccess],
     writes: tuple[_ReachingAccess, ...],
 ) -> list[_ReachingAccess]:
-    cover_regions = tuple(write.region for write in writes)
     return [
         _ReachingAccess(entry.root, entry.access, residual)
         for entry in reaching
-        for residual in _subtract_regions(entry.region, cover_regions)
+        for residual in _subtract_regions(
+            entry.region,
+            tuple(
+                write.region
+                for write in writes
+                # Address coverage only kills an earlier access when both
+                # operations name the same proven rank ownership.  Distinct
+                # peer views may share an address while naming disjoint memory.
+                if write.access.owner_rank_relation == entry.access.owner_rank_relation
+            ),
+        )
     ]
 
 
@@ -6240,6 +6311,39 @@ def build_tile_dependency_graph(
         for access in accesses
         if 0 <= access.root < root_count and access.allocation_id >= 0
     }
+    for root, (root_reads, root_writes) in enumerate(
+        zip(reads_by_root, writes_by_root, strict=True)
+    ):
+        for allocation_id in root_reads.keys() | root_writes.keys():
+            allocation_accesses = (
+                *root_reads.get(allocation_id, ()),
+                *root_writes.get(allocation_id, ()),
+            )
+            if not any(
+                access.owner_rank_relation is not None for access in allocation_accesses
+            ):
+                continue
+            for left_index, left in enumerate(allocation_accesses):
+                for right in allocation_accesses[left_index:]:
+                    if left.kind == right.kind == "load" or not (
+                        allocation_regions_may_overlap(
+                            region_by_access_id[left.access_id],
+                            region_by_access_id[right.access_id],
+                        )
+                    ):
+                        continue
+                    rank_relation = tile_access_rank_relation(left, right)
+                    if rank_relation is None or (
+                        rank_relation.source_support_is_empty() is True
+                    ):
+                        continue
+                    if rank_relation.is_identity_subset():
+                        continue
+                    raise exc.CrossLoopSchedulingError(
+                        "because root "
+                        f"{root} contains an unordered cross-rank "
+                        f"{left.kind}/{right.kind} hazard"
+                    )
     dependencies_by_edge: dict[tuple[int, int, int], set[AccessDependency]] = {}
     reaching_writes: dict[int, list[_ReachingAccess]] = {}
     reaching_reads: dict[int, list[_ReachingAccess]] = {}
@@ -6249,6 +6353,24 @@ def build_tile_dependency_graph(
         consumer: _ReachingAccess,
         kind: TileDependencyKind,
     ) -> None:
+        rank_relation = None
+        if (
+            producer.access.owner_rank_relation is not None
+            or consumer.access.owner_rank_relation is not None
+        ):
+            rank_relation = tile_access_rank_relation(producer.access, consumer.access)
+            if (
+                rank_relation is not None
+                and rank_relation.source_support_is_empty() is True
+            ):
+                return
+        # A grid barrier discharges same-rank hazards, but cannot order a peer
+        # access. Keep only the latter across explicit source phases.
+        if (
+            root_phases[producer.root] != root_phases[consumer.root]
+            and rank_relation is None
+        ):
+            return
         dependencies_by_edge.setdefault(
             (producer.root, consumer.root, consumer.access.allocation_id), set()
         ).add(
@@ -6264,8 +6386,25 @@ def build_tile_dependency_graph(
     for consumer_root in range(root_count):
         phase = root_phases[consumer_root]
         if phase != current_phase:
-            reaching_writes.clear()
-            reaching_reads.clear()
+            # A source-level grid barrier only orders accesses on this rank.
+            # Retain rank-qualified accesses so cross-rank hazards remain in
+            # the dependency graph and cannot silently use the local barrier.
+            reaching_writes = {
+                allocation_id: [
+                    entry
+                    for entry in entries
+                    if entry.access.owner_rank_relation is not None
+                ]
+                for allocation_id, entries in reaching_writes.items()
+            }
+            reaching_reads = {
+                allocation_id: [
+                    entry
+                    for entry in entries
+                    if entry.access.owner_rank_relation is not None
+                ]
+                for allocation_id, entries in reaching_reads.items()
+            }
             current_phase = phase
         reads = {
             allocation_id: tuple(
@@ -6335,11 +6474,10 @@ def build_tile_dependency_graph(
             consumer_reads = reads.get(allocation_id, ())
             if consumer_reads:
                 reaching_reads.setdefault(allocation_id, []).extend(
-                    _ReachingAccess(consumer.root, consumer.access, residual)
+                    residual
                     for consumer in consumer_reads
-                    for residual in _subtract_regions(
-                        consumer.region,
-                        tuple(write.region for write in consumer_writes),
+                    for residual in _subtract_reaching_accesses(
+                        [consumer], consumer_writes
                     )
                 )
 
