@@ -193,7 +193,8 @@ def max_fa4_kv_depth(
     if limits is None:
         limits = FlashScheduleLimits()
     base_bytes = _shared_memory_bytes(dataclasses.replace(spec, kv_depth=0))
-    tile_bytes = 128 * spec.head_dim * spec.dtype_bytes
+    # A staging slot holds one KV tile, which is ``kv_tile_n`` wide.
+    tile_bytes = spec.kv_tile_n * spec.head_dim * spec.dtype_bytes
     bytes_per_stage = (2 if spec.separate_kv else 1) * tile_bytes
     return max(0, (limits.shared_memory_bytes - base_bytes) // bytes_per_stage)
 
