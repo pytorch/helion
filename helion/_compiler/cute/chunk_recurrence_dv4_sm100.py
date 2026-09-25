@@ -510,6 +510,7 @@ def recurrence_tensor_map_specs(
     total_chunks: int,
     sequences: int,
     state_ptr: int,
+    fp32_state: bool = False,
 ) -> dict[str, TensorMapSpec]:
     """Build the exact v2-workspace TensorMap specifications as plain data."""
     rows = BT * total_chunks
@@ -554,9 +555,10 @@ def recurrence_tensor_map_specs(
     specs["v"] = TensorMapSpec(base_ptr=v_ptr, **activation)
     specs["out"] = TensorMapSpec(base_ptr=out_ptr, **activation)
 
-    state = _state_spec_fields(sequences * heads)
-    specs["state_in"] = TensorMapSpec(base_ptr=state_ptr, **state)
-    specs["state_out"] = TensorMapSpec(base_ptr=state_ptr, **state)
+    if not fp32_state:
+        state = _state_spec_fields(sequences * heads)
+        specs["state_in"] = TensorMapSpec(base_ptr=state_ptr, **state)
+        specs["state_out"] = TensorMapSpec(base_ptr=state_ptr, **state)
 
     for spec in specs.values():
         spec.validate()
@@ -722,6 +724,15 @@ def mma_n8(a, b, c):
     return mma_m16n8k16_bf16(a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], c[2], c[3])
 
 
+@cute.jit
+def store_fp32_state_fragment(final_state: cute.Tensor, offset, fragment):
+    """Store a warp-MMA C fragment in the external value-major state layout."""
+    final_state[offset] = fragment[0]
+    final_state[offset + DK] = fragment[1]
+    final_state[offset + 8] = fragment[2]
+    final_state[offset + DK + 8] = fragment[3]
+
+
 @cute.kernel
 def emit_bt16_recurrence(
     gout: cute.Tensor,
@@ -736,6 +747,8 @@ def emit_bt16_recurrence(
     desc_state_out: cutlass.Int64,
     heads: cutlass.Int32,
     SCALE: cutlass.Float32,
+    initial_state: cute.Tensor | None = None,
+    final_state: cute.Tensor | None = None,
 ) -> None:
     tidx, _, _ = cute.arch.thread_idx()
     bidx, bidy, _ = cute.arch.block_idx()
@@ -783,8 +796,9 @@ def emit_bt16_recurrence(
             fence_tensormap_acquire(desc_gt)
             fence_tensormap_acquire(desc_v)
             fence_tensormap_acquire(desc_out)
-            fence_tensormap_acquire(desc_state_in)
-            fence_tensormap_acquire(desc_state_out)
+            if cutlass.const_expr(initial_state is None):
+                fence_tensormap_acquire(desc_state_in)
+                fence_tensormap_acquire(desc_state_out)
     cute.arch.barrier()
 
     # --- sequence coordinates ---------------------------
@@ -795,41 +809,49 @@ def emit_bt16_recurrence(
     state_plane = seq * heads + head
 
     # --- initial state ----------------------------------
-    if warp_id == 0:
-        if lane == 0:
-            cute.arch.mbarrier_arrive_and_expect_tx(p_bar + BAR_STATE, DV_HALF * DK * 2)
-            tma_load_3d(
-                p_state,
-                desc_state_in,
-                p_bar + BAR_STATE,
-                0,
-                dv_half * (STATE_BF16_ROWS_PER_VALUE * DV_HALF),
-                state_plane,
-            )
-    cute.arch.mbarrier_wait(p_bar + BAR_STATE, 0)
-    cute.arch.barrier()
+    if cutlass.const_expr(initial_state is None):
+        if warp_id == 0:
+            if lane == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(
+                    p_bar + BAR_STATE, DV_HALF * DK * 2
+                )
+                tma_load_3d(
+                    p_state,
+                    desc_state_in,
+                    p_bar + BAR_STATE,
+                    0,
+                    dv_half * (STATE_BF16_ROWS_PER_VALUE * DV_HALF),
+                    state_plane,
+                )
+        cute.arch.mbarrier_wait(p_bar + BAR_STATE, 0)
+        cute.arch.barrier()
 
     # --- roles ---------------------------------
     if warp_id < COMPUTE_WARPS:
         v_base = warp_id * WARP_VALUES
-        # The state lives in registers for the whole kernel, read from shared
-        # memory once here and written back once after the chunk loop.  Sixteen
-        # packed BF16 registers per lane hold this warp's [128 key, 8 value]
-        # slice, which is warp-private -- ``v_base`` is ``warp_id *
-        # WARP_VALUES`` and no warp ever addresses another's columns -- so
-        # nothing here needs a cross-warp exchange.
-        #
-        # It replaces 24 shared-memory instructions per chunk per warp (eight
-        # ``ldmatrix_x2`` in pass 1, eight ``ldmatrix_x2_trans`` and eight
-        # ``stmatrix_x2_trans`` in pass 2) with 16 ``movmatrix``.  The
-        # ``.trans`` read is the C view, which is the layout pass 2 accumulates
-        # in; pass 1 wants the B operand and gets it with one ``movmatrix`` per
-        # register.  ``tests/test_recurrence_layouts.py`` enumerates that
-        # equality, 64 of 64.
+        # Each warp owns [128 keys, 8 values]. The C-fragment layout maps
+        # lane//4 to a key row and 2*(lane%4) to two adjacent values.
+        # FP32 state stays authoritative in 32 scalar registers; only its
+        # temporary matrix operands are rounded to BF16. The legacy ABI keeps
+        # its original 16 packed BF16 registers and TMA state transport.
         h_state: tuple = ()
         for kb in cutlass.range_constexpr(KEY_BLOCKS):
-            lo, hi = ldmatrix_x2_trans(p_state + state_x2_ptr(lane, kb, v_base))
-            h_state = h_state + (lo, hi)
+            if cutlass.const_expr(initial_state is not None):
+                fp32_initial_state = cast("cute.Tensor", initial_state)
+                key = kb * BT + lane // 4
+                value = dv_half * DV_HALF + v_base + 2 * (lane % 4)
+                offset = (state_plane * DV + value) * DK + key
+                h_state = h_state + (
+                    fp32_initial_state[offset],
+                    fp32_initial_state[offset + DK],
+                    fp32_initial_state[offset + 8],
+                    fp32_initial_state[offset + DK + 8],
+                )
+            else:
+                initial_lo, initial_hi = ldmatrix_x2_trans(
+                    p_state + state_x2_ptr(lane, kb, v_base)
+                )
+                h_state = h_state + (initial_lo, initial_hi)
 
         for c in range(num_chunks):
             in_stage = input_stage(c)
@@ -872,10 +894,13 @@ def emit_bt16_recurrence(
                 # aliased onto ``h_state``: aliasing an MMA operand onto
                 # persistent state registers is what made engine's equivalent
                 # probe spill.
-                b = (
-                    movmatrix_b16(h_state[2 * kb]),
-                    movmatrix_b16(h_state[2 * kb + 1]),
-                )
+                if cutlass.const_expr(initial_state is not None):
+                    lo = pack_bf16x2(h_state[4 * kb], h_state[4 * kb + 1])
+                    hi = pack_bf16x2(h_state[4 * kb + 2], h_state[4 * kb + 3])
+                else:
+                    lo = h_state[2 * kb]
+                    hi = h_state[2 * kb + 1]
+                b = (movmatrix_b16(lo), movmatrix_b16(hi))
                 acc_x = mma_n8(
                     ldmatrix_x4(p_kd + factor_a_fragment_ptr(lane, kb)),
                     b,
@@ -927,8 +952,11 @@ def emit_bt16_recurrence(
             # is safe in place.
             next_state: tuple = ()
             for kb in cutlass.range_constexpr(KEY_BLOCKS):
-                h0, h1 = unpack_bf16x2(h_state[2 * kb])
-                h2, h3 = unpack_bf16x2(h_state[2 * kb + 1])
+                if cutlass.const_expr(initial_state is not None):
+                    h0, h1, h2, h3 = h_state[4 * kb : 4 * kb + 4]
+                else:
+                    h0, h1 = unpack_bf16x2(h_state[2 * kb])
+                    h2, h3 = unpack_bf16x2(h_state[2 * kb + 1])
                 decay_lo = cutlass.Float32(smem_gt[kb * BT + row_lo])
                 decay_hi = cutlass.Float32(smem_gt[kb * BT + row_lo + 8])
                 acc_s = (
@@ -942,23 +970,33 @@ def emit_bt16_recurrence(
                     res_b,
                     acc_s,
                 )
-                next_state = next_state + (
-                    pack_bf16x2(acc_s[0], acc_s[1]),
-                    pack_bf16x2(acc_s[2], acc_s[3]),
-                )
+                if cutlass.const_expr(initial_state is not None):
+                    next_state = next_state + acc_s
+                else:
+                    next_state = next_state + (
+                        pack_bf16x2(acc_s[0], acc_s[1]),
+                        pack_bf16x2(acc_s[2], acc_s[3]),
+                    )
             h_state = next_state
 
             warp_arrive(p_bar + BAR_IN_CONSUMED + in_stage, lane)
 
-        # The final-state path below reads the state from shared memory with all
-        # 192 threads, so the compute warps publish their registers first.  The
-        # converging barrier after this branch is what orders it.
         for kb in cutlass.range_constexpr(KEY_BLOCKS):
-            stmatrix_x2_trans(
-                p_state + state_x2_ptr(lane, kb, v_base),
-                h_state[2 * kb],
-                h_state[2 * kb + 1],
-            )
+            if cutlass.const_expr(initial_state is not None):
+                fp32_initial_state = cast("cute.Tensor", initial_state)
+                key = kb * BT + lane // 4
+                value = dv_half * DV_HALF + v_base + 2 * (lane % 4)
+                offset = (state_plane * DV + value) * DK + key
+                store_fp32_state_fragment(
+                    final_state, offset, h_state[4 * kb : 4 * kb + 4]
+                )
+            else:
+                # The converging CTA barrier publishes registers for the TMA.
+                stmatrix_x2_trans(
+                    p_state + state_x2_ptr(lane, kb, v_base),
+                    h_state[2 * kb],
+                    h_state[2 * kb + 1],
+                )
 
     elif warp_id == LOAD_WARP:
         for c in range(num_chunks):
@@ -1063,19 +1101,20 @@ def emit_bt16_recurrence(
     # All three roles converge here: the loads are issued, the last state update
     # is written, and every output store has completed its ``wait_group.read``.
     cute.arch.barrier()
-    if warp_id == STORE_WARP:
-        cute.arch.fence_view_async_shared()
-        cute.arch.sync_warp()
-        if lane == 0:
-            tma_store_3d(
-                desc_state_out,
-                p_state,
-                0,
-                dv_half * (STATE_BF16_ROWS_PER_VALUE * DV_HALF),
-                state_plane,
-            )
-            tma_store_commit_group()
-            tma_store_wait_read(0)
+    if cutlass.const_expr(initial_state is None):
+        if warp_id == STORE_WARP:
+            cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()
+            if lane == 0:
+                tma_store_3d(
+                    desc_state_out,
+                    p_state,
+                    0,
+                    dv_half * (STATE_BF16_ROWS_PER_VALUE * DV_HALF),
+                    state_plane,
+                )
+                tma_store_commit_group()
+                tma_store_wait_read(0)
 
 
 @cute.jit
@@ -1095,6 +1134,8 @@ def _recurrence_entry(
     grid_x: cutlass.Int32,
     grid_y: cutlass.Int32,
     stream,
+    initial_state: cute.Tensor | None = None,
+    final_state: cute.Tensor | None = None,
 ):
     emit_bt16_recurrence(
         gout,
@@ -1109,6 +1150,8 @@ def _recurrence_entry(
         desc_state_out,
         heads,
         scale,
+        initial_state,
+        final_state,
     ).launch(
         grid=(grid_x, grid_y, 1),
         block=(REC_THREADS, 1, 1),

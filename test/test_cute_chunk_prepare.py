@@ -369,6 +369,9 @@ def test_prepare_autotuner_searches_all_split_alias_schedules() -> None:
         if dimension.name == "cute_chunk_prepare_schedule"
     ]
     assert dimensions == [list(expected)]
+    assert [
+        dimension.name for dimension in bound.config_spec.iter_search_dimensions()
+    ] == ["block_sizes", "cute_chunk_prepare_schedule"]
     generated = [
         config["cute_chunk_prepare_schedule"]
         for _flat, config in ConfigGeneration(

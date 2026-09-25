@@ -1099,6 +1099,7 @@ class CuteBackend(Backend):
             or key == "cute_proven_bounds"
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
+            or key == "cute_chunk_recurrence_pipeline"
             or key == "cute_chunk_prepare_schedule"
             or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
@@ -1253,7 +1254,11 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        return (
+            config_spec.cute_flash_search_enabled
+            or config_spec.cute_chunk_prepare_schedule is not None
+            or config_spec.cute_chunk_recurrence_dv_partitions is not None
+        )
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or

@@ -15524,7 +15524,11 @@ class TestAutotuneBudget(TestCase):
         )
         self.assertFalse(
             backend.should_deduplicate_generated_sources(
-                SimpleNamespace(cute_flash_search_enabled=False)
+                SimpleNamespace(
+                    cute_flash_search_enabled=False,
+                    cute_chunk_prepare_schedule=None,
+                    cute_chunk_recurrence_dv_partitions=None,
+                )
             )
         )
 

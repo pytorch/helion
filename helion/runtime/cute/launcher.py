@@ -39,6 +39,8 @@ from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
+from ..._compiler.cute.chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINES
+from ..._compiler.cute.chunk_recurrence_config import chunk_recurrence_pipeline
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
 from ..._compiler.cute.grouped_worklist import GroupedWorklistRows
 from ..._compiler.cute.grouped_worklist import Tcgen05GroupedWorklistValidationError
@@ -449,6 +451,12 @@ def _append_cute_wrapper_plan(
     if kind == "chunk_recurrence_sm100":
         outputs_scaled = plan.get("outputs_scaled")
         factor_key_xor = plan.get("factor_key_xor")
+        pipeline_name = plan.get("pipeline", "wide")
+        if not isinstance(pipeline_name, str) or (
+            pipeline_name not in CUTE_CHUNK_RECURRENCE_PIPELINES
+        ):
+            raise exc.BackendUnsupported("cute", "invalid recurrence pipeline")
+        pipeline = chunk_recurrence_pipeline(pipeline_name)
         if (
             plan_int("chunk_size") != 16
             or plan_int("key_size") != 128
@@ -458,13 +466,17 @@ def _append_cute_wrapper_plan(
             or outputs_scaled is not False
             or factor_key_xor != 8
             or plan_int("device_abi") != 2
-            or plan_int("input_stages") != 8
-            or plan_int("tma_stages") != 6
+            or plan_int("smem_bytes") != pipeline.smem_bytes
+            or plan_int("input_stages") != pipeline.input_stages
+            or plan_int("tma_stages") != pipeline.tma_stages
             or plan_int("factor_tma_value_splits") != 2
-            or plan_int("output_acc_stages") != 2
+            or plan_int("output_acc_stages") != pipeline.output_acc_stages
             or plan_int("output_smem_stages") != 7
             or plan_int("output_store_wait_groups") != 6
-            or plan_int("tmem_cols") != 512
+            or plan_int("tmem_cols") != pipeline.tmem_cols
+            or plan.get("compute_registers", 136) != pipeline.compute_registers
+            or plan.get("service_registers", 56) != pipeline.service_registers
+            or plan.get("min_blocks_per_mp", 1) != pipeline.min_blocks_per_mp
         ):
             raise exc.BackendUnsupported(
                 "cute", "invalid SM100 chunk-recurrence schedule ABI"
@@ -1554,6 +1566,11 @@ def _append_sm100_chunk_recurrence_host_call(
     values = tensor_arg("v_idx")
     output = tensor_arg("out_idx")
     state = tensor_arg("state_idx")
+    initial_state_arg = (
+        f", initial_state={tensor_arg('initial_state_idx')}"
+        if plan.get("state_dtype") == "float32"
+        else ""
+    )
     cu_seqlens = tensor_arg("cu_seqlens_idx")
     cu_chunks = tensor_arg("cu_chunks_idx")
 
@@ -1581,6 +1598,7 @@ def _append_sm100_chunk_recurrence_host_call(
     append_view("_chunk_gt", gt, gt_shape, gt_stride)
     append_view("_chunk_v", values, activation_shape, activation_stride)
     append_view("_chunk_out", output, activation_shape, activation_stride)
+    pipeline = chunk_recurrence_pipeline(cast("str", plan.get("pipeline", "wide")))
     host_call = (
         "    _helion_sm100_chain_host("
         "_chunk_v, "
@@ -1589,7 +1607,10 @@ def _append_sm100_chunk_recurrence_host_call(
         f"{state}, _chunk_out, stream, "
         f"cutlass.Int32(0), cutlass.Int32({heads}), "
         f"cutlass.Float32({output_scale}), "
-        "512)"
+        f"512, {pipeline.input_stages}, {pipeline.tma_stages}, "
+        f"{pipeline.output_acc_stages}, {pipeline.tmem_cols}, "
+        f"{pipeline.compute_registers}, {pipeline.service_registers}, "
+        f"{pipeline.min_blocks_per_mp}{initial_state_arg})"
     )
     body.extend(("    _helion_cute_kernel_tag = 'chunk_recurrence_sm100'", host_call))
 
@@ -1624,6 +1645,20 @@ def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -
     cu_seqlens = tensor_arg("cu_seqlens_idx")
     cu_chunks = tensor_arg("cu_chunks_idx")
     output_scale = f"arg{plan_int('scale_idx')}"
+    state_args: tuple[str, ...] = ()
+    if plan.get("state_dtype") == "float32":
+        for name, key in (
+            ("_chunk_initial_state", "initial_state_idx"),
+            ("_chunk_final_state", "state_idx"),
+        ):
+            body.append(
+                f"    {name} = cute.make_tensor({tensor_arg(key)}.iterator, "
+                f"cute.make_layout(({sequences * heads * 128 * 128},), stride=(1,)))"
+            )
+        state_args = (
+            "initial_state=_chunk_initial_state",
+            "final_state=_chunk_final_state",
+        )
     body.extend(
         (
             (
@@ -1654,6 +1689,7 @@ def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -
                     "grid_x",
                     "grid_y",
                     "stream",
+                    *state_args,
                 )
             )
             + ")",
@@ -4945,6 +4981,7 @@ def _chunk_recurrence_tensor_map_specs(
         return value
 
     kind = plan.get("kind")
+    state_dtype = plan.get("state_dtype", "bfloat16")
     if (
         kind not in ("chunk_recurrence_sm100", "chunk_recurrence_warp_dv4")
         or plan_int("workspace_layout_version") != 2
@@ -4953,6 +4990,7 @@ def _chunk_recurrence_tensor_map_specs(
         or plan_int("chunk_size") != 16
         or plan_int("key_size") != 128
         or plan_int("value_size") != 128
+        or state_dtype not in ("bfloat16", "float32")
     ):
         raise exc.BackendUnsupported("cute", "unsupported chunk-recurrence ABI")
     total_tokens = plan_int("total_tokens")
@@ -4986,7 +5024,14 @@ def _chunk_recurrence_tensor_map_specs(
         cu_seqlens,
         cu_chunks,
     ) = tuple(_chunk_recurrence_plan_tensor(plan, args, name) for name in names)
+    initial_state = (
+        _chunk_recurrence_plan_tensor(plan, args, "initial_state_idx")
+        if state_dtype == "float32"
+        else state
+    )
+    state_tensors = (state, initial_state) if state_dtype == "float32" else (state,)
     tensors = (kd, qd, ak, aq, g_total, values, output, state, cu_seqlens, cu_chunks)
+    tensors = (*tensors, initial_state)
     if kd.device.type != "cuda" or any(
         tensor.device != kd.device for tensor in tensors
     ):
@@ -5007,7 +5052,16 @@ def _chunk_recurrence_tensor_map_specs(
         (g_total, torch.float32, (heads * total_chunks, 128)),
         (values, torch.bfloat16, (total_tokens * heads, 128)),
         (output, torch.bfloat16, (total_tokens * heads, 128)),
-        (state, torch.bfloat16, (sequences, heads, 128, 128)),
+        (
+            state,
+            torch.float32 if state_dtype == "float32" else torch.bfloat16,
+            (sequences, heads, 128, 128),
+        ),
+        (
+            initial_state,
+            torch.float32 if state_dtype == "float32" else torch.bfloat16,
+            (sequences, heads, 128, 128),
+        ),
         (cu_seqlens, torch.int32, (sequences + 1,)),
         (cu_chunks, torch.int32, (sequences + 1,)),
     )
@@ -5065,19 +5119,27 @@ def _chunk_recurrence_tensor_map_specs(
             raise exc.BackendUnsupported(
                 "cute", f"chunk-recurrence output aliases {name}"
             )
-    for tensor in (*factor_tensors, values, output, cu_seqlens, cu_chunks):
-        if overlaps(state, tensor):
-            raise exc.BackendUnsupported("cute", "chunk-recurrence state aliases input")
+    if state_dtype == "float32" and overlaps(state, initial_state):
+        raise exc.BackendUnsupported(
+            "cute", "FP32 chunk-recurrence states must be disjoint"
+        )
+    for state_tensor in state_tensors:
+        for tensor in (*factor_tensors, values, output, cu_seqlens, cu_chunks):
+            if overlaps(state_tensor, tensor):
+                raise exc.BackendUnsupported(
+                    "cute", "chunk-recurrence state aliases input"
+                )
     factor_begin = kd_ptr
     factor_end = kd_ptr + workspace_bytes
-    for tensor in (values, output, state, cu_seqlens, cu_chunks):
+    for tensor in (values, output, *state_tensors, cu_seqlens, cu_chunks):
         begin, end = byte_range(tensor)
         if begin < factor_end and factor_begin < end:
             raise exc.BackendUnsupported(
                 "cute", "chunk-recurrence factor workspace aliases another argument"
             )
     if any(
-        tensor.data_ptr() % 16 for tensor in (kd, aq, g_total, values, output, state)
+        tensor.data_ptr() % 16
+        for tensor in (kd, aq, g_total, values, output, *state_tensors)
     ):
         raise exc.BackendUnsupported("cute", "chunk-recurrence TMA base is misaligned")
 
@@ -5107,6 +5169,7 @@ def _chunk_recurrence_tensor_map_specs(
         total_chunks=total_chunks,
         sequences=sequences,
         state_ptr=state.data_ptr(),
+        fp32_state=state_dtype == "float32",
     )
 
 
