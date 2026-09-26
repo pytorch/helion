@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from .aux_tensor import Tcgen05AuxTensorDescriptor
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
+    from .collective_matmul import CollectiveMmaSite
     from .completed_matmul_sum import CompletedMatmulSum
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_flash_bwd import AttentionBwdMatch
@@ -676,6 +677,14 @@ class CuteDeviceFunctionState:
         # masking for that axis (the serial loop already covers exactly [0, C)).
         # Empty except while re-materializing such an operand load.
         self.matmul_operand_index_override: dict[int, str] = {}
+        self.collective_mma_sites: list[CollectiveMmaSite] = []
+        self.collective_mma_static_layouts = False
+        # Late scalar-recipe staging may compose several contractions. These
+        # statements access only fresh compiler-owned shared buffers, so later
+        # sites can keep proving effects against the original global accesses.
+        self.collective_mma_emitted_stmt_ids: set[int] = set()
+        self.collective_mma_shared_results: set[str] = set()
+        self.collective_mma_pure_stmt_ids: set[int] = set()
         # Grouped two-phase lowering for structurally proven fixed-token,
         # split-input BF16 rank-1 recurrences.
         self.fixed_token_rank1_plan: CuteFixedTokenRank1Plan | None = None
@@ -693,6 +702,8 @@ class CuteDeviceFunctionState:
         # BF16 rank-1 state recurrence. The plan is absent by default and is
         # additionally gated by the user-facing fast_math setting.
         self.single_token_rank1_plan: CuteSingleTokenRank1Plan | None = None
+        self.collective_register_chain_lowered = False
+        self.collective_register_chain_block_dims: tuple[int, int, int] | None = None
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None

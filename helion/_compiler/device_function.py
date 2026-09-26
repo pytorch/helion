@@ -1213,7 +1213,20 @@ class DeviceFunction:
                     except ValueError:
                         continue
             proven_disjoint_tensor_pairs = self.proven_disjoint_tensor_pairs()
+            from .cute.collective_matmul import lower_collective_matmul
 
+            kernel_body = lower_collective_matmul(
+                kernel_body,
+                self,
+                boundary_names={arg.name for arg in sorted_arguments},
+                disjoint_pairs=proven_disjoint_tensor_pairs,
+                rename_groups={k: v[0] for k, v in self._variable_renames.items()},
+            )
+            if self.cute_state.collective_register_chain_block_dims is not None:
+                exact_thread_block_dims = thread_block_dims = (
+                    self.cute_state.collective_register_chain_block_dims
+                )
+                thread_block_dims_are_exact = True
             # Autotuner-selected reload mode per rolled or persistent
             # reduction dim ("auto" / "register" / "gmem").
             env = CompileEnvironment.current()
@@ -1577,14 +1590,31 @@ class DeviceFunction:
                 | frozenset(constexpr_values),
                 thread_block_dims=exact_thread_block_dims,
             )
+            from .cute.proven_loop_bounds import exact_static_grid
             from .cute.proven_loop_bounds import simplify_proven_loop_bounds
             from .cute.simplify_proven_bounds import simplify_proven_bounds
+            from .program_id import CuteProgramIDs
+            from .program_id import FlatProgramIDs
 
+            # Ordinary collective launches use the PID strategy's grid
+            # unchanged. Other launch schedulers retain architectural bounds.
+            collective_grid = None
+            if (
+                self.pid is not None
+                and type(self.pid) in (FlatProgramIDs, CuteProgramIDs, XYZProgramIDs)
+                and self.cute_state.simt_cluster_n == 1
+                and self.cute_state.collective_mma_sites
+                and not self.codegen.cute_wrapper_plans
+            ):
+                collective_grid = exact_static_grid(
+                    self.pid.codegen_grid(), constexpr_values
+                )
             kernel_body = simplify_proven_loop_bounds(
                 kernel_body,
                 enabled=bool(self.config.config.get("cute_proven_bounds", False)),
                 thread_block_dims=exact_thread_block_dims,
                 constexpr_values=constexpr_values,
+                block_grid_dims=collective_grid,
             )
 
             kernel_body = simplify_proven_bounds(

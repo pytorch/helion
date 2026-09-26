@@ -23,6 +23,7 @@ from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
 from .cute import CuteChunkPrepareHeuristic
 from .cute import CuteChunkRecurrenceHeuristic
+from .cute import CuteCollectiveMatmulHeuristic
 from .cute import CuteFixedTokenRank1Heuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
@@ -57,6 +58,7 @@ from .cute_launch_bounds import register_matmul_min_blocks_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
+from .register_chain import CuteRegisterChainHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MultiMatmulHeuristic
 from .triton import TritonH100FormulaMatmulHeuristic
@@ -87,6 +89,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFlashAttentionHeuristic,
         CutePackedSingleTokenRank1Heuristic,
         CuteFixedTokenRank1Heuristic,
+        CuteCollectiveMatmulHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,
         CuteTcgen05ClusterM2Heuristic,
         CuteTcgen05GroupedWorklistHeuristic,
@@ -108,6 +111,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteResidentRowWideClusterHeuristic,
         CuteResidentMultiRowHeuristic,
         CutePointwiseVecHeuristic,
+        CuteRegisterChainHeuristic,
         CuteTcgen05GroupedSource64Heuristic,
     ),
     "triton": (
@@ -261,6 +265,18 @@ def compiler_seed_configs(
         configs = add_signed_bitfield_seeds(env, dedupe_configs(configs))
     configs = dedupe_configs(configs)
     if env.backend_name == "cute":
+        # Preserve the complete old prefix. A declared coverage witness below
+        # admits the static-layout policy without displacing coupled schedules
+        # from a bounded initial population.
+        for seed in tuple(configs):
+            if (
+                seed.config.get("cute_collective_mma", False)
+                and seed.config.get("cute_collective_compute", "warp") == "warp"
+            ):
+                values = deepcopy(seed.config)
+                values["cute_collective_static_layouts"] = True
+                configs.append(Config.from_dict(values))
+    if env.backend_name == "cute":
         carrier = grouped_row_union_cluster4_carrier(env, device_ir)
         if carrier is not None:
             configs.append(carrier)
@@ -399,3 +415,25 @@ def register_compiler_coverage_groups(
             )
         )
     register_matmul_min_blocks_coverage(env, device_ir)
+    carriers = env.config_spec.compiler_seed_configs
+    if not carriers:
+        # Declarations remain available when automatic seed use is disabled.
+        # Reuse the same typed layout proof without promoting a default/seed.
+        carriers = CuteCollectiveMatmulHeuristic.get_seed_configs(env, device_ir)
+    for seed in carriers:
+        if (
+            seed.config.get("cute_collective_mma", False)
+            and seed.config.get("cute_collective_compute", "warp") == "warp"
+            and not seed.config.get("cute_collective_static_layouts", False)
+        ):
+            env.config_spec.register_compiler_coverage_group(
+                CompilerCoverageGroup(
+                    mechanism="cute.collective_static_layouts",
+                    version=1,
+                    key="cute_collective_static_layouts",
+                    domain=(False, True),
+                    legacy=False,
+                    witnesses=(CoverageWitness(seed, True),),
+                )
+            )
+            break

@@ -9,6 +9,9 @@ from examples.jagged_dense_bmm import jagged_dense_bmm
 import pytest
 import torch
 
+from test.test_cute_collective_tf32 import _config as _collective_config
+from test.test_cute_collective_tf32 import _jagged_inputs
+from test.test_cute_collective_tf32 import _kernel as _collective_kernel
 from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
@@ -40,19 +43,11 @@ def _selected_config() -> helion.Config:
         load_eviction_policies=["l2_last", "streaming", "", "l2_last", "l2_last"],
         cute_vector_widths=[2, 4, 1, 2],
         cute_lane_layouts=["blocked", "strided", "strided", "strided"],
-    )
-
-
-def _jagged_inputs(
-    *, batch: int, rows: int, k: int, n: int, device: str = "cpu"
-) -> tuple[torch.Tensor, ...]:
-    offsets = torch.zeros(batch + 1, dtype=torch.int64, device=device)
-    offsets[-1] = rows
-    return (
-        offsets,
-        torch.empty((rows, k), device=device),
-        torch.empty((batch, k, n), device=device),
-        torch.empty((batch, n), device=device),
+        cute_collective_mma=False,
+        cute_collective_compute="warp",
+        cute_collective_native_seeded=True,
+        cute_collective_stages=4,
+        cute_collective_copy="scalar",
     )
 
 
@@ -136,6 +131,24 @@ def test_jagged_simt_schedules_keep_row_coverage(
         )
     else:
         assert "for lane_1" in source
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
+@pytest.mark.parametrize("compute", ["warp", "tcgen05"])
+def test_collective_matmul_keeps_its_cooperative_launch(
+    static_shapes: bool, compute: str
+) -> None:
+    inputs = (torch.empty((3, 130, 78)), torch.empty((3, 78, 70)))
+    bound = _collective_kernel(
+        batched=True, static_shapes=static_shapes
+    )._bind_isolated(inputs)
+    source = bound.to_code(_collective_config(compute=compute))
+    assert _launch_shape(source) == (4, 32, 1)
+    assert "cute.gemm(" in source
+    if compute == "tcgen05":
+        assert "tcgen05.CtaGroup.ONE" in source
+    else:
+        assert "warp.MmaTF32Op((16, 8, 8))" in source
 
 
 def _nested_copy(x: torch.Tensor) -> torch.Tensor:
