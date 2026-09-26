@@ -7,7 +7,7 @@ who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
 autotuning.  Each entry lists the NVIDIA architecture it supports (currently
-H100, B200, or both), and Helion picks the matching file at runtime.  Treat the
+H100, B200, or GB300), and Helion picks the matching file at runtime.  Treat the
 files as kernel recipes: copy the kernel and its local `_helion_aot_*` heuristic
 into your code, then retune when your target shapes or hardware differ
 materially from the included sweep.
@@ -27,6 +27,7 @@ pretuned_kernels/
 ├── softmax/
 ├── layer_norm/
 ├── rms_norm/
+├── rms_norm_cute/                    # GB300 CuTe BF16 RMSNorm
 ├── cross_entropy/
 ├── rope/
 ├── scaled_mm/
@@ -61,6 +62,7 @@ At runtime Helion picks the file matching the current GPU.
 | `softmax` | Triton tutorial `M=4096, N=128*i for i in range(2, 100)` + realistic long-context shapes | `F.softmax` |
 | `layer_norm` | Triton tutorial `M=4096, N=512*i for i in range(2, 32)` + realistic hidden-size shapes | `F.layer_norm` |
 | `rms_norm` | TritonBench `(M=2048, H)` default + NPOT shapes + realistic LLM hidden-size and production-style shapes | `F.rms_norm` |
+| `rms_norm_cute` | Thirteen contiguous BF16 shapes from `(2048, 1024)` through `(8192, 262144)`, with `eps=1e-5` (GB300 CuTe only) | `F.rms_norm` |
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
 | `rope` | TritonBench RoPE `(H, T)` defaults with exact shape buckets and `H8192_T2048` fallback | eager RoPE reference |
 | `scaled_mm` | vLLM Qwen3 FP8 `(K, N)` weight shapes at small token counts `M in {16, 64}` | `torch._scaled_mm` |
