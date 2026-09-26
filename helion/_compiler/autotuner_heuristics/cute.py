@@ -3080,6 +3080,18 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
             spec.cute_chained_initialized_accumulator_search_enabled
             and has_late_rhs_candidate(device_ir.graphs)
         )
+        from ..cute.chained_k_schedule import has_k_schedule_candidate
+
+        spec.cute_chained_k_schedule_search_enabled = (
+            spec.cute_chained_late_rhs_reuse_search_enabled
+            and has_k_schedule_candidate(device_ir.graphs)
+        )
+        from ..cute.chained_leaf_pipeline import has_leaf_candidate
+
+        spec.cute_chained_leaf_pipeline_search_enabled = (
+            spec.cute_chained_k_schedule_search_enabled
+            and has_leaf_candidate(device_ir.graphs)
+        )
         return frozenset()
 
     @classmethod
@@ -3306,7 +3318,11 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                             *ordered[index + 1 :],
                         ]
                         break
-            return _with_last_read_seed(ordered)
+            return cls._startup_seed(
+                env,
+                device_ir,
+                _with_last_read_seed(ordered),
+            )
         result: list[Config] = []
         for seed in ordered:
             result.append(seed)
@@ -3326,7 +3342,35 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                             }
                         )
                     )
-        return _with_last_read_seed(_with_early_tmem_release_seed(result))
+        return _with_leaf_pipeline_seeds(
+            cls._startup_seed(
+                env,
+                device_ir,
+                _with_last_read_seed(
+                    _with_k_schedule_seeds(
+                        _with_early_tmem_release_seed(result),
+                        enabled=spec.cute_chained_k_schedule_search_enabled,
+                    )
+                ),
+            ),
+            enabled=spec.cute_chained_leaf_pipeline_search_enabled,
+        )
+
+    @classmethod
+    def _startup_seed(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, seeds: list[Config]
+    ) -> list[Config]:
+        from ..cute.chained_startup import has_startup_leaf
+
+        if not has_startup_leaf(device_ir.graphs):
+            return seeds
+        parents = cls._tcgen05_seed_configs_for_rows(env, device_ir, 128)
+        if parents:
+            return _with_chained_startup_seed(seeds, parents)
+        # The existing sparse direct-result seed supplies the independently
+        # admitted M64 geometry. Never broaden or multiply an M128 pool.
+        parents = cls._tcgen05_seed_configs_for_rows(env, device_ir, 64)
+        return _with_chained_startup_seed(seeds, parents, prefer_direct=True)
 
     @classmethod
     def get_seed_config(
@@ -3334,6 +3378,52 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         seeds = cls.get_seed_configs(env, device_ir)
         return seeds[0] if seeds else None
+
+
+def _with_leaf_pipeline_seeds(seeds: list[Config], *, enabled: bool) -> list[Config]:
+    """Add a paired TMA sibling to one structural overlap parent."""
+    if enabled:
+        for index, seed in enumerate(seeds):
+            if seed.config.get("cute_chained_k_schedule") == "overlap64":
+                return [
+                    *seeds[: index + 1],
+                    Config.from_dict(
+                        seed.config | {"cute_chained_leaf_pipeline": "paired_tma"}
+                    ),
+                    *seeds[index + 1 :],
+                ]
+    return seeds
+
+
+def _with_chained_startup_seed(
+    seeds: list[Config], parents: list[Config], *, prefer_direct: bool = False
+) -> list[Config]:
+    """Add one typed startup sibling without changing any legacy seed object."""
+    geometries = {(tuple(parent.block_sizes), parent.num_warps) for parent in parents}
+    for index, parent in enumerate(seeds):
+        config = parent.config
+        if (
+            config.get("cute_chained_mma_schedule") != "tcgen05_tmem"
+            or "block_sizes" not in config
+            or config.get("cute_chained_k_schedule", "full") != "full"
+            or bool(config.get("cute_chained_direct_output")) != prefer_direct
+            or any(
+                config.get(key)
+                for key in (
+                    "cute_chained_initialized_accumulator",
+                    "cute_chained_late_rhs_reuse",
+                    "cute_chained_startup_transfer",
+                )
+            )
+        ):
+            continue
+        if (tuple(parent.block_sizes), parent.num_warps) in geometries:
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(config | {"cute_chained_startup_transfer": "tma"}),
+                *seeds[index + 1 :],
+            ]
+    return seeds
 
 
 def _with_last_read_seed(seeds: list[Config]) -> list[Config]:
@@ -3344,6 +3434,48 @@ def _with_last_read_seed(seeds: list[Config]) -> list[Config]:
                 *seeds[: index + 1],
                 Config.from_dict(
                     parent.config | {"cute_chained_tmem_free": "last_read"}
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
+
+
+def _with_k_schedule_seeds(seeds: list[Config], *, enabled: bool) -> list[Config]:
+    """Two optional siblings; keep every legacy object in its original order."""
+    if not enabled:
+        return seeds
+    parents = [
+        seed
+        for seed in seeds
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        and seed.config.get("cute_chained_initialized_accumulator")
+        and seed.config.get("cute_chained_late_rhs_reuse")
+        and seed.config.get("cute_chained_pointwise_vectorize")
+        and seed.config.get("cute_chained_pointwise_unroll") == 8
+        and not seed.config.get("cute_chained_pointwise_inplace_async")
+        and not seed.config.get("cute_chained_direct_output")
+    ]
+    if not parents:
+        return seeds
+    parent = next(
+        (
+            seed
+            for seed in parents
+            if seed.config.get("cute_chained_pointwise_read_cache")
+        ),
+        parents[0],
+    )
+    for index, seed in enumerate(seeds):
+        if (
+            seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+            and seed.config.get("block_sizes") == parent.config.get("block_sizes")
+            and seed.config.get("num_warps") == parent.config.get("num_warps")
+        ):
+            return [
+                *seeds[: index + 1],
+                *(
+                    Config.from_dict(parent.config | {"cute_chained_k_schedule": mode})
+                    for mode in ("serial64", "overlap64")
                 ),
                 *seeds[index + 1 :],
             ]

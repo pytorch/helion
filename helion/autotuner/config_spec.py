@@ -774,6 +774,7 @@ VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
 CUTE_CHAINED_MMA_SCHEDULE_KEY = "cute_chained_mma_schedule"
 CUTE_CHAINED_POINTWISE_VECTORIZE_KEY = "cute_chained_pointwise_vectorize"
+CUTE_CHAINED_STARTUP_TRANSFER_KEY = "cute_chained_startup_transfer"
 CUTE_CHAINED_TMEM_FREE_KEY = "cute_chained_tmem_free"
 VALID_CUTE_CHAINED_TMEM_FREE_SCHEDULES = ("legacy", "last_read")
 CUTE_CHAINED_POINTWISE_UNROLL_KEY = "cute_chained_pointwise_unroll"
@@ -790,6 +791,10 @@ VALID_CUTE_LOOP_LOAD_SCHEDULES = (
 )
 CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY = "cute_chained_initialized_accumulator"
 CUTE_CHAINED_LATE_RHS_REUSE_KEY = "cute_chained_late_rhs_reuse"
+CUTE_CHAINED_K_SCHEDULE_KEY = "cute_chained_k_schedule"
+VALID_CUTE_CHAINED_K_SCHEDULES = ("full", "serial64", "overlap64")
+CUTE_CHAINED_LEAF_PIPELINE_KEY = "cute_chained_leaf_pipeline"
+VALID_CUTE_CHAINED_LEAF_PIPELINES = ("legacy", "paired_tma")
 CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY = "cute_chained_tmem_early_release"
 CUTE_CHAINED_DIRECT_OUTPUT_KEY = "cute_chained_direct_output"
 VALID_CUTE_CHAINED_POINTWISE_UNROLLS = (1, 2, 4, 8)
@@ -879,6 +884,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_STARTUP_TRANSFER_KEY,
         CUTE_CHAINED_TMEM_FREE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
@@ -887,6 +893,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
         CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_K_SCHEDULE_KEY,
+        CUTE_CHAINED_LEAF_PIPELINE_KEY,
         CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
         CUTE_CHAINED_DIRECT_OUTPUT_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
@@ -936,6 +944,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_STARTUP_TRANSFER_KEY,
         CUTE_CHAINED_TMEM_FREE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
@@ -944,6 +953,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
         CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_K_SCHEDULE_KEY,
+        CUTE_CHAINED_LEAF_PIPELINE_KEY,
         CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
         CUTE_CHAINED_DIRECT_OUTPUT_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
@@ -1302,6 +1313,8 @@ class ConfigSpec:
         self.cute_chained_pointwise_inplace_search_enabled: bool = False
         self.cute_chained_initialized_accumulator_search_enabled: bool = False
         self.cute_chained_late_rhs_reuse_search_enabled: bool = False
+        self.cute_chained_k_schedule_search_enabled: bool = False
+        self.cute_chained_leaf_pipeline_search_enabled: bool = False
         self.cute_chained_direct_output_search_enabled: bool = False
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
@@ -2680,6 +2693,54 @@ class ConfigSpec:
                 f"{key} requires a resident one-CTA chained TCgen05 schedule"
             )
 
+    def _normalize_cute_chained_k_schedule(self, config: dict[str, object]) -> None:
+        # Run before repair: an explicit unsupported request cannot be erased
+        # or have its prerequisites silently enabled by generic normalization.
+        key = CUTE_CHAINED_K_SCHEDULE_KEY
+        value = config.get(key, "full")
+        if type(value) is not str or value not in VALID_CUTE_CHAINED_K_SCHEDULES:
+            raise InvalidConfig(f"{key} must be full, serial64 or overlap64")
+        if value == "full":
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_k_schedule_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY) is not True
+            or config.get(CUTE_CHAINED_LATE_RHS_REUSE_KEY) is not True
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+            or config.get("num_warps", DEFAULT_NUM_WARPS) != 4
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+        ):
+            raise InvalidConfig(
+                f"{key} requires an initialized late-RHS vector K128 TCgen05 pair"
+            )
+
+    def _normalize_cute_chained_leaf_pipeline(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_LEAF_PIPELINE_KEY
+        value = config.get(key, "legacy")
+        if type(value) is not str or value not in VALID_CUTE_CHAINED_LEAF_PIPELINES:
+            raise InvalidConfig(f"{key} must be legacy or paired_tma")
+        if value == "legacy":
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_leaf_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_K_SCHEDULE_KEY) not in ("serial64", "overlap64")
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY) is not True
+            or config.get(CUTE_CHAINED_LATE_RHS_REUSE_KEY) is not True
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+            or config.get("num_warps", DEFAULT_NUM_WARPS) != 4
+            or config.get(CUTE_CHAINED_POINTWISE_INPLACE_KEY)
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+        ):
+            raise InvalidConfig(
+                f"{key} requires an initialized, late-RHS FP32-leaf K128 pair"
+            )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -2844,6 +2905,8 @@ class ConfigSpec:
 
         self._normalize_cute_loop_load_schedule(config)
         self._normalize_cute_chained_tmem_free(config)
+        self._normalize_cute_chained_k_schedule(config)
+        self._normalize_cute_chained_leaf_pipeline(config)
 
         for name in (
             "block_size",
@@ -3374,6 +3437,16 @@ class ConfigSpec:
                 raise InvalidConfig(
                     "initialized accumulator requires an independent FP32 TCgen05 pair"
                 )
+        startup = config.get(CUTE_CHAINED_STARTUP_TRANSFER_KEY, "legacy")
+        if type(startup) is not str or startup not in ("legacy", "tma"):
+            raise InvalidConfig("cute_chained_startup_transfer must be legacy or tma")
+        if startup == "legacy":
+            config.pop(CUTE_CHAINED_STARTUP_TRANSFER_KEY, None)
+        elif (
+            not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+        ):
+            raise InvalidConfig("startup TMA requires a TCgen05 contraction DAG")
         if self.cute_chained_tcgen05_search_enabled:
             cache = config.setdefault(CUTE_CHAINED_AUXILIARY_CACHE_KEY, False)
             if not isinstance(cache, bool):
@@ -3984,7 +4057,13 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if key == CUTE_CHAINED_STARTUP_TRANSFER_KEY:
+                return True, "legacy"
             if key == CUTE_CHAINED_TMEM_FREE_KEY:
+                return True, "legacy"
+            if key == CUTE_CHAINED_K_SCHEDULE_KEY:
+                return True, "full"
+            if key == CUTE_CHAINED_LEAF_PIPELINE_KEY:
                 return True, "legacy"
             if key in (
                 CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
@@ -4214,6 +4293,18 @@ class ConfigSpec:
                             choices=(False, True)
                         )
                 fields.update(self.user_defined_tunables)
+                if self.cute_chained_k_schedule_search_enabled:
+                    fields[CUTE_CHAINED_K_SCHEDULE_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_K_SCHEDULES
+                    )
+                if self.cute_chained_tcgen05_search_enabled:
+                    fields[CUTE_CHAINED_STARTUP_TRANSFER_KEY] = EnumFragment(
+                        choices=("legacy", "tma")
+                    )
+                if self.cute_chained_leaf_pipeline_search_enabled:
+                    fields[CUTE_CHAINED_LEAF_PIPELINE_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_LEAF_PIPELINES
+                    )
                 return fields
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())

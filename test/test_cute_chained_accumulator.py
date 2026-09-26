@@ -276,8 +276,8 @@ def test_effective_plan_and_exact_shared_cache_budget():
     calls = []
     budgets = []
 
-    def accounting(plan):
-        value = original_bytes(plan)
+    def accounting(plan, *, startup=False):
+        value = original_bytes(plan, startup=startup)
         calls.append((plan, value))
         return value
 

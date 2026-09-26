@@ -1072,6 +1072,14 @@ class CuteBackend(Backend):
         device_function.cute_state.chained_matmul_plan = chained_plan
         if chained_plan is not None:
             return
+        if config.config.get("cute_chained_leaf_pipeline", "legacy") != "legacy":
+            raise exc.BackendUnsupported(
+                "cute", "paired leaf pipeline requires a resident K128 pair"
+            )
+        if config.config.get("cute_chained_k_schedule", "full") != "full":
+            raise exc.BackendUnsupported(
+                "cute", "K64 scheduling requires a supported initialized K128 pair"
+            )
         if config.config.get("cute_chained_direct_output"):
             raise exc.BackendUnsupported(
                 "cute", "direct output requires a supported resident one-dot M64 plan"
@@ -1161,6 +1169,7 @@ class CuteBackend(Backend):
             or key == "cute_affine_scan_schedule"
             or key == "cute_chained_mma_schedule"
             or key == "cute_chained_pointwise_vectorize"
+            or key == "cute_chained_startup_transfer"
             or key == "cute_chained_tmem_free"
             or key == "cute_chained_pointwise_unroll"
             or key == "cute_chained_pointwise_read_cache"
@@ -1169,6 +1178,8 @@ class CuteBackend(Backend):
             or key == "cute_loop_load_schedule"
             or key == "cute_chained_initialized_accumulator"
             or key == "cute_chained_late_rhs_reuse"
+            or key == "cute_chained_k_schedule"
+            or key == "cute_chained_leaf_pipeline"
             or key == "cute_chained_tmem_early_release"
             or key == "cute_chained_direct_output"
             or key == "cute_chained_auxiliary_cache"

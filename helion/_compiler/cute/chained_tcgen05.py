@@ -24,6 +24,10 @@ from . import chained_matmul as chain
 from .chained_aux_cache import make_early_auxiliary_cache
 from .chained_aux_cache import make_late_auxiliary_cache
 from .chained_aux_cache import uses_early_cache
+from .chained_leaf_pipeline import LeafPipeline
+from .chained_leaf_pipeline import finish_wrapper
+from .chained_leaf_pipeline import plan_leaf_pipeline
+from .chained_leaf_pipeline import produce_half
 from .chained_pointwise_cache import PointwiseReadCache
 from .chained_pointwise_inplace import PointwiseInplace
 from .chained_pointwise_inplace import raw_preload
@@ -54,11 +58,17 @@ def _prefetch_final_b(plan: ChainedMatmulPlan) -> bool:
     )
 
 
-def supported_plan(plan: ChainedMatmulPlan) -> bool:
+def supported_plan(plan: ChainedMatmulPlan, *, startup: bool = False) -> bool:
     """Conservative physical bounds, separate from the common semantic proof."""
     if plan.threads != 128 or any(size % block for _, size, block in plan.axes):
         return False
     m64 = is_m64_plan(plan)
+    if startup and (
+        plan.initialized_accumulator is not None
+        or plan.late_rhs_reuse is not None
+        or plan.k_schedule is not None
+    ):
+        return False
     if plan.direct_output and not m64:
         return False
     if not m64 and any(
@@ -70,12 +80,12 @@ def supported_plan(plan: ChainedMatmulPlan) -> bool:
     if final_shape != plan.shapes[-1][:2]:
         return False
     device = cast("Node", plan.dots[0].args[0]).meta["val"].device
-    return _shared_memory_bytes(plan) <= CuteTcgen05Config.per_cta_smem_capacity_bytes(
-        device
-    )
+    return _shared_memory_bytes(
+        plan, startup=startup
+    ) <= CuteTcgen05Config.per_cta_smem_capacity_bytes(device)
 
 
-def _shared_memory_bytes(plan: ChainedMatmulPlan) -> int:
+def _shared_memory_bytes(plan: ChainedMatmulPlan, *, startup: bool = False) -> int:
     """Conservative aligned baseline footprint, excluding optional early caches."""
     final_shape = chain._shape(cast("Node", plan.store.args[2]))
     # Each swizzled operand has a power-of-two contiguous atom, tiled exactly
@@ -109,7 +119,7 @@ def _shared_memory_bytes(plan: ChainedMatmulPlan) -> int:
         8 * len(plan.dots),
         4,
     ]
-    return sum((size + 127) // 128 * 128 for size in allocations)
+    return sum((size + 127) // 128 * 128 for size in allocations) + 128 * startup
 
 
 def _layout(prefix: str, shape: tuple[int, int], inner: int, dtype: str) -> list[str]:
@@ -138,6 +148,8 @@ def _stage(
     pointwise_cache: PointwiseReadCache,
     pointwise_inplace: PointwiseInplace,
     prestaged_leaf: Node | None = None,
+    k_half: str | None = None,
+    leaf_pipeline: LeafPipeline | None = None,
 ) -> list[str]:
     prefix = f"chain_{stage}"
     m, n, k = plan.shapes[stage]
@@ -156,8 +168,12 @@ def _stage(
     value = expression.value(operand, coords)
     domain = chain._operand_domain(cg, operand, coords, plan)
     fallback = [
-        f"for {prefix}_{role}_step in cutlass.range({math.prod(shape) // (128)}, unroll=1):",
-        (f"    {index} = chain_thread + {prefix}_{role}_step * 128"),
+        f"for {prefix}_{role}_step in cutlass.range({math.prod(shape) // (256 if k_half is not None else 128)}, unroll=1):",
+        (
+            f"    {index} = (chain_thread + {prefix}_{role}_step * 128) // 64 * 128 + {k_half} * 64 + (chain_thread + {prefix}_{role}_step * 128) % 64"
+            if k_half is not None
+            else f"    {index} = chain_thread + {prefix}_{role}_step * 128"
+        ),
         chain._indent(expression.lines),
         f"    {prefix}_{role}[{x}, {y}] = {chain._masked_operand(value, dtype, domain)}",
     ]
@@ -167,6 +183,44 @@ def _stage(
         if inner == 1
         else f"cute.make_tensor({prefix}_{role}.iterator, cute.select({prefix}_{role}.layout, mode=[1, 0]))"
     )
+    if k_half is not None:
+        if role != "a" or inner != 1 or shape != (128, 128):
+            raise chain._UnsupportedChain("K64 producer requires K-major M128 K128 A")
+        if leaf_pipeline is not None:
+            return produce_half(
+                cg,
+                plan,
+                boundaries,
+                scans,
+                leaf_pipeline,
+                operand,
+                dtype,
+                target,
+                fallback,
+                pointwise_cache,
+                pointwise_unroll,
+            )
+        result = _pointwise_stage(
+            cg,
+            plan,
+            boundaries,
+            scans,
+            operand,
+            prefix,
+            role,
+            shape,
+            inner,
+            dtype,
+            target,
+            fallback,
+            pointwise_unroll,
+            pointwise_cache,
+            pointwise_inplace,
+            k_half=k_half,
+        )
+        if result is None:
+            raise chain._UnsupportedChain("K64 producer requires proved vector leaves")
+        return result
     return (
         chain._async_copy(
             cg,
@@ -303,6 +357,7 @@ def _pointwise_stage(
     pointwise_unroll: PointwiseUnroll,
     pointwise_cache: PointwiseReadCache,
     pointwise_inplace: PointwiseInplace,
+    k_half: str | None = None,
     prestaged_leaf: Node | None = None,
 ) -> list[str] | None:
     """Vectorize dense leaves, then evaluate the unchanged pointwise graph.
@@ -316,7 +371,7 @@ def _pointwise_stage(
     if chain._direct_operand(operand) or chain._ancestors(operand) & set(plan.dots):
         return None
     width, height = shape[inner], shape[1 - inner]
-    columns = (width) // 8
+    columns = (64 if k_half is not None else width) // 8
     if (
         width % 8
         or columns < 1
@@ -369,6 +424,8 @@ def _pointwise_stage(
                 "pre-staged leaf requires a unique same-dtype bijective vector map"
             )
         raw_leaf = matches[0]
+    if k_half is not None and raw_leaf is not None:
+        raise chain._UnsupportedChain("K64 final-A raw preload is not half-scoped")
     raw = f"{prefix}_{role}_raw"
     expression = chain._Expression(cg, plan, boundaries)
     expression.bind_scan_reads = pointwise_cache.enabled
@@ -388,7 +445,7 @@ def _pointwise_stage(
         tag,
         columns,
         height // rows,
-        column_base=None,
+        column_base=f"{k_half} * 64" if k_half is not None else None,
     )
     invariant, varying = _hoist(expression, {names[1], element})
     pointer_lines, bounds, descriptors, loads, vector_preloads = [], [], [], [], []
@@ -414,21 +471,33 @@ def _pointwise_stage(
         descriptors.extend(
             (
                 f"{name}_source = cute.make_tensor({name}_pointer.align(16), cute.make_layout(({height}, {width}), stride=({leaf.outer_stride}, 1)))",
-                f"{name}_partition = {thread}.partition_S({name}_source)",
+                f"{name}_partition = {thread}.partition_S("
+                + (
+                    f"cute.local_tile({name}_source, (128, 64), (0, {k_half}))"
+                    if k_half is not None
+                    else f"{name}_source"
+                )
+                + ")",
                 f"{name}_values = cute.make_rmem_tensor({name}_partition[None, 0, 0].shape, {leaf_dtype})",
             )
         )
         # These vectors have the same typed address and complete load mask for
         # every row. Keep all original pointer/stride/bounds guards and the
         # untouched scalar fallback; only move their existing copy outside the
-        # row loop, still inside this guarded branch.
+        # row loop, still inside this guarded branch and current K half.
         (vector_preloads if index in cached_vectors else loads).append(
             f"cute.copy({copy}, {raw if index == raw_leaf else name}_partition[None, {'0' if index in cached_vectors else f'{tag}_step'}, 0], {name}_values)"
         )
     fast = [
         f"{tag}_copy = cute.make_tiled_copy_tv(cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), {dtype}, num_bits_per_copy=128), cute.make_layout(({rows}, {columns}), stride=({columns}, 1)), cute.make_layout((1, 8)))",
         f"{tag}_thread = {tag}_copy.get_slice(chain_thread)",
-        f"{tag}_target = {tag}_thread.partition_D({target})",
+        f"{tag}_target = {tag}_thread.partition_D("
+        + (
+            f"cute.local_tile({target}, (128, 64), (0, {k_half}))"
+            if k_half is not None
+            else target
+        )
+        + ")",
         f"{tag}_values = cute.make_rmem_tensor({tag}_target[None, 0, 0].shape, {dtype})",
         *descriptors,
         *cached_reads,
@@ -448,7 +517,9 @@ def _pointwise_stage(
         chain._indent(loads),
         chain._indent(invariant),
         f"    for {element} in cutlass.range_constexpr(8):",
-        f"        {names[1]} = chain_thread % {columns} * 8 + {element}",
+        f"        {names[1]} = "
+        + (f"{k_half} * 64 + " if k_half is not None else "")
+        + f"chain_thread % {columns} * 8 + {element}",
         chain._indent(varying, 8),
         f"        {tag}_values[{element}] = {chain._masked_operand(value, dtype, domain)}",
         f"    cute.copy({tag}_copy, {tag}_values, {tag}_target[None, {tag}_step, 0])",
@@ -791,6 +862,55 @@ def _epilogue(
     return lines
 
 
+def _issue_k_halves(
+    prefix: str,
+    stage: int,
+    mode: str,
+    producer: list[str],
+    *,
+    retire_each_half: bool = False,
+) -> list[str]:
+    # Descriptors cover the full K128 arena. Half1's physical writes cannot
+    # overlap half0's MMA read set; its CTA publication is not MMA completion.
+    half_lines = [
+        *producer,
+        "cute.arch.cp_async_commit_group()",
+        "cute.arch.cp_async_wait_group(0)",
+        "cute.arch.fence_view_async_shared()",
+        "cute.arch.sync_threads()",
+        "if chain_warp == 0:",
+        f"    {prefix}_mma.set(tcgen05.Field.ACCUMULATE, True)",
+        f"    for {prefix}_local_kk in cutlass.range_constexpr(4):",
+        f"        {prefix}_kk = chain_k_half * 4 + {prefix}_local_kk",
+        f"        cute.gemm({prefix}_mma, {prefix}_acc, {prefix}_ra[None, None, {prefix}_kk], {prefix}_rb[None, None, {prefix}_kk], {prefix}_acc)",
+        f"        {prefix}_mma.set(tcgen05.Field.ACCUMULATE, True)",
+    ]
+    if mode == "serial64" or retire_each_half:
+        half_lines.extend(
+            [
+                "    with cute.arch.elect_one():",
+                f"        tcgen05.commit(chain_bars + {stage})",
+                f"cute.arch.mbarrier_wait(chain_bars + {stage}, chain_k_half)",
+                "cute.arch.sync_threads()",
+            ]
+        )
+    lines = [
+        f"{prefix}_rb = {prefix}_mma.make_fragment_B({prefix}_slice.partition_B({prefix}_b))",
+        "for chain_k_half in cutlass.range_constexpr(2):",
+        chain._indent(half_lines),
+    ]
+    if mode == "overlap64" and not retire_each_half:
+        lines.extend(
+            [
+                "if chain_warp == 0:",
+                "    with cute.arch.elect_one():",
+                f"        tcgen05.commit(chain_bars + {stage})",
+                f"cute.arch.mbarrier_wait(chain_bars + {stage}, 0)",
+            ]
+        )
+    return lines
+
+
 def _last_read_epilogue(
     body: list[str], epilogue: list[str], final_stage: int
 ) -> list[str]:
@@ -922,6 +1042,39 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     cast("Node", operand),
                 )
                 inner_axes[stage, role] = inner if role == "a" else 1 - inner
+        if plan.k_schedule is not None and inner_axes[plan.k_schedule.stage, "a"] != 1:
+            raise chain._UnsupportedChain("K64 scheduling requires K-major final A")
+        startup_inputs = []
+        if df.config.config.get("cute_chained_startup_transfer", "legacy") == "tma":
+            from .chained_startup import plan_startup
+
+            if (
+                plan.initialized_accumulator is not None
+                or plan.late_rhs_reuse is not None
+                or plan.k_schedule is not None
+            ):
+                raise chain._UnsupportedChain(
+                    "startup TMA requires uninitialized M128 full scheduling or an independent M64 dot"
+                )
+            if not supported_plan(plan, startup=True):
+                raise chain._UnsupportedChain(
+                    "startup TMA barrier exceeds shared capacity"
+                )
+            startup_inputs = plan_startup(cg, plan, boundaries, scans, inner_axes)
+        leaf_pipeline = plan_leaf_pipeline(
+            cg, plan, boundaries, scans, inner_axes[len(plan.dots) - 1, "a"]
+        )
+        leaf_extra_bytes = 128 if leaf_pipeline is not None else 0
+        if leaf_pipeline is not None:
+            device = cast("Node", plan.dots[0].args[0]).meta["val"].device
+            if _shared_memory_bytes(
+                plan, startup=bool(startup_inputs)
+            ) + leaf_extra_bytes > CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                device
+            ):
+                raise chain._UnsupportedChain(
+                    "paired leaf transaction barrier exceeds shared capacity"
+                )
         seed_lines: list[str] = []
         if plan.initialized_accumulator is not None:
             from .chained_initialized_accumulator import codegen_seed
@@ -966,11 +1119,23 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     ]
                 ),
                 f"chain_bars = cute.arch.alloc_smem(cutlass.Int64, {len(plan.dots)}, alignment=16)",
+                *(
+                    [
+                        "chain_leaf_bar = cute.arch.alloc_smem(cutlass.Int64, 1, alignment=16)"
+                    ]
+                    if leaf_pipeline is not None
+                    else []
+                ),
                 "chain_holding = cute.arch.alloc_smem(cutlass.Int32, 1, alignment=4)",
                 "if chain_thread == 0:",
                 *(
                     f"    cute.arch.mbarrier_init(chain_bars + {stage}, 1)"
                     for stage in range(len(plan.dots))
+                ),
+                *(
+                    ["    cute.arch.mbarrier_init(chain_leaf_bar, 1)"]
+                    if leaf_pipeline is not None
+                    else []
                 ),
                 "cute.arch.mbarrier_init_fence()",
                 "chain_allocation_barrier = chain_pipeline.NamedBarrier(barrier_id=1, num_threads=128)",
@@ -1019,6 +1184,18 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             chain._ancestors(cast("Node", operand)) & set(plan.scans)
             for operand in plan.dots[0].args[:2]
         )
+        if startup_inputs:
+            from .chained_startup import issue_lines
+
+            for transfer in startup_inputs:
+                tag = f"chain_0_{transfer.role}"
+                lines.extend(
+                    [
+                        f"{tag}_ptr = chain_{transfer.role}_workspace",
+                        *_layout(tag, transfer.shape, transfer.inner, dtype),
+                    ]
+                )
+            lines.extend(issue_lines(startup_inputs))
         if early_scan:
             lines.extend(scan_lines)
         early_cached: list[chain._ScanInput] = []
@@ -1034,9 +1211,10 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                 plan,
                 scans,
                 CuteTcgen05Config.per_cta_smem_capacity_bytes(device)
+                - leaf_extra_bytes
                 - max(
-                    _shared_memory_bytes(plan),
-                    _shared_memory_bytes(cache_plan),
+                    _shared_memory_bytes(plan, startup=bool(startup_inputs)),
+                    _shared_memory_bytes(cache_plan, startup=bool(startup_inputs)),
                 ),
             )
             lines.extend(cache_lines)
@@ -1047,6 +1225,8 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             zip(plan.dots, plan.shapes, strict=True)
         ):
             prefix = f"chain_{stage}"
+            split_k = plan.k_schedule is not None and stage == plan.k_schedule.stage
+            half_producer: list[str] = []
             major_a = "K" if stage in bridges or inner_axes[stage, "a"] else "MN"
             major_b = "K" if inner_axes[stage, "b"] else "MN"
             source = "TMEM" if stage in bridges else "SMEM"
@@ -1056,7 +1236,55 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             for role, shape in (("a", (m, k)), ("b", (n, k))):
                 if role == "a" and stage in bridges:
                     continue
-                if not (prefetch_b and stage == final_stage and role == "b"):
+                transfer = next(
+                    (
+                        item
+                        for item in startup_inputs
+                        if stage == 0 and item.role == role
+                    ),
+                    None,
+                )
+                if transfer is not None:
+                    from .chained_startup import finish_lines
+
+                    if not chain._direct_operand(transfer.operand):
+                        # The new M64 domain may reuse the existing vector
+                        # producer after TMA completion. M128 keeps its exact
+                        # original startup emission, including scalar finish.
+                        finish = (
+                            _stage(
+                                cg,
+                                plan,
+                                boundaries,
+                                scans if early_scan else early_cached,
+                                stage,
+                                role,
+                                inner_axes[stage, role],
+                                dtype,
+                                pointwise_unroll,
+                                pointwise_cache,
+                                pointwise_inplace,
+                                prestaged_leaf=transfer.leaf,
+                            )
+                            if is_m64_plan(plan)
+                            and df.config.config.get("cute_chained_pointwise_vectorize")
+                            else finish_lines(
+                                cg,
+                                plan,
+                                transfer,
+                                boundaries,
+                                scans if early_scan else early_cached,
+                                dtype,
+                            )
+                        )
+                        lines.extend(
+                            [
+                                "cute.arch.mbarrier_wait(chain_start_bar, 0)",
+                                "cute.arch.sync_threads()",
+                                *finish,
+                            ]
+                        )
+                elif not (prefetch_b and stage == final_stage and role == "b"):
                     producer = _stage(
                         cg,
                         plan,
@@ -1069,7 +1297,13 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                         pointwise_unroll,
                         pointwise_cache,
                         pointwise_inplace,
+                        k_half="chain_k_half" if split_k and role == "a" else None,
+                        leaf_pipeline=leaf_pipeline
+                        if split_k and role == "a"
+                        else None,
                     )
+                    if split_k and role == "a":
+                        half_producer = producer
                     lines.extend(
                         [
                             f"{prefix}_{role}_ptr = chain_{role}_workspace",
@@ -1079,7 +1313,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                                 inner_axes[stage, role],
                                 dtype,
                             ),
-                            *(producer),
+                            *([] if split_k and role == "a" else producer),
                         ]
                     )
                 if stage == len(plan.dots) - 1:
@@ -1093,11 +1327,21 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     )
                     if cached is not None:
                         staged.append(cached)
-            lines.append("cute.arch.cp_async_commit_group()")
+            if not split_k:
+                lines.append("cute.arch.cp_async_commit_group()")
             if stage == 0 and not early_scan:
                 lines.extend(scan_lines)
+            if stage == 0 and startup_inputs:
+                lines.extend(
+                    [
+                        "cute.arch.mbarrier_wait(chain_start_bar, 0)",
+                        "cute.arch.sync_threads()",
+                    ]
+                )
             lines.extend(
-                [
+                []
+                if split_k
+                else [
                     "cute.arch.cp_async_wait_group(0)",
                     "cute.arch.fence_view_async_shared()",
                     "cute.arch.sync_threads()",
@@ -1159,8 +1403,21 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     f"{prefix}_ra = {prefix}_mma.make_fragment_A({prefix}_slice.partition_A({prefix}_a))"
                 )
                 a_slice = f"{prefix}_ra[None, None, {prefix}_kk]"
+            if split_k:
+                assert plan.k_schedule is not None
+                lines.extend(
+                    _issue_k_halves(
+                        prefix,
+                        stage,
+                        plan.k_schedule.mode,
+                        half_producer,
+                        retire_each_half=leaf_pipeline is not None,
+                    )
+                )
             lines.extend(
-                [
+                _load_result(prefix, (m, n))
+                if split_k
+                else [
                     f"{prefix}_rb = {prefix}_mma.make_fragment_B({prefix}_slice.partition_B({prefix}_b))",
                     "if chain_warp == 0:",
                     f"    {prefix}_mma.set(tcgen05.Field.ACCUMULATE, {stage == 1 and plan.initialized_accumulator is not None})",
@@ -1170,6 +1427,15 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                     "    with cute.arch.elect_one():",
                     f"        tcgen05.commit(chain_bars + {stage})",
                     f"cute.arch.mbarrier_wait(chain_bars + {stage}, 0)",
+                    *(
+                        [
+                            "cute.arch.fence_view_async_shared()",
+                            "cute.arch.sync_threads()",
+                            *leaf_pipeline.issue("0", "0"),
+                        ]
+                        if stage == 0 and leaf_pipeline is not None
+                        else []
+                    ),
                     *_load_result(prefix, (m, n)),
                 ]
             )
@@ -1195,6 +1461,8 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             *_epilogue(cg, plan, boundaries, scans, staged),
             *codegen_scan_exports(cg, plan, boundaries, scans),
         ]
+        if leaf_pipeline is not None:
+            finish_wrapper(cg, plan, leaf_pipeline)
         if df.config.config.get("cute_chained_tmem_free", "legacy") == "last_read":
             lines.extend(_last_read_epilogue(lines, epilogue, final_stage))
         else:

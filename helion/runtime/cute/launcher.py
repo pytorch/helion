@@ -287,6 +287,12 @@ def _append_cute_wrapper_plan(
     plan: dict[str, object],
     num_sm: int | None = None,
 ) -> None:
+    if plan.get("kind") == "chained_startup_tma":
+        from .chained_startup import append_wrapper
+
+        append_wrapper(body, call_args, plan)
+        return
+
     def plan_int(key: str, default: int | None = None) -> int:
         value = plan.get(key, default) if default is not None else plan[key]
         assert isinstance(value, int)
@@ -446,6 +452,11 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "chained_paired_leaf_tma":
+        from .chained_leaf_pipeline import append_wrapper
+
+        append_wrapper(body, call_args, plan)
+        return
     if kind == "chunk_recurrence_sm100":
         outputs_scaled = plan.get("outputs_scaled")
         factor_key_xor = plan.get("factor_key_xor")
@@ -4558,6 +4569,7 @@ def _build_cached_cute_schema_and_args(
     args: tuple[object, ...],
     grid: tuple[int, int, int],
 ) -> _CuteLaunchArgCacheEntry:
+    _validate_chained_leaf_arguments(cute_kernel, args)
     dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     grouped_launch_contexts = _cute_grouped_launch_contexts(
         cute_kernel,
@@ -5162,6 +5174,9 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     bake_tensor_shapes: bool = True,
 ) -> _CuteLaunchArgCacheEntry:
+    from .chained_startup import validate_arguments
+
+    validate_arguments(cute_kernel, args)
     # NOTE: the returned launch args deliberately EXCLUDE the CUDA stream. The
     # stream is the only launch arg that is not a pure function of
     # (grid, tensor metadata, scalars), so it must not be baked into the cached
@@ -5757,9 +5772,11 @@ def _cute_build_fast_relaunch(
     if any(
         plan.get("kind")
         in {
+            "chained_startup_tma",
             "chunk_prepare_tma",
             "chunk_recurrence_sm100",
             "chunk_recurrence_warp_dv4",
+            "chained_paired_leaf_tma",
         }
         for plan in wrapper_plans
     ):
@@ -6016,6 +6033,17 @@ def _set_cute_last_launch_cache_entry(
     )
 
 
+def _validate_chained_leaf_arguments(
+    cute_kernel: object, args: tuple[object, ...]
+) -> None:
+    """Recheck paired-leaf TensorMap alignment and independence before caches."""
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        if plan.get("kind") == "chained_paired_leaf_tma":
+            from .chained_leaf_pipeline import validate_plan
+
+            validate_plan(plan, args)
+
+
 def default_cute_launcher(
     cute_kernel: object,
     grid: tuple[int, ...],
@@ -6048,6 +6076,10 @@ def default_cute_launcher(
         return None
 
     args_tuple = tuple(args)
+    from .chained_startup import validate_arguments
+
+    validate_arguments(cute_kernel, args_tuple)
+    _validate_chained_leaf_arguments(cute_kernel, args_tuple)
     # Metadata-guarded fast relaunch: skips the pointer-keyed caches AND the
     # DSL's per-call marshalling entirely (fresh output allocations change
     # tensor pointers on every call in real workloads, so pointer-keyed
