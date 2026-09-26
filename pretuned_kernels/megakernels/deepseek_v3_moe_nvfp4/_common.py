@@ -59,3 +59,20 @@ def take_stable_argmax(
         values,
     )
     return selected, remaining
+
+
+def take_stable_top8(
+    values: torch.Tensor,
+    indices: torch.Tensor,
+    sentinel: int,
+) -> tuple[torch.Tensor, ...]:
+    """Select eight stable maxima while keeping every value register-local."""
+    id_0, values = take_stable_argmax(values, indices, sentinel)
+    id_1, values = take_stable_argmax(values, indices, sentinel)
+    id_2, values = take_stable_argmax(values, indices, sentinel)
+    id_3, values = take_stable_argmax(values, indices, sentinel)
+    id_4, values = take_stable_argmax(values, indices, sentinel)
+    id_5, values = take_stable_argmax(values, indices, sentinel)
+    id_6, values = take_stable_argmax(values, indices, sentinel)
+    id_7, _values = take_stable_argmax(values, indices, sentinel)
+    return id_0, id_1, id_2, id_3, id_4, id_5, id_6, id_7

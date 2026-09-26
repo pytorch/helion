@@ -31,6 +31,7 @@ from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import fp4_nibbl
 from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import (
     take_stable_argmax,
 )
+from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import take_stable_top8
 
 
 ROUTED_SCALE = 2.5
@@ -379,18 +380,50 @@ def deepseek_v3_moe_nvfp4(
             topk_negative_infinity,
         ).view(topk_batch, topk_num_experts)
         topk_expert_indices = hl.arange(topk_num_experts)[None, :].to(torch.int32)
-        topk_remaining_experts = topk_masked
-        for topk_rank in hl.static_range(top_k):
-            topk_id, topk_remaining_experts = take_stable_argmax(
-                topk_remaining_experts, topk_expert_indices, topk_num_experts
-            )
-            topk_ids[:, topk_rank] = topk_id
-            topk_weights[:, topk_rank] = torch.sigmoid(
-                torch.sum(logits[:, topk_id].float(), dim=-1)
-            )
-        selected_weights = topk_weights[:, :]
-        topk_denominator = torch.sum(selected_weights, dim=-1, keepdim=True)
-        topk_weights[:, :] = selected_weights / topk_denominator * routed_scale
+        (
+            topk_id_0,
+            topk_id_1,
+            topk_id_2,
+            topk_id_3,
+            topk_id_4,
+            topk_id_5,
+            topk_id_6,
+            topk_id_7,
+        ) = take_stable_top8(topk_masked, topk_expert_indices, topk_num_experts)
+        topk_weight_0 = torch.sigmoid(torch.sum(logits[:, topk_id_0].float(), dim=-1))
+        topk_weight_1 = torch.sigmoid(torch.sum(logits[:, topk_id_1].float(), dim=-1))
+        topk_weight_2 = torch.sigmoid(torch.sum(logits[:, topk_id_2].float(), dim=-1))
+        topk_weight_3 = torch.sigmoid(torch.sum(logits[:, topk_id_3].float(), dim=-1))
+        topk_weight_4 = torch.sigmoid(torch.sum(logits[:, topk_id_4].float(), dim=-1))
+        topk_weight_5 = torch.sigmoid(torch.sum(logits[:, topk_id_5].float(), dim=-1))
+        topk_weight_6 = torch.sigmoid(torch.sum(logits[:, topk_id_6].float(), dim=-1))
+        topk_weight_7 = torch.sigmoid(torch.sum(logits[:, topk_id_7].float(), dim=-1))
+        topk_denominator = (
+            topk_weight_0
+            + topk_weight_1
+            + topk_weight_2
+            + topk_weight_3
+            + topk_weight_4
+            + topk_weight_5
+            + topk_weight_6
+            + topk_weight_7
+        )
+        topk_ids[:, 0] = topk_id_0
+        topk_ids[:, 1] = topk_id_1
+        topk_ids[:, 2] = topk_id_2
+        topk_ids[:, 3] = topk_id_3
+        topk_ids[:, 4] = topk_id_4
+        topk_ids[:, 5] = topk_id_5
+        topk_ids[:, 6] = topk_id_6
+        topk_ids[:, 7] = topk_id_7
+        topk_weights[:, 0] = topk_weight_0 / topk_denominator * routed_scale
+        topk_weights[:, 1] = topk_weight_1 / topk_denominator * routed_scale
+        topk_weights[:, 2] = topk_weight_2 / topk_denominator * routed_scale
+        topk_weights[:, 3] = topk_weight_3 / topk_denominator * routed_scale
+        topk_weights[:, 4] = topk_weight_4 / topk_denominator * routed_scale
+        topk_weights[:, 5] = topk_weight_5 / topk_denominator * routed_scale
+        topk_weights[:, 6] = topk_weight_6 / topk_denominator * routed_scale
+        topk_weights[:, 7] = topk_weight_7 / topk_denominator * routed_scale
     for w13_tile_slot, w13_tile_output_group in hl.tile(
         [top_k, activation_groups], block_size=[1, 4]
     ):
