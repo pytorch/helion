@@ -31,7 +31,7 @@ T = TypeVar("T")
 _log = logging.getLogger(__name__)
 _BENCHMARK_CUDAGRAPH_ENV = "HELION_BENCHMARK_CUDAGRAPH"
 _MIRRORED_BENCH_MAX_SWEEPS = 64
-_ROCM_INTERLEAVED_EVENT_PAIRS = 1024
+_INTERLEAVED_EVENT_PAIRS_CAP = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -293,13 +293,20 @@ def interleaved_bench(
     di = runtime.driver.active.get_device_interface()  # type: ignore[attr-defined]
     if max_total_ms is not None:
         repeat = min(repeat, _interleaved_repeat_cap(fns, clear_cache, max_total_ms))
-    # Large finalist passes can create hundreds of thousands of live HIP events
-    # and crash in hipEventCreateWithFlags. Reuse a bounded set after collecting
-    # each batch's timings, preserving the full sample count and interleaving.
+    # Large finalist passes can create hundreds of thousands of live timing
+    # events outstanding at once. On ROCm that crashes in
+    # hipEventCreateWithFlags. On XPU, each Event.record() submits a real
+    # profiling-tag command to the queue, and the Level Zero backend only
+    # reclaims completed events near a synchronization point, so per-event
+    # cost grows superlinearly with the backlog (flat ~0.3ms/event when
+    # synchronized every ~1000 events, tens of ms/event past ~100k
+    # unsynchronized events), turning a single rebenchmark pass into a
+    # multi-minute stall. Reuse a bounded set after collecting each batch's
+    # timings, preserving the full sample count and interleaving.
     batch_size = repeat
-    if torch.version.hip is not None:
+    if torch.version.hip is not None or torch.xpu.is_available():
         batch_size = min(
-            repeat, max(1, _ROCM_INTERLEAVED_EVENT_PAIRS // max(1, len(fns)))
+            repeat, max(1, _INTERLEAVED_EVENT_PAIRS_CAP // max(1, len(fns)))
         )
     start_events = [
         [di.Event(enable_timing=True) for _ in range(batch_size)]
