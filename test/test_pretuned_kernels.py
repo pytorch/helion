@@ -326,8 +326,8 @@ def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
     assert config["host_tensor_descriptors"]
     assert config["num_sm_multiplier"] == 1
     assert module.W13_SPLIT_K == 7
-    assert module.COMMUNICATION_N == 2048
-    assert config["block_sizes"][-1] == 32
+    assert module.COMMUNICATION_N == 4096
+    assert config["block_sizes"][-1] == 512
     assert config["range_num_stages"][11] == 2
 
     distributed_source = module._kernel_source(distributed=True)

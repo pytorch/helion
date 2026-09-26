@@ -41,7 +41,7 @@ if TYPE_CHECKING:
 
 WORLD_SIZE = 4
 W13_SPLIT_K = 7
-COMMUNICATION_N = 2048
+COMMUNICATION_N = 4096
 NUM_SM_MULTIPLIER = 1
 SIGNAL_PAD_BYTES = 32 * 1024
 
@@ -350,7 +350,7 @@ def _config(*, distributed: bool) -> helion.Config:
         range_multi_buffers.append(None)
         range_flattens.append(None)
     return helion.Config(
-        block_sizes=[8, 512, 32, 256, 32],
+        block_sizes=[8, 512, 32, 256, 512],
         cross_loop_pipeline="dynamic",
         host_tensor_descriptors=True,
         indexing=[
