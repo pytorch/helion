@@ -272,6 +272,15 @@ def test_flash_mla_uses_existing_tuning_surface() -> None:
     assert "inline_triton" not in source
     assert "num_tasks == 418" not in source
     assert "608" not in source
+    assert "topology" not in source
+    assert tuple(inspect.signature(module.flash_mla.fn).parameters) == (
+        "query",
+        "kv_cache",
+        "block_tables",
+        "seq_lens",
+        "scale",
+        "block_n",
+    )
 
 
 def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
@@ -290,6 +299,42 @@ def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
     assert "source_ticket" not in source
     assert "w13_tma" in source
     assert "__deepseek" not in source
+
+
+def test_distributed_tp_gemm_uses_compiler_readiness() -> None:
+    module = _import_pretuned_kernel_module("distributed_tp_gemm")
+    config = module.distributed_tp_gemm.configs[0].config
+
+    assert module.distributed_tp_gemm.settings.static_shapes
+    assert config["cross_loop_pipeline"] == "dynamic"
+    assert config["num_sm_multiplier"] == 2
+    assert module.SPLIT_K == 12
+    assert module.PRODUCER_N == module.MERGE_N == 128
+    assert module.COMMUNICATION_N == 2048
+    source = inspect.getsource(module.distributed_tp_gemm.fn)
+    assert "get_remote_tensors" in source
+    assert "inline_triton" not in source
+    assert "topology" not in source
+
+
+def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
+    module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
+    config = module.deepseek_v3_moe_nvfp4_tp.configs[0].config
+
+    assert not module.deepseek_v3_moe_nvfp4_tp.settings.static_shapes
+    assert config["cross_loop_pipeline"] == "dynamic"
+    assert config["host_tensor_descriptors"]
+    assert config["num_sm_multiplier"] == 2
+    assert module.W13_SPLIT_K == 7
+
+    distributed_source = module._kernel_source(distributed=True)
+    local_source = module._kernel_source(distributed=False)
+    assert "get_remote_tensors" in distributed_source
+    assert "get_remote_tensors" not in local_source
+    assert "w13_tile_split" in distributed_source
+    assert "w13_tile_split" in local_source
+    assert "inline_triton" not in distributed_source
+    assert "topology" not in distributed_source
 
 
 def test_pre_captured_graph_sweep_passes_resets(
