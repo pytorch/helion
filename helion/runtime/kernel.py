@@ -2218,6 +2218,31 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             self.host_function = None  # type: ignore[assignment]
             return
 
+        if (
+            self.settings.cute_region_fission
+            or self.settings.cute_materialize_transformed_operands
+        ) and self.settings.backend == "cute":
+            from .._compiler.cute.materialize_operand import (
+                plan_operand_materialization,
+            )
+            from .._compiler.cute.materialized_fission import plan_materialized_fission
+
+            with (
+                _maybe_skip_dtype_check_in_meta_registrations(),
+                patch_inductor_lowerings(),
+            ):
+                if self.settings.cute_materialize_transformed_operands:
+                    self._env.cute_fission_plan = plan_operand_materialization(
+                        self.kernel, args, self._env
+                    )
+                if (
+                    self.settings.cute_region_fission
+                    and self._env.cute_fission_plan is None
+                ):
+                    self._env.cute_fission_plan = plan_materialized_fission(
+                        self.kernel, args, self._env
+                    )
+
         with self.env:
             self._env.process_group_name = _find_process_group_name(
                 kernel.fn, args, is_distributed
@@ -2432,9 +2457,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             parts.extend(
                 [
                     "backend='cute'",
+                    f"cute_region_fission={settings.cute_region_fission}",
                     f"cute_full_slice_matmul_tiling={settings.cute_full_slice_matmul_tiling}",
                     f"cute_segmented_matmul_tiling={settings.cute_segmented_matmul_tiling}",
                     f"cute_flatten_nested_reductions={settings.cute_flatten_nested_reductions}",
+                    f"cute_materialize_transformed_operands={settings.cute_materialize_transformed_operands}",
                 ]
             )
         if settings.backend == "cute" or settings.cute_rng_stream != "word0":

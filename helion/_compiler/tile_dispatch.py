@@ -154,7 +154,13 @@ class TileStrategyDispatch:
         fn.tile_strategy = self
         env = CompileEnvironment.current()
         max_threads = env.backend.max_reduction_threads()
-        rdims = [bs.block_id for bs in env.block_sizes if bs.reduction]
+        active_block_ids = HostFunction.current().device_ir.codegen_active_block_ids
+        rdims = [
+            bs.block_id
+            for bs in env.block_sizes
+            if bs.reduction
+            and (active_block_ids is None or bs.block_id in active_block_ids)
+        ]
         reduction_loop_block_ids = set(
             env.config_spec.reduction_loops.valid_block_ids()
         )

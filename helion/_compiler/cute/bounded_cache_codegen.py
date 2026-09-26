@@ -221,6 +221,7 @@ def generate_bounded_cache(
     env = CompileEnvironment.current()
     if (
         env.cute_resolved_wrapper_plans
+        or env.cute_fission_plan is not None
         or env.config_spec.matmul_facts
         or len(host.device_ir.root_ids) != 1
         or len(host.device_ir.phases) != 1

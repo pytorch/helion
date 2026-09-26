@@ -15,9 +15,9 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _cpu_target
 from test.test_cute_full_slice_matmul import _CpuRefMode
 from test.test_cute_grouped_gemm_split_sizes import _selected_config
+from test.test_cute_materialized_fission import _cpu_target
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment

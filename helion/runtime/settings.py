@@ -603,6 +603,16 @@ class _Settings:
         )
     )
     pallas_topk_recall_target: float = 0.99
+    cute_region_fission: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_REGION_FISSION", False
+        )
+    )
+    cute_materialize_transformed_operands: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_MATERIALIZE_TRANSFORMED_OPERANDS", False
+        )
+    )
     cute_full_slice_matmul_tiling: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CUTE_FULL_SLICE_MATMUL_TILING", False
@@ -755,6 +765,18 @@ class Settings(_Settings):
         "pallas_topk_recall_target": (
             "Recall target for the Pallas approximate top-k lowering. Must be in "
             "(0, 1]; use 1.0 when exact top-k results are required. Default 0.99."
+        ),
+        "cute_region_fission": (
+            "If True, distribute proven row-independent materialized regions "
+            "into ordered CuTe launches with independently tuned tile axes. "
+            "Defaults to HELION_CUTE_REGION_FISSION (False)."
+        ),
+        "cute_materialize_transformed_operands": (
+            "If True, materialize proven pure reused matrix operands before "
+            "a CuTe GEMM, with independent producer and consumer tile axes. "
+            "Input dimensions used by the proof are specialized with normal "
+            "runtime guards. Defaults to "
+            "HELION_CUTE_MATERIALIZE_TRANSFORMED_OPERANDS (False)."
         ),
         "cute_full_slice_matmul_tiling": (
             "If True, give eligible direct full-slice half/BF16 matmuls an "

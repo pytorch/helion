@@ -823,6 +823,9 @@ class DeviceIR:
         self.task_families: list[TaskFamily] = []
         self.grid_block_ids: list[list[int]] = []
         self.noncanonical_task_origin_block_ids: set[int] = set()
+        # A CuTe codegen view can restrict reduction strategies to one launch.
+        # Axis identities and configuration slots remain owned by the full IR.
+        self.codegen_active_block_ids: frozenset[int] | None = None
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
         self._has_atomic_ops: bool | None = None
@@ -3208,6 +3211,35 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
 
             promote_partitioned_output_axis(func, device_ir, visitor.root_nodes)
 
+            if CompileEnvironment.current().cute_fission_plan is not None:
+                from .cute.materialized_fission import forward_materialized_self_loads
+                from .cute.scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_META_KEY
+
+                forward_materialized_self_loads(func, device_ir)
+                env = CompileEnvironment.current()
+                plan = env.cute_fission_plan
+                assert plan is not None
+                env.config_spec.cute_pointwise_region_block_ids = frozenset(
+                    block_id
+                    for index in plan.pointwise_region_indices
+                    for block_id in device_ir.grid_block_ids[index]
+                )
+                # The fission proof gives these roots separate launches. An
+                # axis reused by another root must retain the shared search
+                # floor, even if one of its owners is pointwise.
+                env.config_spec.cute_pointwise_region_grid_groups = tuple(
+                    tuple(device_ir.grid_block_ids[index])
+                    for index in plan.pointwise_region_indices
+                    if all(
+                        sum(block_id in grid for grid in device_ir.grid_block_ids) == 1
+                        for block_id in device_ir.grid_block_ids[index]
+                    )
+                )
+                for index in plan.pointwise_region_indices:
+                    graph = device_ir.graphs[device_ir.root_ids[index]].graph
+                    for node in graph.nodes:
+                        node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
+
         # TODO(hinriksnaer): extract into a separate step? everything below
         # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
@@ -3393,29 +3425,62 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             for item, _lhs, _plan in search_candidates
                         ),
                     )
-                    if (
-                        len(mma_candidates) == 1
-                        and len(device_ir.root_ids) == 1
-                        and not (
-                            config_spec.reduction_block_ids
-                            - {candidate.operands.k_block_id}
-                        )
+                    if len(mma_candidates) == 1 and not (
+                        config_spec.reduction_block_ids
+                        - {candidate.operands.k_block_id}
                     ):
                         from .cute.pipeline_smem import analyze_pipeline_smem_facts
+                        from .cute.pipeline_smem import pipeline_region_graphs
 
                         tcgen05_config = config_spec._cute_tcgen05_config
-                        smem_facts = analyze_pipeline_smem_facts(
-                            candidate,
+                        allocation_graphs = pipeline_region_graphs(
+                            device_ir,
                             mma_candidates[0][3],
-                            device_ir.graphs,
-                            capacity_bytes=(
-                                tcgen05_config.per_cta_smem_capacity_bytes(lhs.device)
-                            ),
+                            separately_launched=env.cute_fission_plan is not None,
+                        )
+                        smem_facts = (
+                            analyze_pipeline_smem_facts(
+                                candidate,
+                                mma_candidates[0][3],
+                                allocation_graphs,
+                                capacity_bytes=(
+                                    tcgen05_config.per_cta_smem_capacity_bytes(
+                                        lhs.device
+                                    )
+                                ),
+                            )
+                            if allocation_graphs is not None
+                            else None
                         )
                         if smem_facts is not None:
                             tcgen05_config.register_pipeline_smem_facts(smem_facts)
+                            from .cute.materialized_pdl import (
+                                prove_materialized_operand_pdl,
+                            )
+
+                            tcgen05_config.materialized_operand_pdl_roots = (
+                                prove_materialized_operand_pdl(
+                                    env, device_ir, candidate
+                                )
+                            )
+                elif env.cute_fission_plan is not None:
+                    from .cute.materialized_mma import enable_materialized_mma_search
+
+                    enable_materialized_mma_search(
+                        env,
+                        device_ir,
+                        planning_results,
+                        search_candidates,
+                        mma_nodes={
+                            id(candidate): node
+                            for candidate, _lhs, _rhs, node in mma_candidates
+                        },
+                    )
         config_spec.raise_grid_block_minimums()
-        if len(device_ir.root_ids) > 1:
+        if (
+            len(device_ir.root_ids) > 1
+            and CompileEnvironment.current().cute_fission_plan is None
+        ):
             # xyz is not supported with shared program IDs. Non-tcgen05
             # persistent kernels are allowed; tcgen05 persistent has a
             # single-root scheduler/grid contract today.
@@ -3474,7 +3539,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.memory_op_facts = memory_op_facts
         from .tile_dependency import build_tile_dependency_graph
 
-        if len(device_ir.task_families) > 1:
+        if len(device_ir.task_families) > 1 and env.cute_fission_plan is None:
             device_ir.tile_dependency_graph = build_tile_dependency_graph(
                 tile_accesses,
                 device_ir=device_ir,

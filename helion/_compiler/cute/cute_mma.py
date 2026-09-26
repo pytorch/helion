@@ -11999,7 +11999,9 @@ def _emit_mma_pipeline(
             # ``use_pdl`` only added to the dict when True so the
             # static-path kernels' wrapper-plan literals stay
             # byte-identical to the pre-G2-H golden.
-            if tcgen05_matmul_plan.is_clc_persistent:
+            if tcgen05_matmul_plan.is_clc_persistent or df.config.get(
+                "tcgen05_materialized_pdl", False
+            ):
                 ab_tma_plan["use_pdl"] = True
             cg.cute_wrapper_plans.append(ab_tma_plan)
             if tcgen05_grouped_static_persistent and (
