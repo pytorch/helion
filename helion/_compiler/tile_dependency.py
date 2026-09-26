@@ -4563,6 +4563,10 @@ class TileAccess:
     is_atomic: bool = False
     graph_node_index: int = -1
     affine_subscript_ranges: tuple[AffineSubscriptRange, ...] | None = None
+    # A later analysis may prove that a non-affine-looking subscript is still
+    # one exact dense span.  Keep that distinct from a genuinely unknown
+    # indirect index, which this module must conservatively widen.
+    subscript_dense_spans: tuple[tuple[int, int, int] | None, ...] = ()
 
     def __post_init__(self) -> None:
         """Canonicalize layout values once at the dependency-analysis boundary."""
@@ -4845,6 +4849,7 @@ def _access_interval_expression(
     *,
     position: int,
     domain: CoordinateDomain,
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> tuple[sympy.Expr, sympy.Expr] | None:
     if position >= len(access.subscript_is_full_slice):
         return None
@@ -4855,6 +4860,32 @@ def _access_interval_expression(
     )
     if access.subscript_is_full_slice[position]:
         return sympy.Integer(0), size
+    dense_span = (
+        access.subscript_dense_spans[position]
+        if position < len(access.subscript_dense_spans)
+        else None
+    )
+    if dense_span is not None:
+        axis, scale, offset = dense_span
+        counts = domain.axis_count_expressions
+        block_size = domain.block_sizes.get(axis)
+        if scale <= 0 or axis not in counts or block_size is None:
+            return None
+        coordinate: sympy.Expr = (
+            sympy.Integer(0)
+            if sympy.simplify(counts[axis] - 1) == 0
+            else coordinate_axis_symbol(axis)
+        )
+        begin = cast("Any", coordinate) * block_size * scale + offset
+        end = begin + block_size * scale
+        final_end = (
+            (counts[axis] - 1) * block_size * scale + offset + block_size * scale
+        )
+        if offset < 0 or not _is_provably_nonnegative(
+            sympy.simplify(size - final_end), prove_nonnegative
+        ):
+            return None
+        return begin, end
     if (
         position >= len(access.subscript_affine_block_ids)
         or position >= len(access.subscript_index_scales)
@@ -4972,15 +5003,33 @@ def _symbolic_access_map(
             allocation_domain.axis_order, tensor_dimensions, strict=True
         ):
             position = positions.get(dimension)
-            interval = (
-                (sympy.Integer(0), shape[dimension])
-                if position is None
-                else _access_interval_expression(
-                    access, position=position, domain=source_domain
+            if position is None:
+                interval = (sympy.Integer(0), shape[dimension])
+            else:
+                interval = _access_interval_expression(
+                    access,
+                    position=position,
+                    domain=source_domain,
+                    prove_nonnegative=prove_nonnegative,
                 )
-            )
-            if interval is None:
-                return None
+                # An indirect subscript can still contribute a useful
+                # conservative relation: it may touch any coordinate of this
+                # tensor dimension, while the remaining affine dimensions stay
+                # precise.
+                if interval is None:
+                    subscript_span = (
+                        access.subscript_dense_spans[position]
+                        if position < len(access.subscript_dense_spans)
+                        else None
+                    )
+                    if (
+                        access.subscript_affine_block_ids[position] is None
+                        and access.subscript_offsets[position] is None
+                        and subscript_span is None
+                    ):
+                        interval = (sympy.Integer(0), shape[dimension])
+                    else:
+                        return None
             ranges.append((allocation_axis, *interval, 1))
         relation = CoordinateRelation(
             source_domain,
@@ -5079,7 +5128,10 @@ def _symbolic_access_map(
             (sympy.Integer(0), size)
             if position is None
             else _access_interval_expression(
-                access, position=position, domain=source_domain
+                access,
+                position=position,
+                domain=source_domain,
+                prove_nonnegative=prove_nonnegative,
             )
         )
         if interval is None:
@@ -5090,8 +5142,21 @@ def _symbolic_access_map(
         if not _is_provably_nonnegative(width - 1, prove_nonnegative):
             return None
         if position is not None and not access.subscript_is_full_slice[position]:
-            axis = access.subscript_affine_block_ids[position]
-            offset = access.subscript_offsets[position]
+            dense_subscript_span = (
+                access.subscript_dense_spans[position]
+                if position < len(access.subscript_dense_spans)
+                else None
+            )
+            axis = (
+                dense_subscript_span[0]
+                if dense_subscript_span is not None
+                else access.subscript_affine_block_ids[position]
+            )
+            offset = (
+                dense_subscript_span[2]
+                if dense_subscript_span is not None
+                else access.subscript_offsets[position]
+            )
             if axis is not None:
                 if offset is None:
                     return None
@@ -5325,6 +5390,13 @@ def _dense_overlap_sources(
             and sympy.simplify(sympy.Mod(begin_delta, width)) == 0
         ):
             ordinal_count, ordinal_step = 1, 1
+        elif (
+            step == 1
+            and width > tile_width
+            and width % tile_width == 0
+            and sympy.simplify(sympy.Mod(begin_delta, tile_width)) == 0
+        ):
+            ordinal_count, ordinal_step = width // tile_width, 1
         elif (
             step >= tile_width
             and step % tile_width == 0
@@ -5613,7 +5685,6 @@ def instantiate_symbolic_dependencies(
         raise ValueError("root domain count disagrees with the dependency graph")
     if len(site_domains) != len(dependency_graph.execution_sites):
         raise ValueError("site domain count disagrees with the dependency graph")
-    site_by_id = {site.site_id: site for site in dependency_graph.execution_sites}
     access_by_id = {access.access_id: access for access in dependency_graph.accesses}
 
     def endpoints(
@@ -5629,9 +5700,11 @@ def instantiate_symbolic_dependencies(
             return () if root_domain is None else ((None, root_domain),)
         result: list[tuple[int | None, CoordinateDomain]] = []
         for site_id in site_ids:
-            site = site_by_id[site_id]
             domain = site_domains[site_id]
-            if domain is not None and site.executes_unconditionally:
+            # Conditional sites still describe the conservative set of memory
+            # accesses that may occur. Counter selection separately requires a
+            # site that can publish or wait on every execution.
+            if domain is not None:
                 result.append((site_id, domain))
         return tuple(result)
 

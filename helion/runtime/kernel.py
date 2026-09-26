@@ -9,7 +9,6 @@ import hashlib
 import inspect
 import itertools
 import logging
-import operator
 import os
 import re
 import sys
@@ -55,8 +54,9 @@ from .._compiler.ast_extension import unparse
 from .._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from .._compiler.autotuner_heuristics import compiler_seed_configs
 from .._compiler.autotuner_heuristics import compiler_seed_specialization_facts
+from .._compiler.compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from .._compiler.compile_environment import CompileEnvironment
-from .._compiler.compile_environment import TensorDescriptorLayoutGuard
+from .._compiler.compile_environment import _concrete_tensor_satisfies_alignment_guard
 from .._compiler.compile_environment import _is_supported_tensor_input_source
 from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import (
@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from .._compiler.autotuner_heuristics.registry import (
         CompilerHeuristicSpecializationFact,
     )
+    from .._compiler.compile_environment import TensorDescriptorLayoutGuard
     from .._compiler.host_function import HostFunction
     from ..autotuner import ConfigSpec
     from ..autotuner.base_cache import BoundKernelInMemoryCacheKey
@@ -105,8 +106,13 @@ def _indexing_config_uses_tensor_descriptor(indexing: object, index: int) -> boo
     return False
 
 
-def _td_layout_guard_active_for_config(
-    guard: TensorDescriptorLayoutGuard, config: Config
+class _TensorDescriptorOperationGuard(Protocol):
+    memory_op_indices: set[int]
+    atomic_op_indices: set[int]
+
+
+def _td_guard_active_for_config(
+    guard: _TensorDescriptorOperationGuard, config: Config
 ) -> bool:
     return any(
         _indexing_config_uses_tensor_descriptor(config.indexing, index)
@@ -2264,6 +2270,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 runtime_args = dict(
                     zip(self.kernel.signature.parameters, args, strict=False)
                 )
+                self.env.snapshot_tensor_descriptor_alignments(runtime_args)
                 with self.env.use_runtime_arg_values(runtime_args):
                     self.env.config_spec.compiler_seed_configs = compiler_seed_configs(
                         self.env,
@@ -2879,10 +2886,15 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             list[Callable[[Sequence[object]], Hashable]]: A list of functions that generate extra specialization keys.
         """
+        tensor_descriptor_layout_guards = self.env.tensor_descriptor_layout_guards
+        tensor_descriptor_alignment_guards = getattr(
+            self.env, "tensor_descriptor_alignment_guards", {}
+        )
         if (
             not self.env.specialized_vars
             and not self.env.specialized_strides
-            and not self.env.tensor_descriptor_layout_guards
+            and not tensor_descriptor_layout_guards
+            and not tensor_descriptor_alignment_guards
             and not self.env.runtime_input_specializations
         ):
             return []
@@ -2945,7 +2957,14 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 return getitem_extractor
             if isinstance(v, LocalSource):
                 index = arg_name_to_index[v.local_name]
-                return operator.itemgetter(index)
+
+                def local_extractor(
+                    args: Sequence[object],
+                    _index: int = index,
+                ) -> Hashable:
+                    return cast("Hashable", args[_index])
+
+                return local_extractor
             raise exc.SpecializeArgType(v)
 
         arg_name_to_index: dict[str, int] = {
@@ -2971,14 +2990,78 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(make_extractor(source))
             )
-        implicit_config = self._fixed_config_for_td_layout_guards()
+        candidate_configs: tuple[Config, ...] | None
+        if tensor_descriptor_layout_guards or tensor_descriptor_alignment_guards:
+            implicit_config = self._fixed_config_for_td_layout_guards()
+            if implicit_config is not None:
+                candidate_configs = (implicit_config,)
+            elif not self.settings.force_autotune and len(self.kernel.configs) > 1:
+                normalized_configs = []
+                for config in self.kernel.configs:
+                    try:
+                        normalized_configs.append(self._normalized_config_copy(config))
+                    except exc.InvalidConfig:
+                        # Finite-search autotuning deliberately permits invalid
+                        # candidates and skips them at compile time. Descriptor
+                        # guard discovery must not make those failures eager.
+                        continue
+                candidate_configs = tuple(normalized_configs)
+            else:
+                candidate_configs = None
+        else:
+            candidate_configs = None
+
+        def guard_is_active(guard: _TensorDescriptorOperationGuard) -> bool:
+            return candidate_configs is None or any(
+                _td_guard_active_for_config(guard, config)
+                for config in candidate_configs
+            )
+
+        def descriptor_extent_cap(
+            guard: TensorDescriptorLayoutGuard,
+        ) -> int | None:
+            if guard.has_derived_block_extent:
+                return (
+                    CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    if self.env.device.type == "cuda"
+                    else None
+                )
+            if candidate_configs is None:
+                return (
+                    CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+                    if self.env.device.type == "cuda"
+                    else None
+                )
+            active_configs = tuple(
+                config
+                for config in candidate_configs
+                if _td_guard_active_for_config(guard, config)
+            )
+            with self.env:
+                resolved_block_sizes = (
+                    block_size.from_config(config)
+                    for config in active_configs
+                    for block_size in self.env.block_sizes
+                )
+                cap = max(
+                    (
+                        value
+                        for value in resolved_block_sizes
+                        if type(value) is int and value > 0 and value & (value - 1) == 0
+                    ),
+                    default=None,
+                )
+            if self.env.device.type != "cuda":
+                return cap
+            if cap is None:
+                return CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
+            return min(cap, CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE)
+
         for source, guard in sorted(
-            self.env.tensor_descriptor_layout_guards.items(),
+            tensor_descriptor_layout_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if implicit_config is not None and not _td_layout_guard_active_for_config(
-                guard, implicit_config
-            ):
+            if not guard_is_active(guard):
                 continue
             extract_tensor = make_extractor(source)
 
@@ -2989,18 +3072,58 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 ] = extract_tensor,
                 _ndim: int = guard.ndim,
                 _element_size: int = guard.element_size,
+                _extent_cap: int | None = descriptor_extent_cap(guard),
             ) -> Hashable:
                 tensor = cast("torch.Tensor", _extract_tensor(args))
                 if tensor.ndim != _ndim:
                     return ("ndim", tensor.ndim)
-                return tensor_descriptor_layout_signature_from_strides(
+                layout = tensor_descriptor_layout_signature_from_strides(
                     tensor.stride(),
                     _element_size,
+                )
+                # Extent classes guard Triton's descriptor block-shape and
+                # int32-coordinate legality. Other backends retain the legacy
+                # layout-only key; they neither consume host descriptors nor
+                # use Triton's descriptor legality checks.
+                if self.env.backend_name != "triton":
+                    return layout
+                return (
+                    layout,
+                    tuple(
+                        _tensor_descriptor_extent_class(int(size), _extent_cap)
+                        for size in tensor.size()
+                    ),
+                    all(int(size) < 2**31 for size in tensor.size()),
                 )
 
             extractors.append(
                 _PreparedMetadataSpecializationExtractor(td_layout_extractor)
             )
+
+        for source, guard in sorted(
+            tensor_descriptor_alignment_guards.items(),
+            key=lambda item: repr(item[0]),
+        ):
+            if not guard_is_active(guard):
+                continue
+            extract_tensor = make_extractor(source)
+
+            def td_alignment_extractor(
+                args: Sequence[object],
+                _extract_tensor: Callable[
+                    [Sequence[object]], Hashable
+                ] = extract_tensor,
+                _requires_zero_storage_offset: bool = (
+                    guard.requires_zero_storage_offset
+                ),
+            ) -> Hashable:
+                tensor = cast("torch.Tensor", _extract_tensor(args))
+                return _concrete_tensor_satisfies_alignment_guard(
+                    tensor, _requires_zero_storage_offset
+                )
+
+            # Prepared metadata guards do not cover base pointers.
+            extractors.append(td_alignment_extractor)
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),
@@ -3100,16 +3223,22 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
         if self._config is not None:
-            return self._config
-        if self.kernel.settings.autotune_effort == "none" and (
+            config = self._config
+        elif self.kernel.settings.autotune_effort == "none" and (
             len(self.kernel.configs) == 0 or self.settings.force_autotune
         ):
-            return self.config_spec.default_config()
-        if self.settings.force_autotune:
+            config = self.config_spec.default_config()
+        elif self.settings.force_autotune:
             return None
-        if len(self.kernel.configs) == 1:
-            return self.kernel.configs[0]
-        return None
+        elif len(self.kernel.configs) == 1:
+            config = self.kernel.configs[0]
+        else:
+            return None
+
+        # Decorator configs are intentionally allowed to omit inferred fields
+        # such as block_sizes.  Resolve the same effective config that codegen
+        # will see before asking BlockSizeSource to read those fields.
+        return self._normalized_config_copy(config)
 
     def _user_provided_config(self) -> Config | None:
         """Return a config if the user explicitly provided one, else None.
@@ -3517,6 +3646,12 @@ def _safe_bucket_dim(s: int | torch.SymInt) -> Hashable:
     # 0 or 1.  Keep 2 as the canonical "dynamic dimension" bucket that was
     # already used for all concrete sizes >= 2.
     return 2
+
+
+def _tensor_descriptor_extent_class(size: int, cap: int | None) -> int:
+    """Largest power-of-two descriptor block that can fit this dimension."""
+    result = 0 if size <= 0 else 1 << (size.bit_length() - 1)
+    return result if cap is None else min(result, cap)
 
 
 _EMPTY_FROZENSET: frozenset[int] = frozenset()

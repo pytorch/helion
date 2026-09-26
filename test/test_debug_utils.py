@@ -230,10 +230,10 @@ class TestDebugUtils(RefEagerTestDisabled, TestCase):
                 # Extract repro script from logs
                 repro_script = self._extract_repro_script(log_capture)
 
-                # Normalize range_warp_specializes=[None] to [] for comparison
+                # Normalize backend-dependent default fields for comparison.
                 normalized_script = repro_script.replace(
                     "range_warp_specializes=[None]", "range_warp_specializes=[]"
-                )
+                ).replace("host_tensor_descriptors=False, ", "")
 
                 self.assertExpectedJournal(normalized_script)
 

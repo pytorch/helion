@@ -34,9 +34,11 @@ from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
+from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 from .tile_dependency import _relation_product_is_within_budget
+from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -295,33 +297,86 @@ def _subscript_static_extent(subscript: object) -> int | None:
         return 1
     if not isinstance(subscript, torch.fx.Node):
         return None
-    node = subscript
-    seen: set[torch.fx.Node] = set()
-    while node not in seen:
-        seen.add(node)
-        if node.target is torch.ops.prims.iota.default:
-            length = node.args[0] if node.args else None
-            start = node.kwargs.get("start", 0)
-            step = node.kwargs.get("step", 1)
-            if (
-                isinstance(length, int)
-                and length >= 0
-                and isinstance(start, int)
-                and step == 1
-            ):
-                return length
-            return None
-        args = node.args
-        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
-            constant, operand = args[1], args[0]
-            if not isinstance(constant, int):
-                constant, operand = operand, constant
-            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
-                node = operand
-                continue
-            return None
+    fake = subscript.meta.get("val")
+    if not isinstance(fake, torch.Tensor):
         return None
-    return None
+    info = _contiguous_integer_tensor_index(fake, subscript)
+    return info.extent if info is not None and isinstance(info.extent, int) else None
+
+
+def _subscript_dense_span(
+    env: CompileEnvironment,
+    host: HostFunction,
+    subscript: object,
+) -> tuple[int, int, int] | None:
+    """Prove ``tile.begin * scale + arange(block_size * scale)``.
+
+    This compact fact preserves the logical tile axis for a contiguous vector
+    subscript without materializing its lanes.  It is intentionally narrower
+    than the general affine-index model: one tile-begin symbol, a positive
+    integer scale, and an integer offset.
+    """
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    fake = subscript.meta.get("val")
+    if not isinstance(fake, torch.Tensor):
+        return None
+    contiguous = _contiguous_integer_tensor_index(fake, subscript)
+    if contiguous is None:
+        return None
+
+    def scalar_expression(value: object) -> sympy.Expr | None:
+        if type(value) is int:
+            return sympy.Integer(value)
+        if isinstance(value, torch.fx.Node):
+            value = value.meta.get("val")
+        if type(value) is int:
+            return sympy.Integer(value)
+        if isinstance(value, torch.SymInt):
+            return env.shape_env.simplify(_symint_sympy_expr(value))
+        return None
+
+    base: sympy.Expr = sympy.Integer(0)
+    for sign, value in contiguous.base_terms:
+        term = scalar_expression(value)
+        if term is None:
+            return None
+        base = env.shape_env.simplify(
+            base + sign * term  # pyrefly: ignore[unsupported-operation]
+        )
+    tile_symbols = tuple(
+        symbol
+        for symbol in base.free_symbols
+        if (origin := host.expr_to_origin.get(symbol)) is not None
+        and isinstance(origin.origin, TileBeginOrigin)
+    )
+    if len(tile_symbols) != 1:
+        return None
+    tile_symbol = tile_symbols[0]
+    origin = host.expr_to_origin[tile_symbol].origin
+    assert isinstance(origin, TileBeginOrigin)
+    coefficient = sympy.expand(base).coeff(tile_symbol)
+    remainder = env.shape_env.simplify(base - coefficient * tile_symbol)
+    if (
+        not isinstance(coefficient, sympy.Integer)
+        or int(coefficient) <= 0
+        or not isinstance(remainder, sympy.Integer)
+    ):
+        return None
+    axis = origin.block_id
+    block_size = env.block_sizes[env.canonical_block_id(axis)].var
+    extent = scalar_expression(contiguous.extent)
+    block_size_expression = scalar_expression(block_size)
+    if (
+        extent is None
+        or block_size_expression is None
+        or env.shape_env.simplify(
+            cast("Any", extent) - cast("Any", coefficient) * block_size_expression
+        )
+        != 0
+    ):
+        return None
+    return axis, int(coefficient), int(remainder)
 
 
 def _subscript_is_full_slice(subscript: object) -> bool:
@@ -1600,6 +1655,7 @@ class DeviceIRAnalysis:
                 subscript_is_scalar: tuple[bool, ...] = ()
                 subscript_is_full_slice: tuple[bool, ...] = ()
                 subscript_static_extents: tuple[int | None, ...] = ()
+                subscript_dense_spans: tuple[tuple[int, int, int] | None, ...] = ()
                 affine_subscript_ranges = None
                 layout_is_symbolically_exact = False
 
@@ -1665,6 +1721,10 @@ class DeviceIRAnalysis:
                             _subscript_static_extent(index_list[position])
                             for position in subscript_dims
                         )
+                        subscript_dense_spans = tuple(
+                            _subscript_dense_span(env, host, index_list[position])
+                            for position in subscript_dims
+                        )
                         if fake.ndim == 1 and subscript_dims == (0,):
                             affine_subscript_ranges = _affine_subscript_ranges(
                                 env,
@@ -1702,6 +1762,7 @@ class DeviceIRAnalysis:
                             has_explicit_mask=has_explicit_mask,
                             subscript_is_full_slice=subscript_is_full_slice,
                             subscript_static_extents=subscript_static_extents,
+                            subscript_dense_spans=subscript_dense_spans,
                             is_atomic=is_atomic,
                             layout_is_symbolically_exact=layout_is_symbolically_exact,
                             graph_node_index=graph_node_index,

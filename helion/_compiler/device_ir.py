@@ -992,7 +992,19 @@ class DeviceIR:
         # A present reduction must keep its slot at index 0, so reduction
         # kernels register their tile slots after the reduction-loop pass below.
         if env.backend_name == "cute" and not rdims:
+            from ..language.scan_ops import _associative_scan
+            from .cute.memory_ops import register_cute_tensor_alias_specializations
+
             self._register_cute_tile_vec_slots(env)
+            # Grid scans also reorder input reads across warps and need the
+            # same cache-specialized alias facts as reduction kernels. Do not
+            # add storage-dependent dispatch guards to unrelated grid kernels.
+            if any(
+                node.op == "call_function" and node.target is _associative_scan
+                for graph_info in self.graphs
+                for node in graph_info.graph.nodes
+            ):
+                register_cute_tensor_alias_specializations(env)
         if not rdims:
             return
         num_original_graphs = len(self.graphs)
@@ -2969,12 +2981,11 @@ def _register_atomic_tunables(atomic_count: int) -> None:
 
 def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
     env = CompileEnvironment.current()
-    if env.settings.static_shapes:
-        return
 
     from .._compat import supports_tensor_descriptor
     from ..language import atomic_ops
     from ..language import memory_ops
+    from .indexing_strategy import _contiguous_integer_tensor_index
 
     if not supports_tensor_descriptor():
         return
@@ -2986,6 +2997,21 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
             return arg.meta.get("val")
         return arg
 
+    def has_derived_block_extent(node: torch.fx.Node) -> bool:
+        indices = node.args[1] if len(node.args) > 1 else None
+        if not isinstance(indices, (list, tuple)):
+            return False
+        for index in indices:
+            if not isinstance(index, torch.fx.Node):
+                continue
+            fake = index.meta.get("val")
+            if not isinstance(fake, torch.Tensor):
+                continue
+            info = _contiguous_integer_tensor_index(fake, index)
+            if info is not None and env.get_block_id(info.extent) is None:
+                return True
+        return False
+
     memory_op_index = 0
     atomic_op_index = 0
     for graph_info in device_ir.graphs:
@@ -2996,7 +3022,9 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 tensor = tensor_arg_value(node.args[0])
                 if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
                     env.register_tensor_descriptor_layout_guard(
-                        tensor, memory_op_index=memory_op_index
+                        tensor,
+                        memory_op_index=memory_op_index,
+                        has_derived_block_extent=has_derived_block_extent(node),
                     )
                 memory_op_index += 1
                 continue
@@ -3004,7 +3032,9 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 tensor = tensor_arg_value(node.args[0])
                 if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
                     env.register_tensor_descriptor_layout_guard(
-                        tensor, atomic_op_index=atomic_op_index
+                        tensor,
+                        atomic_op_index=atomic_op_index,
+                        has_derived_block_extent=has_derived_block_extent(node),
                     )
                 atomic_op_index += 1
 

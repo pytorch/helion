@@ -73,6 +73,7 @@ from .._compiler.cute.tcgen05_config import CuteTcgen05Config
 from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._utils import indexing_uses_tensor_descriptor
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
@@ -859,6 +860,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_min_blocks_per_mp",
         "load_cache_modifiers",
         "store_cache_modifiers",
+        "host_tensor_descriptors",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -898,6 +900,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_eviction_policies",
         "load_cache_modifiers",
         "store_cache_modifiers",
+        "host_tensor_descriptors",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -2374,6 +2377,14 @@ class ConfigSpec:
         )
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "host_tensor_descriptors":
+            return (
+                self.device is not None
+                and self.device.type == "cuda"
+                and self.target_device_capability is not None
+                and self.target_device_capability >= (9, 0)
+                and self.backend.supports_config_key(key)
+            )
         if (
             key == "cross_loop_pipeline"
             and self.device is not None
@@ -3107,6 +3118,7 @@ class ConfigSpec:
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
+            "host_tensor_descriptors",
         ):
             if not self.supports_config_key(name):
                 config.pop(name, None)
@@ -3115,6 +3127,13 @@ class ConfigSpec:
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         if self.supports_config_key("num_stages"):
             config.setdefault("num_stages", self._default_num_stages())
+        if self.supports_config_key("host_tensor_descriptors"):
+            value = config.setdefault("host_tensor_descriptors", False)
+            if type(value) is not bool:
+                if _fix_invalid:
+                    config["host_tensor_descriptors"] = False
+                else:
+                    raise InvalidConfig("host_tensor_descriptors must be a bool")
         if self.supports_config_key("load_eviction_policies"):
             config.setdefault(
                 "load_eviction_policies", self.load_eviction_policies.default()
@@ -3137,6 +3156,15 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if config.get("host_tensor_descriptors"):
+            indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
+            uses_tensor_descriptor = any(
+                map(indexing_uses_tensor_descriptor, indexing_values)
+            )
+            if not uses_tensor_descriptor:
+                # Host and device materialization are identical when no memory
+                # operation selected descriptor indexing. Keep one tune point.
+                config["host_tensor_descriptors"] = False
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
@@ -4091,6 +4119,10 @@ class ConfigSpec:
             fields["indexing"] = self.indexing
         if self.supports_config_key("atomic_indexing"):
             fields["atomic_indexing"] = self.atomic_indexing
+        if self.supports_config_key("host_tensor_descriptors") and (
+            self.indexing.length > 0 or self.atomic_indexing.length > 0
+        ):
+            fields["host_tensor_descriptors"] = BooleanFragment()
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops

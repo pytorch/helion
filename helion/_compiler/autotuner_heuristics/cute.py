@@ -1241,7 +1241,14 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         # Two-tile pattern: outer row + inner reduction (no rolled
         # reductions registered — those use the
         # CuteReductionTileHeuristic seed instead).
-        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+        if (
+            len(spec.block_sizes) != 2
+            or spec.reduction_loops
+            or (
+                spec.kernel_grid_fact is not None
+                and len(spec.kernel_grid_fact.roots) > 1
+            )
+        ):
             return False
         # The inner tile block must have a vec slot registered
         # (added by ``register_rollable_reductions`` for cute tile blocks).
@@ -1284,8 +1291,10 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         nt_n = max(1, block_n // vec)
         seed: dict[str, Any] = {
             "block_sizes": [1, block_n],
-            "num_threads": [0, nt_n],
-            "cute_vector_widths": [1, vec],
+            "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: nt_n}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
         }
         try:
             return Config(**seed)
@@ -1323,7 +1332,14 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         if spec.matmul_facts:
             return False
-        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+        if (
+            len(spec.block_sizes) != 2
+            or spec.reduction_loops
+            or (
+                spec.kernel_grid_fact is not None
+                and len(spec.kernel_grid_fact.roots) > 1
+            )
+        ):
             return False
         inner_block_id = (
             cast("Any", spec.block_sizes[1]).block_ids[0]
@@ -1371,8 +1387,10 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
             return None
         seed: dict[str, Any] = {
             "block_sizes": [1, block_n],
-            "num_threads": [0, 32],
-            "cute_vector_widths": [1, vec],
+            "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
         }
         try:
             return Config(**seed)
@@ -1403,7 +1421,14 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         if spec.matmul_facts:
             return None
-        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+        if (
+            len(spec.block_sizes) != 2
+            or spec.reduction_loops
+            or (
+                spec.kernel_grid_fact is not None
+                and len(spec.kernel_grid_fact.roots) > 1
+            )
+        ):
             return None
         inner = cast("Any", spec.block_sizes[1])
         inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
@@ -1454,11 +1479,19 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
         if plan is None:
             return None
         n, threads, vec, cluster_n = plan
+        spec = env.config_spec
+        inner_block_id = spec.block_sizes[1].block_id
         seed: dict[str, Any] = {
             "block_sizes": [1, n],
-            "num_threads": [0, threads],
-            "cute_vector_widths": [1, vec],
-            "cute_lane_layouts": ["blocked", "strided"],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {inner_block_id: threads}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {inner_block_id: "strided"}
+            ),
         }
         if cluster_n > 1:
             seed["cute_cluster_n"] = cluster_n
@@ -1526,11 +1559,19 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
         if plan is None:
             return None
         n, threads, vec, cluster_n, max_per_thread = plan
+        spec = env.config_spec
+        inner_block_id = spec.block_sizes[1].block_id
         seed: dict[str, Any] = {
             "block_sizes": [1, n],
-            "num_threads": [0, threads],
-            "cute_vector_widths": [1, vec],
-            "cute_lane_layouts": ["blocked", "strided"],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {inner_block_id: threads}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {inner_block_id: "strided"}
+            ),
             "cute_cluster_n": cluster_n,
         }
         if max_per_thread > 64:
@@ -1570,7 +1611,14 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         if spec.matmul_facts:
             return None
-        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+        if (
+            len(spec.block_sizes) != 2
+            or spec.reduction_loops
+            or (
+                spec.kernel_grid_fact is not None
+                and len(spec.kernel_grid_fact.roots) > 1
+            )
+        ):
             return None
         inner = cast("Any", spec.block_sizes[1])
         inner_block_id = inner.block_ids[0] if hasattr(inner, "block_ids") else None
@@ -1610,11 +1658,23 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
         if plan is None:
             return None
         n, vec = plan
+        spec = env.config_spec
+        outer_block_id, inner_block_id = (item.block_id for item in spec.block_sizes)
         seed: dict[str, Any] = {
             "block_sizes": [cls._ROWS_PER_CTA, n],
-            "num_threads": [cls._ROWS_PER_CTA, cls._THREADS_PER_ROW],
-            "cute_vector_widths": [1, vec],
-            "cute_lane_layouts": ["blocked", "strided"],
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {
+                    outer_block_id: cls._ROWS_PER_CTA,
+                    inner_block_id: cls._THREADS_PER_ROW,
+                },
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {inner_block_id: "strided"}
+            ),
         }
         try:
             return Config(**seed)
@@ -1658,7 +1718,14 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         if spec.matmul_facts:
             return False
-        if len(spec.block_sizes) != 2 or spec.reduction_loops:
+        if (
+            len(spec.block_sizes) != 2
+            or spec.reduction_loops
+            or (
+                spec.kernel_grid_fact is not None
+                and len(spec.kernel_grid_fact.roots) > 1
+            )
+        ):
             return False
         inner_block_id = (
             cast("Any", spec.block_sizes[1]).block_ids[0]
@@ -1703,8 +1770,10 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
             return None
         seed: dict[str, Any] = {
             "block_sizes": [2, block_n],
-            "num_threads": [0, 32],
-            "cute_vector_widths": [1, vec],
+            "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
         }
         try:
             return Config(**seed)
@@ -3153,6 +3222,15 @@ class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
     promote_seed_to_default = True
 
     @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        seed = cls.get_seed_config(env, device_ir)
+        if seed is None:
+            return []
+        return [seed]
+
+    @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         from ..cute.cute_mma import tcgen05_fragment_epilogue_has_unique_anchor
         from ..cute.cute_mma import tcgen05_fragment_epilogue_present
@@ -3531,7 +3609,14 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         if vec_block not in spec.num_threads.valid_block_ids():
             return None
         size_hint = spec.block_sizes.block_id_lookup(vec_block).size_hint
-        full_vec = 16 // max(1, fact.storage_itemsize)
+        choices = (
+            spec.cute_vector_widths.block_id_lookup(vec_block)._fragment(spec).choices
+        )
+        full_vec = max(
+            cast("int", value)
+            for value in choices
+            if cast("int", value) <= 16 // max(1, fact.storage_itemsize)
+        )
         # The hoist requires numel % V == 0; shrink V until it divides.
         vec = full_vec
         while vec > 1 and size_hint % vec != 0:
@@ -3563,6 +3648,9 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
         spec = env.config_spec
+        if spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1:
+            seeds = cls._multi_root_seed_configs(env)
+            return seeds[0] if seeds else None
         picked = cls._vec_axis_and_width(env)
         if picked is None:
             return None
@@ -3611,6 +3699,9 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config] | None:
+        topology = env.config_spec.kernel_grid_fact
+        if topology is not None and len(topology.roots) > 1:
+            return cls._multi_root_seed_configs(env)
         primary = cls.get_seed_config(env, device_ir)
         if primary is None:
             return None
@@ -3678,6 +3769,111 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                     with contextlib.suppress(Exception):
                         seeds.append(Config(**wide_seed))
         return seeds
+
+    @classmethod
+    def _multi_root_seed_configs(cls, env: CompileEnvironment) -> list[Config]:
+        """Seed each independent pointwise grid from its own storage accesses.
+
+        Whole-kernel pointwise facts multiply extents across roots, so they
+        cannot size individual roots' vector traffic. Use direct stride-one
+        memory facts here, with scalar siblings for gather-heavy grids. This
+        only seeds a bounded family; codegen remains the vector-eligibility and
+        combined physical-thread-budget authority.
+        """
+        spec = env.config_spec
+        topology = spec.kernel_grid_fact
+        assert topology is not None
+        axes: list[tuple[int, int]] = []
+        for root in topology.roots:
+            candidates = [
+                item.block_id
+                for item in spec.block_sizes
+                if item.block_id in root.block_ids
+                and item.block_id in spec.num_threads.valid_block_ids()
+                and item.block_id in spec.cute_vector_widths.valid_block_ids()
+            ]
+            if not candidates:
+                return []
+            widths: dict[int, int] = {}
+            for block_id in candidates:
+                dtypes = [
+                    fact.dtype
+                    for fact in spec.memory_op_facts
+                    if fact.dtype is not None
+                    and any(
+                        bid == block_id and stride == 1
+                        for bid, stride in zip(
+                            fact.subscript_block_ids,
+                            fact.subscript_strides,
+                            strict=True,
+                        )
+                    )
+                ]
+                if dtypes:
+                    width = min(
+                        _cute_tile_seed_vec_width_for_dtype(dtype) for dtype in dtypes
+                    )
+                    choices = (
+                        spec.cute_vector_widths.block_id_lookup(block_id)
+                        ._fragment(spec)
+                        .choices
+                    )
+                    widths[block_id] = max(
+                        cast("int", value)
+                        for value in choices
+                        if cast("int", value) <= width
+                    )
+            axis = next(
+                (bid for bid in reversed(candidates) if bid in widths), candidates[-1]
+            )
+            axes.append((axis, widths.get(axis, 1)))
+        # Limit family growth independently of a kernel's number of roots.
+        scalar_choices = [set(), {axis for axis, _ in axes}]
+        scalar_choices.extend({axis} for axis, width in axes[:4] if width > 1)
+        seeds: list[Config] = []
+        for threads in (128, cls.NT):
+            for unroll in (1, cls.UNROLL):
+                for scalar_axes in scalar_choices:
+                    blocks: dict[int, object] = {
+                        item.block_id: item.min_size for item in spec.block_sizes
+                    }
+                    thread_values: dict[int, object] = {}
+                    vector_values: dict[int, object] = {}
+                    for axis, width in axes:
+                        width = 1 if axis in scalar_axes else width
+                        fragment = spec.block_sizes.block_id_lookup(axis)._fragment(
+                            spec
+                        )
+                        block = min(threads * width * unroll, fragment.high)
+                        if block < fragment.low or block < width:
+                            break
+                        blocks[axis] = block
+                        thread_values[axis] = min(threads, block // width)
+                        vector_values[axis] = width
+                    else:
+                        seeds.append(
+                            Config(
+                                block_sizes=cast(
+                                    "list[int]",
+                                    _seq_config_list(spec.block_sizes, blocks),
+                                ),
+                                num_threads=cast(
+                                    "list[int]",
+                                    _seq_config_list(spec.num_threads, thread_values),
+                                ),
+                                cute_vector_widths=cast(
+                                    "list[int]",
+                                    _seq_config_list(
+                                        spec.cute_vector_widths, vector_values
+                                    ),
+                                ),
+                                cute_lane_layouts=cast(
+                                    "list[str]",
+                                    _seq_config_list(spec.cute_lane_layouts, {}),
+                                ),
+                            )
+                        )
+        return list(dict.fromkeys(seeds))
 
 
 class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):

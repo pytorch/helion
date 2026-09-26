@@ -352,7 +352,7 @@ jobs:
       image: nvidia/cuda:13.1.0-devel-ubuntu24.04
       options: --gpus all
 
-    runs-on: linux.g5.4xlarge.nvidia.gpu
+    runs-on: mt-l-x86aavx2-11-41-a10g
 
     defaults:
       run:

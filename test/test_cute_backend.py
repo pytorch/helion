@@ -3018,7 +3018,7 @@ class TestCuteBackend(TestCase):
             modified_code = modified_bound.to_triton_code(dense_config)
         self.assertNotIn("LdRed32x32bOp", modified_code)
 
-    def test_flash_attention_sm103_f16x2_exp2_codegen_gates(self) -> None:
+    def test_flash_attention_sm103_specialized_softmax_codegen_gates(self) -> None:
         resident_q, resident_k, resident_v = (
             torch.empty(1, 1, 32768, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
@@ -3061,45 +3061,48 @@ class TestCuteBackend(TestCase):
             torch.empty(1, 1, 262144, 64, dtype=torch.float16, device=DEVICE)
             for _ in range(3)
         )
-        packed_seed = _cute_flash.flash_attention_seed_config(
+        long_resident_seed = _cute_flash.flash_attention_seed_config(
             64,
             2048,
             dtype=torch.float16,
             standard_dense_output=True,
             target_device_capability=(10, 3),
         )
-        assert packed_seed is not None
-        config = helion.Config(**packed_seed.config)
+        assert long_resident_seed is not None
+        config = helion.Config(**long_resident_seed.config)
         dense_bound = cute_dense_attention.bind((q, k, v))
         with patch.object(
             dense_bound.env.config_spec, "target_device_capability", (10, 3)
         ):
             sm103_code = dense_bound.to_triton_code(config)
-        self.assertIn("f16x2_xu=True", sm103_code)
+        self.assertIn("resident_softmax_value_graph", sm103_code)
+        self.assertNotIn("f16x2_xu=True", sm103_code)
 
         with patch.object(
             dense_bound.env.config_spec, "target_device_capability", (10, 0)
         ):
             b200_code = dense_bound.to_triton_code(config)
+        self.assertNotIn("resident_softmax_value_graph", b200_code)
         self.assertNotIn("f16x2_xu=True", b200_code)
 
-        packed_lse_bound = cute_dense_attention_with_lse.bind((q, k, v))
+        long_lse_bound = cute_dense_attention_with_lse.bind((q, k, v))
         # Admit the measured target config through normalization so this test
         # isolates the graph-level LSE gate in flash codegen.
         with (
             patch.object(
-                packed_lse_bound.env.config_spec,
+                long_lse_bound.env.config_spec,
                 "target_device_capability",
                 (10, 3),
             ),
             patch.object(
-                packed_lse_bound.env.config_spec,
+                long_lse_bound.env.config_spec,
                 "_cute_flash_standard_dense_output",
                 True,
             ),
         ):
-            packed_lse_code = packed_lse_bound.to_triton_code(config)
-        self.assertNotIn("f16x2_xu=True", packed_lse_code)
+            long_lse_code = long_lse_bound.to_triton_code(config)
+        self.assertNotIn("resident_softmax_value_graph", long_lse_code)
+        self.assertNotIn("f16x2_xu=True", long_lse_code)
 
         lse_bound = cute_dense_attention_with_lse.bind(
             (resident_q, resident_k, resident_v)
