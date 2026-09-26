@@ -9054,7 +9054,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 resolve_block_id=lambda _shape: 3,
             ),
         ):
-            compacted = dispatch._compact_shape([object()])
+            compacted = dispatch.compact_shape([object()])
 
         self.assertEqual(len(compacted), 1)
         self.assertEqual(compacted[0].size_str, "_BLOCK_3")

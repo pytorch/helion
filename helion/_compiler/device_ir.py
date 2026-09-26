@@ -43,6 +43,7 @@ from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
+from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
@@ -76,6 +77,7 @@ from .type_info import NestedFunctionType
 from .type_info import NumericType
 from .type_info import SequenceType
 from .type_info import StackTensorType
+from .type_info import TensorAttributeType
 from .type_info import TensorType
 from .type_info import TileIndexType
 from .type_info import TypeInfo
@@ -2637,7 +2639,20 @@ class WalkDeviceAST(NodeVisitor):
         return _CheckForIndexCalls.retry_call(func, args, kwargs)
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
-        return getattr(self.visit(node.value), node.attr)
+        value = self.visit(node.value)
+        # Apply the replacement here so saved bound methods use it too.
+        assert isinstance(node, ExtendedAST)
+        if (
+            isinstance(node._type_info, TensorAttributeType)
+            and node.attr in _TENSOR_METHOD_REPLACEMENTS
+            and (
+                replacement := get_device_func_replacement(
+                    getattr(torch.Tensor, node.attr)
+                )
+            )
+        ):
+            return functools.partial(replacement, value)
+        return getattr(value, node.attr)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.scope[node.name] = None

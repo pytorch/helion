@@ -154,7 +154,8 @@ class TileStrategyDispatch:
         strategy = self.block_id_to_strategy[tuple(block_ids)]
         return strategy.codegen_device_loop(state)
 
-    def _compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
+    def compact_shape(self, shapes: ShapeLike) -> list[CompactedShape]:
+        """Return physical dimensions with their logical axis and block mappings."""
         compacted_shapes = []
         for idx, shape in enumerate(shapes):
             block_idx = CompileEnvironment.current().resolve_block_id(shape)
@@ -206,7 +207,7 @@ class TileStrategyDispatch:
         return f"[{', '.join(self.shape_dims(shape))}]"
 
     def shape_dims(self, shape: ShapeLike) -> list[str]:
-        compacted_shapes = self._compact_shape(shape)
+        compacted_shapes = self.compact_shape(shape)
         return [s.size_str for s in compacted_shapes]
 
     def supports_index_rank_expansion(self) -> bool:
@@ -676,7 +677,7 @@ class TileStrategyDispatch:
         if len(shape) == 0 and i == 0:
             return ""
         assert 0 <= i < len(shape), f"Invalid index {i} for shape {shape}"
-        compacted_shapes = self._compact_shape(shape)
+        compacted_shapes = self.compact_shape(shape)
         result = []
         for dim in compacted_shapes:
             if i in dim.user_indices:
@@ -764,8 +765,8 @@ class TileStrategyDispatch:
             return []
 
         env = CompileEnvironment.current()
-        src_compacted = self._compact_shape(input_shape)
-        dst_compacted = self._compact_shape(output_shape)
+        src_compacted = self.compact_shape(input_shape)
+        dst_compacted = self.compact_shape(output_shape)
 
         # Map each source compacted dim to a destination compacted dim.
         src_to_dst: list[int] = []
@@ -843,7 +844,7 @@ class TileStrategyDispatch:
         )
         assert end_idx <= len(shape), f"Invalid end_idx {end_idx} for shape {shape}"
 
-        compacted_shapes = self._compact_shape(shape)
+        compacted_shapes = self.compact_shape(shape)
         result = []
         for dim in compacted_shapes:
             # Check if any of this dim's user_indices fall in our range [start_idx, end_idx)

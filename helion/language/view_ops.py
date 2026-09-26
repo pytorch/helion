@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 
 from .. import exc
@@ -17,6 +18,99 @@ if TYPE_CHECKING:
     from .._compiler.inductor_lowering import CodegenState
 
 __all__ = ["join", "split", "subscript"]
+
+
+def _split_dim(tensor: torch.Tensor, dim: int, op: str) -> tuple[int, int]:
+    if type(dim) is not int or not -tensor.ndim <= dim < tensor.ndim:
+        raise exc.UnsupportedSplitConfiguration(
+            op=op, requirement="a constant dim within the input rank"
+        )
+    dim %= tensor.ndim
+    size = tensor.shape[dim]
+    if isinstance(size, torch.SymInt):
+        env = CompileEnvironment.current()
+        expr = env.specialize_expr(env.shape_env.simplify(size._sympy_()))
+        block_id = env.resolve_block_id(size)
+        if not isinstance(expr, sympy.Integer) and block_id is not None:
+            block = env.block_sizes[block_id]
+            if block.reduction:
+                # A full-axis load has a block symbol even when its logical
+                # extent is constant. Do not use the extent of a tiled axis.
+                expr = env.specialize_expr(env.shape_env.simplify(block.numel))
+        if not isinstance(expr, sympy.Integer):
+            raise exc.UnsupportedSplitConfiguration(
+                op=op, requirement="a compile-time constant split dimension size"
+            )
+        size = int(expr)
+    return dim, size
+
+
+def _check_split_backend(op: str) -> None:
+    env = CompileEnvironment.current()
+    if env.backend_name != "triton":
+        raise exc.BackendUnsupported(
+            env.backend_name,
+            f"{op} device lowering. Use hl.split() for a trailing size-two axis",
+        )
+
+
+def _unbind_two(tensor: torch.Tensor, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if dim != tensor.ndim - 1:
+        order = [i for i in range(tensor.ndim) if i != dim] + [dim]
+        tensor = tensor.permute(order)
+    return split(tensor)
+
+
+@_decorators.device_func_replacement(torch.unbind)
+@_decorators.device_func_replacement(torch.Tensor.unbind)
+def _torch_unbind(
+    input: torch.Tensor,  # noqa: A002  Match PyTorch's input keyword.
+    dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lower a size-two unbind to a permutation and hl.split."""
+    _check_split_backend("torch.unbind")
+    dim, size = _split_dim(input, dim, "torch.unbind")
+    if size != 2:
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.unbind", requirement="a split dimension of size 2"
+        )
+    shape = list(input.shape)
+    # Replace a specialized SymInt with a literal 2 so hl.split sees a constant.
+    shape[dim] = size
+    return _unbind_two(input.reshape(shape), dim)
+
+
+@_decorators.device_func_replacement(torch.chunk)
+@_decorators.device_func_replacement(torch.Tensor.chunk)
+def _torch_chunk(
+    input: torch.Tensor,  # noqa: A002  Match PyTorch's input keyword.
+    chunks: int,
+    dim: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lower two equal, contiguous chunks through a size-two unbind."""
+    _check_split_backend("torch.chunk")
+    if type(chunks) is not int or chunks != 2:
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.chunk", requirement="chunks=2"
+        )
+    dim, size = _split_dim(input, dim, "torch.chunk")
+    if size == 0 or size % 2:
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.chunk", requirement="a positive even split dimension size"
+        )
+    if size & (size - 1):
+        # Triton pads to powers of two. Reshaping a padded axis into
+        # [2, size // 2] would split at the padded midpoint instead of
+        # the logical midpoint.
+        raise exc.UnsupportedSplitConfiguration(
+            op="torch.chunk",
+            requirement="a power-of-two split dimension size",
+        )
+    shape = list(input.shape)
+    shape[dim : dim + 1] = [2, size // 2]
+    # TODO(jjjxia): Lower trailing-axis chunk without a logical permutation so it can
+    # support flattened tiles. The inserted size-two axis is never trailing.
+    return _unbind_two(input.reshape(shape), dim)
 
 
 @_decorators.api(tiles_as_sizes=True)
@@ -123,6 +217,42 @@ def split(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     Returns:
         A tuple ``(lo, hi)`` where each tensor has the same shape as ``tensor``
         without its last dimension.
+
+    .. rubric:: PyTorch alternate forms
+
+    The Triton backend supports ``torch.chunk(x, 2, dim)`` for two equal
+    chunks and ``torch.unbind(x, dim)`` when the selected dimension has size
+    two. Tensor method forms (``x.chunk(...)`` and ``x.unbind(...)``),
+    including saved bound methods, are also supported. Both operations
+    accept positive and negative axes and return a tuple of two tensors.
+    ``chunk`` keeps the input rank; ``unbind`` removes the selected axis.
+    They lower through reshape/permute and ``hl.split``.
+
+    For an accumulator of shape ``[tile_m, 128]``:
+
+    .. code-block:: python
+
+        left, right = torch.chunk(acc, 2, dim=-1)  # each is [tile_m, 64]
+        grouped = acc.reshape(tile_m, 2, 64).permute(0, 2, 1)
+        left, right = grouped.unbind(dim=-1)  # same contiguous halves
+        left, right = hl.split(grouped)  # equivalent lowering
+
+    Note:
+        These PyTorch alternate forms are currently Triton-only inside device
+        loops. The axis and split size must be known at compile time; use
+        :func:`~helion.language.specialize` before the loop when needed.
+        Other tile dimensions can remain symbolic. Because Triton pads tensor
+        dimensions to powers of two, ``chunk`` requires a power-of-two split
+        size of at least two. Other chunk counts, uneven chunks, and unbinding
+        dimensions of other sizes raise an unsupported-configuration error.
+        Host-side calls retain normal PyTorch behavior.
+
+        Lowerings that permute rank-compacted tile tensors are unsupported.
+        This includes ``chunk`` even on the trailing axis. Unbinding an already
+        trailing size-two axis remains supported with flattened tiles. Direct
+        ``permute`` calls have the same restriction: the autotuner skips
+        configurations that compact the input rank. Disable ``flatten_loops``
+        for the affected tile axes to use these permutations.
 
     See Also:
         - :func:`~helion.language.join`
