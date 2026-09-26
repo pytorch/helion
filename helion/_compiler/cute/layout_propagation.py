@@ -234,7 +234,7 @@ def _plan_warp_per_row_execution(
     """Detect the softmax-shaped warp-per-row layout.
 
     When the kernel has a single 1-D outer grid loop over rows (M-axis)
-    and an inner non-reduction tile loop over the reduction axis (N),
+    and inner non-reduction tile passes over the same reduction axis (N),
     and the autotuner picks ``num_threads`` such that:
 
       * M-block (outer grid) has a thread extent >= 2 (multi-row CTAs)
@@ -311,12 +311,30 @@ def _plan_warp_per_row_execution(
         n_strategies.append(strategy)
     if not n_strategies:
         return
+    # The row coordinate is emitted once outside all sibling passes. Reserving
+    # a lower N axis only in some branches gives that shared row strategy two
+    # different offsets; the first branch then silently determines both. A
+    # scalar sibling has no N axis to reserve, so keep the ordinary row-first
+    # layout unless a threaded N strategy covers every branch of this grid.
+    if not tile_strategy.strategies_cover_branches(m_strategy, n_strategies):
+        return
     n_block_ids = {bid for s in n_strategies for bid in s.block_ids}
     if len(n_block_ids) != 1:
-        # Multiple distinct inner blocks — not the simple softmax shape.
+        from .loop_nesting import sibling_row_loop_blocks
+
+        sibling_blocks = sibling_row_loop_blocks(
+            CompileEnvironment.current(),
+            device_ir,
+            m_strategy.fn.codegen.codegen_graphs,
+        )
+        if sibling_blocks is None or set(sibling_blocks[1]) != n_block_ids:
+            return
+    thread_extents = {
+        tile_strategy.thread_extent_for_block_id(block_id) for block_id in n_block_ids
+    }
+    if len(thread_extents) != 1:
         return
-    (n_block_id,) = n_block_ids
-    n_threads = tile_strategy.thread_extent_for_block_id(n_block_id)
+    (n_threads,) = thread_extents
     if not isinstance(n_threads, int) or n_threads < 32 or n_threads % 32 != 0:
         return
     # Joint thread budget check.
@@ -324,15 +342,16 @@ def _plan_warp_per_row_execution(
 
     if m_threads * n_threads > MAX_THREADS_PER_BLOCK:
         return
+    scoped_block_ids = frozenset({m_block_id, *n_block_ids})
     graph_info.cute_grid_execution_plans = (
         *graph_info.cute_grid_execution_plans,
         CuTeGridExecutionPlan(
-            scoped_block_ids=frozenset({m_block_id, n_block_id}),
+            scoped_block_ids=scoped_block_ids,
             block_axis_priority={
-                n_block_id: 0,
+                **dict.fromkeys(n_block_ids, 0),
                 m_block_id: 1,
             },
-            disable_reduction_axis_reservation_for=frozenset({m_block_id, n_block_id}),
+            disable_reduction_axis_reservation_for=scoped_block_ids,
         ),
     )
 

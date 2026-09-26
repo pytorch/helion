@@ -23,8 +23,40 @@ from .indexing import match_cute_stack_reshape_rhs
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from ...autotuner.config_spec import MatmulFact
     from ..aten_lowering import LoweringContext
+    from ..device_ir import DeviceIR
     from ..helper_function import CodegenInterface
+
+
+def cute_matmul_root_placements(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> tuple[tuple[MatmulFact, tuple[int, ...]], ...]:
+    """Return proven contraction/root pairs for the active device regions.
+
+    A fissioned DeviceIR retains kernel-wide facts but owns only a subset of
+    root grids. Match those roots by the recorded graph attribution, never by
+    the order of parallel matmul and grid lists. Callers supply their own dtype,
+    layout, and shared-knob eligibility restrictions.
+    """
+    spec = env.config_spec
+    if len(spec.matmul_facts) == 1 and len(device_ir.grid_block_ids) == 1:
+        return ((spec.matmul_facts[0], tuple(device_ir.grid_block_ids[0])),)
+    matmul = spec.kernel_matmul_fact
+    grid = spec.kernel_grid_fact
+    if matmul is None or grid is None or not matmul.attribution_complete:
+        return ()
+    active_roots = {tuple(root) for root in device_ir.grid_block_ids}
+    if not active_roots.issubset(grid.grid_groups):
+        return ()
+    placed = []
+    for resolved in matmul.matmuls:
+        root = grid.group_for_graph(resolved.site.graph_id)
+        if not root:
+            return ()
+        if root in active_roots:
+            placed.append((resolved.fact, root))
+    return tuple(placed)
 
 
 @dataclass(frozen=True)
@@ -1063,6 +1095,24 @@ def _cute_trace_matmul_operand_load(
     return None
 
 
+def cute_has_synthetic_lane_k(
+    cg: CodegenInterface,
+    k_block_id: int | None,
+) -> bool:
+    """Whether K is split across a lane loop, independent of a static numel."""
+    if k_block_id is None:
+        return False
+    cg_any = cast("Any", cg)
+    loops = cg_any.active_device_loops.get(k_block_id)
+    loop_state = loops[-1] if loops else None
+    strategy = getattr(loop_state, "strategy", None)
+    if strategy is None:
+        return False
+    lane_var = getattr(strategy, "_synthetic_cute_lane_var", None)
+    lane_extent = getattr(strategy, "_synthetic_cute_lane_extent", 1)
+    return lane_var is not None and isinstance(lane_extent, int) and lane_extent > 1
+
+
 def cute_synthetic_lane_k_extent(
     cg: CodegenInterface,
     k_block_id: int | None,
@@ -1074,19 +1124,14 @@ def cute_synthetic_lane_k_extent(
     A cross-thread warp reduction over such a K only covers the live-thread
     fraction of K, so a matmul that reduces over it must instead fold the full
     extent itself (see ``emit_cute_synthetic_lane_fold_mm``).
+
+    ``None`` can also mean that the numel is dynamic. Call
+    ``cute_has_synthetic_lane_k`` when deciding whether a scalar reduction is
+    safe, rather than treating an unknown extent as absence of a lane loop.
     """
-    if k_block_id is None:
+    if not cute_has_synthetic_lane_k(cg, k_block_id):
         return None
-    cg_any = cast("Any", cg)
-    loops = cg_any.active_device_loops.get(k_block_id)
-    loop_state = loops[-1] if loops else None
-    strategy = getattr(loop_state, "strategy", None)
-    if strategy is None:
-        return None
-    lane_var = getattr(strategy, "_synthetic_cute_lane_var", None)
-    lane_extent = getattr(strategy, "_synthetic_cute_lane_extent", 1)
-    if lane_var is None or not isinstance(lane_extent, int) or lane_extent <= 1:
-        return None
+    assert k_block_id is not None
     env = CompileEnvironment.current()
     numel = env.block_sizes[k_block_id].numel
     return _cute_static_int_extent(numel)
@@ -1226,13 +1271,13 @@ def _cute_active_mask_var(cg: CodegenInterface, block_id: int) -> str | None:
 
 def cute_lower_rhs_for_matmul(
     env: Mapping[torch.fx.Node, object],
-    lhs: ast.AST | CutePackedAffineLoad,
+    lhs: ast.AST | CutePackedAffineLoad | CutePackedTerms,
     rhs_node: torch.fx.Node,
-    rhs_fallback: ast.AST,
+    rhs_fallback: ast.AST | CutePackedTerms,
 ) -> tuple[ast.AST | CutePackedTerms, tuple[tuple[torch.fx.Node, ...], int] | None]:
     rhs: ast.AST | CutePackedTerms = rhs_fallback
     packed_rhs = None
-    if isinstance(lhs, CutePackedAffineLoad):
+    if isinstance(lhs, (CutePackedAffineLoad, CutePackedTerms)):
         packed_rhs = match_cute_stack_reshape_rhs(rhs_node)
         if packed_rhs is not None:
             packed_nodes, _ = packed_rhs

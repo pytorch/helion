@@ -496,6 +496,14 @@ class FakeGraphLowering(GraphLowering):
 
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        if (
+            node.target is torch.ops.aten.clone.default
+            and CompileEnvironment.current().backend_name == "cute"
+        ):
+            from .cute.cute_reshape import codegen_cute_virtual_clone
+
+            if (result := codegen_cute_virtual_clone(ctx, node)) is not None:
+                return result
         return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
 
     def codegen_from_input_asts(
@@ -832,6 +840,12 @@ class ReductionLowering(InductorLowering):
         mask_node_inputs(node, default)
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.completed_matmul_sum import completed_matmul_sum_input
+
+            completed = completed_matmul_sum_input(ctx, node)
+            if completed is not None:
+                return completed
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         indices = [sympy.Symbol(f"i{n}") for n in range(len(reduction.ranges))]

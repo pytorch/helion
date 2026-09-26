@@ -148,9 +148,16 @@ def _serialize_compiled_fn(fn: CompiledConfig) -> SerializedCompiledFunction:
                 source_code = inspect.getsource(module)
     if source_code is None:
         raise RuntimeError("Unable to capture source for compiled kernel")
-    source_hash: str | None = None
+    source_hash = getattr(fn, "_helion_cute_source_hash", None)
+    if not isinstance(source_hash, str):
+        source_hash = None
     fn_globals = getattr(fn, "__globals__", None)
-    if isinstance(fn_globals, dict):
+    if isinstance(fn_globals, dict) and not isinstance(
+        getattr(fn, "_helion_cute_kernels", None), tuple
+    ):
+        # A conditional bundle can retain the legacy primary kernel name for
+        # its fallback. That kernel has its own hash; it is not the host
+        # bundle's source identity.
         kernel = fn_globals.get(f"_helion_{fn.__name__}")
         value = getattr(kernel, "_helion_cute_source_hash", None)
         if isinstance(value, str):
@@ -270,12 +277,19 @@ def _load_compiled_fn(fn_spec: SerializedCompiledFunction) -> CompiledConfig:
                 "in generated module"
             )
         cute_kernel = module.__dict__.get(f"_helion_{fn_spec.function_name}")
-        if cute_kernel is not None and fn_spec.source_hash is not None:
+        if (
+            cute_kernel is not None
+            and fn_spec.source_hash is not None
+            and not isinstance(getattr(fn, "_helion_cute_kernels", None), tuple)
+        ):
             # Backend annotation is runtime metadata and is not present in the
             # generated source. Carry the parent's exact value because
             # PyCodeCache treats strip-equivalent source as one file key.
             with contextlib.suppress(AttributeError, TypeError):
                 cute_kernel._helion_cute_source_hash = fn_spec.source_hash
+        if fn_spec.source_hash is not None:
+            with contextlib.suppress(AttributeError, TypeError):
+                fn._helion_cute_source_hash = fn_spec.source_hash
         return fn
     except BaseException:
         sys.modules.pop(module_name, None)
@@ -289,8 +303,12 @@ def _unload_compiled_fn(fn: CompiledConfig) -> None:
     if module_name.startswith("_helion_autotune_subprocess_"):
         module = sys.modules.get(module_name)
         if module is not None:
-            cute_kernel = module.__dict__.get(f"_helion_{fn.__name__}")
-            if cute_kernel is not None:
+            kernels = getattr(fn, "_helion_cute_kernels", None)
+            if not isinstance(kernels, tuple):
+                kernels = (module.__dict__.get(f"_helion_{fn.__name__}"),)
+            for cute_kernel in kernels:
+                if cute_kernel is None:
+                    continue
                 launchers = getattr(
                     cute_kernel, "_helion_cute_compiled_launchers", None
                 )

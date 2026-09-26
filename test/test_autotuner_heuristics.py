@@ -3426,7 +3426,12 @@ class TestAutotunerHeuristic(TestCase):
             static_bound = static_viewed_inputs.bind(args)
             dynamic_bound = dynamic_viewed_inputs.bind(args)
 
-        self.assertTrue(static_bound.env.runtime_input_specializations)
+        self.assertTrue(
+            any(
+                key.startswith("cute_tcgen05_grouped_worklist:")
+                for key in static_bound.env.runtime_input_specializations
+            )
+        )
         self.assertTrue(
             any(
                 config.config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
@@ -3434,7 +3439,14 @@ class TestAutotunerHeuristic(TestCase):
                 for config in static_bound.config_spec.compiler_seed_configs
             )
         )
-        self.assertFalse(dynamic_bound.env.runtime_input_specializations)
+        # Generic copy alignment/alias guards are independent of the guarded
+        # worklist dimensions that this viewed input cannot prove.
+        self.assertFalse(
+            any(
+                key.startswith("cute_tcgen05_grouped_worklist:")
+                for key in dynamic_bound.env.runtime_input_specializations
+            )
+        )
         self.assertFalse(
             any(
                 config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)

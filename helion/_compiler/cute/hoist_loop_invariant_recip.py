@@ -55,6 +55,7 @@ import ast
 
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import _names_read
+from .scaled_sub_fusion import SCALED_SUBTRACTION_ATTR
 
 _HOIST_COUNTER: list[int] = [0]
 
@@ -783,9 +784,12 @@ def _find_invariant_scale_subs(
             # safely without re-evaluating its RHS multiple times.
             # Pattern A doesn't need this since the Sub stays in place.
             const_val = const_side.value
-            if not isinstance(const_val, (int, float)):
+            # This reassociation targets floating-point FMA expressions. Without
+            # a typed integer proof, retain integer arithmetic exactly: turning
+            # its scale into a float can round indices and add conversions.
+            if not isinstance(const_val, float):
                 continue
-            key = (root, float(const_val))
+            key = (root, const_val)
             found.setdefault(key, []).append((sub, sub_node, inv_side))
     return found
 
@@ -861,6 +865,7 @@ def _rewrite_scale_sub_to_fma(
     else:
         node.left = ast.Name(id=scaled_name, ctx=ast.Load())
         node.right = new_a_mult
+    setattr(node, SCALED_SUBTRACTION_ATTR, True)
     ast.fix_missing_locations(node)
 
 

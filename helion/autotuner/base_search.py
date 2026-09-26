@@ -983,7 +983,9 @@ class BaseSearch(BaseAutotuner):
 
         return hardware, specialization_key
 
-    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
+    def _find_similar_cached_configs(
+        self, max_configs: int, *, config_spec_hash: str | None = None
+    ) -> list[SavedBestConfig]:
         """Return cached configs matching hardware and specialization.
 
         Scans the local cache first; if more configs are needed and a remote
@@ -1013,8 +1015,12 @@ class BaseSearch(BaseAutotuner):
         if current_hardware is None or current_spec_key is None:
             return []
 
-        current_fingerprint_hash = self.config_spec.cache_fingerprint_hash(
-            advanced_controls_files=self.settings.autotune_search_acf or None
+        current_fingerprint_hash = (
+            config_spec_hash
+            if config_spec_hash is not None
+            else self.config_spec.cache_fingerprint_hash(
+                advanced_controls_files=self.settings.autotune_search_acf or None
+            )
         )
 
         def is_compatible(entry: SavedBestConfig) -> bool:
@@ -1251,6 +1257,7 @@ class PopulationBasedSearch(BaseSearch):
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
+            compiler_coverage_enabled=not self.settings.disable_autotuner_heuristics,
         )
 
     def _generation_invalid_config_count(self) -> int:
@@ -1406,8 +1413,11 @@ class PopulationBasedSearch(BaseSearch):
         self,
         population: Sequence[FlatConfig],
         target: int,
+        *,
+        generation: ConfigGeneration | None = None,
     ) -> list[FlatConfig]:
         """Pad an initial population with normalized, unique random configs."""
+        generation = self.config_gen if generation is None else generation
         result: list[FlatConfig] = []
         seen: set[Config] = set()
         invalid = 0
@@ -1416,7 +1426,7 @@ class PopulationBasedSearch(BaseSearch):
         def append_if_valid(flat: FlatConfig) -> None:
             nonlocal invalid, duplicate
             try:
-                canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+                canonical_flat, config = generation.canonicalize_flat(flat)
             except exc.InvalidConfig:
                 invalid += 1
                 return
@@ -1433,7 +1443,7 @@ class PopulationBasedSearch(BaseSearch):
         max_attempts = max(64, max(0, target - len(result)) * 64)
         while len(result) < target and attempts < max_attempts:
             attempts += 1
-            append_if_valid(self.config_gen.random_flat())
+            append_if_valid(generation.random_flat())
 
         if len(result) < target:
             self.log(
@@ -1445,7 +1455,9 @@ class PopulationBasedSearch(BaseSearch):
         self.log(f"Initial population after unique random padding: {len(result)} total")
         return result
 
-    def _generate_best_available_population_flat(self) -> list[FlatConfig]:
+    def _generate_best_available_population_flat(
+        self, *, generation: ConfigGeneration | None = None
+    ) -> list[FlatConfig]:
         """
         Generate initial population using default config, explicit seed configs,
         and cached configs.
@@ -1465,6 +1477,8 @@ class PopulationBasedSearch(BaseSearch):
             seed configs and up to autotune_best_available_max_configs cached
             configs.
         """
+        projected = generation is not None and generation._initial_sampling
+        generation = self.config_gen if generation is None else generation
         max_configs = self.settings.autotune_best_available_max_configs
 
         seen: set[Config] = set()
@@ -1474,7 +1488,7 @@ class PopulationBasedSearch(BaseSearch):
         # User seed configs are explicit requests, so try them before compiler-owned
         # seeds, the raw default, and cached configs while still deduplicating
         # normalized configs.
-        for flat, transferred_config in self.config_gen.user_seed_flat_config_pairs(
+        for flat, transferred_config in generation.user_seed_flat_config_pairs(
             self._autotune_seed_configs(), self.log
         ):
             if transferred_config not in seen:
@@ -1486,9 +1500,7 @@ class PopulationBasedSearch(BaseSearch):
         # they encode backend/compiler heuristics and complement user seed configs.
         # Keep them before the raw fragment default so expensive fallback defaults
         # cannot starve a known fast compiler seed in FROM_BEST_AVAILABLE mode.
-        for flat, transferred_config in self.config_gen.seed_flat_config_pairs(
-            self.log
-        ):
+        for flat, transferred_config in generation.seed_flat_config_pairs(self.log):
             if transferred_config not in seen:
                 seen.add(transferred_config)
                 pinned_configs.add(transferred_config)
@@ -1496,8 +1508,8 @@ class PopulationBasedSearch(BaseSearch):
 
         for config in self._best_available_seed_configs:
             try:
-                flat = self.config_gen.flatten(config)
-                transferred_config = self.config_gen.unflatten(flat)
+                flat = generation.flatten(config)
+                transferred_config = generation.unflatten(flat)
                 if transferred_config not in seen:
                     seen.add(transferred_config)
                     pinned_configs.add(transferred_config)
@@ -1505,8 +1517,8 @@ class PopulationBasedSearch(BaseSearch):
             except (ValueError, TypeError, KeyError, AssertionError) as e:
                 self.log(f"Failed to transfer explicit seed config: {e}")
 
-        default_flat = self.config_gen.default_flat()
-        default_config = self.config_gen.unflatten(default_flat)
+        default_flat = generation.default_flat()
+        default_config = generation.unflatten(default_flat)
         if default_config not in seen:
             seen.add(default_config)
             pinned_configs.add(default_config)
@@ -1516,7 +1528,16 @@ class PopulationBasedSearch(BaseSearch):
         )
         self.log("Starting with seed/default configs")
 
-        cached_entries = self._find_similar_cached_configs(max_configs)
+        cached_entries = (
+            self._find_similar_cached_configs(
+                max_configs,
+                config_spec_hash=self.config_spec.projected_cache_fingerprint_hash(
+                    advanced_controls_files=self.settings.autotune_search_acf or None
+                ),
+            )
+            if projected
+            else self._find_similar_cached_configs(max_configs)
+        )
 
         if cached_entries:
             self.log.debug(
@@ -1528,7 +1549,12 @@ class PopulationBasedSearch(BaseSearch):
             try:
                 self.log.debug(f"Cached config {i + 1}: {entry.config}")
                 flat = entry.to_mutable_flat_config()
-                transferred_config = self.config_gen.unflatten(flat)
+                if projected:
+                    flat, transferred_config = generation.projected_cache_flat_pair(
+                        flat
+                    )
+                else:
+                    transferred_config = generation.unflatten(flat)
                 if transferred_config in seen:
                     duplicates += 1
                     self.log.debug(
@@ -1555,6 +1581,48 @@ class PopulationBasedSearch(BaseSearch):
 
         self.log(f"Seed/default/cache population: {len(result)} total")
 
+        return result
+
+    def _append_compiler_coverage(
+        self, population: list[FlatConfig], *, use_cache: bool
+    ) -> list[FlatConfig]:
+        from .compiler_coverage import append_compiler_coverage
+
+        def cached_configs() -> list[Config]:
+            if not use_cache:
+                return []
+            result: list[Config] = []
+            for entry in self._find_similar_cached_configs(
+                self.settings.autotune_best_available_max_configs
+            ):
+                try:
+                    result.append(
+                        self.config_gen.strict_unflatten(entry.to_mutable_flat_config())
+                    )
+                except (
+                    exc.InvalidConfig,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    AssertionError,
+                ) as error:
+                    self.log(
+                        f"Failed to transfer expanded coverage cache config: {error}"
+                    )
+            return result
+
+        result, outcomes = append_compiler_coverage(
+            population,
+            self.config_gen,
+            cached_configs=cached_configs,
+            pin=self.pin_finalist_config,
+        )
+        self.compiler_coverage_outcomes = outcomes
+        for outcome in outcomes:
+            self.log.debug(
+                f"Compiler coverage {outcome.mechanism} ({outcome.origin}): "
+                f"{outcome.outcome}; requested={outcome.requested}, effective={outcome.effective}"
+            )
         return result
 
     def set_best_available_seed_configs(

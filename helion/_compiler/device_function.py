@@ -316,6 +316,10 @@ class DeviceFunction:
         self.pid: ProgramIDs | None = None
         self.namespace: _Namespace = _Namespace()
         self.namespace._used_names.update(reserved_names())
+        if CompileEnvironment.current().backend.name == "cute":
+            # CuTe treats `_` as a write-only discard binding. Python host
+            # locals can still supply values through a renamed device argument.
+            self.namespace._used_names.add("_")
 
         self.namespace._used_names.update(all_reserved_launch_param_names())
         self.namespace._used_names.update(
@@ -1143,6 +1147,24 @@ class DeviceFunction:
         if backend.name == "cute":
             from .cute.fuse_two_pass_loads import fuse_two_pass_loads
 
+            float_scalar_names = {
+                argument.name
+                for expression, argument in self._expr_args.items()
+                if isinstance(expression, sympy.Symbol)
+                and (
+                    symbol_is_type(expression, SymT.FLOAT)
+                    or symbol_is_type(expression, SymT.UNBACKED_FLOAT)
+                )
+            } | {
+                argument.name
+                for argument in self.arguments
+                if isinstance(argument, NumericArgument)
+                and isinstance(
+                    HostFunction.current().params.arguments.get(argument.host_str()),
+                    (float, torch.SymFloat),
+                )
+            }
+
             # Collect static integer values for constexpr names so the
             # fusion pass can resolve range(..., step=cutlass.Int32(NAME))
             # trip counts. Three sources: literal constexpr inlined args,
@@ -1187,6 +1209,7 @@ class DeviceFunction:
                     except ValueError:
                         continue
             proven_disjoint_tensor_pairs = self.proven_disjoint_tensor_pairs()
+
             # Autotuner-selected reload mode per rolled or persistent
             # reduction dim ("auto" / "register" / "gmem").
             env = CompileEnvironment.current()
@@ -1239,6 +1262,15 @@ class DeviceFunction:
                 running_sum_accumulators=self.cute_matmul_running_sums,
                 rename_groups=rename_groups,
             )
+            if self.cute_state.simt_cluster_n > 1:
+                from .cute.duplicate_reduction_carries import (
+                    eliminate_duplicate_cluster_maxima,
+                )
+
+                kernel_body = eliminate_duplicate_cluster_maxima(
+                    kernel_body, constexpr_values, rename_groups
+                )
+
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -1257,23 +1289,6 @@ class DeviceFunction:
                 hoist_lane_invariant_reductions,
             )
 
-            float_scalar_names = {
-                argument.name
-                for expression, argument in self._expr_args.items()
-                if isinstance(expression, sympy.Symbol)
-                and (
-                    symbol_is_type(expression, SymT.FLOAT)
-                    or symbol_is_type(expression, SymT.UNBACKED_FLOAT)
-                )
-            } | {
-                argument.name
-                for argument in self.arguments
-                if isinstance(argument, NumericArgument)
-                and isinstance(
-                    HostFunction.current().params.arguments.get(argument.host_str()),
-                    (float, torch.SymFloat),
-                )
-            }
             kernel_body = hoist_lane_invariant_reductions(
                 kernel_body,
                 tensor_names=set(tensor_dtypes),
@@ -1537,7 +1552,15 @@ class DeviceFunction:
                 | frozenset(constexpr_values),
                 thread_block_dims=exact_thread_block_dims,
             )
+            from .cute.proven_loop_bounds import simplify_proven_loop_bounds
             from .cute.simplify_proven_bounds import simplify_proven_bounds
+
+            kernel_body = simplify_proven_loop_bounds(
+                kernel_body,
+                enabled=bool(self.config.config.get("cute_proven_bounds", False)),
+                thread_block_dims=exact_thread_block_dims,
+                constexpr_values=constexpr_values,
+            )
 
             kernel_body = simplify_proven_bounds(
                 kernel_body,
@@ -1588,20 +1611,18 @@ class DeviceFunction:
             from .cute.hoist_warp_reduce import validate_cluster_reduce_placement
 
             validate_cluster_reduce_placement(kernel_body, constexpr_values)
-        result = [
-            *prefix,
-            ast_rename(
-                create(
-                    ast.FunctionDef,
-                    name=self.name,
-                    args=create_arguments(args),
-                    body=kernel_body,
-                    decorator_list=decorators,
-                    type_params=[],
-                ),
-                {k: v[0] for k, v in self._variable_renames.items()},
+        definition = ast_rename(
+            create(
+                ast.FunctionDef,
+                name=self.name,
+                args=create_arguments(args),
+                body=kernel_body,
+                decorator_list=decorators,
+                type_params=[],
             ),
-        ]
+            {k: v[0] for k, v in self._variable_renames.items()},
+        )
+        result = [*prefix, definition]
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:
             # The CuTe launcher reads this attribute to launch the kernel

@@ -35,3 +35,19 @@ def _assignment_lhs_name(stmt: ast.stmt) -> str | None:
         if isinstance(target, ast.Name):
             return target.id
     return None
+
+
+def _bound_names(tree: ast.AST) -> set[str]:
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arg):
+            names.add(node.arg)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.alias):
+            names.add(node.asname or node.name.split(".", 1)[0])
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            names.update(node.names)
+        elif isinstance(node, ast.ExceptHandler) and node.name is not None:
+            names.add(node.name)
+    return names

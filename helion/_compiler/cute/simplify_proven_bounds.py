@@ -59,6 +59,37 @@ def _loaded_names(node: ast.AST) -> set[str]:
     }
 
 
+def _boolean_value(node: ast.expr) -> bool:
+    if isinstance(node, ast.Constant):
+        return type(node.value) is bool
+    if isinstance(node, ast.Compare):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        return True
+    return isinstance(node, ast.BoolOp) and all(
+        _boolean_value(value) for value in node.values
+    )
+
+
+def _remove_true_and_operands(values: list[ast.expr]) -> list[ast.expr]:
+    remaining = [
+        value
+        for value in values
+        if not (isinstance(value, ast.Constant) and value.value is True)
+    ]
+    # ``and`` returns an operand, not its truth value. A final True changes
+    # the result of ``7 and True`` from 7 to True and must remain unless the
+    # preceding result is already Boolean.
+    if (
+        remaining
+        and isinstance(values[-1], ast.Constant)
+        and values[-1].value is True
+        and not _boolean_value(remaining[-1])
+    ):
+        remaining.append(values[-1])
+    return remaining
+
+
 def _literal_int(node: ast.expr, bounds: dict[str, tuple[int, int]]) -> int | None:
     if isinstance(node, ast.Constant) and type(node.value) is int:
         return node.value
@@ -312,11 +343,7 @@ class _Simplifier:
                 assert isinstance(visited, ast.BoolOp)
                 if not isinstance(visited.op, ast.And):
                     return visited
-                values = [
-                    value
-                    for value in visited.values
-                    if not (isinstance(value, ast.Constant) and value.value is True)
-                ]
+                values = _remove_true_and_operands(visited.values)
                 if len(values) == len(visited.values):
                     return visited
                 parent.changed += 1

@@ -40,6 +40,7 @@ unexpected.
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import re
 from typing import cast
 
@@ -218,6 +219,90 @@ def _compute_dependency_closure(
     return closure
 
 
+def _name_explicit_fp32_reduce_inputs(
+    body: list[ast.stmt], counter: list[int], running_sums: set[str]
+) -> list[ast.stmt]:
+    """Expose an explicit input conversion to the existing dependency proof.
+
+    Keep the conversion as its own assignment. In particular, an earlier
+    narrowing conversion that defines its operand must still execute before
+    the FP32 reduction; replacing that earlier definition's cast would change
+    the observable rounding. Failed hoist attempts leave the original AST
+    unchanged.
+    """
+    used_names = {
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+    }
+    # Only single-assignment scalar recipes can be exposed to the hoister.
+    # A conditional write is not a definite definition. Even an unconditional
+    # reset followed by an update is unsafe: the old scheduler could move the
+    # invariant reset outside the V-loop and turn the update into a recurrence.
+    # Count every syntactic write, including structured/augmented assignments,
+    # then prove lexical dependencies using only ordinary scalar definitions.
+    writes = Counter(
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del))
+    )
+    definite: dict[str, int] = {}
+    for index, statement in enumerate(body):
+        if not (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and not any(isinstance(node, ast.NamedExpr) for node in ast.walk(statement))
+        ):
+            continue
+        name = statement.targets[0].id
+        if (
+            writes[name] == 1
+            and _names_read(statement) & writes.keys() <= definite.keys()
+        ):
+            definite[name] = index
+    result: list[ast.stmt] = []
+    for index, statement in enumerate(body):
+        rhs = _assignment_rhs(statement)
+        found = _find_warp_reduce_in_expr(rhs) if rhs is not None else None
+        if found is None:
+            result.append(statement)
+            continue
+        _op, value, _call = found
+        if not (
+            isinstance(value, ast.Call)
+            and ast.unparse(value.func) == "cutlass.Float32"
+            and len(value.args) == 1
+            and isinstance(value.args[0], ast.Name)
+            and not value.keywords
+        ):
+            result.append(statement)
+            continue
+        input_name = value.args[0].id
+        definition = definite.get(input_name)
+        if input_name in running_sums or definition is None or definition >= index:
+            # Naming a cast must not disguise a running accumulator or other
+            # recurrence as a fresh per-lane reduction input.
+            result.append(statement)
+            continue
+        while (name := f"_helion_vfold_input_{counter[0]}") in used_names:
+            counter[0] += 1
+        counter[0] += 1
+        used_names.add(name)
+        cloned = ast.parse(ast.unparse(statement)).body[0]
+        cloned_rhs = _assignment_rhs(cloned)
+        assert cloned_rhs is not None
+        cloned_found = _find_warp_reduce_in_expr(cloned_rhs)
+        assert cloned_found is not None
+        cloned_call = cloned_found[2]
+        result.append(statement_from_string(f"{name} = {ast.unparse(value)}"))
+        cloned_call.args[0] = ast.Name(id=name, ctx=ast.Load())
+        result.append(cloned)
+    return result
+
+
 def _try_hoist_one_vloop(
     vloop: ast.For,
     v: int,
@@ -231,7 +316,7 @@ def _try_hoist_one_vloop(
     deep-copied nodes, so a failed attempt leaves the original V-loop
     untouched.
     """
-    body = vloop.body
+    body = _name_explicit_fp32_reduce_inputs(vloop.body, acc_name_counter, running_sums)
     vec_lane_var: str | None = None
     if isinstance(vloop.target, ast.Name):
         vec_lane_var = vloop.target.id

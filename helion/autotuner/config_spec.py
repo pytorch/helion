@@ -79,6 +79,8 @@ from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
+from .compiler_coverage import CompilerCoverageGroup
+from .compiler_coverage import coverage_policy
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -100,6 +102,7 @@ if TYPE_CHECKING:
     import sympy
 
     from .._compiler.backend import Backend
+    from .._compiler.cute.loop_nesting import TileLoopPath
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
@@ -855,6 +858,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_signed_bitfield_bf16",
         "cute_proven_bounds",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -917,6 +921,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_signed_bitfield_bf16",
         "cute_proven_bounds",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -983,6 +988,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_signed_bitfield_bf16",
         "cute_proven_bounds",
     }
 )
@@ -1012,7 +1018,17 @@ def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
         # loads only — triton's evict_last equivalent, which keeps up to
         # ~L2-size of a streaming input resident across other traffic
         # (+1.7% on fp32 elementwise mul on B200).
-        return ("", "first", "last", "streaming", "l2_last")
+        # Matching explicit L1/L2 priorities preserve a packet for later
+        # row passes or evict it after its final use; also 16-byte loads only.
+        return (
+            "",
+            "first",
+            "last",
+            "streaming",
+            "l2_last",
+            "l1_l2_first",
+            "l1_l2_last",
+        )
     return ("",)
 
 
@@ -1073,6 +1089,10 @@ class ConfigSpec:
         # before configs are normalized.
         self.reduction_block_ids: set[int] = set()
         self.cute_indexed_reduction_block_ids: set[int] = set()
+        # Non-reduction tiles that execute simultaneously. Sibling loops and
+        # separate roots reuse physical axes during CuTe launch planning.
+        self.cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        self.cute_inactive_tile_block_ids: set[int] = set()
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
@@ -1115,6 +1135,7 @@ class ConfigSpec:
         # updates. Generated-AST matching is stricter and remains authoritative.
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
+        self.cute_signed_bitfield_bf16_available = False
         self.cute_proven_bounds_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
@@ -1239,6 +1260,9 @@ class ConfigSpec:
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
+        self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
+        self._compiler_coverage_fields: tuple[tuple[str | int, ...], ...] = ()
+        self.cute_matmul_min_blocks_search_enabled: bool = False
         # Compiler paths can opt their seeds into a single bounded timeout
         # retry. ``None`` leaves all benchmark behavior unchanged.
         self.compiler_seed_timeout_retry_repetitions: int | None = None
@@ -1265,6 +1289,57 @@ class ConfigSpec:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
+
+    @property
+    def compiler_coverage_groups(self) -> tuple[CompilerCoverageGroup, ...]:
+        return self._compiler_coverage_groups
+
+    def register_compiler_coverage_group(self, group: CompilerCoverageGroup) -> None:
+        """Register ranked coverage after ordinary facts/defaults/seeds are built.
+
+        Consumers expose and normalize their own optional scalar field. They
+        must not change old field domains to make a coverage mode admissible.
+        No user config, compiler default or seed is changed by registration.
+        """
+        for current in self._compiler_coverage_groups:
+            if current.mechanism == group.mechanism or current.key == group.key:
+                raise ValueError("Duplicate compiler coverage mechanism or field")
+        fields = self._flat_fields()
+        fragment = fields.get(group.key)
+        if not isinstance(fragment, ConfigSpecFragment):
+            raise ValueError(f"Unknown or non-scalar coverage field {group.key!r}")
+        group.validate_field(fragment)
+        group.validate_dependencies(self._compiler_coverage_groups)
+        groups = (*self._compiler_coverage_groups, group)
+        owned = {entry.key for entry in groups}
+        fingerprint = tuple(
+            (key, *value.fingerprint()) for key, value in fields.items()
+        )
+        if self._compiler_coverage_groups and tuple(
+            row for row in self._compiler_coverage_fields if row[0] not in owned
+        ) != tuple(row for row in fingerprint if row[0] not in owned):
+            raise ValueError("Compiler coverage registration changed old field layout")
+        self._compiler_coverage_groups = groups
+        self._compiler_coverage_fields = fingerprint
+
+    def validate_compiler_coverage_groups(self) -> None:
+        """Reject stale domains before constructing an immutable initial view."""
+        if not self._compiler_coverage_groups:
+            return
+        fields = self._flat_fields()
+        fingerprint = tuple(
+            (key, *value.fingerprint()) for key, value in fields.items()
+        )
+        if fingerprint != self._compiler_coverage_fields:
+            raise ValueError(
+                "Config fields changed after compiler coverage registration"
+            )
+        for index, group in enumerate(self._compiler_coverage_groups):
+            fragment = fields[group.key]
+            if not isinstance(fragment, ConfigSpecFragment):
+                raise ValueError("Compiler coverage requires independent scalar fields")
+            group.validate_field(fragment)
+            group.validate_dependencies(self._compiler_coverage_groups[:index])
 
     def _should_keep_epilogue_subtile_for_autotune(self) -> bool:
         if self.epilogue_subtile_autotune_choices is None:
@@ -2507,6 +2582,24 @@ class ConfigSpec:
                     "cute_async_load_stages"
                 )
 
+    def _normalize_cute_signed_bitfield_bf16(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_signed_bitfield_bf16"
+        value = config.get(key, False)
+        if type(value) is bool and (
+            not value or self.cute_signed_bitfield_bf16_available
+        ):
+            if not value:
+                config.pop(key, None)
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a Boolean and a signed-byte BF16 candidate on sm_100a"
+        )
+
     def _normalize_cute_bf16x2_recurrence(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -2830,6 +2923,7 @@ class ConfigSpec:
             )
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
         provided_keys = set(config)
@@ -3607,7 +3701,7 @@ class ConfigSpec:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def raise_grid_block_minimums(self) -> None:
-        """Raise min_size for grid block dimensions based on problem size.
+        """Raise search floors for grid block dimensions based on problem size.
 
         Very small block sizes produce enormous grids that the autotuner
         wastes time exploring.  This heuristic sets a floor so the total
@@ -3624,7 +3718,6 @@ class ConfigSpec:
         n_cus = num_compute_units()
         n_dims = len(self.grid_block_ids)
         max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
-
         for grid_bid in self.grid_block_ids:
             try:
                 spec = self.block_sizes.block_id_lookup(grid_bid)
@@ -3648,6 +3741,7 @@ class ConfigSpec:
         overrides: Mapping[str, object] | None = None,
         advanced_controls_files: list[str] | None = None,
         process_group_name: str | None = None,
+        compiler_coverage_enabled: bool = True,
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
@@ -3730,6 +3824,7 @@ class ConfigSpec:
             _flash_pipeline_family_override=family_override,
             advanced_controls_files=advanced_controls_files,
             process_group_name=process_group_name,
+            compiler_coverage_enabled=compiler_coverage_enabled,
         )
 
     def flatten_missing_field_default(
@@ -3738,6 +3833,8 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if key == "cute_signed_bitfield_bf16":
+                return True, False
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
@@ -3817,6 +3914,10 @@ class ConfigSpec:
 
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
+        if self.cute_matmul_min_blocks_search_enabled:
+            # This optional matmul coordinate has no old default Config key.
+            # Keep the public default exact; flat search still represents zero.
+            config.config.pop("cute_min_blocks_per_mp", None)
         self._shrink_for_numel_constraints(config)
         return config
 
@@ -3909,6 +4010,8 @@ class ConfigSpec:
             "block_sizes": self.block_sizes,
         }
         if self.backend_name == "cute":
+            if self.cute_signed_bitfield_bf16_available:
+                fields["cute_signed_bitfield_bf16"] = BooleanFragment()
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
             elif self.cute_flash_search_enabled:
@@ -4077,6 +4180,8 @@ class ConfigSpec:
                 )
             if self.cute_affine_scan_schedule is not None:
                 fields[CUTE_AFFINE_SCAN_SCHEDULE_KEY] = self.cute_affine_scan_schedule
+            if self.cute_matmul_min_blocks_search_enabled:
+                fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))
             fields.update(self.user_defined_tunables)
             return fields
 
@@ -4267,6 +4372,28 @@ class ConfigSpec:
         structural_hash = self.structural_fingerprint_hash(
             advanced_controls_files=advanced_controls_files
         )
+        legacy_hash = self._cache_fingerprint_from_structural_hash(structural_hash)
+        policy = coverage_policy(self.compiler_coverage_groups)
+        if policy is None:
+            return legacy_hash
+        return hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+
+    def projected_cache_fingerprint_hash(
+        self, *, advanced_controls_files: list[str] | None = None
+    ) -> str:
+        """Identity of the old layout, used only by initial warm-base decoding."""
+        owned = {group.key for group in self.compiler_coverage_groups}
+        fingerprint = tuple(
+            row
+            for row in self.structural_fingerprint(
+                advanced_controls_files=advanced_controls_files
+            )
+            if row[0] not in owned
+        )
+        structural_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+        return self._cache_fingerprint_from_structural_hash(structural_hash)
+
+    def _cache_fingerprint_from_structural_hash(self, structural_hash: str) -> str:
         target_policy_identity: object | None = None
         if self.backend_name == "cute" and self.cute_flash_search_enabled:
             from .._compiler.cute.flash_policy import flash_target_policy_cache_identity
@@ -4380,10 +4507,21 @@ class ConfigSpec:
         fields: Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment],
         *,
         advanced_controls_files: list[str] | None,
+        _fix_invalid: bool = True,
     ) -> helion.Config:
         config: dict[str, Any] = {}
         for key, field in fields.items():
             config[key] = field._flat_config(self, fn)
+
+        # None is the flat representation of these absent grouped overrides.
+        # Preserve that absence before strict validation, which intentionally
+        # rejects an explicitly supplied None for either option.
+        for key in (
+            "tcgen05_grouped_mode",
+            "tcgen05_grouped_worklist_source_m_tile",
+        ):
+            if config.get(key) is None:
+                config.pop(key, None)
 
         for name in (
             "loop_orders",
@@ -4409,7 +4547,7 @@ class ConfigSpec:
         acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)
         if acf_fragment is not None:
             config["advanced_controls_file"] = fn(acf_fragment)
-        self.normalize(config, _fix_invalid=True)
+        self.normalize(config, _fix_invalid=_fix_invalid)
         return helion.Config(**config)
 
 

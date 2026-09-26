@@ -78,6 +78,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.cute_epilogue import _AuxiliaryTensorLoadExpr
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
     from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .._compiler.cute.signed_bitfield import SignedByteSite
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
 
@@ -784,7 +785,7 @@ def _cute_scalar_load_expr(
             f"cute.arch.load({_cute_scalar_pointer_expr(tensor_name, index_exprs)}, "
             "cutlass.Uint8)"
         )
-    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
         # The L2 policy helper only exists in 16-byte vector form.
         eviction_suffix = ""
     if eviction_suffix and dtype.itemsize >= 4 and dtype is not torch.bool:
@@ -835,14 +836,14 @@ _CUTE_VECTOR_UNROLL_CARRIER: dict[torch.dtype, str] = {
     torch.float32: "cutlass.Uint32",
 }
 
-# 1-byte fp8 dtypes also use ``unroll`` mode.  Rather than a
+# One-byte FP8 and signed INT8 inputs use ``unroll`` mode. Rather than a
 # ``VectorType([V], Uint8)`` load (which ICEs at V=8 in the CuTe DSL and
 # emits two LDG.32s for V=4), an fp8 vec chunk is loaded as a SINGLE packed
 # integer (``Uint32`` for V=4, ``Uint64`` for V=8) — one LDG.32 / LDG.64 —
-# and each lane byte is extracted with a shift+mask.  The extracted ``Uint8``
-# is decoded downstream by the matmul fallback's PTX helper.
+# and each lane byte is extracted with a shift+mask. FP8 keeps its Uint8
+# payload for downstream decoding; INT8 bitcasts back before signed arithmetic.
 _CUTE_VECTOR_UNROLL_BYTE_DTYPES: frozenset[torch.dtype] = frozenset(
-    {torch.float8_e4m3fn}
+    {torch.float8_e4m3fn, torch.int8}
 )
 
 # Packed-integer cutlass type per total byte width of an fp8 vec chunk.
@@ -901,16 +902,31 @@ def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str])
 # ``createpolicy.fractional.L2::evict_last`` helper.  Non-16-byte or scalar
 # sites silently drop the hint.
 _CUTE_L2_LAST_SUFFIX = "__l2_last__"
+_CUTE_CACHE_LOAD_HELPERS = {
+    _CUTE_L2_LAST_SUFFIX: "_cute_load_l2_evict_last",
+    "__l1_l2_first__": "_cute_load_l1_l2_evict_first",
+    "__l1_l2_last__": "_cute_load_l1_l2_evict_last",
+}
 
 
 def _cute_unroll_vec_load_expr(
     ptr_expr: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str = ""
 ) -> str:
     """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist."""
-    if eviction_suffix == _CUTE_L2_LAST_SUFFIX:
+    if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
         if not _cute_is_byte_packed(dtype) and vec_width * dtype.itemsize == 16:
             return (
-                f"_cute_load_l2_evict_last({ptr_expr}, "
+                f"{_CUTE_CACHE_LOAD_HELPERS[eviction_suffix]}({ptr_expr}, "
+                f"ir.VectorType.get([{vec_width}], "
+                f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
+            )
+        if (
+            eviction_suffix != _CUTE_L2_LAST_SUFFIX
+            and not _cute_is_byte_packed(dtype)
+            and vec_width * dtype.itemsize == 8
+        ):
+            return (
+                f"{_CUTE_CACHE_LOAD_HELPERS[eviction_suffix]}_8b({ptr_expr}, "
                 f"ir.VectorType.get([{vec_width}], "
                 f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
             )
@@ -930,11 +946,13 @@ def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> st
 
     fp8: ``hoist_var`` is a packed integer (Uint32/Uint64); byte ``idx`` is
     extracted with a shift+mask and returned as a ``Uint8`` (decoded
-    downstream).  bf16/fp16: ``hoist_var`` is a ``Uint16`` vector; lane ``idx``
+    downstream). INT8 bytes bitcast back to Int8 before arithmetic.
+    bf16/fp16: ``hoist_var`` is a ``Uint16`` vector; lane ``idx``
     is bitcast back to the original dtype.
     """
     if dtype in _CUTE_VECTOR_UNROLL_BYTE_DTYPES:
-        return f"cutlass.Uint8(({hoist_var} >> (8 * ({idx}))) & 0xFF)"
+        value = f"cutlass.Uint8(({hoist_var} >> (8 * ({idx}))) & 0xFF)"
+        return f"{value}.bitcast(cutlass.Int8)" if dtype is torch.int8 else value
     elem_dtype = _CUTE_VECTOR_UNROLL_DTYPES[dtype]
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     return f"{carrier}({hoist_var}[{idx}]).bitcast({elem_dtype})"
@@ -972,6 +990,7 @@ def _cute_register_tile_unroll_vec_store(
     dtype: torch.dtype = torch.float16,
     *,
     lane_axis_pos: int | None = None,
+    packed_values_expr: str | None = None,
 ) -> ast.stmt | None:
     """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
 
@@ -1023,12 +1042,14 @@ def _cute_register_tile_unroll_vec_store(
     )
     sites.append(list_var)
     vloop_pos = _cute_lane_vloop_insert_pos(strategy, block_id, lane_body)
-    lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
+    if packed_values_expr is None:
+        lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     flush_helper = (
         "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
     )
-    flush_expr = f"{flush_helper}({base_ptr_expr}, {list_var})"
+    flush_values = packed_values_expr if packed_values_expr is not None else list_var
+    flush_expr = f"{flush_helper}({base_ptr_expr}, {flush_values})"
     if mask_expr is not None:
         flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
     else:
@@ -1039,6 +1060,8 @@ def _cute_register_tile_unroll_vec_store(
         _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
         flush_stmt,
     )
+    if packed_values_expr is not None:
+        return ast.Pass()
     return statement_from_string(
         f"{list_var}.append(({value_expr}).bitcast({carrier}))"
     )
@@ -1125,6 +1148,8 @@ def _cute_register_tile_unroll_vec_hoist(
     eviction_suffix: str = "",
     *,
     lane_axis_pos: int | None = None,
+    mask_expr: str | None = None,
+    signed_byte_site: SignedByteSite | None = None,
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
     ``PerThreadNDTileStrategy`` lane loops.
@@ -1174,6 +1199,7 @@ def _cute_register_tile_unroll_vec_hoist(
         # pyrefly: ignore [missing-attribute]
         strategy._cute_lane_vec_loads_by_block = cache_by_block
     cache = cache_by_block.setdefault(block_id, {})
+    hoist_stmt = None
     if cache_key not in cache:
         hoist_var = state.device_function.new_var(
             f"_tile_unroll_vec_{block_id}_{len(cache)}", dce=False
@@ -1270,6 +1296,24 @@ def _cute_register_tile_unroll_vec_hoist(
         )
     else:
         hoist_var, _ = cache[cache_key]
+    if (
+        tensor.dtype is torch.int8
+        and state.config.config.get("cute_signed_bitfield_bf16") is True
+    ):
+        from .._compiler.cute.signed_bitfield import record_signed_byte_packet
+
+        record_signed_byte_packet(
+            state,
+            strategy,
+            block_id,
+            tensor,
+            vec_width,
+            index_exprs,
+            hoist_var,
+            hoist_stmt,
+            mask_expr,
+            signed_byte_site,
+        )
     return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
 
 
@@ -1457,6 +1501,13 @@ def _cute_combined_mask(
                         break
             if not include_tensor_index_masks:
                 for dim_size in idx.shape:
+                    # Address bounds do not replace an index's symbolic tile
+                    # domain. Equal extents may belong to unrelated axes.
+                    direct = env.get_block_id(dim_size)
+                    if direct is not None:
+                        direct_mask = mask_var_for_block_id(direct)
+                        if direct_mask is not None and direct_mask not in terms:
+                            terms.append(direct_mask)
                     for bid in _matching_block_ids(env, dim_size):
                         if bid in seen or not env.is_jagged_tile(bid):
                             continue

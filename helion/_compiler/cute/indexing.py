@@ -56,6 +56,7 @@ _CUTE_SHAPE_CHAIN_TARGETS = frozenset(
         torch.ops.aten.permute.default,
         torch.ops.aten.unsqueeze.default,
         torch.ops.aten.squeeze.dim,
+        torch.ops.aten.clone.default,
     }
 )
 

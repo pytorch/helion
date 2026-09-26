@@ -10,10 +10,10 @@ imports it at the bottom so registration keeps the same eager timing as before.
 from __future__ import annotations
 
 import ast
-import contextlib
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch.fx.node import Node
@@ -50,6 +50,7 @@ from .argreduce import codegen_cute_tile_argreduce
 from .cute_mma import codegen_cute_mma
 from .cute_mma import codegen_cute_mma_direct_mm
 from .indexing import CutePackedAffineLoad
+from .indexing import CutePackedTerms
 from .indexing import CuteShapeChainView
 from .indexing import CuteSortableLoad
 from .indexing import is_cute_shape_chain_target
@@ -515,14 +516,14 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
     acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad, CutePackedTerms))
     acc_node = node.args[0]
     lhs_node = node.args[1]
     rhs_node = node.args[2]
     assert isinstance(acc_node, Node)
     assert isinstance(lhs_node, Node)
     assert isinstance(rhs_node, Node)
-    assert isinstance(rhs, ast.AST)
+    assert isinstance(rhs, (ast.AST, CutePackedTerms))
     rhs, packed_rhs = cute_lower_rhs_for_matmul(ctx.env, lhs, rhs_node, rhs)
     k_block_id = cute_resolve_active_matmul_k_block_id(
         ctx.cg,
@@ -541,6 +542,7 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None
         else cute_static_k_invariant_extent(lhs_node, rhs_node)
     )
+
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 
@@ -728,7 +730,7 @@ def _maybe_codegen_cute_baddbmm_n_collapse(
             )
         return rematerialized
 
-    return _emit_cute_matmul_n_collapse(
+    result = _emit_cute_matmul_n_collapse(
         ctx.cg,
         lhs,
         rhs_at_n=rhs_at_n,
@@ -742,6 +744,10 @@ def _maybe_codegen_cute_baddbmm_n_collapse(
         lhs_node=lhs_node,
         rhs_node=rhs_node,
     )
+    from .completed_matmul_sum import record_completed_matmul_sum
+
+    record_completed_matmul_sum(ctx.cg, node, n_block_id, n_extent, result)
+    return result
 
 
 @baddbmm_lowering.register_codegen("cute")
@@ -788,6 +794,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None
         else cute_static_k_invariant_extent(lhs_node, rhs_node)
     )
+
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 
@@ -974,6 +981,7 @@ def _cute_iota_expr(
     from ..generate_ast import GenerateAST
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _grid_local_coord_expr
+    from .cute_reshape import _resolve_tile_extent
 
     assert isinstance(ctx.cg, GenerateAST)
     cg = ctx.cg
@@ -985,10 +993,8 @@ def _cute_iota_expr(
 
     env = CompileEnvironment.current()
     length_hint: int | None = None
-    if isinstance(length_arg, int):
-        length_hint = length_arg
-    elif isinstance(length_arg, torch.SymInt):
-        length_hint = env.size_hint(length_arg)
+    if isinstance(length_arg, (int, torch.SymInt)):
+        length_hint = _resolve_tile_extent(length_arg, env, cg.device_function.config)
 
     def active_iota_expr() -> ast.AST | None:
         active_block_ids: list[int] = []
@@ -1136,8 +1142,9 @@ def _cute_iota_expr(
     if "val" in source_node.meta:
         fake_val = source_node.meta["val"]
         if isinstance(fake_val, torch.Tensor) and fake_val.ndim == 1:
-            with contextlib.suppress(Exception):
-                length_hint = int(fake_val.shape[0])
+            length_hint = _resolve_tile_extent(
+                fake_val.shape[0], env, cg.device_function.config
+            )
             local_coord = _get_dim_local_coord(cg, fake_val, 0)
             if local_coord != "cutlass.Int32(0)":
                 expr = local_coord
@@ -1154,6 +1161,18 @@ def _cute_iota_expr(
                 )
             if block_id is None:
                 block_id = env.resolve_block_id(fake_val.shape[0])
+            if block_id is None and isinstance(fake_val.shape[0], torch.SymInt):
+                extent_expr = fake_val.shape[0].node._expr
+                if isinstance(extent_expr, sympy.Expr) and any(
+                    env.get_block_id(symbol) is not None
+                    for symbol in extent_expr.free_symbols
+                ):
+                    # Matching an unrelated axis by its selected integer size
+                    # loses the symbolic owner of a derived tile dimension.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "iota of a derived tile extent requires a proven active coordinate",
+                    )
             if block_id is None and cg.current_grid_state is not None:
                 grid_candidates = [
                     candidate

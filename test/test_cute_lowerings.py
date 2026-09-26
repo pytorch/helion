@@ -22,6 +22,7 @@ from torch.fx.immutable_collections import immutable_list
 
 import helion
 from helion import exc
+from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.ast_read_writes import dead_assignment_elimination
@@ -253,6 +254,7 @@ from helion._compiler.tile_strategy import DeviceGridState
 from helion._compiler.tile_strategy import DeviceLoopState
 from helion._compiler.tile_strategy import _create_lane_loop
 from helion._compiler.tile_strategy import _lane_loop_iter
+from helion._compiler.type_info import CallableType
 from helion._compiler.variable_origin import NameOrigin
 from helion._compiler.variable_origin import TileBeginOrigin
 from helion._testing import DEVICE
@@ -273,6 +275,8 @@ from helion.language.memory_ops import _maybe_codegen_cute_packed_affine_lhs_loa
 from helion.language.memory_ops import _tcgen05_rowvec_aux_stage_copy_elems
 from helion.language.memory_ops import load
 from helion.runtime import _append_cute_wrapper_plan
+
+CPU_DEVICE = "cpu"
 
 # The legacy ``T1`` direct-entry seed (1024x4096x1024, bk=64) used a deep
 # (ab=6, c=4) A/B pipeline. The per-target constants were removed when the
@@ -1008,6 +1012,20 @@ def _fake_device_loop(block_id: int) -> DeviceLoopState:
         ),
         inner_statements=[],
         block_thread_axes={block_id: 0},
+    )
+
+
+def _fresh_half_atomic_host_fn(out: torch.Tensor) -> SimpleNamespace:
+    allocation = statement_from_string("out = torch.zeros(8, dtype=torch.float16)")
+    assert isinstance(allocation, ast.Assign)
+    assert isinstance(allocation.value, ast.Call)
+    assert isinstance(allocation.value.func, ExtendedAST)
+    allocation.value.func._type_info = CallableType(
+        NameOrigin("torch.zeros"), torch.zeros
+    )
+    return SimpleNamespace(
+        tensor_to_origin={out: NameOrigin("out")},
+        body=[allocation, statement_from_string("return out")],
     )
 
 
@@ -14221,26 +14239,29 @@ class TestCuteLowerings(unittest.TestCase):
         atomic_out = atomic_graph.call_function(_host_tensor, args=("out",))
         atomic_value = atomic_graph.placeholder("atomic_value")
         atomic_graph.call_function(atomic_add, args=(atomic_out, [0], atomic_value))
-        atomic_graph.output(atomic_out)
+        atomic_graph.output(())
 
         plain_graph = Graph()
         plain_out = plain_graph.call_function(_host_tensor, args=("out",))
         plain_graph.output(plain_out)
 
-        fake_out = torch.zeros(8, device=DEVICE, dtype=torch.float16)
-        fake_value = torch.zeros(8, device=DEVICE, dtype=torch.float32)
+        fake_out = torch.zeros(8, device=CPU_DEVICE, dtype=torch.float16)
+        fake_value = torch.zeros(8, device=CPU_DEVICE, dtype=torch.float32)
         atomic_out.meta["val"] = fake_out
         plain_out.meta["val"] = fake_out
         atomic_value.meta["val"] = fake_value
 
-        fake_host_fn = SimpleNamespace(
-            tensor_to_origin={fake_out: NameOrigin("out")},
-        )
+        fake_host_fn = _fresh_half_atomic_host_fn(fake_out)
 
         with patch.object(HostFunction, "current", return_value=fake_host_fn):
+            atomic_root = RootGraphInfo(graph_id=0, graph=atomic_graph, phase_index=0)
+            self.assertEqual(
+                collect_cute_half_atomic_output_promotions([atomic_root]),
+                {"out": torch.float16},
+            )
             promotions = collect_cute_half_atomic_output_promotions(
                 [
-                    RootGraphInfo(graph_id=0, graph=atomic_graph, phase_index=0),
+                    atomic_root,
                     RootGraphInfo(graph_id=1, graph=plain_graph, phase_index=1),
                 ]
             )
@@ -14257,26 +14278,29 @@ class TestCuteLowerings(unittest.TestCase):
         root_out = root_graph.call_function(_host_tensor, args=("out",))
         root_value = root_graph.placeholder("root_value")
         root_graph.call_function(atomic_add, args=(root_out, [0], root_value))
-        root_graph.output(root_out)
+        root_graph.output(())
 
         loop_graph = Graph()
         loop_out = loop_graph.call_function(_host_tensor, args=("out",))
         loop_graph.output(loop_out)
 
-        fake_out = torch.zeros(8, device=DEVICE, dtype=torch.float16)
-        fake_value = torch.zeros(8, device=DEVICE, dtype=torch.float32)
+        fake_out = torch.zeros(8, device=CPU_DEVICE, dtype=torch.float16)
+        fake_value = torch.zeros(8, device=CPU_DEVICE, dtype=torch.float32)
         root_out.meta["val"] = fake_out
         loop_out.meta["val"] = fake_out
         root_value.meta["val"] = fake_value
 
-        fake_host_fn = SimpleNamespace(
-            tensor_to_origin={fake_out: NameOrigin("out")},
-        )
+        fake_host_fn = _fresh_half_atomic_host_fn(fake_out)
 
         with patch.object(HostFunction, "current", return_value=fake_host_fn):
+            atomic_root = RootGraphInfo(graph_id=0, graph=root_graph, phase_index=0)
+            self.assertEqual(
+                collect_cute_half_atomic_output_promotions([atomic_root]),
+                {"out": torch.float16},
+            )
             promotions = collect_cute_half_atomic_output_promotions(
                 [
-                    RootGraphInfo(graph_id=0, graph=root_graph, phase_index=0),
+                    atomic_root,
                     ForLoopGraphInfo(
                         graph_id=1,
                         graph=loop_graph,
@@ -14371,11 +14395,14 @@ class TestCuteLowerings(unittest.TestCase):
     ) -> None:
         backend = CuteBackend()
         fn = _FakeDeviceFunction()
+        root_graph = Graph()
+        root_graph.call_function(_tracing_ops._for_loop, args=(1, [0, 0], [128, 8], []))
         fn.codegen = SimpleNamespace(
             codegen_graphs=[
+                RootGraphInfo(graph_id=0, graph=root_graph),
                 ForLoopGraphInfo(
-                    graph_id=0, graph=Graph(), node_args=[], block_ids=[0, 1]
-                )
+                    graph_id=1, graph=Graph(), node_args=[], block_ids=[0, 1]
+                ),
             ]
         )
         env = SimpleNamespace(
@@ -14400,7 +14427,10 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=SimpleNamespace(
-                    device_ir=SimpleNamespace(grid_block_ids=[[2]])
+                    device_ir=SimpleNamespace(
+                        grid_block_ids=[[2]],
+                        root_ids=[0],
+                    )
                 ),
             ),
             patch(
@@ -14892,6 +14922,7 @@ class TestCuteLowerings(unittest.TestCase):
             _synthetic_cute_lane_var="synthetic_lane_0",
             _synthetic_cute_lane_extent=4,
             _cute_reduction_vec_width=1,
+            _cute_resident_reduction=False,
             block_size_var=lambda block_idx: "_RDIM_SIZE_0",
             index_var=lambda block_idx: "indices_0",
             _get_thread_axis=lambda: 0,

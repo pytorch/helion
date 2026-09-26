@@ -1,15 +1,17 @@
-"""AST pre-pass that rewrites the online two-pass softmax pattern into the
-equivalent 3-pass form for the CuTe backend.
+"""Rewrite a closed online-softmax pattern into three CuTe sweeps.
 
-Shape gating: the rewrite only fires when the reduction-axis extent ``N``
-exceeds ``HELION_ONLINE_TO_3PASS_MIN_N`` (default 2048).  The 3-pass form
-adds an extra inner sweep and so introduces additional SMEM-reduction
-sync per outer iter; for small ``N`` the per-sweep fixed cost dominates
-and the rewrite REGRESSES wall-clock.  For large ``N`` (where the online
-merge's rescale dominates) the independent reductions in the 3-pass form
-win materially.  The cutoff was picked from B200 microbench on
-``softmax_two_pass`` shapes (4096, 256/6400/12672/16384):
-``N >= 2048`` flips the sign of the perf delta.
+The recognized initializers use FP32. An explicit FP32 input conversion stays
+before every reduction and subtraction, and the original output conversion
+stays in the consume loop. Finite sums are reassociated: the pass preserves
+the existing softmax tolerance contract, not bitwise equality. It does not
+enable fast_math or change its default. In particular, leading all--inf
+logical tiles must still poison the denominator, and an empty reduction
+must leave it at positive zero.
+
+The rewrite requires pure signatures and iterators, a canonical consume
+loop, and no observations of its state or temporaries outside the matched
+region. ``HELION_DISABLE_ONLINE_TO_3PASS=1`` disables it; the optional
+``HELION_ONLINE_TO_3PASS_MIN_N`` threshold defaults to zero.
 
 
 The CuTe backend's two-pass softmax kernel (``examples/softmax.py::softmax_two_pass``)
@@ -33,41 +35,34 @@ expresses the algorithm as one outer ``for tile_m`` loop with TWO inner
             values = x[tile_m, tile_n]
             out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
 
-The online merge inside pass 1 has TWO sequential SMEM reductions per outer
-iter (the amax warp/shared reduce and the exp-sum reduce), and the rescale
-introduces a data dependency between them.  In CuTe codegen this compiles
-to a kernel that hits a structural perf ceiling (~1750 GB/s on B200 for
-(4096, 12672) fp16).
-
-The 3-pass form computes the SAME final ``mi``/``di`` because:
+For finite inputs, the three sweeps compute the same real-arithmetic result:
   * max-pass final mi = max over all tiles of local_amax — equivalent to
     the running maximum once the loop has visited every tile.
   * sum-pass final di = sum over all tiles of sum(exp(values - mi_final))
     — equivalent to the running rescaled sum once mi has reached its
     final value.
 
-Rewriting the first inner loop into TWO separate sweeps (max-only, then
-sum-only) lets each reduction stand on its own and compiles to materially
-faster code (the structural ceiling goes away because the two reductions
-no longer share an outer iter).  Numerical roundoff differs by a factor
-that's smaller than the fp16 tolerance used for softmax correctness
-(verified end-to-end against ``torch.nn.functional.softmax``).
-
-This pass runs on the user's source AST BEFORE tracing, gated on the CuTe
-backend.  Detection is intentionally conservative — only matches the
-exact ``softmax_two_pass`` body shape — so it won't fire on lookalike
-kernels.  Set ``HELION_DISABLE_ONLINE_TO_3PASS=1`` to skip it (for A/B
-testing or if a downstream variant breaks).
+The max sweep also reduces the first logical tile independently. Its result
+preserves the online denominator's NaN when that first tile is all -inf,
+without placing a consumer between a partial lane reduction and its complete
+logical-tile reduction. Later nonfinite inputs already poison the exp sum.
+This pass runs on source AST before tracing, only for the CuTe backend.
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
+import inspect
+import math
 import os
 from typing import TYPE_CHECKING
 
+import torch
+
 from ..ast_extension import ExtendedAST
 from ..ast_extension import create
+import helion.language as hl
 
 if TYPE_CHECKING:
     from ..host_function import HostFunction
@@ -114,8 +109,297 @@ def _single_target_name(assign: ast.AST) -> str | None:
 
 
 def _is_tile_call(node: ast.AST) -> bool:
-    """Detect ``hl.tile(<extent>, ...)`` calls used as for-loop iterators."""
-    return _is_hl_call(node, "tile")
+    """Accept a zero-based extent and an optional pure, invariant block size."""
+    if not _is_hl_call(node, "tile"):
+        return False
+    assert isinstance(node, ast.Call)
+    if len(node.args) != 1 or not _integer_atom(node.args[0], minimum=0):
+        return False
+    if not node.keywords:
+        return True
+    return (
+        len(node.keywords) == 1
+        and node.keywords[0].arg == "block_size"
+        and _integer_atom(node.keywords[0].value, minimum=1)
+    )
+
+
+def _integer_atom(node: ast.AST, *, minimum: int) -> bool:
+    # hl.tile validates the type of a named extent/block size during tracing.
+    # No arithmetic, calls, subscriptions, or attribute evaluation is duplicated.
+    return isinstance(node, ast.Name) or (
+        isinstance(node, ast.Constant)
+        and type(node.value) is int
+        and node.value >= minimum
+    )
+
+
+def _fp32_dtype(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and _name(node.value) == "torch"
+        and node.attr == "float32"
+    )
+
+
+def _initializer_tile(node: ast.expr, *, maximum: bool) -> str | None:
+    """Match the complete FP32 initializer, including its positive-zero sign."""
+    if not isinstance(node, ast.Call):
+        return None
+    is_full = _is_hl_call(node, "full")
+    if not is_full and (maximum or not _is_hl_call(node, "zeros")):
+        return None
+    if len(node.args) != (2 if is_full else 1):
+        return None
+    if not (
+        len(node.keywords) == 1
+        and node.keywords[0].arg == "dtype"
+        and _fp32_dtype(node.keywords[0].value)
+    ):
+        return None
+    shape = node.args[0]
+    if not isinstance(shape, ast.List) or len(shape.elts) != 1:
+        return None
+    tile = _name(shape.elts[0])
+    if tile is None:
+        return None
+    if is_full:
+        fill = node.args[1]
+        if maximum:
+            if not (
+                isinstance(fill, ast.Call)
+                and _name(fill.func) == "float"
+                and len(fill.args) == 1
+                and not fill.keywords
+                and isinstance(fill.args[0], ast.Constant)
+                and fill.args[0].value == "-inf"
+            ) and not (
+                isinstance(fill, ast.UnaryOp)
+                and isinstance(fill.op, ast.USub)
+                and isinstance(fill.operand, ast.Attribute)
+                and _name(fill.operand.value) == "math"
+                and fill.operand.attr == "inf"
+            ):
+                return None
+        elif not (
+            isinstance(fill, ast.Constant)
+            and type(fill.value) in (int, float)
+            and fill.value == 0
+            and math.copysign(1.0, fill.value) > 0
+        ):
+            return None
+    return tile
+
+
+def _typed_load(node: ast.expr) -> ast.Subscript | None:
+    """Accept a direct load or its explicit FP32 conversion."""
+    if isinstance(node, ast.Subscript):
+        return node
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "to"
+        and isinstance(node.func.value, ast.Subscript)
+    ):
+        return None
+    if len(node.args) == 1 and not node.keywords:
+        dtype = node.args[0]
+    elif not node.args and len(node.keywords) == 1 and node.keywords[0].arg == "dtype":
+        dtype = node.keywords[0].value
+    else:
+        return None
+    if not _fp32_dtype(dtype):
+        return None
+    return node.func.value
+
+
+def _sum_argument(node: ast.expr) -> ast.expr | None:
+    """Match only a row sum with its default dtype and no output argument."""
+    return _row_reduction_argument(node, "sum", allow_method=True)
+
+
+def _row_reduction_argument(
+    node: ast.expr, operation: str, *, allow_method: bool = False
+) -> ast.expr | None:
+    if not isinstance(node, ast.Call):
+        return None
+    if _is_torch_call(node, operation):
+        if not node.args:
+            return None
+        value = node.args[0]
+        dims = node.args[1:]
+    elif (
+        allow_method
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == operation
+    ):
+        value = node.func.value
+        dims = node.args
+    else:
+        return None
+    if len(dims) == 1 and not node.keywords:
+        dim = dims[0]
+    elif not dims and len(node.keywords) == 1 and node.keywords[0].arg == "dim":
+        dim = node.keywords[0].value
+    else:
+        return None
+    return (
+        value
+        if isinstance(dim, ast.Constant) and type(dim.value) is int and dim.value == 1
+        else None
+    )
+
+
+def _broadcast(node: ast.AST, name: str) -> bool:
+    if not isinstance(node, ast.Subscript) or _name(node.value) != name:
+        return False
+    index = node.slice
+    if not isinstance(index, ast.Tuple) or len(index.elts) != 2:
+        return False
+    rows, new_axis = index.elts
+    if not isinstance(new_axis, ast.Constant) or new_axis.value is not None:
+        return False
+    if isinstance(rows, ast.Slice):
+        return rows.lower is None and rows.upper is None and rows.step is None
+    # Host preprocessing spells ':' as slice(None, None, None).
+    return (
+        isinstance(rows, ast.Call)
+        and _name(rows.func) == "slice"
+        and len(rows.args) == 3
+        and not rows.keywords
+        and all(
+            isinstance(arg, ast.Constant) and arg.value is None for arg in rows.args
+        )
+    )
+
+
+def _tile_subscript(node: ast.AST, tile_m: str, tile_n: str) -> str | None:
+    if not isinstance(node, ast.Subscript):
+        return None
+    index = node.slice
+    if not (
+        isinstance(index, ast.Tuple)
+        and len(index.elts) == 2
+        and _name(index.elts[0]) == tile_m
+        and _name(index.elts[1]) == tile_n
+    ):
+        return None
+    return _name(node.value)
+
+
+def _consume_output(
+    loop: ast.For,
+    *,
+    values_assign: ast.Assign,
+    tile_m: str,
+    tile_n: str,
+    mi: str,
+    di: str,
+) -> str | None:
+    """Require the unchanged load / pure normalization / owned-tile store."""
+    body = _strip_doc(list(loop.body))
+    if len(body) != 2 or not isinstance(body[0], ast.Assign):
+        return None
+    load, store = body
+    assert isinstance(load, ast.Assign)
+    if (
+        _single_target_name(load) != _single_target_name(values_assign)
+        or _expr_unparse(load.value) != _expr_unparse(values_assign.value)
+        or not isinstance(store, ast.Assign)
+        or len(store.targets) != 1
+    ):
+        return None
+    output = _tile_subscript(store.targets[0], tile_m, tile_n)
+    if output is None:
+        return None
+    normalized = store.value
+    if isinstance(normalized, ast.Call):
+        if not (
+            isinstance(normalized.func, ast.Attribute) and normalized.func.attr == "to"
+        ):
+            return None
+        if len(normalized.args) == 1 and not normalized.keywords:
+            dtype = normalized.args[0]
+        elif (
+            not normalized.args
+            and len(normalized.keywords) == 1
+            and normalized.keywords[0].arg == "dtype"
+        ):
+            dtype = normalized.keywords[0].value
+        else:
+            return None
+        if not (
+            isinstance(dtype, ast.Attribute)
+            and _name(dtype.value) == output
+            and dtype.attr == "dtype"
+        ):
+            return None
+        normalized = normalized.func.value
+    if not (
+        isinstance(normalized, ast.BinOp)
+        and isinstance(normalized.op, ast.Div)
+        and _broadcast(normalized.right, di)
+        and _is_torch_call(normalized.left, "exp")
+    ):
+        return None
+    numerator = normalized.left
+    assert isinstance(numerator, ast.Call)
+    if len(numerator.args) != 1 or numerator.keywords:
+        return None
+    shifted = numerator.args[0]
+    if not (
+        isinstance(shifted, ast.BinOp)
+        and isinstance(shifted.op, ast.Sub)
+        and _name(shifted.left) == _single_target_name(values_assign)
+        and _broadcast(shifted.right, mi)
+    ):
+        return None
+    return output
+
+
+def _direct_names(node: ast.AST) -> tuple[str, ...]:
+    if isinstance(node, ast.Name):
+        return (node.id,)
+    if isinstance(node, ast.arg):
+        return (node.arg,)
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return tuple(node.names)
+    if isinstance(node, ast.alias):
+        return (node.asname or node.name.split(".", 1)[0],)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return (node.name,)
+    if isinstance(node, ast.ExceptHandler) and node.name is not None:
+        return (node.name,)
+    if isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name is not None:
+        return (node.name,)
+    if isinstance(node, ast.MatchMapping) and node.rest is not None:
+        return (node.rest,)
+    return ()
+
+
+def _names(node: ast.AST) -> set[str]:
+    """Include bindings as well as reads, even bindings without an ast.Name."""
+    return {name for child in ast.walk(node) for name in _direct_names(child)}
+
+
+def _outside_names(body: list[ast.stmt], region: list[ast.stmt]) -> set[str]:
+    """Names outside the region, including a later outer iteration's prefix."""
+    excluded = {id(stmt) for stmt in region}
+
+    class OutsideNames(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.names: set[str] = set()
+
+        def visit(self, node: ast.AST) -> None:
+            if id(node) in excluded:
+                return
+            self.names.update(_direct_names(node))
+            super().visit(node)
+
+    visitor = OutsideNames()
+    for stmt in body:
+        visitor.visit(stmt)
+    return visitor.names
 
 
 def _expr_unparse(node: ast.AST) -> str:
@@ -201,6 +485,9 @@ def _make_for_loop(template_loop: ast.For, body: list[ast.stmt]) -> ast.For:
 
 def _detect_online_softmax(
     outer_body: list[ast.stmt],
+    *,
+    scope_body: list[ast.stmt] | None = None,
+    parameter_names: frozenset[str] = frozenset(),
 ) -> tuple[int, dict[str, object]] | None:
     """Detect the online-softmax pattern in an outer ``for tile_m`` loop body.
 
@@ -222,6 +509,8 @@ def _detect_online_softmax(
     online-merge body matches the exact 5-statement shape used by
     ``examples/softmax.py::softmax_two_pass``.
     """
+    if scope_body is None:
+        scope_body = outer_body
     n = len(outer_body)
     for i in range(n - 3):
         # Look for the (mi init, di init, first inner for, second inner for)
@@ -240,59 +529,11 @@ def _detect_online_softmax(
         assert isinstance(s_mi, ast.Assign)
         assert isinstance(s_di, ast.Assign)
 
-        # mi = hl.full([tile_m], float('-inf'), dtype=torch.float32)
-        if not _is_hl_call(s_mi.value, "full"):
-            continue
-        mi_call = s_mi.value
-        assert isinstance(mi_call, ast.Call)
-        if len(mi_call.args) < 2:
-            continue
-        mi_shape = mi_call.args[0]
-        if not (
-            isinstance(mi_shape, ast.List)
-            and len(mi_shape.elts) == 1
-            and isinstance(mi_shape.elts[0], ast.Name)
+        tile_m_name = _initializer_tile(s_mi.value, maximum=True)
+        if (
+            tile_m_name is None
+            or _initializer_tile(s_di.value, maximum=False) != tile_m_name
         ):
-            continue
-        tile_m_name = mi_shape.elts[0].id
-        # The init value must be -inf (float('-inf') or a Constant("-inf"))
-        init_val = mi_call.args[1]
-        init_text = _expr_unparse(init_val)
-        if init_text not in {"float('-inf')", 'float("-inf")', "-math.inf"}:
-            continue
-
-        # di = hl.zeros([tile_m], dtype=torch.float32)  -OR-
-        # di = hl.full([tile_m], 0, dtype=torch.float32)
-        if _is_hl_call(s_di.value, "zeros"):
-            di_call = s_di.value
-            assert isinstance(di_call, ast.Call)
-            if not di_call.args:
-                continue
-            di_shape = di_call.args[0]
-            if not (
-                isinstance(di_shape, ast.List)
-                and len(di_shape.elts) == 1
-                and _name(di_shape.elts[0]) == tile_m_name
-            ):
-                continue
-            di_init_value_repr = "0.0"  # canonical
-        elif _is_hl_call(s_di.value, "full"):
-            di_call = s_di.value
-            assert isinstance(di_call, ast.Call)
-            if len(di_call.args) < 2:
-                continue
-            di_shape = di_call.args[0]
-            if not (
-                isinstance(di_shape, ast.List)
-                and len(di_shape.elts) == 1
-                and _name(di_shape.elts[0]) == tile_m_name
-            ):
-                continue
-            di_init_text = _expr_unparse(di_call.args[1])
-            if di_init_text not in {"0", "0.0"}:
-                continue
-            di_init_value_repr = "0.0"
-        else:
             continue
 
         # First inner for-loop: online merge
@@ -301,6 +542,10 @@ def _detect_online_softmax(
         if loop1 is None or loop2 is None:
             continue
         if not _is_tile_call(loop1.iter) or not _is_tile_call(loop2.iter):
+            continue
+        assert isinstance(loop1.iter, ast.Call)
+        assert isinstance(loop2.iter, ast.Call)
+        if loop1.orelse or loop2.orelse:
             continue
         if _expr_unparse(loop1.iter) != _expr_unparse(loop2.iter):
             continue
@@ -330,15 +575,11 @@ def _detect_online_softmax(
         # x[tile_m, tile_n] — capture the source-tensor name to reuse in
         # the rewritten loops, but accept any name (we only need to ensure
         # it's a 2-D subscript over (tile_m, tile_n)).
-        if not isinstance(b0.value, ast.Subscript):
+        load = _typed_load(b0.value)
+        if load is None:
             continue
-        src_name = _name(b0.value.value)
+        src_name = _tile_subscript(load, tile_m_name, tile_n_name)
         if src_name is None:
-            continue
-        sl = b0.value.slice
-        if not (isinstance(sl, ast.Tuple) and len(sl.elts) == 2):
-            continue
-        if _name(sl.elts[0]) != tile_m_name or _name(sl.elts[1]) != tile_n_name:
             continue
 
         # local_amax = torch.amax(values, dim=1)
@@ -346,20 +587,7 @@ def _detect_online_softmax(
         if local_amax_name is None:
             continue
         assert isinstance(b1, ast.Assign)
-        if not _is_torch_call(b1.value, "amax"):
-            continue
-        amax_call = b1.value
-        assert isinstance(amax_call, ast.Call)
-        if not (amax_call.args and _name(amax_call.args[0]) == values_name):
-            continue
-        amax_dim = None
-        for kw in amax_call.keywords:
-            if kw.arg == "dim":
-                amax_dim = _expr_unparse(kw.value)
-        # also support positional dim
-        if amax_dim is None and len(amax_call.args) >= 2:
-            amax_dim = _expr_unparse(amax_call.args[1])
-        if amax_dim != "1":
+        if _name(_row_reduction_argument(b1.value, "amax")) != values_name:
             continue
 
         # mi_next = torch.maximum(mi, local_amax)
@@ -371,7 +599,7 @@ def _detect_online_softmax(
             continue
         mx_call = b2.value
         assert isinstance(mx_call, ast.Call)
-        if len(mx_call.args) != 2:
+        if len(mx_call.args) != 2 or mx_call.keywords:
             continue
         if (
             _name(mx_call.args[0]) != mi_name
@@ -399,7 +627,7 @@ def _detect_online_softmax(
             continue
         exp_call = left.right
         assert isinstance(exp_call, ast.Call)
-        if len(exp_call.args) != 1:
+        if len(exp_call.args) != 1 or exp_call.keywords:
             continue
         sub_expr = exp_call.args[0]
         if not (isinstance(sub_expr, ast.BinOp) and isinstance(sub_expr.op, ast.Sub)):
@@ -407,40 +635,21 @@ def _detect_online_softmax(
         if _name(sub_expr.left) != mi_name or _name(sub_expr.right) != mi_next_name:
             continue
         # right: torch.exp(values - mi_next[:, None]).sum(dim=1)
-        if not (
-            isinstance(right, ast.Call)
-            and isinstance(right.func, ast.Attribute)
-            and right.func.attr == "sum"
-        ):
+        sum_target = _sum_argument(right)
+        if sum_target is None:
             continue
-        sum_kw_dim = None
-        for kw in right.keywords:
-            if kw.arg == "dim":
-                sum_kw_dim = _expr_unparse(kw.value)
-        if sum_kw_dim is None and len(right.args) >= 1:
-            sum_kw_dim = _expr_unparse(right.args[0])
-        if sum_kw_dim != "1":
-            continue
-        sum_target = right.func.value
         if not _is_torch_call(sum_target, "exp"):
             continue
         sum_exp_call = sum_target
         assert isinstance(sum_exp_call, ast.Call)
-        if len(sum_exp_call.args) != 1:
+        if len(sum_exp_call.args) != 1 or sum_exp_call.keywords:
             continue
         sum_sub = sum_exp_call.args[0]
         if not (isinstance(sum_sub, ast.BinOp) and isinstance(sum_sub.op, ast.Sub)):
             continue
         if _name(sum_sub.left) != values_name:
             continue
-        if not isinstance(sum_sub.right, ast.Subscript):
-            continue
-        if _name(sum_sub.right.value) != mi_next_name:
-            continue
-        if _expr_unparse(sum_sub.right.slice) not in {
-            "(slice(None, None, None), None)",
-            "(:, None)",
-        }:
+        if not _broadcast(sum_sub.right, mi_next_name):
             continue
 
         # mi = mi_next
@@ -450,14 +659,46 @@ def _detect_online_softmax(
         if _name(b4.value) != mi_next_name:
             continue
 
-        # Match the consume loop body too — at minimum it must reference
-        # ``mi`` and ``di`` (so the names stay live across the splice) and
-        # use the same ``tile_n`` index.
-        body2 = _strip_doc(list(loop2.body))
-        consume_text = ast.unparse(ast.Module(body=body2, type_ignores=[]))  # type: ignore[arg-type]
-        if mi_name not in consume_text or di_name not in consume_text:
+        output_name = _consume_output(
+            loop2,
+            values_assign=b0,
+            tile_m=tile_m_name,
+            tile_n=tile_n_name,
+            mi=mi_name,
+            di=di_name,
+        )
+        if output_name is None:
             continue
-        if tile_n_name not in consume_text:
+        local_names = {mi_name, di_name, values_name, local_amax_name, mi_next_name}
+        if len(local_names) != 5:
+            continue
+        if len({tile_m_name, tile_n_name, src_name}) != 3:
+            continue
+        if output_name in {tile_m_name, tile_n_name}:
+            continue
+        iterator_names = _names(loop1.iter) - {"hl"}
+        if iterator_names & {tile_m_name, tile_n_name, src_name, output_name}:
+            continue
+        invariant_names = iterator_names | {
+            tile_m_name,
+            tile_n_name,
+            src_name,
+            output_name,
+            "hl",
+            "torch",
+            "float",
+            "slice",
+            "math",
+        }
+        if local_names & invariant_names:
+            continue
+        # This also rejects prefix reads that observe the preceding row's
+        # locals, and uses after the outer loop. Neither is visible to a
+        # suffix-only liveness check. Empty loops retain their old bindings.
+        region_names = local_names | {tile_n_name}
+        if region_names & (
+            parameter_names | _outside_names(scope_body, outer_body[i : i + 4])
+        ):
             continue
 
         info: dict[str, object] = {
@@ -469,11 +710,11 @@ def _detect_online_softmax(
             "local_amax_name": local_amax_name,
             "values_name": values_name,
             "src_name": src_name,
+            "values_expr": b0.value,
             "loop1": loop1,
             "loop2": loop2,
             "s_mi": s_mi,
             "s_di": s_di,
-            "di_init_value_repr": di_init_value_repr,
         }
         return i, info
     return None
@@ -487,7 +728,8 @@ def _build_max_loop(
     mi_name: str,
     local_amax_name: str,
     values_name: str,
-    src_name: str,
+    values_expr: ast.expr,
+    first_max_name: str,
 ) -> ast.For:
     """Build the max-only pass:
 
@@ -499,19 +741,7 @@ def _build_max_loop(
     values_assign = create(
         ast.Assign,
         targets=[create(ast.Name, id=values_name, ctx=ast.Store())],
-        value=create(
-            ast.Subscript,
-            value=create(ast.Name, id=src_name, ctx=ast.Load()),
-            slice=create(
-                ast.Tuple,
-                elts=[
-                    create(ast.Name, id=tile_m_name, ctx=ast.Load()),
-                    create(ast.Name, id=tile_n_name, ctx=ast.Load()),
-                ],
-                ctx=ast.Load(),
-            ),
-            ctx=ast.Load(),
-        ),
+        value=_ext_copy(values_expr),
         type_comment=None,
     )
     local_amax_assign = create(
@@ -555,18 +785,134 @@ def _build_max_loop(
         ),
         type_comment=None,
     )
-    return _make_for_loop(template_loop, [values_assign, local_amax_assign, mi_update])
+    first_local_name = first_max_name + "_local"
+    first_local_assign = create(
+        ast.Assign,
+        targets=[create(ast.Name, id=first_local_name, ctx=ast.Store())],
+        value=create(
+            ast.Call,
+            func=create(
+                ast.Attribute,
+                value=create(ast.Name, id="torch", ctx=ast.Load()),
+                attr="amax",
+                ctx=ast.Load(),
+            ),
+            args=[
+                create(
+                    ast.Call,
+                    func=create(
+                        ast.Attribute,
+                        value=create(ast.Name, id="torch", ctx=ast.Load()),
+                        attr="where",
+                        ctx=ast.Load(),
+                    ),
+                    args=[
+                        create(
+                            ast.Call,
+                            func=create(
+                                ast.Attribute,
+                                value=create(ast.Name, id="hl", ctx=ast.Load()),
+                                attr="full",
+                                ctx=ast.Load(),
+                            ),
+                            args=[
+                                create(
+                                    ast.List,
+                                    elts=[
+                                        create(
+                                            ast.Name, id=tile_m_name, ctx=ast.Load()
+                                        ),
+                                        create(
+                                            ast.Name, id=tile_n_name, ctx=ast.Load()
+                                        ),
+                                    ],
+                                    ctx=ast.Load(),
+                                ),
+                                create(
+                                    ast.Compare,
+                                    left=create(
+                                        ast.Attribute,
+                                        value=create(
+                                            ast.Name, id=tile_n_name, ctx=ast.Load()
+                                        ),
+                                        attr="begin",
+                                        ctx=ast.Load(),
+                                    ),
+                                    ops=[create(ast.Eq)],
+                                    comparators=[
+                                        create(ast.Constant, value=0, kind=None)
+                                    ],
+                                ),
+                            ],
+                            keywords=[
+                                create(
+                                    ast.keyword,
+                                    arg="dtype",
+                                    value=create(
+                                        ast.Attribute,
+                                        value=create(
+                                            ast.Name, id="torch", ctx=ast.Load()
+                                        ),
+                                        attr="bool",
+                                        ctx=ast.Load(),
+                                    ),
+                                )
+                            ],
+                        ),
+                        create(ast.Name, id=values_name, ctx=ast.Load()),
+                        create(ast.Constant, value=float("-inf"), kind=None),
+                    ],
+                    keywords=[],
+                ),
+            ],
+            keywords=[
+                create(
+                    ast.keyword,
+                    arg="dim",
+                    value=create(ast.Constant, value=1, kind=None),
+                )
+            ],
+        ),
+        type_comment=None,
+    )
+    first_max_update = create(
+        ast.Assign,
+        targets=[create(ast.Name, id=first_max_name, ctx=ast.Store())],
+        value=create(
+            ast.Call,
+            func=create(
+                ast.Attribute,
+                value=create(ast.Name, id="torch", ctx=ast.Load()),
+                attr="maximum",
+                ctx=ast.Load(),
+            ),
+            args=[
+                create(ast.Name, id=first_max_name, ctx=ast.Load()),
+                create(ast.Name, id=first_local_name, ctx=ast.Load()),
+            ],
+            keywords=[],
+        ),
+        type_comment=None,
+    )
+    return _make_for_loop(
+        template_loop,
+        [
+            values_assign,
+            local_amax_assign,
+            mi_update,
+            first_local_assign,
+            first_max_update,
+        ],
+    )
 
 
 def _build_sum_loop(
     template_loop: ast.For,
     *,
-    tile_m_name: str,
-    tile_n_name: str,
     mi_name: str,
     di_name: str,
     values_name: str,
-    src_name: str,
+    values_expr: ast.expr,
 ) -> ast.For:
     """Build the sum-only pass:
 
@@ -577,19 +923,7 @@ def _build_sum_loop(
     values_assign = create(
         ast.Assign,
         targets=[create(ast.Name, id=values_name, ctx=ast.Store())],
-        value=create(
-            ast.Subscript,
-            value=create(ast.Name, id=src_name, ctx=ast.Load()),
-            slice=create(
-                ast.Tuple,
-                elts=[
-                    create(ast.Name, id=tile_m_name, ctx=ast.Load()),
-                    create(ast.Name, id=tile_n_name, ctx=ast.Load()),
-                ],
-                ctx=ast.Load(),
-            ),
-            ctx=ast.Load(),
-        ),
+        value=_ext_copy(values_expr),
         type_comment=None,
     )
     # mi[:, None]
@@ -663,11 +997,19 @@ def _build_sum_loop(
     return _make_for_loop(template_loop, [values_assign, di_update])
 
 
-def _rewrite_outer_body(outer_body: list[ast.stmt]) -> tuple[list[ast.stmt], bool]:
+def _rewrite_outer_body(
+    outer_body: list[ast.stmt],
+    *,
+    scope_body: list[ast.stmt] | None = None,
+    parameter_names: frozenset[str] = frozenset(),
+    used_names: set[str] | None = None,
+) -> tuple[list[ast.stmt], bool]:
     """If ``outer_body`` matches the online softmax pattern, return the
     rewritten body and ``True``.  Otherwise return ``(outer_body, False)``.
     """
-    match = _detect_online_softmax(outer_body)
+    match = _detect_online_softmax(
+        outer_body, scope_body=scope_body, parameter_names=parameter_names
+    )
     if match is None:
         return outer_body, False
     start, info = match
@@ -678,7 +1020,7 @@ def _rewrite_outer_body(outer_body: list[ast.stmt]) -> tuple[list[ast.stmt], boo
     di_name = info["di_name"]
     local_amax_name = info["local_amax_name"]
     values_name = info["values_name"]
-    src_name = info["src_name"]
+    values_expr = info["values_expr"]
     loop1 = info["loop1"]
     loop2 = info["loop2"]
     s_mi = info["s_mi"]
@@ -689,11 +1031,24 @@ def _rewrite_outer_body(outer_body: list[ast.stmt]) -> tuple[list[ast.stmt], boo
     assert isinstance(di_name, str)
     assert isinstance(local_amax_name, str)
     assert isinstance(values_name, str)
-    assert isinstance(src_name, str)
+    assert isinstance(values_expr, ast.expr)
     assert isinstance(loop1, ast.For)
+    assert isinstance(loop1.iter, ast.Call)
     assert isinstance(loop2, ast.For)
     assert isinstance(s_mi, ast.Assign)
     assert isinstance(s_di, ast.Assign)
+
+    if used_names is None:
+        used_names = set(parameter_names)
+        for stmt in scope_body if scope_body is not None else outer_body:
+            used_names.update(_names(stmt))
+    first_max_name = "_helion_first_tile_max"
+    while first_max_name in used_names or first_max_name + "_local" in used_names:
+        first_max_name += "_"
+    used_names.update((first_max_name, first_max_name + "_local"))
+    first_max_init = _ext_copy(s_mi)
+    assert isinstance(first_max_init, ast.Assign)
+    first_max_init.targets = [create(ast.Name, id=first_max_name, ctx=ast.Store())]
 
     max_loop = _build_max_loop(
         loop1,
@@ -702,16 +1057,15 @@ def _rewrite_outer_body(outer_body: list[ast.stmt]) -> tuple[list[ast.stmt], boo
         mi_name=mi_name,
         local_amax_name=local_amax_name,
         values_name=values_name,
-        src_name=src_name,
+        values_expr=values_expr,
+        first_max_name=first_max_name,
     )
     sum_loop = _build_sum_loop(
         loop1,
-        tile_m_name=tile_m_name,
-        tile_n_name=tile_n_name,
         mi_name=mi_name,
         di_name=di_name,
         values_name=values_name,
-        src_name=src_name,
+        values_expr=values_expr,
     )
 
     # Splice: keep mi init, move di init AFTER the max loop, drop the
@@ -721,8 +1075,86 @@ def _rewrite_outer_body(outer_body: list[ast.stmt]) -> tuple[list[ast.stmt], boo
     # Replace the 4-stmt window [s_mi, s_di, loop1, loop2] with
     # [s_mi, max_loop, s_di (deepcopied), sum_loop, loop2].
     s_di_copy = _ext_copy(s_di)
+    poison_update = create(
+        ast.Assign,
+        targets=[create(ast.Name, id=di_name, ctx=ast.Store())],
+        value=create(
+            ast.Call,
+            func=create(
+                ast.Attribute,
+                value=create(ast.Name, id="torch", ctx=ast.Load()),
+                attr="where",
+                ctx=ast.Load(),
+            ),
+            args=[
+                create(
+                    ast.BinOp,
+                    left=create(
+                        ast.Compare,
+                        left=create(ast.Name, id=first_max_name, ctx=ast.Load()),
+                        ops=[create(ast.Eq)],
+                        comparators=[
+                            create(ast.Constant, value=float("-inf"), kind=None)
+                        ],
+                    ),
+                    op=create(ast.BitAnd),
+                    right=create(
+                        ast.Call,
+                        func=create(
+                            ast.Attribute,
+                            value=create(ast.Name, id="hl", ctx=ast.Load()),
+                            attr="full",
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            create(
+                                ast.List,
+                                elts=[create(ast.Name, id=tile_m_name, ctx=ast.Load())],
+                                ctx=ast.Load(),
+                            ),
+                            create(
+                                ast.Compare,
+                                left=_ext_copy(loop1.iter.args[0]),
+                                ops=[create(ast.Gt)],
+                                comparators=[create(ast.Constant, value=0, kind=None)],
+                            ),
+                        ],
+                        keywords=[
+                            create(
+                                ast.keyword,
+                                arg="dtype",
+                                value=create(
+                                    ast.Attribute,
+                                    value=create(ast.Name, id="torch", ctx=ast.Load()),
+                                    attr="bool",
+                                    ctx=ast.Load(),
+                                ),
+                            )
+                        ],
+                    ),
+                ),
+                create(ast.Constant, value=float("nan"), kind=None),
+                create(ast.Name, id=di_name, ctx=ast.Load()),
+            ],
+            keywords=[],
+        ),
+        type_comment=None,
+    )
+    # Apply the poison after summation. NaN absorbs every FP32 addition, so
+    # selecting it after the pure sum has the same observable result as
+    # initializing the sum with it. A false predicate keeps the original
+    # positive-zero initializer and sum order, including the empty-axis case.
+    # This also leaves the independent sum in its ordinary reduction form.
     # pyrefly: ignore [bad-assignment]
-    replacement: list[ast.stmt] = [s_mi, max_loop, s_di_copy, sum_loop, loop2]
+    replacement: list[ast.stmt] = [
+        s_mi,
+        first_max_init,
+        max_loop,
+        s_di_copy,
+        sum_loop,
+        poison_update,
+        loop2,
+    ]
     new_body[start : start + 4] = replacement
     return new_body, True
 
@@ -733,9 +1165,16 @@ class _OnlineToThreePassTransformer(ast.NodeTransformer):
     bodies in-place to the 3-pass form.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, scope_body: list[ast.stmt], parameter_names: frozenset[str]
+    ) -> None:
         super().__init__()
         self.rewrites = 0
+        self.scope_body = scope_body
+        self.parameter_names = parameter_names
+        self.used_names = set(parameter_names)
+        for stmt in scope_body:
+            self.used_names.update(_names(stmt))
 
     def visit_For(self, node: ast.For) -> ast.AST:
         # Recurse first so nested patterns get rewritten.
@@ -744,7 +1183,12 @@ class _OnlineToThreePassTransformer(ast.NodeTransformer):
         # online softmax pattern in its body.  Walk both GRID and DEVICE
         # loops to also catch nested cases — match-or-pass-through is
         # safe because detection is conservative.
-        new_body, fired = _rewrite_outer_body(list(node.body))
+        new_body, fired = _rewrite_outer_body(
+            list(node.body),
+            scope_body=self.scope_body,
+            parameter_names=self.parameter_names,
+            used_names=self.used_names,
+        )
         if fired:
             self.rewrites += 1
             node.body = new_body
@@ -752,14 +1196,7 @@ class _OnlineToThreePassTransformer(ast.NodeTransformer):
 
 
 def _min_n_for_rewrite() -> int:
-    """The reduction-axis extent (``N``) at or above which the 3-pass form
-    is profitable.  Defaults to 0 (always rewrite): with the lane-reduce
-    collapse (one grouped reduce per sweep) and cross-sweep load fusion,
-    the 3-pass form beats the online merge even at N=1024 on B200
-    (measured +10% on both the warp-looped and resident-row config
-    families).  Set ``HELION_ONLINE_TO_3PASS_MIN_N`` to override (useful
-    for A/B tests).
-    """
+    """Optional reduction-axis threshold; the existing default is zero."""
     val = os.environ.get("HELION_ONLINE_TO_3PASS_MIN_N")
     if val is None:
         return 0
@@ -781,8 +1218,6 @@ def _reduction_axis_extent(func: HostFunction) -> int | None:
     don't follow this convention (their detected pattern still won't
     rewrite if the last-dim extent is below the cutoff).
     """
-    import torch  # local import — keep module-level imports minimal
-
     chosen: tuple[int, int] | None = None  # (num_elements, last_dim)
     for arg in func.params.arguments.values():
         if not isinstance(arg, torch.Tensor):
@@ -809,16 +1244,41 @@ def rewrite_online_to_3pass(func: HostFunction) -> bool:
 
     * ``HELION_DISABLE_ONLINE_TO_3PASS=1`` — skip the pass entirely.
     * ``HELION_ONLINE_TO_3PASS_MIN_N`` — minimum reduction-axis extent
-      for the rewrite to apply (default 2048).
+      for the rewrite to apply (default zero).
     """
     if os.environ.get("HELION_DISABLE_ONLINE_TO_3PASS") == "1":
+        return False
+    # Pure-looking calls must actually resolve to these modules/builtins.
+    # A parameter or local binding also shadows the corresponding global.
+    closure = inspect.getclosurevars(func.fn)
+    bindings = {**closure.builtins, **closure.globals, **closure.nonlocals}
+    if bindings.get("torch") is not torch or bindings.get("hl") is not hl:
+        return False
+    for name, expected in (
+        ("float", builtins.float),
+        ("slice", builtins.slice),
+        ("math", math),
+    ):
+        if bindings.get(name, expected) is not expected:
+            return False
+    reserved = {"torch", "hl", "float", "slice", "math"}
+    parameter_names = frozenset(
+        node.arg for node in ast.walk(func.args) if isinstance(node, ast.arg)
+    )
+    if parameter_names & reserved or any(
+        isinstance(node, ast.Name)
+        and not isinstance(node.ctx, ast.Load)
+        and node.id in reserved
+        for stmt in func.body
+        for node in ast.walk(stmt)
+    ):
         return False
     min_n = _min_n_for_rewrite()
     if min_n > 0:
         extent = _reduction_axis_extent(func)
         if extent is not None and extent < min_n:
             return False
-    transformer = _OnlineToThreePassTransformer()
+    transformer = _OnlineToThreePassTransformer(func.body, parameter_names)
     new_body: list[ast.stmt] = []
     for stmt in func.body:
         result = transformer.visit(stmt)
