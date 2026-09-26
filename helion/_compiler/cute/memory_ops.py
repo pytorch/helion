@@ -28,7 +28,6 @@ from ... import exc
 from ...language import _decorators
 from ...language.memory_ops import _CUTE_L2_LAST_SUFFIX
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
-from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_CARRIER
 from ...language.memory_ops import _CUTE_VECTOR_UNROLL_DTYPES
 from ...language.memory_ops import _codegen_cute_store_permute_lane_loops
@@ -58,6 +57,7 @@ from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import RuntimeInputSpecialization
 from ..compile_environment import _replay_tensor_input_source
+from ..compile_environment import _to_sympy
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
 from .indexing import is_cute_direct_iota_index
@@ -67,11 +67,23 @@ if TYPE_CHECKING:
     from collections.abc import Hashable
     from collections.abc import Sequence
 
+    import sympy
     from torch._guards import Source
 
     from ..inductor_lowering import CodegenState
 
 log = logging.getLogger(__name__)
+
+
+_CUTE_ALIGNMENT_MAX_BYTES = 32
+
+
+def _specialized_int(
+    env: CompileEnvironment, value: int | torch.SymInt | sympy.Expr
+) -> int | None:
+    """Resolve only shape facts already covered by the kernel's cache key."""
+    expression = env.specialize_expr(env.shape_env.replace(_to_sympy(value)))
+    return int(expression) if not expression.free_symbols else None
 
 
 def _persistent_vec_alignment_signature(values: Sequence[object]) -> Hashable:
@@ -84,21 +96,21 @@ def _persistent_vec_alignment_signature(values: Sequence[object]) -> Hashable:
         return None
     tensor = values[0]
     element_size = tensor.element_size()
-    max_vector_elements = max(_CUTE_VECTOR_MAX_BYTES // element_size, 1)
+    max_vector_elements = max(_CUTE_ALIGNMENT_MAX_BYTES // element_size, 1)
     return (
-        int(tensor.data_ptr()) % _CUTE_VECTOR_MAX_BYTES,
+        int(tensor.data_ptr()) % _CUTE_ALIGNMENT_MAX_BYTES,
         tuple(int(size) % max_vector_elements for size in tensor.shape),
         tuple(
             (
                 int(stride) == 1,
-                (int(stride) * element_size) % _CUTE_VECTOR_MAX_BYTES,
+                (int(stride) * element_size) % _CUTE_ALIGNMENT_MAX_BYTES,
             )
             for stride in tensor.stride()
         ),
     )
 
 
-_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY = "cute_persistent_vec_alignment_matrix_v2"
+_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY = "cute_persistent_vec_alignment_matrix_v3"
 
 
 def _persistent_vec_alignment_matrix_signature(
@@ -131,8 +143,8 @@ def register_persistent_vec_alignment_specializations(
         RuntimeInputSpecialization(
             sources=sources,
             classifier_identity=(
-                "byte_alignment_matrix_v2",
-                _CUTE_VECTOR_MAX_BYTES,
+                "byte_alignment_matrix_v3",
+                _CUTE_ALIGNMENT_MAX_BYTES,
                 tuple(map(repr, sources)),
             ),
             classifier=_persistent_vec_alignment_matrix_signature,
@@ -147,7 +159,7 @@ def runtime_tensor_has_specialized_alignment(
     required_alignment: int,
 ) -> bool:
     """Return a cache-key-backed runtime base-pointer alignment proof."""
-    if required_alignment <= 0 or _CUTE_VECTOR_MAX_BYTES % required_alignment:
+    if required_alignment <= 0 or _CUTE_ALIGNMENT_MAX_BYTES % required_alignment:
         return False
     runtime_tensor = env.runtime_value_for_tensor(tensor)
     if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
@@ -861,16 +873,18 @@ def _persistent_vec_is_exact_aligned(
     if len(strides) != len(rebased):
         return False
     lane_dim = dependent[0][0]
-    lane_size = sizes[lane_dim]
-    if not isinstance(lane_size, int) or lane_size % vec_width:
+
+    lane_size = _specialized_int(env, sizes[lane_dim])
+    if lane_size is None or lane_size % vec_width:
         return False
     for dim, stride in enumerate(strides):
-        if not isinstance(stride, int):
+        stride_value = _specialized_int(env, stride)
+        if stride_value is None:
             return False
         if dim == lane_dim:
-            if stride != 1:
+            if stride_value != 1:
                 return False
-        elif stride * element_size % required_alignment:
+        elif stride_value * element_size % required_alignment:
             return False
     return True
 
@@ -2900,7 +2914,9 @@ def _cute_vector_load_ctx(
     env = CompileEnvironment.current()
     if env.backend.name != "cute":
         return None
-    if extra_mask is not None:
+    if extra_mask is not None and not (
+        isinstance(extra_mask, ast.Constant) and extra_mask.value is True
+    ):
         return None
     if "None" in index_exprs:
         return None
@@ -2949,16 +2965,14 @@ def _cute_vector_load_ctx(
     # ``_cute_lane_axis_pos`` records the index_exprs position of that
     # stride-1 lane axis so the hoist substitutes the per-lane base there
     # (not blindly at ``[-1]``).
-    # Find the stride-1 dim WITHOUT forcing specialization of a symbolic
-    # stride: a contiguous dim has a concrete ``int`` stride of 1, so only
-    # accept plain ints here.  Calling ``int()`` on a ``SymInt`` stride would
-    # bake the (otherwise-dynamic) size into the kernel — see the
-    # ``test_mark_static`` regression where ``int(stride(0))`` specialized
-    # ``n``.
+    # Find the stride-1 dim without implicitly specializing a symbolic
+    # stride. Explicitly specialized shape variables are safe to resolve:
+    # they are already represented in the BoundKernel cache key.
     stride1_tensor_dim: int | None = None
     for d in range(tensor.ndim):
         s = tensor.stride(d)
-        if isinstance(s, int) and s == 1:
+        stride = _specialized_int(env, s)
+        if stride == 1:
             stride1_tensor_dim = d
             break
     if stride1_tensor_dim is None:
@@ -3023,36 +3037,16 @@ def _cute_vector_load_ctx(
             if tensor_dim < tensor.ndim:
                 dim_size = tensor.shape[tensor_dim]
                 matches: list[int] = []
+
+                dim_int = _specialized_int(env, dim_size)
                 for cand_bid, bs in enumerate(env.block_sizes):
                     if not isinstance(bs.size, (int, torch.SymInt)):
                         continue
-                    bs_numel = bs.numel
-                    # Try a few candidate forms for the size equality
-                    # check: sympy.Integer (most common via specialize()),
-                    # int, and torch.SymInt all flow through known_equal
-                    # after we coerce to plain int when possible.
-                    bs_int: int | torch.SymInt | None
-                    if isinstance(bs_numel, (int, torch.SymInt)):
-                        bs_int = bs_numel
-                    else:
-                        try:
-                            bs_int = int(bs_numel)
-                        except (TypeError, ValueError):
-                            bs_int = None
-                    if bs_int is None:
-                        continue
-                    dim_int: int | torch.SymInt | None
-                    if isinstance(dim_size, (int, torch.SymInt)):
-                        dim_int = dim_size
-                    else:
-                        try:
-                            dim_int = int(dim_size)
-                        except (TypeError, ValueError):
-                            dim_int = None
-                    if dim_int is None:
+                    bs_int = _specialized_int(env, bs.numel)
+                    if bs_int is None or dim_int is None:
                         continue
                     if (
-                        env.known_equal(bs_int, dim_int)
+                        bs_int == dim_int
                         and _cute_lane_strategy(state, cand_bid) is not None
                     ):
                         matches.append(cand_bid)
@@ -3097,9 +3091,9 @@ def _cute_vector_load_ctx(
         if mode == "unroll":
             if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
                 return None
-            # Cap at one LDG.128 per hoist (fp32 V=8 would need 32 bytes);
-            # oversized configs stay on the (correct) scalar fallback.
-            if vec_width * tensor.dtype.itemsize > 16:
+            capability = env.config_spec.target_device_capability
+            max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
+            if vec_width * tensor.dtype.itemsize > max_bytes:
                 return None
             # Need a lane base index var + a constexpr V-loop var; both
             # are set up by the strategy's codegen_device_loop.
@@ -3143,9 +3137,9 @@ def _cute_vector_load_ctx(
             return None
         if not _cute_is_unroll_dtype(tensor.dtype):
             return None
-        # Cap at one LDG.128 per hoist: wider than 16 bytes per thread
-        # exceeds the widest gmem access and is not supported.
-        if vec_width * tensor.dtype.itemsize > 16:
+        capability = env.config_spec.target_device_capability
+        max_bytes = 32 if capability is not None and capability >= (10, 0) else 16
+        if vec_width * tensor.dtype.itemsize > max_bytes:
             return None
         base_var_by_block = getattr(
             strategy, "_cute_lane_base_index_var_by_block", None

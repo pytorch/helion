@@ -706,7 +706,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         from .device_ir import ReductionLoopGraphInfo
 
         env = CompileEnvironment.current()
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
         if isinstance(numel, (int, sympy.Integer)):
             size_hint = int(numel)
         elif isinstance(numel, sympy.Expr):
@@ -868,7 +868,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         backend = env.backend
         block_idx = self.block_index
-        numel = env.block_sizes[block_idx].numel
+        numel = env.specialize_expr(env.block_sizes[block_idx].numel)
         index_var = self.index_var(block_idx)
         mask_var = self._mask_var
         block_size_var = self.block_size_var(self.block_index)
@@ -1364,9 +1364,8 @@ class LoopedReductionStrategy(ReductionStrategy):
                     self._cute_reduction_lane_extent = (
                         self._cute_reduction_lane_extent // vec_width
                     )
-        if env.known_multiple(
-            env.block_sizes[block_index].numel, self._loop_block_size
-        ):
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
+        if env.known_multiple(numel, self._loop_block_size):
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
@@ -1441,7 +1440,7 @@ class LoopedReductionStrategy(ReductionStrategy):
             size > 1 for size in grid_axis_sizes.values()
         ):
             return
-        numel = env.block_sizes[self.block_index].numel
+        numel = env.specialize_expr(env.block_sizes[self.block_index].numel)
         try:
             numel_int = int(numel)
         except (TypeError, ValueError):
@@ -1654,7 +1653,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         env = CompileEnvironment.current()
         self._maybe_apply_cute_rolled_cluster(state)
         block_index = self.block_index
-        numel = env.block_sizes[block_index].numel
+        numel = env.specialize_expr(env.block_sizes[block_index].numel)
         offset_var = self.offset_var(block_index)
         index_var = self.index_var(block_index)
         block_size_var = self.block_size_var(block_index)

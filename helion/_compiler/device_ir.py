@@ -90,6 +90,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    import sympy
+
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
@@ -1131,11 +1133,27 @@ class DeviceIR:
                 continue
             if used_graphs & graphs_with_rolled_rdim:
                 continue
+            if env.backend_name == "cute":
+                # Rolled CuTe reductions use exact extents to make vectorized
+                # multi-sweep caching available. Wide rows can additionally
+                # use a CTA-cluster split, whose single-use mbarrier needs an
+                # exact per-CTA slice. AOT kernels keep dimensions symbolic by
+                # default, so specialize the participating tensor dimensions.
+                # Vector loads across the reduced axis also need the sibling
+                # grid bounds to be exact: an unrelated dynamic row mask would
+                # otherwise keep the scalar fallback. ``specialized_vars`` is
+                # part of the BoundKernel cache key, so later calls with other
+                # shapes compile distinct kernels.
+                for block_size in env.block_sizes:
+                    env.specialized_vars.update(
+                        cast("set[sympy.Symbol]", block_size.numel.free_symbols)
+                    )
             if env.backend_name != "pallas":
                 env.config_spec.reduction_loops.append(
                     ReductionLoopSpec(
                         block_id=rdim.block_id,
                         size_hint=rdim.size_hint(),
+                        allow_non_power_of_two=env.backend_name == "cute",
                     )
                 )
                 env.backend.register_reduction_loop_config_slots(
