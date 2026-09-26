@@ -1227,6 +1227,13 @@ class CuteBackend(Backend):
             or key == "cute_packet_prefetch"
             or key
             in (
+                "cute_split_k_workspace",
+                "cute_split_k_stages",
+                "cute_split_k_schedule",
+                "cute_split_k_finalizer_warps",
+            )
+            or key
+            in (
                 "cute_grouped_rna_warps",
                 "cute_grouped_rna_block_k",
                 "cute_grouped_ab_stages",

@@ -2115,6 +2115,34 @@ def generate_ast(
             config = type(config).from_dict(
                 {**config.config, "cute_reduction_sequence": "scalar"}
             )
+        if config.get("cute_split_k_schedule") == "cluster8_k4":
+            from .cute.split_k_cluster_codegen import generate_split_k_cluster
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "cluster split-K excludes external lowering transforms"
+                )
+            return generate_split_k_cluster(func, config, emit_repro_caller)
+        if config.get("cute_split_k_workspace", False) and _codegen_graphs is None:
+            from .cute.split_k_workspace_codegen import generate_split_k_workspace
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "split-K workspace does not support external memory transforms",
+                )
+            return generate_split_k_workspace(func, config, emit_repro_caller)
         if env.cute_fission_plan is not None and len(func.device_ir.root_ids) > 1:
             from .cute.materialized_fission_codegen import generate_materialized_fission
 
