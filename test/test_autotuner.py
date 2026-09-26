@@ -11621,8 +11621,11 @@ class TestCuteAutotuner(TestCase):
         # ``load_eviction_policies`` carries per-load-site L1 eviction
         # hints (lowered on the vectorized load forms). ``flatten_loops``
         # selects the flattened multi-dim tile form (flat base-pointer
-        # vectorization). The set still excludes Triton-style knobs that
+        # vectorization). ``cute_proven_bounds`` selects proof-based mask
+        # elimination. The set still excludes Triton-style knobs that
         # the CuTe path does not consume.
+        # Resident packet controls are explicit CuTe config fields; unseeded
+        # configs retain their false-only search domains.
         self.assertEqual(
             flat_keys,
             {
@@ -11634,6 +11637,11 @@ class TestCuteAutotuner(TestCase):
                 "cute_lane_layouts",
                 "cute_cluster_n",
                 "cute_min_blocks_per_mp",
+                "cute_proven_bounds",
+                "cute_packet_prefetch",
+                "cute_independent_reduction",
+                "cute_replicated_reduction",
+                "cute_vector_packet_unroll",
                 "load_eviction_policies",
             },
         )
@@ -11658,6 +11666,11 @@ class TestCuteAutotuner(TestCase):
                     "cute_lane_layouts",
                     "cute_cluster_n",
                     "cute_min_blocks_per_mp",
+                    "cute_proven_bounds",
+                    "cute_packet_prefetch",
+                    "cute_independent_reduction",
+                    "cute_replicated_reduction",
+                    "cute_vector_packet_unroll",
                     "load_eviction_policies",
                 },
             )
@@ -11683,10 +11696,12 @@ class TestCuteAutotuner(TestCase):
                     block_sizes=[16, 64],
                     num_threads=[16, 64],
                     loop_orders=[[1, 0]],
+                    cute_proven_bounds=True,
                 )
             )
         )
         self.assertEqual(round_tripped.loop_orders, [[1, 0]])
+        self.assertTrue(round_tripped.config["cute_proven_bounds"])
 
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="tcgen05 requires CUDA capability >= 10.0"

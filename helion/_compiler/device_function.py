@@ -1146,6 +1146,7 @@ class DeviceFunction:
         )
         if backend.name == "cute":
             from .cute.fuse_two_pass_loads import fuse_two_pass_loads
+            from .cute.uniform_comparison import lower_uniform_comparisons
 
             float_scalar_names = {
                 argument.name
@@ -1164,6 +1165,9 @@ class DeviceFunction:
                     (float, torch.SymFloat),
                 )
             }
+            kernel_body = lower_uniform_comparisons(
+                kernel_body, self, float_scalar_names=float_scalar_names
+            )
 
             # Collect static integer values for constexpr names so the
             # fusion pass can resolve range(..., step=cutlass.Int32(NAME))
@@ -1270,7 +1274,11 @@ class DeviceFunction:
                 kernel_body = eliminate_duplicate_cluster_maxima(
                     kernel_body, constexpr_values, rename_groups
                 )
+            from .cute.affine_vector_io import vectorize_affine_tile_lanes
 
+            kernel_body = vectorize_affine_tile_lanes(
+                kernel_body, self, constexpr_values
+            )
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -1279,6 +1287,23 @@ class DeviceFunction:
             from .cute.merge_sibling_v_loops import merge_sibling_v_loops
 
             kernel_body = merge_sibling_v_loops(kernel_body)
+            from .cute.vector_reduction_packets import optimize_vector_reductions
+
+            kernel_body = optimize_vector_reductions(
+                kernel_body,
+                constexpr_values,
+                thread_block_dims=exact_thread_block_dims,
+                independent_accumulators=self.config.get(
+                    "cute_independent_reduction", False
+                )
+                is True,
+                replicated_single_use=self.config.get(
+                    "cute_replicated_reduction", False
+                )
+                is True,
+                unroll_packets=self.config.get("cute_vector_packet_unroll", False)
+                is True,
+            )
             # A persistent row tile may repeat a row-invariant Q/K norm (and
             # its warp reduction) once for every compile-time row lane.  Wide
             # row tiles are useful only if that setup is shared.  Unswitch a
@@ -1611,6 +1636,31 @@ class DeviceFunction:
             from .cute.hoist_warp_reduce import validate_cluster_reduce_placement
 
             validate_cluster_reduce_placement(kernel_body, constexpr_values)
+            from .cute.full_tile_bounds import lower_full_tile_bounds
+
+            kernel_body = lower_full_tile_bounds(
+                kernel_body, self, param_args, constexpr_values, rename_groups
+            )
+            if self.config.get("cute_rng_packet", False):
+                from .cute.philox_packets import lower_philox_packets
+
+                kernel_body = lower_philox_packets(
+                    kernel_body,
+                    seed_names=self.cute_state.explicit_rng_seed_names,
+                    integer_names=set(constexpr_values),
+                    new_name=self.unique_name,
+                    vectorize_packet=lambda loop, read, known: (
+                        vectorize_affine_tile_lanes(
+                            [loop],
+                            self,
+                            constexpr_values,
+                            register_accesses=frozenset(
+                                {ast.dump(read, include_attributes=False)}
+                            ),
+                            integer_names=known,
+                        )
+                    ),
+                )
         definition = ast_rename(
             create(
                 ast.FunctionDef,
@@ -1622,6 +1672,12 @@ class DeviceFunction:
             ),
             {k: v[0] for k, v in self._variable_renames.items()},
         )
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.boolean_guards import reassociate_boolean_guards
+
+            # Type facts must see the final binding names, including every
+            # loop-carried alias, before changing the SDK's Boolean tree shape.
+            definition.body = reassociate_boolean_guards(definition.body)
         result = [*prefix, definition]
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:

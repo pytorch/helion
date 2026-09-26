@@ -39,6 +39,12 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
 
     raw_args = state.ast_args[2]
     args_list = list(raw_args) if isinstance(raw_args, (list, tuple)) else [raw_args]
+    if state.fx_node is not None and "cute_philox_host_seed" in state.fx_node.meta:
+        from .philox_stream import stage_explicit_seed
+
+        args_list[0] = stage_explicit_seed(
+            state, state.fx_node.meta["cute_philox_host_seed"]
+        )
     args_ast = create(ast.Tuple, elts=args_list, ctx=ast.Load())
 
     from ..compile_environment import CompileEnvironment

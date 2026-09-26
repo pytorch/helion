@@ -860,6 +860,11 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_bf16x2_recurrence",
         "cute_signed_bitfield_bf16",
         "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         "load_cache_modifiers",
@@ -923,6 +928,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_bf16x2_recurrence",
         "cute_signed_bitfield_bf16",
         "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
@@ -990,6 +1000,11 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_bf16x2_recurrence",
         "cute_signed_bitfield_bf16",
         "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
     }
 )
 
@@ -1137,6 +1152,8 @@ class ConfigSpec:
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
         self.cute_proven_bounds_enabled = False
+        self.cute_rng_packet_enabled = False
+        self.cute_packet_prefetch_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -2503,6 +2520,12 @@ class ConfigSpec:
             raise InvalidConfig("proven bounds cleanup requires CuTe")
         self.cute_proven_bounds_enabled = True
 
+    def enable_cute_packet_prefetch(self) -> None:
+        """Expose independent packet staging to the pointwise tuner."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("packet prefetch requires CuTe")
+        self.cute_packet_prefetch_enabled = True
+
     def _normalize_cute_async_load_pipeline(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -2620,6 +2643,20 @@ class ConfigSpec:
         elif config.get("cute_async_load_stages", 0) == 0:
             config[key] = False
 
+    def _normalize_cute_vector_reductions(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        for key in (
+            "cute_independent_reduction",
+            "cute_replicated_reduction",
+            "cute_vector_packet_unroll",
+        ):
+            if key in config and type(config[key]) is not bool:
+                if fix_invalid:
+                    config[key] = False
+                else:
+                    raise InvalidConfig(f"{key} must be a boolean")
+
     def _normalize_cute_proven_bounds(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -2659,6 +2696,44 @@ class ConfigSpec:
                     f"{CUTE_AFFINE_SCAN_SCHEDULE_KEY} must be one of "
                     f"{fragment.choices!r}, got {value!r}"
                 )
+
+    def _normalize_cute_rng_packet(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_rng_packet"
+        value = config.get(key, False)
+        if not self.cute_rng_packet_enabled or type(value) is not bool:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_rng_packet requires the philox4 stream and a boolean"
+                )
+            config.pop(key, None)
+            return
+        config.setdefault(key, False)
+
+    def _normalize_cute_packet_prefetch(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_packet_prefetch"
+        value = config.get(key, 0)
+        if type(value) is not int or value not in (0, 2, 4, 8):
+            if not fix_invalid:
+                raise InvalidConfig(f"{key} must be 0, 2, 4, or 8, got {value!r}")
+            config.pop(key, None)
+            return
+        if value == 0:
+            config.pop(key, None)
+            return
+        if (
+            not self.cute_packet_prefetch_enabled
+            or not self.cute_proven_bounds_enabled
+            or config.get("cute_proven_bounds") is not True
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_packet_prefetch requires pointwise facts and cute_proven_bounds"
+                )
+            config.pop(key, None)
 
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
@@ -2926,6 +3001,9 @@ class ConfigSpec:
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -4112,6 +4190,24 @@ class ConfigSpec:
                     fields["cute_bf16x2_recurrence"] = BooleanFragment()
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
+                if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
+                    for key in (
+                        "cute_independent_reduction",
+                        "cute_replicated_reduction",
+                        "cute_vector_packet_unroll",
+                    ):
+                        seeded = any(
+                            seed.config.get(key) is True
+                            for seed in self.compiler_seed_configs
+                        )
+                        fields[key] = EnumFragment(
+                            (False, True),
+                            search_choices=(False, True) if seeded else (False,),
+                        )
+                if self.cute_rng_packet_enabled:
+                    fields["cute_rng_packet"] = BooleanFragment()
+                if self.cute_packet_prefetch_enabled:
+                    fields["cute_packet_prefetch"] = EnumFragment(choices=(0, 2, 4, 8))
                 # CuTe's SIMT search normally has no pid_type coordinate.  A
                 # metadata-specialized compiler seed may nevertheless prove one
                 # exact 3-D ``xyz`` launch safe after the earlier, deliberately

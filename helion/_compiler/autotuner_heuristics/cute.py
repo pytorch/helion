@@ -1618,7 +1618,43 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
                         {**seeds[-1].config, "load_eviction_policies": cache_policies}
                     )
                 )
-        return dedupe_configs(seeds)
+        packet_seeds: list[Config] = []
+        for seed in seeds:
+            block_sizes = seed.block_sizes
+            thread_counts = seed.num_threads
+            if block_sizes[
+                spec.block_sizes.block_id_to_index(row_block_id)
+            ] != 1 or not all(
+                block_sizes[spec.block_sizes.block_id_to_index(block_id)] == row_extent
+                for block_id in inner_block_ids
+            ):
+                continue
+            for packet_width in dict.fromkeys((vec, max(2, vec // 2))):
+                if not all(
+                    row_extent
+                    % (
+                        thread_counts[spec.num_threads.block_id_to_index(block_id)]
+                        * packet_width
+                    )
+                    == 0
+                    for block_id in inner_block_ids
+                ):
+                    continue
+                packet_seeds.append(
+                    Config.from_dict(
+                        deepcopy(seed.config)
+                        | {
+                            "cute_vector_widths": _seq_config_list(
+                                spec.cute_vector_widths,
+                                dict.fromkeys(inner_block_ids, packet_width),
+                            ),
+                            "cute_independent_reduction": True,
+                            "cute_replicated_reduction": True,
+                            "cute_vector_packet_unroll": True,
+                        }
+                    )
+                )
+        return dedupe_configs([*seeds, *packet_seeds])
 
 
 class CuteNestedRowHeuristic(AutotunerHeuristic):
@@ -4262,6 +4298,17 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
     UNROLL = 2  # vectors per thread (outer lane iters)
 
     @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        if env.config_spec.pointwise_facts:
+            # Admission uses the actual launch's tensor metadata behind a
+            # guard; no example size or new binding specialization is needed.
+            env.config_spec.enable_cute_proven_bounds()
+            env.config_spec.enable_cute_packet_prefetch()
+        return frozenset()
+
+    @classmethod
     def _vec_axis_and_width(
         cls, env: CompileEnvironment
     ) -> tuple[int, int, int, bool] | None:
@@ -4472,6 +4519,68 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                         spec.cute_vector_widths, {vec_block: packet_width}
                     )
                     seeds.append(Config.from_dict(packet))
+        if spec.cute_proven_bounds_enabled:
+            # Keep the complete existing family and its order. Add independent
+            # true counterparts so ordinary cold search can compare the proof
+            # with its original fallback, without changing the default config.
+            seeds.extend(
+                Config.from_dict(deepcopy(seed.config) | {"cute_proven_bounds": True})
+                for seed in list(seeds)
+                if not seed.config.get("cute_proven_bounds", False)
+            )
+        if (
+            spec.cute_packet_prefetch_enabled
+            and picked is not None
+            and spec.pointwise_facts[0].storage_itemsize in (2, 4)
+        ):
+            # Preserve the complete existing prefix, including its paired
+            # bounds variants. Only add strided off/on siblings of existing
+            # multi-packet tiles; do not invent new geometries or defaults.
+            vec_block = picked[0]
+            block_ids = [item.block_id for item in spec.block_sizes]
+            thread_ids = [item.block_id for item in spec.num_threads]
+            vector_ids = [item.block_id for item in spec.cute_vector_widths]
+            layout_ids = [item.block_id for item in spec.cute_lane_layouts]
+            if all(
+                vec_block in ids
+                for ids in (block_ids, thread_ids, vector_ids, layout_ids)
+            ):
+                for base in list(seeds):
+                    if base.config.get("cute_proven_bounds") is not True:
+                        continue
+                    block = base.block_sizes[block_ids.index(vec_block)]
+                    threads = base.num_threads[thread_ids.index(vec_block)]
+                    widths = base.config["cute_vector_widths"]
+                    assert isinstance(widths, list)
+                    width = widths[vector_ids.index(vec_block)]
+                    packet = threads * width
+                    if (
+                        width not in (2, 4, 8)
+                        or packet <= 0
+                        or block < 2 * packet
+                        or block % (2 * packet)
+                    ):
+                        continue
+                    control = deepcopy(base.config)
+                    control["cute_lane_layouts"] = _seq_config_list(
+                        spec.cute_lane_layouts, {vec_block: "strided"}
+                    )
+                    for values in (
+                        control,
+                        deepcopy(control) | {"cute_packet_prefetch": 2},
+                    ):
+                        if all(values != previous.config for previous in seeds):
+                            seeds.append(Config.from_dict(values))
+        if spec.cute_rng_packet_enabled:
+            # Keep the complete existing family in order. Explicit-uniform RNG
+            # may reuse one Philox invocation across a vector packet; seed that
+            # choice alongside the scalar path without changing stream policy
+            # or relying on a later Boolean mutation to discover it.
+            seeds.extend(
+                Config.from_dict(deepcopy(seed.config) | {"cute_rng_packet": True})
+                for seed in list(seeds)
+                if not seed.config.get("cute_rng_packet", False)
+            )
         return seeds
 
     @classmethod

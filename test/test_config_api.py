@@ -172,6 +172,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "cute_affine_scan_schedule": st.sampled_from(
                 ["ordinary", "direct_m16n8_v1", "direct_m16n16_v1"]
             ),
+            "cute_packet_prefetch": st.sampled_from([0, 2, 4, 8]),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
@@ -228,6 +229,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "cute_bf16x2_recurrence",
                     "cute_proven_bounds",
                     "cute_affine_scan_schedule",
+                    "cute_packet_prefetch",
                     "num_warps",
                     "num_stages",
                     "pid_type",
@@ -513,6 +515,7 @@ class TestConfigAPI(TestCase):
             "cute_bf16x2_recurrence",
             "cute_proven_bounds",
             "cute_affine_scan_schedule",
+            "cute_packet_prefetch",
             "num_warps",
             "num_stages",
             "pid_type",

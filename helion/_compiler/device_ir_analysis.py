@@ -1885,7 +1885,19 @@ class DeviceIRAnalysis:
                         compute_itemsize = max(compute_itemsize, itemsize)
                 if node.op == "call_function":
                     if node.target in unsafe_pointwise_ops:
-                        return None
+                        if (
+                            spec.backend_name != "cute"
+                            or node.target is not inline_asm_elementwise
+                            or len(node.args) != 6
+                            or node.args[5] != 1
+                        ):
+                            return None
+                        from .cute.pure_lane_packets import is_pure_scalar_assembly
+
+                        if not is_pure_scalar_assembly(
+                            node.args[0], node.args[1], node.args[4]
+                        ):
+                            return None
                     base = getattr(node.target, "__name__", str(node.target)).split(
                         "."
                     )[0]
