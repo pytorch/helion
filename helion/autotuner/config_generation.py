@@ -458,9 +458,21 @@ class ConfigGeneration:
         if flat_config[bounds[0][0]] is not True:
             flat_config[prefetch[0][0]] = 0
 
+    def _repair_cute_reduction_pipeline_depth(self, flat_config: FlatConfig) -> None:
+        """Keep inactive ring coordinates at the existing two-slot default."""
+        if self.config_spec.backend_name != "cute":
+            return
+        depth = self._key_to_flat_indices.get("cute_reduction_pipeline_depth")
+        schedule = self._key_to_flat_indices.get("cute_reduction_schedule")
+        if depth is None or schedule is None:
+            return
+        if flat_config[schedule[0][0]] != "pipelined":
+            flat_config[depth[0][0]] = 2
+
     def _repair_cute_num_threads(self, flat_config: FlatConfig) -> None:
         """Keep CuTe launch-thread choices compatible with tuned block sizes."""
         self._repair_cute_packet_prefetch(flat_config)
+        self._repair_cute_reduction_pipeline_depth(flat_config)
         if not self._cute_num_thread_block_pairs:
             return
 

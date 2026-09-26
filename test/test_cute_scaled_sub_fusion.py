@@ -5,15 +5,21 @@ import ctypes
 import ctypes.util
 from types import SimpleNamespace
 
+from examples.aot_example import row_softmax
 import numpy as np
 import pytest
+import torch
 
+from .test_cute_bounded_cache_codegen import _config
+from .test_cute_bounded_cache_codegen import _cpu_target
+import helion
 from helion._compiler.cute.fuse_fma import fuse_fma
 from helion._compiler.cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
 from helion._compiler.cute.scaled_sub_fusion import SCALED_SUBTRACTION_ATTR
 from helion._compiler.cute.scaled_sub_fusion import (
     contract_distributed_scale_subtractions,
 )
+from helion._testing import skipUnlessBackends
 
 SOURCE = """
 offset = cutlass.Float32(other)
@@ -255,3 +261,44 @@ def test_explicit_contract_preserves_fp32_fma_width_and_nonfinite_classes(
         assert np.isnan(result)
     else:
         assert result.tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("fast_math", [False, True])
+@pytest.mark.parametrize("aligned", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@skipUnlessBackends(["cute"])
+def test_actual_masked_and_vector_sources_follow_the_same_fusion_policy(
+    fast_math, aligned, dtype
+):
+    vector = 4 if dtype == torch.float32 else 8
+    with _cpu_target():
+        storage = torch.empty(17 * 513 + 1, dtype=dtype)
+        x = storage.as_strided((17, 513), (513, 1), int(not aligned))
+        kernel = helion.kernel(
+            row_softmax.fn,
+            backend="cute",
+            static_shapes=False,
+            autotune_effort="none",
+            fast_math=fast_math,
+            cute_full_slice_matmul_tiling=True,
+            cute_segmented_matmul_tiling=True,
+            cute_flatten_nested_reductions=True,
+        )
+        bound = kernel._bind_isolated((x,))
+        scalar = bound.to_code(_config("scalar", vector=vector))
+        generated = bound.to_code(_config("bounded_layout", vector=vector))
+    functions = {
+        node.name: node
+        for node in ast.parse(generated).body
+        if isinstance(node, ast.FunctionDef)
+    }
+    original = next(
+        node
+        for node in ast.parse(scalar).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_helion_row_softmax"
+    )
+    assert ast.dump(original) == ast.dump(functions["_helion_row_softmax"])
+    assert _count_fmas(original.body) >= 2
+    assert _count_fmas(functions["_helion_row_softmax_bounded"].body) >= 2
+    assert ("cute.arch.load(" in scalar) is aligned
+    assert ("cute.arch.load(" in generated) is aligned

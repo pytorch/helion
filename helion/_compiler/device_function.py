@@ -51,6 +51,7 @@ from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
@@ -1044,7 +1045,9 @@ class DeviceFunction:
             )
         ]
 
-    def codegen_function_def(self) -> list[ast.stmt]:
+    def codegen_function_def(
+        self, *, bounded_cache_request: BoundedCacheRequest | None = None
+    ) -> list[ast.stmt]:
         prefix = []
         if self._tensor_descriptor_args:
             prefix.append(
@@ -1240,6 +1243,19 @@ class DeviceFunction:
                 )
                 for block_id in env.config_spec.cute_reduction_reloads.valid_block_ids()
             }
+            if bounded_cache_request is not None:
+                kernel_body = bounded_cache_request.prepare(
+                    kernel_body,
+                    self,
+                    param_args,
+                    constexpr_values,
+                    tensor_dtypes,
+                    proven_disjoint_tensor_pairs,
+                )
+                if bounded_cache_request.plan is not None:
+                    exact_thread_block_dims = bounded_cache_request.plan.launch_block
+                    thread_block_dims = exact_thread_block_dims
+                    thread_block_dims_are_exact = True
             if exact_thread_block_dims is not None:
                 kernel_body = fuse_two_pass_loads(
                     kernel_body,
@@ -1289,9 +1305,20 @@ class DeviceFunction:
                 )
             from .cute.affine_vector_io import vectorize_affine_tile_lanes
 
-            kernel_body = vectorize_affine_tile_lanes(
-                kernel_body, self, constexpr_values
-            )
+            if bounded_cache_request is not None:
+                kernel_body, private_fragments = bounded_cache_request.cache(
+                    kernel_body, constexpr_values, rename_groups
+                )
+                kernel_body = vectorize_affine_tile_lanes(
+                    kernel_body,
+                    self,
+                    constexpr_values,
+                    private_fragments=private_fragments,
+                )
+            else:
+                kernel_body = vectorize_affine_tile_lanes(
+                    kernel_body, self, constexpr_values
+                )
             # Merge adjacent constexpr V-loops that share an identical
             # statement prefix.  Caches the last common per-V-lane value
             # into a register fragment so V-loop 2's bitcast/cast chain
@@ -1666,6 +1693,8 @@ class DeviceFunction:
             from .cute.hoist_warp_reduce import validate_cluster_reduce_placement
 
             validate_cluster_reduce_placement(kernel_body, constexpr_values)
+            if bounded_cache_request is not None:
+                kernel_body = bounded_cache_request.finalize(kernel_body)
             from .cute.full_tile_bounds import lower_full_tile_bounds
 
             kernel_body = lower_full_tile_bounds(
@@ -1709,6 +1738,17 @@ class DeviceFunction:
             # loop-carried alias, before changing the SDK's Boolean tree shape.
             definition.body = reassociate_boolean_guards(definition.body)
         result = [*prefix, definition]
+        if (
+            CompileEnvironment.current().backend.name == "cute"
+            and self.cute_state.resident_reduction_layouts
+        ):
+            # These imported device helpers are absent from generated source.
+            # Persist their dependency with this kernel through source reload.
+            result.append(
+                statement_from_string(
+                    f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
+                )
+            )
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:
             # The CuTe launcher reads this attribute to launch the kernel

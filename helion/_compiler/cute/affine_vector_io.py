@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from ..device_function import DeviceFunction
+    from .bounded_loop_cache import OwnedFragment
 
 _LANE = re.compile(r"vec_lane_(\d+)")
 _CASTS = frozenset(
@@ -1102,6 +1103,7 @@ def vectorize_affine_tile_lanes(
     device_function: DeviceFunction,
     constexpr_values: dict[str, int],
     *,
+    private_fragments: tuple[OwnedFragment, ...] = (),
     register_accesses: frozenset[str] = frozenset(),
     integer_names: frozenset[str] = frozenset(),
 ) -> list[ast.stmt]:
@@ -1196,6 +1198,10 @@ def vectorize_affine_tile_lanes(
             torch.uint64,
         )
     }
+    if private_fragments:
+        from .bounded_loop_cache import private_fragment_accesses
+
+        private_accesses = private_fragment_accesses(body, private_fragments)
     vectorizer = _Vectorizer(
         body,
         strides=strides,

@@ -2357,9 +2357,11 @@ def _cute_disk_cache_key(
         "Sequence[dict[str, object]]",
         getattr(cute_kernel, "_helion_cute_wrapper_plans", ()),
     )
-    helper_sources = wrapper_source_dependencies(
-        cast("str", plan.get("kind", "")) for plan in plans
+    helper_kinds = [cast("str", plan.get("kind", "")) for plan in plans]
+    helper_kinds.extend(
+        cast("Sequence[str]", getattr(cute_kernel, "_helion_cute_helper_kinds", ()))
     )
+    helper_sources = wrapper_source_dependencies(helper_kinds)
     if helper_sources is None:
         return None
     try:
