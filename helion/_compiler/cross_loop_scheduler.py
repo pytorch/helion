@@ -2302,6 +2302,30 @@ def _build_readiness_events(
             )
             covered_obligations.update(relation_points)
         else:
+            supported_indices = tuple(
+                index
+                for index, producer in enumerate(event_producers)
+                if _supports_readiness_counter_lowering(producer)
+            )
+            unsupported_indices: tuple[int, ...] = ()
+            if consumer_rank_relation is None and 0 < len(supported_indices) < len(
+                event_producers
+            ):
+                # An unsupported arm must not erase independent keyed readiness.
+                supported = frozenset(supported_indices)
+                unsupported_indices = tuple(
+                    index
+                    for index in range(len(event_producers))
+                    if index not in supported
+                )
+                event_producers = [
+                    event_producers[index] for index in supported_indices
+                ]
+                covered_obligations = {
+                    obligation
+                    for index in supported_indices
+                    for obligation in merged_relations[index][2]
+                }
             _record_readiness_event(
                 pending_events,
                 readiness_key_domain=readiness_key_domain,
@@ -2317,6 +2341,14 @@ def _build_readiness_events(
                     ),
                 ),
             )
+            if unsupported_indices:
+                add_producer_key_events(
+                    consumer_root=consumer_root,
+                    consumer_site_id=consumer_site_id,
+                    relations=[
+                        merged_relations[index] for index in unsupported_indices
+                    ],
+                )
             continue
 
         add_producer_key_events(

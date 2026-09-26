@@ -398,6 +398,50 @@ def _configured_readiness_graph(
     )
 
 
+_MIXED_EVENT_GEOMETRY = {
+    10: (1, 1),
+    20: (8, 16),
+    30: (16, 8),
+    40: (8, 16),
+}
+
+
+def _mixed_broadcast_and_keyed_graph(
+    rank_relation: CoordinateRelation | None = None,
+) -> TileDependencyGraph:
+    broadcast_load = dataclasses.replace(
+        _access(root=3, kind="load", block_id=40),
+        subscript_affine_block_ids=(None,),
+        subscript_offsets=(0,),
+        subscript_is_scalar=(True,),
+        subscript_static_extents=(1,),
+    )
+    graph = _dependency_graph(
+        [[10], [20], [30], [40]],
+        _access(root=0, kind="store", block_id=10),
+        broadcast_load,
+        _access(root=1, allocation_id=1, kind="store", block_id=20),
+        _access(root=3, allocation_id=1, kind="load", block_id=40),
+        _access(root=2, allocation_id=2, kind="store", block_id=30),
+        _access(root=3, allocation_id=2, kind="load", block_id=40),
+    )
+    if rank_relation is None:
+        return graph
+    return dataclasses.replace(
+        graph,
+        edges=tuple(
+            dataclasses.replace(
+                edge,
+                access_dependencies=tuple(
+                    dataclasses.replace(dependency, rank_relation=rank_relation)
+                    for dependency in edge.access_dependencies
+                ),
+            )
+            for edge in graph.edges
+        ),
+    )
+
+
 class TestCrossLoopScheduler(TestCase):
     def test_rank_disjoint_dependency_needs_no_readiness_event(self) -> None:
         ranks = CoordinateDomain.scalar(2, kind="value", identity=0)
@@ -475,6 +519,95 @@ class TestCrossLoopScheduler(TestCase):
                 readiness_counters=(
                     ReadinessCounterPlan(event.producers, event.consumers),
                 ),
+            )
+
+    def test_mixed_local_event_preserves_keyed_readiness(self) -> None:
+        graph = _mixed_broadcast_and_keyed_graph()
+        readiness = _configured_readiness_graph(graph, _MIXED_EVENT_GEOMETRY)
+        events = {
+            tuple(producer.producer_root for producer in event.producers): event
+            for event in readiness.events
+        }
+
+        self.assertEqual(len(readiness.events), 2)
+        self.assertEqual(set(events), {(0,), (1, 2)})
+        broadcast_obligations = events[(0,)].consumers[0].covered_obligations
+        keyed_obligations = events[(1, 2)].consumers[0].covered_obligations
+        obligations_by_pair = dict(graph.obligations_by_root_pair())
+        expected_broadcast = obligations_by_pair[(0, 3)]
+        expected_keyed = obligations_by_pair[(1, 3)] | obligations_by_pair[(2, 3)]
+        self.assertEqual(broadcast_obligations, expected_broadcast)
+        self.assertEqual(
+            keyed_obligations,
+            expected_keyed,
+        )
+        self.assertTrue(broadcast_obligations.isdisjoint(keyed_obligations))
+        manifest = frozenset(
+            obligation
+            for _pair, obligations in graph.obligations_by_root_pair()
+            for obligation in obligations
+        )
+        self.assertEqual(broadcast_obligations | keyed_obligations, manifest)
+
+        for mode in ("static", "dynamic"):
+            with self.subTest(mode=mode):
+                plan = build_static_pipeline_plan(
+                    dependency_graph=graph,
+                    root_task_orders=tuple(
+                        _dense(root) for root in readiness.root_domains
+                    ),
+                    site_domains=(),
+                    worker_count=4,
+                    cross_loop_dispatch_mode=mode,
+                )
+                self.assertEqual(plan.root_barrier_edges, frozenset(((0, 3),)))
+                self.assertEqual(len(plan.readiness_counters), 1)
+                (counter,) = plan.readiness_counters
+                self.assertEqual(
+                    tuple(producer.producer_root for producer in counter.producers),
+                    (1, 2),
+                )
+                self.assertEqual(counter.uniform_arrival_count(), 3)
+                self.assertIsNone(counter.continuation_consumer_index)
+                self.assertEqual(
+                    counter.consumers[0].covered_obligations,
+                    keyed_obligations,
+                )
+
+    def test_mixed_distributed_event_is_not_partially_split(self) -> None:
+        ranks = CoordinateDomain.scalar(4, kind="value", identity=0)
+        graph = _mixed_broadcast_and_keyed_graph(CoordinateRelation.total(ranks, ranks))
+        readiness = _configured_readiness_graph(graph, _MIXED_EVENT_GEOMETRY)
+
+        self.assertEqual(len(readiness.events), 1)
+        (event,) = readiness.events
+        self.assertEqual(
+            tuple(producer.producer_root for producer in event.producers),
+            (0, 1, 2),
+        )
+        self.assertTrue(
+            all(consumer.rank_relation is not None for consumer in event.consumers)
+        )
+        manifest = frozenset(
+            obligation
+            for _pair, obligations in graph.obligations_by_root_pair()
+            for obligation in obligations
+        )
+        self.assertEqual(readiness.distributed_obligations, manifest)
+        counters = choose_readiness_counters(
+            readiness,
+            (),
+            charge=cross_loop_scheduler._new_relation_work_budget(),
+        )
+        self.assertEqual(counters, ())
+        with self.assertRaisesRegex(
+            exc.CrossLoopSchedulingError,
+            "distributed dependencies require exact readiness counters",
+        ):
+            cross_loop_scheduler._finalize_emitted_synchronization(
+                readiness_graph=readiness,
+                obligations_by_root_pair=graph.obligations_by_root_pair(),
+                readiness_counters=counters,
             )
 
     def test_all_rank_union_canonicalizes_only_complete_peer_set(self) -> None:
