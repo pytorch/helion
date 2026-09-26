@@ -379,6 +379,16 @@ class Backend(abc.ABC):
         """Maximum user-visible loop chunk for a rolled reduction."""
         return self.max_reduction_threads()
 
+    def allow_wide_persistent_reduction(self) -> bool:
+        """Whether the backend supports reduction_loops=[N] (chunk == row size).
+
+        When True, ReductionLoopSpec._normalize preserves chunk >= size_hint
+        rather than collapsing to None.  This lets a single-iteration looped
+        strategy act as a persistent kernel while keeping the constexpr_range
+        register-caching path (in_local[] across reduce+normalize passes).
+        """
+        return False
+
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]
     ) -> int:
@@ -399,6 +409,21 @@ class Backend(abc.ABC):
         Other backends return False and use a constexpr kernel param.
         """
         return False
+
+    def record_reduction_loop_meta(
+        self,
+        state: object,
+        block_index: int,
+        numel: object,
+        device_loop_state: object,
+    ) -> None:
+        """Record per-block reduction-loop metadata after the device loop is built.
+
+        FlyDSL uses this to stash (chunk, num_tiles, outer_prefix) on the device
+        function so its load codegen can emit per-tile register-slot arrays when
+        the constexpr-range path is active. No-op by default.
+        """
+        return
 
     def create_synthetic_reduction_lanes(
         self,

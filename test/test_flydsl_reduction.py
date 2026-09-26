@@ -340,6 +340,145 @@ class TestFlydslReduction(TestCase):
         out = bk.compile_config(cfg)(x)
         torch.testing.assert_close(out, x.float().sum(-1), rtol=1e-3, atol=1e-3)
 
+    def test_constexpr_range_emits_and_correct(self) -> None:
+        # constexpr_range=True with a small tile count (N=1024, chunk=256 -> 4
+        # tiles <= 16) unrolls the reduction loop into range_constexpr, enabling
+        # in_local[] register caching (2-read HBM). Assert the unrolled form IS
+        # emitted AND the result is still correct (checked inside _rms).
+        code = self._rms(
+            8,
+            1024,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[256],
+            constexpr_range=True,
+        )
+        self.assertIn("range_constexpr(0, 1024", code)
+        self.assertNotIn("range(0, 1024", code)
+
+    def test_constexpr_softmax_correct(self) -> None:
+        # Whole-row softmax under constexpr_range (register-cached passes).
+        code = self._softmax(
+            8,
+            1024,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[256],
+            constexpr_range=True,
+        )
+        self.assertIn("range_constexpr(0, 1024", code)
+
+    def test_constexpr_large_tile_count_falls_back(self) -> None:
+        # constexpr_range=True but tile count > 16 (N=16384, chunk=256 -> 64
+        # tiles) must fall back to the runtime scf.for (unrolling 64 tiles would
+        # blow up VGPRs), so range_constexpr is NOT emitted.
+        code = self._rms(
+            8,
+            16384,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[256],
+            constexpr_range=True,
+        )
+        self.assertNotIn("range_constexpr(0, 16384", code)
+        self.assertIn("range(0, 16384", code)
+
+    def test_autotune_offers_constexpr(self) -> None:
+        # autotune on a small-N rms_norm reaches the constexpr_range=True
+        # candidates without crashing and returns a valid, correct config.
+        x = torch.randn(8, 1024, device=DEVICE, dtype=torch.float16)
+        w = torch.randn(1024, device=DEVICE, dtype=torch.float16)
+        bk = rms_norm_fwd.bind((x, w, 1e-5))
+        cfg = bk.autotune((x, w, 1e-5), force=True)
+        self.assertIn("block_sizes", cfg.config)
+        out, _ = bk.compile_config(cfg)(x, w, 1e-5)
+        torch.testing.assert_close(
+            out.float(), ref_rms(x, w).float(), rtol=1e-2, atol=1e-2
+        )
+
+    def test_persistent_single_pass_emits_and_correct(self) -> None:
+        # reduction_loops=[N] with constexpr_range=True: chunk equals the row
+        # size, so the reduction loop has one iteration.  The in_local[] path
+        # caches the whole row in registers across reduce+normalize — zero second
+        # HBM read.  N=4096, V=8 -> thread_count = 4096/8 = 512 (W=8).
+        # ReductionLoopSpec._normalize must NOT collapse chunk=N to None
+        # (allow_wide_persistent_reduction=True on FlyDSL).
+        code = self._rms(
+            8,
+            4096,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[4096],
+            cute_vector_widths=[8],
+            constexpr_range=True,
+        )
+        # Single-iteration range_constexpr — step == chunk == N.
+        self.assertIn("range_constexpr(0, 4096, 4096)", code)
+        # Must not fall back to runtime scf.for.
+        self.assertNotIn("range(0, 4096", code)
+        # 512 threads = N / V = 4096 / 8.
+        self.assertIn("_num_threads=512", code)
+
+    def test_persistent_single_pass_normalization_preserves_chunk(self) -> None:
+        # Verify that ReductionLoopSpec._normalize does NOT collapse chunk=N to
+        # None for FlyDSL (allow_wide_persistent_reduction=True).  If it did,
+        # reduction_loops=[4096] would silently become persistent (None) and the
+        # looped single-iteration path would never be reached.
+        # We confirm normalization is correct by checking the generated code
+        # uses range_constexpr (looped path) rather than a persistent no-loop.
+        code = self._rms(
+            8,
+            4096,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[4096],
+            cute_vector_widths=[8],
+            constexpr_range=True,
+        )
+        # If normalization collapsed chunk=N to None, the kernel would be
+        # persistent (no range_constexpr, 64 threads only).  Looped path wins.
+        self.assertIn("range_constexpr(0, 4096, 4096)", code)
+        self.assertNotIn("range(0, 4096", code)
+
+    def test_nonpot_constexpr_range_correct(self) -> None:
+        # N=20000 is non-power-of-two.  chunk=4096, V=8 → 5 tiles, W=8 warps.
+        # Last tile (roffset=16384) covers columns 16384..19999 — only 3616 of
+        # 4096 elements are valid.  rolled_col_pred masks the tail; full tiles
+        # use const_expr(roffset + chunk <= N) to elide the predicate.
+        # Correctness proves both the tail masking and the full-tile fast path.
+        code = self._rms(
+            8,
+            20000,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[4096],
+            cute_vector_widths=[8],
+            constexpr_range=True,
+        )
+        self.assertIn("range_constexpr(0, 20000, 4096)", code)
+        self.assertNotIn("range(0, 20000", code)
+        # W=8: thread_count = 4096 / 8 = 512.
+        self.assertIn("_num_threads=512", code)
+        # Full tiles elide the select; only the tail tile has it.
+        self.assertIn("const_expr(", code)
+
+    def test_nonpot_tail_one_element(self) -> None:
+        # N=4097: one element past a full chunk (chunk=4096, V=4, W=1).
+        # Tile 0 (roffset=0): full, 4096 elements — no select().
+        # Tile 1 (roffset=4096): 1 valid element, 1023 OOB — select() masks.
+        # Verifies the extreme boundary case of the tail predicate.
+        code = self._rms(
+            8,
+            4097,
+            torch.float16,
+            block_sizes=[1],
+            reduction_loops=[4096],
+            cute_vector_widths=[4],
+            constexpr_range=True,
+        )
+        self.assertIn("range_constexpr(0, 4097, 4096)", code)
+        self.assertNotIn("range(0, 4097", code)
+
 
 if __name__ == "__main__":
     import unittest

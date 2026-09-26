@@ -1821,7 +1821,7 @@ class LoopedReductionStrategy(ReductionStrategy):
         tracker = ThreadAxisTracker()
         if self._thread_count > 0:
             tracker.record(block_index, self._get_thread_axis(), self._thread_count)
-        return DeviceLoopState(
+        device_loop_state = DeviceLoopState(
             self,
             for_node=for_node,
             inner_statements=inner_body,
@@ -1829,6 +1829,15 @@ class LoopedReductionStrategy(ReductionStrategy):
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
         )
+
+        # Register-slot metadata for in_local[] register caching. Backends that
+        # cache reduction loads across passes (FlyDSL) record their per-block loop
+        # geometry here; the default is a no-op.
+        env.backend.record_reduction_loop_meta(
+            state, block_index, numel, device_loop_state
+        )
+
+        return device_loop_state
 
     def codegen_reduction(
         self,
