@@ -159,6 +159,44 @@ def ref_gdn_fwd_h(
 # %%
 # Testing Function
 # -------------
+def _make_orthonormal_w(
+    batch: int,
+    seqlen: int,
+    nheads: int,
+    chunk_size: int,
+    dhead: int,
+    device: torch.device,
+) -> torch.Tensor:
+    shape = (batch, seqlen // chunk_size, chunk_size, nheads, dhead)
+    if device.type == "tpu":
+        # TODO(tcombes): Use the randomized SVD path once torch.linalg.svd supports TPU.
+        positions = torch.arange(chunk_size, dtype=torch.float32) + 0.5
+        frequencies = torch.arange(dhead, dtype=torch.float32)
+        frame = torch.cos(math.pi / chunk_size * positions[:, None] * frequencies)
+        frame[:, 0] /= math.sqrt(chunk_size)
+        frame[:, 1:] *= math.sqrt(2 / chunk_size)
+        signs = torch.randint(
+            0,
+            2,
+            (batch, seqlen // chunk_size, 1, nheads, dhead),
+            dtype=torch.int32,
+        )
+        return (
+            (frame[None, None, :, None, :] * (signs * 2 - 1))
+            .reshape(batch, seqlen, nheads, dhead)
+            .to(device=device, dtype=torch.bfloat16)
+        )
+
+    w = torch.randn(*shape, dtype=torch.float32, device=device)
+    wu, _, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
+    return (
+        torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
+        .permute(0, 1, 3, 2, 4)
+        .reshape(batch, seqlen, nheads, dhead)
+        .to(torch.bfloat16)
+    )
+
+
 def test(
     batch: int,
     nheads: int,
@@ -170,23 +208,7 @@ def test(
 ) -> None:
     k = torch.randn(batch, seqlen, nheads, dhead, dtype=torch.bfloat16, device=DEVICE)
     k = torch.nn.functional.rms_norm(k, [dhead])
-    w = torch.randn(
-        batch,
-        seqlen // chunk_size,
-        chunk_size,
-        nheads,
-        dhead,
-        dtype=torch.float32,
-        device=DEVICE,
-    )
-    # w = torch.nn.functional.rms_norm(w.to(torch.bfloat16), (dhead,))
-    wu, ws, wv = torch.linalg.svd(w.permute(0, 1, 3, 2, 4), full_matrices=False)
-    w = torch.einsum("bnhik,bnhkj->bnhij", wu, wv)
-    w = (
-        w.permute(0, 1, 3, 2, 4)
-        .reshape(batch, seqlen, nheads, dhead)
-        .to(torch.bfloat16)
-    )
+    w = _make_orthonormal_w(batch, seqlen, nheads, chunk_size, dhead, DEVICE)
     u = torch.randn(batch, seqlen, nheads, dstate, dtype=torch.bfloat16, device=DEVICE)
     u = torch.nn.functional.rms_norm(u, [dstate])
     g = torch.cumsum(
