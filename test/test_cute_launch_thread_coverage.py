@@ -48,6 +48,8 @@ def _selected_config() -> helion.Config:
         cute_collective_native_seeded=True,
         cute_collective_stages=4,
         cute_collective_copy="scalar",
+        cute_gathered_mma_n=256,
+        cute_gathered_mma_stages=3,
     )
 
 

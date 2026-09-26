@@ -790,6 +790,7 @@ def _region_write_roots(
     identity: int | set[int],
     *,
     emitted_statement_ids: set[int] | None = None,
+    allow_relaxed_atomics: bool = True,
 ) -> set[str] | None:
     """Prove the effects of the region across which staging moves.
 
@@ -798,6 +799,8 @@ def _region_write_roots(
     root. An unused relaxed atomic add is a read/write of its output root;
     the caller must prove that root disjoint from operands and control reads.
     Other atomics, barriers, opaque calls, and write forms refuse staging.
+    Whole-region replacements that preserve only stores must disable relaxed
+    atomics, since knowing their write root does not preserve their effect.
     """
     roots: set[str] = set()
     identities = {identity} if isinstance(identity, int) else identity
@@ -819,7 +822,8 @@ def _region_write_roots(
         if isinstance(statement, ast.Expr):
             value = statement.value
             if (
-                isinstance(value, ast.Call)
+                allow_relaxed_atomics
+                and isinstance(value, ast.Call)
                 and (root := _relaxed_atomic_add_root(value)) is not None
             ):
                 roots.add(root)
@@ -2153,11 +2157,24 @@ def lower_collective_matmul(
             rename_groups=rename_groups,
         )
     if not df.cute_state.collective_mma_sites:
+        if df.config.get("cute_collective_compute", "warp") == "tma_gather":
+            raise exc.BackendUnsupported(
+                "cute", "gathered MMA requires an admitted collective contraction"
+            )
         return body
     # Phi names must be canonical before reduction live-out analysis. This is
     # the same final renaming already applied to the generated function.
     module = ast.Module(body=body, type_ignores=[])
     ast_rename(module, rename_groups)
+    if df.config.get("cute_collective_compute", "warp") == "tma_gather":
+        from .gathered_mma_lowering import lower_gathered_matmul
+
+        return lower_gathered_matmul(
+            body,
+            df,
+            boundary_names=boundary_names,
+            disjoint_pairs=disjoint_pairs,
+        )
     tmem_resource = None
     occupied = _bound_names(module) | boundary_names
     native_sites = [

@@ -1213,6 +1213,8 @@ class CuteBackend(Backend):
             or key == "cute_collective_native_seeded"
             or key == "cute_collective_tmem_seed"
             or key == "cute_collective_tmem_a"
+            or key == "cute_gathered_mma_n"
+            or key == "cute_gathered_mma_stages"
             or key == "cute_proven_bounds"
             or key == "cute_rng_packet"
             or key == "cute_independent_reduction"
