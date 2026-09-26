@@ -1619,6 +1619,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         )
 
     def _tcgen05_output_tile_dims_expr(self, *, is_device: bool) -> list[str]:
+        plan = self._tcgen05_plan()
+        if plan is not None and plan.row_union is not None:
+            union = plan.row_union
+            if union.schedule is not None:
+                rows = (
+                    (union.m + plan.bn - 1) // plan.bn
+                    if union.linear_record_clc
+                    else union.m // plan.bn
+                )
+                return [str(union.n // plan.bm), str(rows), "1"]
+            return [str(union.m // plan.bm), str(union.n // plan.bn), "1"]
         assert len(self.pid_info) <= 3, (
             "tcgen05 persistent scheduler supports at most 3 PID dimensions"
         )
@@ -1757,7 +1768,21 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         cluster_m = self._tcgen05_cluster_m()
         cluster_n = self._tcgen05_cluster_n()
         if cluster_m * cluster_n == 1:
+            plan = self._tcgen05_plan()
+            if (
+                plan is not None
+                and plan.row_union is not None
+                and plan.row_union.resident_ctas != 1
+            ):
+                return f"({self.grid_size_expr}) * {plan.row_union.resident_ctas}"
             return self.grid_size_expr
+        plan = self._tcgen05_plan()
+        if (
+            plan is not None
+            and plan.row_union is not None
+            and plan.row_union.schedule is not None
+        ):
+            return f"max(1, ({self.grid_size_expr}) // {cluster_m * cluster_n})"
         return f"max(1, ({self.grid_size_expr}) // {cluster_m})"
 
     def _tcgen05_grid_work_clusters_expr(self, total_clusters: str) -> str:
@@ -1813,6 +1838,11 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return coord
 
     def _tcgen05_linear_virtual_pid_expr(self, work_tile_var: str) -> str:
+        plan = self._tcgen05_plan()
+        if plan is not None and plan.row_union is not None:
+            return self._tcgen05_linear_virtual_pid_from_coords_expr(
+                [f"{work_tile_var}.tile_idx[{i}]" for i in range(3)]
+            )
         terms: list[str] = []
         for i, _pid in enumerate(self.pid_info):
             coord = f"{work_tile_var}.tile_idx[{i}]"
@@ -1826,10 +1856,46 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         return " + ".join(terms) if terms else "cutlass.Int32(0)"
 
     def _tcgen05_linear_virtual_pid_from_coords_expr(self, coords: list[str]) -> str:
+        plan = self._tcgen05_plan()
+        if plan is not None and plan.row_union is not None:
+            union = plan.row_union
+            if union.linear_record_clc:
+                # This profile launches one complete cluster per linear record.
+                # CLC returns that same z coordinate; physical rows are the
+                # fast axis, independently of the source PID decomposition.
+                assert union.schedule is not None
+                if [pid.block_id for pid in self.pid_info] == [
+                    union.group_block_id,
+                    union.m_block_id,
+                    union.n_block_id,
+                ]:
+                    return f"({coords[2]}) * cutlass.Int32({union.groups})"
+                row, column = union.schedule.record_coordinates(coords[2], union.m)
+                coords = [
+                    f"({column}) * cutlass.Int32({plan.cluster_m})",
+                    row,
+                    "cutlass.Int32(0)",
+                ]
+            by_block = {
+                union.group_block_id: "cutlass.Int32(0)",
+                union.m_block_id: coords[0],
+                union.n_block_id: coords[1],
+            }
+            if union.schedule is not None:
+                by_block[union.m_block_id] = coords[1]
+                by_block[union.n_block_id] = self._tcgen05_logical_m_coord_expr(
+                    coords[0]
+                )
+            assert {pid.block_id for pid in self.pid_info} == set(by_block)
+            coords = [by_block[pid.block_id] for pid in self.pid_info]
         terms: list[str] = []
         for i, coord in enumerate(coords[: len(self.pid_info)]):
             if i == 0:
-                terms.append(self._tcgen05_logical_m_coord_expr(coord))
+                terms.append(
+                    coord
+                    if plan is not None and plan.row_union is not None
+                    else self._tcgen05_logical_m_coord_expr(coord)
+                )
                 continue
             stride = " * ".join(
                 f"({pid.num_pids_expr(is_device=True)})" for pid in self.pid_info[:i]
@@ -2874,8 +2940,6 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string(
                     f"{sched_pipeline}.consumer_wait({sched_consumer_state})"
                 ),
-                statement_from_string("cute.arch.fence_view_async_shared()"),
-                statement_from_string("cute.arch.sync_warp()"),
             ]
             work_tile_release: list[ast.stmt] = [
                 statement_from_string(
@@ -3073,13 +3137,22 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 )
             )
         prelude.append(statement_from_string("cute.arch.sync_threads()"))
+        if layout.cluster_m > 1:
+            # Only the elected thread waits on the remote transaction, but
+            # every mailbox reader crosses the async/shared proxy boundary.
+            prelude.append(statement_from_string("cute.arch.fence_view_async_shared()"))
         prelude.extend(layout.refresh_work_tile_stmts)
         if layout.cluster_m > 1:
-            prelude.append(
-                self._tcgen05_scheduler_if(
-                    layout.consumer_leader_var,
-                    list(layout.work_tile_release_stmts),
-                )
+            # There is one release per CTA. Finish all readers, including the
+            # terminal valid flag, before that arrival permits stage reuse.
+            prelude.extend(
+                [
+                    statement_from_string("cute.arch.sync_threads()"),
+                    self._tcgen05_scheduler_if(
+                        layout.consumer_leader_var,
+                        list(layout.work_tile_release_stmts),
+                    ),
+                ]
             )
         return prelude
 
@@ -3138,12 +3211,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         ``while`` after any role-local mainloop work. Passing ``False``
         is reserved for the later fully role-local shape where no
         role-local warp reaches the shared loop and the remaining work
-        has a replacement non-CTA synchronization scheme.
+        has a replacement non-CTA synchronization scheme. The clustered
+        mailbox bridge requires CTA-wide read completion and rejects this
+        option until such a replacement protocol is implemented.
 
         See :meth:`_build_tcgen05_persistent_tile_body_role_local` for
         the role-local-while consumer that lifts non-shared role blocks
         into sibling ``while`` loops.
         """
+        if layout.cluster_m > 1 and not emit_block_wide_sync:
+            raise exc.InvalidConfig(
+                "Clustered scheduler mailbox refresh requires CTA-wide synchronization"
+            )
         body: list[ast.stmt] = [
             statement_from_string(f"{self.virtual_pid_var} = {layout.linear_pid_expr}"),
         ]
@@ -3175,13 +3254,18 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         if emit_block_wide_sync:
             body.append(statement_from_string("cute.arch.sync_threads()"))
+        if layout.cluster_m > 1:
+            body.append(statement_from_string("cute.arch.fence_view_async_shared()"))
         body.extend(layout.refresh_work_tile_stmts)
         if layout.cluster_m > 1:
-            body.append(
-                self._tcgen05_scheduler_if(
-                    layout.consumer_leader_var,
-                    list(layout.work_tile_release_stmts),
-                )
+            body.extend(
+                [
+                    statement_from_string("cute.arch.sync_threads()"),
+                    self._tcgen05_scheduler_if(
+                        layout.consumer_leader_var,
+                        list(layout.work_tile_release_stmts),
+                    ),
+                ]
             )
         return body
 
@@ -3688,6 +3772,20 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         assert runtime_table or scheduler_mailbox
         assert (layout is not None) == uses_pipeline
 
+        local_full = (
+            grouped.full_coverage
+            if grouped.full_coverage is not None
+            and grouped.full_coverage.consumer_local
+            else None
+        )
+        dense_index: str | None = None
+        dense_step: str | None = None
+        dense_initializers: list[ast.stmt] = []
+        if local_full is not None:
+            assert scheduler_mailbox and not runtime_table and not plan.is_two_cta
+            dense_index = device_function.new_var(f"{scheduler_var_prefix}_dense_index")
+            dense_step = device_function.new_var(f"{scheduler_var_prefix}_dense_step")
+
         linear_idx: str | None = None
         grid_stride: str | None = None
         records = grouped.runtime_tile_records
@@ -3783,7 +3881,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 initialize_tile_counter=initialize_tile_counter,
             )
         )
-        if uses_pipeline:
+        if uses_pipeline and local_full is None:
             prelude.extend(consumer_wait_block())
 
         epi_role = role_block.role_predicate == self._tcgen05_epi_role_predicate()
@@ -3899,13 +3997,88 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     derived_metadata_stmts, role_reads
                 )
             )
-            metadata_stmts.extend(
+            mailbox_loads = [
                 statement_from_string(f"{name} = {slot(field)}")
                 for name, field in mailbox_fields
                 if name in required_metadata_names
-            )
+            ]
+            if local_full is None:
+                metadata_stmts.extend(mailbox_loads)
+            else:
+                assert dense_index is not None
+                row, column = local_full.tile_coordinates(dense_index)
+                dense_values = {
+                    _TCGEN05_GROUPED_SELECTED_MAILBOX_CTA_M: row,
+                    _TCGEN05_GROUPED_SELECTED_MAILBOX_CTA_N: column,
+                    _TCGEN05_GROUPED_SELECTED_MAILBOX_METADATA_IDX: "cutlass.Int32(0)",
+                    _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_M: f"cutlass.Int32({local_full.m})",
+                    _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_N: f"cutlass.Int32({local_full.n})",
+                    _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K: f"cutlass.Int32({local_full.k})",
+                    _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START: "cutlass.Int32(0)",
+                }
+                required_fields = [
+                    (name, field)
+                    for name, field in mailbox_fields
+                    if name in required_metadata_names
+                ]
+                assert all(field in dense_values for _name, field in required_fields)
+                # CuTe staging requires typed definitions outside the dynamic
+                # branch. Each is overwritten before its first per-tile use.
+                dense_initializers.extend(
+                    statement_from_string(f"{name} = cutlass.Int32(0)")
+                    for name, _field in required_fields
+                )
+                metadata_stmts.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(local_full.predicate),
+                        body=[
+                            statement_from_string(f"{name} = {dense_values[field]}")
+                            for name, field in required_fields
+                        ],
+                        orelse=mailbox_loads,
+                    )
+                )
             metadata_stmts.extend(derived_metadata_stmts)
-            metadata_stmts.extend(consumer_release_block())
+            if local_full is None:
+                metadata_stmts.extend(consumer_release_block())
+            else:
+                metadata_stmts.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(f"not {local_full.predicate}"),
+                        body=consumer_release_block(),
+                        orelse=[],
+                    )
+                )
+
+        if local_full is not None:
+            assert dense_index is not None and dense_step is not None
+            assert valid_var is not None
+            prelude.extend(
+                [
+                    statement_from_string(f"{dense_index} = cutlass.Int32(0)"),
+                    statement_from_string(f"{dense_step} = cutlass.Int32(0)"),
+                    statement_from_string(f"{valid_var} = cutlass.Boolean(False)"),
+                    *dense_initializers,
+                    create(
+                        ast.If,
+                        test=expr_from_string(local_full.predicate),
+                        body=[
+                            statement_from_string(
+                                f"{dense_index} = cutlass.Int32(cute.arch.block_idx()[2])"
+                            ),
+                            statement_from_string(
+                                f"{dense_step} = cutlass.Int32(cute.arch.grid_dim()[2])"
+                            ),
+                            statement_from_string(
+                                f"{valid_var} = {dense_index} < cutlass.Int32({local_full.tiles})"
+                            ),
+                        ],
+                        orelse=consumer_wait_block(),
+                    ),
+                ]
+            )
 
         per_tile_body = [
             *metadata_stmts,
@@ -3919,7 +4092,25 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         if uses_pipeline:
             assert valid_var is not None
-            per_tile_body.extend(consumer_wait_block())
+            if local_full is None:
+                per_tile_body.extend(consumer_wait_block())
+            else:
+                assert dense_index is not None and dense_step is not None
+                per_tile_body.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(local_full.predicate),
+                        body=[
+                            statement_from_string(
+                                f"{dense_index} = {dense_index} + {dense_step}"
+                            ),
+                            statement_from_string(
+                                f"{valid_var} = {dense_index} < cutlass.Int32({local_full.tiles})"
+                            ),
+                        ],
+                        orelse=consumer_wait_block(),
+                    )
+                )
             loop_test = valid_var
         else:
             assert linear_idx is not None
@@ -3938,7 +4129,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             )
         )
         if uses_pipeline:
-            prelude.extend(consumer_release_block())
+            if local_full is None:
+                prelude.extend(consumer_release_block())
+            else:
+                prelude.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(f"not {local_full.predicate}"),
+                        body=consumer_release_block(),
+                        orelse=[],
+                    )
+                )
         return create(
             ast.If,
             test=expr_from_string(role_block.role_predicate),
@@ -4544,6 +4745,80 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             ),
         ]
 
+        if (
+            grouped.full_coverage is not None
+            and not grouped.full_coverage.consumer_local
+        ):
+            full = grouped.full_coverage
+            assert source_tile_m == full.tile_m and source_tile_n == full.tile_n
+            dense_index = device_function.new_var("tcgen05_grouped_dense_index")
+            dense_step = device_function.new_var("tcgen05_grouped_dense_step")
+            row, column = full.tile_coordinates(dense_index)
+            dense_values = {
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_CTA_M: row,
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_CTA_N: column,
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_VALID: "cutlass.Int32(1)",
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_METADATA_IDX: "cutlass.Int32(0)",
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_M: f"cutlass.Int32({full.m})",
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_N: f"cutlass.Int32({full.n})",
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_PROBLEM_K: f"cutlass.Int32({full.k})",
+                _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START: "cutlass.Int32(0)",
+            }
+            # The shared-RHS identity contraction consumes no group-id slot.
+            # Retain exactly the fields selected by the ordinary dependency proof.
+            assert all(field in dense_values for field, _value in mailbox_values)
+            dense = [
+                statement_from_string(
+                    f"{dense_index} = cutlass.Int32(cute.arch.block_idx()[2])"
+                ),
+                statement_from_string(
+                    f"{dense_step} = cutlass.Int32(cute.arch.grid_dim()[2])"
+                ),
+                create(
+                    ast.While,
+                    test=expr_from_string(
+                        f"{dense_index} < cutlass.Int32({full.tiles})"
+                    ),
+                    body=[
+                        create(
+                            ast.If,
+                            test=expr_from_string(leader_predicate),
+                            body=[
+                                statement_from_string(
+                                    f"{sched_pipeline}.producer_acquire({sched_producer_state})"
+                                ),
+                                *[
+                                    statement_from_string(
+                                        f"{slot(field)} = {dense_values[field]}"
+                                    )
+                                    for field, _value in mailbox_values
+                                ],
+                                statement_from_string(
+                                    f"{sched_pipeline}.producer_commit({sched_producer_state})"
+                                ),
+                            ],
+                            orelse=[],
+                        ),
+                        statement_from_string(
+                            emit_pipeline_advance(sched_producer_state)
+                        ),
+                        statement_from_string("cute.arch.sync_warp()"),
+                        statement_from_string(
+                            f"{dense_index} = {dense_index} + {dense_step}"
+                        ),
+                    ],
+                    orelse=[],
+                ),
+            ]
+            prelude = [
+                create(
+                    ast.If,
+                    test=expr_from_string(full.predicate),
+                    body=dense,
+                    orelse=prelude,
+                )
+            ]
+
         prelude.extend(
             [
                 create(
@@ -4567,6 +4842,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 statement_from_string("cute.arch.sync_warp()"),
             ]
         )
+        if grouped.full_coverage is not None and grouped.full_coverage.consumer_local:
+            # Dense consumers have no scheduler waiter, including at the final
+            # token. Keep the complete original producer/sentinel for fallback.
+            prelude = [
+                create(
+                    ast.If,
+                    test=expr_from_string(f"not {grouped.full_coverage.predicate}"),
+                    body=prelude,
+                    orelse=[],
+                )
+            ]
         return create(
             ast.If,
             test=expr_from_string(self._tcgen05_scheduler_role_predicate()),
@@ -4878,7 +5164,10 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         """
         plan = self._tcgen05_plan()
         assert plan is not None and plan.has_scheduler_warp and plan.is_clc_persistent
-        runtime_table_clc = self._tcgen05_uses_grouped_worklist_nm_runtime_clc()
+        row_union_clc = plan.row_union is not None and plan.row_union.linear_record_clc
+        linear_record_clc = (
+            self._tcgen05_uses_grouped_worklist_nm_runtime_clc() or row_union_clc
+        )
         sched_plan = self._tcgen05_sched_pipeline_plan()
         assert sched_plan is not None
         sched_pipeline = sched_plan.pipeline
@@ -4949,7 +5238,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         # returns Int32 for the valid flag. The CuTe DSL's while-region
         # type-checker rejects type changes between iterations.
         sched_var: str | None = None
-        if runtime_table_clc:
+        if linear_record_clc:
             clc_initial_block = [
                 # The runtime table has exactly one row per launched cluster.
                 # Keep the raw z CTAID as the record index; the x CTAID differs
@@ -5067,6 +5356,13 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     statement_from_string(f"{sched_peer_m} = {sched_peer_rank}")
                 ]
                 publish_bidy_expr = cluster_bidy_var
+            publish_bidx_expr = (
+                "cutlass.Int32(0)"
+                if row_union_clc
+                else f"{cluster_bidx_var} + {sched_peer_m}"
+            )
+            if row_union_clc:
+                publish_bidy_expr = "cutlass.Int32(0)"
             # Whole-warp prelude: every lane runs ``producer_acquire``
             # (mbarrier wait) and computes the warp-uniform barrier
             # pointer + lane id. Lanes ``cluster_size..31`` no-op past
@@ -5095,7 +5391,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                         ),
                         statement_from_string(
                             f"_cute_store_shared_remote_x4("
-                            f"{cluster_bidx_var} + {sched_peer_m}, "
+                            f"{publish_bidx_expr}, "
                             f"{publish_bidy_expr}, "
                             f"{cluster_bidz_var}, "
                             f"{valid_var}, "
@@ -5195,7 +5491,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             ),
             statement_from_string("cute.arch.fence_view_async_shared()"),
         ]
-        if runtime_table_clc:
+        if linear_record_clc:
             clc_query_block.extend(
                 [
                     statement_from_string(f"{cluster_bidx_var} = {bidx_var}"),
@@ -5608,44 +5904,15 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         bm_per_cta = bm // cluster_m if is_two_cta else bm
         tile_m_var = device_function.new_var("tcgen05_aux_tile_m")
         tile_n_var = device_function.new_var("tcgen05_aux_tile_n")
-        # Bring the L2-grouping PID-decomposition chain (the
-        # ``inner_2d_pid`` → ``pid_0`` / ``pid_1`` →
-        # ``tile_offset_0`` / ``tile_offset_1`` line) into this
-        # role-local while body so the producer's per-CTA aux
-        # GMEM tile aligns with the consumer's post-L2-remap
-        # logical tile coords. Without it the producer would
-        # build its per-CTA aux GMEM tile from the raw
-        # ``work_tile_smem`` coords (which equal the consumer's
-        # only under ``l2_groupings=[1]``); under
-        # ``l2_groupings=[g>1]`` the consumer's post-L2-remap
-        # ``pid_0`` / ``pid_1`` no longer equal ``work_tile_smem[0,1]``
-        # and the producer fetches a misaligned aux tile.
-        # ``_role_local_dependency_stmts`` walks the shared body
-        # backward from a synthetic read of ``tile_offset_0`` /
-        # ``tile_offset_1`` and returns the smallest set of
-        # statements that define them. The walker is the same
-        # one the consumer role-local whiles use; this keeps the
-        # producer and consumer in lockstep on whatever the
-        # L2-grouping decomposition emits.
-        #
-        # ``tile_offset_0`` / ``tile_offset_1`` are emitted
-        # unconditionally by the standard ``NDTileStrategy``
-        # decomposition (see ``tile_strategy.py:_strategy_codegen``
-        # — ``tile_offset_<i> = pid_<i> * BS`` is part of every
-        # tile body). They are therefore always present in
-        # ``shared_body_extracted`` for any real kernel binding,
-        # regardless of whether ``L2GroupingProgramIDs.codegen``
-        # wraps the strategy (l2_grp=[g>1]) or not (l2_grp=[1]
-        # passes the names through directly with the identity
-        # remap). The branch on ``has_post_l2_coords`` below is
-        # purely defensive — it preserves the pre-cycle-2i
-        # ``work_tile_smem`` fallback for the hypothetical case
-        # where a future strategy emits the role-local while
-        # without these names, so the cycle 2b correctness
-        # baseline at ``l2_grp=[1]`` cannot regress silently.
+        assert plan.output_offsets is not None
+        m_offset_var, n_offset_var = plan.output_offsets
+        # Extract the same post-remap coordinates used by the MMA and store
+        # roles. Block IDs need not start at zero (independent materialized
+        # regions have disjoint IDs), and launch order may interchange M/N.
+        # The matmul plan carries the actual names instead of assuming axes 0/1.
         synthetic_reads_for_l2 = [
             statement_from_string(
-                "_tcgen05_aux_l2_anchor = tile_offset_0 + tile_offset_1"
+                f"_tcgen05_aux_l2_anchor = {m_offset_var} + {n_offset_var}"
             )
         ]
         l2_dependency_stmts: list[ast.stmt] = []
@@ -5658,8 +5925,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             _, writes = _stmt_name_uses(stmt)
             l2_dependency_writes.update(writes)
         has_post_l2_coords = (
-            "tile_offset_0" in l2_dependency_writes
-            and "tile_offset_1" in l2_dependency_writes
+            m_offset_var in l2_dependency_writes
+            and n_offset_var in l2_dependency_writes
         )
         # ``peer_m`` is this CTA's rank along the M axis of the cluster:
         # ``block_idx_in_cluster() % cluster_m``. The modulo is load-bearing
@@ -5674,10 +5941,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             f"% cutlass.Int32({cluster_m}))"
         )
         if has_post_l2_coords:
-            # Post-L2 path. ``tile_offset_0 // bm`` is the
-            # post-L2-remap logical M tile index (== ``pid_0``
-            # in the decomposition emitted right above this
-            # body); ``tile_offset_1 // bn`` is ``pid_1``.
+            # These are logical matrix coordinates after the launch-order
+            # and L2-grouping remaps, in the same units as the consumer.
             #
             # Note that under ``cluster_n=1 + l2_groupings=[1]``
             # the post-L2 expression ``pid_0 * cluster_m +
@@ -5690,8 +5955,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # ``l2_grp=[g>1]`` because L2 remap is non-identity,
             # and under ``cluster_n=2`` because the raw
             # rank-in-cluster ≠ peer_m.
-            m_source = f"(tile_offset_0 // cutlass.Int32({bm}))"
-            n_source = f"(tile_offset_1 // cutlass.Int32({bn}))"
+            m_source = f"({m_offset_var} // cutlass.Int32({bm}))"
+            n_source = f"({n_offset_var} // cutlass.Int32({bn}))"
             if is_two_cta:
                 tile_m_expr = (
                     f"({m_source}) * cutlass.Int32({cluster_m}) + {peer_m_expr}"
@@ -5711,10 +5976,9 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                 tile_m_expr = m_source
             tile_n_expr = n_source
         else:
-            # Pre-cycle-2i raw scheduler coords. Unreachable in
-            # production today: ``tile_offset_0`` /
-            # ``tile_offset_1`` are emitted unconditionally by
-            # the standard ``NDTileStrategy`` decomposition,
+            # Raw scheduler coordinates are only valid for a decomposition
+            # that does not emit the requested output offset names. The
+            # standard NDTileStrategy always emits those names,
             # which runs for every real kernel binding
             # regardless of ``l2_groupings``. Purely defensive —
             # preserves the pre-cycle-2i correctness baseline
@@ -5768,8 +6032,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         aux_m_size = int(aux_shape[0])
         aux_n_size = int(aux_shape[1])
         if has_post_l2_coords:
-            aux_m_start_expr = "tile_offset_0"
-            aux_n_start_expr = "tile_offset_1"
+            aux_m_start_expr = m_offset_var
+            aux_n_start_expr = n_offset_var
         else:
             if is_two_cta:
                 aux_m_tile_expr = f"({sched_coord_0} // cutlass.Int32({cluster_m}))"
@@ -6453,7 +6717,16 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         assignment = cls._tcgen05_single_name_assignment(stmt)
         if assignment is not None:
             name, value = assignment
-            if name in allowed_coord_writes or name == "safe_group_id":
+            if (
+                name in allowed_coord_writes
+                or name == "safe_group_id"
+                or cls._tcgen05_numbered_name(name, "tile_begin")
+            ):
+                # The scalar tile-origin lowering may materialize a separate
+                # coordinate assignment before grouped role extraction. It
+                # is dependency-only like tile_offset: used definitions are
+                # cloned into their roles, and post-loop uses still retain
+                # the shared loop. Keep the same expression-effects proof.
                 return cls._tcgen05_expr_safe_to_omit(value)
             if name == "group_id":
                 return cls._tcgen05_expr_safe_to_omit(value) or (
@@ -6885,6 +7158,14 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
                     role_prelude_stmts = [
                         _clone_stmt(stmt) for stmt in epi_role_prelude_stmts
                     ]
+                if (
+                    predicate == self._tcgen05_tma_load_role_predicate()
+                    and cute_state.ab_startup_prefill is not None
+                ):
+                    assert role_prelude_stmts is None and not phase
+                    role_prelude_stmts = ast.parse(
+                        cute_state.ab_startup_prefill.role_prelude()
+                    ).body
                 suffix = f"_{phase}" if phase else ""
                 # Cycle-94 merge: build the store warp's aux producer body for
                 # injection into the epilogue role-local while. Only on the epi

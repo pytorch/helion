@@ -907,6 +907,65 @@ class TestCuteDeviceFunctionState(unittest.TestCase):
         with self.assertRaisesRegex(exc.BackendUnsupported, "multi-store fan-out"):
             state.consume_tcgen05_store_value(["matmul_result"])
 
+    def test_tcgen05_fanout_assigns_first_wait_and_last_release(self) -> None:
+        state = CuteDeviceFunctionState()
+        graph = Graph()
+        stores = tuple(graph.placeholder(f"store_{index}") for index in range(3))
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(),
+            output_block_ids=(0, 1),
+            output_stores=stores,
+        )
+        self.assertEqual(
+            state.claim_tcgen05_store_site(value, stores[0]), (False, False)
+        )
+        self.assertEqual(
+            state.claim_tcgen05_store_site(value, stores[1]), (True, False)
+        )
+        self.assertEqual(state.claim_tcgen05_store_site(value, stores[2]), (True, True))
+        with self.assertRaisesRegex(exc.BackendUnsupported, "distinct stores"):
+            state.claim_tcgen05_store_site(value, stores[2])
+
+    def test_tcgen05_fanout_requires_a_complete_store_set(self) -> None:
+        state = CuteDeviceFunctionState()
+        graph = Graph()
+        stores = tuple(graph.placeholder(f"store_{index}") for index in range(2))
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(), output_block_ids=(0, 1)
+        )
+        self.assertEqual(
+            state.claim_tcgen05_store_site(value, stores[0]), (False, True)
+        )
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "complete output store set"
+        ):
+            state.claim_tcgen05_store_site(value, stores[1])
+
+    def test_tcgen05_fanout_rejects_different_execution_scopes(self) -> None:
+        state = CuteDeviceFunctionState()
+        stores = tuple(Graph().placeholder(f"store_{index}") for index in range(2))
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(),
+            output_block_ids=(0, 1),
+            output_stores=stores,
+        )
+        with self.assertRaisesRegex(exc.BackendUnsupported, "one FX graph"):
+            state.claim_tcgen05_store_site(value, stores[0])
+
+    def test_tcgen05_fanout_rejects_an_unexpected_store(self) -> None:
+        state = CuteDeviceFunctionState()
+        graph = Graph()
+        expected, unexpected = (
+            graph.placeholder(name) for name in ("expected", "other")
+        )
+        value = CuteTcgen05StoreValue(
+            lifecycle_context=_lifecycle(),
+            output_block_ids=(0, 1),
+            output_stores=(expected,),
+        )
+        with self.assertRaisesRegex(exc.BackendUnsupported, "distinct stores"):
+            state.claim_tcgen05_store_site(value, unexpected)
+
     def test_codegen_state_marks_collective_dependency_statement(self) -> None:
         state = CuteDeviceFunctionState()
         loop = _kloop_with_inner()

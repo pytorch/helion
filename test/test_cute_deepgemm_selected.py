@@ -1455,8 +1455,10 @@ def test_grouped_worklist_nm_one_cta_codegen(runtime_direct: bool) -> None:
 
 
 @pytest.mark.parametrize("runtime_n_ptx", (False, True))
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_grouped_worklist_nm_one_cta_runtime_direct_uses_physical_n_tile(
     runtime_n_ptx: bool,
+    dtype: torch.dtype,
 ) -> None:
     _require_codegen_cuda()
 
@@ -1477,15 +1479,17 @@ def test_grouped_worklist_nm_one_cta_runtime_direct_uses_physical_n_tile(
         ) as warn_fallback,
     ):
         code = _code_for(
-            _make_args((24, 23, 19, 17, 20, 15), n=4096, k=128),
+            _make_args((24, 23, 19, 17, 20, 15), n=4096, k=128, dtype=dtype),
             config,
         )
 
     assert warn_fallback.call_count == (not runtime_n_ptx)
 
     assert "cute.nvgpu.tcgen05.CtaGroup.ONE" in code
-    assert ("cutlass.experimental.primitives.inline_ptx(" in code) is runtime_n_ptx
-    assert ("tcgen05.mma.cta_group::1.kind::f16" in code) is runtime_n_ptx
+    uses_runtime_n_ptx = runtime_n_ptx and dtype == torch.bfloat16
+    assert ("cutlass.experimental.primitives.inline_ptx(" in code) is uses_runtime_n_ptx
+    assert ("tcgen05.mma.cta_group::1.kind::f16" in code) is uses_runtime_n_ptx
+    assert "cute.gemm(" in code
     assert "tcgen05.mma.cta_group::2.kind::f16" not in code
     assert "StaticPersistentGroupTileScheduler.create" not in code
     assert "tcgen05_grouped_runtime_tile_records.iterator" in code
@@ -1611,21 +1615,24 @@ def test_grouped_worklist_nm_panel_raster_codegen_and_mapping() -> None:
     assert panel_l2_swizzle_size == 8
 
 
-def test_grouped_worklist_nm_fixed_tensormap_rejects_misaligned_d() -> None:
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
+def test_grouped_worklist_nm_fixed_tensormap_rejects_misaligned_d(
+    dtype: torch.dtype,
+) -> None:
     _require_codegen_cuda()
 
     m_total = 224
     n = 256
     k = 128
-    a_packed = torch.empty((m_total, k), dtype=torch.bfloat16, device=DEVICE)
-    b_grouped = torch.empty((1, n, k), dtype=torch.bfloat16, device=DEVICE)
+    a_packed = torch.empty((m_total, k), dtype=dtype, device=DEVICE)
+    b_grouped = torch.empty((1, n, k), dtype=dtype, device=DEVICE)
     work_tile_metadata = torch.tensor(
         [[0, 0, m_total, m_total]],
         dtype=torch.int32,
         device=DEVICE,
     )
-    aligned_output = torch.empty((m_total, n), dtype=torch.bfloat16, device=DEVICE)
-    d_storage = torch.empty(m_total * n + 1, dtype=torch.bfloat16, device=DEVICE)
+    aligned_output = torch.empty((m_total, n), dtype=dtype, device=DEVICE)
+    d_storage = torch.empty(m_total * n + 1, dtype=dtype, device=DEVICE)
     output = d_storage[1:].view(m_total, n)
     assert output.data_ptr() % 16 != 0
 
@@ -1647,6 +1654,18 @@ def test_grouped_worklist_nm_fixed_tensormap_rejects_misaligned_d() -> None:
         plan,
         (work_tile_metadata, a_packed, b_grouped, aligned_output),
     )
+    mismatched_output = aligned_output.to(
+        torch.bfloat16 if dtype == torch.float16 else torch.float16
+    )
+    with pytest.raises(
+        helion.exc.BackendUnsupported,
+        match="matching contiguous FP16/BF16 D",
+    ):
+        _validate_tcgen05_grouped_fixed_tensormaps(
+            cute_kernel,
+            plan,
+            (work_tile_metadata, a_packed, b_grouped, mismatched_output),
+        )
     with pytest.raises(
         helion.exc.BackendUnsupported,
         match="16-byte-aligned D base",
@@ -1805,7 +1824,10 @@ def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
         patch_cute_mma_support(),
         pytest.raises(
             helion.exc.BackendUnsupported,
-            match="rank3 grouped semantic proof failed|MMA RHS was not grouped rank-3",
+            match=(
+                "rank3 grouped semantic proof failed|MMA RHS was not grouped rank-3"
+                "|MMA operands did not expose group metadata"
+            ),
         ),
     ):
         bound.to_triton_code(_selected_config())
@@ -1814,7 +1836,7 @@ def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
 @pytest.mark.parametrize(
     ("case", "match"),
     (
-        ("fp16", "bf16_operands"),
+        ("fp32", "rank3 grouped semantic proof failed"),
         ("k96", "k_multiple_block_k"),
         ("n196", f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}|n_multiple_32"),
         ("strided_b", f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}|contiguous_b_grouped"),
@@ -1822,8 +1844,8 @@ def test_grouped_worklist_nm_rejects_extra_metadata_columns() -> None:
 )
 def test_grouped_worklist_nm_rejects_ineligible_inputs(case: str, match: str) -> None:
     _require_codegen_cuda()
-    if case == "fp16":
-        args = _make_args(dtype=torch.float16)
+    if case == "fp32":
+        args = _make_args(dtype=torch.float32)
     elif case == "k96":
         args = _make_args(k=96)
     elif case == "n196":
@@ -1851,9 +1873,11 @@ def test_grouped_worklist_nm_rejects_ineligible_inputs(case: str, match: str) ->
         (64, TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE),
     ),
 )
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 def test_grouped_worklist_nm_runtime_and_graph_replay(
     block_k: int,
     source_m_tile: int,
+    dtype: torch.dtype,
 ) -> None:
     _require_runtime_cuda13_sm100_or_newer()
 
@@ -1865,6 +1889,7 @@ def test_grouped_worklist_nm_runtime_and_graph_replay(
         k=2048 if small_source else 2 * block_k,
         dirty_padding=True,
         source_m_tile=source_m_tile,
+        dtype=dtype,
     )
     expected_metadata = []
     start = 0

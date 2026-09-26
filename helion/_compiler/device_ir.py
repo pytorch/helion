@@ -3281,7 +3281,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             candidate.operands.output_block_ids
                             not in root_grid_block_ids
                         ):
-                            if not candidate.operands.rhs.rhs_rank3_grouped_nt:
+                            if not candidate.operands.rhs.rhs_is_grouped:
                                 continue
                             env = CompileEnvironment.current()
                             grouped_axes = _rank3_grouped_root_axes(
@@ -3340,6 +3340,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         ),
                         allow_dynamic_hints=(
                             candidate.operands.rhs.rhs_segment_group is not None
+                            or candidate.operands.rhs.rhs_packed_group is not None
                         ),
                     )
                     planning_results.append(planning_result)
@@ -3387,6 +3388,27 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             for item, _lhs, _plan in search_candidates
                         ),
                     )
+                    if (
+                        len(mma_candidates) == 1
+                        and len(device_ir.root_ids) == 1
+                        and not (
+                            config_spec.reduction_block_ids
+                            - {candidate.operands.k_block_id}
+                        )
+                    ):
+                        from .cute.pipeline_smem import analyze_pipeline_smem_facts
+
+                        tcgen05_config = config_spec._cute_tcgen05_config
+                        smem_facts = analyze_pipeline_smem_facts(
+                            candidate,
+                            mma_candidates[0][3],
+                            device_ir.graphs,
+                            capacity_bytes=(
+                                tcgen05_config.per_cta_smem_capacity_bytes(lhs.device)
+                            ),
+                        )
+                        if smem_facts is not None:
+                            tcgen05_config.register_pipeline_smem_facts(smem_facts)
         config_spec.raise_grid_block_minimums()
         if len(device_ir.root_ids) > 1:
             # xyz is not supported with shared program IDs. Non-tcgen05

@@ -7,10 +7,12 @@ import pytest
 import torch
 
 from test._cute_binding import _cpu_bind
+from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
+from helion._compiler.autotuner_heuristics.cute import CuteSiblingRowHeuristic
 from helion._compiler.cute.loop_nesting import tile_loop_paths
 from helion._compiler.cute.thread_budget import tile_loop_thread_count
 from helion._testing import skipUnlessBackends
@@ -92,3 +94,44 @@ def test_nested_seeds_do_not_claim_a_plain_row_kernel() -> None:
     host = bound.host_function
     assert host is not None
     assert not CuteNestedRowHeuristic.get_seed_configs(bound.env, host.device_ir)
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_flat_jagged_search_reaches_wide_coherent_vector_sweeps(
+    static_shapes: bool,
+) -> None:
+    kernel = helion.kernel(
+        jagged_layer_norm_kernel.fn,
+        backend="cute",
+        static_shapes=static_shapes,
+        cute_flatten_nested_reductions=True,
+        autotune_effort="none",
+    )
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(
+            kernel, (torch.empty((731, 128)), torch.empty(18, dtype=torch.int64))
+        )
+    host = bound.host_function
+    assert host is not None
+    spec = bound.config_spec
+    seeds = CuteSiblingRowHeuristic.get_seed_configs(bound.env, host.device_ir)
+    assert seeds and all(seed in spec.compiler_seed_configs for seed in seeds)
+    assert any(
+        seed.block_sizes == [1, 32768, 32768, 32768]
+        and seed.num_threads == [1, 512, 512, 512]
+        and seed.config["cute_vector_widths"] == [1, 4, 4, 4]
+        for seed in seeds
+    )
+    for seed in seeds:
+        normalized = seed.config.copy()
+        spec.normalize(normalized)
+        assert normalized["block_sizes"] == seed.block_sizes
+        assert normalized["num_threads"] == seed.num_threads
+        for item, size in zip(spec.block_sizes, seed.block_sizes, strict=True):
+            fragment = item._fragment(spec)
+            assert fragment.low <= size <= fragment.high
+        with patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ):
+            assert "def _helion_jagged_layer_norm_kernel" in bound.to_code(seed)

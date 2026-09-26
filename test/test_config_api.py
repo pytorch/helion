@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import pickle
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -50,6 +51,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
@@ -1795,7 +1799,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             ] = invalid_value
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
-                r"source_m_tile.*\(32, 224, 256\)",
+                r"source_m_tile.*"
+                + re.escape(str(TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES)),
             ):
                 spec.normalize(wrong_type_config)
 

@@ -141,6 +141,8 @@ from helion._compiler.cute.grouped_worklist_policy import (
 from helion._compiler.cute.grouped_worklist_policy import (
     grouped_worklist_target_identities,
 )
+from helion._compiler.cute.pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -1800,7 +1802,17 @@ class TestAutotunerHeuristic(TestCase):
         )
         spec.matmul_facts = [fp16_fact]
         self.assertIs(_tcgen05_grouped_fact(env), fp16_fact)
-        self.assertIsNone(_tcgen05_grouped_worklist_fact(env))
+        self.assertIs(_tcgen05_grouped_worklist_fact(env), fp16_fact)
+        for lhs_dtype, rhs_dtype in (
+            (torch.float32, torch.float32),
+            (torch.float16, torch.bfloat16),
+        ):
+            with self.subTest(lhs_dtype=lhs_dtype, rhs_dtype=rhs_dtype):
+                spec.matmul_facts = [
+                    fact._replace(lhs_dtype=lhs_dtype, rhs_dtype=rhs_dtype)
+                ]
+                self.assertIsNone(_tcgen05_grouped_fact(env))
+                self.assertIsNone(_tcgen05_grouped_worklist_fact(env))
 
         families = self._grouped_worklist_seed_families()
         small = families["small_k"]
@@ -2845,16 +2857,33 @@ class TestAutotunerHeuristic(TestCase):
                 ),
                 patch("helion._hardware.get_hardware_info", return_value=hardware),
             ):
-                self.assertTrue(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
-        spec.matmul_facts = [static_fact._replace(static_k=None)]
-        self.assertFalse(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
-        spec.matmul_facts = [
-            static_fact._replace(
-                lhs_dtype=torch.float16,
-                rhs_dtype=torch.float16,
-            )
-        ]
-        self.assertFalse(CuteTcgen05GroupedWorklistHeuristic.should_promote(env))
+                for dtype in (torch.bfloat16, torch.float16):
+                    with self.subTest(dtype=dtype):
+                        spec.matmul_facts = [
+                            static_fact._replace(lhs_dtype=dtype, rhs_dtype=dtype)
+                        ]
+                        self.assertTrue(
+                            CuteTcgen05GroupedWorklistHeuristic.should_promote(env)
+                        )
+                        spec.matmul_facts = [
+                            spec.matmul_facts[0]._replace(static_k=None)
+                        ]
+                        self.assertFalse(
+                            CuteTcgen05GroupedWorklistHeuristic.should_promote(env)
+                        )
+                for lhs_dtype, rhs_dtype in (
+                    (torch.float32, torch.float32),
+                    (torch.float16, torch.bfloat16),
+                ):
+                    with self.subTest(lhs_dtype=lhs_dtype, rhs_dtype=rhs_dtype):
+                        spec.matmul_facts = [
+                            static_fact._replace(
+                                lhs_dtype=lhs_dtype, rhs_dtype=rhs_dtype
+                            )
+                        ]
+                        self.assertFalse(
+                            CuteTcgen05GroupedWorklistHeuristic.should_promote(env)
+                        )
 
     def test_grouped_worklist_gb300_target_override_requires_exact_rows(self) -> None:
         gb300_identity = ("cuda", "NVIDIA GB300", "sm103")
@@ -5674,14 +5703,16 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             config.config
             for config in configs
             if config.config["tcgen05_cluster_m"] == 2
+            and config.config.get("tcgen05_cta_group", "auto") == "auto"
         ]
         # FFI-eligible shapes have both DEFAULT-layout and direct-entry seeds.
         # Callers decide whether both are expected in the supplied population;
-        # every cluster_m=2 seed must still match one of the validated tile
+        # every automatic cluster_m=2 seed must match a legacy validated tile
         # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
         # (two 256-row subtiles sharing B; baseline ab=2 only), or the
         # deep-staged short-K variant (bk=64 with the ab=6 pipeline). At least
-        # one canonical-envelope seed must be present.
+        # one canonical-envelope seed must be present. Explicit paired-CTA
+        # seeds have independent geometry and allocation checks below.
         self.assertGreaterEqual(len(seeded), 1)
         canonical: list[dict[str, object]] = []
         for seed in seeded:
@@ -8380,6 +8411,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         with (
             patch_cute_mma_support(),
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
         ):
             bound = cute_matmul_mma.bind(args)
         spec = bound.config_spec
@@ -8462,12 +8496,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
         )
 
-        # ab > 3 is only valid on the TVM-FFI direct-entry path for the
-        # (bk, ab, c) stage tuples the codegen accepts
-        # (``TCGEN05_DIRECT_ENTRY_STAGE_TUPLES_BY_BK``: bk=64 admits the deep
-        # (ab=6, c=4) tuple). ab=4 and ab=5 are admitted by NO bk, so they are
-        # rejected everywhere; a bare ab>3 config (no FFI launch) is likewise
-        # rejected. ``_fix_invalid=True`` clamps any such config down to ab=3.
+        # With the automatic CTA group, ab > 3 still requires the FFI stage
+        # envelope. The explicit paired family must not relax these defaults:
+        # search repair clamps them to 3, and explicit invalid configs reject.
         def _non_seed_stage_config(requested_ab_stages: int) -> helion.Config:
             return helion.Config(
                 block_sizes=[256, 256, 64],
@@ -8533,18 +8564,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for_search=True
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
-        # The for_search ab cap is BUDGET-AWARE — lifted to the 16-bit hard cap
-        # (6) wherever deep AB is admissible (the SMEM-budget constraints were
-        # recorded at bind time, i.e. bf16/fp16 on a B200-class optin cap),
-        # else 2. Conditioning on the recorded constraints keeps the assertion
-        # deterministic across hosts.
-        expected_search_ab_high = (
-            6
-            if bound.config_spec._cute_tcgen05_config.ab_stages_three_search_constraints
-            is not None
-            else 2
+        # The global fragment also represents explicit paired-CTA pipelines.
+        # Automatic and FFI configs still obey the rejection checks above.
+        self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+        self.assertEqual(
+            search_ab_stages_fragment.high, TCGEN05_SMEM_AWARE_MAX_AB_STAGES
         )
-        self.assertEqual(search_ab_stages_fragment.high, expected_search_ab_high)
 
         @helion.kernel(backend="cute")
         def cute_matmul_mma_no_ab3_budget(
@@ -8564,14 +8589,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             patch_cute_mma_support(),
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
             patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+            patch.object(
                 CuteTcgen05Config,
                 "per_cta_ab_smem_budget_bytes",
                 return_value=0,
             ),
         ):
             no_ab3_budget_bound = cute_matmul_mma_no_ab3_budget.bind(args)
-        # With no recorded SMEM budget the generalized FFI seed is ineligible
-        # (ab=3 cannot fit) and the for_search ab cap stays at 2.
+        # A missing legacy AB budget disables the generalized FFI seed. The
+        # separate paired-CTA proof still has a known raw capacity here, so its
+        # deeper choices remain represented by the shared search fragment.
         self.assertFalse(
             no_ab3_budget_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
         )
@@ -8581,7 +8610,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )["tcgen05_ab_stages"]
         )
         self.assertIsInstance(no_budget_ab_stages_fragment, IntegerFragment)
-        self.assertEqual(no_budget_ab_stages_fragment.high, 2)
+        self.assertTrue(
+            no_ab3_budget_bound.config_spec._cute_tcgen05_config.paired_pipeline_search_enabled()
+        )
+        self.assertEqual(
+            no_budget_ab_stages_fragment.high, TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+        )
 
         # An fp16 matmul IS eligible for the FFI seed: the direct-entry TMA
         # descriptors / SMEM layout / epilogue tile are dtype-general for any
@@ -8594,6 +8628,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         with (
             patch_cute_mma_support(),
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
         ):
             fp16_bound = cute_matmul_mma.bind(fp16_args)
         self.assertTrue(
@@ -10290,6 +10327,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             patch_cute_mma_support(),
             patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
             patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+            patch.object(
                 CuteTcgen05Config,
                 "per_cta_ab_smem_budget_bytes",
                 return_value=b200_budget,
@@ -10313,10 +10353,16 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.aux_kernel_detected)
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
-        # The for_search ab fragment is lifted to the 16-bit hard cap (the
-        # budget was recorded at bind via the mocked B200 cap) for every
-        # family; sampled depths are budget-clamped at fix-invalid time.
-        for tcfg in (plain_tcfg, bias_tcfg, residual_tcfg):
+        # The plain output has an exact allocation proof for deeper paired-CTA
+        # pipelines. Auxiliary loads retain the legacy six-stage fragment and
+        # its separate AB/source-C budget checks below.
+        self.assertTrue(plain_tcfg.paired_pipeline_search_enabled())
+        self.assertEqual(
+            plain_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
+        for tcfg in (bias_tcfg, residual_tcfg):
+            self.assertIsNone(tcfg.pipeline_smem_facts)
             ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
             self.assertEqual(ab_fragment.high, 6)
 
@@ -10531,7 +10577,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
         )
-        with patch_cute_mma_support():
+        with (
+            patch_cute_mma_support(),
+            patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+        ):
             bound = cute_matmul_mma.bind(args)
         self.assertIn(
             CuteTcgen05ClusterM2Heuristic.name,
@@ -10627,6 +10678,38 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for config in configs
         }
         self.assertTrue(expected_seed_modes.issubset(best_available_modes))
+
+        paired_configs = [
+            config for config in configs if config.get("tcgen05_cta_group") == "two"
+        ]
+        self.assertTrue(paired_configs)
+        facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
+        self.assertIsNotNone(facts)
+        assert facts is not None
+        for config in paired_configs:
+            with self.subTest(paired_config=config):
+                self.assertEqual(config["tcgen05_cluster_m"], 2)
+                self.assertEqual(config["tcgen05_cluster_n"], 1)
+                self.assertEqual(config["pid_type"], "persistent_blocked")
+                self.assertEqual(config["tcgen05_c_stages"], 2)
+                self.assertEqual(config["tcgen05_acc_stages"], 2)
+                self.assertFalse(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY])
+                bm, bn, bk = config.block_sizes
+                self.assertLessEqual(
+                    pipeline_smem_bytes(
+                        facts,
+                        bm=bm,
+                        bn=bn,
+                        bk=bk,
+                        ab_stages=cast("int", config["tcgen05_ab_stages"]),
+                        c_stages=2,
+                        acc_stages=2,
+                    ),
+                    facts.capacity_bytes,
+                )
+                self.assertEqual(
+                    config_gen.unflatten(config_gen.flatten(config)), config
+                )
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seed_indexing_matches_live_spec(self) -> None:

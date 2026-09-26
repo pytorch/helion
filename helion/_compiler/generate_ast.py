@@ -118,6 +118,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         # Initialize our attributes
         self.host_function = func
+        config = CompileEnvironment.current().backend.codegen_config(config)
         self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []

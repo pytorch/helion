@@ -21,6 +21,9 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
@@ -690,6 +693,7 @@ def test_grouped_device_split_automatic_seed_families_use_mailbox_scheduler() ->
     } == {
         TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
         TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+        TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
     }
     assert (
         seeds[0].config[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY]
@@ -1124,6 +1128,7 @@ def test_grouped_device_split_sizes_rejects_near_misses(
             helion.exc.BackendUnsupported,
             match=(
                 "rank3 grouped semantic proof failed|MMA RHS was not grouped rank-3"
+                "|MMA operands did not expose group metadata"
             ),
         ),
     ):
