@@ -1099,6 +1099,81 @@ def _cute_stack_tensor_pointer_expr(
     )
 
 
+def _codegen_cute_stack_load_loop(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    tensor_like: torch.Tensor,
+    dev_ptrs: torch.Tensor,
+    subscript: tuple[object, ...] | list[object],
+    ast_subscript: tuple[object, ...] | list[object],
+    extra_mask: ast.AST | None,
+    value_node: torch.fx.Node,
+) -> ast.AST | None:
+    stack_value_subscript = value_node.args[1]
+    if not isinstance(stack_value_subscript, (list, tuple)):
+        return None
+    stack_value_subscript_proxy = map_arg(
+        stack_value_subscript, lambda arg: arg.meta["val"]
+    )
+    stack_value_subscript_ast = map_arg(
+        stack_value_subscript, lambda arg: state.env[arg]
+    )
+    tensor_offset_expr = _cute_stack_tensor_offset_expr(
+        state,
+        tensor_like,
+        [*stack_value_subscript_proxy],
+        [*stack_value_subscript_ast],
+    )
+    target_index_exprs = _cute_index_exprs(
+        state,
+        [*subscript],
+        ast_subscript,
+        tensor=tensor,
+        inactive_singleton_slice_expr="0",
+    )
+    if len(target_index_exprs) != tensor.ndim:
+        return None
+    loop_axis = dev_ptrs.ndim - 1
+    leading_indices = target_index_exprs[:loop_axis]
+    target_tail = target_index_exprs[loop_axis + 1 :]
+    loop_var = state.device_function.new_var("stack_dim", dce=True)
+    env = CompileEnvironment.current()
+    index_dtype = env.index_type()
+    dev_ptrs_name = state.device_function.tensor_arg(dev_ptrs).name
+    tensor_name = state.device_function.tensor_arg(tensor).name
+    target_dtype = env.backend.dtype_str(tensor.dtype)
+    offset_terms = [
+        f"{index_dtype}({idx}) * {index_dtype}({dev_ptrs.stride(axis)})"
+        for axis, idx in enumerate(leading_indices)
+    ]
+    offset_terms.append(
+        f"{index_dtype}({loop_var}) * {index_dtype}({dev_ptrs.stride(loop_axis)})"
+    )
+    dev_ptr_offset = " + ".join(offset_terms)
+    stack_ptr_expr = (
+        f"(cute.make_ptr({target_dtype}, "
+        f"cutlass.Int64(({dev_ptrs_name}.iterator + {dev_ptr_offset}).load()), "
+        f"cute.AddressSpace.gmem) + ({tensor_offset_expr}))"
+    )
+    target_indices = [*leading_indices, loop_var, *target_tail]
+    store_expr = _cute_scalar_store_expr(
+        tensor_name,
+        target_indices,
+        f"({stack_ptr_expr}).load()",
+    )
+    mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
+    if mask_expr is None:
+        body = f"    {store_expr}"
+    else:
+        body = f"    if {mask_expr}:\n        {store_expr}"
+    state.add_statement(
+        statement_from_string(
+            f"for {loop_var} in range({dev_ptrs.size(loop_axis)}):\n{body}"
+        )
+    )
+    return ast.Constant(value=None)
+
+
 def _codegen_cute_store_stack_load(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -1141,74 +1216,25 @@ def _codegen_cute_store_stack_load(
         return None
 
     if (
-        dev_ptrs.ndim == 2
-        and len(ptr_subscript) == 2
+        dev_ptrs.ndim in (1, 2)
+        and len(ptr_subscript) == dev_ptrs.ndim
         and all(isinstance(idx, slice) and idx == slice(None) for idx in ptr_subscript)
-        and len(subscript) >= 3
-        and isinstance(subscript[0], slice)
-        and subscript[0] == slice(None)
-        and isinstance(subscript[1], slice)
-        and subscript[1] == slice(None)
+        and len(subscript) >= dev_ptrs.ndim + 1
+        and all(
+            isinstance(idx, slice) and idx == slice(None)
+            for idx in subscript[: dev_ptrs.ndim]
+        )
     ):
-        stack_value_subscript = value_node.args[1]
-        if not isinstance(stack_value_subscript, (list, tuple)):
-            return None
-        stack_value_subscript_proxy = map_arg(
-            stack_value_subscript, lambda arg: arg.meta["val"]
-        )
-        stack_value_subscript_ast = map_arg(
-            stack_value_subscript, lambda arg: state.env[arg]
-        )
-        tensor_offset_expr = _cute_stack_tensor_offset_expr(
+        return _codegen_cute_stack_load_loop(
             state,
+            tensor,
             tensor_like,
-            [*stack_value_subscript_proxy],
-            [*stack_value_subscript_ast],
-        )
-        target_index_exprs = _cute_index_exprs(
-            state,
-            [*subscript],
+            dev_ptrs,
+            subscript,
             ast_subscript,
-            tensor=tensor,
-            inactive_singleton_slice_expr="0",
+            extra_mask,
+            value_node,
         )
-        if len(target_index_exprs) != tensor.ndim:
-            return None
-        first_stack_index = target_index_exprs[0]
-        target_tail = target_index_exprs[2:]
-        loop_var = state.device_function.new_var("stack_dim", dce=True)
-        env = CompileEnvironment.current()
-        index_dtype = env.index_type()
-        dev_ptrs_name = state.device_function.tensor_arg(dev_ptrs).name
-        tensor_name = state.device_function.tensor_arg(tensor).name
-        target_dtype = env.backend.dtype_str(tensor.dtype)
-        dev_ptr_offset = (
-            f"{index_dtype}({first_stack_index}) * "
-            f"{index_dtype}({dev_ptrs.stride(0)}) + "
-            f"{index_dtype}({loop_var}) * {index_dtype}({dev_ptrs.stride(1)})"
-        )
-        stack_ptr_expr = (
-            f"(cute.make_ptr({target_dtype}, "
-            f"cutlass.Int64(({dev_ptrs_name}.iterator + {dev_ptr_offset}).load()), "
-            f"cute.AddressSpace.gmem) + ({tensor_offset_expr}))"
-        )
-        target_indices = [first_stack_index, loop_var, *target_tail]
-        store_expr = _cute_scalar_store_expr(
-            tensor_name,
-            target_indices,
-            f"({stack_ptr_expr}).load()",
-        )
-        mask_expr = _cute_combined_mask(state, [*subscript], extra_mask, tensor=tensor)
-        if mask_expr is None:
-            body = f"    {store_expr}"
-        else:
-            body = f"    if {mask_expr}:\n        {store_expr}"
-        state.add_statement(
-            statement_from_string(
-                f"for {loop_var} in range({dev_ptrs.size(1)}):\n{body}"
-            )
-        )
-        return ast.Constant(value=None)
 
     ptr_subscript_proxy = map_arg(ptr_subscript, lambda arg: arg.meta["val"])
     ptr_subscript_ast = map_arg(ptr_subscript, lambda arg: state.env[arg])
