@@ -53,6 +53,11 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/paired_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
+    "block_scaled_mma": (
+        "_compiler/cute/block_scaled_config.py",
+        "_compiler/cute/block_scaled_prepare.py",
+        "_compiler/cute/block_scaled_runtime.py",
+    ),
     "gathered_mma_tma": (
         "_compiler/cute/_mlir_compat.py",
         "_compiler/cute/gathered_mma_runtime.py",

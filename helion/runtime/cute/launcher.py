@@ -520,6 +520,20 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "block_scaled_mma":
+        if (
+            plan_int("bn") not in (128, 256)
+            or plan_int("bk") not in (64, 128, 256)
+            or plan_int("stages") not in (2, 3, 4, 5)
+            or plan_int("cluster_m") not in (1, 2)
+            or any(plan_int(key) <= 0 for key in ("m", "n", "k", "workspace_bytes"))
+            or plan_int("k") % 16
+            or type(plan.get("persistent")) is not bool
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "invalid block-scaled wrapper geometry"
+            )
+        return
     if kind == "gathered_mma_tma":
         bn = plan_int("bn")
         stages = plan_int("stages")
@@ -2070,6 +2084,13 @@ def _create_cute_wrapper(
         for plan in wrapper_plans
         if plan.get("kind") == "chunk_recurrence_warp_dv4"
     ]
+    block_scaled_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "block_scaled_mma"
+    ]
+    if block_scaled_plans and (len(wrapper_plans) != 1 or block != (192, 1, 1)):
+        raise exc.BackendUnsupported(
+            "cute", "native block scaling must own the complete device root"
+        )
     if len(sm100_recurrence_plans) > 1:
         raise exc.BackendUnsupported("cute", "multiple SM100 recurrence plans")
     if len(warp_dv4_recurrence_plans) > 1:
@@ -2124,7 +2145,27 @@ def _create_cute_wrapper(
         launch_suffix += f", min_blocks_per_mp={explicit_min_blocks}"
     elif any(plan.get("topology") == "fa4" for plan in wrapper_plans):
         launch_suffix += ", min_blocks_per_mp=1"
-    if sm100_recurrence_plans:
+    if block_scaled_plans:
+        plan = block_scaled_plans[0]
+        arguments = [
+            f"arg{plan[key]}"
+            for key in (
+                "lhs_idx",
+                "rhs_idx",
+                "lhs_scale_idx",
+                "rhs_scale_idx",
+                "workspace_idx",
+                "out_idx",
+            )
+        ]
+        alpha = (
+            f"arg{plan['scale_idx']}"
+            if "scale_idx" in plan
+            else "_helion_block_scaled_alpha"
+        )
+        arguments.extend((f"cutlass.Float32({alpha})", "stream"))
+        body.append("    _helion_block_scaled_entry(" + ", ".join(arguments) + ")")
+    elif sm100_recurrence_plans:
         _append_sm100_chunk_recurrence_host_call(body, sm100_recurrence_plans[0])
     elif warp_dv4_recurrence_plans:
         _append_sm100_warp_dv4_host_call(body, warp_dv4_recurrence_plans[0])
@@ -2156,6 +2197,16 @@ def _create_cute_wrapper(
         from ..._compiler.cute.gathered_mma_runtime import make_tma_arguments
 
         namespace["_helion_make_gathered_tma"] = make_tma_arguments
+    if block_scaled_plans:
+        from ..._compiler.cute.block_scaled_prepare import make_block_scaled_entry
+
+        namespace["_helion_block_scaled_entry"] = make_block_scaled_entry(
+            block_scaled_plans[0]
+        )
+        if "scale_value" in block_scaled_plans[0]:
+            namespace["_helion_block_scaled_alpha"] = block_scaled_plans[0][
+                "scale_value"
+            ]
     if sm100_recurrence_plans:
         from ..._compiler.cute.chunk_recurrence_sm100 import host_chain_dv2
 
@@ -4988,6 +5039,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
         "gathered_mma_tma",
+        "block_scaled_mma",
     }:
         return True
     if not kind.startswith("tcgen05"):
@@ -6157,6 +6209,7 @@ def _cute_build_fast_relaunch(
             "chunk_recurrence_sm100",
             "chunk_recurrence_warp_dv4",
             "gathered_mma_tma",
+            "block_scaled_mma",
         }
         for plan in wrapper_plans
     ):

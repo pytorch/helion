@@ -34,6 +34,7 @@ def register_matmul_min_blocks_coverage(
         env.backend_name != "cute"
         or not spec.matmul_facts
         or spec.cute_flash_search_enabled
+        or spec.cute_scaled_mma_available
         or not spec.supports_config_key(MIN_BLOCKS_KEY)
         or MIN_BLOCKS_KEY in spec._flat_fields()
     ):
