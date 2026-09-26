@@ -28,11 +28,14 @@ from helion._compiler.cute.split_k_workspace import analyze_split_k_workspace
 from helion._compiler.cute.split_k_workspace import workspace_schedule
 from helion._compiler.cute.split_k_workspace_codegen import _reducer_source
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import skipUnlessBackends
 from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
+
+pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

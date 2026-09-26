@@ -28,6 +28,7 @@ from pathlib import Path
 import re
 import tempfile
 import textwrap
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -36,6 +37,12 @@ from .._compiler.compile_environment import (
 )
 from .._compiler.output_code_utils import _check_kernel_name_not_shadowed
 from .._compiler.output_code_utils import dependency_free_runtime_source
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from .aot_structural_export import RuntimeGuard
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -270,6 +277,11 @@ def generate_standalone_file(
     kernel_source_file: str | None = None,
     dispatch_keys: list[tuple[object, ...]] | None = None,
     tensor_descriptor_guards: bool = False,
+    *,
+    structural_policy: CuteStructuralPolicy | None = None,
+    user_key: Callable[..., object] | None = None,
+    dynamic_groups: list[tuple[tuple[object, ...], list[int]]] | None = None,
+    runtime_guards: tuple[RuntimeGuard, ...] = (),
 ) -> Path:
     """
     Generate one standalone ``.py`` file containing every selected config.
@@ -294,6 +306,21 @@ def generate_standalone_file(
     Returns:
         Path to the generated file.
     """
+    if structural_policy is not None:
+        from .aot_structural_export import generate_policy_standalone
+
+        return generate_policy_standalone(
+            kernel_name,
+            triton_codes,
+            heuristic_code,
+            output_dir,
+            kernel_source_file,
+            dispatch_keys,
+            structural_policy,
+            user_key,
+            dynamic_groups,
+            runtime_guards,
+        )
     if dispatch_keys is not None:
         if len(dispatch_keys) != len(triton_codes):
             raise ValueError("dispatch_keys must match triton_codes")

@@ -5,8 +5,12 @@ import pytest
 import torch
 
 import helion
+from helion._testing import skipUnlessBackends
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    skipUnlessBackends(["cute"]),
+]
 
 
 def _routing(

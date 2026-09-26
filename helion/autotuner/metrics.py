@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.device_ir import DeviceIR
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
 
 
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
@@ -139,6 +140,7 @@ class KernelMetadata:
     _device_ir: DeviceIR | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
+    cute_structural_policy: CuteStructuralPolicy | None = None
 
     @functools.cached_property
     def run_id(self) -> str:
@@ -148,10 +150,14 @@ class KernelMetadata:
             f"{self.kernel_source}\x00{_codegen_signature(self.settings)}\x00"
             f"{self.input_shapes}\x00{self.dtypes}\x00{self.hardware}"
         )
+        if self.cute_structural_policy is not None:
+            payload += (
+                f"\x00cute_structural_policy:{self.cute_structural_policy.identity()}"
+            )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "run_id": self.run_id,
             "kernel_name": self.kernel_name,
             "kernel_source": self.kernel_source,
@@ -161,6 +167,9 @@ class KernelMetadata:
             "settings": self.settings,
             "ir_graph": self.ir_graph,
         }
+        if self.cute_structural_policy is not None:
+            result["cute_structural_policy"] = self.cute_structural_policy.to_dict()
+        return result
 
     @functools.cached_property
     def ir_graph(self) -> dict[str, object] | None:

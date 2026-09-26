@@ -13,7 +13,10 @@ from test.test_cute_split_k_workspace import _fp32_bias
 from test.test_cute_split_k_workspace_protocol import _matrix_bias
 
 import helion
+from helion._testing import skipUnlessBackends
 from helion.autotuner.benchmarking import _make_cudagraph_replay
+
+pytestmark = skipUnlessBackends(["cute"])
 
 
 @dataclass(frozen=True)

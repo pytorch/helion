@@ -11,9 +11,13 @@ from test.test_cute_split_k_workspace import _fp32_bias
 
 import helion
 from helion._compiler.autotuner_heuristics.cute_split_k_cluster import cluster_carrier
+from helion._testing import skipUnlessBackends
 
 CUDA_DEVICE = "cuda"
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    skipUnlessBackends(["cute"]),
+]
 
 
 def _check_cluster(

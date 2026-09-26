@@ -18,6 +18,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuri
 from helion._compiler.cute.collective_matmul import _tensor_roots
 from helion._compiler.cute.packed_matmul import interleaved_matrix_terms
 from helion._compiler.cute.scaled_contraction import expose_scaled_contractions
+from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language import creation_ops
@@ -74,6 +75,7 @@ def _config(compute: str = "tcgen05", *, bk: int = 2) -> helion.Config:
 
 
 @pytest.mark.parametrize("shape", [(128, 16, 128), (512, 64, 512), (1024, 128, 1024)])
+@skipUnlessBackends(["cute"])
 def test_original_nvfp4_has_ordinary_mma_seeds(shape: tuple[int, int, int]) -> None:
     bound, inputs = _bind(shape)
     assert bound.host_function is not None
@@ -134,6 +136,7 @@ def _scaled_pairs(
 
 
 @pytest.mark.parametrize("pairs", [1, 2, 3])
+@skipUnlessBackends(["cute"])
 def test_pair_count_and_scale_layout_are_not_fixed(pairs: int) -> None:
     args = (
         torch.empty((73, 7, pairs), dtype=torch.float4_e2m1fn_x2),
@@ -181,6 +184,7 @@ class _StopProbe(Exception):
         "extra_output",
     ],
 )
+@skipUnlessBackends(["cute"])
 def test_refuses_unproved_precision_or_effects(change: str) -> None:
     checked = False
 
@@ -305,6 +309,7 @@ def _scale_offset(row: int, group: int, groups: int) -> int:
 
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
 @pytest.mark.parametrize("bk", [1, 2, 4])
+@skipUnlessBackends(["cute"])
 def test_actual_packed_staging_preserves_scales_and_nan_padding(
     compute: str, bk: int
 ) -> None:

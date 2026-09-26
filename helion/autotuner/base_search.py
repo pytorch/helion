@@ -32,6 +32,10 @@ from torch.utils._pytree import tree_flatten
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
+from ..runtime.cute_structural_config import CuteStructuralConfig
+from ..runtime.cute_structural_config import StructuralPolicyError
+from ..runtime.cute_structural_config import bound_structural_policy
+from ..runtime.cute_structural_config import require_same_structural_policy
 from ..runtime.settings import _env_get_int
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
@@ -62,6 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
     from ..runtime.settings import Settings
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
@@ -188,21 +193,50 @@ class _AutotunableKernel(Protocol):
 _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
 
-def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
+def normalize_autotune_seed_configs(
+    settings: Settings,
+    *,
+    structural_policy: CuteStructuralPolicy
+    | Callable[[], CuteStructuralPolicy | None]
+    | None = None,
+) -> tuple[Config, ...]:
     """Return user-provided autotune seed configs from settings as concrete Configs."""
     from ..runtime.config import Config
 
     seed_configs = settings.autotune_seed_configs
     if seed_configs is None:
         return ()
+    if isinstance(seed_configs, CuteStructuralConfig):
+        seed_configs = (seed_configs,)
     if isinstance(seed_configs, Config):
         return (seed_configs,)
     if isinstance(seed_configs, dict):
         return (Config.from_dict(seed_configs),)
-    return tuple(
-        Config.from_dict(seed_config) if isinstance(seed_config, dict) else seed_config
-        for seed_config in seed_configs
-    )
+    result = []
+    for seed_config in seed_configs:
+        if isinstance(seed_config, CuteStructuralConfig):
+            # Legacy search-policy inspection can run before binding. Only a
+            # new envelope needs the captured bound's policy, so resolve lazily.
+            policy = (
+                structural_policy()
+                if callable(structural_policy)
+                else structural_policy
+            )
+            require_same_structural_policy(
+                seed_config.policy,
+                policy or settings.get_cute_structural_policy()
+                if settings.backend == "cute"
+                else None,
+                context="Late autotune seed envelope",
+            )
+            result.append(seed_config.config)
+        else:
+            result.append(
+                Config.from_dict(seed_config)
+                if isinstance(seed_config, dict)
+                else seed_config
+            )
+    return tuple(result)
 
 
 def _file_sha256(filename: str | None) -> str | None:
@@ -348,6 +382,12 @@ class BaseSearch(BaseAutotuner):
         super().__init__()
         self.kernel = kernel
         self.settings: Settings = kernel.settings
+        if isinstance(self.settings.autotune_config_overrides, CuteStructuralConfig):
+            raise StructuralPolicyError(
+                "Policy-bearing autotune overrides must be supplied before "
+                "creating a new Kernel; late overrides must be an ordinary "
+                "dictionary for the already selected config schema."
+            )
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
@@ -420,7 +460,12 @@ class BaseSearch(BaseAutotuner):
                 "autotune_effort": settings.autotune_effort,
                 "autotune_budget_seconds": settings.autotune_budget_seconds,
                 "autotune_config_overrides": settings.autotune_config_overrides,
-                "autotune_seed_configs": normalize_autotune_seed_configs(settings),
+                "autotune_seed_configs": normalize_autotune_seed_configs(
+                    settings,
+                    structural_policy=lambda: bound_structural_policy(
+                        self.kernel, captured=True
+                    ),
+                ),
                 "compiler_seed_configs": tuple(self.config_spec.compiler_seed_configs),
                 "compiler_seed_timeout_retry_repetitions": (
                     self.config_spec.compiler_seed_timeout_retry_repetitions
@@ -581,6 +626,7 @@ class BaseSearch(BaseAutotuner):
             hardware=hardware,
             settings=metadata_settings,
             _device_ir=getattr(host_function, "_device_ir", None),
+            cute_structural_policy=bound_structural_policy(self.kernel),
         )
         provider_cls = (
             MultiShapeBenchmarkProvider
@@ -1030,6 +1076,7 @@ class BaseSearch(BaseAutotuner):
                 and _normalize_spec_key_str(entry.specialization_key)
                 == current_spec_key
                 and entry.config_spec_hash == current_fingerprint_hash
+                and entry.cute_structural_policy == bound_structural_policy(self.kernel)
             )
 
         matching: list[SavedBestConfig] = []
@@ -1093,7 +1140,12 @@ class BaseSearch(BaseAutotuner):
 
     def _autotune_seed_configs(self) -> Sequence[Config]:
         """Return user-provided autotune seed configs normalized from settings."""
-        return normalize_autotune_seed_configs(self.settings)
+        return normalize_autotune_seed_configs(
+            self.settings,
+            structural_policy=lambda: bound_structural_policy(
+                self.kernel, captured=True
+            ),
+        )
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
