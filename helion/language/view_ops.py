@@ -108,6 +108,8 @@ def _torch_chunk(
         )
     shape = list(input.shape)
     shape[dim : dim + 1] = [2, size // 2]
+    # TODO(jjjxia): Lower trailing-axis chunk without a logical permutation so it can
+    # support flattened tiles. The inserted size-two axis is never trailing.
     return _unbind_two(input.reshape(shape), dim)
 
 
@@ -215,6 +217,42 @@ def split(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     Returns:
         A tuple ``(lo, hi)`` where each tensor has the same shape as ``tensor``
         without its last dimension.
+
+    .. rubric:: PyTorch alternate forms
+
+    The Triton backend supports ``torch.chunk(x, 2, dim)`` for two equal
+    chunks and ``torch.unbind(x, dim)`` when the selected dimension has size
+    two. Tensor method forms (``x.chunk(...)`` and ``x.unbind(...)``),
+    including saved bound methods, are also supported. Both operations
+    accept positive and negative axes and return a tuple of two tensors.
+    ``chunk`` keeps the input rank; ``unbind`` removes the selected axis.
+    They lower through reshape/permute and ``hl.split``.
+
+    For an accumulator of shape ``[tile_m, 128]``:
+
+    .. code-block:: python
+
+        left, right = torch.chunk(acc, 2, dim=-1)  # each is [tile_m, 64]
+        grouped = acc.reshape(tile_m, 2, 64).permute(0, 2, 1)
+        left, right = grouped.unbind(dim=-1)  # same contiguous halves
+        left, right = hl.split(grouped)  # equivalent lowering
+
+    Note:
+        These PyTorch alternate forms are currently Triton-only inside device
+        loops. The axis and split size must be known at compile time; use
+        :func:`~helion.language.specialize` before the loop when needed.
+        Other tile dimensions can remain symbolic. Because Triton pads tensor
+        dimensions to powers of two, ``chunk`` requires a power-of-two split
+        size of at least two. Other chunk counts, uneven chunks, and unbinding
+        dimensions of other sizes raise an unsupported-configuration error.
+        Host-side calls retain normal PyTorch behavior.
+
+        Lowerings that permute rank-compacted tile tensors are unsupported.
+        This includes ``chunk`` even on the trailing axis. Unbinding an already
+        trailing size-two axis remains supported with flattened tiles. Direct
+        ``permute`` calls have the same restriction: the autotuner skips
+        configurations that compact the input rank. Disable ``flatten_loops``
+        for the affected tile axes to use these permutations.
 
     See Also:
         - :func:`~helion.language.join`

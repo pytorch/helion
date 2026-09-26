@@ -43,6 +43,7 @@ from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
 from ..autotuner.config_spec import ReductionLoopSpec
 from ..language import _tracing_ops
+from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
 from ..language._tracing_ops import _new_var
@@ -2643,7 +2644,7 @@ class WalkDeviceAST(NodeVisitor):
         assert isinstance(node, ExtendedAST)
         if (
             isinstance(node._type_info, TensorAttributeType)
-            and node.attr in {"chunk", "unbind"}
+            and node.attr in _TENSOR_METHOD_REPLACEMENTS
             and (
                 replacement := get_device_func_replacement(
                     getattr(torch.Tensor, node.attr)

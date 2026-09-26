@@ -218,7 +218,6 @@ class TestViews(RefEagerTestBase, TestCase):
             self.assertIn("tl.split", code)
             self.assertIn("tl.join", code)
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.chunk lowering is Triton-only")
     def test_torch_chunk_two(self):
         @helion.kernel(autotune_effort="none")
@@ -249,10 +248,8 @@ class TestViews(RefEagerTestBase, TestCase):
                         fn, (x, use_method), block_sizes=[32]
                     )
                     torch.testing.assert_close(result, expected)
-                    if _get_backend() == "triton":
-                        self.assertIn("tl.split", code)
+                    self.assertIn("tl.split", code)
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.unbind lowering is Triton-only")
     def test_torch_unbind_full_slice(self):
         @helion.kernel(autotune_effort="none")
@@ -281,7 +278,6 @@ class TestViews(RefEagerTestBase, TestCase):
                 _code, result = code_and_output(fn, (x, use_method), block_sizes=[32])
                 torch.testing.assert_close(result, torch.unbind(x, dim=1))
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.unbind lowering is Triton-only")
     def test_torch_unbind_two(self):
         @helion.kernel(autotune_effort="none")
@@ -315,7 +311,6 @@ class TestViews(RefEagerTestBase, TestCase):
                     )
                     torch.testing.assert_close(result, expected)
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.chunk and torch.unbind lowering is Triton-only")
     def test_torch_chunk_unbind_accumulator(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -343,7 +338,6 @@ class TestViews(RefEagerTestBase, TestCase):
                 _code, result = code_and_output(fn, (x, use_unbind), block_sizes=[32])
                 torch.testing.assert_close(result, expected)
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.chunk and torch.unbind lowering is Triton-only")
     def test_torch_chunk_unbind_axes(self):
         @helion.kernel(autotune_effort="none")
@@ -379,7 +373,6 @@ class TestViews(RefEagerTestBase, TestCase):
                 _code, result = code_and_output(fn, (x, leading_axis), block_sizes=[32])
                 torch.testing.assert_close(result, expected)
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.unbind lowering is Triton-only")
     def test_torch_unbind_stack_flattened_tiles(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -414,7 +407,6 @@ class TestViews(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, torch.stack((x, x + 1), dim=0))
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.chunk and torch.unbind lowering is Triton-only")
     def test_torch_chunk_unbind_dot_accumulator(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)

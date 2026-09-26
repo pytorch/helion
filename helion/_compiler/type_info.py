@@ -19,6 +19,7 @@ from .. import exc
 from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import BlockSizeSpec
 from ..autotuner.config_spec import NumThreadsSpec
+from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import get_device_func_replacement
 from ..language._decorators import is_api_func
 from ..language.stack_tensor import StackTensor
@@ -564,7 +565,7 @@ class TensorAttributeType(TypeInfo):
         attr = self.attr()
         if (
             origin.is_device()
-            and attr in {"chunk", "unbind"}
+            and attr in _TENSOR_METHOD_REPLACEMENTS
             and (
                 replacement := get_device_func_replacement(getattr(torch.Tensor, attr))
             )

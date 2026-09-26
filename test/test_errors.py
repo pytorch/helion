@@ -463,7 +463,6 @@ class TestErrors(RefEagerTestDisabled, TestCase):
                     ):
                         fn.bind((x, use_chunk, use_method))
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.chunk lowering is Triton-only")
     def test_torch_chunk_unbind_reject_flattened_multi_axis_tiles(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -482,7 +481,6 @@ class TestErrors(RefEagerTestDisabled, TestCase):
         ):
             code_and_output(chunk_fn, (x,), block_sizes=[2, 8], flatten_loops=[True])
 
-    @onlyBackends(["triton"])
     @skipIfNotTriton("torch.chunk lowering is Triton-only")
     def test_torch_chunk_autotune_skips_flattened_candidate(self):
         @helion.kernel(
