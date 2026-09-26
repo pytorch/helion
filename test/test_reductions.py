@@ -668,15 +668,32 @@ class TestReductions(RefEagerTestBase, TestCase):
                                 rtol=torch.finfo(x.dtype).eps,
                                 atol=1e-5,
                             )
-                            normalized = (x - mean) * torch.rsqrt(var.float() + eps)
-                            expected = (normalized * weight.float() + bias.float()).to(
-                                x.dtype
+                            centered = x.float() - mean.float()
+                            rstd = torch.rsqrt(var.float() + eps)
+                            expected = (
+                                centered * rstd * weight.float() + bias.float()
+                            ).to(x.dtype)
+                            # Some backends retain centering in FP32. Bound the
+                            # propagated BF16 subtraction error per element,
+                            # plus final output rounding and FP32 arithmetic.
+                            centered_error = (
+                                centered.to(x.dtype).float() - centered
+                            ).abs()
+                            propagated_error = (
+                                centered_error * rstd * weight.float().abs()
                             )
+                            allowed_error = (
+                                propagated_error
+                                + torch.finfo(x.dtype).eps
+                                * (expected.float().abs() + propagated_error)
+                                + 1e-5
+                            )
+                            self.assertEqual(result.dtype, x.dtype)
                             torch.testing.assert_close(
-                                result,
-                                expected,
-                                rtol=torch.finfo(x.dtype).eps,
-                                atol=1e-5,
+                                (result.float() - expected.float()) / allowed_error,
+                                torch.zeros_like(allowed_error),
+                                rtol=0,
+                                atol=1,
                             )
 
     @xfailIfPallasTpu("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
