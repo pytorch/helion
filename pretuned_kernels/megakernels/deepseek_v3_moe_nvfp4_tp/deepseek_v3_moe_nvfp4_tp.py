@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 WORLD_SIZE = 4
 W13_SPLIT_K = 7
 COMMUNICATION_N = 2048
-NUM_SM_MULTIPLIER = 4
+NUM_SM_MULTIPLIER = 1
 SIGNAL_PAD_BYTES = 32 * 1024
 
 
@@ -215,6 +215,18 @@ def _kernel_source(*, distributed: bool) -> str:
     source = source[:w13_begin] + _SPLIT_W13_SOURCE + source[w13_end:]
     source = _replace_once(
         source,
+        "for w2_tile_group in hl.tile(w2_groups, block_size=32):",
+        "for w2_tile_group in hl.tile(w2_groups, block_size=16):",
+        "routed W2 reduction group",
+    )
+    source = _replace_once(
+        source,
+        "for shared_w2_tile_group in hl.tile(w2_groups, block_size=64):",
+        "for shared_w2_tile_group in hl.tile(w2_groups, block_size=32):",
+        "shared W2 reduction group",
+    )
+    source = _replace_once(
+        source,
         "    output = torch.empty((1, hidden), dtype=torch.bfloat16, device=w2.device)\n",
         "    symmetric_rows, symmetric_hidden = symmetric_output.size()\n"
         "    symmetric_rows = hl.specialize(symmetric_rows)\n"
@@ -298,7 +310,7 @@ def _load_function(*, distributed: bool) -> Callable[..., object]:
 
 
 def _config(*, distributed: bool) -> helion.Config:
-    range_num_stages = [0, 4, 0, 0, 2, 0, 0, 2, 0, 0, 0, 3, 0, 1, 0]
+    range_num_stages = [0, 4, 0, 0, 2, 0, 0, 2, 0, 0, 0, 2, 0, 1, 0]
     range_multi_buffers = [
         None,
         None,
@@ -338,7 +350,7 @@ def _config(*, distributed: bool) -> helion.Config:
         range_multi_buffers.append(None)
         range_flattens.append(None)
     return helion.Config(
-        block_sizes=[8, 512, 32, 256, 512],
+        block_sizes=[8, 512, 32, 256, 32],
         cross_loop_pipeline="dynamic",
         host_tensor_descriptors=True,
         indexing=[

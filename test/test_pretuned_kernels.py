@@ -324,11 +324,11 @@ def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
     assert not module.deepseek_v3_moe_nvfp4_tp.settings.static_shapes
     assert config["cross_loop_pipeline"] == "dynamic"
     assert config["host_tensor_descriptors"]
-    assert config["num_sm_multiplier"] == 4
+    assert config["num_sm_multiplier"] == 1
     assert module.W13_SPLIT_K == 7
     assert module.COMMUNICATION_N == 2048
-    assert config["block_sizes"][-1] == 512
-    assert config["range_num_stages"][11] == 3
+    assert config["block_sizes"][-1] == 32
+    assert config["range_num_stages"][11] == 2
 
     distributed_source = module._kernel_source(distributed=True)
     local_source = module._kernel_source(distributed=False)
@@ -336,6 +336,10 @@ def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
     assert "get_remote_tensors" not in local_source
     assert "w13_tile_split" in distributed_source
     assert "w13_tile_split" in local_source
+    routed_w2 = "for w2_tile_group in hl.tile(w2_groups, block_size=16):"
+    shared_w2 = "for shared_w2_tile_group in hl.tile(w2_groups, block_size=32):"
+    assert routed_w2 in distributed_source and routed_w2 in local_source
+    assert shared_w2 in distributed_source and shared_w2 in local_source
     assert "inline_triton" not in distributed_source
     assert "topology" not in distributed_source
 
