@@ -14,9 +14,10 @@ Scope and safety:
   forward dataflow over ``cutlass.Float32(...)``, ``cute.math.*`` calls and
   float constants) that is read exactly once in the whole kernel — integer
   index arithmetic never matches.
-- Operands must be plain names or constants, and any name operand must be
-  assigned at most once in the kernel (codegen temporaries are SSA;
-  loop-carried accumulators are reassigned and therefore excluded).
+- Multiply operands must be plain names or constants, and any name operand
+  must be assigned at most once in the kernel. The addend may also be the
+  consumer's loop-carried accumulator, which is read at the same point
+  before and after fusion.
 - The consumer must be a top-level ``w = t + c`` / ``c + t`` / ``t - c`` /
   ``c - t`` assignment in the SAME statement list as the multiply.
 """
@@ -169,7 +170,14 @@ def _process_list(
         for t_node, c_node, t_on_left in ((left, right, True), (right, left, False)):
             if not (isinstance(t_node, ast.Name) and t_node.id in muls):
                 continue
-            if not _simple_operand(c_node, float_names, writes):
+            is_self_accumulator = (
+                isinstance(c_node, ast.Name)
+                and c_node.id in float_names
+                and canon.get(c_node.id, c_node.id) == canon.get(name, name)
+            )
+            if not (
+                is_self_accumulator or _simple_operand(c_node, float_names, writes)
+            ):
                 continue
             a, b = muls[t_node.id][1], muls[t_node.id][2]
             if isinstance(value.op, ast.Add):
