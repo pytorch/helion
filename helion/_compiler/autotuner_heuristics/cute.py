@@ -60,6 +60,7 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
+from .chained_seed_order import order_chained_seed_configs
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
@@ -3299,7 +3300,7 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                 )
                 for seed in parents
             )
-        ordered = seeds
+        ordered = order_chained_seed_configs(seeds)
         if not spec.cute_chained_initialized_accumulator_search_enabled:
             ordered = _with_early_tmem_release_seed(ordered)
             if (

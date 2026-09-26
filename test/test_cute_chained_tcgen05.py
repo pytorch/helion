@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import torch
@@ -25,6 +24,7 @@ import sys
 import tempfile
 import types
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from typing import Any
 
 import pytest

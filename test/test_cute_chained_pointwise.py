@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import os
 import re
 import subprocess
@@ -19,6 +20,7 @@ from test.test_cute_chained_tcgen05 import _tcgen_compile
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.cute.chained_pointwise_inplace import PointwiseInplace
 from helion._compiler.cute.chained_pointwise_inplace import sw128_ownership
 from helion._compiler.cute.chained_pointwise_unroll import PointwiseUnroll
@@ -28,6 +30,8 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -737,6 +741,52 @@ def test_direct_and_dot_derived_operands_do_not_advertise_unroll() -> None:
     assert POINTWISE_UNROLL_KEY not in fixed.config
 
 
+def test_search_preserves_old_order_and_reaches_both_factors() -> None:
+    with patch_cute_mma_support():
+        bound = _pointwise_dot._bind_isolated(_pointwise_args("cpu", "dense"))
+    spec = bound.config_spec
+    assert spec.cute_chained_pointwise_unroll_search_enabled
+    fragment = spec._flat_fields()[POINTWISE_UNROLL_KEY]
+    assert isinstance(fragment, EnumFragment)
+    assert fragment.search_values() == [1, 2, 4, 8]
+    assert bound.host_function is not None
+    with bound.env:
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        spec.cute_chained_pointwise_unroll_search_enabled = False
+        try:
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        finally:
+            spec.cute_chained_pointwise_unroll_search_enabled = True
+        assert old is not None and new is not None
+        assert [
+            seed for seed in new if seed.config.get(POINTWISE_UNROLL_KEY, 1) == 1
+        ] == old
+        assert new[0] == old[0]
+        generation = ConfigGeneration(spec)
+        population = [
+            generation.unflatten(flat)
+            for flat in generation.random_population_flat(100)
+        ]
+        factor2 = [
+            seed for seed in population if seed.config.get(POINTWISE_UNROLL_KEY) == 2
+        ]
+        assert factor2
+        for seed in factor2:
+            assert seed.config["cute_chained_mma_schedule"] == "tcgen05_tmem"
+            assert seed.config["cute_chained_pointwise_vectorize"] is True
+            canonical = generation.unflatten(generation.flatten(seed))
+            assert canonical.config[POINTWISE_UNROLL_KEY] == 2
+        assert population[0].config[POINTWISE_UNROLL_KEY] == 1
+    with patch(
+        "test.test_cute_chained_pointwise._pointwise_config", return_value=factor2[0]
+    ):
+        assert LOOP.search(_pointwise_code(_pointwise_args("cpu", "dense"))) is not None
+
+
 @pytest.mark.parametrize("schedule", ["coalesced", "cp_async_register"])
 def test_other_schedules_canonicalize_factor_two(schedule: str) -> None:
     with patch_cute_mma_support():
@@ -834,6 +884,69 @@ def test_larger_inactive_configs_preserve_canonical_default(factor: int) -> None
         normalized = bound.config_spec.normalized_config(config)
         assert normalized.config[POINTWISE_UNROLL_KEY] == 1
         assert normalized.config["cute_chained_pointwise_vectorize"] is False
+
+
+def test_larger_seed_factors_preserve_old_pool_order_and_reach_initial_population() -> (
+    None
+):
+    with patch_cute_mma_support():
+        bound = _pointwise_dot._bind_isolated(_pointwise_args("cpu", "dense"))
+    assert bound.host_function is not None
+    reached_configs = []
+    with bound.env:
+        with patch(
+            "helion._compiler.autotuner_heuristics.cute.VALID_CUTE_CHAINED_POINTWISE_UNROLLS",
+            (1, 2),
+        ):
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        assert old is not None and new is not None
+        assert [
+            seed for seed in new if seed.config.get(POINTWISE_UNROLL_KEY, 1) in (1, 2)
+        ] == old
+        assert new[0] == old[0]
+        old_two = [seed for seed in old if seed.config.get(POINTWISE_UNROLL_KEY) == 2]
+        assert len(new) == len(old) + 2 * len(old_two)
+        for factor in (4, 8):
+            assert Counter(
+                helion.Config.from_dict(seed.config | {POINTWISE_UNROLL_KEY: 2})
+                for seed in new
+                if seed.config.get(POINTWISE_UNROLL_KEY) == factor
+            ) == Counter(old_two)
+        generation = ConfigGeneration(bound.config_spec)
+        population = [
+            generation.unflatten(flat)
+            for flat in generation.random_population_flat(100)
+        ]
+        assert (
+            len(population) == 100 and population[0].config[POINTWISE_UNROLL_KEY] == 1
+        )
+        for factor in (2, 4, 8):
+            reached = [
+                candidate
+                for candidate in population
+                if candidate.config.get(POINTWISE_UNROLL_KEY) == factor
+                and candidate.block_sizes == [128, 64]
+            ]
+            assert reached, factor
+            assert all(
+                seed.config["cute_chained_pointwise_vectorize"]
+                and seed.config["cute_chained_mma_schedule"] == "tcgen05_tmem"
+                for seed in reached
+            )
+            config = generation.unflatten(generation.flatten(reached[0]))
+            assert config.config[POINTWISE_UNROLL_KEY] == factor
+            reached_configs.append(config)
+    for config in reached_configs:
+        with patch(
+            "test.test_cute_chained_pointwise._pointwise_config", return_value=config
+        ):
+            source = _pointwise_code(_pointwise_args("cpu", "dense"))
+        assert f"unroll={config.config[POINTWISE_UNROLL_KEY]}" in source
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -1026,6 +1139,50 @@ def test_typed_selection_and_private_activation() -> None:
         )
         is None
     )
+
+
+def test_actual_initial100_and_filtered_seed_order() -> None:
+    with patch_cute_mma_support():
+        bound = _pointwise_dot._bind_isolated(_pointwise_args("cpu", "dense"))
+    spec = bound.config_spec
+    assert bound.host_function is not None
+    assert spec.cute_chained_pointwise_inplace_search_enabled
+    with bound.env:
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        spec.cute_chained_pointwise_inplace_search_enabled = False
+        try:
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        finally:
+            spec.cute_chained_pointwise_inplace_search_enabled = True
+        assert new is not None and old is not None
+        assert [
+            seed for seed in new if not seed.config.get(POINTWISE_INPLACE_KEY)
+        ] == old
+        generation = ConfigGeneration(spec)
+        population = [
+            generation.unflatten(value)
+            for value in generation.random_population_flat(100)
+        ]
+        candidates = [
+            seed for seed in population if seed.config.get(POINTWISE_INPLACE_KEY)
+        ]
+        assert candidates
+        assert not population[0].config.get(POINTWISE_INPLACE_KEY)
+        for candidate in candidates:
+            assert (
+                generation.unflatten(generation.flatten(candidate)).config[
+                    POINTWISE_INPLACE_KEY
+                ]
+                is True
+            )
+    with patch(
+        "test.test_cute_chained_pointwise._pointwise_config", return_value=candidates[0]
+    ):
+        assert "_raw_copy =" in _pointwise_code(_pointwise_args("cpu", "dense"))
 
 
 def test_fp32_leaf_keeps_original_typed_load_path() -> None:

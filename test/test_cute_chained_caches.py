@@ -8,10 +8,12 @@ import subprocess
 import sys
 from types import SimpleNamespace
 from typing import Any
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.codecache import PyCodeCache
 
 from test.test_cute_chained_pointwise import _pointwise_code
 from test.test_cute_chained_scan_export import _scan_export
@@ -36,6 +38,8 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.base_search import PopulationBasedSearch
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import EnumFragment
 import helion.language as hl
 
@@ -1014,6 +1018,54 @@ def test_vector_read_catalog_disabled_trip_rank_and_capacity() -> None:
         (node, (f"col + {i}",), indices, value) for i in range(5)
     ]
     assert not PointwiseReadCache(True).vector_reads(expression, ("row", "col"), 8)
+
+
+@pytest.mark.parametrize("n", [32, 64])
+def test_raw_canonical_preload_and_initial_population(n: int) -> None:
+    class Stop(BaseException):
+        pass
+
+    with _cpu_codegen():
+        bound = _vector_read_pair._bind_isolated(_vector_read_args(n=n))
+        raw = _vector_read_config()
+        canonical = bound._normalized_config_copy(raw)
+        source = bound.to_code(raw)
+        assert source == bound.to_code(canonical)
+        stops = []
+
+        def stop(text: str, **kwargs: Any) -> None:
+            assert text == source
+            stops.append(text)
+            raise Stop
+
+        with (
+            patch.object(PyCodeCache, "load", side_effect=stop),
+            patch.object(type(bound.env.backend), "setup_compile_cache_dir"),
+        ):
+            for config in (raw, canonical):
+                with pytest.raises(Stop):
+                    bound.compile_config(config, allow_print=False)
+        assert len(stops) == 2
+        with bound.env:
+            generation = ConfigGeneration(bound.config_spec)
+            population = generation.random_population_flat(100)
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast("Any", SimpleNamespace(config_gen=generation)), flat
+                )
+                for flat in population
+            ]
+        cache_members = [
+            (index, member)
+            for index, member in enumerate(members)
+            if member is not None
+            and member.config.config.get(VECTOR_READ_KEY)
+            and member.config.config.get("cute_chained_k_schedule") == "serial64"
+            and member.config.config.get("cute_chained_leaf_pipeline", "legacy")
+            == "legacy"
+        ]
+        assert cache_members
+        bound.to_code(cache_members[0][1].config)
 
 
 def test_copy_coordinate_and_fp32_bit_identity() -> None:

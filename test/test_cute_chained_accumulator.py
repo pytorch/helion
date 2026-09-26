@@ -7,8 +7,10 @@ import dataclasses
 from dataclasses import replace
 import itertools
 from itertools import product
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 from unittest.mock import patch
 
 import pytest
@@ -22,6 +24,7 @@ from ._cute_aux import _cpu_codegen
 import helion
 from helion import exc
 from helion._compiler.autotuner_heuristics import cute as heuristics
+from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute import chained_initialized_accumulator as initialized
 from helion._compiler.cute import chained_matmul
@@ -31,7 +34,9 @@ from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import default_cute_mma_support
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -249,6 +254,45 @@ def test_other_schedule_rejects_true_false_canonicalizes():
         spec = _initialized_pair._bind_isolated(_initialized_args()).config_spec
         config = spec.normalized_config(_initialized_config(enabled=False))
         assert INITIALIZED_KEY not in config.config
+
+
+def test_actual_initial100_and_exact_old_order():
+    with _cpu():
+        bound = _initialized_pair._bind_isolated(_initialized_args())
+    spec = bound.config_spec
+    assert spec.cute_chained_initialized_accumulator_search_enabled
+    assert bound.host_function is not None
+    with bound.env:
+        new = CuteChainedMatmulHeuristic.get_seed_configs(
+            bound.env, bound.host_function.device_ir
+        )
+        spec.cute_chained_initialized_accumulator_search_enabled = False
+        try:
+            old = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        finally:
+            spec.cute_chained_initialized_accumulator_search_enabled = True
+        assert new is not None and old is not None
+        assert [value for value in new if not value.config.get(INITIALIZED_KEY)] == old
+        generation = ConfigGeneration(spec)
+        population = [
+            generation.unflatten(value)
+            for value in generation.random_population_flat(100)
+        ]
+        candidates = [
+            value for value in population if value.config.get(INITIALIZED_KEY)
+        ]
+        assert candidates and not population[0].config.get(INITIALIZED_KEY)
+        selected = candidates[0]
+        assert (
+            generation.unflatten(generation.flatten(selected)).config[INITIALIZED_KEY]
+            is True
+        )
+    with _cpu():
+        assert "chain_seed_copy =" in _initialized_pair._bind_isolated(
+            _initialized_args()
+        ).to_code(selected)
 
 
 def test_unavailable_scan_boundary_is_fail_closed():
@@ -818,6 +862,42 @@ def test_partial_swizzle_atom_rejects(shape, inner):
     assert _layout_bytes(shape, inner) is None
 
 
+def test_actual_seed_old_order_and_useful_first100():
+    with _cpu():
+        bound = _late_rhs_pair._bind_isolated(_late_rhs_args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env:
+            new = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            spec.cute_chained_late_rhs_reuse_search_enabled = False
+            try:
+                old = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            finally:
+                spec.cute_chained_late_rhs_reuse_search_enabled = True
+            assert new is not None and old is not None
+            assert [seed for seed in new if not seed.config.get(LATE_RHS_KEY)] == old
+            assert new[0] == old[0]
+            generation = ConfigGeneration(spec)
+            population = [
+                generation.unflatten(item)
+                for item in generation.random_population_flat(100)
+            ]
+        useful = [
+            value
+            for value in population
+            if value.config.get(LATE_RHS_KEY)
+            and value.config.get("cute_chained_pointwise_unroll") == 8
+            and value.config.get("cute_chained_pointwise_read_cache")
+        ]
+        assert useful
+        source = bound.to_code(useful[0])
+        assert "chain_output_ptr = chain_a_workspace" in source
+
+
 def test_no_cuda_initialization():
     before = torch.cuda.is_initialized()
     _late_rhs_code(_late_rhs_args())
@@ -1178,6 +1258,84 @@ def test_real_codegen_rejects_injected_future_tmem_read():
         _tmem_free_bound().to_code(_tmem_free_config())
 
 
+@pytest.mark.parametrize("kind", ["single", "plain", "scan", "three"])
+def test_exact_one_typed_sibling_preserves_old_pool_and_first100(kind):
+    from test.test_cute_chained_tcgen05 import _without_startup_seed
+
+    from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
+
+    with _cpu_codegen():
+        bound = _tmem_free_bound(kind)
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env, bound.host_function:
+            pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            assert pool is not None
+            pool = _without_startup_seed(pool)
+            enabled = [
+                (i, seed)
+                for i, seed in enumerate(pool)
+                if seed.config.get(TMEM_FREE_KEY) == "last_read"
+            ]
+            assert len(enabled) == 1
+            index, sibling = enabled[0]
+            assert index > 0
+            assert sibling.config == pool[index - 1].config | {
+                TMEM_FREE_KEY: "last_read"
+            }
+            with patch(
+                "helion._compiler.autotuner_heuristics.cute._with_last_read_seed",
+                side_effect=lambda seeds: seeds,
+            ):
+                legacy_pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            assert legacy_pool is not None
+            legacy_pool = _without_startup_seed(legacy_pool)
+            assert len(pool) == len(legacy_pool) + 1
+            assert [
+                dict(seed) for seed in pool if TMEM_FREE_KEY not in seed.config
+            ] == [dict(seed) for seed in legacy_pool]
+            assert dict(spec.default_config()).get(TMEM_FREE_KEY) is None
+            generation = ConfigGeneration(spec)
+            flat = generation.random_population_flat(100)
+            user = _tmem_free_config("legacy")
+            priority = generation.random_population_flat(100, user_seed_configs=[user])
+            assert priority[0] == generation.default_flat()
+            assert generation.unflatten(priority[1]) == bound._normalized_config_copy(
+                user
+            )
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast(
+                        "PopulationBasedSearch", SimpleNamespace(config_gen=generation)
+                    ),
+                    row,
+                )
+                for row in flat
+            ]
+        selected = [
+            (i, member)
+            for i, member in enumerate(members)
+            if member is not None
+            and member.config.config.get(TMEM_FREE_KEY) == "last_read"
+        ]
+        assert selected and selected[0][0] < 100
+        source = bound.to_code(selected[0][1].config)
+        assert "chain_allocator.free(chain_tptr)" in source
+        assert _inverse(source) == bound.to_code(
+            helion.Config.from_dict(
+                {
+                    key: value
+                    for key, value in selected[0][1].config.config.items()
+                    if key != TMEM_FREE_KEY
+                }
+            )
+        )
+
+
 # Tmem early release.
 
 EARLY_RELEASE_KEY = CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY
@@ -1522,3 +1680,54 @@ def test_one_seed_twin_preserves_objects_and_all_old_priority() -> None:
     )
     assert heuristics._with_early_tmem_release_seed([]) == []
     assert heuristics._with_early_tmem_release_seed(seeds[:1]) == seeds[:1]
+
+
+@pytest.mark.parametrize("initialized", (False, True))
+def test_actual_initial100_flat_roundtrip_default_and_old_order(
+    initialized: bool,
+) -> None:
+    with _cpu():
+        bound = _initialized_pair._bind_isolated(_initialized_args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        spec.cute_chained_initialized_accumulator_search_enabled = initialized
+        with bound.env:
+            new = heuristics.CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            with patch.object(
+                heuristics,
+                "_with_early_tmem_release_seed",
+                side_effect=lambda seeds: seeds,
+            ):
+                old = heuristics.CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            assert new is not None and old is not None
+            assert len(new) == len(old) + 1
+            assert [
+                seed for seed in new if not seed.config.get(EARLY_RELEASE_KEY)
+            ] == old
+            assert new[0] == old[0]
+            # Rebinding registration already recorded the real compiler pool.
+            generation = ConfigGeneration(spec)
+            population = [
+                generation.unflatten(item)
+                for item in generation.random_population_flat(100)
+            ]
+            selected = [
+                seed for seed in population if seed.config.get(EARLY_RELEASE_KEY)
+            ]
+            assert len(selected) >= 1
+            assert not population[0].config.get(EARLY_RELEASE_KEY)
+            assert (
+                generation.unflatten(generation.flatten(selected[0])).config[
+                    EARLY_RELEASE_KEY
+                ]
+                is True
+            )
+        new_source = bound.to_code(selected[0])
+        old_source = bound.to_code(
+            helion.Config.from_dict(selected[0].config | {EARLY_RELEASE_KEY: False})
+        )
+        _assert_only_release(old_source, new_source)

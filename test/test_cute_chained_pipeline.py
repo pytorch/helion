@@ -41,6 +41,8 @@ from helion._compiler.cute import chained_tcgen05
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.config_generation import ConfigGeneration
+from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -297,6 +299,30 @@ def test_guard_precedes_builder_and_cache() -> None:
     assert source.index("validate_arguments(cute_kernel, args_tuple)") < source.index(
         "_cute_last_launch_cache_entry("
     )
+
+
+def test_actual_initial_pool_admission() -> None:
+    from helion.autotuner.config_generation import ConfigGeneration
+    from helion.autotuner.pattern_search import PatternSearch
+
+    with cpu_codegen():
+        bound = _tcgen_chain._bind_isolated((*_tcgen_inputs("cpu"), "decay"))
+        generation = ConfigGeneration(bound.env.config_spec)
+        search = PatternSearch.__new__(PatternSearch)
+        search.config_gen = generation
+        raw = generation.random_population_flat(100)
+        admitted = []
+        for index, flat in enumerate(raw[:100]):
+            member = search.make_unbenchmarked(flat)
+            if (
+                member is not None
+                and member.config.config.get("cute_chained_startup_transfer") == "tma"
+            ):
+                source = bound.to_code(member.config)
+                assert "chained_startup_tma" in source
+                admitted.append(index)
+                break
+        assert len(raw) >= 100 and admitted, (len(raw), admitted)
 
 
 @pytest.mark.parametrize("inner", [0, 1])
@@ -679,6 +705,50 @@ def test_real_raw_canonical_preload_stops(mode):
         assert observed == [expected, expected] and not bound._compile_cache
 
 
+def test_actual_pool_and_normalized_first100():
+    from types import SimpleNamespace
+
+    from helion.autotuner.base_search import PopulationBasedSearch
+
+    with _cpu():
+        bound = _late_rhs_pair._bind_isolated(_late_rhs_args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env:
+            pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            spec.cute_chained_k_schedule_search_enabled = False
+            try:
+                old = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            finally:
+                spec.cute_chained_k_schedule_search_enabled = True
+            assert pool is not None and old is not None
+            assert [seed for seed in pool if K_SCHEDULE_KEY not in seed.config] == old
+            assert len(pool) == len(old) + 2 and pool[0] == old[0]
+            generation = ConfigGeneration(spec)
+            flats = generation.random_population_flat(100)
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast(
+                        "PopulationBasedSearch", SimpleNamespace(config_gen=generation)
+                    ),
+                    flat,
+                )
+                for flat in flats
+            ]
+            population = [member.config for member in members if member is not None]
+            assert len(members) == 100
+        for mode in ("serial64", "overlap64"):
+            candidate = next(
+                item for item in population if item.config.get(K_SCHEDULE_KEY) == mode
+            )
+            assert "chain_k_half" in bound.to_code(candidate)
+            assert generation.unflatten(generation.flatten(candidate)) == candidate
+
+
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("cache", (False, True))
 @pytest.mark.parametrize("unroll", (1, 2, 4, 8))
@@ -874,6 +944,47 @@ def test_real_raw_canonical_stops():
                     bound.compile_config(request, allow_print=False)
         assert observed == [expected, expected]
         assert not bound._compile_cache
+
+
+def test_seed_pool_and_real_first100():
+    from helion._compiler.autotuner_heuristics.cute import CuteChainedMatmulHeuristic
+    from helion.autotuner.base_search import PopulationBasedSearch
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    with _cpu():
+        bound = pair._bind_isolated(args())
+        spec = bound.config_spec
+        assert bound.host_function is not None
+        with bound.env:
+            pool = CuteChainedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+            spec.cute_chained_leaf_pipeline_search_enabled = False
+            try:
+                old = CuteChainedMatmulHeuristic.get_seed_configs(
+                    bound.env, bound.host_function.device_ir
+                )
+            finally:
+                spec.cute_chained_leaf_pipeline_search_enabled = True
+            assert pool is not None and old is not None
+            assert [c for c in pool if LEAF_KEY not in c.config] == old
+            assert len(pool) == len(old) + 1 and pool[0] == old[0]
+            generation = ConfigGeneration(spec)
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast(
+                        "PopulationBasedSearch", SimpleNamespace(config_gen=generation)
+                    ),
+                    flat,
+                )
+                for flat in generation.random_population_flat(100)
+            ]
+        member = next(
+            m
+            for m in members
+            if m is not None and m.config.config.get(LEAF_KEY) == "paired_tma"
+        )
+        assert "chained_paired_leaf_tma" in bound.to_code(member.config)
 
 
 @pytest.mark.parametrize(
@@ -1423,6 +1534,35 @@ def test_m64_seed_adds_one_direct_sibling_preserving_legacy_objects():
     assert _with_chained_startup_seed([legacy], [legacy], prefer_direct=True) == [
         legacy
     ]
+
+
+def test_m64_actual_initial100_normalizes_and_admits():
+    with cpu_codegen():
+        bound = _one._bind_isolated(_startup_m64_values())
+        generation = ConfigGeneration(bound.env.config_spec)
+        search = PatternSearch.__new__(PatternSearch)
+        search.config_gen = generation
+        population = generation.random_population_flat(100)
+        expected = search.make_unbenchmarked(
+            generation.flatten(
+                next(
+                    seed
+                    for seed in bound.config_spec.compiler_seed_configs
+                    if seed.config.get(STARTUP_M64_KEY) == "tma"
+                )
+            )
+        )
+        assert expected is not None
+        admitted = []
+        for position, flat in enumerate(population[:100]):
+            member = search.make_unbenchmarked(flat)
+            if member is not None and member.config == expected.config:
+                source = bound.to_code(member.config)
+                assert member.config.config["cute_chained_direct_output"]
+                assert "tcgen05.Ld16x256bOp" in source
+                assert "tma_bar_ptr=chain_start_bar" in source
+                admitted.append(position)
+        assert len(population) >= 100 and admitted
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

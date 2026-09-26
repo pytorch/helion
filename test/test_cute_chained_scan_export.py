@@ -9,10 +9,12 @@ import sys
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.codecache import PyCodeCache
 
 from test.test_cute_chained_tcgen05 import _tcgen_compile
 
@@ -25,6 +27,8 @@ from helion._compiler.device_ir import RootGraphInfo
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
+from helion.autotuner.base_search import PopulationBasedSearch
+from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
@@ -926,6 +930,52 @@ def test_vector_exports_actual_host_fresh_returns_and_consumer(
                 for value in consumer_args
             )
             retained.extend(outputs)
+
+
+def test_vector_exports_raw_normalized_preload_and_population() -> None:
+    class Stop(BaseException):
+        pass
+
+    with _scan_export_cpu_codegen():
+        bound = _vectors._bind_isolated((*_vector_export_args(), "normal"))
+        raw = _scan_export_config()
+        normalized = bound._normalized_config_copy(raw)
+        expected = bound.to_code(raw)
+        assert bound.to_code(normalized) == expected
+        calls: list[str] = []
+
+        def stop(source: str, **kwargs: Any) -> None:
+            calls.append(source)
+            assert source == expected
+            raise Stop
+
+        with (
+            patch.object(PyCodeCache, "load", side_effect=stop),
+            patch.object(type(bound.env.backend), "setup_compile_cache_dir"),
+        ):
+            for config in (raw, normalized):
+                with pytest.raises(Stop):
+                    bound.compile_config(config, allow_print=False)
+        assert len(calls) == 2
+        assert not bound._compile_cache
+        with bound.env:
+            generation = ConfigGeneration(bound.config_spec)
+            rows = generation.random_population_flat(100)
+            members = [
+                PopulationBasedSearch.make_unbenchmarked(
+                    cast("Any", SimpleNamespace(config_gen=generation)), row
+                )
+                for row in rows
+            ]
+        assert len(members) == 100
+        eligible = [
+            member
+            for member in members
+            if member is not None
+            and member.config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        ]
+        assert eligible
+        assert "chain_export_1_index" in bound.to_code(eligible[0].config)
 
 
 class _Pointer:
