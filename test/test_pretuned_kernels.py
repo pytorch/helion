@@ -324,8 +324,11 @@ def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
     assert not module.deepseek_v3_moe_nvfp4_tp.settings.static_shapes
     assert config["cross_loop_pipeline"] == "dynamic"
     assert config["host_tensor_descriptors"]
-    assert config["num_sm_multiplier"] == 2
+    assert config["num_sm_multiplier"] == 4
     assert module.W13_SPLIT_K == 7
+    assert module.COMMUNICATION_N == 2048
+    assert config["block_sizes"][-1] == 512
+    assert config["range_num_stages"][11] == 3
 
     distributed_source = module._kernel_source(distributed=True)
     local_source = module._kernel_source(distributed=False)

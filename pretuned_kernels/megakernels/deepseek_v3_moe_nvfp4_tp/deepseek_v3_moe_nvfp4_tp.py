@@ -41,8 +41,8 @@ if TYPE_CHECKING:
 
 WORLD_SIZE = 4
 W13_SPLIT_K = 7
-COMMUNICATION_N = 1024
-NUM_SM_MULTIPLIER = 2
+COMMUNICATION_N = 2048
+NUM_SM_MULTIPLIER = 4
 SIGNAL_PAD_BYTES = 32 * 1024
 
 
@@ -298,7 +298,7 @@ def _load_function(*, distributed: bool) -> Callable[..., object]:
 
 
 def _config(*, distributed: bool) -> helion.Config:
-    range_num_stages = [0, 4, 0, 0, 2, 0, 0, 2, 0, 0, 0, 2, 0, 1, 0]
+    range_num_stages = [0, 4, 0, 0, 2, 0, 0, 2, 0, 0, 0, 3, 0, 1, 0]
     range_multi_buffers = [
         None,
         None,
@@ -338,7 +338,7 @@ def _config(*, distributed: bool) -> helion.Config:
         range_multi_buffers.append(None)
         range_flattens.append(None)
     return helion.Config(
-        block_sizes=[8, 512, 32, 256, 32],
+        block_sizes=[8, 512, 32, 256, 512],
         cross_loop_pipeline="dynamic",
         host_tensor_descriptors=True,
         indexing=[
@@ -433,16 +433,18 @@ def main(verbose: bool = True) -> dict[str, Any]:
         )
         vllm_local = vllm_call()
         source_module._validate_vllm(local, vllm_local, routing_replay)
-        expected = local[0].clone()
-        gathered_local = [torch.empty_like(expected) for _ in range(WORLD_SIZE)]
-        dist.all_gather(gathered_local, expected)
+        helion_expected = local[0].clone()
+        vllm_expected = vllm_local.clone()
+        gathered_local = [torch.empty_like(helion_expected) for _ in range(WORLD_SIZE)]
+        dist.all_gather(gathered_local, helion_expected)
         if any(
             torch.equal(left, right)
             for index, left in enumerate(gathered_local)
             for right in gathered_local[index + 1 :]
         ):
             raise AssertionError("rank-local MoE outputs must differ")
-        dist.all_reduce(expected)
+        dist.all_reduce(helion_expected)
+        dist.all_reduce(vllm_expected)
         actual = persistent()
         current_signature = (
             source_module._dispatch_cache_signature(deepseek_v3_moe_nvfp4_tp),
@@ -456,9 +458,18 @@ def main(verbose: bool = True) -> dict[str, Any]:
         production_actual = production()
         torch.cuda.synchronize()
         dist.barrier()
-        torch.testing.assert_close(actual[0], expected, rtol=2e-2, atol=6.25e-2)
-        torch.testing.assert_close(standalone_actual, expected, rtol=2e-2, atol=6.25e-2)
-        torch.testing.assert_close(production_actual, expected, rtol=3e-2, atol=1.25e-1)
+        torch.testing.assert_close(actual[0], helion_expected, rtol=2e-2, atol=6.25e-2)
+        torch.testing.assert_close(
+            standalone_actual, helion_expected, rtol=2e-2, atol=6.25e-2
+        )
+        torch.testing.assert_close(
+            production_actual, vllm_expected, rtol=3e-2, atol=1.25e-1
+        )
+        aggregate_error = source_module._similarity_error(actual[0], production_actual)
+        if not math.isfinite(aggregate_error) or aggregate_error > 1e-3:
+            raise AssertionError(
+                f"distributed vLLM similarity error {aggregate_error:.6g} exceeds 1e-3"
+            )
         for actual_value, local_value in zip(actual[1:], local[1:], strict=True):
             torch.testing.assert_close(actual_value, local_value, rtol=0, atol=0)
 
@@ -469,13 +480,17 @@ def main(verbose: bool = True) -> dict[str, Any]:
         }
 
         def validate_replay(
-            name: str, value: object, expected: torch.Tensor = expected
+            name: str,
+            value: object,
+            helion_expected: torch.Tensor = helion_expected,
+            vllm_expected: torch.Tensor = vllm_expected,
         ) -> None:
             output = (
                 cast("tuple[torch.Tensor, ...]", value)[0]
                 if name == "distributed_helion"
                 else cast("torch.Tensor", value)
             )
+            expected = vllm_expected if name.startswith("vllm_") else helion_expected
             torch.testing.assert_close(output, expected, rtol=3e-2, atol=1.25e-1)
 
         results = benchmark(launches, validate=validate_replay)
