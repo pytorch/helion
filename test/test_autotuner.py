@@ -10614,9 +10614,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.args = (original,)
         search.log = AutotuningLogger(settings)
         search.best_perf_so_far = 100.0
+        benchmark_isolated = Mock(return_value=None)
         search.benchmark_provider = SimpleNamespace(
             mutated_arg_indices=[0],
-            benchmark_isolated=lambda _fns, *, warmup, rep, desc: None,
+            benchmark_isolated=benchmark_isolated,
         )
         search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
         observed_pointers: dict[str, list[int]] = {"a": [], "b": []}
@@ -10664,6 +10665,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 candidate_private_args=True,
             )
 
+        benchmark_isolated.assert_called_once()
+        self.assertTrue(benchmark_isolated.call_args.kwargs["fresh_process"])
         self.assertEqual(clone_args.call_count, 3)
         self.assertTrue(
             all(
@@ -10820,7 +10823,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         reps: list[int] = []
 
         def benchmark_isolated(
-            fns: list[Callable[[], object]], *, warmup: int, rep: int, desc: str
+            fns: list[Callable[[], object]],
+            *,
+            warmup: int,
+            rep: int,
+            desc: str,
+            fresh_process: bool = False,
         ) -> list[float]:
             reps.append(rep)
             return [0.05 for _ in fns]
@@ -11071,7 +11079,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         members = [initial_fast_final_slow, middle, initial_slow_final_fast]
 
         def benchmark_isolated(
-            fns: list[Callable[[], object]], *, warmup: int, rep: int, desc: str
+            fns: list[Callable[[], object]],
+            *,
+            warmup: int,
+            rep: int,
+            desc: str,
+            fresh_process: bool = False,
         ) -> list[float]:
             self.assertEqual(len(fns), 3)
             return [10.0, 5.0, 0.5]
