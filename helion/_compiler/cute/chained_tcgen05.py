@@ -4,8 +4,8 @@ Pointwise semantics and indexing come from the common chain interpreter. Only
 an exclusive, coordinate-preserving edge into operand A uses packed TMEM;
 other live results retain an FP32 shared boundary. The default performs no graph
 reassociation; initialized-accumulator reuse is an explicit FP32 reassociation
-option.
-M128 uses the full datapath family.
+option. M128 uses the full datapath family; an independent M64 result uses
+the explicitly proven sparse 16x256 load and optional direct output transport.
 """
 
 from __future__ import annotations
@@ -29,6 +29,9 @@ from .chained_pointwise_inplace import PointwiseInplace
 from .chained_pointwise_inplace import raw_preload
 from .chained_pointwise_inplace import sw128_ownership
 from .chained_pointwise_unroll import PointwiseUnroll
+from .chained_result_transport import direct_store
+from .chained_result_transport import is_m64_plan
+from .chained_result_transport import load_operation
 from .chained_scan_export import codegen_scan_exports
 from .fx_matcher import _GeneratedCodeTemplate
 from .tcgen05_config import CuteTcgen05Config
@@ -55,7 +58,10 @@ def supported_plan(plan: ChainedMatmulPlan) -> bool:
     """Conservative physical bounds, separate from the common semantic proof."""
     if plan.threads != 128 or any(size % block for _, size, block in plan.axes):
         return False
-    if any(
+    m64 = is_m64_plan(plan)
+    if plan.direct_output and not m64:
+        return False
+    if not m64 and any(
         m != 128 or n % 32 or not 32 <= n <= 256 or k % 16 or k <= 0
         for m, n, k in plan.shapes
     ):
@@ -83,7 +89,7 @@ def _shared_memory_bytes(plan: ChainedMatmulPlan) -> int:
         else 2 * max(n * k for _, n, k in plan.shapes),
         (
             0
-            if plan.late_rhs_reuse is not None
+            if plan.late_rhs_reuse is not None or plan.direct_output
             else 2 * plan.shapes[-1][1] * plan.shapes[-1][2]
             if _prefetch_final_b(plan)
             else math.prod(final_shape)
@@ -458,7 +464,7 @@ def _pointwise_stage(
 
 def _load_result(prefix: str, shape: tuple[int, int]) -> list[str]:
     return [
-        f"{prefix}_copy = tcgen05.make_tmem_copy(cute.make_copy_atom({'tcgen05.Ld32x32bOp(tcgen05.Repetition(32))'}, cutlass.Float32), {prefix}_acc)",
+        f"{prefix}_copy = tcgen05.make_tmem_copy(cute.make_copy_atom({load_operation(shape)}, cutlass.Float32), {prefix}_acc)",
         f"{prefix}_thread = {prefix}_copy.get_slice(chain_thread)",
         f"{prefix}_source = {prefix}_thread.partition_S({prefix}_acc)",
         f"{prefix}_identity = {prefix}_slice.partition_C(cute.make_identity_tensor({shape!r}))",
@@ -769,6 +775,11 @@ def _epilogue(
             f"    chain_epi_values[{index}] = {dtype}({value})",
             *(
                 [
+                    "cute.arch.sync_threads()",
+                    *direct_store(cg, plan, expression, coords, prefix),
+                ]
+                if plan.direct_output
+                else [
                     f"chain_epi_target = {prefix}_thread.partition_D({prefix}_slice.partition_C(chain_output))",
                     "cute.autovec_copy(chain_epi_values, chain_epi_target)",
                     "cute.arch.sync_threads()",
@@ -778,6 +789,79 @@ def _epilogue(
         ]
     )
     return lines
+
+
+def _last_read_epilogue(
+    body: list[str], epilogue: list[str], final_stage: int
+) -> list[str]:
+    """Release only after a complete register snapshot and all-reader rendezvous.
+
+    The resident emitter owns these storage names. Track aliases of its TMEM
+    pointer, but not pure layout/copy metadata or newly allocated registers.
+    Fail closed if the following epilogue still references any TMEM storage.
+    """
+    prefix = f"chain_{final_stage}"
+    if body[-3:] != [
+        f"cute.copy({prefix}_copy, {prefix}_source, {prefix}_values)",
+        "cute.arch.fence_view_async_tmem_load()",
+        "cute.arch.sync_threads()",
+    ]:
+        raise chain._UnsupportedChain(
+            "last_read requires the final TMEM load fence and CTA rendezvous"
+        )
+    aliases = {"chain_tptr"}
+    metadata_factories = {
+        "cute.make_rmem_tensor",
+        "cute.make_identity_tensor",
+        "cute.make_copy_atom",
+        "cute.make_tiled_copy_tv",
+        "tcgen05.make_tmem_copy",
+    }
+
+    def depends(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in aliases
+        if isinstance(node, ast.Attribute) and node.attr in (
+            "shape",
+            "layout",
+            "dtype",
+        ):
+            return False
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in metadata_factories:
+            return False
+        return any(depends(child) for child in ast.iter_child_nodes(node))
+
+    statements = ast.parse("\n".join(body))
+    while True:
+        previous = set(aliases)
+        for node in ast.walk(statements):
+            if isinstance(node, ast.Assign) and depends(node.value):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases.add(target.id)
+                    else:
+                        raise chain._UnsupportedChain(
+                            "last_read has an unproven TMEM alias target"
+                        )
+            elif isinstance(
+                node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
+            ) and depends(node):
+                raise chain._UnsupportedChain(
+                    "last_read has an unproven TMEM alias statement"
+                )
+        if aliases == previous:
+            break
+    for node in ast.walk(ast.parse("\n".join(epilogue))):
+        if (
+            (
+                isinstance(node, ast.Name)
+                and node.id in aliases | {"chain_allocator", "tcgen05"}
+            )
+            or (isinstance(node, ast.Attribute) and "tmem" in node.attr)
+            or (isinstance(node, ast.Call) and ast.unparse(node.func) == "cute.gemm")
+        ):
+            raise chain._UnsupportedChain("last_read epilogue has a later TMEM use")
+    return ["chain_allocator.free(chain_tptr)", *epilogue]
 
 
 def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
@@ -793,6 +877,7 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             "bool", df.config.config.get("cute_chained_pointwise_inplace_async", False)
         )
     )
+    early_release = df.config.config.get("cute_chained_tmem_early_release", False)
     dtype = CompileEnvironment.current().backend.dtype_str(plan.dtype)
     index_dtype = CompileEnvironment.current().backend.dtype_str(
         CompileEnvironment.current().index_dtype
@@ -867,7 +952,9 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                 f"chain_a_workspace = cute.arch.alloc_smem({dtype}, {a_size}, alignment=128)",
                 f"chain_b_workspace = cute.arch.alloc_smem({dtype}, {b_size}, alignment=128)",
                 *(
-                    [
+                    []
+                    if plan.direct_output
+                    else [
                         (
                             "chain_output_ptr = chain_a_workspace"
                             if plan.late_rhs_reuse is not None
@@ -891,6 +978,10 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                 f"chain_allocator.allocate({tmem_columns})",
             ]
         )
+        if early_release:
+            # Allocation and release use the same fully active allocator warp.
+            # No later allocation occurs; wait/retrieve still publish the pointer.
+            lines.append("chain_allocator.relinquish_alloc_permit()")
         deferred_rhs: list[str] = []
         prefetch_position = len(lines)
         deferred_position = 0
@@ -934,8 +1025,8 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
         if df.config.config.get("cute_chained_auxiliary_cache"):
             device = cast("Node", plan.dots[0].args[0]).meta["val"].device
             cache_plan = (
-                dataclasses.replace(plan, late_rhs_reuse=None)
-                if plan.late_rhs_reuse is not None
+                dataclasses.replace(plan, late_rhs_reuse=None, direct_output=False)
+                if plan.late_rhs_reuse is not None or plan.direct_output
                 else plan
             )
             cache_lines, early_cached = make_early_auxiliary_cache(
@@ -1019,7 +1110,8 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
                         "chain_tptr = chain_allocator.retrieve_ptr(cutlass.Float32)",
                     ]
                 )
-                lines.append("chain_allocator.relinquish_alloc_permit()")
+                if not early_release:
+                    lines.append("chain_allocator.relinquish_alloc_permit()")
             if stage in bridges:
                 if (
                     stage == final_stage
@@ -1103,8 +1195,13 @@ def codegen_chained_tcgen05(cg: GenerateAST, plan: ChainedMatmulPlan) -> bool:
             *_epilogue(cg, plan, boundaries, scans, staged),
             *codegen_scan_exports(cg, plan, boundaries, scans),
         ]
-        lines.extend(epilogue)
-        lines.extend(["cute.arch.sync_threads()", "chain_allocator.free(chain_tptr)"])
+        if df.config.config.get("cute_chained_tmem_free", "legacy") == "last_read":
+            lines.extend(_last_read_epilogue(lines, epilogue, final_stage))
+        else:
+            lines.extend(epilogue)
+            lines.extend(
+                ["cute.arch.sync_threads()", "chain_allocator.free(chain_tptr)"]
+            )
         pointwise_unroll.validate()
         pointwise_cache.validate()
         pointwise_inplace.validate()

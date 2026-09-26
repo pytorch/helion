@@ -774,6 +774,8 @@ VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
 CUTE_CHAINED_MMA_SCHEDULE_KEY = "cute_chained_mma_schedule"
 CUTE_CHAINED_POINTWISE_VECTORIZE_KEY = "cute_chained_pointwise_vectorize"
+CUTE_CHAINED_TMEM_FREE_KEY = "cute_chained_tmem_free"
+VALID_CUTE_CHAINED_TMEM_FREE_SCHEDULES = ("legacy", "last_read")
 CUTE_CHAINED_POINTWISE_UNROLL_KEY = "cute_chained_pointwise_unroll"
 CUTE_CHAINED_POINTWISE_READ_CACHE_KEY = "cute_chained_pointwise_read_cache"
 CUTE_CHAINED_POINTWISE_INPLACE_KEY = "cute_chained_pointwise_inplace_async"
@@ -788,6 +790,8 @@ VALID_CUTE_LOOP_LOAD_SCHEDULES = (
 )
 CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY = "cute_chained_initialized_accumulator"
 CUTE_CHAINED_LATE_RHS_REUSE_KEY = "cute_chained_late_rhs_reuse"
+CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY = "cute_chained_tmem_early_release"
+CUTE_CHAINED_DIRECT_OUTPUT_KEY = "cute_chained_direct_output"
 VALID_CUTE_CHAINED_POINTWISE_UNROLLS = (1, 2, 4, 8)
 CUTE_CHAINED_AUXILIARY_CACHE_KEY = "cute_chained_auxiliary_cache"
 VALID_CUTE_CHAINED_MMA_SCHEDULES = (
@@ -875,6 +879,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_TMEM_FREE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
         CUTE_CHAINED_POINTWISE_INPLACE_KEY,
@@ -882,6 +887,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
         CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
+        CUTE_CHAINED_DIRECT_OUTPUT_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_threads",
         "cute_vector_widths",
@@ -929,6 +936,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_TMEM_FREE_KEY,
         CUTE_CHAINED_POINTWISE_UNROLL_KEY,
         CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
         CUTE_CHAINED_POINTWISE_INPLACE_KEY,
@@ -936,6 +944,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_LOOP_LOAD_SCHEDULE_KEY,
         CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
         CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
+        CUTE_CHAINED_DIRECT_OUTPUT_KEY,
         CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_warps",
         "num_stages",
@@ -1292,6 +1302,7 @@ class ConfigSpec:
         self.cute_chained_pointwise_inplace_search_enabled: bool = False
         self.cute_chained_initialized_accumulator_search_enabled: bool = False
         self.cute_chained_late_rhs_reuse_search_enabled: bool = False
+        self.cute_chained_direct_output_search_enabled: bool = False
         self.compiler_seed_configs: list[helion.Config] = []
         # Compiler paths can opt their seeds into a single bounded timeout
         # retry. ``None`` leaves all benchmark behavior unchanged.
@@ -2646,6 +2657,29 @@ class ConfigSpec:
                 f"{key} requires cute_loop_vectorize on an independent tile-valued loop"
             )
 
+    def _normalize_cute_chained_tmem_free(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_TMEM_FREE_KEY
+        value = config.get(key, "legacy")
+        if (
+            type(value) is not str
+            or value not in VALID_CUTE_CHAINED_TMEM_FREE_SCHEDULES
+        ):
+            raise InvalidConfig(f"{key} must be legacy or last_read")
+        if value == "legacy":
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get("num_warps", DEFAULT_NUM_WARPS) != 4
+            or config.get("pid_type", "flat") != "flat"
+            or config.get("cute_cluster_n", 1) != 1
+        ):
+            raise InvalidConfig(
+                f"{key} requires a resident one-CTA chained TCgen05 schedule"
+            )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -2809,6 +2843,7 @@ class ConfigSpec:
                 )
 
         self._normalize_cute_loop_load_schedule(config)
+        self._normalize_cute_chained_tmem_free(config)
 
         for name in (
             "block_size",
@@ -3223,6 +3258,32 @@ class ConfigSpec:
                 config.pop(CUTE_CHAINED_MMA_SCHEDULE_KEY)
             else:
                 raise InvalidConfig("chained MMA schedules require a contraction DAG")
+        if CUTE_CHAINED_DIRECT_OUTPUT_KEY in config:
+            direct_output = config[CUTE_CHAINED_DIRECT_OUTPUT_KEY]
+            if type(direct_output) is not bool:
+                raise InvalidConfig("cute_chained_direct_output must be bool")
+            if not direct_output:
+                config.pop(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+            elif (
+                not self.cute_chained_direct_output_search_enabled
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "direct output requires a resident one-dot M64 schedule"
+                )
+        if CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY in config:
+            early_release = config[CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY]
+            if type(early_release) is not bool:
+                raise InvalidConfig("cute_chained_tmem_early_release must be bool")
+            if not early_release:
+                config.pop(CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY)
+            elif (
+                not self.cute_chained_tcgen05_search_enabled
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "early TMEM release requires a resident chained TCgen05 schedule"
+                )
         if CUTE_CHAINED_LATE_RHS_REUSE_KEY in config:
             late_rhs = config[CUTE_CHAINED_LATE_RHS_REUSE_KEY]
             if type(late_rhs) is not bool:
@@ -3923,6 +3984,15 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if key == CUTE_CHAINED_TMEM_FREE_KEY:
+                return True, "legacy"
+            if key in (
+                CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
+                CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+                CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
+                CUTE_CHAINED_DIRECT_OUTPUT_KEY,
+            ):
+                return True, False
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
@@ -4117,6 +4187,9 @@ class ConfigSpec:
                     fields[CUTE_CHAINED_AUXILIARY_CACHE_KEY] = EnumFragment(
                         choices=(False, True)
                     )
+                    fields[CUTE_CHAINED_TMEM_FREE_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_TMEM_FREE_SCHEDULES
+                    )
                     if self.cute_chained_pointwise_read_cache_search_enabled:
                         fields[CUTE_CHAINED_POINTWISE_READ_CACHE_KEY] = EnumFragment(
                             choices=(False, True)
@@ -4131,6 +4204,13 @@ class ConfigSpec:
                         )
                     if self.cute_chained_late_rhs_reuse_search_enabled:
                         fields[CUTE_CHAINED_LATE_RHS_REUSE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    fields[CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY] = EnumFragment(
+                        choices=(False, True)
+                    )
+                    if self.cute_chained_direct_output_search_enabled:
+                        fields[CUTE_CHAINED_DIRECT_OUTPUT_KEY] = EnumFragment(
                             choices=(False, True)
                         )
                 fields.update(self.user_defined_tunables)

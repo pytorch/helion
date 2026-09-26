@@ -1108,6 +1108,23 @@ def test_vector_exports_raw_only_computed_family_fails_closed() -> None:
             bound.to_code(helion.Config(block_sizes=[128, 64], num_warps=4))
 
 
+@pytest.mark.parametrize("direct", [False, True])
+def test_vector_exports_m64_transport(direct: bool) -> None:
+    with _scan_export_cpu_codegen():
+        config = helion.Config(
+            block_sizes=[64, 64],
+            num_warps=4,
+            cute_chained_mma_schedule="tcgen05_tmem",
+            cute_chained_direct_output=direct,
+        )
+        source = _vectors._bind_isolated((*_vector_export_args(), "normal")).to_code(
+            config
+        )
+    assert "Ld16x256bOp" in source
+    assert "chain_export_1_index" in source
+    assert "chain_export_2_index" in source
+
+
 if __name__ == "__main__":
     command = sys.argv.pop(1)
     if command == "scan_export":

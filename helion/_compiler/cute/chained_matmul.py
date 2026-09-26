@@ -70,6 +70,7 @@ class ChainedMatmulPlan:
     scan_exports: tuple[ScanExport, ...] = ()
     initialized_accumulator: InitializedAccumulator | None = None
     late_rhs_reuse: LateRhsArenaPlan | None = None
+    direct_output: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -526,6 +527,7 @@ def plan_chained_matmul(graphs: Sequence[GraphInfo]) -> ChainedMatmulPlan | None
         scans,
         strategy="tcgen05_tmem" if tcgen else "warp",
         scan_exports=graph.exports.exports if graph.exports is not None else (),
+        direct_output=bool(df.config.config.get("cute_chained_direct_output", False)),
     )
     if not valid_scan_exports(plan):
         return None

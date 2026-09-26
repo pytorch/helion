@@ -3053,6 +3053,10 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
             mma_support.get_cute_mma_support().tcgen05_f16bf16
             and bool(cls._tcgen05_seed_configs(env, device_ir))
         )
+        spec.cute_chained_direct_output_search_enabled = (
+            spec.cute_chained_tcgen05_search_enabled
+            and bool(cls._tcgen05_seed_configs_for_rows(env, device_ir, 64))
+        )
         spec.cute_chained_pointwise_unroll_search_enabled = (
             spec.cute_chained_tcgen05_search_enabled
             and has_pointwise_vector_candidate(device_ir.graphs)
@@ -3084,7 +3088,9 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
     ) -> list[Config]:
         # Preserve the complete old pool for every formerly admitted root.
         # Only newly admitted M64 roots acquire a different TCgen05 family.
-        return cls._tcgen05_seed_configs_for_rows(env, device_ir, 128)
+        return cls._tcgen05_seed_configs_for_rows(
+            env, device_ir, 128
+        ) or cls._tcgen05_seed_configs_for_rows(env, device_ir, 64)
 
     @classmethod
     def _tcgen05_seed_configs_for_rows(
@@ -3283,7 +3289,24 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
             )
         ordered = seeds
         if not spec.cute_chained_initialized_accumulator_search_enabled:
-            return ordered
+            ordered = _with_early_tmem_release_seed(ordered)
+            if (
+                spec.cute_chained_direct_output_search_enabled
+                and not cls._tcgen05_seed_configs_for_rows(env, device_ir, 128)
+            ):
+                # Newly admitted roots get one useful direct sibling. Existing
+                # M128 pools, multiplicities, ordering and first seed are intact.
+                for index, seed in enumerate(ordered):
+                    if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+                        ordered = [
+                            *ordered[: index + 1],
+                            Config.from_dict(
+                                seed.config | {"cute_chained_direct_output": True}
+                            ),
+                            *ordered[index + 1 :],
+                        ]
+                        break
+            return _with_last_read_seed(ordered)
         result: list[Config] = []
         for seed in ordered:
             result.append(seed)
@@ -3303,7 +3326,7 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
                             }
                         )
                     )
-        return result
+        return _with_last_read_seed(_with_early_tmem_release_seed(result))
 
     @classmethod
     def get_seed_config(
@@ -3311,6 +3334,34 @@ class CuteChainedMatmulHeuristic(AutotunerHeuristic):
     ) -> Config | None:
         seeds = cls.get_seed_configs(env, device_ir)
         return seeds[0] if seeds else None
+
+
+def _with_last_read_seed(seeds: list[Config]) -> list[Config]:
+    """One default-off sibling, after ordering; preserve the full legacy pool."""
+    for index, parent in enumerate(seeds):
+        if parent.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(
+                    parent.config | {"cute_chained_tmem_free": "last_read"}
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
+
+
+def _with_early_tmem_release_seed(seeds: list[Config]) -> list[Config]:
+    """Add one release-timing sibling without reordering any existing seed."""
+    for index, seed in enumerate(seeds):
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            return [
+                *seeds[: index + 1],
+                Config.from_dict(
+                    seed.config | {"cute_chained_tmem_early_release": True}
+                ),
+                *seeds[index + 1 :],
+            ]
+    return seeds
 
 
 class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):

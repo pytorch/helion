@@ -1367,11 +1367,72 @@ def _tcgen_seeds(bound: Any) -> list[helion.Config]:
     ]
 
 
+def _without_startup_seed(seeds: list[helion.Config]) -> list[helion.Config]:
+    """Verify the sole startup child, then preserve every original seed object."""
+    key = "cute_chained_startup_transfer"
+    children = [seed for seed in seeds if seed.config.get(key) == "tma"]
+    if not children:
+        return seeds
+    assert len(children) == 1
+    child = children[0]
+    index = next(i for i, seed in enumerate(seeds) if seed is child)
+    assert index > 0
+    parent = seeds[index - 1]
+    assert child.config == parent.config | {key: "tma"}
+    assert parent.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+    assert parent.config.get("cute_chained_k_schedule", "full") == "full"
+    for excluded in (
+        "cute_chained_initialized_accumulator",
+        "cute_chained_late_rhs_reuse",
+        "cute_chained_direct_output",
+    ):
+        assert not parent.config.get(excluded, False)
+    legacy = [seed for seed in seeds if seed is not child]
+    assert len(legacy) + 1 == len(seeds)
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            legacy, seeds[:index] + seeds[index + 1 :], strict=True
+        )
+    )
+    return legacy
+
+
 def _without_early_release_seed(
     seeds: list[helion.Config], spec: Any | None = None
 ) -> list[helion.Config]:
-    # Release siblings are introduced with the TMEM-lifetime feature.
-    return seeds
+    """Check the sole new sibling before testing the entire legacy seed pool."""
+    seeds = _without_startup_seed(seeds)
+    free_key = "cute_chained_tmem_free"
+    free_children = [seed for seed in seeds if seed.config.get(free_key) == "last_read"]
+    free_legacy = [seed for seed in seeds if seed.config.get(free_key) != "last_read"]
+    free_parents = [
+        seed
+        for seed in free_legacy
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+    ]
+    assert len(free_children) == int(bool(free_parents))
+    if free_parents:
+        assert free_children[0].config == free_parents[0].config | {
+            free_key: "last_read"
+        }
+        assert seeds.index(free_children[0]) == seeds.index(free_parents[0]) + 1
+    seeds = free_legacy
+    key = "cute_chained_tmem_early_release"
+    legacy = [seed for seed in seeds if not seed.config.get(key)]
+    added = [seed for seed in seeds if seed.config.get(key)]
+    parents = [
+        seed
+        for seed in legacy
+        if seed.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+    ]
+    assert len(added) == int(bool(parents))
+    assert len(seeds) == len(legacy) + len(added)
+    if parents:
+        assert added[0].config == parents[0].config | {key: True}
+        assert seeds.index(added[0]) == seeds.index(parents[0]) + 1
+        assert seeds[0] is legacy[0]
+    return legacy
 
 
 @pytest.mark.usefixtures("_cpu_support")
