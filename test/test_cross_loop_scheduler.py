@@ -27,6 +27,7 @@ from helion._compiler.tile_dependency import CoordinateDomain
 from helion._compiler.tile_dependency import CoordinateRelation
 from helion._compiler.tile_dependency import DenseTaskOrder
 from helion._compiler.tile_dependency import DependencyObligation
+from helion._compiler.tile_dependency import ExecutionSite
 from helion._compiler.tile_dependency import Incidence
 from helion._compiler.tile_dependency import KeyPartition
 from helion._compiler.tile_dependency import TileAccess
@@ -609,6 +610,176 @@ class TestCrossLoopScheduler(TestCase):
                 obligations_by_root_pair=graph.obligations_by_root_pair(),
                 readiness_counters=counters,
             )
+
+    def test_mixed_event_probe_budget_exhaustion_keeps_unified_event(self) -> None:
+        graph = _mixed_broadcast_and_keyed_graph()
+        roots, sites = instantiate_coordinate_domains(
+            graph,
+            axis_geometry=_MIXED_EVENT_GEOMETRY,
+        )
+        assert all(root is not None for root in roots)
+        root_domains = tuple(root for root in roots if root is not None)
+        planning_charge = cross_loop_scheduler._new_relation_work_budget()
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_new_relation_work_budget",
+            return_value=lambda _amount: False,
+        ):
+            events, distributed_obligations = (
+                cross_loop_scheduler._build_readiness_events(
+                    graph,
+                    root_domains=root_domains,
+                    site_domains=sites,
+                    charge=planning_charge,
+                )
+            )
+
+        self.assertEqual(distributed_obligations, frozenset())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            tuple(producer.producer_root for producer in events[0].producers),
+            (0, 1, 2),
+        )
+
+    def test_mixed_event_keeps_one_useful_coarsened_counter(self) -> None:
+        graph = _dependency_graph(
+            [[10], [20], [30]],
+            _access(root=0, kind="store", block_id=10),
+            _access(root=2, kind="load", block_id=30),
+            _access(root=1, allocation_id=1, kind="store", block_id=20),
+            _access(root=2, allocation_id=1, kind="load", block_id=30),
+        )
+        readiness = _configured_readiness_graph(
+            graph,
+            {10: (4, 32), 20: (8, 16), 30: (8, 16)},
+        )
+
+        self.assertEqual(len(readiness.events), 1)
+        (event,) = readiness.events
+        self.assertEqual(
+            tuple(producer.producer_root for producer in event.producers),
+            (0, 1),
+        )
+        self.assertEqual(
+            tuple(
+                cross_loop_scheduler._supports_readiness_counter_lowering(producer)
+                for producer in event.producers
+            ),
+            (False, True),
+        )
+
+        for mode in ("static", "dynamic"):
+            with self.subTest(mode=mode):
+                plan = build_static_pipeline_plan(
+                    dependency_graph=graph,
+                    root_task_orders=tuple(
+                        _dense(root) for root in readiness.root_domains
+                    ),
+                    site_domains=(),
+                    worker_count=4,
+                    cross_loop_dispatch_mode=mode,
+                )
+                self.assertEqual(plan.root_barrier_edges, frozenset())
+                self.assertEqual(len(plan.readiness_counters), 1)
+                (counter,) = plan.readiness_counters
+                self.assertEqual(counter.readiness_key_domain.size, 4)
+                self.assertEqual(counter.uniform_arrival_count(), 3)
+                self.assertEqual(
+                    tuple(producer.producer_root for producer in counter.producers),
+                    (0, 1),
+                )
+
+    def test_nested_mixed_event_is_not_split(self) -> None:
+        nested_load = dataclasses.replace(
+            _access(root=3, kind="load", block_id=41),
+            graph_id=4,
+        )
+        broadcast_load = dataclasses.replace(
+            nested_load,
+            subscript_affine_block_ids=(None,),
+            subscript_offsets=(0,),
+            subscript_is_scalar=(True,),
+            subscript_static_extents=(1,),
+        )
+        graph = _dependency_graph(
+            [[10], [20], [30], [40]],
+            _access(root=0, kind="store", block_id=10),
+            broadcast_load,
+            _access(root=1, allocation_id=1, kind="store", block_id=20),
+            dataclasses.replace(
+                nested_load,
+                allocation_id=1,
+                tensor_name="tmp_1",
+            ),
+            _access(root=2, allocation_id=2, kind="store", block_id=30),
+            dataclasses.replace(
+                nested_load,
+                allocation_id=2,
+                tensor_name="tmp_2",
+            ),
+        )
+        graph = dataclasses.replace(
+            graph,
+            execution_sites=(
+                ExecutionSite(0, 0, 0, (), None, "root", (10,), True, False),
+                ExecutionSite(1, 1, 1, (), None, "root", (20,), True, False),
+                ExecutionSite(2, 2, 2, (), None, "root", (30,), True, False),
+                ExecutionSite(3, 3, 3, (), None, "root", (40,), True, False),
+                ExecutionSite(
+                    4,
+                    3,
+                    4,
+                    ((0, 0),),
+                    3,
+                    "loop",
+                    (40, 41),
+                    True,
+                    True,
+                ),
+            ),
+            site_ids_by_access=((0,), (4,), (1,), (4,), (2,), (4,)),
+        )
+        readiness = _configured_readiness_graph(
+            graph,
+            {
+                10: (1, 1),
+                20: (8, 16),
+                30: (16, 8),
+                40: (1, 1),
+                41: (8, 16),
+            },
+        )
+
+        nested_events = tuple(
+            event
+            for event in readiness.events
+            if any(consumer.consumer_site_id == 4 for consumer in event.consumers)
+        )
+        self.assertEqual(len(nested_events), 1)
+        (nested_event,) = nested_events
+        self.assertEqual(
+            tuple(producer.producer_root for producer in nested_event.producers),
+            (0, 1, 2),
+        )
+        self.assertEqual(
+            tuple(
+                cross_loop_scheduler._supports_readiness_counter_lowering(producer)
+                for producer in nested_event.producers
+            ),
+            (False, True, True),
+        )
+
+        nested_counters = cross_loop_scheduler.collect_nested_loop_scheduling_counters(
+            readiness,
+            cross_loop_scheduler._new_relation_work_budget(),
+        )
+        self.assertEqual(len(nested_counters), 1)
+        (counter,) = nested_counters
+        self.assertEqual(
+            tuple(producer.producer_root for producer in counter.producers),
+            (0, 1, 2),
+        )
+        self.assertEqual(counter.readiness_key_domain.size, 1)
 
     def test_all_rank_union_canonicalizes_only_complete_peer_set(self) -> None:
         ranks = CoordinateDomain.scalar(4, kind="value", identity=0)

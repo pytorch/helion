@@ -2085,6 +2085,14 @@ def _build_readiness_events(
         tuple[CoordinateDomain, tuple[ReadinessProducer, ...]],
         ReadinessEvent,
     ] = {}
+    mixed_event_probe_charge = _new_relation_work_budget()
+    mixed_event_probe_exhausted = False
+
+    def charge_mixed_event_probe(amount: int) -> bool:
+        nonlocal mixed_event_probe_exhausted
+        allowed = mixed_event_probe_charge(amount)
+        mixed_event_probe_exhausted |= not allowed
+        return allowed
 
     def add_producer_key_events(
         *,
@@ -2302,44 +2310,73 @@ def _build_readiness_events(
             )
             covered_obligations.update(relation_points)
         else:
-            supported_indices = tuple(
+            full_producers = tuple(event_producers)
+            event_consumer = ReadinessConsumer(
+                consumer_root,
+                partition.as_incidence(grouped_items=consumer_group_order),
+                0,
+                frozenset(covered_obligations),
+                consumer_site_id,
+                consumer_rank_relation,
+            )
+            directly_lowerable_indices = tuple(
                 index
-                for index, producer in enumerate(event_producers)
+                for index, producer in enumerate(full_producers)
                 if _supports_readiness_counter_lowering(producer)
             )
             unsupported_indices: tuple[int, ...] = ()
-            if consumer_rank_relation is None and 0 < len(supported_indices) < len(
-                event_producers
-            ):
+            should_split = (
+                consumer_site_id is None
+                and consumer_rank_relation is None
+                and not mixed_event_probe_exhausted
+                and 0 < len(directly_lowerable_indices) < len(full_producers)
+            )
+            if should_split:
+                # Probe the existing counter selector for lowering capability only.
+                # An exhausted proof budget is unknown, so it preserves the event.
+                probe_events: dict[
+                    tuple[CoordinateDomain, tuple[ReadinessProducer, ...]],
+                    ReadinessEvent,
+                ] = {}
+                _record_readiness_event(
+                    probe_events,
+                    readiness_key_domain=readiness_key_domain,
+                    producers=full_producers,
+                    consumers=(event_consumer,),
+                )
+                should_split = (
+                    not choose_readiness_counters(
+                        ReadinessGraph(root_domains, tuple(probe_events.values())),
+                        (),
+                        charge=charge_mixed_event_probe,
+                    )
+                    and not mixed_event_probe_exhausted
+                )
+            if should_split:
                 # An unsupported arm must not erase independent keyed readiness.
-                supported = frozenset(supported_indices)
+                directly_lowerable = frozenset(directly_lowerable_indices)
                 unsupported_indices = tuple(
                     index
-                    for index in range(len(event_producers))
-                    if index not in supported
+                    for index in range(len(full_producers))
+                    if index not in directly_lowerable
                 )
                 event_producers = [
-                    event_producers[index] for index in supported_indices
+                    full_producers[index] for index in directly_lowerable_indices
                 ]
                 covered_obligations = {
                     obligation
-                    for index in supported_indices
+                    for index in directly_lowerable_indices
                     for obligation in merged_relations[index][2]
                 }
+                event_consumer = dataclasses.replace(
+                    event_consumer,
+                    covered_obligations=frozenset(covered_obligations),
+                )
             _record_readiness_event(
                 pending_events,
                 readiness_key_domain=readiness_key_domain,
                 producers=tuple(event_producers),
-                consumers=(
-                    ReadinessConsumer(
-                        consumer_root,
-                        partition.as_incidence(grouped_items=consumer_group_order),
-                        0,
-                        frozenset(covered_obligations),
-                        consumer_site_id,
-                        consumer_rank_relation,
-                    ),
-                ),
+                consumers=(event_consumer,),
             )
             if unsupported_indices:
                 add_producer_key_events(
