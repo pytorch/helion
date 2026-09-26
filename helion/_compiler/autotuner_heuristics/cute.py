@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import TypeVar
 from typing import cast
 
 import torch
@@ -74,10 +75,13 @@ if TYPE_CHECKING:
     from .registry import CompilerHeuristicSpecializationFact
 
 
+_T = TypeVar("_T")
+
+
 def _seq_config_list(
     seq: Any,  # noqa: ANN401 - BlockIdSequence of any spec type
-    overrides: dict[int, object],
-) -> list[object]:
+    overrides: dict[int, _T],
+) -> list[_T]:
     """Build a full-length config list for a BlockIdSequence, filling
     non-overridden slots with each spec's default.  Seeds must match the
     live spec length exactly (``_encode_flat_values`` asserts on it), and
@@ -85,7 +89,9 @@ def _seq_config_list(
     while ``cute_vector_widths`` keeps the rdim slot at index 0), so build
     by block id instead of by position."""
     return [
-        overrides[item.block_id] if item.block_id in overrides else item._fill_missing()
+        overrides[item.block_id]
+        if item.block_id in overrides
+        else cast("_T", item._fill_missing())
         for item in seq
     ]
 
@@ -716,7 +722,24 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return is_canonical_row_reduction(env)
+        if is_canonical_row_reduction(env):
+            return True
+        spec = env.config_spec
+        fact = spec.reduction_kernel_fact
+        return (
+            fact is not None
+            and not spec.matmul_facts
+            and len(spec.block_sizes) == 1
+            and len(spec.reduction_loops) == 1
+            and len(fact.reductions) == 1
+            and fact.reductions[0].category.value == "full_slice"
+            and fact.reductions[0].size_hint <= 256
+            and max(
+                spec.block_sizes[0].min_size,
+                spec.block_sizes[0].autotuner_min,
+            )
+            <= 4
+        )
 
     @classmethod
     def get_seed_config(
@@ -726,6 +749,27 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         max_threads = spec.max_reduction_threads or 1024
         size_hint = rl_spec.size_hint
+        row_spec = spec.block_sizes[0]
+        min_rows = max(row_spec.min_size, row_spec.autotuner_min)
+        if size_hint <= 256 and min_rows <= 4:
+            rdim_id = rl_spec.block_id
+            tile_id = row_spec.block_id
+            return Config(
+                block_sizes=[4],
+                num_threads=_seq_config_list(
+                    spec.num_threads, {tile_id: 4, rdim_id: 32}
+                ),
+                reduction_loops=[None],
+                cute_vector_widths=_seq_config_list(
+                    spec.cute_vector_widths, {rdim_id: 8}
+                ),
+                cute_lane_layouts=_seq_config_list(
+                    spec.cute_lane_layouts, {rdim_id: "strided"}
+                ),
+                cute_reduction_reloads=_seq_config_list(
+                    spec.cute_reduction_reloads, {rdim_id: "register"}
+                ),
+            )
         if size_hint <= max_threads:
             # Persistent reduction (no roll). The normalize step will keep
             # reduction_loops[0]=None when the M-axis allows it.
@@ -1899,6 +1943,66 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
             )
         return Config(**seed)
 
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        size_hint = rl_spec.size_hint
+        capability = spec.target_device_capability
+        if capability is None or capability < (10, 0) or size_hint > 16384:
+            return [primary]
+
+        if size_hint <= 1024:
+            threads_per_row, rows_per_cta = 32, 4
+            chunk: int | None = None if size_hint <= 256 else size_hint // 2
+            vec, reload = (8 if size_hint <= 256 else 16), "register"
+        elif size_hint <= 3584:
+            threads_per_row, rows_per_cta = 64, 2
+            chunk, vec, reload = size_hint, 8, "gmem"
+        elif size_hint <= 4096:
+            threads_per_row, rows_per_cta = 128, 1
+            chunk, vec, reload = size_hint // 2, 16, "gmem"
+        elif size_hint <= 7168:
+            threads_per_row, rows_per_cta = 224, 1
+            chunk, vec, reload = size_hint // 2, 16, "gmem"
+        elif size_hint <= 8192:
+            threads_per_row, rows_per_cta = 256, 1
+            chunk, vec, reload = size_hint // 2, 8, "register"
+        else:
+            threads_per_row, rows_per_cta = 256, 1
+            chunk, vec, reload = size_hint // 2, 16, "register"
+
+        rdim_id = rl_spec.block_id
+        tile_id = spec.block_sizes[0].block_id
+        seed: dict[str, Any] = {
+            "block_sizes": [rows_per_cta],
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {tile_id: rows_per_cta, rdim_id: threads_per_row},
+            ),
+            "reduction_loops": [chunk],
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {rdim_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {rdim_id: "strided"}
+            ),
+            "cute_reduction_reloads": _seq_config_list(
+                spec.cute_reduction_reloads, {rdim_id: reload}
+            ),
+        }
+        if "l2_last" in get_valid_eviction_policies("cute"):
+            seed["load_eviction_policies"] = [
+                "l2_last"
+            ] * spec.load_eviction_policies.length
+        tuned = Config(**seed)
+        return dedupe_configs([primary, tuned])
+
 
 class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
     """Cluster row-split seed for very wide rolled row reductions: split
@@ -1920,7 +2024,7 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
 
     _SLICE_TARGET = 16384
     _MAX_CLUSTER = 16
-    _THREADS_PER_ROW = 128
+    _THREADS_PER_ROW = 256
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -1928,7 +2032,7 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
             return False
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
-        return rl_spec.size_hint >= 4 * cls._SLICE_TARGET
+        return rl_spec.size_hint >= 2 * cls._SLICE_TARGET
 
     @classmethod
     def get_seed_config(
@@ -1940,6 +2044,9 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
         vec = _cute_seed_vec_width(
             env, rl_spec, spec.max_reduction_threads or 1024, size_hint, device_ir
         )
+        capability = spec.target_device_capability
+        if capability is not None and capability >= (10, 0) and vec == 8:
+            vec = 16
         # Power of two only: the cute_cluster_n EnumFragment enumerates
         # {1,2,4,8,16}, and an off-surface value would one-hot encode as
         # all zeros in the search surrogate.
@@ -1953,12 +2060,9 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
             cluster_n //= 2
         if cluster_n <= 1:
             return None
-        # A chunk a few trips smaller than the slice schedules better than
-        # one whole-slice trip (measured on B200 at N=262144: 4616 vs
-        # 4350 GB/s) — the shorter unrolled body overlaps its loads across
-        # roll iterations instead of one long dependency chain.
         slice_len = size_hint // cluster_n
-        chunk = max(threads_per_row * max(vec, 1), min(4096, slice_len))
+        chunk = slice_len if cluster_n == cls._MAX_CLUSTER else slice_len // 2
+        chunk = max(threads_per_row * max(vec, 1), chunk)
         while slice_len % chunk:
             chunk //= 2
         rdim_id = rl_spec.block_id
@@ -1973,11 +2077,19 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
             "cute_lane_layouts": _seq_config_list(
                 spec.cute_lane_layouts, {rdim_id: "strided"}
             ),
+            "cute_reduction_reloads": _seq_config_list(
+                spec.cute_reduction_reloads, {rdim_id: "gmem"}
+            ),
+            "cute_min_blocks_per_mp": 2 if size_hint <= 65536 else 0,
         }
         if vec > 1:
             seed["cute_vector_widths"] = _seq_config_list(
                 spec.cute_vector_widths, {rdim_id: vec}
             )
+        if "l2_last" in get_valid_eviction_policies("cute"):
+            seed["load_eviction_policies"] = [
+                "l2_last"
+            ] * spec.load_eviction_policies.length
         try:
             return Config(**seed)
         except Exception:

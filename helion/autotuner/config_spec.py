@@ -4567,6 +4567,11 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
         # 0 is a valid sentinel meaning "use block_size as thread count"
         if value == 0:
             return 0
+        # CuTe SIMT reductions can use any whole number of warps. Keep these
+        # values available to explicit seeds even though the random search
+        # fragment remains power-of-two for a compact search space.
+        if type(value) is int and 32 <= value <= 1024 and value % 32 == 0:
+            return value
         return super()._normalize(name, value)
 
     def _fragment(self, base: ConfigSpec) -> NumThreadsFragment:
@@ -4597,9 +4602,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         *,
         block_id: int,
         size_hint: int,
+        allow_non_power_of_two: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
+        self.allow_non_power_of_two = allow_non_power_of_two
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -4628,7 +4635,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
             raise InvalidConfig(
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"
             )
-        if value >= self.size_hint:
+        if value >= self.size_hint and not (
+            self.allow_non_power_of_two
+            and value == self.size_hint
+            and value & (value - 1) != 0
+        ):
             return None  # max size becomes persistent reduction
         return value
 
@@ -4647,7 +4658,20 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
     def _normalize(self, name: str, value: object) -> int | None:
         if value is None:
             return None
-        normalized = super()._normalize(name, value)
+        if (
+            self.allow_non_power_of_two
+            and type(value) is int
+            and value >= 8
+            and value <= self.size_hint
+            and self.size_hint % value == 0
+            and value & (value - 1) != 0
+        ):
+            # Exact non-power-of-two divisors avoid padding model widths such
+            # as 3584 and 7168. They are seeded explicitly; the continuous
+            # search fragment remains power-of-two for a compact search space.
+            normalized = value
+        else:
+            normalized = super()._normalize(name, value)
         # A looped chunk of 1 is degenerate: "hold the whole axis" is encoded as
         # ``None`` (persistent), not 1, and ``LoopedReductionStrategy`` rejects a
         # block size <= 1.  The autotuner search never proposes < 8 (its fragment
@@ -4667,7 +4691,11 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # two reductions).  Collapsing to ``None`` here matches the
         # ``_flat_config`` behaviour and keeps the persistent/loop choice in
         # sync regardless of how the value was generated.
-        if isinstance(normalized, int) and normalized >= self.size_hint:
+        if (
+            isinstance(normalized, int)
+            and normalized >= self.size_hint
+            and normalized & (normalized - 1) == 0
+        ):
             return None
         return normalized
 
@@ -4675,7 +4703,7 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         return None
 
 
-_CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
+_CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
 _CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
 
@@ -4748,9 +4776,9 @@ class CuteLaneLayoutSpec(_BlockIdItem):
 class CuteVectorWidthSpec(_BlockIdItem):
     """Per-reduction-block vector load width for the CuTe backend.
 
-    V=1 disables vectorization (scalar loads). V=2/4/8 emits
+    V=1 disables vectorization (scalar loads). V=2/4/8/16 emits
     ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
-    for the inner reduction load, lowering to LDG.64/LDG.128.
+    for the inner reduction load. SM100+ also admits 32-byte vectors.
     """
 
     def __init__(
