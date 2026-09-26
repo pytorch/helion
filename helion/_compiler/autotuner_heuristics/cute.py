@@ -693,7 +693,7 @@ def _cute_seed_vec_width(
             val = node.meta.get("val")
             if isinstance(val, torch.Tensor) and val.ndim >= 1:
                 last = val.shape[-1]
-                if isinstance(last, int) and last == rdim_size:
+                if env.size_hint(last) == rdim_size:
                     dtype = val.dtype
                     break
         if dtype is not None:
@@ -787,6 +787,57 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
                 spec.cute_vector_widths, {rl_spec.block_id: vec}
             )
         return Config(**seed)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        width = rl_spec.size_hint
+        capability = spec.target_device_capability
+        if (
+            capability is None
+            or capability < (10, 0)
+            or not rl_spec.allow_full_size
+            or not 8 <= width <= 4096
+            or width & (width - 1)
+        ):
+            return [primary]
+
+        # A full-width rolled chunk keeps one vector fragment per thread while
+        # avoiding the persistent path's thread-budget fallback to scalar loops.
+        # Pack rows into a 256-thread CTA; the autotuner can vary this geometry.
+        vec = 2 * _cute_seed_vec_width(env, rl_spec, width, width, device_ir)
+        if vec <= 2:
+            return [primary]
+        vec = min(vec, width)
+        threads_per_row = width // vec
+        rows_per_cta = max(1, 256 // threads_per_row)
+        row_spec = spec.block_sizes[0]
+        if not _block_size_value_reachable(spec, 0, rows_per_cta):
+            return [primary]
+        full_width = Config(
+            block_sizes=[rows_per_cta],
+            num_threads=_seq_config_list(
+                spec.num_threads,
+                {row_spec.block_id: rows_per_cta, rl_spec.block_id: threads_per_row},
+            ),
+            reduction_loops=[width],
+            cute_vector_widths=_seq_config_list(
+                spec.cute_vector_widths, {rl_spec.block_id: vec}
+            ),
+            cute_lane_layouts=_seq_config_list(
+                spec.cute_lane_layouts, {rl_spec.block_id: "strided"}
+            ),
+            cute_reduction_reloads=_seq_config_list(
+                spec.cute_reduction_reloads, {rl_spec.block_id: "register"}
+            ),
+        )
+        return dedupe_configs([primary, full_width])
 
 
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:

@@ -3077,6 +3077,17 @@ def _cute_vector_load_ctx(
         vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
         if vec_width <= 1:
             return None
+        if isinstance(strategy, LoopedReductionStrategy):
+            # A contiguous reduction axis does not imply that every row starts
+            # at a vector-aligned address (e.g. a width-256 view with stride257).
+            # Keep the constexpr element loop, but issue scalar accesses when
+            # another dimension can shift the base off the vector boundary.
+            for dim in range(tensor.ndim):
+                if dim == stride1_tensor_dim:
+                    continue
+                stride = _specialized_int(env, tensor.stride(dim))
+                if stride is None or stride % vec_width:
+                    return None
         if strategy._mask_var is not None:
             return None
         if strategy._cute_reduction_lane_extent <= 0:

@@ -4603,10 +4603,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         block_id: int,
         size_hint: int,
         allow_non_power_of_two: bool = False,
+        allow_full_size: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
         self.allow_non_power_of_two = allow_non_power_of_two
+        self.allow_full_size = allow_full_size
 
     def _flat_fragment(self, base: ConfigSpec) -> BlockSizeFragment:
         # Shared by both directions:
@@ -4615,6 +4617,12 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         low = 8  # TODO(jansel): is smaller needed?
         high = next_power_of_2(max(low, self.size_hint))
         default = min(high, 4096)
+        if self.allow_full_size and high == self.size_hint:
+            # Keep a distinct persistent sentinel above the exact full-width
+            # rolled chunk. Preserve the previous default's persistent meaning.
+            high *= 2
+            if default == self.size_hint:
+                default = high
         # Cap default at the backend's max reduction loop so that
         # large reductions default to looped rather than persistent.
         if base.max_reduction_loop is not None:
@@ -4636,18 +4644,19 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
                 f"Invalid value for reduction loop {low} <= {value} <= {high}"
             )
         if value >= self.size_hint and not (
-            self.allow_non_power_of_two
-            and value == self.size_hint
-            and value & (value - 1) != 0
+            value == self.size_hint
+            and (
+                self.allow_full_size
+                or (self.allow_non_power_of_two and value & (value - 1) != 0)
+            )
         ):
             return None  # max size becomes persistent reduction
         return value
 
     def _encode_flat_value(self, base: ConfigSpec, value: object) -> object:
         # Encode None ("persistent reduction") so the inverse ``_flat_config``
-        # decodes it back to None. ``_flat_config`` returns None for any value
-        # >= size_hint, so the encoding must also be >= size_hint: use the
-        # fragment's ``high`` (always >= size_hint). The fragment *default* is
+        # decodes it back to None. Use the fragment's ``high`` (above size_hint
+        # when an exact full-width rolled chunk is available). The *default* is
         # capped at max_reduction_loop and can fall below size_hint, which would
         # round-trip None into a slow looped config (e.g. size_hint=32000 ->
         # default 4096 -> reduction_loops=[4096]).
@@ -4683,18 +4692,19 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
         # left byte-identical).
         if isinstance(normalized, int) and normalized < 2:
             normalized = 8
-        # A looped reduction whose chunk equals or exceeds the reduction
-        # extent has only one iteration — it is semantically identical to a
-        # persistent reduction, but the looped codegen path occasionally
-        # produces subtly different results on the CuTe backend (e.g. when a
-        # multi-pass kernel like layer_norm reuses the loaded inputs across
-        # two reductions).  Collapsing to ``None`` here matches the
-        # ``_flat_config`` behaviour and keeps the persistent/loop choice in
-        # sync regardless of how the value was generated.
+        # Preserve an explicitly requested full-width rolled chunk on backends
+        # that support it. Its vectorized lane loop is a different codegen path
+        # from a persistent reduction, which may be forced to a smaller chunk
+        # by the thread budget. Other backends retain the persistent alias.
         if (
             isinstance(normalized, int)
             and normalized >= self.size_hint
             and normalized & (normalized - 1) == 0
+            and not (
+                self.allow_full_size
+                and normalized == self.size_hint
+                and normalized >= 8
+            )
         ):
             return None
         return normalized

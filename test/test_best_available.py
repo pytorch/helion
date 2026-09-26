@@ -420,6 +420,119 @@ class TestBestAvailable(unittest.TestCase):
         self.assertEqual(fragment.pattern_neighbors(224), [0, 128, 256])
         self.assertEqual(fragment.encode(224), [math.log2(224.0) + 1.0])
 
+    def test_full_size_reduction_loop_distinct_roundtrip(self):
+        # Opt into the capability on an otherwise unrestricted spec to isolate
+        # representation from CuTe's separate thread-budget normalization.
+        for size_hint in (8, 256, 3584, 4096, 8192):
+            with self.subTest(size_hint=size_hint):
+                config_spec = ConfigSpec(backend=TritonBackend())
+                config_spec.reduction_loops.append(
+                    ReductionLoopSpec(
+                        block_id=0,
+                        size_hint=size_hint,
+                        allow_non_power_of_two=True,
+                        allow_full_size=True,
+                    )
+                )
+                config_gen = ConfigGeneration(config_spec)
+                flat_values = []
+                for value in (size_hint, None):
+                    config = config_spec.default_config()
+                    config.config["reduction_loops"] = [value]
+                    config_spec.normalize(config.config)
+                    self.assertEqual(config.config["reduction_loops"], [value])
+                    flat = config_gen.flatten(config)
+                    restored = config_gen.unflatten(flat)
+                    self.assertEqual(restored.config["reduction_loops"], [value])
+                    self.assertEqual(config_gen.flatten(restored), flat)
+                    flat_values.append(flat)
+                self.assertNotEqual(*flat_values)
+
+    def test_full_size_reduction_loop_preserves_defaults(self):
+        for size_hint in (1, 2, 4, 8, 256, 3584, 4096, 8192, 65536):
+            for max_loop in (None, 128):
+                with self.subTest(size_hint=size_hint, max_loop=max_loop):
+                    defaults = []
+                    for allow_full_size in (False, True):
+                        config_spec = ConfigSpec(backend=TritonBackend())
+                        config_spec.max_reduction_loop = max_loop
+                        config_spec.reduction_loop_force_threshold = 128
+                        config_spec.reduction_loops.append(
+                            ReductionLoopSpec(
+                                block_id=0,
+                                size_hint=size_hint,
+                                allow_non_power_of_two=True,
+                                allow_full_size=allow_full_size,
+                            )
+                        )
+                        config_gen = ConfigGeneration(config_spec)
+                        default = config_gen.unflatten(config_gen.default_flat())
+                        defaults.append(default.config["reduction_loops"])
+                    self.assertEqual(*defaults)
+
+    def test_full_size_reduction_loop_neighbors(self):
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.reduction_loops.append(
+            ReductionLoopSpec(block_id=0, size_hint=256, allow_full_size=True)
+        )
+        config_gen = ConfigGeneration(config_spec)
+        for value, expected in ((128, [64, 256]), (256, [128, None]), (None, [256])):
+            with self.subTest(value=value):
+                config = config_spec.default_config()
+                config.config["reduction_loops"] = [value]
+                neighbors = [
+                    projection
+                    for projection in config_gen.coordinate_neighbor_projections(
+                        config_gen.flatten(config)
+                    )
+                    if projection.key == "reduction_loops"
+                ]
+                values = []
+                for item in neighbors:
+                    self.assertEqual(item.outcome, "candidate")
+                    assert item.config is not None
+                    reduction_loops = item.config.config["reduction_loops"]
+                    assert isinstance(reduction_loops, list)
+                    values.append(reduction_loops[0])
+                self.assertEqual(values, expected)
+
+    def test_full_size_reduction_loop_boundaries(self):
+        for size_hint in (1, 2, 4, 8, 256):
+            with self.subTest(size_hint=size_hint):
+                spec = ReductionLoopSpec(
+                    block_id=0, size_hint=size_hint, allow_full_size=True
+                )
+                expected = size_hint if size_hint >= 8 else None
+                self.assertEqual(
+                    spec._normalize("reduction_loops", size_hint), expected
+                )
+                self.assertIsNone(spec._normalize("reduction_loops", size_hint * 2))
+                self.assertIsNone(spec._normalize("reduction_loops", None))
+
+        spec = ReductionLoopSpec(block_id=0, size_hint=256, allow_full_size=True)
+        for value in (2, 4, 8, 128):
+            self.assertEqual(spec._normalize("reduction_loops", value), value)
+        for value in (0, -1, 255, 257):
+            with self.subTest(value=value), self.assertRaises(InvalidConfig):
+                spec._normalize("reduction_loops", value)
+
+    def test_full_size_reduction_loop_requires_opt_in(self):
+        for size_hint in (8, 256, 4096, 8192):
+            with self.subTest(size_hint=size_hint):
+                config_spec = ConfigSpec(backend=TritonBackend())
+                spec = ReductionLoopSpec(block_id=0, size_hint=size_hint)
+                config_spec.reduction_loops.append(spec)
+                self.assertIsNone(spec._normalize("reduction_loops", size_hint))
+                self.assertIsNone(spec._normalize("reduction_loops", size_hint * 2))
+                config_gen = ConfigGeneration(config_spec)
+                flat = config_gen.default_flat()
+                indices, _is_sequence = config_gen._key_to_flat_indices[
+                    "reduction_loops"
+                ]
+                flat[indices[0]] = size_hint
+                restored = config_gen.unflatten(flat)
+                self.assertEqual(restored.config["reduction_loops"], [None])
+
 
 class TestCacheMatching(unittest.TestCase):
     """Tests for cache file matching in warm start."""
