@@ -1,0 +1,697 @@
+{
+  "gpu": "NVIDIA GB300",
+  "power_limit_w": 1400,
+  "dtype": "bfloat16",
+  "eps": 1e-05,
+  "baseline_source": "benchmark_rms_norm/repro/breadth/final_result/rms_norm_experiment.json",
+  "selection": "Fresh-cache full LFBO autotune; winners replayed with CUPTI, CUDA graphs and cold L2.",
+  "verification_date": "2026-09-25",
+  "configs": {
+    "2048x1024": {
+      "config": {
+        "block_sizes": [
+          2
+        ],
+        "num_threads": [
+          2,
+          32
+        ],
+        "reduction_loops": [
+          512
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          16,
+          8
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "register"
+        ],
+        "cute_cluster_n": 1,
+        "cute_min_blocks_per_mp": 0
+      },
+      "baseline_impl": "cutlass",
+      "baseline_ms": 0.003552,
+      "before_helion_ms": 0.006624,
+      "verified_ms": 0.00336,
+      "verified_runs_ms": [
+        0.00336,
+        0.00336,
+        0.00336,
+        0.003361,
+        0.003392
+      ],
+      "review_verified_ms": 0.003392,
+      "review_verified_runs_ms": [
+        0.00336,
+        0.003392,
+        0.003392,
+        0.003392,
+        0.003392
+      ]
+    },
+    "2048x4096": {
+      "config": {
+        "block_sizes": [
+          4
+        ],
+        "num_threads": [
+          4,
+          64
+        ],
+        "reduction_loops": [
+          2048
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          8,
+          16
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "auto"
+        ],
+        "cute_cluster_n": 1,
+        "cute_min_blocks_per_mp": 6
+      },
+      "baseline_impl": "flashinfer",
+      "baseline_ms": 0.007616,
+      "before_helion_ms": 0.014721,
+      "verified_ms": 0.006432,
+      "verified_runs_ms": [
+        0.006464,
+        0.006432,
+        0.006432,
+        0.006432,
+        0.006432
+      ],
+      "review_verified_ms": 0.006464,
+      "review_verified_runs_ms": [
+        0.006496,
+        0.006464,
+        0.006465,
+        0.006464,
+        0.006464
+      ]
+    },
+    "2048x8192": {
+      "config": {
+        "block_sizes": [
+          1
+        ],
+        "num_threads": [
+          1,
+          256
+        ],
+        "reduction_loops": [
+          4096
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          8,
+          1
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "register"
+        ],
+        "cute_cluster_n": 1,
+        "cute_min_blocks_per_mp": 0
+      },
+      "baseline_impl": "cudnn",
+      "baseline_ms": 0.012032,
+      "before_helion_ms": 0.02592,
+      "verified_ms": 0.011392,
+      "verified_runs_ms": [
+        0.011392,
+        0.011392,
+        0.011392,
+        0.011392,
+        0.011392
+      ],
+      "review_verified_ms": 0.011616,
+      "review_verified_runs_ms": [
+        0.011616,
+        0.011616,
+        0.011616,
+        0.011616,
+        0.011585
+      ]
+    },
+    "2048x16384": {
+      "config": {
+        "block_sizes": [
+          1
+        ],
+        "num_threads": [
+          1,
+          256
+        ],
+        "reduction_loops": [
+          8192
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "l2_last",
+          "",
+          ""
+        ],
+        "cute_vector_widths": [
+          8,
+          16
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "register"
+        ],
+        "cute_cluster_n": 1,
+        "cute_min_blocks_per_mp": 0
+      },
+      "baseline_impl": "cudnn",
+      "baseline_ms": 0.024544,
+      "before_helion_ms": 0.046145,
+      "verified_ms": 0.022401,
+      "verified_runs_ms": [
+        0.022432,
+        0.022401,
+        0.022401,
+        0.022401,
+        0.0224
+      ],
+      "review_verified_ms": 0.02224,
+      "review_verified_runs_ms": [
+        0.02224,
+        0.02224,
+        0.02224,
+        0.02224,
+        0.02224
+      ]
+    },
+    "2048x32768": {
+      "config": {
+        "block_sizes": [
+          1
+        ],
+        "num_threads": [
+          1,
+          256
+        ],
+        "reduction_loops": [
+          8192
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          16,
+          1
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "gmem"
+        ],
+        "cute_cluster_n": 2,
+        "cute_min_blocks_per_mp": 2
+      },
+      "baseline_impl": "liger-cute",
+      "baseline_ms": 0.0432,
+      "before_helion_ms": 0.086433,
+      "verified_ms": 0.042976,
+      "verified_runs_ms": [
+        0.042944,
+        0.04304,
+        0.042976,
+        0.042976,
+        0.042976
+      ],
+      "review_verified_ms": 0.042945,
+      "review_verified_runs_ms": [
+        0.042944,
+        0.042945,
+        0.042945,
+        0.042976,
+        0.042976
+      ]
+    },
+    "4096x3584": {
+      "config": {
+        "block_sizes": [
+          2
+        ],
+        "num_threads": [
+          2,
+          64
+        ],
+        "reduction_loops": [
+          3584
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "streaming",
+          "l2_last",
+          "",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          8,
+          1
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "gmem"
+        ],
+        "cute_cluster_n": 1,
+        "cute_min_blocks_per_mp": 0
+      },
+      "baseline_impl": "cudnn",
+      "baseline_ms": 0.010977,
+      "before_helion_ms": 0.022784,
+      "verified_ms": 0.009472,
+      "verified_runs_ms": [
+        0.009472,
+        0.009472,
+        0.009472,
+        0.009472,
+        0.009472
+      ],
+      "review_verified_ms": 0.0096,
+      "review_verified_runs_ms": [
+        0.0096,
+        0.0096,
+        0.0096,
+        0.0096,
+        0.0096005
+      ]
+    },
+    "4096x7168": {
+      "config": {
+        "block_sizes": [
+          1
+        ],
+        "num_threads": [
+          1,
+          224
+        ],
+        "reduction_loops": [
+          3584
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          16,
+          1
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "gmem"
+        ],
+        "cute_cluster_n": 1,
+        "cute_min_blocks_per_mp": 0
+      },
+      "baseline_impl": "flashinfer",
+      "baseline_ms": 0.020064,
+      "before_helion_ms": 0.04032,
+      "verified_ms": 0.02,
+      "verified_runs_ms": [
+        0.02,
+        0.02,
+        0.02,
+        0.020032,
+        0.02
+      ],
+      "review_verified_ms": 0.02016,
+      "review_verified_runs_ms": [
+        0.02016,
+        0.02016,
+        0.02016,
+        0.0201595,
+        0.02016
+      ]
+    },
+    "16384x8192": {
+      "config": {
+        "block_sizes": [
+          4
+        ],
+        "num_threads": [
+          0,
+          512
+        ],
+        "reduction_loops": [
+          2048
+        ],
+        "load_eviction_policies": [
+          "last",
+          "l2_last",
+          "l2_last",
+          "last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          8,
+          2
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "auto"
+        ],
+        "cute_cluster_n": 2,
+        "cute_min_blocks_per_mp": 0
+      },
+      "baseline_impl": "flashinfer",
+      "baseline_ms": 0.079425,
+      "before_helion_ms": 0.140033,
+      "verified_ms": 0.077216,
+      "verified_runs_ms": [
+        0.077216,
+        0.077185,
+        0.077216,
+        0.077216,
+        0.077216
+      ],
+      "review_verified_ms": 0.076769,
+      "review_verified_runs_ms": [
+        0.076705,
+        0.076705,
+        0.076769,
+        0.0768,
+        0.076769
+      ]
+    },
+    "32768x256": {
+      "config": {
+        "block_sizes": [
+          64
+        ],
+        "num_threads": [
+          64,
+          256
+        ],
+        "reduction_loops": [
+          128
+        ],
+        "load_eviction_policies": [
+          "",
+          "",
+          "",
+          "l2_last",
+          "streaming"
+        ],
+        "cute_vector_widths": [
+          8,
+          4
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "register"
+        ],
+        "cute_cluster_n": 2,
+        "cute_min_blocks_per_mp": 2
+      },
+      "baseline_impl": "quack-cute",
+      "baseline_ms": 0.00752,
+      "before_helion_ms": 0.011488,
+      "verified_ms": 0.007136,
+      "verified_runs_ms": [
+        0.007136,
+        0.007136,
+        0.007136,
+        0.007136,
+        0.007136
+      ],
+      "review_verified_ms": 0.007264,
+      "review_verified_runs_ms": [
+        0.007264,
+        0.007264,
+        0.007264,
+        0.007264,
+        0.007264
+      ]
+    },
+    "32768x4096": {
+      "config": {
+        "block_sizes": [
+          2
+        ],
+        "num_threads": [
+          2,
+          128
+        ],
+        "reduction_loops": [
+          2048
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          16,
+          1
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "blocked"
+        ],
+        "cute_reduction_reloads": [
+          "gmem"
+        ],
+        "cute_cluster_n": 1,
+        "cute_min_blocks_per_mp": 6
+      },
+      "baseline_impl": "flashinfer",
+      "baseline_ms": 0.079425,
+      "before_helion_ms": 0.132545,
+      "verified_ms": 0.078881,
+      "verified_runs_ms": [
+        0.078928,
+        0.078881,
+        0.078912,
+        0.078881,
+        0.078881
+      ],
+      "review_verified_ms": 0.078624,
+      "review_verified_runs_ms": [
+        0.078624,
+        0.078655,
+        0.078625,
+        0.078593,
+        0.078624
+      ]
+    },
+    "32768x65536": {
+      "config": {
+        "block_sizes": [
+          1
+        ],
+        "num_threads": [
+          1,
+          512
+        ],
+        "reduction_loops": [
+          32768
+        ],
+        "load_eviction_policies": [
+          "l2_last",
+          "first",
+          "",
+          "l2_last",
+          "l2_last"
+        ],
+        "cute_vector_widths": [
+          8,
+          16
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "strided"
+        ],
+        "cute_reduction_reloads": [
+          "gmem"
+        ],
+        "cute_cluster_n": 2,
+        "cute_min_blocks_per_mp": 3
+      },
+      "baseline_impl": "cutlass",
+      "baseline_ms": 1.202278,
+      "before_helion_ms": 2.237768,
+      "verified_ms": 1.197862,
+      "verified_runs_ms": [
+        1.197829,
+        1.198984,
+        1.197862,
+        1.198982,
+        1.197672
+      ],
+      "review_verified_ms": 1.199397,
+      "review_verified_runs_ms": [
+        1.199397,
+        1.199432,
+        1.1993654999999999,
+        1.199399,
+        1.1993025
+      ]
+    },
+    "16384x131072": {
+      "config": {
+        "block_sizes": [
+          1
+        ],
+        "num_threads": [
+          1,
+          0
+        ],
+        "reduction_loops": [
+          65536
+        ],
+        "load_eviction_policies": [
+          "last",
+          "streaming",
+          "",
+          "",
+          "last"
+        ],
+        "cute_vector_widths": [
+          8,
+          16
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "strided"
+        ],
+        "cute_reduction_reloads": [
+          "gmem"
+        ],
+        "cute_cluster_n": 2,
+        "cute_min_blocks_per_mp": 0
+      },
+      "baseline_impl": "cutlass",
+      "baseline_ms": 1.250149,
+      "before_helion_ms": 2.821838,
+      "verified_ms": 1.222087,
+      "verified_runs_ms": [
+        1.22215,
+        1.221767,
+        1.222151,
+        1.221831,
+        1.222087
+      ],
+      "review_verified_ms": 1.222183,
+      "review_verified_runs_ms": [
+        1.222183,
+        1.2230794999999999,
+        1.2221665000000002,
+        1.223271,
+        1.2221495
+      ]
+    },
+    "8192x262144": {
+      "config": {
+        "block_sizes": [
+          1
+        ],
+        "reduction_loops": [
+          65536
+        ],
+        "load_eviction_policies": [
+          "last",
+          "first",
+          "first",
+          "streaming",
+          "streaming"
+        ],
+        "cute_vector_widths": [
+          16,
+          4
+        ],
+        "cute_lane_layouts": [
+          "strided",
+          "strided"
+        ],
+        "cute_reduction_reloads": [
+          "auto"
+        ],
+        "cute_cluster_n": 4,
+        "cute_min_blocks_per_mp": 4
+      },
+      "baseline_impl": "cudnn",
+      "baseline_ms": 1.264707,
+      "before_helion_ms": 2.9804645,
+      "verified_ms": 1.241991,
+      "verified_runs_ms": [
+        1.2417825,
+        1.2423595,
+        1.241991,
+        1.242407,
+        1.241831
+      ],
+      "review_verified_ms": 1.243528,
+      "review_verified_runs_ms": [
+        1.243528,
+        1.243977,
+        1.2433975,
+        1.2439594999999999,
+        1.243493
+      ]
+    }
+  },
+  "review_verification": "Standalone pinned replay after cache-scope correctness fixes; CUPTI, CUDA graphs, cold L2, five repeats per shape."
+}
