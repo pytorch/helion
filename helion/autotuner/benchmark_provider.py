@@ -26,7 +26,6 @@ import torch
 import torch.distributed as dist
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
-from torch.utils._pytree import tree_unflatten
 
 from .. import exc
 from ..runtime.precompile_shim import already_compiled
@@ -46,6 +45,9 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .kernel_args import _argument_storage_bytes
+from .kernel_args import _clone_args
+from .kernel_args import save_trusted_kernel_args
 from .logger import SUPPRESSED_TRITON_CODE_MSG
 from .logger import AutotuneLogEntry
 from .logger import capture_output
@@ -59,10 +61,7 @@ from .precompile_future import PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
 from .precompile_future import _serialize_compiled_fn
 from .progress_bar import iter_with_progress
-from helion._dist_utils import _clone_symm_mem_tensor
 from helion._dist_utils import all_gather_object
-from helion._dist_utils import get_signal_pad_ptrs_dev
-from helion._dist_utils import is_symm_mem_tensor
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
@@ -242,114 +241,6 @@ def _has_valid_multi_shape_measurement(
     materialized = _materialize_multi_shape_config(config_spec, config)
     measurement = args.measurements.get(repr(materialized))
     return measurement is not None and math.isfinite(measurement[1])
-
-
-def _clone_args(
-    args: Sequence[object],
-    process_group_name: str | None,
-    idx_to_clone: Sequence[int] | None = None,
-) -> Sequence[object]:
-    """Clone selected tensor leaves while preserving their alias topology.
-
-    If a selected ordinary tensor shares storage with another tensor argument,
-    clone that whole argument alias group.  This keeps view offsets, strides,
-    mixed-dtype storage aliases, and duplicate references intact while still
-    isolating the cloned group from both the caller and other candidates.
-    """
-
-    clone_indices = None if idx_to_clone is None else set(idx_to_clone)
-
-    def _should_clone(idx: int) -> bool:
-        return clone_indices is None or idx in clone_indices
-
-    args_flat, tree_spec = tree_flatten(args)
-    tensor_replacements: dict[int, torch.Tensor] = {}
-    signal_pad_replacements: dict[int, int] = {}
-    symmetric_tensor_ids: set[int] = set()
-
-    for i, arg in enumerate(args_flat):
-        if _should_clone(i) and is_symm_mem_tensor(arg, process_group_name):
-            arg_id = id(arg)
-            symmetric_tensor_ids.add(arg_id)
-            if arg_id not in tensor_replacements:
-                new_arg = _clone_symm_mem_tensor(arg, process_group_name)
-                signal_pad_replacements[
-                    get_signal_pad_ptrs_dev(arg, process_group_name)
-                ] = get_signal_pad_ptrs_dev(new_arg, process_group_name)
-                tensor_replacements[arg_id] = new_arg
-
-    def _storage_id(tensor: torch.Tensor) -> int | None:
-        if tensor.layout is not torch.strided:
-            return None
-        try:
-            return tensor.untyped_storage()._cdata
-        except RuntimeError:
-            return None
-
-    # A partial selection must include all ordinary tensor arguments that alias
-    # a selected tensor.  Otherwise an in-place candidate sees a different
-    # alias relationship from the original invocation.
-    selected_storage_ids: set[int] = set()
-    selected_tensor_ids: set[int] = set()
-    for i, arg in enumerate(args_flat):
-        if (
-            _should_clone(i)
-            and isinstance(arg, torch.Tensor)
-            and id(arg) not in symmetric_tensor_ids
-        ):
-            selected_tensor_ids.add(id(arg))
-            storage_id = _storage_id(arg)
-            if storage_id is not None:
-                selected_storage_ids.add(storage_id)
-
-    ordinary_tensors: list[torch.Tensor] = []
-    seen_tensor_ids: set[int] = set()
-    for arg in args_flat:
-        if not isinstance(arg, torch.Tensor) or id(arg) in tensor_replacements:
-            continue
-        arg_id = id(arg)
-        storage_id = _storage_id(arg)
-        if arg_id not in selected_tensor_ids and (
-            storage_id is None or storage_id not in selected_storage_ids
-        ):
-            continue
-        if arg_id not in seen_tensor_ids:
-            seen_tensor_ids.add(arg_id)
-            ordinary_tensors.append(arg)
-
-    storage_groups: dict[tuple[str, int], list[torch.Tensor]] = {}
-    for tensor in ordinary_tensors:
-        storage_id = _storage_id(tensor)
-        key = (
-            ("storage", storage_id)
-            if storage_id is not None
-            else ("tensor", id(tensor))
-        )
-        storage_groups.setdefault(key, []).append(tensor)
-
-    for tensors in storage_groups.values():
-        if len(tensors) == 1 and tensors[0].is_contiguous():
-            # Retain the ordinary fast path (and its observable clone
-            # semantics) when there is no cross-argument alias topology to
-            # preserve.
-            clones = [tensors[0].detach().clone()]
-        else:
-            # Deepcopy aliased detached tensors together: PyTorch memoizes their
-            # storage, preserving cross-view aliases, offsets, strides, and
-            # mixed dtypes. It also preserves a lone non-contiguous layout.
-            clones = copy.deepcopy([tensor.detach() for tensor in tensors])
-        for tensor, clone in zip(tensors, clones, strict=True):
-            clone.requires_grad_(tensor.requires_grad)
-            tensor_replacements[id(tensor)] = clone
-
-    for i, arg in enumerate(args_flat):
-        if isinstance(arg, torch.Tensor) and id(arg) in tensor_replacements:
-            args_flat[i] = tensor_replacements[id(arg)]
-            continue
-        if isinstance(arg, int) and arg in signal_pad_replacements:
-            args_flat[i] = signal_pad_replacements[arg]
-
-    return tree_unflatten(args_flat, tree_spec)
 
 
 def _estimate_tree_bytes(obj: object) -> int:
@@ -912,7 +803,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self.settings.autotune_precompile != "spawn":
             return jobs
 
-        memory_per_job = _estimate_tree_bytes(self.args) + _estimate_tree_bytes(
+        # Spawn workers retain a cached pristine template and a private copy.
+        # The loader may briefly hold raw and restored templates; later the
+        # candidate holds a template plus its private copy. Count full storage
+        # spans/padding, not just visible tensor elements. The existing 2x
+        # safety factor also covers a transient rebasing copy.
+        memory_per_job = 2 * _argument_storage_bytes(self.args) + _estimate_tree_bytes(
             self._baseline_output
         )
         memory_per_job *= 2  # safety factor
@@ -970,7 +866,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         ):
             args_path = os.path.join(self._precompile_tmpdir.name, "args.pt")
             try:
-                torch.save(self.args, args_path)
+                save_trusted_kernel_args(self.args, args_path)
             except (pickle.PicklingError, AttributeError, TypeError) as e:
                 # Kernel args holding lambdas/closures (e.g. an epilogue
                 # callable) cannot cross a spawn boundary. Fall back to the
@@ -1150,14 +1046,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         mode = self.settings.autotune_precompile
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
-        if len(self.mutated_arg_indices) > 0:
-            args = _clone_args(
-                self.args,
-                self.kernel.env.process_group_name,
-                idx_to_clone=self.mutated_arg_indices,
-            )
-        else:
-            args = self.args
+        args = _clone_args(self.args, self.kernel.env.process_group_name)
         return PrecompileFuture.create(
             ctx=ctx,
             config=config,
@@ -1606,14 +1495,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # None means the subprocess path could not handle this config
             # (e.g., serialization failed); fall through to in-process.
 
-        if len(self.mutated_arg_indices) > 0:
-            working_args = _clone_args(
-                self.args,
-                self.kernel.env.process_group_name,
-                idx_to_clone=self.mutated_arg_indices,
-            )
-        else:
-            working_args = self.args
+        # Reference mutation describes comparison semantics, not candidate
+        # write behavior. Even a rejected candidate must not modify the next
+        # candidate's inputs or the caller's scratch/output storage.
+        working_args = _clone_args(self.args, self.kernel.env.process_group_name)
 
         # precompile in the current process for distributed kernels.
         # The reason we need this is due to some tricky distributed kernels
@@ -1681,11 +1566,18 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # while other ranks return immediately, this will cause stuck jobs!
                 return inf
 
+            # Accuracy/compile-trigger launches may have modified arguments.
+            # Start timing from another private snapshot, outside the timer.
+            # Accuracy is synchronized and validated above, so release its
+            # output and argument references before allocating the timing copy.
+            output = None
+            working_args = ()
+            timing_args = _clone_args(self.args, self.kernel.env.process_group_name)
             with capture_output() as _captured_output:
                 benchmark_function = self.kernel.bench_compile_config(
                     config, allow_print=False
                 )
-                benchmark_function(*working_args)  # warmup benchmark kernel
+                benchmark_function(*timing_args)  # warmup benchmark kernel
 
                 t1 = time.perf_counter()
                 _backend = getattr(getattr(self, "config_spec", None), "backend", None)
@@ -1696,7 +1588,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # default do_bench, which accepts probe_long_kernel.
                 if self._probe_long_cute_flash_kernel():
                     res = benchmark_runner(
-                        functools.partial(benchmark_function, *working_args),
+                        functools.partial(benchmark_function, *timing_args),
                         return_mode="median",
                         warmup=1,  # we are already warmed up above
                         rep=50,
@@ -1705,7 +1597,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     )
                 else:
                     res = benchmark_runner(
-                        functools.partial(benchmark_function, *working_args),
+                        functools.partial(benchmark_function, *timing_args),
                         return_mode="median",
                         warmup=1,  # we are already warmed up above
                         rep=50,
@@ -1924,9 +1816,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # worker; validate in-process instead.
             try:
                 with capture_output():
-                    output = fn(*self.args)
+                    working_args = _clone_args(
+                        self.args, self.kernel.env.process_group_name
+                    )
+                    output = fn(*working_args)
                     synchronize_device()
-                if not self._validate_against_baseline(config, output, self.args):
+                if not self._validate_against_baseline(config, output, working_args):
                     self._record_accuracy_failure(config)
                     return inf
             except Exception as e:
@@ -2245,14 +2140,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 "relative_to='baseline' requires autotune_baseline_fn for "
                 f"arg_sets[{case_index}]"
             )
-        if child.mutated_arg_indices:
-            reference_args = _clone_args(
-                child.args,
-                child.kernel.env.process_group_name,
-                idx_to_clone=child.mutated_arg_indices,
-            )
-        else:
-            reference_args = child.args
+        reference_args = _clone_args(child.args, child.kernel.env.process_group_name)
         backend = getattr(child.config_spec, "backend", None)
         benchmark_runner = (
             backend.get_do_bench() if backend is not None else None

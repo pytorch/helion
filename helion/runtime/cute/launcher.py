@@ -287,6 +287,12 @@ def _append_cute_wrapper_plan(
     plan: dict[str, object],
     num_sm: int | None = None,
 ) -> None:
+    if plan.get("kind") == "chained_startup_tma":
+        from .chained_startup import append_wrapper
+
+        append_wrapper(body, call_args, plan)
+        return
+
     def plan_int(key: str, default: int | None = None) -> int:
         value = plan.get(key, default) if default is not None else plan[key]
         assert isinstance(value, int)
@@ -446,6 +452,11 @@ def _append_cute_wrapper_plan(
         call_args.extend(kernel_args)
 
     kind = plan["kind"]
+    if kind == "chained_paired_leaf_tma":
+        from .chained_leaf_pipeline import append_wrapper
+
+        append_wrapper(body, call_args, plan)
+        return
     if kind == "chunk_recurrence_sm100":
         outputs_scaled = plan.get("outputs_scaled")
         factor_key_xor = plan.get("factor_key_xor")
@@ -2147,6 +2158,8 @@ def _cute_compiled_launcher_discriminator(
     block: tuple[int, int, int],
     compile_options: str | None,
     arch_args: tuple[object, ...] | None,
+    *,
+    pointer_alignment: int = 16,
 ) -> tuple[tuple[object, ...], str, int | None]:
     merged_compile_options = _merge_tvm_ffi_compile_option(compile_options)
     num_sm = _cute_num_sm_from_arch_args(arch_args)
@@ -2156,6 +2169,7 @@ def _cute_compiled_launcher_discriminator(
             block,
             merged_compile_options,
             num_sm,
+            pointer_alignment,
         ),
         merged_compile_options,
         num_sm,
@@ -2181,6 +2195,7 @@ def _get_compiled_cute_launcher(
         block,
         compile_options,
         arch_args,
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )
     try:
         # pyrefly: ignore [missing-attribute]
@@ -2295,6 +2310,7 @@ def _cute_disk_cache_key(
             _cute_cache_relevant_env(),
             cutlass_version,
             num_sm,
+            _cute_pointer_alignment(cute_kernel),
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()
@@ -2607,6 +2623,7 @@ class _CuteLastLaunchArgGuard:
     arg_guards: tuple[_CuteLastTensorArgGuard | _CuteLastScalarArgGuard, ...]
     grouped_mutation_guards: tuple[_CuteLastGroupedMutationGuard, ...]
     grouped_launch_contexts: tuple[_CuteGroupedLaunchContext, ...]
+    pointer_alignment: int = 16
 
     def matches(
         self,
@@ -2618,6 +2635,7 @@ class _CuteLastLaunchArgGuard:
             len(args) != self.arg_count
             or grid != self.grid
             or _cute_bake_tensor_shapes_guard(cute_kernel) != self.bake_tensor_shapes
+            or _cute_pointer_alignment(cute_kernel) != self.pointer_alignment
             or _cute_grouped_launch_contexts(cute_kernel, args)
             != self.grouped_launch_contexts
         ):
@@ -3804,6 +3822,15 @@ def _tcgen05_grouped_static_metadata_cache_key(
     )
 
 
+def _cute_pointer_alignment(cute_kernel: object) -> int:
+    """Immutable compiler metadata shared by pointer marshalling and caches."""
+    return cast("int", getattr(cute_kernel, "_helion_cute_pointer_alignment", 16))
+
+
+def _cute_tensor_pointer_alignment(cute_kernel: object, tensor: torch.Tensor) -> int:
+    return max(_cute_pointer_alignment(cute_kernel), tensor.element_size())
+
+
 def _cute_bake_tensor_shapes_guard(cute_kernel: object) -> bool:
     any_obj = cast("Any", cute_kernel)
     wrapper_plans = getattr(any_obj, "_helion_cute_wrapper_plans", None)
@@ -4436,7 +4463,12 @@ def _cute_launch_arg_cache_key(
     dynamic_tensormap_contexts: tuple[_CuteGroupedLaunchContext, ...] | None = None,
 ) -> tuple[object, ...]:
     constexpr_flags = _cute_kernel_param_is_constexpr(cute_kernel)
-    key: list[object] = [len(args), grid, _cute_bake_tensor_shapes_guard(cute_kernel)]
+    key: list[object] = [
+        len(args),
+        grid,
+        _cute_bake_tensor_shapes_guard(cute_kernel),
+        _cute_pointer_alignment(cute_kernel),
+    ]
     if dynamic_tensormap_contexts is None:
         dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     if dynamic_tensormap_contexts:
@@ -4537,6 +4569,7 @@ def _build_cached_cute_schema_and_args(
     args: tuple[object, ...],
     grid: tuple[int, int, int],
 ) -> _CuteLaunchArgCacheEntry:
+    _validate_chained_leaf_arguments(cute_kernel, args)
     dynamic_tensormap_contexts = _cute_dynamic_tensormap_contexts(cute_kernel, args)
     grouped_launch_contexts = _cute_grouped_launch_contexts(
         cute_kernel,
@@ -5141,6 +5174,9 @@ def _build_cute_schema_and_args(
     grid: tuple[int, int, int],
     bake_tensor_shapes: bool = True,
 ) -> _CuteLaunchArgCacheEntry:
+    from .chained_startup import validate_arguments
+
+    validate_arguments(cute_kernel, args)
     # NOTE: the returned launch args deliberately EXCLUDE the CUDA stream. The
     # stream is the only launch arg that is not a pure function of
     # (grid, tensor metadata, scalars), so it must not be baked into the cached
@@ -5173,7 +5209,7 @@ def _build_cute_schema_and_args(
                     cast("Any", _torch_dtype_to_cutlass(arg.dtype)),
                     arg.data_ptr(),
                     gmem_space,
-                    assumed_align=16,
+                    assumed_align=_cute_tensor_pointer_alignment(cute_kernel, arg),
                 )
             )
             # ``cute.make_layout`` rejects a 0 in any shape dimension, so
@@ -5230,7 +5266,7 @@ def _build_cute_schema_and_args(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
                 tensor.data_ptr(),
                 gmem_space,
-                assumed_align=16,
+                assumed_align=_cute_tensor_pointer_alignment(cute_kernel, tensor),
             )
         )
         if runtime_leading_extent:
@@ -5515,6 +5551,7 @@ def _cute_last_launch_arg_guard(
         arg_guards=tuple(arg_guards),
         grouped_mutation_guards=tuple(grouped_mutation_guards),
         grouped_launch_contexts=_cute_grouped_launch_contexts(cute_kernel, args),
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )
 
 
@@ -5567,6 +5604,7 @@ class _CuteFastRelaunch:
         "keepalive",
         "last_raw",
         "lock",
+        "pointer_alignment",
         "scalar_guards",
         "tensor_guards",
         "tensor_slots",
@@ -5593,6 +5631,7 @@ class _CuteFastRelaunch:
         device_index: int,
         last_raw: int,
         keepalive: tuple[object, ...],
+        pointer_alignment: int = 16,
     ) -> None:
         self.executor = executor
         self.exe_args = exe_args
@@ -5609,6 +5648,7 @@ class _CuteFastRelaunch:
         self.device_index = device_index
         self.last_raw = last_raw
         self.keepalive = keepalive
+        self.pointer_alignment = pointer_alignment
         self.lock = threading.Lock()
 
     def try_launch(
@@ -5617,12 +5657,14 @@ class _CuteFastRelaunch:
         grid: tuple[int, int, int],
         block: tuple[int, int, int],
         compile_options: str | None,
+        pointer_alignment: int = 16,
     ) -> tuple[bool, object]:
         if (
             len(args) != self.arg_count
             or grid != self.grid
             or block != self.block
             or compile_options != self.compile_options
+            or pointer_alignment != self.pointer_alignment
         ):
             return _CUTE_FASTPATH_MISS
         for (
@@ -5641,6 +5683,7 @@ class _CuteFastRelaunch:
                 or tensor.device.index != device_index
                 or tensor.size() != shape
                 or tensor.stride() != stride
+                or tensor.data_ptr() % max(pointer_alignment, tensor.element_size())
             ):
                 return _CUTE_FASTPATH_MISS
         for guard in self.scalar_guards:
@@ -5729,9 +5772,11 @@ def _cute_build_fast_relaunch(
     if any(
         plan.get("kind")
         in {
+            "chained_startup_tma",
             "chunk_prepare_tma",
             "chunk_recurrence_sm100",
             "chunk_recurrence_warp_dv4",
+            "chained_paired_leaf_tma",
         }
         for plan in wrapper_plans
     ):
@@ -5770,7 +5815,7 @@ def _cute_build_fast_relaunch(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
                 int(tensor.data_ptr()),
                 gmem_space,
-                assumed_align=16,
+                assumed_align=_cute_tensor_pointer_alignment(cute_kernel, tensor),
             )
         base = tuple(own_base)
         stream_a = cuda_driver.CUstream(raw0)
@@ -5816,7 +5861,7 @@ def _cute_build_fast_relaunch(
                 cast("Any", _torch_dtype_to_cutlass(tensor.dtype)),
                 int(tensor.data_ptr()) + shift,
                 gmem_space,
-                assumed_align=16,
+                assumed_align=_cute_tensor_pointer_alignment(cute_kernel, tensor),
             )
         exe4, _adapted4 = execution_args.generate_execution_args(
             (*tuple(alt_base), stream_a), {}
@@ -5929,6 +5974,7 @@ def _cute_build_fast_relaunch(
             device_index=device_index,
             last_raw=raw0,
             keepalive=(base, stream_a, adapted1, exe1),
+            pointer_alignment=_cute_pointer_alignment(cute_kernel),
         )
     except Exception:
         return None
@@ -5951,6 +5997,7 @@ def _cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )[0]
     if discriminator != entry.compiled_discriminator:
         return None
@@ -5976,6 +6023,7 @@ def _set_cute_last_launch_cache_entry(
         block,
         compile_options,
         args,
+        pointer_alignment=_cute_pointer_alignment(cute_kernel),
     )[0]
     cast("Any", cute_kernel)._helion_cute_last_launch_cache = _CuteLastLaunchCacheEntry(
         arg_guard=arg_guard,
@@ -5983,6 +6031,17 @@ def _set_cute_last_launch_cache_entry(
         launch=launch,
         compiled=compiled,
     )
+
+
+def _validate_chained_leaf_arguments(
+    cute_kernel: object, args: tuple[object, ...]
+) -> None:
+    """Recheck paired-leaf TensorMap alignment and independence before caches."""
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        if plan.get("kind") == "chained_paired_leaf_tma":
+            from .chained_leaf_pipeline import validate_plan
+
+            validate_plan(plan, args)
 
 
 def default_cute_launcher(
@@ -6017,6 +6076,10 @@ def default_cute_launcher(
         return None
 
     args_tuple = tuple(args)
+    from .chained_startup import validate_arguments
+
+    validate_arguments(cute_kernel, args_tuple)
+    _validate_chained_leaf_arguments(cute_kernel, args_tuple)
     # Metadata-guarded fast relaunch: skips the pointer-keyed caches AND the
     # DSL's per-call marshalling entirely (fresh output allocations change
     # tensor pointers on every call in real workloads, so pointer-keyed
@@ -6024,7 +6087,11 @@ def default_cute_launcher(
     fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
     if isinstance(fastpath, _CuteFastRelaunch):
         hit, result = fastpath.try_launch(
-            args_tuple, grid_xyz, block_xyz, cute_compile_options
+            args_tuple,
+            grid_xyz,
+            block_xyz,
+            cute_compile_options,
+            _cute_pointer_alignment(cute_kernel),
         )
         if hit:
             return result
