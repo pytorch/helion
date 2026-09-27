@@ -7,6 +7,7 @@ import csv
 from dataclasses import replace
 import functools
 import inspect
+import itertools
 import json
 import logging
 import math
@@ -31,6 +32,7 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 import torch
+from torch._inductor.runtime.triton_compat import OutOfResources
 
 import helion
 from helion import _compat
@@ -70,6 +72,7 @@ from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_provider import _MAX_REFERENCE_BASELINE_ATTEMPTS
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_provider import _compile_config_failure_source_hash
@@ -9398,6 +9401,137 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             "Custom baseline function failed while computing baseline",
         ):
             add(*args)
+
+    @staticmethod
+    def _rejecting_baseline_search(
+        reject: Callable[[int, int], bool],
+        attempted: list[int],
+        error: Exception | None = None,
+    ) -> tuple[FiniteSearch, tuple[torch.Tensor, torch.Tensor], int]:
+        """A search whose baseline compiles are rejected by *reject*.
+
+        ``reject`` is called with the attempted block size and the reference
+        config's block size.  A rejected compile raises *error*, by default the
+        ``OutOfResources`` Intel's backend raises when a tile overflows its
+        per-thread scratch space.  ``_prepare()`` builds the benchmark provider
+        (and with it the accuracy baseline) but does not compile the candidate
+        configs, so replacing ``compile_config`` here only intercepts the
+        baseline.
+        """
+
+        @helion.kernel(autotune_log_level=0, autotune_benchmark_subprocess=False)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([1024], device=DEVICE),
+            torch.randn([1024], device=DEVICE),
+        )
+        bound = add.bind(args)
+        reference_block = bound.config_spec.autotune_reference_config()["block_sizes"][
+            0
+        ]
+        original = bound.compile_config
+
+        def compile_config(config: helion.Config, **kwargs: object) -> object:
+            block = config["block_sizes"][0]
+            attempted.append(block)
+            if reject(block, reference_block):
+                if error is not None:
+                    raise error
+                raise OutOfResources(406912, 262144, "per-thread scratch space")
+            return original(config, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        search = FiniteSearch(
+            bound,
+            args,
+            configs=[
+                helion.Config(block_sizes=[16], num_warps=4),
+                helion.Config(block_sizes=[32], num_warps=4),
+            ],
+        )
+        search.kernel.compile_config = compile_config  # pyrefly: ignore[bad-assignment]
+        return search, args, reference_block
+
+    def test_reference_baseline_shrinks_after_hardware_rejection(self) -> None:
+        """A reference config the device rejects backs off instead of aborting.
+
+        The reference config only exists to produce baseline outputs, so a
+        hardware limit Helion cannot model at config-generation time must not
+        cost the whole autotune.
+        """
+        attempted: list[int] = []
+        search, args, reference_block = self._rejecting_baseline_search(
+            lambda block, reference: block > reference // 4, attempted
+        )
+        self.assertGreaterEqual(reference_block, 4)
+
+        search._prepare()
+
+        # Halve once per failure until the tile is accepted.
+        self.assertEqual(
+            attempted,
+            [reference_block, reference_block // 2, reference_block // 4],
+        )
+        torch.testing.assert_close(
+            search.benchmark_provider._baseline_output, args[0] + args[1]
+        )
+
+    def test_reference_baseline_aborts_when_every_block_size_fails(self) -> None:
+        """Shrinking is bounded: a config nothing fixes still reports clearly."""
+        attempted: list[int] = []
+        search, _, reference_block = self._rejecting_baseline_search(
+            lambda block, reference: True, attempted
+        )
+
+        with (
+            patch.object(search.log, "warning") as warn,
+            self.assertRaisesRegex(
+                helion.exc.InvalidConfig,
+                "Autotuning reference config failed while computing baseline",
+            ),
+        ):
+            search._prepare()
+
+        self.assertEqual(len(attempted), _MAX_REFERENCE_BASELINE_ATTEMPTS)
+        # Each attempt halves the previous one, starting from the reference
+        # config that the error message reports.
+        self.assertEqual(attempted[0], reference_block)
+        for previous, block in itertools.pairwise(attempted):
+            self.assertEqual(block, previous // 2)
+        # A retry is announced only when it actually runs.
+        retries = [
+            c for c in warn.call_args_list if "retrying the baseline" in str(c.args[0])
+        ]
+        self.assertEqual(len(retries), len(attempted) - 1)
+
+    def test_reference_baseline_raises_errors_shrinking_cannot_fix(self) -> None:
+        """Bugs and unrecoverable runtime errors are not retried.
+
+        A smaller config would fail the same way, so the error surfaces on the
+        reference config right away, as it did before the backoff existed.
+        """
+        for error in (
+            RuntimeError("unsupported op"),
+            RuntimeError("CUDA error: an illegal memory access was encountered"),
+        ):
+            with self.subTest(error=str(error)):
+                attempted: list[int] = []
+                search, _, reference_block = self._rejecting_baseline_search(
+                    lambda block, reference: True, attempted, error
+                )
+
+                with self.assertRaisesRegex(
+                    helion.exc.InvalidConfig,
+                    "Autotuning reference config failed while computing baseline",
+                ) as ctx:
+                    search._prepare()
+
+                self.assertEqual(attempted, [reference_block])
+                self.assertIs(ctx.exception.__cause__, error)
 
     def test_autotune_baseline_tolerance(self) -> None:
         cfg1 = helion.Config(block_sizes=[1], num_warps=4)
