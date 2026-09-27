@@ -523,18 +523,26 @@ def qwen3_decode_layer(
     activation_intermediate = activation_twice_intermediate // 2
     hl.specialize(activation_group_size)
     activation_groups = activation_intermediate // activation_group_size
-    activation_q = torch.empty(
-        (activation_m, activation_intermediate),
+    # Two W2 K partitions nearly fill the eight-program-per-SM persistent grid.
+    # Keep the chunk dimension visible in the activation views so dependency
+    # analysis can release each half as soon as its input groups are ready.
+    w2_chunks = 2
+    assert activation_groups % w2_chunks == 0
+    w2_split_k_groups = activation_groups // w2_chunks
+    w2_chunk_k = w2_split_k_groups * activation_group_size
+    activation_q_chunked = torch.empty(
+        (activation_m, w2_chunks, w2_chunk_k),
         dtype=torch.float8_e4m3fn,
         device=activation_gate_up.device,
     )
-    activation_scale = torch.empty(
-        (activation_m, activation_groups),
+    activation_scale_chunked = torch.empty(
+        (activation_m, w2_chunks, w2_split_k_groups),
         dtype=torch.float32,
         device=activation_gate_up.device,
     )
+    activation_q = activation_q_chunked.view(activation_m, activation_intermediate)
+    activation_scale = activation_scale_chunked.view(activation_m, activation_groups)
     w2_activation_q = activation_q
-    w2_activation_scale = activation_scale
     w2_weight_q = w2_q
     w2_weight_scale = w2_scale
     w2_group_size = group
@@ -544,6 +552,13 @@ def qwen3_decode_layer(
     assert w2_weight_k == w2_k
     assert w2_group_size == 128
     hl.specialize(w2_group_size)
+    w2_groups = w2_k // w2_group_size
+    assert w2_groups == w2_chunks * w2_split_k_groups
+    w2_partials = torch.empty(
+        (w2_m, w2_chunks, w2_n),
+        dtype=torch.float32,
+        device=w2_activation_q.device,
+    )
     output = torch.empty(
         (w2_m, w2_n), dtype=torch.bfloat16, device=w2_activation_q.device
     )
@@ -1063,19 +1078,31 @@ def qwen3_decode_layer(
             .to(activation_q.dtype)
         )
     # vLLM: Qwen3DecoderLayer.mlp.down_proj.
-    for w2_tile_m, w2_tile_n in hl.tile([w2_m, w2_n], block_size=[1, None]):
+    for w2_tile_m, w2_tile_chunk, w2_tile_n in hl.tile(
+        [w2_m, w2_chunks, w2_n], block_size=[1, 1, None]
+    ):
         w2_acc = hl.zeros([w2_tile_m, w2_tile_n], dtype=torch.float32)
-        for w2_tile_k in hl.tile(w2_k, block_size=w2_group_size):
+        for w2_tile_local_k in hl.tile(w2_chunk_k, block_size=w2_group_size):
+            w2_tile_k = w2_tile_chunk.begin * w2_chunk_k + w2_tile_local_k.index
+            w2_group = w2_tile_chunk.begin * w2_split_k_groups + w2_tile_local_k.id
             w2_partial = hl.dot(
-                w2_activation_q[w2_tile_m, w2_tile_k],
+                activation_q_chunked[w2_tile_m, w2_tile_chunk.begin, w2_tile_local_k],
                 w2_weight_q[w2_tile_n, w2_tile_k].T,
             ).to(torch.float32)
-            w2_a_scale = w2_activation_scale[w2_tile_m, w2_tile_k.id].to(torch.float32)
-            w2_w_scale = w2_weight_scale[
-                w2_tile_n.index // w2_group_size, w2_tile_k.id
+            w2_a_scale = activation_scale_chunked[
+                w2_tile_m, w2_tile_chunk.begin, w2_tile_local_k.id
             ].to(torch.float32)
+            w2_w_scale = w2_weight_scale[w2_tile_n.index // w2_group_size, w2_group].to(
+                torch.float32
+            )
             w2_acc = w2_acc + w2_partial * w2_a_scale[:, None] * w2_w_scale[None, :]
-        output[w2_tile_m, w2_tile_n] = w2_acc.to(output.dtype)
+        w2_partials[w2_tile_m, w2_tile_chunk, w2_tile_n] = w2_acc[:, None, :]
+    for w2_final_m, w2_final_n in hl.tile([w2_m, w2_n], block_size=[1, 8]):
+        w2_final_chunk = hl.arange(w2_chunks)
+        w2_final_values = w2_partials[w2_final_m, w2_final_chunk, w2_final_n]
+        output[w2_final_m, w2_final_n] = torch.sum(w2_final_values, dim=1).to(
+            output.dtype
+        )
     return (
         output,
         pre_q,
