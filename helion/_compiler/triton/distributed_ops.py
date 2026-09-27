@@ -21,8 +21,6 @@ from ...language.distributed_ops import wait_recv_async_remote_copy
 from ...language.distributed_ops import wait_send_async_remote_copy
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
-from ..host_function import HostFunction
-from ..variable_origin import GridOrigin
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -186,19 +184,6 @@ def _index_expr(
     tile_max_extents: list[str] = []
     for position, (proxy, index) in enumerate(zip(proxy_index, index_ast, strict=True)):
         block_id = env.get_block_id(proxy) if isinstance(proxy, torch.SymInt) else None
-        if isinstance(proxy, torch.SymInt):
-            origin_info = HostFunction.current().expr_to_origin.get(proxy._sympy_())
-            # A raw tile/grid value names the live tile region.  Derived tile
-            # scalars (tile.begin/end/count/id) have their own codegen formula
-            # in ``index`` and must not be silently replaced by the tile
-            # offset.  In particular, treating ``tile.id`` as an offset makes
-            # a leading remote-copy index scale by the block size twice.
-            if (
-                origin_info is not None
-                and isinstance(origin_info.origin, GridOrigin)
-                and type(origin_info.origin) is not GridOrigin
-            ):
-                block_id = None
         if block_id is not None:
             assert state.fx_node is not None
             block_id = env.resolve_codegen_block_id(

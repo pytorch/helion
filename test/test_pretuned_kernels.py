@@ -301,27 +301,12 @@ def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
     assert "__deepseek" not in source
 
 
-def test_distributed_tp_gemm_uses_compiler_readiness() -> None:
-    module = _import_pretuned_kernel_module("distributed_tp_gemm")
-    config = module.distributed_tp_gemm.configs[0].config
-
-    assert module.distributed_tp_gemm.settings.static_shapes
-    assert config["cross_loop_pipeline"] == "dynamic"
-    assert config["num_sm_multiplier"] == 2
-    assert module.SPLIT_K == 12
-    assert module.PRODUCER_N == module.MERGE_N == 128
-    assert module.COMMUNICATION_N == 2048
-    source = inspect.getsource(module.distributed_tp_gemm.fn)
-    assert "get_remote_tensors" in source
-    assert "inline_triton" not in source
-    assert "topology" not in source
-
-
 def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
     module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
     config = module.deepseek_v3_moe_nvfp4_tp.configs[0].config
 
     assert not module.deepseek_v3_moe_nvfp4_tp.settings.static_shapes
+    assert module.WORLD_SIZE == 4
     assert config["cross_loop_pipeline"] == "dynamic"
     assert config["host_tensor_descriptors"]
     assert config["num_sm_multiplier"] == 1

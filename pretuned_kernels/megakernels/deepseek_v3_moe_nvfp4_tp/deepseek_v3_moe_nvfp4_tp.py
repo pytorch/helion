@@ -1,11 +1,19 @@
-"""DeepSeek-V3 B1 NVFP4 MoE with a fused TP4 all-reduce.
+"""DeepSeek-V3 B1 NVFP4 MoE with a fused TP4 all-reduce on B200.
 
-The model body is derived from the single-device pretuned kernel so routing,
-quantization, expert arithmetic, and intermediate numerics have one source of
-truth.  This module changes only two source-level choices needed by TP4:
+This is tensor parallelism, not token expert parallelism: every rank receives
+the same token and routing result, evaluates a distinct intermediate shard of
+the selected experts, and sums the rank-local weighted outputs.  The model body
+is derived from the single-device pretuned kernel so routing, quantization,
+expert arithmetic, and intermediate numerics have one source of truth.  The
+TP4 variant makes three source-level changes:
 
 * split the underfilled routed-W13 reduction seven ways; and
+* retune the routed and shared W2 reduction widths for the TP4 shard; and
 * write the local weighted sum to symmetric memory before a coarse peer pull.
+
+The benchmark compares the one-kernel path against the same generated Helion
+body followed by a production one-shot all-reduce, and against FlashInfer's
+TRT-LLM MoE followed by that same collective.
 
 Run the benchmark with four local ranks::
 

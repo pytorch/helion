@@ -1173,7 +1173,7 @@ class TestCrossLoopScheduler(TestCase):
             )
         )
 
-    def test_dynamic_final_arrival_ignores_static_worker_strands(self) -> None:
+    def test_final_arrival_continuation_rejects_cross_key_worker_strands(self) -> None:
         roots = (
             _domain((10, 8, 1), identity=0),
             _domain((20, 8, 1), identity=1),
@@ -1204,16 +1204,6 @@ class TestCrossLoopScheduler(TestCase):
                 charge=charge,
             ),
             (),
-        )
-        self.assertEqual(
-            choose_final_arrival_continuations(
-                graph,
-                candidates,
-                dataclasses.replace(plan, dispatch_mode="dynamic"),
-                causal_relations={},
-                charge=lambda _amount: False,
-            ),
-            candidates,
         )
 
     def test_root_local_preparation_keeps_order_without_composed_grouping(

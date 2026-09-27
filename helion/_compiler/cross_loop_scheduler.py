@@ -1478,31 +1478,6 @@ def choose_final_arrival_continuations(
         for consumer in event.consumers
         if consumer.consumer_site_id is not None
     )
-    counters_by_event = {
-        counter.readiness_key_domain.identity: counter
-        for counter in plan.readiness_counters
-    }
-    if plan.dispatch_mode == "dynamic":
-        # Dynamic dispatch has no fixed worker slot to preserve: each exact
-        # readiness counter elects one temporal final arrival. Candidate
-        # derivation has already proved complete one-task-per-key coverage.
-        dynamic_result: list[FinalArrivalContinuation] = []
-        dynamic_roots: set[int] = set()
-        for continuation in candidates:
-            consumer_root = (
-                readiness_graph.events[continuation.event_id]
-                .consumers[continuation.consumer_index]
-                .consumer_root
-            )
-            if (
-                consumer_root not in excluded_roots
-                and consumer_root not in dynamic_roots
-                and continuation.event_id in counters_by_event
-            ):
-                dynamic_result.append(continuation)
-                dynamic_roots.add(consumer_root)
-        return tuple(dynamic_result)
-
     slot_domain = CoordinateDomain.scalar(
         plan.static_slot_count + (len(candidates) + 1) * plan.worker_count,
         kind="worker",
@@ -1524,6 +1499,10 @@ def choose_final_arrival_continuations(
             return ()
         execution_by_slot_by_root[root] = execution
     virtual_placements: dict[int, Incidence] = {}
+    counters_by_event = {
+        counter.readiness_key_domain.identity: counter
+        for counter in plan.readiness_counters
+    }
     result: list[FinalArrivalContinuation] = []
     removed_roots: set[int] = set()
     virtual_supports: list[CoordinateRelation] = []
@@ -3391,15 +3370,10 @@ def build_static_pipeline_plan(
         if continuation_candidates
         else ()
     )
-    continuation_selection_plan = (
-        dataclasses.replace(all_resident_plan, dispatch_mode="dynamic")
-        if cross_loop_dispatch_mode == "dynamic"
-        else all_resident_plan
-    )
     continuations = choose_final_arrival_continuations(
         readiness_graph,
         continuation_candidates,
-        continuation_selection_plan,
+        all_resident_plan,
         excluded_roots=continuation_ineligible_roots,
         causal_relations=causal_relations,
         charge=charge,
