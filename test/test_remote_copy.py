@@ -54,6 +54,8 @@ _REMOTE_SLOT = 1
 _PIPELINE_STEPS = 4
 _GATHER_ROWS = 8
 _HBM_TILE = 8
+_CHUNK_COUNT = 4
+_CHUNK_WIDTH = 32
 
 
 def _rank_values(rank: int, width: int = _WIDTH) -> np.ndarray:
@@ -184,6 +186,31 @@ def _remote_copy_with_unrelated_loop_input(
             copy.wait()
             output[0, step, :] = dst[0, step, :] + bias[0, :]
     return dst, output
+
+
+@helion.kernel(
+    static_shapes=True,
+    config=helion.Config(block_sizes=[]),
+)
+def _tile_id_remote_copy(
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    peers: torch.Tensor,
+) -> torch.Tensor:
+    """Use a derived tile id as a leading remote-copy index."""
+    elements = src.size(1) * src.size(2)
+    for element_tile in hl.tile(elements, block_size=_CHUNK_WIDTH):
+        chunk = element_tile.id
+        copy = hl.make_async_remote_copy(
+            src,
+            [0, chunk],
+            peers[0, 0],
+            dst=dst,
+            dst_index=[0, chunk],
+        )
+        copy.start()
+        copy.wait()
+    return dst
 
 
 @helion.kernel(
@@ -784,6 +811,28 @@ class TestRemoteCopyGPU(TestCase, MultiProcessTestCase):
             torch.cuda.synchronize()
             torch.testing.assert_close(result_dst[0], expected)
             torch.testing.assert_close(result_output[0], expected + bias)
+
+    def test_remote_copy_preserves_derived_tile_id_index(self) -> None:
+        self._init_process()
+        values = torch.arange(
+            _CHUNK_COUNT * _CHUNK_WIDTH,
+            dtype=torch.float32,
+            device=self.device,
+        ).reshape(1, _CHUNK_COUNT, _CHUNK_WIDTH)
+        src = values + self.rank * 1000
+        dst = self._make_symmetric_buffer(src.shape)
+        peers = torch.tensor(
+            [[(self.rank + 1) % self.world_size]],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        expected = values + ((self.rank - 1) % self.world_size) * 1000
+        for _invocation in range(2):
+            dst.fill_(-1)
+            dist.barrier()
+            result = _tile_id_remote_copy(src, dst, peers)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(result, expected)
 
     def test_computed_pipeline_copy(self) -> None:
         self._init_process()
