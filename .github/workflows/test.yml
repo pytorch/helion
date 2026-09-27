@@ -343,6 +343,7 @@ jobs:
           # serially rather than assigning its tests to concurrent xdist workers.
           if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
             pytest -rf --timeout=$TIMEOUT --timeout-method=thread $EXTRA_FLAGS test/test_remote_copy.py::TestRemoteCopyGPU | tee >(eval $SKIP_CHECK)
+            TEST_WORLD_SIZE=4 HELION_TEST_DISTRIBUTED_READINESS=1 pytest -rf --timeout=600 --timeout-method=thread $EXTRA_FLAGS test/test_distributed.py::TestDistributed::test_pipelined_allreduce_replays | tee >(eval $SKIP_CHECK)
           fi
 
   test-notebooks:

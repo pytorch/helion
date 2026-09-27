@@ -32,6 +32,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -338,9 +339,14 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
+    @skipIfNotCUDA()
     @unittest.skipUnless(
-        torch.version.cuda is not None,
+        torch.version.cuda is not None and torch.version.hip is None,
         "compiler-derived distributed readiness requires NVIDIA CUDA",
+    )
+    @unittest.skipUnless(
+        os.environ.get("HELION_TEST_DISTRIBUTED_READINESS") == "1",
+        "run compiler-derived readiness only in the sequential distributed job",
     )
     def test_pipelined_allreduce_replays(self) -> None:
         """Compiler-derived cross-rank readiness survives eager and graph replay."""

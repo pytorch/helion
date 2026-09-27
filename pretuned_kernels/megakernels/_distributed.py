@@ -20,25 +20,42 @@ def initialize(
     *, kernel_name: str, world_size: int, signal_pad_bytes: int
 ) -> tuple[int, int, dist.ProcessGroup]:
     """Initialize the fixed-size local NVSHMEM process group used by a probe."""
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or torch.version.hip is not None:
         raise RuntimeError(f"{kernel_name} is pretuned only for NVIDIA SM100")
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     actual_world_size = int(os.environ["WORLD_SIZE"])
     if actual_world_size != world_size:
         raise RuntimeError(f"{kernel_name} requires TP={world_size}")
+    local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", actual_world_size))
+    visible_devices = torch.cuda.device_count()
+    if local_world_size != world_size or visible_devices < local_world_size:
+        raise RuntimeError(
+            f"{kernel_name} requires {world_size} visible local CUDA devices, "
+            f"but found {visible_devices} for {local_world_size} local ranks"
+        )
+    if not 0 <= local_rank < visible_devices:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is outside the {visible_devices} visible devices"
+        )
     torch.cuda.set_device(local_rank)
     if torch.cuda.get_device_capability() != (10, 0):
         raise RuntimeError(f"{kernel_name} is pretuned only for NVIDIA SM100")
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
-    group = dist.group.WORLD
-    if group is None:
-        raise RuntimeError("default process group was not initialized")
-    import torch.distributed._symmetric_memory as symm_mem
+    try:
+        group = dist.group.WORLD
+        if group is None:
+            raise RuntimeError("default process group was not initialized")
+        import torch.distributed._symmetric_memory as symm_mem
 
-    symm_mem.set_backend("NVSHMEM")
-    symm_mem.set_signal_pad_size(max(symm_mem.get_signal_pad_size(), signal_pad_bytes))
-    return rank, local_rank, group
+        symm_mem.set_backend("NVSHMEM")
+        symm_mem.set_signal_pad_size(
+            max(symm_mem.get_signal_pad_size(), signal_pad_bytes)
+        )
+        return rank, local_rank, group
+    except Exception:
+        dist.destroy_process_group()
+        raise
 
 
 def _capture(launch: Callable[[], _T]) -> tuple[torch.cuda.CUDAGraph, _T]:

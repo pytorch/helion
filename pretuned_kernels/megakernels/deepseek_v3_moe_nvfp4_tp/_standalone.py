@@ -1,29 +1,7 @@
-"""DeepSeek-V3 B1 NVFP4 MoE with a fused TP4 all-reduce on B200.
-
-This is tensor parallelism, not token expert parallelism: every rank receives
-the same token and routing result, evaluates a distinct intermediate shard of
-the selected experts, and sums the rank-local weighted outputs. Both the fused
-TP path and its matched local baseline are ordinary, explicit Helion kernels.
-
-Run the benchmark with four local ranks::
-
-    NVSHMEM_DISABLE_CUDA_VMM=1 \\
-      python -m torch.distributed.run --standalone --nproc-per-node=4 \\
-      pretuned_kernels/megakernels/deepseek_v3_moe_nvfp4_tp/deepseek_v3_moe_nvfp4_tp.py
-"""
+"""Matched local Helion control for the distributed TP4 MoE megakernel."""
 
 from __future__ import annotations
 
-import math
-from typing import TYPE_CHECKING
-from typing import Any
-from typing import cast
-
-from pretuned_kernels.megakernels._distributed import benchmark
-from pretuned_kernels.megakernels._distributed import initialize
-from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4 import (
-    deepseek_v3_moe_nvfp4 as source_module,
-)
 from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import FP4_MAX
 from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import MMA_N
 from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import first_mma_column
@@ -33,23 +11,12 @@ from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import (
 )
 from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4._common import take_stable_top8
 import torch
-import torch.distributed as dist
 
 import helion
 import helion.language as hl
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
-
-WORLD_SIZE = 4
-W13_SPLIT_K = 7
-COMMUNICATION_N = 4096
-NUM_SM_MULTIPLIER = 1
-SIGNAL_PAD_BYTES = 32 * 1024
-
-
-def _deepseek_v3_moe_nvfp4_tp(
+def _deepseek_v3_moe_nvfp4_tp_local(
     hidden_input: torch.Tensor,
     router_weight: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -230,8 +197,7 @@ def _deepseek_v3_moe_nvfp4_tp(
     assert symmetric_output.stride(1) == 1
     assert symmetric_output.storage_offset() == 0
     local_output = torch.as_strided(symmetric_output, (hidden,), (1,), storage_offset=0)
-    output = torch.empty((1, hidden), dtype=torch.bfloat16, device=w2.device)
-    remote_outputs = torch.ops.symm_mem.get_remote_tensors(local_output, group_name)
+    output = symmetric_output
     shared_w13_preactivation = torch.empty(
         (twice_intermediate,), dtype=torch.bfloat16, device=w13.device
     )
@@ -645,13 +611,6 @@ def _deepseek_v3_moe_nvfp4_tp(
         local_output[final_tile_n] = (
             (final_routed_output + final_shared_output).reshape(-1).to(torch.bfloat16)
         )
-    for communication_tile_n in hl.tile(hidden, block_size=COMMUNICATION_N):
-        communication_total = hl.zeros([communication_tile_n], dtype=torch.float32)
-        for remote_output in remote_outputs:
-            communication_total = communication_total + remote_output[
-                communication_tile_n
-            ].to(torch.float32)
-        output[0, communication_tile_n] = communication_total.to(torch.bfloat16)
     return (
         output,
         router_logits,
@@ -670,228 +629,60 @@ def _deepseek_v3_moe_nvfp4_tp(
 
 
 def _config() -> helion.Config:
-    range_num_stages = [0, 4, 0, 0, 2, 0, 0, 2, 0, 0, 0, 2, 0, 1, 0, 0]
-    range_multi_buffers = [
-        None,
-        None,
-        None,
-        None,
-        True,
-        None,
-        None,
-        False,
-        None,
-        None,
-        None,
-        True,
-        None,
-        True,
-        None,
-        None,
-    ]
-    range_flattens = [
-        None,
-        None,
-        None,
-        None,
-        False,
-        None,
-        None,
-        False,
-        None,
-        None,
-        None,
-        False,
-        None,
-        False,
-        None,
-        None,
-    ]
     return helion.Config(
         block_sizes=[8, 512, 32, 256, 512],
         cross_loop_pipeline="dynamic",
         host_tensor_descriptors=True,
         indexing=[
             "tensor_descriptor" if index in (41, 43, 58, 60) else "pointer"
-            for index in range(79)
+            for index in range(76)
         ],
         maxnreg=None,
-        num_sm_multiplier=NUM_SM_MULTIPLIER,
+        num_sm_multiplier=1,
         num_stages=1,
         num_warps=4,
         pid_type="persistent_blocked",
-        range_flattens=range_flattens,
-        range_multi_buffers=range_multi_buffers,
-        range_num_stages=range_num_stages,
+        range_flattens=[
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            False,
+            None,
+            False,
+            None,
+        ],
+        range_multi_buffers=[
+            None,
+            None,
+            None,
+            None,
+            True,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            True,
+            None,
+            True,
+            None,
+        ],
+        range_num_stages=[0, 4, 0, 0, 2, 0, 0, 2, 0, 0, 0, 2, 0, 1, 0],
     )
 
 
-deepseek_v3_moe_nvfp4_tp = helion.kernel(
-    _deepseek_v3_moe_nvfp4_tp,
+deepseek_v3_moe_nvfp4_tp_local = helion.kernel(
+    _deepseek_v3_moe_nvfp4_tp_local,
     config=_config(),
     static_shapes=False,
     backend="triton",
-    ignore_warnings=[helion.exc.TensorOperationInWrapper],
 )
-
-
-def _run(
-    rank: int,
-    local_rank: int,
-    group: dist.ProcessGroup,
-    *,
-    verbose: bool,
-) -> dict[str, Any]:
-    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4_tp import _standalone
-    import torch.distributed._symmetric_memory as symm_mem
-
-    standalone_kernel = _standalone.deepseek_v3_moe_nvfp4_tp_local
-
-    shape = source_module.Shape(intermediate=2048 // WORLD_SIZE)
-    tensors = source_module._allocate(shape)
-    symmetric_output = symm_mem.empty(
-        (shape.batch, shape.hidden),
-        dtype=torch.bfloat16,
-        device=torch.device("cuda", local_rank),
-    )
-    symm_mem.rendezvous(symmetric_output, group.group_name)
-    # Model each rank as a distinct TP shard while preserving replicated input
-    # and routing.  Scaling the local output factors is enough to make peer
-    # mixups observable without changing the packed NVFP4 layouts.
-    rank_output_scale = 1.0 + rank / 8.0
-    tensors["alpha2"].mul_(rank_output_scale)
-    tensors["shared_alpha2"].mul_(rank_output_scale)
-    base_args = source_module._kernel_args(tensors, shape)
-    local_args = (*base_args, W13_SPLIT_K, symmetric_output, group.group_name)
-    raw_vllm_call, backend, routing_replay = source_module._make_vllm_call(
-        tensors, shape
-    )
-    vllm_call = cast("Callable[[], torch.Tensor]", raw_vllm_call)
-    case_metrics: dict[str, dict[str, tuple[float, float]]] = {}
-    dispatch_signature = None
-
-    for label, selected_ids in source_module.ROUTING_CASES:
-        source_module._set_routing_case(tensors, selected_ids)
-
-        def persistent() -> tuple[torch.Tensor, ...]:
-            return cast(
-                "tuple[torch.Tensor, ...]",
-                deepseek_v3_moe_nvfp4_tp(*local_args),
-            )
-
-        def standalone() -> torch.Tensor:
-            standalone_kernel(*local_args)
-            return torch.ops.symm_mem.one_shot_all_reduce(
-                symmetric_output, "sum", group.group_name
-            )
-
-        def production(call: Callable[[], torch.Tensor] = vllm_call) -> torch.Tensor:
-            local = call()
-            symmetric_output.copy_(local)
-            return torch.ops.symm_mem.one_shot_all_reduce(
-                symmetric_output, "sum", group.group_name
-            )
-
-        local = cast(
-            "tuple[torch.Tensor, ...]",
-            standalone_kernel(*local_args),
-        )
-        vllm_local = vllm_call()
-        source_module._validate_vllm(local, vllm_local, routing_replay)
-        helion_expected = local[0].clone()
-        vllm_expected = vllm_local.clone()
-        gathered_local = [torch.empty_like(helion_expected) for _ in range(WORLD_SIZE)]
-        dist.all_gather(gathered_local, helion_expected)
-        if any(
-            torch.equal(left, right)
-            for index, left in enumerate(gathered_local)
-            for right in gathered_local[index + 1 :]
-        ):
-            raise AssertionError("rank-local MoE outputs must differ")
-        dist.all_reduce(helion_expected)
-        dist.all_reduce(vllm_expected)
-        actual = persistent()
-        current_signature = (
-            source_module._dispatch_cache_signature(deepseek_v3_moe_nvfp4_tp),
-            source_module._dispatch_cache_signature(standalone_kernel),
-        )
-        if dispatch_signature is None:
-            dispatch_signature = current_signature
-        elif current_signature != dispatch_signature:
-            raise AssertionError("runtime routing triggered a recompilation")
-        standalone_actual = standalone()
-        production_actual = production()
-        torch.cuda.synchronize()
-        dist.barrier()
-        torch.testing.assert_close(actual[0], helion_expected, rtol=2e-2, atol=6.25e-2)
-        torch.testing.assert_close(
-            standalone_actual, helion_expected, rtol=2e-2, atol=6.25e-2
-        )
-        torch.testing.assert_close(
-            production_actual, vllm_expected, rtol=3e-2, atol=1.25e-1
-        )
-        aggregate_error = source_module._similarity_error(actual[0], production_actual)
-        if not math.isfinite(aggregate_error) or aggregate_error > 1e-3:
-            raise AssertionError(
-                f"distributed vLLM similarity error {aggregate_error:.6g} exceeds 1e-3"
-            )
-        for actual_value, local_value in zip(actual[1:], local[1:], strict=True):
-            torch.testing.assert_close(actual_value, local_value, rtol=0, atol=0)
-
-        launches: dict[str, Callable[[], object]] = {
-            "distributed_helion": persistent,
-            "standalone_helion_one_shot": standalone,
-            f"vllm_{backend}_one_shot": production,
-        }
-
-        def validate_replay(
-            name: str,
-            value: object,
-            helion_expected: torch.Tensor = helion_expected,
-            vllm_expected: torch.Tensor = vllm_expected,
-        ) -> None:
-            output = (
-                cast("tuple[torch.Tensor, ...]", value)[0]
-                if name == "distributed_helion"
-                else cast("torch.Tensor", value)
-            )
-            expected = vllm_expected if name.startswith("vllm_") else helion_expected
-            torch.testing.assert_close(output, expected, rtol=3e-2, atol=1.25e-1)
-
-        results = benchmark(launches, validate=validate_replay)
-        case_metrics[label] = results
-        if verbose and rank == 0:
-            print(f"routing={label} experts={selected_ids}")
-            for name, (warm, cold) in results.items():
-                print(f"{name:>36s}: {warm:7.2f} us warm, {cold:7.2f} us cold L2")
-
-    speedups = []
-    for results in case_metrics.values():
-        persistent_cold = results["distributed_helion"][1]
-        production_name = next(name for name in results if name.startswith("vllm_"))
-        speedups.append(results[production_name][1] / persistent_cold)
-    return {
-        "helion_wins": sum(speedup > 1 for speedup in speedups),
-        "total": len(speedups),
-        "geomean": math.prod(speedups) ** (1.0 / len(speedups)),
-        "best_speedup": max(speedups),
-        "results": case_metrics,
-    }
-
-
-@torch.inference_mode()
-def main(verbose: bool = True) -> dict[str, Any]:
-    """Run TP4 routing correctness and the paired cold-L2 comparison."""
-    rank, local_rank, group = initialize(
-        kernel_name="deepseek_v3_moe_nvfp4_tp",
-        world_size=WORLD_SIZE,
-        signal_pad_bytes=SIGNAL_PAD_BYTES,
-    )
-    try:
-        return _run(rank, local_rank, group, verbose=verbose)
-    finally:
-        dist.destroy_process_group()
-
-
-if __name__ == "__main__":
-    main()

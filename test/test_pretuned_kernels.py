@@ -29,6 +29,7 @@ from helion._testing import TestCase
 from helion._testing import is_cuda
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
 
@@ -301,9 +302,15 @@ def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
     assert "__deepseek" not in source
 
 
-def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
+@skipIfNotCUDA()
+def test_deepseek_v3_moe_nvfp4_tp_uses_explicit_sources() -> None:
+    if torch.cuda.device_count() < 4:
+        pytest.skip("distributed TP4 pretuned kernels require four CUDA devices")
     module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4_tp import _standalone
+
     config = module.deepseek_v3_moe_nvfp4_tp.configs[0].config
+    standalone_config = _standalone.deepseek_v3_moe_nvfp4_tp_local.configs[0].config
 
     assert not module.deepseek_v3_moe_nvfp4_tp.settings.static_shapes
     assert module.WORLD_SIZE == 4
@@ -315,8 +322,15 @@ def test_deepseek_v3_moe_nvfp4_tp_reuses_model_source() -> None:
     assert config["block_sizes"][-1] == 512
     assert config["range_num_stages"][11] == 2
 
-    distributed_source = module._kernel_source(distributed=True)
-    local_source = module._kernel_source(distributed=False)
+    module_source = inspect.getsource(module)
+    distributed_source = inspect.getsource(module._deepseek_v3_moe_nvfp4_tp)
+    standalone_source = inspect.getsource(_standalone)
+    local_source = inspect.getsource(_standalone._deepseek_v3_moe_nvfp4_tp_local)
+    assert "_SPLIT_W13_SOURCE" not in module_source
+    assert "exec(" not in module_source
+    assert standalone_config["cross_loop_pipeline"] == "dynamic"
+    assert standalone_config["host_tensor_descriptors"]
+    assert "exec(" not in standalone_source
     assert "get_remote_tensors" in distributed_source
     assert "get_remote_tensors" not in local_source
     assert "w13_tile_split" in distributed_source
