@@ -708,6 +708,7 @@ def _build_direct_call_invoke(
     donate_argnums: object,
     out_tree: object,
     alias_items: tuple[tuple[int, int], ...],
+    device_assignment: list[int],
 ) -> object:
     """Pre-bake a closure that runs the direct-dispatch hot path; two variants
     (no-alias / with-alias) avoid a per-call branch on ``alias_items``."""
@@ -720,6 +721,7 @@ def _build_direct_call_invoke(
                 inputs=input_tensors,
                 output_shapes=output_shapes,
                 donate_argnums=donate_argnums,
+                device_assignment=device_assignment,
             )
             return out_tree.unflatten(results)  # type: ignore[attr-defined]
 
@@ -732,6 +734,7 @@ def _build_direct_call_invoke(
             inputs=input_tensors,
             output_shapes=output_shapes,
             donate_argnums=donate_argnums,
+            device_assignment=device_assignment,
         )
         for in_idx, out_idx in alias_items:
             input_tensors[in_idx].copy_(results[out_idx])  # type: ignore[attr-defined]
@@ -799,6 +802,11 @@ def _make_helion_static_jax_callable_class() -> type:
                 for a in args
             )
             alias_items = tuple(self.input_output_aliases.items())
+            device_assignment = (
+                [int(d.id) for d in self.mesh.devices.flat]
+                if self.mesh is not None
+                else []
+            )
             # Stash the launcher-side direct-call structure so the next call
             # can bypass this ``__call__`` entirely.  Pre-bake ``invoke`` now
             # so the hot path skips the attribute walk + kwargs dict alloc.
@@ -810,6 +818,7 @@ def _make_helion_static_jax_callable_class() -> type:
                 self.donate_argnums,
                 out_tree,
                 alias_items,
+                device_assignment,
             )
             self._helion_direct_call = _DirectCallKernel(
                 call_custom_kernel=tpu_torch_pallas.call_custom_kernel,
@@ -1260,6 +1269,7 @@ def _pallas_build_callable(
     trace_key_suffix: str = "",
     *,
     interpret: bool = False,
+    uses_distributed: bool = False,
 ) -> object:
     """Build a ``JaxCallable``, cache it on the kernel, and return it.
 
@@ -1290,6 +1300,30 @@ def _pallas_build_callable(
 
     import jax
 
+    mesh = None
+    input_partition_specs = None
+    if uses_distributed:
+        # Mesh device IDs need an abstract mesh in scope while lowering; a
+        # direct TorchTPU launch has no enclosing shard_map, so supply one.
+        if torch.distributed.is_initialized():
+            from torch_tpu._internal.pallas.pallas import (  # pyrefly: ignore[missing-import]
+                get_default_pallas_mesh,
+            )
+
+            mesh = get_default_pallas_mesh()
+        else:
+            mesh = jax.make_mesh((1,), ("rank",))
+        input_partition_specs = (jax.sharding.PartitionSpec(),) * len(
+            tensor_arg_indices
+        )
+        jit_fn = jax.shard_map(
+            jit_fn,
+            mesh=mesh,
+            in_specs=input_partition_specs,
+            out_specs=jax.sharding.PartitionSpec(),
+            check_vma=False,
+        )
+
     kernel_name = getattr(pallas_kernel, "__name__", "pallas_kernel")
 
     # JaxCallable subclass caches the per-call invocation key (see _make_helion_static_jax_callable_class).
@@ -1298,6 +1332,8 @@ def _pallas_build_callable(
         name=kernel_name,
         jit_fn=jax.jit(jit_fn),
         trace_key=f"{kernel_name}_{id(pallas_kernel)}_{grid}{trace_key_suffix}",
+        mesh=mesh,
+        input_partition_specs=input_partition_specs,
         input_output_aliases=call_aliases,
     )
     # Seed with ``None`` fast-path slot; launcher overwrites with real ``_LauncherFastPath``.
@@ -2140,6 +2176,7 @@ def _pallas_install_launcher_cache(
     _pallas_interpret: bool | None,
     _collective_id: int | None,
     _use_low_level_scheduler: bool,
+    _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
@@ -2201,6 +2238,7 @@ def _pallas_install_launcher_cache(
         call_aliases=result.pallas_aliases,
         trace_key_suffix="",
         interpret=interpret,
+        uses_distributed=_uses_remote_copy or _collective_id is not None,
     )
 
     fast_path = _LauncherFastPath(
@@ -2384,6 +2422,7 @@ def default_pallas_launcher(
                 _pallas_interpret=_pallas_interpret,
                 _collective_id=_collective_id,
                 _use_low_level_scheduler=_use_low_level_scheduler,
+                _uses_remote_copy=_uses_remote_copy,
                 _matmul_dot_general=_matmul_dot_general,
             )
         setattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, scratch_key)
