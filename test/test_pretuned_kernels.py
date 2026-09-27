@@ -48,6 +48,14 @@ def _current_compute_capability() -> str | None:
         return None
 
 
+def _require_four_sm100_gpus() -> None:
+    """Skip distributed TP4 pretuned-kernel checks without four local B200s."""
+    if not is_cuda() or torch.cuda.device_count() < 4:
+        pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
+    if any(torch.cuda.get_device_capability(device) != (10, 0) for device in range(4)):
+        pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
+
+
 def _pretuned_kernel_directory(name: str) -> Path:
     megakernel = PRETUNED_KERNELS_DIR / "megakernels" / name
     return megakernel if megakernel.is_dir() else PRETUNED_KERNELS_DIR / name
@@ -304,8 +312,7 @@ def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
 
 @skipIfNotCUDA()
 def test_deepseek_v3_moe_nvfp4_tp_uses_explicit_sources() -> None:
-    if torch.cuda.device_count() < 4:
-        pytest.skip("distributed TP4 pretuned kernels require four CUDA devices")
+    _require_four_sm100_gpus()
     module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
     from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4_tp import _standalone
 
@@ -341,6 +348,49 @@ def test_deepseek_v3_moe_nvfp4_tp_uses_explicit_sources() -> None:
     assert shared_w2 in distributed_source and shared_w2 in local_source
     assert "inline_triton" not in distributed_source
     assert "topology" not in distributed_source
+
+
+@skipIfNotCUDA()
+def test_deepseek_v3_attention_nvfp4_tp_uses_tagged_dynamic_exchange() -> None:
+    _require_four_sm100_gpus()
+    module = _import_pretuned_kernel_module("deepseek_v3_attention_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _common
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _standalone
+
+    from helion.runtime.triton import dist_utils
+
+    config = module.deepseek_v3_attention_nvfp4_tp.configs[0].config
+    assert not module.deepseek_v3_attention_nvfp4_tp.settings.static_shapes
+    assert module.WORLD_SIZE == 4
+    assert config["cross_loop_pipeline"] == "dynamic"
+    assert config["num_sm_multiplier"] == 4
+    assert config["maxnreg"] == 128
+
+    common_source = inspect.getsource(_common)
+    distributed_source = inspect.getsource(_common.attention_boundary_source)
+    standalone_source = inspect.getsource(_standalone._attention_o_proj_local)
+    store_source = dist_utils._store_relaxed_sys_u32.src
+    load_source = dist_utils._load_volatile_u32.src
+    assert "st.relaxed.sys.global.u32" in store_source
+    assert "ld.volatile.global.u32" in load_source
+    assert "inline_asm_elementwise" not in common_source
+    assert "get_remote_tensors" in distributed_source
+    assert "for source_rank in range(WORLD_SIZE)" in distributed_source
+    assert "advance_tokens" in distributed_source
+    assert "inline_triton" not in distributed_source
+    assert "topology" not in distributed_source
+
+    # Both sides of the comparison use the same projection algorithm and
+    # specialize metadata, while only the fused source owns peer exchange.
+    for fragment in (
+        "hl.load_float4_e2m1fn_x16_to_float16",
+        "nvfp4.swizzled_scale_offsets",
+        "contribution.to(torch.float32) * scale",
+        "symmetric_output[0, tile_n]",
+    ):
+        assert fragment in distributed_source
+        assert fragment in standalone_source
+    assert "get_remote_tensors" not in standalone_source
 
 
 def test_pre_captured_graph_sweep_passes_resets(

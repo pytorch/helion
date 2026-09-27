@@ -7,6 +7,32 @@ from triton.language import core
 
 
 @triton.jit
+def _load_volatile_u32(pointer):  # noqa: ANN001, ANN202
+    """Load a peer-visible 32-bit word without allowing compiler caching."""
+    return tl.inline_asm_elementwise(
+        "ld.volatile.global.u32 $0, [$1];",
+        "=r,l",
+        [pointer],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _store_relaxed_sys_u32(pointer, value):  # noqa: ANN001, ANN202
+    """Store an aligned 32-bit word with system-scope visibility."""
+    return tl.inline_asm_elementwise(
+        "st.relaxed.sys.global.u32 [$1], $2; mov.u32 $0, 0;",
+        "=r,l,r",
+        [pointer, value],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def _local_copy_block(dest, source, nelems):  # noqa: ANN001, ANN202
     for offset in range(0, nelems, 256):
         offsets = offset + tl.arange(0, 256)
