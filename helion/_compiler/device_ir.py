@@ -227,6 +227,15 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 )
                 proxy.node.meta["val"] = obj
                 proxy.node.meta["lowering"] = APIFuncLowering(_tracing_ops._get_symnode)
+                # Epilogue classification also runs outside HostFunction's
+                # context. Preserve the proof that a scalar can be lifted as
+                # a uniform runtime argument, rather than a device coordinate.
+                if isinstance(obj, (torch.SymInt, torch.SymFloat)):
+                    origins = HostFunction.current().expr_to_origin
+                    proxy.node.meta["helion_host_scalar"] = all(
+                        symbol in origins and origins[symbol].origin.is_host()
+                        for symbol in obj.node.expr.free_symbols
+                    )
                 # pyrefly: ignore [missing-attribute]
                 proxy.force = lambda: proxy
             return transform(tracker[obj])
@@ -3694,6 +3703,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # so both matmul front ends read one description of the workload (axis roles, knob
         # competition, per-dot placement/work, peak liveness).
         device_ir.build_kernel_matmul_fact(analysis)
+        if env.backend_name == "cute" and (
+            config_spec.kernel_matmul_fact is not None
+            or analysis.writes_input_storage(env)
+        ):
+            from .cute.memory_ops import register_cute_tensor_alias_specializations
+
+            # Vectorized writes to inputs and collective matmuls need the same
+            # guarded disjoint-input facts as reductions. Fresh grid outputs
+            # cannot alias inputs and must not add storage-dependent cache keys.
+            register_cute_tensor_alias_specializations(env)
         # Phase 4: compose a matmul + reduction-over-output epilogue fact when a matmul AND a
         # register-resident epilogue reduction co-occur (matmul_rms_norm etc.).
         device_ir.build_matmul_reduction_epilogue_facts()

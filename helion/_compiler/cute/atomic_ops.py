@@ -42,7 +42,7 @@ def _cute_pointer_expr(
 ) -> str:
     from ...language.memory_ops import _cute_index_exprs
 
-    index_exprs = _cute_index_exprs(state, index, ast_index)
+    index_exprs = _cute_index_exprs(state, index, ast_index, tensor=target)
     name = state.device_function.tensor_arg(target).name
     coord = (
         f"({index_exprs[0]},)"
@@ -395,6 +395,69 @@ def _cute_unindexed_axis_leader_predicate(
         )
 
     fx_graph = state.fx_node.graph if state.fx_node is not None else None
+
+    if any(isinstance(idx, slice) for idx in index):
+        from ...language.memory_ops import _cute_resolve_active_slice_block_id
+        from ..utils import compute_slice_size
+
+        target = state.proxy_arg(0)
+        assert isinstance(target, torch.Tensor)
+        assert state.fx_node is not None
+        assert fx_graph is not None
+        # Match pointer lowering's choice of slice axis, including equal-sized
+        # tile dimensions. A slice indexes that axis; it is not a broadcast
+        # atomic that should run only on the axis's leader thread.
+        used_block_ids = {
+            block_id
+            for idx in index
+            if isinstance(idx, torch.SymInt)
+            if (block_id := env.get_block_id(idx)) is not None
+        }
+        tensor_dim = 0
+        for idx in index:
+            if idx is None:
+                continue
+            if isinstance(idx, slice) and idx.step in (None, 1):
+                size = compute_slice_size(idx, target.shape[tensor_dim])
+                block_id = _cute_resolve_active_slice_block_id(
+                    state, size, used_block_ids
+                )
+                if block_id is not None:
+                    used_block_ids.add(block_id)
+                    indexed_block_ids.add(
+                        env.resolve_codegen_block_id(block_id, state.codegen, fx_graph)
+                    )
+                    has_block_size_index = True
+            tensor_dim += 1
+
+        value_positions = (2, 3) if state.fx_node.target is atomic_cas else (2,)
+        for position in value_positions:
+            value = state.proxy_arg(position)
+            if not isinstance(value, torch.Tensor):
+                continue
+            # A full slice can introduce a new persistent axis even when an
+            # equally sized explicit tile already supplies the update value.
+            # Until those coordinate systems can be remapped, do not collapse
+            # the value's distinct axis to its leader and replicate one lane.
+            for size in value.shape:
+                if not isinstance(size, torch.SymInt):
+                    continue
+                expr = _symint_expr(size)
+                if expr is None:
+                    continue
+                for symbol in expr.free_symbols:
+                    value_block = env.get_block_id(symbol)
+                    if (
+                        value_block is not None
+                        and env.resolve_codegen_block_id(
+                            value_block, state.codegen, fx_graph
+                        )
+                        not in indexed_block_ids
+                    ):
+                        raise exc.BackendUnsupported(
+                            "cute",
+                            "atomic slice and update value use distinct tile axes",
+                        )
 
     leader_axes: set[int] = set()
     active_thread_axes: set[int] = set()
@@ -807,26 +870,9 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(atomic_cas, "cute")
 def _(state: CodegenState) -> ast.AST:
-    exp_expr = state.ast_args[2]
-    val_expr = state.ast_args[3]
-    target = state.proxy_arg(0)
-    index = state.proxy_arg(1)
-    sem = expr_from_string(repr(state.proxy_arg(len(state.ast_args) - 1)))
-
-    assert isinstance(target, torch.Tensor)
-    assert isinstance(index, list)
-
-    host_function = HostFunction.current()
-    if target not in host_function.tensor_to_origin:
-        raise exc.AtomicOnDeviceTensor("atomic_cas")
-
-    pointer = _cute_pointer_expr(state, target, index)
-    exp_ast, val_ast = _to_ast_values([exp_expr, val_expr])
-    cmp_kw, val_kw = _resolve_cute_atomic_kwargs("atomic_cas", ["cmp", "val"])
-    return expr_from_string(
-        f"cute.arch.atomic_cas({{ptr}}, {cmp_kw}={{exp}}, {val_kw}={{val}}, sem={{sem}})",
-        ptr=expr_from_string(pointer),
-        exp=exp_ast,
-        val=val_ast,
-        sem=sem,
+    return _codegen_common_cute(
+        "atomic_cas",
+        state,
+        value_exprs=_to_ast_values([state.ast_args[2], state.ast_args[3]]),
+        keyword_names=["cmp", "val"],
     )

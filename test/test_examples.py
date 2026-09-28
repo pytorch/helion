@@ -441,7 +441,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 128, 128, 256],
         )
 
-    @onlyBackends(["triton", "pallas"])
+    @onlyBackends(["triton", "pallas", "cute"])
     @skipIfCudaCapabilityLessThan((9, 0), reason="FP8 requires CUDA capability >= 9.0")
     def test_fp8_gemm(self):
         # Create FP32 tensors and convert to FP8
@@ -2400,7 +2400,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="squeeze_and_excitation_net_bwd_dx",
-            block_sizes=[16, 16, 16],
+            block_sizes=[16] * 8,
+            pid_type="persistent_blocked",
             num_warps=4,
             num_stages=2,
             atol=0.3,
@@ -2444,7 +2445,8 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="squeeze_and_excitation_net_bwd_da",
-            block_sizes=[16, 16, 16],
+            block_sizes=[16] * 8,
+            pid_type="persistent_blocked",
             num_warps=4,
             num_stages=2,
             atol=0.3,

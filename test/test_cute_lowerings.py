@@ -247,6 +247,7 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
 from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import collect_cute_half_atomic_output_promotions
+from helion._compiler.generate_ast import GenerateAST
 from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import BlockReductionStrategy
 from helion._compiler.reduction_strategy import PersistentReductionStrategy
@@ -938,9 +939,10 @@ class _FakeMaskCodegen:
         return SimpleNamespace(id=f"{prefix}_0")
 
 
-class _FakeCuteReductionCodegen:
+class _FakeCuteReductionCodegen(GenerateAST):
     def __init__(self) -> None:
         self.device_function = _FakeDeviceFunction()
+        self.device_function.tile_strategy = SimpleNamespace(thread_axis_sizes=dict)
         self.active_device_loops = {
             0: [
                 SimpleNamespace(
@@ -956,7 +958,7 @@ class _FakeCuteReductionCodegen:
             ],
         }
         self.current_grid_state = None
-        self.max_thread_block_dims = (3, 16, 1)
+        self.max_thread_block_dims = [3, 16, 1]
         self.statements: list[object] = []
 
     def add_statement(self, stmt: object) -> None:
@@ -1323,7 +1325,7 @@ class TestCuteLowerings(unittest.TestCase):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_tcgen05_direct_and_permuted_bf16_small_n_runtime(self) -> None:
-        """Direct operands retain small universal tiles; permutes require TMA."""
+        """Direct and permuted operands work with universal and tcgen05 MMA."""
         from helion._compiler.cute.mma_support import get_cute_mma_support
 
         if not get_cute_mma_support().tcgen05_f16bf16:
@@ -1395,6 +1397,17 @@ class TestCuteLowerings(unittest.TestCase):
             transposed_bound.set_config(tcgen05_persistent_config)
             transposed_code = transposed_bound.to_triton_code(tcgen05_persistent_config)
             transposed_actual = transposed_bound(x, y_t)
+            with patch.dict("os.environ", {"HELION_CUTE_MMA_IMPL": "universal"}):
+                transposed_universal_config = helion.Config(
+                    block_sizes=[64, 8, 16],
+                    num_threads=[64, 8, 16],
+                    pid_type="persistent_blocked",
+                )
+                transposed_bound.set_config(transposed_universal_config)
+                transposed_universal_code = transposed_bound.to_triton_code(
+                    transposed_universal_config
+                )
+                transposed_universal_actual = transposed_bound(x, y_t)
 
         expected = x @ y
         self.assertNotIn(
@@ -1407,10 +1420,12 @@ class TestCuteLowerings(unittest.TestCase):
         self.assertNotIn("while tcgen05_role_local", tcgen05_code)
         self.assertIn("'rhs_tma_order': (0, 1)", transposed_code)
         self.assertIn("while tcgen05_role_local", transposed_code)
+        self.assertIn("MmaUniversalOp", transposed_universal_code)
         for name, actual in (
             ("universal", universal_actual),
             ("tcgen05", tcgen05_actual),
             ("transposed_rhs", transposed_actual),
+            ("transposed_universal", transposed_universal_actual),
         ):
             with self.subTest(name=name):
                 torch.testing.assert_close(actual, expected)
@@ -23439,6 +23454,27 @@ class TestPerKiterTmaBuilders(unittest.TestCase):
         self.assertIn(
             "tiled_mma.set(cute.nvgpu.tcgen05.Field.ACCUMULATE, False)",
             body_src,
+        )
+
+    def test_non_pipeline_consumer_initializes_try_token(self) -> None:
+        args = self._make_args(use_tma_a=True, use_tma_b=False)
+        node = _build_kloop_non_pipeline_consumer_if(args)
+        exec_if = next(
+            stmt
+            for stmt in node.body
+            if isinstance(stmt, ast.If) and ast.unparse(stmt.test) == args.exec_active
+        )
+        self.assertEqual(
+            self._stmt_kinds(exec_if.body),
+            ["sync_warp", "=consumer_try_wait", "consumer_wait"],
+        )
+        self.assertEqual(
+            ast.unparse(exec_if.body[1]),
+            "ab_consumer_try_token = ab_pipeline.consumer_try_wait(ab_consumer_state)",
+        )
+        self.assertEqual(
+            ast.unparse(exec_if.body[2]),
+            "ab_pipeline.consumer_wait(ab_consumer_state, ab_consumer_try_token)",
         )
 
     def test_non_pipeline_release_advances_both_states(self) -> None:

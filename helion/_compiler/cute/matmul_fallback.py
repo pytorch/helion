@@ -313,21 +313,25 @@ def _cast_operand_to_f32(
 def _cute_active_thread_layout(
     cg: CodegenInterface,
 ) -> tuple[dict[int, int], dict[int, int]]:
-    axis_sizes: dict[int, int] = {}
+    from ..generate_ast import GenerateAST
+
+    assert isinstance(cg, GenerateAST)
+    # A reduction in a later kernel phase still reserves physical thread axes
+    # in this launch. Include them when computing the stride between K lanes.
+    axis_sizes = cg.device_function.tile_strategy.thread_axis_sizes()
+    cg._record_thread_axis_sizes(axis_sizes)
     block_axes: dict[int, int] = {}
     seen: set[int] = set()
-    active_device_loops = getattr(cg, "active_device_loops", None)
-    if isinstance(active_device_loops, dict):
-        for loops in active_device_loops.values():
-            for state in loops:
-                key = id(state)
-                if key in seen:
-                    continue
-                seen.add(key)
-                for axis, size in state.thread_axis_sizes.items():
-                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
-                block_axes.update(state.block_thread_axes)
-    current_grid_state = getattr(cg, "current_grid_state", None)
+    for loops in cg.active_device_loops.values():
+        for state in loops:
+            key = id(state)
+            if key in seen:
+                continue
+            seen.add(key)
+            for axis, size in state.thread_axis_sizes.items():
+                axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
+            block_axes.update(state.block_thread_axes)
+    current_grid_state = cg.current_grid_state
     if current_grid_state is not None:
         for axis, size in current_grid_state.thread_axis_sizes.items():
             axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)

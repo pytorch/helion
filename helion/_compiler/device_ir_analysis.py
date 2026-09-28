@@ -1553,6 +1553,20 @@ class DeviceIRAnalysis:
                 )
         return facts
 
+    def writes_input_storage(self, env: CompileEnvironment) -> bool:
+        """Whether a store can overwrite an input, including through a host view."""
+        from ..language.memory_ops import store
+
+        input_storages = {tensor.untyped_storage() for tensor in env.input_sources}
+        return any(
+            node.op == "call_function"
+            and node.target is store
+            and (tensor := _accessed_tensor_fake(node)) is not None
+            and tensor.untyped_storage() in input_storages
+            for graph in self.graphs
+            for node in graph.nodes
+        )
+
     def memory_op_facts(
         self,
         env: CompileEnvironment,

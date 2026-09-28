@@ -55,7 +55,8 @@ def squeeze_and_excitation_net_fwd(
             acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
             for tile_k in hl.tile(k):
                 acc = torch.addmm(acc, c[tile_m, tile_k], b[tile_k, tile_n])
-            d[tile_m, tile_n] = torch.sigmoid(acc)
+            # Match the input-dtype matmul result before applying sigmoid.
+            d[tile_m, tile_n] = torch.sigmoid(acc.to(x.dtype))
             out[tile_m, tile_n] = x[tile_m, tile_n] * d[tile_m, tile_n]
 
     return out, c, d
@@ -70,43 +71,40 @@ def squeeze_and_excitation_net_bwd_dx(
     Compute grad_x for the squeeze and excitation network.
     grad_x = grad_out * d + (grad_out * x * d * (1-d) @ b.T * (c>0)) @ a.T
 
-    The computation is structured to properly accumulate over the k dimension:
-    1. First term: grad_out * d (element-wise, no reduction)
-    2. Second term: chain rule through d->c->x path
-       - For each output position (m, n), accumulate over k dimension
-       - grad_c[m,k] = (grad_out * x * d * (1-d))[m,:] @ b[k,:].T * (c[m,k] > 0)
-       - grad_x[m,n] += grad_c[m,k] @ a[n,k].T
+    Materialize grad_cb and grad_c once, then use tiled matmuls for the two
+    linear layers. This avoids recomputing the full grad_c reduction for every
+    output tile. Barriers make each intermediate available to the next phase.
     """
     m, n = x.size()
     k = a.size(1)
 
+    grad_cb = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    grad_c = torch.empty([m, k], dtype=x.dtype, device=x.device)
     grad_x = torch.empty([m, n], dtype=x.dtype, device=x.device)
 
-    # Compute grad_x: grad_out * d + second_term where second_term accumulates over k
-    for tile_m, tile_n in hl.tile([m, n]):
-        # First term: grad_out * d (element-wise)
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        acc += grad_out[tile_m, tile_n] * d[tile_m, tile_n]
+    for point_m, point_n in hl.tile((m, n)):
+        grad_cb[point_m, point_n] = (
+            grad_out[point_m, point_n]
+            * x[point_m, point_n]
+            * d[point_m, point_n]
+            * (1.0 - d[point_m, point_n])
+        )
+    hl.barrier()
 
-        # Second term: accumulate gradient chain over k dimension
-        for tile_k in hl.tile(k):
-            # Compute grad_to_d for the full row: shape [tile_m, n]
-            grad_to_d = (
-                grad_out[tile_m, :] * x[tile_m, :] * d[tile_m, :] * (1.0 - d[tile_m, :])
-            )
+    for row_c, col_c in hl.tile((m, k)):
+        acc_c = hl.zeros([row_c, col_c], dtype=torch.float32)
+        for reduce_n in hl.tile(n):
+            acc_c = torch.addmm(acc_c, grad_cb[row_c, reduce_n], b[col_c, reduce_n].T)
+        grad_c[row_c, col_c] = acc_c.to(x.dtype) * (c[row_c, col_c] > 0)
+    hl.barrier()
 
-            # Backprop through (c @ b): grad_c = grad_to_d @ b.T
-            # [tile_m, n] @ [n, tile_k] = [tile_m, tile_k]
-            grad_to_c = grad_to_d @ b[tile_k, :].T
-
-            # Apply ReLU mask: shape [tile_m, tile_k]
-            grad_c_masked = grad_to_c * (c[tile_m, tile_k] > 0)
-
-            # Backprop through (x @ a): grad_x_contribution = grad_c_masked @ a.T
-            # [tile_m, tile_k] @ [tile_k, tile_n] = [tile_m, tile_n]
-            acc = torch.addmm(acc, grad_c_masked, a[tile_n, tile_k].T)
-
-        grad_x[tile_m, tile_n] = acc
+    for row_x, col_x in hl.tile((m, n)):
+        acc_x = hl.zeros([row_x, col_x], dtype=torch.float32)
+        for reduce_k in hl.tile(k):
+            acc_x = torch.addmm(acc_x, grad_c[row_x, reduce_k], a[col_x, reduce_k].T)
+        grad_x[row_x, col_x] = grad_out[row_x, col_x] * d[row_x, col_x] + acc_x.to(
+            x.dtype
+        )
 
     return grad_x
 
@@ -119,26 +117,38 @@ def squeeze_and_excitation_net_bwd_da(
     """
     Compute grad_a for the squeeze and excitation network.
     grad_a = x.T @ (grad_out * x * d * (1-d) @ b.T * (c>0))
+
+    Materialize the intermediate gradients so both matmuls have explicit tiled
+    reductions, without a full-row matmul nested inside another reduction.
     """
     m, n = x.size()
     k = c.size(1)
 
+    grad_cb = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    grad_c = torch.empty([m, k], dtype=x.dtype, device=x.device)
     grad_a = torch.empty([n, k], dtype=x.dtype, device=x.device)
 
-    # Compute grad_a: x.T @ grad_c
-    for tile_n, tile_k in hl.tile([n, k]):
-        acc_a = hl.zeros([tile_n, tile_k], dtype=torch.float32)
-        for tile_m in hl.tile(m):
-            # Backprop through sigmoid: need full row for matmul with b.T
-            grad_to_d = grad_out[tile_m, :] * x[tile_m, :]
-            grad_to_cb = grad_to_d * d[tile_m, :] * (1.0 - d[tile_m, :])
-            # Backprop through c @ b: [tile_m, n] @ [n, tile_k] = [tile_m, tile_k]
-            grad_to_c = grad_to_cb @ b[tile_k, :].T
-            # Backprop through relu
-            grad_through_relu = grad_to_c * (c[tile_m, tile_k] > 0)
-            # Accumulate x.T @ grad_c: [tile_n, tile_m] @ [tile_m, tile_k] = [tile_n, tile_k]
-            acc_a = torch.addmm(acc_a, x[tile_m, tile_n].T, grad_through_relu)
-        grad_a[tile_n, tile_k] = acc_a
+    for point_m, point_n in hl.tile((m, n)):
+        grad_cb[point_m, point_n] = (
+            grad_out[point_m, point_n]
+            * x[point_m, point_n]
+            * d[point_m, point_n]
+            * (1.0 - d[point_m, point_n])
+        )
+    hl.barrier()
+
+    for row_c, col_c in hl.tile((m, k)):
+        acc_c = hl.zeros([row_c, col_c], dtype=torch.float32)
+        for reduce_n in hl.tile(n):
+            acc_c = torch.addmm(acc_c, grad_cb[row_c, reduce_n], b[col_c, reduce_n].T)
+        grad_c[row_c, col_c] = acc_c.to(x.dtype) * (c[row_c, col_c] > 0)
+    hl.barrier()
+
+    for row_a, col_a in hl.tile((n, k)):
+        acc_a = hl.zeros([row_a, col_a], dtype=torch.float32)
+        for reduce_m in hl.tile(m):
+            acc_a = torch.addmm(acc_a, x[reduce_m, row_a].T, grad_c[reduce_m, col_a])
+        grad_a[row_a, col_a] = acc_a
 
     return grad_a
 

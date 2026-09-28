@@ -141,6 +141,16 @@ def test_residual_epilogue_codegen(
         assert "out.layout.stride[0] == 80" in source
 
 
+def test_residual_epilogue_rejects_aliased_output() -> None:
+    a, b, residual, _out = _residual_inputs(torch.float16, torch.float16, False)
+    arguments = (a, b, residual, a[:, :70])
+    bound = _cpu_bind(_residual_matmul, arguments)
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="operand loads may alias row-loop writes"
+    ):
+        bound.to_code(_residual_config("vector", "tcgen05", False))
+
+
 @pytest.mark.parametrize("strategy", [None, True, 8, "automatic"])
 def test_invalid_epilogue_strategy_rejected(strategy: object) -> None:
     arguments = _residual_inputs(torch.float16, torch.float16, False)

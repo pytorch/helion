@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from itertools import starmap
 import logging
 import operator
 from typing import TYPE_CHECKING
@@ -763,6 +764,10 @@ class ReductionStrategy(TileStrategy):
     def _index_init_expr(self, block_size_var: str, dtype: str, block_idx: int) -> str:
         env = CompileEnvironment.current()
         backend = env.backend
+        if backend.name == "cute" and self._reduction_thread_count() == 1:
+            # A serial reduction has no thread axis of its own. Its fallback
+            # axis may belong to a sibling tile and must not shift this index.
+            return backend.reduction_index_zero_expr(dtype)
         size = env.block_sizes[block_idx].size
         if isinstance(size, int) and size == 0:
             return backend.reduction_index_zero_expr(dtype)
@@ -1635,7 +1640,11 @@ class LoopedReductionStrategy(ReductionStrategy):
     def _active_thread_axis_sizes(
         self, state: CodegenState, device_loop: DeviceLoopState
     ) -> dict[int, int]:
-        axis_sizes: dict[int, int] = {}
+        axis_sizes = self.fn.tile_strategy.thread_axis_sizes()
+        # Earlier phases may have emitted axes outside this root's strategy
+        # plan. Those threads still participate in shared-memory reductions.
+        for axis, size in enumerate(state.codegen.max_thread_block_dims):
+            axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
         seen: set[int] = set()
         for loops in state.codegen.active_device_loops.values():
             for loop_state in loops:
@@ -1706,7 +1715,16 @@ class LoopedReductionStrategy(ReductionStrategy):
         # that hasn't been entered yet), the emitted reduction would race
         # across the missing axis. Bail out and fall back to the warp-level
         # path in that case.
-        planned_dims = self._planned_thread_dims()
+        planned_dims = tuple(
+            starmap(
+                max,
+                zip(
+                    self._planned_thread_dims(),
+                    state.codegen.max_thread_block_dims,
+                    strict=True,
+                ),
+            )
+        )
         planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
         if num_threads != planned_block_threads:
             unsupported("another strategy contributes unentered thread axes")
@@ -2270,6 +2288,17 @@ class BlockReductionStrategy(ReductionStrategy):
             for axis, size in current_grid.thread_axis_sizes.items():
                 axis_sizes[axis] = max(axis_sizes.get(axis, 1), size)
             block_axes.update(current_grid.block_thread_axes)
+        # Full-slice axes need not be in the active loop nest. Their threads
+        # still determine the stride between rows of a tiled reduction.
+        for strategy in self.fn.tile_strategy.strategies:
+            if isinstance(
+                strategy, (PersistentReductionStrategy, LoopedReductionStrategy)
+            ):
+                count = strategy._reduction_thread_count()
+                axis = self.fn.tile_strategy.thread_axis_for_strategy(strategy)
+                if count > 1 and axis is not None:
+                    block_axes[strategy.block_index] = axis
+                    axis_sizes[axis] = max(axis_sizes.get(axis, 1), count)
         return block_axes, axis_sizes
 
     def _aliased_active_thread_axis(self, block_axes: dict[int, int]) -> int | None:
