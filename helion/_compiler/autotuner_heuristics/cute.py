@@ -5194,7 +5194,7 @@ class CuteGdnRecurrenceHeuristic(AutotunerHeuristic):
 
 
 class CuteTopKHeuristic(AutotunerHeuristic):
-    """Register the correctness facts for specialized top-k selection."""
+    """Seed subgroup geometry from bounded per-lane selection fragments."""
 
     name = "cute_topk"
     backend = "cute"
@@ -5229,6 +5229,115 @@ class CuteTopKHeuristic(AutotunerHeuristic):
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         return env.config_spec.cute_topk_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        from ..cute.topk import match_topk_root
+        from ..cute.topk import topk_tensors_are_proven_disjoint
+
+        host_function = device_ir.host_function
+        if host_function is None or len(device_ir.root_ids) != 1:
+            return None
+        with host_function:
+            plan = match_topk_root(
+                device_ir.graphs,
+                noncanonical_block_ids=device_ir.noncanonical_task_origin_block_ids,
+            )
+            # A structural candidate can still fail the final runtime alias
+            # proof. Do not seed its specialized schedule without that proof.
+            if plan is None or not topk_tensors_are_proven_disjoint(plan, env):
+                return None
+        padded_k = 1 << (plan.k - 1).bit_length()
+        seeds = []
+        # Retain the original register-pressure and occupancy candidates. All
+        # seeds are search hints, not promoted defaults.
+        for target, threads, value_mode, rank_mode, layout in (
+            (32, 128, "decode", "ordinal", "replicated"),
+            (64, 128, "decode", "signed", "replicated"),
+            (128, 64, "gather", "signed", "replicated"),
+            (32, 64, "decode", "ordinal", "distributed"),
+        ):
+            elements_per_lane = max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(32, padded_k, 1 << (required_lanes - 1).bit_length())
+            config = env.config_spec.default_config()
+            config.config.update(
+                cute_topk_lanes_per_row=lanes,
+                cute_topk_rows_per_block=threads // lanes,
+                cute_topk_vector_width=8,
+                cute_topk_output_vector_width=4,
+                cute_topk_value_mode=value_mode,
+                cute_topk_key_dtype="int32",
+                cute_topk_rank_mode=rank_mode,
+                cute_topk_selection_layout=layout,
+            )
+            seeds.append(config)
+
+        # Growing distributed fragments need not contain K keys in every lane.
+        # Native floating-point comparisons provide a complementary replicated
+        # schedule; their precision guard can fall back to integer keys.
+        for target, layout, key_dtype in (
+            (8, "distributed", "int32"),
+            (16, "distributed", "int32"),
+            (32, "replicated", "float32_native"),
+            (64, "replicated", "float32_native"),
+        ):
+            distributed = layout == "distributed"
+            elements_per_lane = target if distributed else max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(
+                32,
+                32 if distributed else padded_k,
+                1 << (required_lanes - 1).bit_length(),
+            )
+            per_lane = (plan.n + lanes - 1) // lanes
+            input_vector = min(8, 1 << (per_lane.bit_length() - 1))
+            config = env.config_spec.default_config()
+            config.config.update(
+                cute_topk_lanes_per_row=lanes,
+                cute_topk_rows_per_block=128 // lanes,
+                cute_topk_vector_width=input_vector,
+                cute_topk_output_vector_width=4,
+                cute_topk_value_mode="decode",
+                cute_topk_key_dtype=key_dtype,
+                cute_topk_rank_mode="ordinal",
+                cute_topk_selection_layout=layout,
+                cute_topk_sort_network="compact_pruned",
+            )
+            seeds.append(config)
+        # Replicated ordinal decoding can avoid irregular value gathers. Add
+        # both encoder implementations at two bounded register-fragment sizes;
+        # these remain unpromoted search hints with the ordinary merge default.
+        for target in (32, 64):
+            elements_per_lane = max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(32, padded_k, 1 << (required_lanes - 1).bit_length())
+            for encoder in ("dsl", "asm"):
+                config = env.config_spec.default_config()
+                config.config.update(
+                    cute_topk_lanes_per_row=lanes,
+                    cute_topk_rows_per_block=128 // lanes,
+                    cute_topk_vector_width=8,
+                    cute_topk_output_vector_width=4,
+                    cute_topk_value_mode="decode",
+                    cute_topk_key_dtype="int32",
+                    cute_topk_rank_mode="ordinal",
+                    cute_topk_selection_layout="replicated",
+                    cute_topk_sort_network="compact_pruned",
+                    cute_topk_key_encoder=encoder,
+                    cute_topk_defer_value_gathers=True,
+                )
+                seeds.append(config)
+        return dedupe_configs(seeds)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
 
 
 class CuteChunkPrepareHeuristic(AutotunerHeuristic):

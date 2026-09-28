@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import dataclasses
 import gc
 import itertools
@@ -19,6 +20,8 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import helion
 from helion import exc
+from helion._compiler.autotuner_heuristics import get_heuristics
+from helion._compiler.autotuner_heuristics.cute import CuteTopKHeuristic
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
@@ -3244,6 +3247,309 @@ def test_balanced_asm_endpoint_exact_selected_bits(
     assert bool((index_storage[rows * k :] == -7).all())
 
 
+# Seeds top-k tests.
+
+
+@pytest.fixture
+def _cpu_compile_environment() -> Iterator[None]:
+    with (
+        patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
+        patch(
+            "helion._compiler.compile_environment.target_device_capability",
+            return_value=(10, 0),
+        ),
+        patch("helion.language.loops.use_tileir_tunables", return_value=False),
+        patch("helion.language.loops._supports_warp_specialize", return_value=True),
+        patch("helion._compat._supports_tensor_descriptor", return_value=True),
+        patch("helion._compat._min_dot_size", return_value=(16, 16, 16)),
+        patch("helion._compat._is_hip", return_value=False),
+    ):
+        yield
+
+
+@pytest.mark.usefixtures("_cpu_compile_environment")
+@pytest.mark.parametrize(
+    "cols,k,primary_lanes",
+    [(1, 1, 1), (17, 3, 1), (64, 32, 2), (128, 32, 4), (1024, 32, 32), (32768, 1, 1)],
+)
+def test_topk_seeds_follow_fragment_geometry(
+    cols: int, k: int, primary_lanes: int
+) -> None:
+    with FakeTensorMode():
+        x = torch.empty((17, cols), dtype=torch.bfloat16)
+    bound = _allocating_topk._bind_isolated((x, k, True))
+    spec = bound.config_spec
+    assert "cute_topk" in spec.autotuner_heuristics
+    assert spec.compiler_default_config is None
+    assert spec.default_config()["cute_topk_lanes_per_row"] == 16
+    assert spec.default_config()["cute_topk_value_mode"] == "gather"
+    assert spec.default_config()["cute_topk_sort_network"] == "batcher"
+    seeds = [
+        seed for seed in spec.compiler_seed_configs if "cute_topk_lanes_per_row" in seed
+    ]
+    legacy = [seed for seed in seeds if not seed["cute_topk_defer_value_gathers"]]
+    assert 4 < len(legacy) <= 8
+    assert len(legacy) < len(seeds) <= 12
+    pairs = ConfigGeneration(spec).seed_flat_config_pairs()
+    normalized = copy.deepcopy(seeds)
+    for config in normalized:
+        spec.normalize(config)
+    assert [config for _flat, config in pairs[: len(seeds)]] == normalized
+    primary = pairs[0][1]
+    assert primary["cute_topk_lanes_per_row"] == primary_lanes
+    assert primary["cute_topk_rows_per_block"] == 128 // primary_lanes
+    assert primary["cute_topk_rank_mode"] == "ordinal"
+    assert primary["cute_topk_value_mode"] == "decode"
+    for _flat, config in pairs[:4]:
+        spec.normalize(config)
+        lanes = config["cute_topk_lanes_per_row"]
+        rows = config["cute_topk_rows_per_block"]
+        assert isinstance(lanes, int) and isinstance(rows, int)
+        assert lanes <= min(32, 1 << (k - 1).bit_length())
+        assert lanes * rows in (64, 128)
+    assert pairs[3][1]["cute_topk_selection_layout"] == "distributed"
+    assert all(seed["cute_topk_sort_network"] == "batcher" for seed in seeds[:4])
+    assert all(seed["cute_topk_sort_network"] == "compact_pruned" for seed in seeds[4:])
+    host_function = bound.host_function
+    assert host_function is not None
+    with bound.env, host_function:
+        assert (
+            CuteTopKHeuristic.get_seed_config(bound.env, host_function.device_ir)
+            == spec.compiler_seed_configs[0]
+        )
+
+
+@pytest.mark.usefixtures("_cpu_compile_environment")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "cols,k,distributed_lanes,native_lanes",
+    [
+        (3, 1, [1], [1]),
+        (64, 32, [8, 4], [2, 1]),
+        (65, 3, [16, 8], [4, 2]),
+        (128, 32, [16, 8], [4, 2]),
+        (256, 8, [32, 16], [8, 4]),
+        (512, 8, [32], [8]),
+        (32768, 1, [32], [1]),
+    ],
+)
+def test_topk_new_seeds_cover_growing_and_native_fragments(
+    dtype: torch.dtype,
+    cols: int,
+    k: int,
+    distributed_lanes: list[int],
+    native_lanes: list[int],
+) -> None:
+    with FakeTensorMode():
+        x = torch.empty((17, cols), dtype=dtype)
+    bound = _allocating_topk._bind_isolated((x, k, False))
+    spec = bound.config_spec
+    seeds = [
+        seed
+        for seed in spec.compiler_seed_configs
+        if seed.get("cute_topk_sort_network") == "compact_pruned"
+        and not seed["cute_topk_defer_value_gathers"]
+    ]
+    assert [
+        seed["cute_topk_lanes_per_row"]
+        for seed in seeds
+        if seed["cute_topk_selection_layout"] == "distributed"
+    ] == distributed_lanes
+    assert [
+        seed["cute_topk_lanes_per_row"]
+        for seed in seeds
+        if seed["cute_topk_key_dtype"] == "float32_native"
+    ] == native_lanes
+    for seed in seeds:
+        spec.normalize(copy.deepcopy(seed))
+        lanes = seed["cute_topk_lanes_per_row"]
+        rows = seed["cute_topk_rows_per_block"]
+        vector = seed["cute_topk_vector_width"]
+        assert isinstance(lanes, int) and isinstance(rows, int)
+        assert isinstance(vector, int)
+        assert lanes * rows == 128
+        assert vector <= min(8, (cols + lanes - 1) // lanes)
+        assert seed["cute_topk_value_mode"] == "decode"
+        assert seed["cute_topk_rank_mode"] == "ordinal"
+        assert seed["cute_topk_output_vector_width"] == 4
+        assert seed["cute_topk_key_dtype"] == (
+            "int32"
+            if seed["cute_topk_selection_layout"] == "distributed"
+            else "float32_native"
+        )
+
+
+@pytest.mark.usefixtures("_cpu_compile_environment")
+@pytest.mark.parametrize(
+    "dtype,inner_stride", [(torch.float32, 1), (torch.bfloat16, 2)]
+)
+def test_topk_seeds_reject_unsupported_roots(
+    dtype: torch.dtype, inner_stride: int
+) -> None:
+    with FakeTensorMode():
+        x = torch.empty_strided(
+            (17, 64), (64 * inner_stride, inner_stride), dtype=dtype
+        )
+    bound = _allocating_topk._bind_isolated((x, 32, True))
+    assert "cute_topk" not in bound.config_spec.autotuner_heuristics
+    assert not any(
+        "cute_topk_lanes_per_row" in config
+        for config in bound.config_spec.compiler_seed_configs
+    )
+
+
+@pytest.mark.usefixtures("_cpu_compile_environment")
+@pytest.mark.parametrize("alias_kind", ["separate", "view", "dlpack"])
+def test_topk_seeds_require_final_runtime_alias_proof(alias_kind: str) -> None:
+    x = torch.arange(32, dtype=torch.bfloat16).reshape(2, 16)
+    values = (
+        x.clone()
+        if alias_kind == "separate"
+        else x.view_as(x)
+        if alias_kind == "view"
+        else torch.from_dlpack(x)
+    )
+    indices = torch.empty_like(x, dtype=torch.int64)
+    bound = _out_topk._bind_isolated((x, values, indices))
+    runtime_args: dict[str, object] = {"x": x, "values": values, "indices": indices}
+    host_function = bound.host_function
+    assert host_function is not None
+    with bound.env, host_function, bound.env.use_runtime_arg_values(runtime_args):
+        seeds = CuteTopKHeuristic.get_seed_configs(bound.env, host_function.device_ir)
+    assert bool(seeds) == (alias_kind == "separate")
+
+
+@pytest.mark.usefixtures("_cpu_compile_environment")
+@pytest.mark.parametrize("alias_kind", ["separate", "view", "dlpack"])
+@pytest.mark.parametrize("disable_heuristics", [False, True])
+@pytest.mark.parametrize("width", [1, 32])
+def test_topk_alias_fallback_retains_generic_search(
+    alias_kind: str, disable_heuristics: bool, width: int
+) -> None:
+    x = torch.empty((17, width), dtype=torch.bfloat16)
+    values = (
+        torch.empty_like(x)
+        if alias_kind == "separate"
+        else x.view_as(x)
+        if alias_kind == "view"
+        else torch.from_dlpack(x)
+    )
+    indices = torch.empty_like(x, dtype=torch.int32)
+    with patch.object(
+        _out_topk.settings, "disable_autotuner_heuristics", disable_heuristics
+    ):
+        bound = _out_topk._bind_isolated((x, values, indices))
+    spec = bound.config_spec
+    specialized = alias_kind == "separate"
+    assert spec.cute_topk_search_enabled == specialized
+    config = spec.default_config()
+    assert ("cute_topk_lanes_per_row" in config) == specialized
+    assert ("_cute_local_topk" in bound.to_triton_code(config)) == specialized
+    row = spec.block_sizes[0]
+    if specialized:
+        assert row.autotuner_min == row.max_size
+        config.config.update(cute_topk_lanes_per_row=2, cute_topk_rows_per_block=64)
+        spec.normalize(config)
+        assert config["cute_topk_lanes_per_row"] == 2
+        assert config["cute_topk_rows_per_block"] == 64
+    else:
+        assert row.max_size is None or row.autotuner_min < row.max_size
+        small, large = copy.deepcopy(config), copy.deepcopy(config)
+        small.config["block_sizes"] = [1]
+        large.config["block_sizes"] = [16]
+        spec.normalize(small)
+        spec.normalize(large)
+        assert small["block_sizes"] != large["block_sizes"]
+        # Saved specialized configs can still be repaired for this fallback.
+        large.config["cute_topk_lanes_per_row"] = 2
+        spec.normalize(large, _fix_invalid=True)
+        assert "cute_topk_lanes_per_row" not in large
+
+
+@pytest.mark.usefixtures("_cpu_compile_environment")
+def test_topk_seeds_registry_cache_and_disable_integration() -> None:
+    assert CuteTopKHeuristic in get_heuristics("cute")
+    assert CuteTopKHeuristic not in get_heuristics("triton")
+    with FakeTensorMode():
+        x = torch.empty((17, 64), dtype=torch.bfloat16)
+    bound = _allocating_topk._bind_isolated((x, 32, True))
+    spec = bound.config_spec
+    structural_hash = spec.structural_fingerprint_hash()
+    cache_hash = spec.cache_fingerprint_hash()
+    spec.compiler_seed_configs = list(reversed(spec.compiler_seed_configs))
+    assert spec.structural_fingerprint_hash() == structural_hash
+    assert spec.cache_fingerprint_hash() != cache_hash
+    with patch.object(_allocating_topk.settings, "disable_autotuner_heuristics", True):
+        disabled = _allocating_topk._bind_isolated((x, 32, True))
+    assert disabled.config_spec.compiler_seed_configs == []
+    assert disabled.config_spec.cute_topk_search_enabled
+    assert disabled.config_spec.compiler_default_config is None
+
+
+@pytest.mark.usefixtures("_cpu_compile_environment")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "cols,k,expected_lanes",
+    [
+        (1, 1, [1]),
+        (17, 3, [1]),
+        (64, 32, [2, 1]),
+        (128, 32, [4, 2]),
+        (129, 24, [8, 4]),
+        (1024, 8, [8]),
+        (32768, 1, [1]),
+    ],
+)
+def test_topk_endpoint_encoder_seeds_are_unpromoted(
+    dtype: torch.dtype, cols: int, k: int, expected_lanes: list[int]
+) -> None:
+    with FakeTensorMode():
+        x = torch.empty((17, cols), dtype=dtype)
+    bound = _allocating_topk._bind_isolated((x, k, True))
+    spec = bound.config_spec
+    default = spec.default_config()
+    assert default["cute_topk_key_encoder"] == "dsl"
+    assert default["cute_topk_defer_value_gathers"] is False
+    assert default["cute_topk_merge_schedule"] == "sequential"
+    assert spec.compiler_default_config is None
+    seeds = [
+        seed
+        for seed in spec.compiler_seed_configs
+        if seed.get("cute_topk_defer_value_gathers", False)
+    ]
+    assert [
+        (seed["cute_topk_lanes_per_row"], seed["cute_topk_key_encoder"])
+        for seed in seeds
+    ] == [(lanes, encoder) for lanes in expected_lanes for encoder in ("dsl", "asm")]
+    for seed in seeds:
+        spec.normalize(copy.deepcopy(seed))
+        lanes = seed["cute_topk_lanes_per_row"]
+        assert isinstance(lanes, int)
+        rows = seed["cute_topk_rows_per_block"]
+        assert isinstance(rows, int)
+        assert rows * lanes == 128
+        assert seed["cute_topk_vector_width"] == 8
+        assert seed["cute_topk_output_vector_width"] == 4
+        assert seed["cute_topk_value_mode"] == "decode"
+        assert seed["cute_topk_key_dtype"] == "int32"
+        assert seed["cute_topk_rank_mode"] == "ordinal"
+        assert seed["cute_topk_selection_layout"] == "replicated"
+        assert seed["cute_topk_sort_network"] == "compact_pruned"
+        assert seed["cute_topk_merge_schedule"] == "sequential"
+    generation = ConfigGeneration(spec)
+    flattened = generation.seed_flat_config_pairs()
+    normalized = copy.deepcopy(seeds)
+    for config in normalized:
+        spec.normalize(config)
+    assert [
+        config
+        for _, config in flattened
+        if config.get("cute_topk_defer_value_gathers", False)
+    ] == normalized
+    for flat, config in flattened:
+        assert generation.unflatten(flat) == config
+
+
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
     return {
         "block_sizes": [1],
@@ -3277,6 +3583,7 @@ def test_sort_uses_register_selection_network(descending: bool) -> None:
     with FakeTensorMode():
         x = torch.empty((17, 65), dtype=torch.bfloat16)
     bound = _row_network_sort._bind_isolated((x, descending))
+    assert bound.config_spec.cute_topk_search_enabled
     config = bound.config_spec.default_config()
     config.config.update(_composition_config(8, "distributed"))
     code = bound.to_code(config)
