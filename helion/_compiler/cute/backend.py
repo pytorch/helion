@@ -1265,6 +1265,7 @@ class CuteBackend(Backend):
                 "cute_topk_sort_network",
                 "cute_topk_key_encoder",
                 "cute_topk_defer_value_gathers",
+                "cute_topk_merge_schedule",
             )
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")

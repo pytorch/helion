@@ -527,7 +527,7 @@ topk_keys = cute.make_rmem_tensor({fragment_size}, {key_type})
 topk_keys.fill({key_padding})
 {loads}
 
-topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row}, {plan.sort_network!r})
+topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row}, {plan.sort_network!r}, {plan.merge_schedule!r})
 {stores}
 """
     statements: list[ast.AST] = []
