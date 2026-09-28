@@ -448,7 +448,9 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
                 torch.randn(32, device=DEVICE, dtype=torch.float32),
             ],
             rtol=1e-2,
-            atol=1e-2,
+            # A10G TF32 reduction order can leave an isolated w-grad element
+            # just above 1e-2 absolute error (same as test_example_bmm).
+            atol=2e-2,
         )
 
     def test_single_loop_batched_bmm(self):
