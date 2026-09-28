@@ -153,7 +153,7 @@ topk_packed = ((topk_ordered << cutlass.Int32({index_bits}))
                | (cutlass.Int32({index_mask}) - topk_col))
 topk_keys[topk_i] = {encoded_key}
 """
-    use_asm_encoder = not native_float and plan.key_encoder == "asm"
+    use_asm_encoder = not native_float and plan.key_encoder in ("asm", "paired")
     if use_asm_encoder:
         encode_helper = f"_cute_encode_ordered_topk_{helper_hash}"
         cg.module_statements.append(
@@ -260,6 +260,53 @@ for topk_chunk in cutlass.range({fragment_size // plan.vector_width}, unroll_ful
             topk_col = topk_col_base + cutlass.Int32(topk_element)
             topk_bits = {vector_word}
 {textwrap.indent(encode, "            ")}
+"""
+    if (
+        vectorized
+        and plan.key_encoder == "paired"
+        and not native_float
+        and plan.rank_mode == "ordinal"
+    ):
+        pair_helper = f"_cute_encode_ordinal_pair_{helper_hash}"
+        cg.module_statements.append(
+            ast.ImportFrom(
+                module="helion.runtime.cute.topk",
+                names=[ast.alias(name="encode_ordinal_topk_pair", asname=pair_helper)],
+                level=0,
+            )
+        )
+        # The existing vector proof covers both adjacent words, byte alignment
+        # and row/column tails. Recast the already-offset pointer so address
+        # arithmetic retains its original element units and selected width.
+        # A single packed word is a scalar load. NVVM drops vector<1xi32>
+        # load_ext values in this path, leaving an undefined encoder input.
+        pair_load_type = (
+            "cutlass.Uint32"
+            if plan.vector_width == 2
+            else f"ir.VectorType.get([{plan.vector_width // 2}], cutlass.Uint32.mlir_type)"
+        )
+        pair_word = (
+            "topk_pairs"
+            if plan.vector_width == 2
+            else "cutlass.Uint32(topk_pairs[topk_pair])"
+        )
+        vector_loads = f"""
+for topk_chunk in cutlass.range({fragment_size // plan.vector_width}, unroll_full=True):
+    topk_col_base = ((cutlass.Int32(topk_chunk * {plan.lanes_per_row})
+                      + topk_lane) * cutlass.Int32({plan.vector_width}))
+    if topk_valid_row & ({vector_col_guard}):
+        topk_pairs = cute.arch.load(
+            cute.recast_ptr(topk_input_bits.iterator + topk_row * {index_type}({row_stride}) + {index_type}(topk_col_base), dtype=cutlass.Uint32),
+            {pair_load_type},
+        )
+        for topk_pair in cutlass.range_constexpr({plan.vector_width // 2}):
+            topk_i = topk_chunk * {plan.vector_width} + 2 * topk_pair
+            topk_col = topk_col_base + cutlass.Int32(2 * topk_pair)
+            topk_low, topk_high = {pair_helper}({pair_word}, topk_col, {index_bits}, {plan.largest!r}, {infinity_bits})
+            topk_packed = topk_low
+            topk_keys[topk_i] = {encoded_key}
+            topk_packed = topk_high
+            topk_keys[topk_i + 1] = {encoded_key}
 """
     scalar_loads = f"""
 for topk_i in cutlass.range({fragment_size}, unroll_full=True):

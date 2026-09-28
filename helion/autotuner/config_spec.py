@@ -845,7 +845,7 @@ CUTE_TOPK_CHOICES: dict[str, tuple[int | str, ...]] = {
     "cute_topk_rank_mode": ("signed", "ordinal"),
     "cute_topk_selection_layout": ("replicated", "distributed"),
     "cute_topk_sort_network": ("batcher", "compact", "compact_pruned"),
-    "cute_topk_key_encoder": ("dsl", "asm"),
+    "cute_topk_key_encoder": ("dsl", "asm", "paired"),
     "cute_topk_defer_value_gathers": (False, True),
     "cute_topk_merge_schedule": ("sequential", "balanced"),
 }

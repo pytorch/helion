@@ -2,20 +2,18 @@
 
 The encoded signed Int32 maximum identifies the preferred value/index pair.
 The 16-bit rank and at most 15 index bits leave every valid key above INT_MIN,
-which callers can use to mask missing candidates.
+which callers can use to mask missing candidates. Paired encoding retains the
+ordinal, NaNs-last policy used for register selection.
 """
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
 
 import cutlass
 from cutlass import Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-if TYPE_CHECKING:
-    from ..._compiler.cute._mlir_compat import ir
+from ..._compiler.cute._mlir_compat import ir
 
 
 @dsl_user_op
@@ -78,3 +76,62 @@ def encode_ordered_key_16(
         ip=ip,
     )
     return Int32(result)
+
+
+@dsl_user_op
+def encode_ordinal_key_pair_16(
+    words: cutlass.Uint32,
+    column: Int32,
+    index_bits: int,
+    largest: bool,
+    infinity_bits: int,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> tuple[Int32, Int32]:
+    """Encode two adjacent 16-bit values without splitting their rank work.
+
+    Each masked magnitude is at most 0x7fff. Adding 0x7fff-infinity
+    cannot carry into its neighboring half; its sign bit detects only NaNs.
+    PRMT expands those bits into masks for exact per-half canonicalization.
+    """
+    assert 1 <= index_bits <= 15
+    assert infinity_bits in (0x7C00, 0x7F80)
+    bias = 0x7FFF - infinity_bits
+    packed_bias = bias | (bias << 16)
+    index_mask = (1 << index_bits) - 1
+    reverse = "neg.s32 lo, lo; neg.s32 hi, hi;" if not largest else ""
+    result = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32, i32)>"),
+        [words.ir_value(loc=loc, ip=ip), column.ir_value(loc=loc, ip=ip)],
+        f"""
+        {{
+          .reg .b32 sign, rank, magnitude, biased, nan_mask, lo, hi, payload;
+          prmt.b32 sign, $2, 0, 0xbb99;
+          lop3.b32 rank, $2, sign, 0x7fff7fff, 0x78;
+          and.b32 magnitude, $2, 0x7fff7fff;
+          add.u32 biased, magnitude, {packed_bias};
+          prmt.b32 nan_mask, biased, 0, 0xbb99;
+          lop3.b32 rank, rank, nan_mask, 0x7fff7fff, 0xb8;
+          prmt.b32 lo, rank, 0, 0x9910;
+          prmt.b32 hi, rank, 0, 0xbb32;
+          {reverse}
+          shl.b32 lo, lo, {index_bits};
+          sub.u32 payload, {index_mask}, $3;
+          or.b32 $0, lo, payload;
+          shl.b32 hi, hi, {index_bits};
+          sub.u32 payload, payload, 1;
+          or.b32 $1, hi, payload;
+        }}
+        """,
+        "=r,=r,r,r",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return (
+        Int32(llvm.extractvalue(Int32.mlir_type, result, [0], loc=loc, ip=ip)),
+        Int32(llvm.extractvalue(Int32.mlir_type, result, [1], loc=loc, ip=ip)),
+    )
