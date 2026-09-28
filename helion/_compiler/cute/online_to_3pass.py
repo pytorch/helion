@@ -802,21 +802,22 @@ def _reduction_axis_extent(func: HostFunction) -> int | None:
     return None if chosen is None else chosen[1]
 
 
-def rewrite_online_to_3pass(func: HostFunction) -> bool:
+def rewrite_online_to_3pass(func: HostFunction, *, min_n: int | None = None) -> bool:
     """Rewrite online softmax patterns in ``func.body`` to the 3-pass form.
 
     Returns True if any rewrite fired.  Gated externally by:
 
     * ``HELION_DISABLE_ONLINE_TO_3PASS=1`` — skip the pass entirely.
     * ``HELION_ONLINE_TO_3PASS_MIN_N`` — minimum reduction-axis extent
-      for the rewrite to apply (default 2048).
+      for the rewrite to apply (default 0 = always rewrite).
+    * ``min_n`` — explicit override; takes precedence over the env var when set.
     """
     if os.environ.get("HELION_DISABLE_ONLINE_TO_3PASS") == "1":
         return False
-    min_n = _min_n_for_rewrite()
-    if min_n > 0:
+    effective_min_n = min_n if min_n is not None else _min_n_for_rewrite()
+    if effective_min_n > 0:
         extent = _reduction_axis_extent(func)
-        if extent is not None and extent < min_n:
+        if extent is not None and extent < effective_min_n:
             return False
     transformer = _OnlineToThreePassTransformer()
     new_body: list[ast.stmt] = []

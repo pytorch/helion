@@ -187,6 +187,8 @@ def default_flydsl_launcher(
     grid: tuple[int, ...],
     *args: object,
     _num_threads: int = 64,
+    _waves_per_eu: int = 0,
+    _maxnreg: int = 0,
     **kwargs: object,
 ) -> None:
     """Default launcher for FlyDSL kernels on ROCm devices.
@@ -214,10 +216,20 @@ def default_flydsl_launcher(
     gz = grid[2] if len(grid) > 2 else 1
 
     # _num_threads = 64*bm from launcher_keyword_args; default 64 = bm=1.
+    # _waves_per_eu = occupancy hint (0 = let compiler decide).
     # id(flydsl_kernel) is safe as a key component only because the cached closure
     # (_make(flydsl_kernel)) keeps the kernel object alive, so its id can't be
     # recycled for a different kernel while the entry lives.
-    cache_key = (id(flydsl_kernel), n, gx, gy, gz, _num_threads)
+    cache_key = (
+        id(flydsl_kernel),
+        n,
+        gx,
+        gy,
+        gz,
+        _num_threads,
+        _waves_per_eu,
+        _maxnreg,
+    )
     if cache_key not in _flydsl_jit_cache:
         params = ", ".join(f"_a{i}: fx.Tensor" for i in range(n))
         call = ", ".join(f"_a{i}" for i in range(n))
@@ -254,7 +266,23 @@ def _make(kernel):
     compiled = _flydsl_compiled_cache.get(cache_key)
     if compiled is None:
         import flydsl.compiler as _flyc  # pyrefly: ignore[missing-import]
+        from flydsl.compiler.jit_function import (  # pyrefly: ignore[missing-import]
+            CompilationContext,
+        )
 
-        compiled = _flyc.compile(_flydsl_jit_cache[cache_key], *args, _flydsl_stream)
+        hints: dict = {}
+        if _waves_per_eu > 0:
+            hints["waves_per_eu"] = _waves_per_eu
+        if _maxnreg > 0:
+            hints["maxnreg"] = _maxnreg
+        if hints:
+            with CompilationContext.compile_hints(hints):
+                compiled = _flyc.compile(
+                    _flydsl_jit_cache[cache_key], *args, _flydsl_stream
+                )
+        else:
+            compiled = _flyc.compile(
+                _flydsl_jit_cache[cache_key], *args, _flydsl_stream
+            )
         _flydsl_compiled_cache[cache_key] = compiled
     compiled(*args, _flydsl_stream)
