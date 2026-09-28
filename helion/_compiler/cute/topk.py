@@ -52,6 +52,7 @@ class CuteTopKPlan:
     selection_layout: str = "replicated"
     sort_network: str = "batcher"
     key_encoder: str = "dsl"
+    defer_value_gathers: bool = False
 
     stable_ties: bool = False
 
@@ -345,6 +346,9 @@ def plan_topk_root(
         ),
         sort_network=cast("str", config.get("cute_topk_sort_network", "batcher")),
         key_encoder=cast("str", config.get("cute_topk_key_encoder", "dsl")),
+        defer_value_gathers=cast(
+            "bool", config.get("cute_topk_defer_value_gathers", False)
+        ),
     )
 
 

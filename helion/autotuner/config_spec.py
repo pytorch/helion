@@ -853,6 +853,7 @@ CUTE_TOPK_CHOICES: dict[str, tuple[int | str, ...]] = {
     "cute_topk_selection_layout": ("replicated", "distributed"),
     "cute_topk_sort_network": ("batcher", "compact", "compact_pruned"),
     "cute_topk_key_encoder": ("dsl", "asm"),
+    "cute_topk_defer_value_gathers": (False, True),
 }
 CUTE_TOPK_CONFIG_KEYS: frozenset[str] = frozenset(CUTE_TOPK_CHOICES)
 
