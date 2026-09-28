@@ -14,6 +14,7 @@ from torch.fx import Node
 from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _get_symnode
 from ...language._tracing_ops import _host_tensor
+from ...language._tracing_ops import _mask_to
 from ...language.memory_ops import load
 from ...language.memory_ops import store
 from ..compile_environment import CompileEnvironment
@@ -42,6 +43,7 @@ class CuteTopKPlan:
     x: torch.Tensor
     values: torch.Tensor
     indices: torch.Tensor
+    softmax: bool = False
     lanes_per_row: int = 16
     rows_per_block: int = 8
     vector_width: int = 8
@@ -78,13 +80,78 @@ def _row_block(node: object) -> int | None:
     return CompileEnvironment.current().get_block_id(value)
 
 
+def _match_softmax_epilogue(
+    value: Node, selection: Node, dtype: torch.dtype
+) -> tuple[Node, set[Node]] | None:
+    """Recognize stable FP32 softmax of the selected values along their K axis."""
+    consumed: set[Node] = set()
+
+    def args(node: object, target: object, count: int) -> tuple[object, ...] | None:
+        if (
+            not isinstance(node, Node)
+            or node.target is not target
+            or node.kwargs
+            or len(node.args) != count
+        ):
+            return None
+        consumed.add(node)
+        return node.args
+
+    cast_args = args(value, torch.ops.prims.convert_element_type.default, 2)
+    if cast_args is None or cast_args[1] != dtype:
+        return None
+    div_args = args(cast_args[0], torch.ops.aten.div.Tensor, 2)
+    if div_args is None:
+        return None
+    exponential, denominator = div_args
+    sum_args = args(denominator, torch.ops.aten.sum.dim_IntList, 3)
+    if sum_args is None or sum_args[1] not in ([-1], [1]) or sum_args[2] is not True:
+        return None
+    sum_input = sum_args[0]
+    if isinstance(sum_input, Node) and sum_input.target is _mask_to:
+        masked = args(sum_input, _mask_to, 2)
+        if masked is None or masked[1] != 0:
+            return None
+        sum_input = masked[0]
+    if sum_input is not exponential:
+        return None
+    exp_args = args(exponential, torch.ops.aten.exp.default, 1)
+    if exp_args is None:
+        return None
+    sub_args = args(exp_args[0], torch.ops.aten.sub.Tensor, 2)
+    if sub_args is None:
+        return None
+    logits, maximum = sub_args
+    max_args = args(maximum, torch.ops.aten.amax.default, 3)
+    if max_args is None or max_args[1] not in ([-1], [1]) or max_args[2] is not True:
+        return None
+    max_input = max_args[0]
+    if isinstance(max_input, Node) and max_input.target is _mask_to:
+        masked = args(max_input, _mask_to, 2)
+        if masked is None or masked[1] != float("-inf"):
+            return None
+        max_input = masked[0]
+    if max_input is not logits:
+        return None
+    float_args = args(logits, torch.ops.prims.convert_element_type.default, 2)
+    if float_args is None or float_args[1] != torch.float32:
+        return None
+    selected = float_args[0]
+    selected_args = args(selected, operator.getitem, 2)
+    if selected_args != (selection, 0):
+        return None
+    assert isinstance(selected, Node)
+    return selected, consumed
+
+
 def match_topk_root(
     graphs: Sequence[GraphInfo], *, noncanonical_block_ids: set[int]
 ) -> CuteTopKPlan | None:
-    """Prove a full-row load, top-k, and direct stores with exact index narrowing.
+    """Prove a full-row top-k and direct or stable-softmax value stores.
 
-    Reject additional computation or effects. In particular, neither inputs
-    nor outputs may share storage: the output-value gather reads the input.
+    Reject computation outside the recognized selection/softmax epilogue or
+    additional effects. Neither inputs nor outputs may share storage: the
+    output-value gather reads the input.
     Final planning also requires a cache-specialized runtime overlap proof.
     Reduction rolling can wrap the load in a graph-return/getitem pair; this
     is accepted only when that child graph returns exactly the direct load.
@@ -200,11 +267,18 @@ def match_topk_root(
     if not env.known_equal(x.stride(-1), 1):
         return None
     outputs: dict[int, torch.Tensor] = {}
+    softmax = False
     for effect in stores:
         if len(effect.args) != 4 or effect.args[3] is not None or effect.kwargs:
             return None
         output_tensor = _tensor(effect.args[0])
         output_subscript, value = effect.args[1:3]
+        if isinstance(value, Node):
+            epilogue = _match_softmax_epilogue(value, selection, x.dtype)
+            if epilogue is not None:
+                value, epilogue_nodes = epilogue
+                consumed.update(epilogue_nodes)
+                softmax = True
         if (
             isinstance(value, Node)
             and value.target is torch.ops.prims.convert_element_type.default
@@ -277,6 +351,7 @@ def match_topk_root(
         x,
         values,
         indices,
+        softmax=softmax,
         stable_ties=stable_ties,
     )
 
