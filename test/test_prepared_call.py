@@ -1073,23 +1073,26 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
 
         prepare.assert_called_once()
 
-    def test_compiler_capture_does_not_inspect_prepared_guard(self) -> None:
+    def test_compiler_capture_does_not_inspect_eager_dispatch_guards(self) -> None:
         add_one = _make_add_one()
         x = torch.randn(64, device=DEVICE)
         add_one(x)
+        self.assertTrue(add_one._dispatch_cache)  # type: ignore[attr-defined]
 
         with (
-            patch.object(
-                torch.compiler, "is_compiling", return_value=True
-            ) as is_compiling,
+            patch.object(torch.compiler, "is_compiling", return_value=True),
             patch.object(
                 kernel_module._PreparedCall,
                 "matches",
                 side_effect=AssertionError("capture inspected prepared state"),
             ),
+            patch.object(
+                add_one,
+                "_fast_dispatch_key",
+                side_effect=AssertionError("capture inspected runtime specialization"),
+            ),
         ):
             out = add_one(x)
-        is_compiling.assert_called_once_with()
         torch.testing.assert_close(out, x + 1)
 
     @unittest.skipUnless(

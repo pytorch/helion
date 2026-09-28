@@ -2030,7 +2030,9 @@ class Kernel(Generic[_R]):
             and prepared.bound._run is not None
         ):
             return prepared.bound._run(*args)
-        if self._dispatch_cache:
+        # Runtime specialization guards can inspect pointers and storage offsets.
+        # Compiler capture must bind in isolation even after an eager warmup.
+        if not is_compiling and self._dispatch_cache:
             # Fast path: repeat call with argument metadata seen before. The
             # cache is only populated by calls that already took the slow
             # path below, so hitting it cannot skip autotuning/compilation.
@@ -2054,8 +2056,6 @@ class Kernel(Generic[_R]):
                     bound = self._dispatch_cache.get(fast_key)
                     if bound is not None and bound._run is not None:
                         run = bound._run
-                        if is_compiling:
-                            return run(*args)
                         if (
                             bound._dispatch_generation == specialization_generation
                             and bound._run is run
@@ -2076,8 +2076,6 @@ class Kernel(Generic[_R]):
                 bound = self._dispatch_cache.get(fast_key)
                 if bound is not None and bound._run is not None:
                     run = bound._run
-                    if is_compiling:
-                        return run(*args)
                     # A compilation can discover a late specialization while a
                     # different thread is reading this cache. Revalidate fast-
                     # path state while the mapping is still current; the same
