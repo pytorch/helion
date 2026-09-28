@@ -41,6 +41,12 @@ if TYPE_CHECKING:
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
+import cutlass
+import cutlass.cute as cute
+
+from helion.runtime import default_cute_launcher
+from helion.runtime.cute.register_layout import subgroup_unvectorize
+from helion.runtime.cute.register_layout import subgroup_vectorize
 from helion.runtime.cute.sorting_networks import COMPACT_SORT_LAYERS
 from helion.runtime.cute.topk import _balanced_chunk_program
 from helion.runtime.cute.topk import _odd_even_sort_network
@@ -1804,10 +1810,10 @@ def test_distributed_output_transpose_rank_mapping(
 @pytest.mark.parametrize(
     "k,lanes,requested,effective",
     [
-        (32, 1, 8, 1),
+        (32, 1, 8, 8),
         (32, 32, 8, 1),
-        (32, 2, 8, 2),
-        (32, 4, 8, 4),
+        (32, 2, 8, 8),
+        (32, 4, 8, 8),
         (64, 8, 8, 8),
         (24, 8, 8, 4),
         (12, 8, 8, 2),
@@ -1840,7 +1846,8 @@ def test_distributed_vector_codegen(
     assert f"values.iterator.alignment >= {2 * effective}" in code
     assert "indices.iterator.alignment >= 16" in code
     assert f"cute.assume(topk_output_offset, divby={effective})" in code
-    assert f"topk_output_lane * cutlass.Int32({effective})" in code
+    output_lane = "topk_lane" if effective > lanes else "topk_output_lane"
+    assert f"{output_lane} * cutlass.Int32({effective})" in code
     if k != 1 << (k - 1).bit_length():
         assert f"topk_output_col < cutlass.Int32({k})" in code
     # Scalar ABI fallback must retain the original cyclic fragment, while
@@ -3794,6 +3801,125 @@ def test_paired_encoder_same_bound_alignment_transition(
         _assert_topk_output(x, values, indices, k, largest, index_dtype=torch.int32)
 
 
+# Wide output top-k tests.
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [True, False])
+@pytest.mark.parametrize(
+    "k,lanes,requested,effective,wide",
+    [
+        (32, 1, 8, 8, True),
+        (32, 2, 4, 4, True),
+        (32, 2, 8, 8, True),
+        (32, 4, 8, 8, True),
+        (24, 2, 8, 8, True),
+        (12, 2, 8, 4, True),
+        (6, 2, 8, 2, False),
+        (32, 32, 8, 1, False),
+    ],
+)
+def test_distributed_wide_output_codegen(
+    index_dtype: torch.dtype,
+    largest: bool,
+    k: int,
+    lanes: int,
+    requested: int,
+    effective: int,
+    wide: bool,
+) -> None:
+    code = _code(
+        1,
+        128,
+        2**35,
+        k,
+        requested,
+        lanes=lanes,
+        largest=largest,
+        selection_layout="distributed",
+        key_dtype="float32_bits",
+        rank_mode="ordinal",
+        value_mode="decode",
+        defer_value_gathers=True,
+        index_dtype=index_dtype,
+    )
+    assert (
+        "from helion.runtime.cute.topk import transpose_topk_output_wide" in code
+    ) == wide
+    assert "topk_row = cutlass.Int64(" in code
+    assert "topk_selected[topk_j]" in code  # Misaligned ABI keeps cyclic scalar stores.
+    if effective == 1:
+        assert "cute.autovec_copy" not in code
+        return
+    assert f"cute.assume(topk_output_offset, divby={effective})" in code
+    assert f"topk_row * cutlass.Int64({k})" in code
+    assert f"values.iterator.alignment >= {2 * effective}" in code
+    if k != 1 << (k - 1).bit_length():
+        assert f"topk_output_col < cutlass.Int32({k})" in code
+        assert "topk_output_max_rank" not in code
+    else:
+        endpoint = 0 if largest else k // lanes - 1
+        assert f"topk_output_keys[{endpoint}]" in code
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "k,lanes,vector,offset,key_dtype,defer",
+    [
+        (32, 1, 8, 0, "int32", True),
+        (32, 2, 4, 0, "int32", False),
+        (32, 2, 8, 0, "float32_bits", True),
+        (24, 2, 4, 1, "int32", True),
+        (24, 4, 8, 0, "float32_native", True),
+        (6, 2, 8, 0, "int32", False),
+    ],
+)
+def test_distributed_wide_output_exact_bits_and_tails(
+    dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    largest: bool,
+    k: int,
+    lanes: int,
+    vector: int,
+    offset: int,
+    key_dtype: str,
+    defer: bool,
+) -> None:
+    rows, width = 9, 128
+    x, storage = _layout_input(rows, width, dtype, 2 * offset, offset)
+    original = storage.clone()
+    value_storage = torch.full((rows * k + 2,), 7, dtype=dtype, device=DEVICE)
+    index_storage = torch.full((rows * k + 2,), -7, dtype=index_dtype, device=DEVICE)
+    values = value_storage[offset : offset + rows * k].view(rows, k)
+    indices = index_storage[offset : offset + rows * k].view(rows, k)
+    code_and_output(
+        _extra_out_topk,
+        (x, values, indices, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=vector,
+        cute_topk_selection_layout="distributed",
+        cute_topk_sort_network="compact_pruned",
+        cute_topk_key_encoder="paired",
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode="ordinal",
+        cute_topk_value_mode="decode",
+        cute_topk_defer_value_gathers=defer,
+    )
+    _assert_topk_output(x, values, indices, k, largest, index_dtype=index_dtype)
+    assert torch.equal(original.view(torch.int16), storage.view(torch.int16))
+    assert bool((value_storage[:offset] == 7).all())
+    assert bool((value_storage[offset + rows * k :] == 7).all())
+    assert bool((index_storage[:offset] == -7).all())
+    assert bool((index_storage[offset + rows * k :] == -7).all())
+
+
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
     return {
         "block_sizes": [1],
@@ -3859,3 +3985,63 @@ def test_sort_network_preserves_values_indices_and_ties(
     torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
     assert torch.equal(values.view(torch.int16), expected_values.view(torch.int16))
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@cute.kernel
+def _subgroup_layout_roundtrip_kernel(
+    x,
+    output,
+    restored,
+    lanes: cutlass.Constexpr,
+    vector: cutlass.Constexpr,
+    registers: cutlass.Constexpr,
+):
+    thread = cute.arch.lane_idx()
+    row = thread // lanes
+    lane = thread % lanes
+    fragment = cute.make_rmem_tensor(registers, x.element_type)
+    for index in cutlass.range_constexpr(registers):
+        fragment[index] = x[row, index * lanes + lane]
+    grouped, output_lane = subgroup_vectorize(fragment, vector, lanes)
+    for index in cutlass.range_constexpr(registers):
+        column = (index // vector * lanes + output_lane) * vector + index % vector
+        output[row, column] = grouped[index]
+    cyclic = subgroup_unvectorize(grouped, vector, lanes)
+    for index in cutlass.range_constexpr(registers):
+        restored[row, index * lanes + lane] = cyclic[index]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "dtype", [torch.int32, torch.float32, torch.float16, torch.bfloat16, torch.int64]
+)
+@pytest.mark.parametrize("lanes,vector", [(2, 8), (4, 2), (32, 4)])
+def test_subgroup_vector_layout_roundtrip(
+    dtype: torch.dtype, lanes: int, vector: int
+) -> None:
+    registers = 16
+    shape = (32 // lanes, registers * lanes)
+    if dtype in (torch.float16, torch.bfloat16):
+        words = torch.arange(32 * registers, device=DEVICE, dtype=torch.int16)
+        words[:8] = torch.tensor(
+            [0, -32768, 0x7FC1, -47, 0x7F80, -128, 0x7E01, -511],
+            device=DEVICE,
+            dtype=torch.int16,
+        )
+        x = words.view(dtype).reshape(shape)
+    else:
+        x = torch.arange(32 * registers, device=DEVICE).to(dtype).reshape(shape)
+    output, restored = torch.empty_like(x), torch.empty_like(x)
+    default_cute_launcher(
+        _subgroup_layout_roundtrip_kernel,
+        (1,),
+        x,
+        output,
+        restored,
+        lanes,
+        vector,
+        registers,
+        block=(8, 4, 1),
+    )
+    assert torch.equal(x.view(torch.uint8), output.view(torch.uint8))
+    assert torch.equal(x.view(torch.uint8), restored.view(torch.uint8))

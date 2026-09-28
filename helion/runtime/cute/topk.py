@@ -18,6 +18,8 @@ import cutlass.cute as cute
 
 from .ordered_key import encode_ordered_key_16 as encode_ordered_topk_key
 from .ordered_key import encode_ordinal_key_pair_16 as encode_ordinal_topk_pair
+from .register_layout import cyclic_to_vector_narrow as transpose_topk_output
+from .register_layout import cyclic_to_vector_wide as transpose_topk_output_wide
 from .sorting_networks import COMPACT_SORT_LAYERS
 
 __all__ = [
@@ -26,6 +28,7 @@ __all__ = [
     "encode_ordinal_topk_pair",
     "local_topk",
     "transpose_topk_output",
+    "transpose_topk_output_wide",
 ]
 
 
@@ -358,42 +361,3 @@ def distributed_topk(
             else:
                 selected = halves[None, 0]
     return selected
-
-
-@cute.jit
-def transpose_topk_output(
-    selected: cute.Tensor,
-    vector_width: cutlass.Constexpr[int],
-) -> cute.Tensor:
-    """Transpose cyclic ranks into contiguous vectors within lane subgroups.
-
-    Swap the low log2(vector_width) lane and register bits. Each lane then
-    owns contiguous output vectors; the caller permutes its output lane to
-    account for the swapped bits. The containing row subgroup and per-lane
-    fragment must both be divisible by vector_width.
-    """
-    size = cute.size(selected.shape)
-    assert 1 < vector_width <= 32
-    assert (vector_width & (vector_width - 1)) == 0
-    assert size % vector_width == 0
-    output = cute.make_rmem_tensor(size, selected.element_type)
-    for index in cutlass.range_constexpr(size):
-        output[index] = selected[index]
-    lane = Int32(cute.arch.thread_idx()[0])
-    for block in cutlass.range_constexpr(size // vector_width):
-        for stage in cutlass.range_constexpr(vector_width.bit_length() - 1):
-            bit = 1 << stage
-            for group in cutlass.range_constexpr(vector_width // (2 * bit)):
-                for offset in cutlass.range_constexpr(bit):
-                    low = block * vector_width + group * 2 * bit + offset
-                    high = low + bit
-                    a = selected.element_type(output[low])
-                    b = selected.element_type(output[high])
-                    # Every lane shuffles both old registers before writing.
-                    peer_b = cute.arch.shuffle_sync_bfly(b, offset=bit)
-                    peer_a = cute.arch.shuffle_sync_bfly(a, offset=bit)
-                    if (lane & Int32(bit)) != 0:
-                        output[low], output[high] = peer_b, b
-                    else:
-                        output[low], output[high] = a, peer_a
-    return output

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from ...runtime.cute import ordered_key as runtime_ordered_key
+from ...runtime.cute import register_layout as runtime_register_layout
 from ...runtime.cute import sorting_networks as runtime_sorting_networks
 from ...runtime.cute import topk as runtime_topk
 from ..program_id import XYZProgramIDs
@@ -73,6 +74,7 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
             inspect.getsource(runtime_topk)
             + inspect.getsource(runtime_sorting_networks)
             + inspect.getsource(runtime_ordered_key)
+            + inspect.getsource(runtime_register_layout)
         ).encode("utf-8")
     ).hexdigest()[:16]
     helper_function = "distributed_topk" if distributed else "local_topk"
@@ -419,7 +421,11 @@ for topk_j in cutlass.range_constexpr({selected_per_lane}):
 """
     output_vector = plan.output_vector_width
     if distributed:
-        output_vector = min(output_vector, output_lanes, selected_per_lane)
+        output_vector = min(output_vector, selected_per_lane)
+        # Wider vectors need complete groups. Retain the existing narrow
+        # transpose when the new width would discard a usable smaller vector.
+        while output_vector > output_lanes and plan.k % output_vector != 0:
+            output_vector //= 2
     # The matcher proves contiguous outputs. Complete vector groups also
     # ensure every row starts at a compatible alignment; odd k stays scalar.
     if output_vector > 1 and plan.k % output_vector == 0:
@@ -437,23 +443,30 @@ for topk_j in cutlass.range_constexpr({selected_per_lane}):
         output_key = f"topk_output_keys[topk_j * {output_vector} + topk_v]"
         output_lane = "topk_lane"
         if distributed:
-            transpose_name = f"_cute_transpose_topk_output_{helper_hash}"
+            wide_output = output_vector > plan.lanes_per_row
+            transpose_helper = (
+                "transpose_topk_output_wide" if wide_output else "transpose_topk_output"
+            )
+            transpose_name = f"_cute_{transpose_helper}_{helper_hash}"
             cg.module_statements.append(
                 ast.ImportFrom(
                     module="helion.runtime.cute.topk",
-                    names=[
-                        ast.alias(name="transpose_topk_output", asname=transpose_name)
-                    ],
+                    names=[ast.alias(name=transpose_helper, asname=transpose_name)],
                     level=0,
                 )
             )
-            vector_setup = f"""
+            if wide_output:
+                vector_setup = f"""
+topk_output_keys = {transpose_name}(topk_selected, {output_vector}, {plan.lanes_per_row})
+"""
+            else:
+                vector_setup = f"""
 topk_output_keys = {transpose_name}(topk_selected, {output_vector})
 topk_output_lane = ((topk_lane % cutlass.Int32({output_vector}))
                     * cutlass.Int32({plan.lanes_per_row // output_vector})
                     + topk_lane // cutlass.Int32({output_vector}))
 """
-            output_lane = "topk_output_lane"
+                output_lane = "topk_output_lane"
             output_key = selected_key.replace("topk_selected[topk_output]", output_key)
         else:
             vector_setup = f"""
