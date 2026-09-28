@@ -844,7 +844,11 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
         config_spec=SimpleNamespace(cute_flash_search_enabled=False),
         is_cacheable=lambda: True,
     )
-    autotuner = SimpleNamespace(kernel=bound_kernel, args=(tensor,))
+    autotuner = SimpleNamespace(
+        kernel=bound_kernel,
+        args=(tensor,),
+        settings=SimpleNamespace(autotune_final_benchmark_fn=None),
+    )
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)
     monkeypatch.setattr(
