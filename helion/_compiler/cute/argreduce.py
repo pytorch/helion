@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import inspect
 import math
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 
 from ..ast_extension import expr_from_string
@@ -23,6 +26,10 @@ if TYPE_CHECKING:
 
     from ..aten_lowering import LoweringContext
     from ..generate_ast import GenerateAST
+    from ..inductor_lowering import CodegenState
+    from ..reduction_strategy import LoopedReductionStrategy
+    from ..reduction_strategy import PersistentReductionStrategy
+    from ..tile_strategy import DeviceLoopState
 
 
 def _argreduce_extreme_literal(
@@ -175,6 +182,131 @@ def _argreduce_scan_ready_expr(
     if not terms:
         return None
     return " and ".join(terms)
+
+
+def _import_ordered_key_helper(cg: GenerateAST) -> str:
+    from ...runtime.cute import ordered_key
+
+    # CuTe's persistent cache keys generated source, including import aliases.
+    digest = hashlib.sha256(inspect.getsource(ordered_key).encode()).hexdigest()[:16]
+    encoder = f"_cute_argreduce_key_{digest}"
+    cg.module_statements.append(
+        ast.ImportFrom(
+            module="helion.runtime.cute.ordered_key",
+            names=[
+                ast.alias(name="encode_ordered_key_16", asname=encoder),
+            ],
+            level=0,
+        )
+    )
+    return encoder
+
+
+def codegen_packed_reduction(
+    state: CodegenState,
+    strategy: LoopedReductionStrategy | PersistentReductionStrategy,
+    device_loop: DeviceLoopState | None,
+    input_name: str,
+    reduction_type: str,
+    dim: int,
+    fake_input: torch.Tensor,
+    fake_output: torch.Tensor,
+) -> ast.AST | None:
+    """Use one ordered-key collective for bounded low-precision argreductions."""
+    from ..reduction_strategy import LoopedReductionStrategy
+
+    env = CompileEnvironment.current()
+    if isinstance(strategy, LoopedReductionStrategy):
+        if (
+            strategy._cute_rolled_cluster_n != 1
+            or strategy._cute_emitted_vec_load
+            or strategy._cute_reduction_vec_width != 1
+        ):
+            return None
+    elif strategy._synthetic_cute_lane_var is not None:
+        return None
+    numel = env.block_sizes[strategy.block_index].numel
+    threads = strategy._reduction_thread_count()
+    if (
+        fake_input.dtype not in (torch.float16, torch.bfloat16)
+        or not isinstance(numel, (int, sympy.Integer))
+        or not 0 < int(numel) <= 32768
+        or not 0 < threads <= 32
+        or threads & (threads - 1)
+        or strategy._get_thread_axis() != 0
+    ):
+        return None
+    extent = int(numel)
+    index_bits = (extent - 1).bit_length()
+    index_mask = (1 << index_bits) - 1
+    infinity_bits = 0x7C00 if fake_input.dtype == torch.float16 else 0x7F80
+    largest = reduction_type == "argmax"
+    nan_order = "last" if largest else "first"
+    fn = state.device_function
+    encoder = _import_ordered_key_helper(state.codegen)
+    assert state.fx_node is not None
+    accumulator = fn.new_var(f"{state.fx_node.name}_key_acc", dce=True)
+    result = fn.new_var(state.fx_node.name, dce=True)
+    index = strategy.index_var(strategy.block_index)
+    input_type = env.backend.dtype_str(fake_input.dtype)
+    if device_loop is not None:
+        local_value = fn.new_var(f"{state.fx_node.name}_local_value", dce=True)
+        local_index = fn.new_var(f"{state.fx_node.name}_local_index", dce=True)
+        value = fn.new_var(f"{state.fx_node.name}_value", dce=True)
+        extreme = "float('-inf')" if largest else "float('inf')"
+        device_loop.outer_prefix.extend(
+            [
+                statement_from_string(f"{local_value} = cutlass.Float32({extreme})"),
+                statement_from_string(
+                    f"{local_index} = cutlass.Int32(cute.arch.thread_idx()[0])"
+                ),
+            ]
+        )
+        state.add_statement(f"{value} = cutlass.Float32({input_type}({input_name}))")
+        comparison = ">" if largest else "<"
+        # Scalar reduction loops visit each lane's columns in increasing order,
+        # starting at its thread index. Retaining equal values gives first-index
+        # ties, including signed zero and infinities. The first NaN wins as well.
+        better = (
+            f"({index}) < {extent} and "
+            f"(({value} {comparison} {local_value}) or "
+            f"({value} != {value} and {local_value} == {local_value}))"
+        )
+        state.add_statement(
+            f"{local_value}, {local_index} = ({value}, {index}) if ({better}) "
+            f"else ({local_value}, {local_index})"
+        )
+        input_name, index = local_value, local_index
+    encoded = (
+        f"{encoder}({input_type}({input_name}).bitcast(cutlass.Uint16), "
+        f"cutlass.Int32({index}), {index_bits}, {largest!r}, 'signed', "
+        f"{infinity_bits}, nan_order={nan_order!r})"
+    )
+    # Invalid loads may use an extreme value also present in the input. Mask
+    # keys explicitly so padding cannot win even when every real value is inf.
+    encoded = f"({encoded} if ({index}) < {extent} else cutlass.Int32(-2147483648))"
+    if device_loop is None:
+        state.add_statement(f"{accumulator} = {encoded}")
+    else:
+        # Encode only each thread's winner: packing every loop element adds
+        # work without reducing the number of subgroup collectives.
+        device_loop.outer_suffix.append(
+            statement_from_string(f"{accumulator} = {encoded}")
+        )
+    maximum = env.backend.reduction_expr(
+        accumulator, "max", dim, threads_in_group=threads, dtype=torch.int32
+    )
+    decoded = (
+        f"(cutlass.Int32({index_mask}) - ({maximum} & cutlass.Int32({index_mask})))"
+    )
+    decoded = strategy.maybe_reshape(decoded, dim, fake_input, fake_output)
+    output_type = env.backend.dtype_str(fake_output.dtype)
+    assignment = statement_from_string(f"{result} = {output_type}({decoded})")
+    if device_loop is None:
+        state.codegen.add_statement(assignment)
+    else:
+        device_loop.outer_suffix.append(assignment)
+    return expr_from_string(result)
 
 
 def codegen_cute_tile_argreduce(

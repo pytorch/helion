@@ -848,10 +848,11 @@ CUTE_TOPK_CHOICES: dict[str, tuple[int | str, ...]] = {
     "cute_topk_vector_width": (8, 1, 2, 4),
     "cute_topk_output_vector_width": (1, 2, 4, 8),
     "cute_topk_value_mode": ("gather", "decode"),
-    "cute_topk_key_dtype": ("int32", "float32", "float32_bits"),
+    "cute_topk_key_dtype": ("int32", "float32", "float32_bits", "float32_native"),
     "cute_topk_rank_mode": ("signed", "ordinal"),
     "cute_topk_selection_layout": ("replicated", "distributed"),
     "cute_topk_sort_network": ("batcher", "compact", "compact_pruned"),
+    "cute_topk_key_encoder": ("dsl", "asm"),
 }
 CUTE_TOPK_CONFIG_KEYS: frozenset[str] = frozenset(CUTE_TOPK_CHOICES)
 

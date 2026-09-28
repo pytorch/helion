@@ -436,7 +436,10 @@ def test_topk_output_alignment_changes_on_same_bound_kernel(
         (1, 1, 1, 1, "int32", "signed", "gather", "replicated", 0, 0),
         (64, 32, 4, 2, "float32_bits", "ordinal", "decode", "replicated", 0, 0),
         (65, 65, 8, 8, "float32", "signed", "decode", "distributed", 2, 1),
+        (128, 24, 8, 8, "float32_native", "ordinal", "decode", "distributed", 2, 1),
+        (128, 8, 32, 8, "float32_native", "signed", "gather", "distributed", 0, 0),
         (64, 6, 2, 2, "int32", "ordinal", "decode", "distributed", 0, 0),
+        (128, 32, 8, 4, "float32_native", "ordinal", "decode", "replicated", 0, 0),
     ],
 )
 def test_topk_index_output_dtype_preserves_selected_bits(
@@ -984,6 +987,58 @@ def test_topk_config_limits_threads_per_block(
     topk_spec.normalize(config)
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("selection_layout", ["replicated", "distributed"])
+@pytest.mark.parametrize("sort_network", ["batcher", "compact_pruned"])
+@pytest.mark.parametrize(
+    "width,k,lanes,output_vector,padding,offset,value_mode",
+    [
+        (64, 64, 4, 8, 0, 0, "decode"),
+        (65, 65, 4, 1, 2, 1, "gather"),
+        (128, 32, 16, 4, 0, 0, "decode"),
+        (128, 8, 32, 4, 0, 0, "decode"),
+    ],
+)
+def test_topk_native_float_preserves_all_bits(
+    dtype: torch.dtype,
+    largest: bool,
+    selection_layout: str,
+    sort_network: str,
+    width: int,
+    lanes: int,
+    k: int,
+    output_vector: int,
+    padding: int,
+    offset: int,
+    value_mode: str,
+) -> None:
+    rows = (65536 + width - 1) // width + 2
+    x, storage = _layout_input(rows, width, dtype, padding, offset)
+    words = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    data = words.view(dtype).repeat(2)[: (rows - 2) * width].reshape(rows - 2, width)
+    x[2:].copy_(data)
+    original = x.clone()
+    code, (values, indices) = code_and_output(
+        _extra_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=8,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=output_vector,
+        cute_topk_value_mode=value_mode,
+        cute_topk_key_dtype="float32_native",
+        cute_topk_selection_layout=selection_layout,
+        cute_topk_sort_network=sort_network,
+    )
+    assert "topk_native_key" in code
+    _assert_topk_output(original, values, indices, k, largest)
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
 # Safety top-k tests.
 
 
@@ -1071,6 +1126,7 @@ def _code(
             cute_topk_rank_mode=rank_mode,
             cute_topk_selection_layout=selection_layout,
             cute_topk_sort_network=sort_network,
+            cute_topk_key_encoder=key_encoder,
         )
         return bound.to_triton_code(config)
 
@@ -1186,7 +1242,7 @@ def test_topk_odd_output_stride_uses_scalar_stores() -> None:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("largest", [False, True])
 @pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
-@pytest.mark.parametrize("key_encoder", ["dsl"])
+@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
 def test_topk_decode_all_16bit_inputs(
     dtype: torch.dtype, largest: bool, rank_mode: str, key_encoder: str
 ) -> None:
@@ -1831,6 +1887,148 @@ def test_matcher_uses_runtime_span_alias_proof(
         assert ("_cute_local_topk" in code) == (alias_kind == "separate")
 
 
+@pytest.mark.parametrize(
+    "dtype,width", [(torch.bfloat16, 16384), (torch.float16, 8192)]
+)
+def test_native_float_key_range_and_roundtrip(dtype: torch.dtype, width: int) -> None:
+    words = torch.arange(65536, dtype=torch.int32)
+    original = words.to(torch.int16).view(dtype)
+    magnitude = words & 32767
+    infinity = 0x7F80 if dtype == torch.bfloat16 else 0x7C00
+    bits = original.float().view(torch.int32)
+    bits = (
+        bits | 16384
+        if dtype == torch.bfloat16
+        else torch.where(magnitude == 0, bits | 32768, bits)
+    )
+    bits = torch.where(
+        magnitude == infinity, 0x7F7F8000 | ((words & 32768) << 16), bits
+    )
+    bits = torch.where(magnitude > infinity, 0x7F7FC000, bits)
+    indices = words % width
+    encoded_index = torch.where(bits < 0, indices, width - 1 - indices)
+    keys_bits = bits | encoded_index
+    keys = keys_bits.view(torch.float32)
+    assert bool(torch.isfinite(keys).all())
+    assert not bool((keys == 0).any())
+    recovered_indices = (keys_bits ^ ((keys_bits >> 31) ^ -1)) & (width - 1)
+    assert torch.equal(recovered_indices, indices)
+    clean = keys_bits & ~(width - 1)
+    recovered_values = clean.view(torch.float32).to(dtype)
+    finite = magnitude < infinity
+    assert torch.equal(
+        recovered_values[finite].view(torch.int16), original[finite].view(torch.int16)
+    )
+    order = keys.argsort()
+    values = original.float()[order]
+    nonnan = ~values.isnan()
+    assert bool((values[nonnan][:-1] <= values[nonnan][1:]).all())
+    assert bool(values[-int((~nonnan).sum()) :].isnan().all())
+
+
+@pytest.mark.parametrize("index_bits", range(15))
+@pytest.mark.parametrize("largest", [False, True])
+def test_native_bfloat_bias_exhaustive(index_bits: int, largest: bool) -> None:
+    # All payload widths cover every N in [1, 16384]. Checking both endpoints
+    # bounds every intervening index because the payload is monotone and lies
+    # strictly below the reserved bit. Also check a middle index explicitly.
+    mask = (1 << index_bits) - 1
+    words = torch.arange(65536, dtype=torch.int32)
+    original = words.to(torch.int16).view(torch.bfloat16)
+    magnitude = words & 32767
+    finite = magnitude < 0x7F80
+    bits = original.float().view(torch.int32) | 0x4000
+    bits = torch.where(magnitude == 0x7F80, 0x7F7F8000 | ((words & 32768) << 16), bits)
+    bits = torch.where(magnitude > 0x7F80, 0x7F7FC000, bits)
+    indices = torch.tensor([0, mask // 2, mask], dtype=torch.int32)[:, None]
+    payload = torch.where(bits[None, :] < 0, indices, mask - indices)
+    key_bits = bits[None, :] | payload
+    keys = key_bits.view(torch.float32)
+    if not largest:
+        keys = -keys
+    assert bool(torch.isfinite(keys).all())
+    assert not bool((keys == 0).any())
+
+    # Recover indices and bits by the emitted decoder, including undoing the
+    # smallest-first sign reversal before interpreting the native payload.
+    output_bits = (keys if largest else -keys).view(torch.int32)
+    recovered_indices = (output_bits ^ ((output_bits >> 31) ^ -1)) & mask
+    assert torch.equal(recovered_indices, indices.expand_as(recovered_indices))
+    clean = output_bits & ~mask
+    decoded = clean.view(torch.float32).to(torch.bfloat16)
+    assert torch.equal(
+        decoded[:, finite].view(torch.int16),
+        original[finite].view(torch.int16)[None, :].expand_as(decoded[:, finite]),
+    )
+    # The existing guard must gather exactly infinities and NaNs, preserving
+    # their original sign/payload. Quarter-ULP finite keys must stay below it.
+    decodable = (output_bits & 0x7FFF8000) < 0x7F7F8000
+    assert torch.equal(decodable, finite[None, :].expand_as(decodable))
+    assert bool(((output_bits[:, finite] & 0x7FFFFFFF) <= 0x7F7F7FFF).all())
+    gathered = original.view(torch.int16)[None, :].expand_as(output_bits)
+    selected = torch.where(decodable, decoded.view(torch.int16), gathered)
+    assert torch.equal(selected, gathered)
+
+    # An integer ordinal oracle independently orders original BF16 words;
+    # signed zeros can be ordered either way and NaNs share the largest rank.
+    signed = words.to(torch.int16).to(torch.int32)
+    ordinal = signed ^ ((signed >> 31) & 32767)
+    ordinal = torch.where(magnitude > 0x7F80, 32767, ordinal)
+    if not largest:
+        ordinal = -ordinal
+    order = ordinal.argsort()
+    distinct = ordinal[order][1:] != ordinal[order][:-1]
+    minimum = keys.amin(dim=0)[order]
+    maximum = keys.amax(dim=0)[order]
+    # Even opposite index endpoints cannot exchange differently ranked values.
+    assert bool((maximum[:-1][distinct] < minimum[1:][distinct]).all())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+def test_native_float_bias_codegen(dtype: torch.dtype, largest: bool) -> None:
+    code = _code(
+        3,
+        128,
+        128,
+        32,
+        4,
+        dtype=dtype,
+        largest=largest,
+        key_dtype="float32_native",
+        value_mode="decode",
+    )
+    input_type = "cutlass.BFloat16" if dtype == torch.bfloat16 else "cutlass.Float16"
+    assert f"cutlass.Uint16(topk_bits).bitcast({input_type})" in code
+    assert ("if topk_magnitude == 0:" in code) == (dtype == torch.float16)
+    expected_bias = 16384 if dtype == torch.bfloat16 else 32768
+    assert f"topk_native_bits | cutlass.Int32({expected_bias})" in code
+    assert ("topk_native_key = -topk_native_key" in code) == (not largest)
+
+
+@pytest.mark.parametrize(
+    "dtype,width,native",
+    [
+        (torch.bfloat16, 16384, True),
+        (torch.bfloat16, 16385, False),
+        (torch.float16, 8192, True),
+        (torch.float16, 8193, False),
+    ],
+)
+def test_native_float_width_guard(dtype: torch.dtype, width: int, native: bool) -> None:
+    code = _code(
+        3,
+        width,
+        width,
+        32,
+        4,
+        dtype=dtype,
+        key_dtype="float32_native",
+        value_mode="decode",
+    )
+    assert ("topk_native_key" in code) == native
+
+
 # Networks top-k tests.
 
 
@@ -1928,6 +2126,96 @@ def test_pruned_network_rejects_invalid_sizes(size: int, k: int) -> None:
         _pruned_sort_network(size, k)
 
 
+# Ordered asm top-k tests.
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("index_bits", range(16))
+def test_ordered_key_asm_exhaustive(
+    dtype: torch.dtype, rank_mode: str, largest: bool, index_bits: int
+) -> None:
+    words = torch.arange(65536, dtype=torch.int32)
+    signed = words.to(torch.int16).to(torch.int32)
+    magnitude = signed & 32767
+    sign = signed >> 31
+    mask = (1 << index_bits) - 1
+    infinity = 0x7F80 if dtype == torch.bfloat16 else 0x7C00
+    # PTX arithmetic with signed32 wrapping and the same narrow input.
+    rank = (
+        signed ^ (sign & 32767) if rank_mode == "ordinal" else (magnitude ^ sign) - sign
+    )
+    rank = torch.where(magnitude > infinity, 32767, rank)
+    if not largest:
+        rank = -rank
+    columns = torch.tensor([0, mask // 2, mask], dtype=torch.int32)[:, None]
+    packed = (rank[None, :] << index_bits) | (mask - columns)
+
+    # Independent sign/magnitude oracle: ordinal negative values include -1.
+    expected_rank = torch.where(
+        words < 32768, magnitude, -magnitude - int(rank_mode == "ordinal")
+    )
+    expected_rank = torch.where(magnitude > infinity, 32767, expected_rank)
+    if not largest:
+        expected_rank = -expected_rank
+    expected = (expected_rank[None, :] << index_bits) | (mask - columns)
+    assert torch.equal(packed, expected)
+    assert torch.equal(packed >> index_bits, rank[None, :].expand_as(packed))
+    assert torch.equal(mask - (packed & mask), columns.expand_as(packed))
+    assert bool((packed > torch.iinfo(torch.int32).min).all())
+    assert int(rank.min()) >= -32767 and int(rank.max()) <= 32767
+    # The existing Float32 conversions remain exact inside their guards.
+    if index_bits <= 9:
+        assert torch.equal(packed.float().to(torch.int32), packed)
+    if index_bits <= 14:
+        biased = packed + 0x40000000
+        assert bool(torch.isfinite(biased.view(torch.float32)).all())
+        assert bool((biased.view(torch.float32) > 0).all())
+        assert torch.equal(
+            biased.view(torch.float32).view(torch.int32) - 0x40000000, packed
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "width,key_dtype,ordered",
+    [
+        (128, "int32", True),
+        (512, "float32", True),
+        (1024, "float32", True),
+        (16384, "float32_bits", True),
+        (32768, "float32_bits", True),
+        (128, "float32_native", False),
+        (32768, "float32_native", True),
+    ],
+)
+@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
+def test_ordered_key_asm_codegen_scope(
+    dtype: torch.dtype, width: int, key_dtype: str, ordered: bool, key_encoder: str
+) -> None:
+    code = _code(
+        3,
+        width,
+        width + 1,
+        8,
+        dtype=dtype,
+        key_dtype=key_dtype,
+        key_encoder=key_encoder,
+    )
+    ordered = ordered and key_encoder == "asm"
+    assert ("_cute_encode_ordered_topk_" in code) == ordered
+    if ordered:
+        assert "topk_bits = topk_input_bits[topk_row, topk_col]" in code
+        tree = ast.parse(code)
+        assert not any(
+            isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "topk_sign"
+            for node in ast.walk(tree)
+        )
+
+
 @pytest.fixture
 def cpu_codegen() -> Any:
     with (
@@ -1998,7 +2286,7 @@ def test_sort_network_preserves_values_indices_and_ties(
     config = _composition_config(4, layout)
     # Sorting must enforce first-index ties even when a top-k tuning choice
     # would otherwise distinguish signed zeros or use native float keys.
-    config.update(cute_topk_rank_mode="ordinal")
+    config.update(cute_topk_rank_mode="ordinal", cute_topk_key_dtype="float32_native")
     code, (values, indices) = code_and_output(
         _row_network_sort, (x, descending), **config
     )

@@ -16,7 +16,15 @@ from cutlass import Float32
 from cutlass import Int32
 import cutlass.cute as cute
 
+from .ordered_key import encode_ordered_key_16 as encode_ordered_topk_key
 from .sorting_networks import COMPACT_SORT_LAYERS
+
+__all__ = [
+    "distributed_topk",
+    "encode_ordered_topk_key",
+    "local_topk",
+    "transpose_topk_output",
+]
 
 
 @functools.cache

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ...runtime.cute import ordered_key as runtime_ordered_key
 from ...runtime.cute import sorting_networks as runtime_sorting_networks
 from ...runtime.cute import topk as runtime_topk
 from ..program_id import XYZProgramIDs
@@ -71,6 +72,7 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
         (
             inspect.getsource(runtime_topk)
             + inspect.getsource(runtime_sorting_networks)
+            + inspect.getsource(runtime_ordered_key)
         ).encode("utf-8")
     ).hexdigest()[:16]
     helper_function = "distributed_topk" if distributed else "local_topk"
@@ -116,6 +118,15 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
             "topk_selected[topk_output].bitcast(cutlass.Int32)"
             " - cutlass.Int32(1073741824)"
         )
+    native_float = plan.key_dtype == "float32_native" and plan.n <= (
+        16384 if plan.x.dtype == torch.bfloat16 else 8192
+    )
+    if native_float:
+        key_type = "cutlass.Float32"
+        key_padding = "-cutlass.Float32.inf"
+        selected_key = "topk_selected[topk_output].bitcast(cutlass.Int32)"
+        if not plan.largest:
+            selected_key = f"({selected_key} ^ cutlass.Int32(-2147483648))"
     per_lane = (plan.n + plan.lanes_per_row - 1) // plan.lanes_per_row
     fragment_size = max(
         1 << (per_lane - 1).bit_length(),
@@ -142,6 +153,58 @@ topk_packed = ((topk_ordered << cutlass.Int32({index_bits}))
                | (cutlass.Int32({index_mask}) - topk_col))
 topk_keys[topk_i] = {encoded_key}
 """
+    use_asm_encoder = not native_float and plan.key_encoder == "asm"
+    if use_asm_encoder:
+        encode_helper = f"_cute_encode_ordered_topk_{helper_hash}"
+        cg.module_statements.append(
+            ast.ImportFrom(
+                module="helion.runtime.cute.topk",
+                names=[ast.alias(name="encode_ordered_topk_key", asname=encode_helper)],
+                level=0,
+            )
+        )
+        encode = f"""
+topk_packed = {encode_helper}(topk_bits, topk_col, {index_bits}, {plan.largest!r}, {plan.rank_mode!r}, {infinity_bits})
+topk_keys[topk_i] = {encoded_key}
+"""
+    if native_float:
+        # Every FP16/BF16 value has at least log2(N) unused Float32 mantissa
+        # bits. Keep finite values in their native Float32 order. Exceptional
+        # values use finite keys above the largest BF16 value and are gathered
+        # on output, preserving NaN payloads exactly.
+        input_type = (
+            "cutlass.BFloat16" if plan.x.dtype == torch.bfloat16 else "cutlass.Float16"
+        )
+        # BF16 leaves 16 low Float32 bits free. Reserve bit 14 above the index
+        # payload: a quarter-ULP bias separates signed zeros and rounds back to
+        # every finite BF16 value once the payload is cleared. FP16 retains
+        # its zero-only bias because it has fewer free mantissa bits.
+        zero_bias = (
+            "topk_native_bits = topk_native_bits | cutlass.Int32(16384)"
+            if plan.x.dtype == torch.bfloat16
+            else "if topk_magnitude == 0:\n    topk_native_bits = topk_native_bits | cutlass.Int32(32768)"
+        )
+        flip = "topk_native_key = -topk_native_key" if not plan.largest else ""
+        encode = f"""
+topk_magnitude = topk_bits & cutlass.Int32(32767)
+topk_native_bits = cutlass.Float32(cutlass.Uint16(topk_bits).bitcast({input_type})).bitcast(cutlass.Int32)
+{zero_bias}
+if topk_magnitude == cutlass.Int32({infinity_bits}):
+    topk_native_bits = cutlass.Int32(2139062272) | ((topk_bits & cutlass.Int32(32768)) << cutlass.Int32(16))
+if topk_magnitude > cutlass.Int32({infinity_bits}):
+    topk_native_bits = cutlass.Int32(2139078656)
+topk_encoded_index = cutlass.Int32({index_mask}) - topk_col
+if topk_native_bits < 0:
+    topk_encoded_index = topk_col
+topk_native_key = (topk_native_bits | topk_encoded_index).bitcast(cutlass.Float32)
+{flip}
+topk_keys[topk_i] = topk_native_key
+"""
+    vector_word = "cutlass.Uint16(topk_vector[topk_element])"
+    scalar_word = "topk_input_bits[topk_row, topk_col]"
+    if not use_asm_encoder:
+        vector_word = f"cutlass.Int32({vector_word}.bitcast(cutlass.Int16))"
+        scalar_word = f"cutlass.Int32({scalar_word}.bitcast(cutlass.Int16))"
     # Vector loads require an aligned logical base and complete aligned rows.
     # Irregular widths and sliced bases retain the scalar masked path.
     row_guard = (
@@ -164,10 +227,6 @@ topk_keys[topk_i] = {encoded_key}
         if plan.k % plan.lanes_per_row == 0
         else f"topk_output_col < cutlass.Int32({plan.k})"
     )
-    output_index_dtype = (
-        "cutlass.Int32" if plan.indices.dtype == torch.int32 else "cutlass.Int64"
-    )
-    output_index_bytes = plan.indices.element_size()
     row_stride = plan.x.stride(0)
     max_input_offset = (
         max(row_stride, (plan.x.size(0) - 1) * row_stride + plan.n - 1)
@@ -199,7 +258,7 @@ for topk_chunk in cutlass.range({fragment_size // plan.vector_width}, unroll_ful
         for topk_element in cutlass.range_constexpr({plan.vector_width}):
             topk_i = topk_chunk * {plan.vector_width} + topk_element
             topk_col = topk_col_base + cutlass.Int32(topk_element)
-            topk_bits = cutlass.Int32(cutlass.Uint16(topk_vector[topk_element]).bitcast(cutlass.Int16))
+            topk_bits = {vector_word}
 {textwrap.indent(encode, "            ")}
 """
     scalar_loads = f"""
@@ -211,7 +270,7 @@ for topk_i in cutlass.range({fragment_size}, unroll_full=True):
         + cutlass.Int32(topk_i % {plan.vector_width})
     )
     if topk_valid_row & ({scalar_col_guard}):
-        topk_bits = cutlass.Int32(topk_input_bits[topk_row, topk_col].bitcast(cutlass.Int16))
+        topk_bits = {scalar_word}
 {textwrap.indent(encode, "        ")}
 """
     loads = scalar_loads
@@ -225,11 +284,28 @@ for topk_i in cutlass.range({fragment_size}, unroll_full=True):
     value_dtype = (
         "cutlass.BFloat16" if plan.x.dtype == torch.bfloat16 else "cutlass.Float16"
     )
+    output_index_dtype = (
+        "cutlass.Int32" if plan.indices.dtype == torch.int32 else "cutlass.Int64"
+    )
+    output_index_bytes = plan.indices.element_size()
+
+    def selected_index(key: str) -> str:
+        if native_float:
+            return f"(({key} ^ (({key} >> cutlass.Int32(31)) ^ cutlass.Int32(-1))) & cutlass.Int32({index_mask}))"
+        return f"(cutlass.Int32({index_mask}) - ({key} & cutlass.Int32({index_mask})))"
 
     def value_store(key: str, destination: str) -> str:
         source = f"{x}[topk_row, topk_selected_index]"
         if plan.value_mode == "gather":
             return f"{destination} = {source}\n"
+        if native_float:
+            return f"""
+topk_native_clean = {key} & cutlass.Int32({~index_mask})
+topk_value = topk_native_clean.bitcast(cutlass.Float32).to({value_dtype})
+if (topk_native_clean & cutlass.Int32(2147483647)) >= cutlass.Int32(2139062272):
+    topk_value = {source}
+{destination} = topk_value
+"""
         undo_reverse = "topk_value_rank = -topk_value_rank" if not plan.largest else ""
         decode = (
             """
@@ -268,10 +344,7 @@ for topk_output in cutlass.range_constexpr({plan.k}):
 for topk_j in cutlass.range_constexpr({(plan.k + plan.lanes_per_row - 1) // plan.lanes_per_row}):
     topk_output_col = cutlass.Int32(topk_j * {plan.lanes_per_row}) + topk_lane
     if topk_valid_row & ({output_col_guard}):
-        topk_selected_index = (
-            cutlass.Int32({index_mask})
-            - (topk_local[topk_j] & cutlass.Int32({index_mask}))
-        )
+        topk_selected_index = {selected_index("topk_local[topk_j]")}
 {textwrap.indent(scalar_value_store, "        ")}
         {indices}[topk_row, topk_output_col] = {output_index_dtype}(topk_selected_index)
 """
@@ -293,10 +366,7 @@ for topk_j in cutlass.range_constexpr({selected_per_lane}):
     topk_output_col = cutlass.Int32(topk_j * {output_lanes}) + topk_lane
     if topk_valid_row & ({distributed_output_guard}):
         topk_selected_key = {distributed_key}
-        topk_selected_index = (
-            cutlass.Int32({index_mask})
-            - (topk_selected_key & cutlass.Int32({index_mask}))
-        )
+        topk_selected_index = {selected_index("topk_selected_key")}
 {textwrap.indent(distributed_value_store, "        ")}
         {indices}[topk_row, topk_output_col] = {output_index_dtype}(topk_selected_index)
 """
@@ -358,10 +428,7 @@ for topk_j in cutlass.range_constexpr({output_groups}):
         topk_index_fragment = cute.make_rmem_tensor({output_vector}, {output_index_dtype})
         for topk_v in cutlass.range_constexpr({output_vector}):
             topk_selected_key = {output_key}
-            topk_selected_index = (
-                cutlass.Int32({index_mask})
-                - (topk_selected_key & cutlass.Int32({index_mask}))
-            )
+            topk_selected_index = {selected_index("topk_selected_key")}
 {textwrap.indent(vector_value_store, "            ")}
             topk_index_fragment[topk_v] = {output_index_dtype}(topk_selected_index)
         topk_output_offset = topk_row * {index_type}({plan.k}) + {index_type}(topk_output_col)

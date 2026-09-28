@@ -51,6 +51,7 @@ class CuteTopKPlan:
     rank_mode: str = "signed"
     selection_layout: str = "replicated"
     sort_network: str = "batcher"
+    key_encoder: str = "dsl"
 
     stable_ties: bool = False
 
@@ -343,6 +344,7 @@ def plan_topk_root(
             "str", config.get("cute_topk_selection_layout", "replicated")
         ),
         sort_network=cast("str", config.get("cute_topk_sort_network", "batcher")),
+        key_encoder=cast("str", config.get("cute_topk_key_encoder", "dsl")),
     )
 
 
