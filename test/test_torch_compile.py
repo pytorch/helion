@@ -35,6 +35,7 @@ from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 import helion.language as hl
+from helion.runtime.settings import default_autotuner_fn
 
 
 def requires_fusion_support(test_fn):
@@ -5581,11 +5582,20 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 "torch.compile fusion requires ExternalTritonTemplateKernel support"
             )
 
+        # Initial candidates exercise the cache and fused benchmarking paths.
+        # Disable both neighbor search and polishing to keep two real autotunes
+        # within the CI timeout, even when GPU time is shared by test workers.
         @helion.kernel(
             torch_compile_fusion=True,
             autotune_with_torch_compile_fusion=True,
-            autotune_max_generations=1,
             autotune_effort="quick",
+            autotuner_fn=functools.partial(
+                default_autotuner_fn,
+                initial_population=2,
+                copies=1,
+                max_generations=0,
+                polish_rounds=0,
+            ),
         )
         def k_add_no_configs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
