@@ -1,6 +1,6 @@
 """Register-resident selection networks for CuTe kernels.
 
-Local sorting uses Batcher's odd-even mergesort; merging retains the bitonic
+Local sorting uses Batcher's odd-even mergesort. Merging retains the bitonic
 network construction
 ("Sorting networks and their applications", AFIPS 1968).  Keeping only the
 larger half before each merge implements exact top-k selection.
@@ -99,6 +99,7 @@ def local_topk(
 
     Callers encode values and tie-breaking indices in the keys and pad absent
     elements with a key below every real key. Float32 keys must be finite.
+    Negative infinity is also permitted as a padding key.
     The input fragment is not modified.
     """
     size = cute.size(keys.shape)
@@ -129,3 +130,160 @@ def local_topk(
             )
         _merge_topk(selected, other)
     return selected
+
+
+@cute.jit
+def _merge_cyclic_fragment(keys: cute.Tensor, stage: cutlass.Constexpr[int]) -> None:
+    """Merge a bitonic sequence distributed cyclically over 2**stage lanes."""
+    _merge_descending(keys)
+    max_fn = cute.arch.fmax if cutlass.const_expr(keys.element_type == Float32) else max
+    min_fn = cute.arch.fmin if cutlass.const_expr(keys.element_type == Float32) else min
+    lane = Int32(cute.arch.thread_idx()[0])
+    for step in cutlass.range_constexpr(stage - 1, -1, -1):
+        distance = 1 << step
+        keep_high = (lane & Int32(distance)) == 0
+        for index in cutlass.range_constexpr(cute.size(keys.shape)):
+            own = keys.element_type(keys[index])
+            peer = cute.arch.shuffle_sync_bfly(own, offset=distance)
+            value = min_fn(own, peer)
+            if keep_high:
+                value = max_fn(own, peer)
+            keys[index] = value
+
+
+@cute.jit
+def distributed_topk(
+    keys: cute.Tensor,
+    k: cutlass.Constexpr[int],
+    lanes_per_row: cutlass.Constexpr[int],
+) -> cute.Tensor:
+    """Return top-k in cyclic rank order, with at least one key per lane.
+
+    Each merge doubles the lane group. Groups with at most k input keys keep
+    both halves of the merge; larger groups retain only their largest half.
+    This avoids padding every lane to k when its input fragment is smaller.
+    Local register merges followed by subgroup butterflies preserve cyclic
+    rank ownership. If there are more lanes than k, each k-lane subgroup
+    holds an identical result and only the first k lanes should store it.
+    """
+    assert k > 0 and (k & (k - 1)) == 0
+    assert 0 < lanes_per_row <= 32
+    assert (lanes_per_row & (lanes_per_row - 1)) == 0
+    selected = local_topk(keys, min(k, cute.size(keys.shape)), 1)
+    lane = Int32(cute.arch.thread_idx()[0]) % Int32(lanes_per_row)
+    max_fn = cute.arch.fmax if cutlass.const_expr(keys.element_type == Float32) else max
+    min_fn = cute.arch.fmin if cutlass.const_expr(keys.element_type == Float32) else min
+    for stage in cutlass.range_constexpr(1, lanes_per_row.bit_length()):
+        half = 1 << (stage - 1)
+        group = 2 * half
+        previous_size = cute.size(selected.shape)
+        grow = previous_size * group <= k
+        upper_half = (lane & Int32(half)) != 0
+        if cutlass.const_expr(previous_size == 1 and group > k):
+            # Both halves already contain replicated k-lane top-k groups.
+            # Opposite ranks form the larger bitonic half; orient every
+            # replica identically and merge within k lanes, not group lanes.
+            own = keys.element_type(selected[0])
+            peer = cute.arch.shuffle_sync_bfly(own, offset=group - 1)
+            value = max_fn(own, peer)
+            if cutlass.const_expr(k > 1):
+                reordered = cute.arch.shuffle_sync_bfly(value, offset=k - 1)
+                if upper_half:
+                    value = reordered
+            merged = cute.make_rmem_tensor(1, keys.element_type)
+            merged[0] = value
+            _merge_cyclic_fragment(merged, k.bit_length() - 1)
+            selected = merged
+        elif cutlass.const_expr(grow and previous_size == 1):
+            # Concatenated single-register groups become bitonic by reversing
+            # the upper group's lanes, then merge entirely through shuffles.
+            value = keys.element_type(selected[0])
+            if cutlass.const_expr(half > 1):
+                reordered = cute.arch.shuffle_sync_bfly(value, offset=half - 1)
+                if upper_half:
+                    value = reordered
+            merged = cute.make_rmem_tensor(1, keys.element_type)
+            merged[0] = value
+            _merge_cyclic_fragment(merged, stage)
+            selected = merged
+        else:
+            halves = cute.make_rmem_tensor(
+                (previous_size // 2, 2 if grow else 1), keys.element_type
+            )
+            for index in cutlass.range_constexpr(previous_size // 2):
+                own = keys.element_type(selected[2 * index])
+                peer_source = keys.element_type(selected[2 * index + 1])
+                if upper_half:
+                    own = keys.element_type(selected[previous_size - 2 - 2 * index])
+                    peer_source = keys.element_type(
+                        selected[previous_size - 1 - 2 * index]
+                    )
+                peer = cute.arch.shuffle_sync_bfly(peer_source, offset=group - 1)
+                value = max_fn(own, peer)
+                if cutlass.const_expr(half > 1):
+                    # Correct the reversed upper-half lane positions for
+                    # both bitonic halves before sorting them independently.
+                    reordered = cute.arch.shuffle_sync_bfly(value, offset=half - 1)
+                    if upper_half:
+                        value = reordered
+                halves[index, 0] = value
+                if cutlass.const_expr(grow):
+                    low_value = min_fn(own, peer)
+                    if cutlass.const_expr(half > 1):
+                        low_reordered = cute.arch.shuffle_sync_bfly(
+                            low_value, offset=half - 1
+                        )
+                        if upper_half:
+                            low_value = low_reordered
+                    halves[index, 1] = low_value
+            _merge_cyclic_fragment(halves[None, 0], stage)
+            if cutlass.const_expr(grow):
+                _merge_cyclic_fragment(halves[None, 1], stage)
+                # Every key in the larger half precedes every smaller key.
+                # Concatenating per-lane fragments preserves cyclic rank order.
+                selected = cute.make_rmem_tensor(previous_size, keys.element_type)
+                for index in cutlass.range_constexpr(previous_size // 2):
+                    selected[index] = halves[index, 0]
+                    selected[index + previous_size // 2] = halves[index, 1]
+            else:
+                selected = halves[None, 0]
+    return selected
+
+
+@cute.jit
+def transpose_topk_output(
+    selected: cute.Tensor,
+    vector_width: cutlass.Constexpr[int],
+) -> cute.Tensor:
+    """Transpose cyclic ranks into contiguous vectors within lane subgroups.
+
+    Swap the low log2(vector_width) lane and register bits. Each lane then
+    owns contiguous output vectors; the caller permutes its output lane to
+    account for the swapped bits. The containing row subgroup and per-lane
+    fragment must both be divisible by vector_width.
+    """
+    size = cute.size(selected.shape)
+    assert 1 < vector_width <= 32
+    assert (vector_width & (vector_width - 1)) == 0
+    assert size % vector_width == 0
+    output = cute.make_rmem_tensor(size, selected.element_type)
+    for index in cutlass.range_constexpr(size):
+        output[index] = selected[index]
+    lane = Int32(cute.arch.thread_idx()[0])
+    for block in cutlass.range_constexpr(size // vector_width):
+        for stage in cutlass.range_constexpr(vector_width.bit_length() - 1):
+            bit = 1 << stage
+            for group in cutlass.range_constexpr(vector_width // (2 * bit)):
+                for offset in cutlass.range_constexpr(bit):
+                    low = block * vector_width + group * 2 * bit + offset
+                    high = low + bit
+                    a = selected.element_type(output[low])
+                    b = selected.element_type(output[high])
+                    # Every lane shuffles both old registers before writing.
+                    peer_b = cute.arch.shuffle_sync_bfly(b, offset=bit)
+                    peer_a = cute.arch.shuffle_sync_bfly(a, offset=bit)
+                    if (lane & Int32(bit)) != 0:
+                        output[low], output[high] = peer_b, b
+                    else:
+                        output[low], output[high] = a, peer_a
+    return output
