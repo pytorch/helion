@@ -47,6 +47,7 @@ class CuteTopKPlan:
     value_mode: str = "gather"
     key_dtype: str = "int32"
     rank_mode: str = "signed"
+    selection_layout: str = "replicated"
 
     @property
     def threads(self) -> int:
@@ -311,6 +312,9 @@ def plan_topk_root(
         value_mode=cast("str", config.get("cute_topk_value_mode", "gather")),
         key_dtype=cast("str", config.get("cute_topk_key_dtype", "int32")),
         rank_mode=cast("str", config.get("cute_topk_rank_mode", "signed")),
+        selection_layout=cast(
+            "str", config.get("cute_topk_selection_layout", "replicated")
+        ),
     )
 
 

@@ -58,16 +58,23 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
     x = template.protect(x_name)
     values = template.protect(values_name)
     indices = template.protect(indices_name)
+    padded_k = 1 << (plan.k - 1).bit_length()
+    distributed = plan.selection_layout == "distributed"
+    output_lanes = (
+        min(plan.lanes_per_row, padded_k) if distributed else plan.lanes_per_row
+    )
+    selected_per_lane = max(1, padded_k // plan.lanes_per_row)
     # The persistent CuTe cache keys generated source rather than imported
     # helper code. Include the helper content in the actual imported symbol.
     helper_hash = hashlib.sha256(
-        inspect.getsource(runtime_topk).encode("utf-8")
+        (inspect.getsource(runtime_topk)).encode("utf-8")
     ).hexdigest()[:16]
-    helper_name = f"_cute_local_topk_{helper_hash}"
+    helper_function = "distributed_topk" if distributed else "local_topk"
+    helper_name = f"_cute_{helper_function}_{helper_hash}"
     cg.module_statements.append(
         ast.ImportFrom(
             module="helion.runtime.cute.topk",
-            names=[ast.alias(name="local_topk", asname=helper_name)],
+            names=[ast.alias(name=helper_function, asname=helper_name)],
             level=0,
         )
     )
@@ -105,9 +112,12 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
             "topk_selected[topk_output].bitcast(cutlass.Int32)"
             " - cutlass.Int32(1073741824)"
         )
-    padded_k = 1 << (plan.k - 1).bit_length()
     per_lane = (plan.n + plan.lanes_per_row - 1) // plan.lanes_per_row
-    fragment_size = max(1 << (per_lane - 1).bit_length(), padded_k, plan.vector_width)
+    fragment_size = max(
+        1 << (per_lane - 1).bit_length(),
+        1 if distributed else padded_k,
+        plan.vector_width,
+    )
     infinity_bits = 0x7F80 if plan.x.dtype == torch.bfloat16 else 0x7C00
     reverse = "topk_ordered = -topk_ordered" if not plan.largest else ""
     # Ordinal ranks preserve both zero signs; ordering these otherwise tied
@@ -262,36 +272,91 @@ for topk_j in cutlass.range_constexpr({(plan.k + plan.lanes_per_row - 1) // plan
         {indices}[topk_row, topk_output_col] = {output_index_dtype}(topk_selected_index)
 """
     stores = scalar_stores
+    if distributed:
+        distributed_output_guard = (
+            "True"
+            if plan.k == padded_k and plan.lanes_per_row <= padded_k
+            else f"topk_output_col < cutlass.Int32({plan.k})"
+        )
+        distributed_key = selected_key.replace(
+            "topk_selected[topk_output]", "topk_selected[topk_j]"
+        )
+        distributed_value_store = value_store(
+            "topk_selected_key", f"{values}[topk_row, topk_output_col]"
+        )
+        stores = f"""
+for topk_j in cutlass.range_constexpr({selected_per_lane}):
+    topk_output_col = cutlass.Int32(topk_j * {output_lanes}) + topk_lane
+    if topk_valid_row & ({distributed_output_guard}):
+        topk_selected_key = {distributed_key}
+        topk_selected_index = (
+            cutlass.Int32({index_mask})
+            - (topk_selected_key & cutlass.Int32({index_mask}))
+        )
+{textwrap.indent(distributed_value_store, "        ")}
+        {indices}[topk_row, topk_output_col] = {output_index_dtype}(topk_selected_index)
+"""
     output_vector = plan.output_vector_width
+    if distributed:
+        output_vector = min(output_vector, output_lanes, selected_per_lane)
     # The matcher proves contiguous outputs. Complete vector groups also
     # ensure every row starts at a compatible alignment; odd k stays scalar.
     if output_vector > 1 and plan.k % output_vector == 0:
         group_width = plan.lanes_per_row * output_vector
-        output_groups = (plan.k + group_width - 1) // group_width
+        output_groups = (
+            padded_k // group_width
+            if distributed
+            else (plan.k + group_width - 1) // group_width
+        )
         vector_output_guard = (
             "True"
-            if plan.k % group_width == 0
+            if (plan.k == padded_k if distributed else plan.k % group_width == 0)
             else f"topk_output_col < cutlass.Int32({plan.k})"
         )
-        vector_value_store = value_store(
-            f"topk_output_keys[topk_j * {output_vector} + topk_v]",
-            "topk_value_fragment[topk_v]",
-        )
-        vector_stores = f"""
+        output_key = f"topk_output_keys[topk_j * {output_vector} + topk_v]"
+        output_lane = "topk_lane"
+        if distributed:
+            transpose_name = f"_cute_transpose_topk_output_{helper_hash}"
+            cg.module_statements.append(
+                ast.ImportFrom(
+                    module="helion.runtime.cute.topk",
+                    names=[
+                        ast.alias(name="transpose_topk_output", asname=transpose_name)
+                    ],
+                    level=0,
+                )
+            )
+            vector_setup = f"""
+topk_output_keys = {transpose_name}(topk_selected, {output_vector})
+topk_output_lane = ((topk_lane % cutlass.Int32({output_vector}))
+                    * cutlass.Int32({plan.lanes_per_row // output_vector})
+                    + topk_lane // cutlass.Int32({output_vector}))
+"""
+            output_lane = "topk_output_lane"
+            output_key = selected_key.replace("topk_selected[topk_output]", output_key)
+        else:
+            vector_setup = f"""
 topk_output_keys = cute.make_rmem_tensor({output_groups * output_vector}, cutlass.Int32)
 topk_output_keys.fill(cutlass.Int32(0))
 for topk_output in cutlass.range_constexpr({plan.k}):
     if topk_lane == cutlass.Int32((topk_output // {output_vector}) % {plan.lanes_per_row}):
         topk_output_keys[(topk_output // {group_width}) * {output_vector} + topk_output % {output_vector}] = {selected_key}
+"""
+        vector_value_store = value_store(
+            "topk_selected_key", "topk_value_fragment[topk_v]"
+        )
+        vector_stores = f"""
+{vector_setup}
 for topk_j in cutlass.range_constexpr({output_groups}):
-    topk_output_col = cutlass.Int32(topk_j * {group_width}) + topk_lane * cutlass.Int32({output_vector})
+    topk_output_col = cutlass.Int32(topk_j * {group_width}) + {output_lane} * cutlass.Int32({output_vector})
     if topk_valid_row & ({vector_output_guard}):
         topk_value_fragment = cute.make_rmem_tensor({output_vector}, {value_dtype})
         topk_index_fragment = cute.make_rmem_tensor({output_vector}, {output_index_dtype})
         for topk_v in cutlass.range_constexpr({output_vector}):
+            topk_selected_key = {output_key}
             topk_selected_index = (
                 cutlass.Int32({index_mask})
-                - (topk_output_keys[topk_j * {output_vector} + topk_v] & cutlass.Int32({index_mask}))
+                - (topk_selected_key & cutlass.Int32({index_mask}))
             )
 {textwrap.indent(vector_value_store, "            ")}
             topk_index_fragment[topk_v] = {output_index_dtype}(topk_selected_index)
@@ -316,7 +381,7 @@ for topk_j in cutlass.range_constexpr({output_groups}):
             f"and {indices}.iterator.alignment >= {min(16, output_index_bytes * output_vector)}):\n"
             + textwrap.indent(vector_stores, "    ")
             + "else:\n"
-            + textwrap.indent(scalar_stores, "    ")
+            + textwrap.indent(stores, "    ")
         )
     body = f"""
 topk_thread = cutlass.Int32(cute.arch.thread_idx()[0])

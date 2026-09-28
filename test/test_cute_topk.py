@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import itertools
+import random
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
@@ -359,6 +361,121 @@ def test_direct_topk_layout_and_geometry(
 
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("value_mode", ["gather", "decode"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "selection_layout,key_dtype,k,lanes",
+    [
+        ("replicated", "int32", 32, 4),
+        ("distributed", "int32", 32, 4),
+        ("distributed", "float32_bits", 6, 2),
+        ("distributed", "float32_bits", 8, 32),
+    ],
+)
+def test_topk_output_alignment_changes_on_same_bound_kernel(
+    dtype: torch.dtype,
+    value_mode: str,
+    index_dtype: torch.dtype,
+    selection_layout: str,
+    key_dtype: str,
+    k: int,
+    lanes: int,
+) -> None:
+    rows, width = 5, 64
+    x, storage = _layout_input(rows, width, dtype, 0, 0)
+    original_storage = storage.clone()
+    value_storage = torch.empty(rows * k + 3, dtype=dtype, device=DEVICE)
+    index_storage = torch.empty(rows * k + 3, dtype=index_dtype, device=DEVICE)
+    values = value_storage[: rows * k].view(rows, k)
+    indices = index_storage[: rows * k].view(rows, k)
+    bound = _extra_out_topk._bind_isolated((x, values, indices, k, True))
+    bound.set_config(
+        helion.Config(
+            block_sizes=[1],
+            cute_topk_lanes_per_row=lanes,
+            cute_topk_rows_per_block=4,
+            cute_topk_vector_width=8,
+            cute_topk_output_vector_width=8,
+            cute_topk_value_mode=value_mode,
+            cute_topk_key_dtype=key_dtype,
+            cute_topk_rank_mode="ordinal",
+            cute_topk_selection_layout=selection_layout,
+        )
+    )
+    for value_offset, index_offset in ((0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (0, 0)):
+        value_storage.fill_(7)
+        index_storage.fill_(-7)
+        values = value_storage[value_offset : value_offset + rows * k].view(rows, k)
+        indices = index_storage[index_offset : index_offset + rows * k].view(rows, k)
+        bound(x, values, indices, k, True)
+        _assert_topk_output(x, values, indices, k, index_dtype=index_dtype)
+        assert bool((value_storage[:value_offset] == 7).all())
+        assert bool((value_storage[value_offset + rows * k :] == 7).all())
+        assert bool((index_storage[:index_offset] == -7).all())
+        assert bool((index_storage[index_offset + rows * k :] == -7).all())
+        assert torch.equal(
+            storage.view(torch.int16), original_storage.view(torch.int16)
+        )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,lanes,output_vector,key_dtype,rank_mode,value_mode,layout,padding,offset",
+    [
+        (1, 1, 1, 1, "int32", "signed", "gather", "replicated", 0, 0),
+        (64, 32, 4, 2, "float32_bits", "ordinal", "decode", "replicated", 0, 0),
+        (65, 65, 8, 8, "float32", "signed", "decode", "distributed", 2, 1),
+        (64, 6, 2, 2, "int32", "ordinal", "decode", "distributed", 0, 0),
+    ],
+)
+def test_topk_index_output_dtype_preserves_selected_bits(
+    index_dtype: torch.dtype,
+    dtype: torch.dtype,
+    largest: bool,
+    width: int,
+    k: int,
+    lanes: int,
+    output_vector: int,
+    key_dtype: str,
+    rank_mode: str,
+    value_mode: str,
+    layout: str,
+    padding: int,
+    offset: int,
+) -> None:
+    rows = 5
+    x, storage = _layout_input(rows, width, dtype, padding, offset)
+    original_storage = storage.clone()
+    values = torch.full((rows, k), 7, dtype=dtype, device=DEVICE)
+    indices = torch.full((rows, k), -7, dtype=index_dtype, device=DEVICE)
+    code, _output = code_and_output(
+        _extra_out_topk,
+        (x, values, indices, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=output_vector,
+        cute_topk_value_mode=value_mode,
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_selection_layout=layout,
+    )
+    helper = "_cute_distributed_topk" if layout == "distributed" else "_cute_local_topk"
+    # Singleton top-k simplifies to a value copy and index zero.
+    if width > 1:
+        assert helper in code
+    _assert_topk_output(x, values, indices, k, largest, index_dtype=index_dtype)
+    assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_topk_narrow_indices_preserve_wide_address_math(
     index_dtype: torch.dtype,
@@ -468,6 +585,161 @@ def test_topk_float_keys_preserve_selected_bits(
     assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
 
 
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,lanes,block_rows,padding,offset,key_dtype,rank_mode,value_mode",
+    [
+        (1, 1, 1, 1, 0, 0, "int32", "ordinal", "decode"),
+        (65, 33, 1, 8, 2, 1, "int32", "ordinal", "decode"),
+        (65, 6, 2, 8, 2, 1, "int32", "ordinal", "decode"),
+        (128, 32, 2, 64, 0, 0, "float32_bits", "ordinal", "decode"),
+        (128, 32, 4, 32, 0, 0, "float32", "signed", "decode"),
+        (128, 64, 8, 16, 0, 0, "int32", "ordinal", "gather"),
+        (128, 24, 8, 16, 2, 1, "float32_bits", "ordinal", "decode"),
+        (128, 12, 8, 16, 0, 0, "int32", "signed", "decode"),
+        (256, 128, 16, 8, 0, 0, "float32_bits", "ordinal", "decode"),
+        (128, 64, 32, 4, 0, 0, "float32", "signed", "decode"),
+        (65, 65, 4, 32, 2, 1, "float32", "signed", "gather"),
+        (64, 7, 8, 4, 0, 0, "int32", "ordinal", "decode"),
+        (128, 17, 16, 4, 0, 0, "float32_bits", "ordinal", "decode"),
+        (65, 31, 32, 1, 2, 1, "float32", "signed", "decode"),
+        (64, 3, 32, 1, 0, 0, "int32", "ordinal", "gather"),
+    ],
+)
+def test_topk_distributed_selection(
+    dtype: torch.dtype,
+    largest: bool,
+    width: int,
+    k: int,
+    lanes: int,
+    block_rows: int,
+    padding: int,
+    offset: int,
+    key_dtype: str,
+    rank_mode: str,
+    value_mode: str,
+) -> None:
+    x, storage = _layout_input(block_rows + 1, width, dtype, padding, offset)
+    original = x.clone()
+    original_storage = storage.clone()
+    code, (values, indices) = code_and_output(
+        _extra_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=block_rows,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=8,
+        cute_topk_value_mode=value_mode,
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_selection_layout="distributed",
+    )
+    assert "_cute_distributed_topk" in code
+    vector = min(8, lanes, max(1, (1 << (k - 1).bit_length()) // lanes))
+    assert ("cute.autovec_copy" in code) == (vector > 1 and k % vector == 0)
+    _assert_topk_output(original, values, indices, k, largest)
+    assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,lanes,input_vector,key_dtype,rank_mode,value_mode",
+    [
+        (8, 8, 8, 1, "int32", "ordinal", "decode"),
+        (13, 9, 16, 1, "float32_bits", "signed", "decode"),
+        (64, 32, 32, 2, "float32", "ordinal", "gather"),
+        (128, 32, 16, 8, "int32", "ordinal", "decode"),
+        (128, 32, 32, 4, "float32_bits", "ordinal", "decode"),
+        (65, 33, 32, 4, "float32", "signed", "decode"),
+    ],
+)
+def test_topk_distributed_growing_selection(
+    dtype: torch.dtype,
+    largest: bool,
+    width: int,
+    k: int,
+    lanes: int,
+    input_vector: int,
+    key_dtype: str,
+    rank_mode: str,
+    value_mode: str,
+) -> None:
+    # Misaligned, strided rows and a partial CTA exercise the smaller fragment
+    # with both real values and padding through the growing subgroup stages.
+    x, storage = _layout_input(5, width, dtype, 2, 1)
+    original = storage.clone()
+    code, (values, indices) = code_and_output(
+        _extra_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=input_vector,
+        cute_topk_output_vector_width=8,
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_value_mode=value_mode,
+        cute_topk_selection_layout="distributed",
+    )
+    assert "_cute_distributed_topk" in code
+    _assert_topk_output(x, values, indices, k, largest)
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,lanes,input_vector,key_dtype,network",
+    [
+        (256, 8, 16, 8, "int32", "batcher"),
+        (256, 8, 32, 8, "float32", "compact"),
+        (512, 8, 32, 8, "float32_bits", "compact_pruned"),
+        (128, 3, 16, 8, "int32", "compact_pruned"),
+        (33, 1, 32, 4, "float32", "batcher"),
+        (3, 3, 32, 1, "float32_bits", "compact"),
+    ],
+)
+def test_topk_distributed_more_lanes_than_outputs(
+    dtype: torch.dtype,
+    largest: bool,
+    width: int,
+    k: int,
+    lanes: int,
+    input_vector: int,
+    key_dtype: str,
+    network: str,
+) -> None:
+    x, storage = _layout_input(5, width, dtype, 2, 1)
+    original = storage.clone()
+    code, (values, indices) = code_and_output(
+        _extra_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=input_vector,
+        cute_topk_output_vector_width=8,
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode="ordinal",
+        cute_topk_value_mode="decode",
+        cute_topk_selection_layout="distributed",
+    )
+    assert "_cute_distributed_topk" in code
+    assert "cute.autovec_copy" not in code
+    assert f"topk_output_col < cutlass.Int32({k})" in code
+    _assert_topk_output(x, values, indices, k, largest)
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+
+
 @pytest.fixture
 def topk_spec(monkeypatch: pytest.MonkeyPatch) -> ConfigSpec:
     # Keep configuration validation independent of CUDA device discovery.
@@ -498,6 +770,9 @@ def topk_spec(monkeypatch: pytest.MonkeyPatch) -> ConfigSpec:
         ("cute_topk_rank_mode", True),
         ("cute_topk_rank_mode", 1),
         ("cute_topk_rank_mode", "unknown"),
+        ("cute_topk_selection_layout", True),
+        ("cute_topk_selection_layout", 1),
+        ("cute_topk_selection_layout", "unknown"),
     ],
 )
 def test_topk_config_rejects_noninteger_or_unsupported_choices(
@@ -595,6 +870,25 @@ def test_topk_invalid_rank_mode_normalizes_to_signed(topk_spec: ConfigSpec) -> N
     config = helion.Config(cute_topk_rank_mode=False)
     topk_spec.normalize(config, _fix_invalid=True)
     assert config["cute_topk_rank_mode"] == "signed"
+
+
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_selection_layout_survives_flat_config_roundtrip(
+    topk_spec: ConfigSpec, layout: str
+) -> None:
+    assert topk_spec.default_config()["cute_topk_selection_layout"] == "replicated"
+    config = helion.Config(cute_topk_selection_layout=layout)
+    topk_spec.normalize(config)
+    generation = ConfigGeneration(topk_spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+
+
+def test_topk_invalid_selection_layout_normalizes_to_replicated(
+    topk_spec: ConfigSpec,
+) -> None:
+    config = helion.Config(cute_topk_selection_layout=False)
+    topk_spec.normalize(config, _fix_invalid=True)
+    assert config["cute_topk_selection_layout"] == "replicated"
 
 
 @pytest.mark.parametrize("lanes,rows", [(16, 128), (32, 64), (32, 128)])
@@ -698,13 +992,14 @@ def _code(
             cute_topk_value_mode=value_mode,
             cute_topk_key_dtype=key_dtype,
             cute_topk_rank_mode=rank_mode,
+            cute_topk_selection_layout=selection_layout,
         )
         return bound.to_triton_code(config)
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("vector", [1, 2, 4, 8])
-@pytest.mark.parametrize("layout", ["replicated"])
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
 def test_topk_index_output_dtype_codegen(
     index_dtype: torch.dtype, vector: int, layout: str
 ) -> None:
@@ -1034,6 +1329,352 @@ def test_topk_biased_float_key_exactness_boundary() -> None:
     # One more index bit admits NaN encodings and must use the Int32 fallback.
     too_wide = torch.tensor(((32767 << 15) | 32767) + 0x40000000, dtype=torch.int32)
     assert bool(torch.isnan(too_wide.view(torch.float32)))
+
+
+def _simulate_distributed_topk(inputs: list[list[int]], k: int) -> list[int]:
+    """Simulate cyclic subgroup exchanges, independently of CuTe execution."""
+    lanes = len(inputs)
+    selected = [sorted(values, reverse=True)[:k] for values in inputs]
+    for stage in range(1, lanes.bit_length()):
+        half = 1 << (stage - 1)
+        group = 2 * half
+        previous_size = len(selected[0])
+        grow = previous_size * group <= k
+        merge_group = group
+        if previous_size == 1 and group > k:
+            merged = [
+                [max(selected[lane][0], selected[lane ^ (group - 1)][0])]
+                for lane in range(lanes)
+            ]
+            halves = [
+                [
+                    merged[lane ^ (k - 1)] if lane & half else merged[lane]
+                    for lane in range(lanes)
+                ]
+            ]
+            merge_group = k
+        elif grow and previous_size == 1:
+            halves = [
+                [
+                    selected[lane ^ (half - 1)] if lane & half else selected[lane]
+                    for lane in range(lanes)
+                ]
+            ]
+        else:
+            halves = []
+            for compare in (max, min) if grow else (max,):
+                merged = []
+                for lane in range(lanes):
+                    peer_lane = lane ^ (group - 1)
+                    fragment = []
+                    for index in range(previous_size // 2):
+                        own_index = (
+                            previous_size - 2 - 2 * index if lane & half else 2 * index
+                        )
+                        peer_index = (
+                            previous_size - 1 - 2 * index
+                            if peer_lane & half
+                            else 2 * index + 1
+                        )
+                        fragment.append(
+                            compare(
+                                selected[lane][own_index],
+                                selected[peer_lane][peer_index],
+                            )
+                        )
+                    merged.append(fragment)
+                # Reverse only the upper half to establish cyclic rank ownership.
+                halves.append(
+                    [
+                        merged[lane ^ (half - 1)] if lane & half else merged[lane]
+                        for lane in range(lanes)
+                    ]
+                )
+        for merged in halves:
+            distance = len(merged[0]) * merge_group // 2
+            while distance:
+                previous = [fragment[:] for fragment in merged]
+                for lane in range(lanes):
+                    for index in range(len(merged[0])):
+                        rank = index * merge_group + lane % merge_group
+                        peer = (
+                            previous[lane][index ^ (distance // merge_group)]
+                            if distance >= merge_group
+                            else previous[lane ^ distance][index]
+                        )
+                        compare = min if rank & distance else max
+                        merged[lane][index] = compare(previous[lane][index], peer)
+                distance //= 2
+        selected = [
+            list(itertools.chain.from_iterable(part[lane] for part in halves))
+            for lane in range(lanes)
+        ]
+    return [selected[rank % lanes][rank // lanes] for rank in range(k)]
+
+
+@pytest.mark.parametrize("k,lanes", [(2, 2), (4, 4), (8, 4)])
+def test_distributed_topk_zero_one_network(k: int, lanes: int) -> None:
+    # After local sorting, every binary fragment is characterized by its
+    # number of ones; this exhausts all binary inputs without permutations.
+    for counts in itertools.product(range(k + 1), repeat=lanes):
+        inputs = [[1] * count + [0] * (k - count) for count in counts]
+        expected = sorted(itertools.chain.from_iterable(inputs), reverse=True)[:k]
+        assert _simulate_distributed_topk(inputs, k) == expected
+
+
+@pytest.mark.parametrize("lanes", [1, 2, 4, 8, 16, 32])
+def test_distributed_topk_random_keys_and_padding(lanes: int) -> None:
+    generator = random.Random(20260925)
+    for k in (1, 2, 4, 8, 16, 32, 64, 128):
+        if k < lanes:
+            continue
+        for _trial in range(16):
+            inputs = [
+                [
+                    generator.choice(
+                        (-2147483648, 0, 1, generator.randrange(-100000, 100000))
+                    )
+                    for _index in range(2 * k)
+                ]
+                for _lane in range(lanes)
+            ]
+            expected = sorted(itertools.chain.from_iterable(inputs), reverse=True)[:k]
+            assert _simulate_distributed_topk(inputs, k) == expected
+
+
+@pytest.mark.parametrize(
+    "size,lanes,k", [(1, 8, 8), (2, 4, 8), (2, 8, 8), (4, 4, 8), (4, 4, 16)]
+)
+def test_distributed_topk_growing_zero_one_network(
+    size: int, lanes: int, k: int
+) -> None:
+    for counts in itertools.product(range(size + 1), repeat=lanes):
+        inputs = [[1] * count + [0] * (size - count) for count in counts]
+        expected = sorted(itertools.chain.from_iterable(inputs), reverse=True)[:k]
+        assert _simulate_distributed_topk(inputs, k) == expected
+
+
+@pytest.mark.parametrize("lanes", [2, 4, 8, 16, 32])
+def test_distributed_topk_growing_random_and_padding(lanes: int) -> None:
+    generator = random.Random(20260926)
+    for size in (1, 2, 4, 8, 16, 32, 64):
+        for k in (2, 4, 8, 16, 32, 64, 128):
+            if not lanes <= k <= size * lanes or size >= k:
+                continue
+            for _trial in range(16):
+                inputs = [
+                    [
+                        generator.choice(
+                            (-2147483648, -1, 0, 1, generator.randrange(-10000, 10000))
+                        )
+                        for _index in range(size)
+                    ]
+                    for _lane in range(lanes)
+                ]
+                expected = sorted(itertools.chain.from_iterable(inputs), reverse=True)[
+                    :k
+                ]
+                assert _simulate_distributed_topk(inputs, k) == expected
+
+
+@pytest.mark.parametrize("size,lanes,k", [(1, 8, 1), (1, 8, 2), (2, 8, 4), (4, 4, 2)])
+def test_distributed_topk_wide_zero_one_network(size: int, lanes: int, k: int) -> None:
+    for counts in itertools.product(range(size + 1), repeat=lanes):
+        inputs = [[1] * count + [0] * (size - count) for count in counts]
+        expected = sorted(itertools.chain.from_iterable(inputs), reverse=True)[:k]
+        assert _simulate_distributed_topk(inputs, k) == expected
+
+
+@pytest.mark.parametrize("lanes", [2, 4, 8, 16, 32])
+def test_distributed_topk_wider_than_k_random(lanes: int) -> None:
+    generator = random.Random(20260928)
+    for k in (1, 2, 4, 8, 16):
+        if k >= lanes:
+            continue
+        for size in (1, 2, 4, 8, 16, 32, 64):
+            for _trial in range(32):
+                inputs = [
+                    [
+                        generator.choice(
+                            (-2147483648, -1, 0, 1, generator.randrange(-10000, 10000))
+                        )
+                        for _index in range(size)
+                    ]
+                    for _lane in range(lanes)
+                ]
+                expected = sorted(itertools.chain.from_iterable(inputs), reverse=True)[
+                    :k
+                ]
+                assert _simulate_distributed_topk(inputs, k) == expected
+
+
+@pytest.mark.parametrize(
+    "n,k,lanes,vector,fragment",
+    [
+        (128, 32, 16, 8, 8),
+        (128, 32, 32, 8, 8),
+        (128, 32, 32, 4, 4),
+        (8, 8, 8, 1, 1),
+        (13, 9, 16, 1, 1),
+        (64, 32, 32, 2, 2),
+    ],
+)
+def test_distributed_fragment_does_not_pad_every_lane_to_k(
+    n: int, k: int, lanes: int, vector: int, fragment: int
+) -> None:
+    code = _code(
+        9, n, n, k, selection_layout="distributed", lanes=lanes, input_vector=vector
+    )
+    assert "_cute_distributed_topk" in code
+    assert f"topk_keys = cute.make_rmem_tensor({fragment}, cutlass.Int32)" in code
+
+
+@pytest.mark.parametrize(
+    "k,lanes",
+    [(3, 8), (3, 4), (6, 2), (33, 1), (32, 16), (1, 32), (8, 32)],
+)
+@pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
+def test_topk_distributed_codegen_guard(k: int, lanes: int, key_dtype: str) -> None:
+    code = _code(
+        5,
+        64,
+        64,
+        k,
+        8,
+        lanes=lanes,
+        key_dtype=key_dtype,
+        selection_layout="distributed",
+        value_mode="decode",
+        rank_mode="ordinal",
+    )
+    assert "_cute_distributed_topk" in code
+    assert "topk_selected_key =" in code
+    assert "topk_local = cute.make_rmem_tensor" not in code
+    vector = min(8, lanes, max(1, (1 << (k - 1).bit_length()) // lanes))
+    assert ("cute.autovec_copy" in code) == (vector > 1 and k % vector == 0)
+    assert f"topk_j * {min(lanes, 1 << (k - 1).bit_length())}" in code
+    if k != 1 << (k - 1).bit_length() or k < lanes:
+        assert f"topk_output_col < cutlass.Int32({k})" in code
+
+
+@pytest.mark.parametrize("rows,stride", [(1, 2**35), (268435457, 0)])
+def test_topk_distributed_keeps_wide_addresses(rows: int, stride: int) -> None:
+    code = _code(
+        rows,
+        8,
+        stride,
+        8,
+        8,
+        selection_layout="distributed",
+        lanes=4,
+        value_mode="decode",
+        rank_mode="ordinal",
+    )
+    assert "_cute_distributed_topk" in code
+    assert "cutlass.Int64(cute.arch.block_idx()[0])" in code
+    assert f"* cutlass.Int64({stride})" in code
+    assert "values[topk_row, topk_output_col]" in code
+    assert "indices[topk_row, topk_output_col]" in code
+    assert "topk_row * cutlass.Int64(8) + cutlass.Int64(topk_output_col)" in code
+    assert "cute.assume(topk_output_offset, divby=2)" in code
+
+
+@pytest.mark.parametrize("lanes", [1, 2, 4, 8, 16, 32])
+@pytest.mark.parametrize("requested_vector", [1, 2, 4, 8])
+def test_distributed_output_transpose_rank_mapping(
+    lanes: int, requested_vector: int
+) -> None:
+    # Label every register with its original global rank. This verifies the
+    # permutation for any key values, including duplicates and padding.
+    for local_size in (1, 2, 4, 8, 16, 32, 64):
+        vector = min(requested_vector, lanes, local_size)
+        ranks = [
+            [index * lanes + lane for index in range(local_size)]
+            for lane in range(lanes)
+        ]
+        for block in range(local_size // vector):
+            for stage in range(vector.bit_length() - 1):
+                bit = 1 << stage
+                previous = [registers[:] for registers in ranks]
+                for lane in range(lanes):
+                    for register in range(vector):
+                        if register & bit:
+                            continue
+                        low = block * vector + register
+                        high = low + bit
+                        ranks[lane][low] = (
+                            previous[lane ^ bit][high]
+                            if lane & bit
+                            else previous[lane][low]
+                        )
+                        ranks[lane][high] = (
+                            previous[lane][high]
+                            if lane & bit
+                            else previous[lane ^ bit][low]
+                        )
+        for lane in range(lanes):
+            output_lane = (lane % vector) * (lanes // vector) + lane // vector
+            expected = [
+                block * lanes * vector + output_lane * vector + element
+                for block in range(local_size // vector)
+                for element in range(vector)
+            ]
+            assert ranks[lane] == expected
+
+
+@pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
+@pytest.mark.parametrize(
+    "k,lanes,requested,effective",
+    [
+        (32, 1, 8, 1),
+        (32, 32, 8, 1),
+        (32, 2, 8, 2),
+        (32, 4, 8, 4),
+        (64, 8, 8, 8),
+        (24, 8, 8, 4),
+        (12, 8, 8, 2),
+        (6, 2, 8, 2),
+        (3, 2, 8, 1),
+        (32, 4, 1, 1),
+        (64, 8, 2, 2),
+        (64, 8, 4, 4),
+    ],
+)
+def test_distributed_vector_codegen(
+    k: int, lanes: int, requested: int, effective: int, key_dtype: str
+) -> None:
+    code = _code(
+        9,
+        128,
+        130,
+        k,
+        requested,
+        lanes=lanes,
+        selection_layout="distributed",
+        key_dtype=key_dtype,
+        value_mode="decode",
+        rank_mode="ordinal",
+    )
+    assert ("_cute_transpose_topk_output" in code) == (effective > 1)
+    assert ("cute.autovec_copy" in code) == (effective > 1)
+    if effective == 1:
+        return
+    assert f"values.iterator.alignment >= {2 * effective}" in code
+    assert "indices.iterator.alignment >= 16" in code
+    assert f"cute.assume(topk_output_offset, divby={effective})" in code
+    assert f"topk_output_lane * cutlass.Int32({effective})" in code
+    if k != 1 << (k - 1).bit_length():
+        assert f"topk_output_col < cutlass.Int32({k})" in code
+    # Scalar ABI fallback must retain the original cyclic fragment, while
+    # Float32 keys are only converted back after the transpose.
+    assert "topk_selected[topk_j]" in code
+    vector_key = f"topk_output_keys[topk_j * {effective} + topk_v]"
+    if key_dtype == "float32":
+        assert f"cutlass.Int32({vector_key})" in code
+    elif key_dtype == "float32_bits":
+        assert f"{vector_key}.bitcast(cutlass.Int32)" in code
+    else:
+        assert f"topk_selected_key = {vector_key}" in code
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
