@@ -3054,6 +3054,27 @@ class KeyPartition:
         )
 
     @classmethod
+    def single_key(cls, fine_domain: CoordinateDomain) -> KeyPartition | None:
+        """Collapse every fine key into one coarse key with an exact count."""
+        if not fine_domain.axis_order or fine_domain._allow_empty:
+            return None
+        axis, *full_axes = fine_domain.axis_order
+        coarse = CoordinateDomain(
+            (axis,),
+            ((axis, sympy.Integer(1)),),
+            kind="event",
+            identity=fine_domain.identity,
+        )
+        return cls._rectangular(
+            fine_domain,
+            coarse,
+            _full_point_map(fine_domain, coarse, (sympy.Integer(0),)),
+            {axis: fine_domain.axis_count_expressions[axis]},
+            frozenset(full_axes),
+            clipped_axes=frozenset(),
+        )
+
+    @classmethod
     def contiguous_segments(
         cls,
         fine_domain: CoordinateDomain,

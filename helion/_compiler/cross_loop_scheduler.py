@@ -52,7 +52,7 @@ def _new_relation_work_budget() -> Callable[[int], bool]:
 def _canonical_all_rank_relation(
     relation: CoordinateRelation,
 ) -> CoordinateRelation:
-    """Collapse a union of constant peer views to one exact all-rank relation."""
+    """Collapse a union of constant peer ranges to one exact all-rank relation."""
     source = relation.source_domain
     target = relation.target_domain
     if len(source.axis_order) != 1 or len(target.axis_order) != 1:
@@ -70,14 +70,10 @@ def _canonical_all_rank_relation(
         if len(piece.target_ranges) != 1:
             return relation
         axis, begin, end, step = piece.target_ranges[0]
-        if (
-            axis != target_axis
-            or step != 1
-            or not begin.is_number
-            or sympy.simplify(end - begin) != 1  # pyrefly: ignore[unsupported-operation]
-        ):
+        # A piece may already be a constant rank range, e.g. an earlier union.
+        if axis != target_axis or step != 1 or not begin.is_number or not end.is_number:
             return relation
-        ranks.add(int(begin))
+        ranks.update(range(int(begin), int(end)))
     if ranks != set(range(int(target_count))):
         return relation
     return CoordinateRelation.total(source, target)
@@ -402,6 +398,16 @@ class ReadinessCounterPlan:
         """Return constant fan-in without enumerating readiness keys."""
         bounds = _arrival_count_bounds(self.producers)
         return None if bounds is None or bounds[0] != bounds[1] else bounds[0]
+
+    def distributed_consumer_task_count(self) -> int | None:
+        """Return how many tasks consume this cross-rank counter, if uniform per key."""
+        distributed = [c for c in self.consumers if c.rank_relation is not None]
+        if len(distributed) != 1 or distributed[0].incidence.count_by_key is None:
+            return None
+        low, high = distributed[0].incidence.count_by_key.value_bounds()
+        if low != high or low <= 0:
+            return None
+        return int(low) * self.readiness_key_domain.size
 
     def is_root_barrier_equivalent(
         self,
@@ -1637,11 +1643,19 @@ def _coarsen_event(
         if not _supports_readiness_counter_lowering(lowered):
             return None
         producers.append(lowered)
+    coarse_domain = partition.coarse_key_by_fine_key.target_domain
     consumers: list[ReadinessConsumer] = []
     for index, consumer in enumerate(event.consumers):
         incidence = known_consumer_incidences.get(index) or consumer.incidence.coarsen(
             partition
         )
+        if incidence is None and coarse_domain.size == 1:
+            # Every consumer task waiting on the only key over-approximates any demand.
+            incidence = Incidence.from_fibers(
+                CoordinateRelation.total(
+                    coarse_domain, consumer.incidence.items_by_key.target_domain
+                )
+            )
         if incidence is None:
             return None
         consumers.append(dataclasses.replace(consumer, incidence=incidence))
@@ -1743,6 +1757,11 @@ def choose_readiness_counters(
                 )
                 if lowering_relations is not None:
                     break
+        if lowering_relations is None and has_distributed_consumer:
+            # Waiting on every producer task subsumes mixed keyed and broadcast reads.
+            single_key = KeyPartition.single_key(event.readiness_key_domain)
+            if single_key is not None:
+                lowering_relations = _coarsen_event(event, single_key, charge=charge)
         if lowering_relations is None:
             continue
         lowered_producers, lowered_consumers = lowering_relations
@@ -1974,8 +1993,10 @@ def _build_readiness_events(
                     )
                 )
 
+    # Consumer keys carry a fallback flag: root-entry projections of nested
+    # consumers stay out of direct root events so a nested counter can drop them.
     exact_relations: dict[
-        tuple[int, int | None, CoordinateDomain],
+        tuple[int, int | None, CoordinateDomain, bool],
         dict[
             tuple[int, int | None, CoordinateDomain],
             list[
@@ -1997,9 +2018,10 @@ def _build_readiness_events(
         incidence: Incidence,
         covered_obligations: frozenset[DependencyObligation],
         rank_relation: CoordinateRelation | None,
+        fallback: bool = False,
     ) -> None:
         relation = incidence.items_by_key
-        consumer = (consumer_root, consumer_site_id, relation.source_domain)
+        consumer = (consumer_root, consumer_site_id, relation.source_domain, fallback)
         producer = (producer_root, producer_site_id, relation.target_domain)
         exact_relations.setdefault(consumer, {}).setdefault(producer, []).extend(
             (incidence, obligation, rank_relation) for obligation in covered_obligations
@@ -2079,6 +2101,7 @@ def _build_readiness_events(
             incidence=root_incidence,
             covered_obligations=exact_obligations,
             rank_relation=dependency.rank_relation,
+            fallback=not consumer_is_root,
         )
 
     pending_events: dict[
@@ -2154,9 +2177,10 @@ def _build_readiness_events(
         key=lambda item: (
             item[0][0],
             -1 if item[0][1] is None else item[0][1],
+            item[0][3],
         ),
     ):
-        consumer_root, consumer_site_id, consumer_domain = consumer
+        consumer_root, consumer_site_id, consumer_domain, _fallback = consumer
         merged_relations: list[
             tuple[
                 tuple[int, int | None, CoordinateDomain],
@@ -2932,13 +2956,12 @@ def _supports_emitted_counter_plan_lowering(
         ):
             return False
         (distributed_consumer,) = distributed_consumers
-        consumer_count = distributed_consumer.incidence.count_by_key
+        # Several tasks may wait on one key; each arrives once at completion.
         if (
             distributed_consumer.consumer_site_id is not None
             or distributed_consumer.rank_relation is None
             or not distributed_consumer.rank_relation.is_total()
-            or consumer_count is None
-            or consumer_count.value_bounds() != (1, 1)
+            or plan.distributed_consumer_task_count() is None
         ):
             return False
     for producer in plan.producers:

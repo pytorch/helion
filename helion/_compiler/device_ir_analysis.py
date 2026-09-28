@@ -39,7 +39,10 @@ from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 from .tile_dependency import _relation_product_is_within_budget
+from .variable_origin import BlockSizeOrigin
+from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
+from .variable_origin import TileIdOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -235,6 +238,90 @@ def _subscript_is_scalar_tile_index(subscript: object) -> bool:
         if len(node_args) != 1:
             return False
         node = node_args[0]
+    return False
+
+
+def _scalar_subscript_tile_point(
+    env: CompileEnvironment,
+    host: HostFunction,
+    subscript: object,
+) -> tuple[int | None, int | None, bool] | None:
+    """Classify a scalar subscript from its symbolic value, not its FX chain.
+
+    Returns ``None`` for non-scalar subscripts, else ``(block_id, offset,
+    is_scalar)``: ``tile.id`` plus a constant is a point,
+    a tile begin or grid index plus a constant keeps the whole-block footprint,
+    and any other value is ``(None, None, True)``, i.e. the whole dimension.
+    """
+    if isinstance(subscript, int):
+        return None, subscript, True
+    if not isinstance(subscript, torch.fx.Node):
+        return None
+    value = subscript.meta.get("val")
+    if type(value) is int:
+        return None, value, True
+    if not isinstance(value, torch.SymInt):
+        return None
+    expression = env.shape_env.simplify(_symint_sympy_expr(value))
+    if expression.is_Integer:
+        return None, int(expression), True
+    if len(expression.free_symbols) != 1:
+        return None, None, True
+    (symbol,) = expression.free_symbols
+    origin_info = host.expr_to_origin.get(symbol)
+    origin = origin_info.origin if origin_info is not None else None
+    # A bare block-size symbol is the tile slice itself, not a scalar index.
+    if isinstance(origin, BlockSizeOrigin) and expression == symbol:
+        return None
+    offset = env.shape_env.simplify(expression - symbol)
+    if (
+        type(origin) not in (TileIdOrigin, TileBeginOrigin, GridOrigin)
+        or not offset.is_Integer
+    ):
+        return None, None, True
+    assert isinstance(origin, GridOrigin)
+    # A grid index steps by its block size (the grid step), like a tile begin.
+    return origin.block_id, int(offset), type(origin) is TileIdOrigin
+
+
+def _subscript_chain_is_affine(env: CompileEnvironment, subscript: object) -> bool:
+    """Whether the FX walkers' tile provenance is exact for this subscript.
+
+    ``subscript_index_scale`` and ``_subscript_static_offset`` step through any
+    single-input node; that is only sound for affine and value-preserving ops.
+    """
+    from ..language import view_ops
+    from ..language.tile_ops import tile_index
+
+    node = subscript
+    for _ in range(16):
+        if not isinstance(node, torch.fx.Node) or subscript_tile_info(env, node):
+            return isinstance(node, torch.fx.Node)
+        target, args = node.target, node.args
+        if target is torch.ops.prims.iota.default:
+            return True
+        if target is view_ops.subscript:
+            index = args[1] if len(args) >= 2 else None
+            if not isinstance(index, (list, tuple)) or not all(
+                item is None or _subscript_is_full_slice(item) for item in index
+            ):
+                return False
+            node = args[0]
+        elif target in (torch.ops.aten.add.Tensor, torch.ops.aten.mul.Tensor):
+            operands = [arg for arg in args if isinstance(arg, torch.fx.Node)]
+            if len(args) != 2 or len(operands) != 1 or not any(
+                type(arg) is int for arg in args
+            ):
+                return False
+            node = operands[0]
+        elif target in (
+            tile_index,
+            torch.ops.prims.convert_element_type.default,
+            torch.ops.aten._to_copy.default,
+        ):
+            node = args[0] if args else None
+        else:
+            return False
     return False
 
 
@@ -1760,9 +1847,25 @@ class DeviceIRAnalysis:
                     index_list = node.args[1] if len(node.args) >= 2 else None
                     if isinstance(index_list, (list, tuple)):
                         subscript_dims = tuple(range(min(len(index_list), fake.ndim)))
-                        affine = tuple(
-                            subscript_index_scale(env, index_list[position])
+                        scalar_points = tuple(
+                            _scalar_subscript_tile_point(
+                                env, host, index_list[position]
+                            )
                             for position in subscript_dims
+                        )
+                        affine_chains = tuple(
+                            _subscript_chain_is_affine(env, index_list[position])
+                            for position in subscript_dims
+                        )
+                        affine = tuple(
+                            (point[0], 1)
+                            if point is not None
+                            else subscript_index_scale(env, index_list[position])
+                            if exact
+                            else (None, 1)
+                            for position, point, exact in zip(
+                                subscript_dims, scalar_points, affine_chains, strict=True
+                            )
                         )
                         subscript_affine_block_ids = tuple(
                             block_id for block_id, _scale in affine
@@ -1771,12 +1874,22 @@ class DeviceIRAnalysis:
                             scale for _block_id, scale in affine
                         )
                         subscript_offsets = tuple(
-                            _subscript_static_offset(env, index_list[position])
-                            for position in subscript_dims
+                            point[1]
+                            if point is not None
+                            else _subscript_static_offset(env, index_list[position])
+                            if exact
+                            else None
+                            for position, point, exact in zip(
+                                subscript_dims, scalar_points, affine_chains, strict=True
+                            )
                         )
                         subscript_is_scalar = tuple(
-                            _subscript_is_scalar_tile_index(index_list[position])
-                            for position in subscript_dims
+                            point[2]
+                            if point is not None
+                            else _subscript_is_scalar_tile_index(index_list[position])
+                            for position, point in zip(
+                                subscript_dims, scalar_points, strict=True
+                            )
                         )
                         subscript_is_full_slice = tuple(
                             _subscript_is_full_slice(index_list[position])

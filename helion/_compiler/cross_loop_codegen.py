@@ -918,7 +918,8 @@ def emit_cross_loop_schedule(
     if distributed_terminal_counter_offset is not None:
         distributed_counter_count += _DISTRIBUTED_COUNTER_ALIGNMENT_WORDS
     distributed_consumer_count = sum(
-        plan.readiness_key_domain.size for plan in distributed_counter_plans
+        cast("int", plan.distributed_consumer_task_count())
+        for plan in distributed_counter_plans
     )
     if distributed_counter_plans and distributed_consumer_count <= 0:
         raise AssertionError("distributed completion requires at least one consumer")

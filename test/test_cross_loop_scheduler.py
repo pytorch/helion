@@ -575,7 +575,7 @@ class TestCrossLoopScheduler(TestCase):
                     keyed_obligations,
                 )
 
-    def test_mixed_distributed_event_is_not_partially_split(self) -> None:
+    def test_mixed_distributed_event_collapses_to_one_counter(self) -> None:
         ranks = CoordinateDomain.scalar(4, kind="value", identity=0)
         graph = _mixed_broadcast_and_keyed_graph(CoordinateRelation.total(ranks, ranks))
         readiness = _configured_readiness_graph(graph, _MIXED_EVENT_GEOMETRY)
@@ -600,16 +600,20 @@ class TestCrossLoopScheduler(TestCase):
             (),
             charge=cross_loop_scheduler._new_relation_work_budget(),
         )
-        self.assertEqual(counters, ())
-        with self.assertRaisesRegex(
-            exc.CrossLoopSchedulingError,
-            "distributed dependencies require exact readiness counters",
-        ):
-            cross_loop_scheduler._finalize_emitted_synchronization(
-                readiness_graph=readiness,
-                obligations_by_root_pair=graph.obligations_by_root_pair(),
-                readiness_counters=counters,
-            )
+        # One key over every producer task covers the whole manifest, never a part.
+        (counter,) = counters
+        self.assertEqual(counter.readiness_key_domain.size, 1)
+        self.assertEqual(
+            frozenset().union(
+                *(consumer.covered_obligations for consumer in counter.consumers)
+            ),
+            manifest,
+        )
+        cross_loop_scheduler._finalize_emitted_synchronization(
+            readiness_graph=readiness,
+            obligations_by_root_pair=graph.obligations_by_root_pair(),
+            readiness_counters=counters,
+        )
 
     def test_mixed_event_probe_budget_exhaustion_keeps_unified_event(self) -> None:
         graph = _mixed_broadcast_and_keyed_graph()
