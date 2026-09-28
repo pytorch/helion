@@ -22,6 +22,8 @@ from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import RootGraphInfo
 from ..host_function import HostFunction
 from .memory_ops import runtime_tensors_are_proven_disjoint
+from .ordered_selection import is_ordered_selection
+from .ordered_selection import selection_args
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -48,6 +50,9 @@ class CuteTopKPlan:
     key_dtype: str = "int32"
     rank_mode: str = "signed"
     selection_layout: str = "replicated"
+    sort_network: str = "batcher"
+
+    stable_ties: bool = False
 
     @property
     def threads(self) -> int:
@@ -88,19 +93,16 @@ def match_topk_root(
     nodes = list(root.graph.nodes)
     if nodes[-1].op != "output" or nodes[-1].args != (None,):
         return None
-    selections = [n for n in nodes if n.target is torch.ops.aten.topk.default]
+    selections = [n for n in nodes if is_ordered_selection(n)]
     stores = [n for n in nodes if n.target is store]
     if len(selections) != 1 or len(stores) != 2:
         return None
     env = CompileEnvironment.current()
     selection = selections[0]
-    if not 2 <= len(selection.args) <= 5 or selection.kwargs:
+    arguments = selection_args(selection)
+    if arguments is None:
         return None
-    source, k = selection.args[:2]
-    dim = selection.args[2] if len(selection.args) > 2 else -1
-    largest = selection.args[3] if len(selection.args) > 3 else True
-    if type(k) is not int or type(largest) is not bool or dim not in (-1, 1):
-        return None
+    source, k, largest, stable_ties = arguments
     consumed = {selection, *stores}
     reduction_end: object | None = None
     reduction_block: int | None = None
@@ -168,10 +170,13 @@ def match_topk_root(
     if row_block_id in noncanonical_block_ids:
         return None
     m, n = x.shape
+    if k is None and isinstance(n, int):
+        k = n
     if (
         not isinstance(m, int)
         or m <= 0
         or not isinstance(n, int)
+        or not isinstance(k, int)
         or not 0 < k <= n <= 32768
     ):
         return None
@@ -260,7 +265,17 @@ def match_topk_root(
         for node in nodes
     ):
         return None
-    return CuteTopKPlan(root.graph, row_block_id, n, k, largest, x, values, indices)
+    return CuteTopKPlan(
+        root.graph,
+        row_block_id,
+        n,
+        k,
+        largest,
+        x,
+        values,
+        indices,
+        stable_ties=stable_ties,
+    )
 
 
 def topk_tensors_are_proven_disjoint(
@@ -310,11 +325,24 @@ def plan_topk_root(
         vector_width=cast("int", config.get("cute_topk_vector_width", 8)),
         output_vector_width=cast("int", config.get("cute_topk_output_vector_width", 1)),
         value_mode=cast("str", config.get("cute_topk_value_mode", "gather")),
-        key_dtype=cast("str", config.get("cute_topk_key_dtype", "int32")),
-        rank_mode=cast("str", config.get("cute_topk_rank_mode", "signed")),
+        # Sort preserves the original index order of equal values, including
+        # opposite zero signs. Native floating keys deliberately distinguish
+        # those signs, so only the integer-based encodings are eligible here.
+        key_dtype=(
+            "int32"
+            if candidate.stable_ties
+            and config.get("cute_topk_key_dtype") == "float32_native"
+            else cast("str", config.get("cute_topk_key_dtype", "int32"))
+        ),
+        rank_mode=(
+            "signed"
+            if candidate.stable_ties
+            else cast("str", config.get("cute_topk_rank_mode", "signed"))
+        ),
         selection_layout=cast(
             "str", config.get("cute_topk_selection_layout", "replicated")
         ),
+        sort_network=cast("str", config.get("cute_topk_sort_network", "batcher")),
     )
 
 

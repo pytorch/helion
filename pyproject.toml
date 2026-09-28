@@ -157,6 +157,7 @@ include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
   "helion/**/*.json",
+  "helion/runtime/cute/sorting_networks.LICENSE",
   "LICENSE",
 ]
 exclude = [
