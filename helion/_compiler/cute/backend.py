@@ -1494,6 +1494,10 @@ class CuteBackend(Backend):
                 "cute_topk_lanes_per_row",
                 "cute_topk_rows_per_block",
                 "cute_topk_vector_width",
+                "cute_topk_output_vector_width",
+                "cute_topk_value_mode",
+                "cute_topk_key_dtype",
+                "cute_topk_rank_mode",
             )
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")

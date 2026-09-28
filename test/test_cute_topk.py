@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -286,25 +288,40 @@ def _assert_topk_output(
 @skipUnlessCuteAvailable("requires CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "rows,width,k,dtype,lanes,block_rows,vector,padding,offset",
+    "rows,width,k,dtype,lanes,block_rows,vector,padding,offset,output_vector",
     [
-        pytest.param(3, 1, 1, torch.bfloat16, 1, 1, 1, 0, 0, id="singleton-min-cta"),
+        pytest.param(3, 1, 1, torch.bfloat16, 1, 1, 1, 0, 0, 1, id="singleton-min-cta"),
         pytest.param(
-            17, 65, 65, torch.float16, 8, 4, 2, 4, 1, id="all-elements-odd-stride"
+            17, 65, 65, torch.float16, 8, 4, 2, 4, 1, 1, id="all-elements-odd-stride"
         ),
         pytest.param(
-            35, 65, 3, torch.bfloat16, 32, 32, 4, 2, 1, id="max-cta-odd-stride"
+            35, 65, 3, torch.bfloat16, 32, 32, 4, 2, 1, 1, id="max-cta-odd-stride"
         ),
-        pytest.param(9, 33, 17, torch.float16, 2, 2, 4, 0, 1, id="vector4-offset"),
+        pytest.param(9, 33, 17, torch.float16, 2, 2, 4, 0, 1, 1, id="vector4-offset"),
         pytest.param(
-            7, 31, 1, torch.bfloat16, 8, 1, 1, 5, 0, id="unit-vector-row-stride"
-        ),
-        pytest.param(17, 64, 3, torch.bfloat16, 16, 8, 2, 0, 0, id="vector2-aligned"),
-        pytest.param(
-            129, 64, 32, torch.bfloat16, 1, 128, 8, 0, 0, id="one-lane-128-rows-tail"
+            7, 31, 1, torch.bfloat16, 8, 1, 1, 5, 0, 1, id="unit-vector-row-stride"
         ),
         pytest.param(
-            65, 128, 32, torch.float16, 2, 64, 8, 0, 0, id="two-lanes-64-rows-tail"
+            17, 64, 3, torch.bfloat16, 16, 8, 2, 0, 0, 1, id="vector2-aligned"
+        ),
+        pytest.param(
+            129, 64, 32, torch.bfloat16, 1, 128, 8, 0, 0, 1, id="one-lane-128-rows-tail"
+        ),
+        pytest.param(
+            65, 128, 32, torch.float16, 2, 64, 8, 0, 0, 1, id="two-lanes-64-rows-tail"
+        ),
+        pytest.param(5, 64, 32, torch.bfloat16, 4, 4, 8, 0, 0, 2, id="output2-bf16"),
+        pytest.param(5, 64, 6, torch.float16, 4, 4, 8, 0, 0, 2, id="output2-fp16-tail"),
+        pytest.param(5, 64, 32, torch.bfloat16, 4, 4, 8, 0, 0, 4, id="output4-bf16"),
+        pytest.param(
+            5, 64, 12, torch.float16, 4, 4, 8, 0, 0, 4, id="output4-fp16-tail"
+        ),
+        pytest.param(5, 64, 32, torch.bfloat16, 4, 4, 8, 0, 0, 8, id="output8-bf16"),
+        pytest.param(
+            5, 64, 24, torch.float16, 4, 4, 8, 0, 0, 8, id="output8-fp16-tail"
+        ),
+        pytest.param(
+            5, 64, 17, torch.float16, 4, 4, 8, 2, 1, 8, id="output8-odd-k-offset"
         ),
     ],
 )
@@ -318,6 +335,7 @@ def test_direct_topk_layout_and_geometry(
     vector: int,
     padding: int,
     offset: int,
+    output_vector: int,
 ) -> None:
     x, storage = _layout_input(rows, width, dtype, padding, offset)
     original = x.clone()
@@ -329,10 +347,124 @@ def test_direct_topk_layout_and_geometry(
         cute_topk_lanes_per_row=lanes,
         cute_topk_rows_per_block=block_rows,
         cute_topk_vector_width=vector,
+        cute_topk_output_vector_width=output_vector,
     )
     assert "_cute_local_topk" in code
-    assert "cute.autovec_copy" not in code
+    assert ("cute.autovec_copy" in code) == (
+        output_vector > 1 and k % output_vector == 0
+    )
     _assert_topk_output(original, values, indices, k)
+    assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_topk_narrow_indices_preserve_wide_address_math(
+    index_dtype: torch.dtype,
+) -> None:
+    x, storage = _layout_input(1, 8, torch.bfloat16, 0, 0)
+    x = torch.as_strided(x, (1, 8), (2**35, 1))
+    original_storage = storage.clone()
+    values = torch.empty((1, 8), dtype=x.dtype, device=DEVICE)
+    indices = torch.empty((1, 8), dtype=index_dtype, device=DEVICE)
+    code, _output = code_and_output(
+        _extra_out_topk,
+        (x, values, indices, 8, True),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=1,
+        cute_topk_rows_per_block=1,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=8,
+    )
+    assert "topk_row * cutlass.Int64(34359738368)" in code
+    _assert_topk_output(x, values, indices, 8, index_dtype=index_dtype)
+    assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize(
+    "width,k,output_vector,padding,offset",
+    [(64, 64, 8, 0, 0), (65, 65, 1, 2, 1), (64, 17, 4, 2, 1)],
+)
+def test_topk_decode_preserves_selected_bits(
+    dtype: torch.dtype,
+    largest: bool,
+    rank_mode: str,
+    width: int,
+    k: int,
+    output_vector: int,
+    padding: int,
+    offset: int,
+) -> None:
+    x, storage = _layout_input(5, width, dtype, padding, offset)
+    original = x.clone()
+    original_storage = storage.clone()
+    code, (values, indices) = code_and_output(
+        _extra_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=4,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=output_vector,
+        cute_topk_value_mode="decode",
+        cute_topk_rank_mode=rank_mode,
+    )
+    assert "topk_value_decodable" in code
+    _assert_topk_output(original, values, indices, k, largest)
+    assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize(
+    "key_dtype,width,k,output_vector,padding,offset,value_mode",
+    [
+        ("float32", 512, 32, 8, 0, 0, "decode"),
+        ("float32", 65, 65, 1, 2, 1, "gather"),
+        ("float32", 1024, 32, 4, 0, 1, "decode"),
+        ("float32_bits", 1024, 32, 8, 0, 0, "decode"),
+        ("float32_bits", 65, 65, 1, 2, 1, "gather"),
+        ("float32_bits", 1, 1, 1, 0, 0, "decode"),
+    ],
+)
+def test_topk_float_keys_preserve_selected_bits(
+    dtype: torch.dtype,
+    largest: bool,
+    rank_mode: str,
+    key_dtype: str,
+    width: int,
+    k: int,
+    output_vector: int,
+    padding: int,
+    offset: int,
+    value_mode: str,
+) -> None:
+    x, storage = _layout_input(5, width, dtype, padding, offset)
+    original = x.clone()
+    original_storage = storage.clone()
+    code, (values, indices) = code_and_output(
+        _extra_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=4,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=output_vector,
+        cute_topk_value_mode=value_mode,
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode=rank_mode,
+    )
+    assert "_cute_local_topk" in code
+    _assert_topk_output(original, values, indices, k, largest)
     assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
 
 
@@ -355,6 +487,17 @@ def topk_spec(monkeypatch: pytest.MonkeyPatch) -> ConfigSpec:
         ("cute_topk_rows_per_block", 3),
         ("cute_topk_vector_width", 16),
         ("cute_topk_vector_width", 8.0),
+        ("cute_topk_output_vector_width", True),
+        ("cute_topk_output_vector_width", 16),
+        ("cute_topk_value_mode", True),
+        ("cute_topk_value_mode", 1),
+        ("cute_topk_value_mode", "unknown"),
+        ("cute_topk_key_dtype", True),
+        ("cute_topk_key_dtype", 1),
+        ("cute_topk_key_dtype", "unknown"),
+        ("cute_topk_rank_mode", True),
+        ("cute_topk_rank_mode", 1),
+        ("cute_topk_rank_mode", "unknown"),
     ],
 )
 def test_topk_config_rejects_noninteger_or_unsupported_choices(
@@ -391,6 +534,67 @@ def test_topk_geometry_survives_flat_config_roundtrip(
     topk_spec.normalize(config)
     generation = ConfigGeneration(topk_spec)
     assert generation.unflatten(generation.flatten(config)) == config
+
+
+@pytest.mark.parametrize("vector", [1, 2, 4, 8])
+def test_topk_output_vector_survives_flat_config_roundtrip(
+    topk_spec: ConfigSpec, vector: int
+) -> None:
+    config = helion.Config(cute_topk_output_vector_width=vector)
+    topk_spec.normalize(config)
+    generation = ConfigGeneration(topk_spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+
+
+@pytest.mark.parametrize("mode", ["gather", "decode"])
+def test_topk_value_mode_survives_flat_config_roundtrip(
+    topk_spec: ConfigSpec, mode: str
+) -> None:
+    assert topk_spec.default_config()["cute_topk_value_mode"] == "gather"
+    config = helion.Config(cute_topk_value_mode=mode)
+    topk_spec.normalize(config)
+    generation = ConfigGeneration(topk_spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+
+
+def test_topk_invalid_value_mode_normalizes_to_gather(topk_spec: ConfigSpec) -> None:
+    config = helion.Config(cute_topk_value_mode=False)
+    topk_spec.normalize(config, _fix_invalid=True)
+    assert config["cute_topk_value_mode"] == "gather"
+
+
+@pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
+def test_topk_key_dtype_survives_flat_config_roundtrip(
+    topk_spec: ConfigSpec, key_dtype: str
+) -> None:
+    assert topk_spec.default_config()["cute_topk_key_dtype"] == "int32"
+    config = helion.Config(cute_topk_key_dtype=key_dtype)
+    topk_spec.normalize(config)
+    generation = ConfigGeneration(topk_spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+
+
+def test_topk_invalid_key_dtype_normalizes_to_int32(topk_spec: ConfigSpec) -> None:
+    config = helion.Config(cute_topk_key_dtype=False)
+    topk_spec.normalize(config, _fix_invalid=True)
+    assert config["cute_topk_key_dtype"] == "int32"
+
+
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+def test_topk_rank_mode_survives_flat_config_roundtrip(
+    topk_spec: ConfigSpec, rank_mode: str
+) -> None:
+    assert topk_spec.default_config()["cute_topk_rank_mode"] == "signed"
+    config = helion.Config(cute_topk_rank_mode=rank_mode)
+    topk_spec.normalize(config)
+    generation = ConfigGeneration(topk_spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+
+
+def test_topk_invalid_rank_mode_normalizes_to_signed(topk_spec: ConfigSpec) -> None:
+    config = helion.Config(cute_topk_rank_mode=False)
+    topk_spec.normalize(config, _fix_invalid=True)
+    assert config["cute_topk_rank_mode"] == "signed"
 
 
 @pytest.mark.parametrize("lanes,rows", [(16, 128), (32, 64), (32, 128)])
@@ -490,12 +694,16 @@ def _code(
             cute_topk_lanes_per_row=lanes,
             cute_topk_rows_per_block=8,
             cute_topk_vector_width=input_vector,
+            cute_topk_output_vector_width=output_vector,
+            cute_topk_value_mode=value_mode,
+            cute_topk_key_dtype=key_dtype,
+            cute_topk_rank_mode=rank_mode,
         )
         return bound.to_triton_code(config)
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("vector", [1])
+@pytest.mark.parametrize("vector", [1, 2, 4, 8])
 @pytest.mark.parametrize("layout", ["replicated"])
 def test_topk_index_output_dtype_codegen(
     index_dtype: torch.dtype, vector: int, layout: str
@@ -519,6 +727,17 @@ def test_topk_index_output_dtype_codegen(
             f"indices.iterator.alignment >= {min(16, element_bytes * vector)}" in code
         )
     assert "topk_row = cutlass.Int32(" in code
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("rows,stride", [(1, 2**35), (268435457, 0)])
+def test_topk_output_dtype_does_not_narrow_addresses(
+    index_dtype: torch.dtype, rows: int, stride: int
+) -> None:
+    code = _code(rows, 8, stride, 8, 2, index_dtype=index_dtype)
+    assert "cutlass.Int64(cute.arch.block_idx()[0])" in code
+    assert f"topk_row * cutlass.Int64({stride})" in code
+    assert "topk_output_offset = topk_row * cutlass.Int64(8)" in code
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int16, torch.float32])
@@ -552,6 +771,269 @@ def test_topk_wide_address_codegen(
     assert f"{dtype}(cute.arch.block_idx()[0])" in code
     assert f"* {dtype}({stride})" in code
     assert "_cute_local_topk_" in code
+
+
+@pytest.mark.parametrize(
+    "rows,cols,stride,k,vector,wide",
+    [
+        (17, 64, 64, 32, 2, False),
+        (17, 64, 64, 32, 4, False),
+        (17, 64, 64, 32, 8, False),
+        (1, 8, 2**35, 8, 8, True),
+        (268435457, 8, 0, 8, 8, True),
+    ],
+)
+def test_topk_output_vector_address_codegen(
+    rows: int, cols: int, stride: int, k: int, vector: int, wide: bool
+) -> None:
+    code = _code(rows, cols, stride, k, vector)
+    dtype = "cutlass.Int64" if wide else "cutlass.Int32"
+    assert f"topk_row * {dtype}({k}) + {dtype}(topk_output_col)" in code
+    assert f"values.iterator.alignment >= {2 * vector}" in code
+    assert "indices.iterator.alignment >= 16" in code
+    assert code.count("cute.autovec_copy") == 2
+    # Preserve the dynamic offset's divisibility through pointer addition.
+    # The address arithmetic must retain its selected width before the hint.
+    offset = f"topk_row * {dtype}({k}) + {dtype}(topk_output_col)"
+    assumption = f"cute.assume(topk_output_offset, divby={vector})"
+    assert code.index(offset) < code.index(assumption)
+    assert code.index(assumption) < code.index("values.iterator + topk_output_offset")
+    assert code.index(assumption) < code.index("indices.iterator + topk_output_offset")
+    assert k % vector == 0
+    assert f"topk_lane * cutlass.Int32({vector})" in code
+
+
+def test_topk_odd_output_stride_uses_scalar_stores() -> None:
+    code = _code(17, 64, 64, 17, 8)
+    assert "_cute_local_topk" in code
+    assert "cute.autovec_copy" not in code
+    assert "cute.assume(topk_output_offset" not in code
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+@pytest.mark.parametrize("key_encoder", ["dsl"])
+def test_topk_decode_all_16bit_inputs(
+    dtype: torch.dtype, largest: bool, rank_mode: str, key_encoder: str
+) -> None:
+    code = _code(
+        1,
+        64,
+        64,
+        32,
+        dtype=dtype,
+        largest=largest,
+        value_mode="decode",
+        rank_mode=rank_mode,
+        key_encoder=key_encoder,
+    )
+    tree = ast.parse(code)
+    encoder = None
+    if key_encoder == "asm":
+        packed_assignment = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "topk_packed"
+        )
+        assert isinstance(packed_assignment.value, ast.Call)
+        encoder_call = packed_assignment.value
+        assert ast.unparse(encoder_call.func).startswith("_cute_encode_ordered_topk_")
+        assert [ast.literal_eval(arg) for arg in encoder_call.args[2:]] == [
+            6,
+            largest,
+            rank_mode,
+            0x7F80 if dtype == torch.bfloat16 else 0x7C00,
+        ]
+    else:
+        encode_body = next(
+            node.body
+            for node in ast.walk(tree)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(stmt, ast.Assign)
+                and isinstance(stmt.targets[0], ast.Name)
+                and stmt.targets[0].id == "topk_magnitude"
+                for stmt in node.body
+            )
+        )
+        encode_start = next(
+            i
+            for i, stmt in enumerate(encode_body)
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == "topk_magnitude"
+        )
+        encode_end = next(
+            i
+            for i, stmt in enumerate(encode_body)
+            if isinstance(stmt, ast.Assign)
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == "topk_packed"
+        )
+        encoder = compile(
+            ast.Module(
+                body=encode_body[encode_start : encode_end + 1], type_ignores=[]
+            ),
+            "<topk-encode>",
+            "exec",
+        )
+    names = {
+        "topk_value_rank",
+        "topk_value_sign",
+        "topk_value_magnitude",
+        "topk_value_bits",
+        "topk_value_decodable",
+    }
+    assignments: list[ast.stmt] = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in names
+    ]
+    assert len(assignments) == (3 if rank_mode == "ordinal" else 5) + (not largest)
+    decoder = compile(
+        ast.Module(body=assignments, type_ignores=[]), "<topk-decode>", "exec"
+    )
+    infinity = 0x7F80 if dtype == torch.bfloat16 else 0x7C00
+    namespace = {"cutlass": SimpleNamespace(Int32=int)}
+    ranks = []
+    for word in range(1 << 16):
+        magnitude = word & 0x7FFF
+        rank = magnitude if word < 32768 else -magnitude - (rank_mode == "ordinal")
+        if magnitude > infinity:
+            rank = 32767
+        if not largest:
+            rank = -rank
+        packed = (rank << 6) | (63 - (word & 63))
+        if encoder is not None:
+            encoded = {
+                "topk_bits": word if word < 32768 else word - 65536,
+                "topk_col": word & 63,
+            }
+            exec(encoder, namespace, encoded)
+            assert encoded["topk_packed"] == packed
+        assert packed & 63 == 63 - (word & 63)
+        ranks.append(packed >> 6)
+        local = {"topk_local": [packed], "topk_j": 0}
+        exec(decoder, namespace, local)
+        decodable = magnitude <= infinity and (rank_mode == "ordinal" or magnitude != 0)
+        assert local["topk_value_decodable"] == decodable
+        if decodable:
+            # Uint16 truncates the recovered signed representation.
+            bits = local["topk_value_bits"]
+            assert isinstance(bits, int)
+            assert bits & 65535 == word
+    # These bounds justify both Float32 key guards for either ranking mode.
+    assert min(ranks) >= -32767 and max(ranks) <= 32767
+    words = torch.arange(65536, dtype=torch.int32).to(torch.int16)
+    values = words.view(dtype).float()
+    finite_or_inf = ~torch.isnan(values)
+    order = torch.tensor(ranks)[finite_or_inf].argsort(descending=True)
+    ordered_values = values[finite_or_inf][order]
+    assert bool(
+        (
+            ordered_values[:-1] >= ordered_values[1:]
+            if largest
+            else ordered_values[:-1] <= ordered_values[1:]
+        ).all()
+    )
+    if rank_mode == "ordinal":
+        assert ranks[0] == 0
+        assert ranks[32768] == (-1 if largest else 1)
+
+
+def test_topk_decode_keeps_wide_vector_output_addresses() -> None:
+    code = _code(268435457, 8, 0, 8, 8, value_mode="decode")
+    assert "topk_row * cutlass.Int64(8) + cutlass.Int64(topk_output_col)" in code
+    assert code.count("topk_value_decodable =") == 2
+    assert "values.iterator.alignment >= 16" in code
+
+
+@pytest.mark.parametrize(
+    "cols,key_dtype,selected_dtype",
+    [
+        (512, "int32", "Int32"),
+        (512, "float32", "Float32"),
+        (513, "float32", "Int32"),
+        (1024, "float32", "Int32"),
+        (1, "float32_bits", "Float32"),
+        (1024, "float32_bits", "Float32"),
+        (16384, "float32_bits", "Float32"),
+        (16385, "float32_bits", "Int32"),
+        (32768, "float32_bits", "Int32"),
+    ],
+)
+def test_topk_float_key_codegen_precision_guard(
+    cols: int, key_dtype: str, selected_dtype: str
+) -> None:
+    code = _code(
+        5, cols, cols, min(cols, 32), 8, key_dtype=key_dtype, value_mode="decode"
+    )
+    tree = ast.parse(code)
+    assignment = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "topk_keys"
+    )
+    assert ast.unparse(assignment.value).endswith(f"cutlass.{selected_dtype})")
+    if selected_dtype == "Int32":
+        assert "topk_keys.fill(cutlass.Int32(-2147483648))" in code
+        assert "topk_keys[topk_i] = topk_packed" in code
+    elif key_dtype == "float32":
+        assert "topk_keys.fill(cutlass.Float32(-2147483648))" in code
+        assert "topk_keys[topk_i] = cutlass.Float32(topk_packed)" in code
+        assert code.count("cutlass.Int32(topk_selected[topk_output])") == 2
+    else:
+        assert "topk_keys.fill(cutlass.Float32(0.0))" in code
+        assert (
+            "(topk_packed + cutlass.Int32(1073741824)).bitcast(cutlass.Float32)" in code
+        )
+        assert (
+            "topk_selected[topk_output].bitcast(cutlass.Int32) - cutlass.Int32(1073741824)"
+            in code
+        )
+
+
+def test_topk_numeric_float_key_exactness_boundary() -> None:
+    # Every integer in [-2**24, 2**24] has an exact Float32 representation.
+    # Check both rank signs and payload endpoints at the widest enabled key.
+    ranks = torch.arange(-32767, 32768, dtype=torch.int32)
+    payloads = torch.tensor([0, 1, 510, 511], dtype=torch.int32)
+    keys = ((ranks[:, None] << 9) | payloads).flatten()
+    floats = keys.to(torch.float32)
+    assert bool((keys.abs() <= 2**24).all())
+    assert torch.equal(floats.to(torch.int32), keys)
+    assert bool((floats[1:] > floats[:-1]).all())
+    padding = torch.tensor(-2147483648, dtype=torch.int32)
+    assert padding.float().to(torch.int32) == padding
+    assert bool((floats > padding.float()).all())
+    # At ten payload bits a representable rank can lose its tie-breaking bit.
+    too_wide = torch.tensor((32767 << 10) | 1, dtype=torch.int32)
+    assert too_wide.float().to(torch.int32) != too_wide
+
+
+def test_topk_biased_float_key_exactness_boundary() -> None:
+    # All valid biased keys are positive normal finite floats. Their IEEE
+    # representation therefore preserves integer order without conversions.
+    ranks = torch.arange(-32767, 32768, dtype=torch.int32)
+    payloads = torch.tensor([0, 1, 16382, 16383], dtype=torch.int32)
+    keys = ((ranks[:, None] << 14) | payloads).flatten()
+    floats = (keys + 0x40000000).view(torch.float32)
+    assert bool(torch.isfinite(floats).all())
+    assert bool((floats >= torch.finfo(torch.float32).tiny).all())
+    assert bool((floats[1:] > floats[:-1]).all())
+    assert bool((floats > 0.0).all())  # Padding cannot displace any real key.
+    assert torch.equal(floats.view(torch.int32) - 0x40000000, keys)
+    # One more index bit admits NaN encodings and must use the Int32 fallback.
+    too_wide = torch.tensor(((32767 << 15) | 32767) + 0x40000000, dtype=torch.int32)
+    assert bool(torch.isnan(too_wide.view(torch.float32)))
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
