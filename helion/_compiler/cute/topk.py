@@ -53,6 +53,7 @@ class CuteTopKPlan:
     sort_network: str = "batcher"
     key_encoder: str = "dsl"
     defer_value_gathers: bool = False
+    merge_schedule: str = "sequential"
 
     stable_ties: bool = False
 
@@ -348,6 +349,9 @@ def plan_topk_root(
         key_encoder=cast("str", config.get("cute_topk_key_encoder", "dsl")),
         defer_value_gathers=cast(
             "bool", config.get("cute_topk_defer_value_gathers", False)
+        ),
+        merge_schedule=cast(
+            "str", config.get("cute_topk_merge_schedule", "sequential")
         ),
     )
 

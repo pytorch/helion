@@ -39,6 +39,7 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion.runtime.cute.sorting_networks import COMPACT_SORT_LAYERS
+from helion.runtime.cute.topk import _balanced_chunk_program
 from helion.runtime.cute.topk import _odd_even_sort_network
 from helion.runtime.cute.topk import _pruned_sort_network
 from helion.runtime.cute.topk import _sort_network
@@ -1137,6 +1138,7 @@ def _code(
             cute_topk_sort_network=sort_network,
             cute_topk_key_encoder=key_encoder,
             cute_topk_defer_value_gathers=defer_value_gathers,
+            cute_topk_merge_schedule=merge_schedule,
         )
         return bound.to_triton_code(config)
 
@@ -1681,7 +1683,7 @@ def test_topk_sort_network_reaches_codegen(network: str, layout: str) -> None:
     )
     name = "local_topk" if layout == "replicated" else "distributed_topk"
     assert f"_cute_{name}_" in code
-    assert f"(topk_keys, 32, 2, '{network}')" in code
+    assert f"(topk_keys, 32, 2, '{network}', 'sequential')" in code
 
 
 def test_topk_cache_hash_includes_compact_tables() -> None:
@@ -2911,6 +2913,335 @@ def test_cached_topk_recompiles_exact_values_after_input_release(
     gc.collect()
     assert all(ref() is None for ref in first._runtime_tensor_refs_by_name.values())
     assert run("asm") is first
+
+
+# Balanced top-k tests.
+
+
+def _merge(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    result = np.maximum(left, right[:, ::-1])
+    distance = result.shape[1] // 2
+    while distance:
+        for begin in range(0, result.shape[1], 2 * distance):
+            for offset in range(distance):
+                low, high = begin + offset, begin + offset + distance
+                a, b = result[:, low].copy(), result[:, high].copy()
+                result[:, low], result[:, high] = np.maximum(a, b), np.minimum(a, b)
+        distance //= 2
+    return result
+
+
+def _select(values: np.ndarray, k: int, network: str) -> np.ndarray:
+    partials: dict[int, np.ndarray] = {}
+    for left, right in _balanced_chunk_program(values.shape[1] // k):
+        if left == right:
+            partials[left] = _evaluate(
+                values[:, left * k : (left + 1) * k], k, k, network
+            )
+        else:
+            partials[left] = _merge(partials[left], partials.pop(right))
+    assert len(partials) == 1
+    return partials[0]
+
+
+@pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("network", ["batcher", "compact"])
+def test_balanced_exhaustive_binary(size: int, network: str) -> None:
+    values = (
+        (np.arange(1 << size, dtype=np.uint32)[:, None] >> np.arange(size)) & 1
+    ).astype(np.uint8)
+    expected = np.sort(values, axis=1)[:, ::-1]
+    for exponent in range(size.bit_length()):
+        k = 1 << exponent
+        np.testing.assert_array_equal(_select(values, k, network), expected[:, :k])
+
+
+@pytest.mark.parametrize("size", [32, 64, 128, 256])
+@pytest.mark.parametrize("network", ["batcher", "compact"])
+@pytest.mark.parametrize("floating", [False, True])
+def test_balanced_random_duplicates_padding(
+    size: int, network: str, floating: bool
+) -> None:
+    generator = np.random.default_rng(20260926)
+    values = generator.integers(-64, 64, size=(128, size), dtype=np.int32)
+    values[0] = 0
+    for row in range(1, len(values)):
+        values[row, row % size :] = np.iinfo(np.int32).min
+        generator.shuffle(values[row])
+    if floating:
+        values = values.astype(np.float32)
+        values[values == np.float32(np.iinfo(np.int32).min)] = -np.inf
+    expected = np.sort(values, axis=1)[:, ::-1]
+    for exponent in range(size.bit_length()):
+        k = 1 << exponent
+        np.testing.assert_array_equal(_select(values, k, network), expected[:, :k])
+
+
+@pytest.mark.parametrize("chunks", [1, 2, 4, 8, 16, 32])
+def test_balanced_schedule_equal_adjacent_groups(chunks: int) -> None:
+    groups: dict[int, int] = {}
+    merges = 0
+    for left, right in _balanced_chunk_program(chunks):
+        if left == right:
+            assert left not in groups
+            groups[left] = 1
+        else:
+            assert groups[left] == groups[right] == right - left
+            groups[left] += groups.pop(right)
+            merges += 1
+    assert groups == {0: chunks}
+    assert merges == chunks - 1
+
+
+def _operation_count_and_depth(
+    size: int, k: int, network: str, balanced: bool
+) -> tuple[int, int]:
+    depths: dict[int, list[int]] = {}
+    operations = 0
+    chunks = size // k
+    program = (
+        _balanced_chunk_program(chunks)
+        if balanced
+        else tuple(
+            item
+            for chunk in range(chunks)
+            for item in (
+                ((chunk, chunk),) if chunk == 0 else ((chunk, chunk), (0, chunk))
+            )
+        )
+    )
+    for left, right in program:
+        if left == right:
+            depth = [0] * k
+            for a, b in _sort_network(k, network):
+                depth[a] = depth[b] = max(depth[a], depth[b]) + 1
+                operations += 2
+            depths[left] = depth
+        else:
+            depth = [
+                max(a, b) + 1
+                for a, b in zip(depths[left], reversed(depths.pop(right)), strict=True)
+            ]
+            operations += k
+            distance = k // 2
+            while distance:
+                for begin in range(0, k, distance * 2):
+                    for offset in range(distance):
+                        a, b = begin + offset, begin + offset + distance
+                        depth[a] = depth[b] = max(depth[a], depth[b]) + 1
+                        operations += 2
+                distance //= 2
+            depths[left] = depth
+    return operations, max(depths[0])
+
+
+@pytest.mark.parametrize(
+    "size,k,operations,sequential,balanced",
+    [
+        (32, 8, 248, 18, 14),
+        (64, 8, 528, 34, 18),
+        (128, 8, 1088, 66, 22),
+        (32, 32, 382, 15, 15),
+        (128, 32, 2104, 33, 27),
+    ],
+)
+def test_balanced_same_operations_shorter_depth(
+    size: int, k: int, operations: int, sequential: int, balanced: int
+) -> None:
+    assert _operation_count_and_depth(size, k, "batcher", False) == (
+        operations,
+        sequential,
+    )
+    assert _operation_count_and_depth(size, k, "batcher", True) == (
+        operations,
+        balanced,
+    )
+
+
+def test_balanced_config_roundtrip_and_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("helion.autotuner.config_spec.get_num_xcd", lambda device: 1)
+    spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0), num_sm=1)
+    with pytest.raises(exc.InvalidConfig):
+        spec.normalize(helion.Config(cute_topk_merge_schedule="balanced"))
+    spec.enable_cute_topk_search()
+    assert spec.default_config()["cute_topk_merge_schedule"] == "sequential"
+    config = helion.Config(cute_topk_merge_schedule="balanced")
+    spec.normalize(config)
+    generation = ConfigGeneration(spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+    for invalid in (True, 1, "tree"):
+        with pytest.raises(exc.InvalidConfig):
+            spec.normalize(helion.Config(cute_topk_merge_schedule=invalid))
+
+
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
+def test_balanced_schedule_reaches_codegen(layout: str, network: str) -> None:
+    code = _code(
+        5,
+        128,
+        130,
+        8,
+        selection_layout=layout,
+        lanes=4,
+        sort_network=network,
+        merge_schedule="balanced",
+    )
+    assert f"8, 4, '{network}', 'balanced')" in code
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,lanes,network,key_dtype,layout,rank_mode,value_mode,padding,offset",
+    [
+        (128, 8, 4, "batcher", "float32_bits", "distributed", "signed", "gather", 0, 0),
+        (1024, 8, 8, "batcher", "float32", "distributed", "ordinal", "decode", 2, 1),
+        (
+            65,
+            6,
+            2,
+            "compact",
+            "float32_native",
+            "replicated",
+            "ordinal",
+            "decode",
+            2,
+            1,
+        ),
+        (
+            128,
+            32,
+            4,
+            "compact_pruned",
+            "int32",
+            "distributed",
+            "signed",
+            "gather",
+            0,
+            0,
+        ),
+        (33, 8, 16, "batcher", "int32", "distributed", "ordinal", "decode", 0, 0),
+    ],
+)
+def test_balanced_gpu_exact_selected_bits(
+    dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    largest: bool,
+    width: int,
+    k: int,
+    lanes: int,
+    network: str,
+    key_dtype: str,
+    layout: str,
+    rank_mode: str,
+    value_mode: str,
+    padding: int,
+    offset: int,
+) -> None:
+    rows = 5
+    x, storage = _layout_input(rows, width, dtype, padding, offset)
+    original_storage = storage.clone()
+    values_storage = torch.full((rows * k + 2,), 7, dtype=dtype, device=DEVICE)
+    indices_storage = torch.full((rows * k + 2,), -7, dtype=index_dtype, device=DEVICE)
+    values = values_storage[offset : offset + rows * k].view(rows, k)
+    indices = indices_storage[offset : offset + rows * k].view(rows, k)
+    code, _output = code_and_output(
+        _extra_out_topk,
+        (x, values, indices, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=4,
+        cute_topk_value_mode=value_mode,
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_selection_layout=layout,
+        cute_topk_sort_network=network,
+        cute_topk_merge_schedule="balanced",
+    )
+    assert "'balanced')" in code
+    _assert_topk_output(x, values, indices, k, largest, index_dtype=index_dtype)
+    assert torch.equal(storage.view(torch.int16), original_storage.view(torch.int16))
+    assert bool((values_storage[offset + rows * k :] == 7).all())
+    assert bool((indices_storage[offset + rows * k :] == -7).all())
+    if offset:
+        assert bool((values_storage[:offset] == 7).all())
+        assert bool((indices_storage[:offset] == -7).all())
+
+
+@pytest.mark.parametrize("encoder", ["dsl", "asm"])
+@pytest.mark.parametrize("largest", [False, True])
+def test_balanced_endpoint_codegen_composition(encoder: str, largest: bool) -> None:
+    # P=128 exceeds the compact table catalog, so compact_pruned selects its
+    # chunked fallback and the balanced schedule is active. K/(L*V)=1 makes
+    # every output group complete, activating the ordinal endpoint guard.
+    code = _code(
+        5,
+        256,
+        256,
+        8,
+        4,
+        lanes=2,
+        largest=largest,
+        value_mode="decode",
+        rank_mode="ordinal",
+        key_encoder=encoder,
+        sort_network="compact_pruned",
+        merge_schedule="balanced",
+        defer_value_gathers=True,
+    )
+    assert "'compact_pruned', 'balanced')" in code
+    assert "topk_output_max_rank" in code
+    assert (
+        "_cute_encode_ordered_topk" in code
+        if encoder == "asm"
+        else "topk_magnitude" in code
+    )
+    assert "topk_output_keys[0]" in code if largest else "topk_output_keys[3]" in code
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+def test_balanced_asm_endpoint_exact_selected_bits(
+    dtype: torch.dtype, largest: bool
+) -> None:
+    rows, width, k = 5, 256, 8
+    x, storage = _layout_input(rows, width, dtype, 0, 0)
+    original = storage.clone()
+    value_storage = torch.full((rows * k + 2,), 7, dtype=dtype, device=DEVICE)
+    index_storage = torch.full((rows * k + 2,), -7, dtype=torch.int32, device=DEVICE)
+    values = value_storage[: rows * k].view(rows, k)
+    indices = index_storage[: rows * k].view(rows, k)
+    code, _ = code_and_output(
+        _extra_out_topk,
+        (x, values, indices, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=2,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=4,
+        cute_topk_key_dtype="int32",
+        cute_topk_rank_mode="ordinal",
+        cute_topk_value_mode="decode",
+        cute_topk_selection_layout="replicated",
+        cute_topk_sort_network="compact_pruned",
+        cute_topk_merge_schedule="balanced",
+        cute_topk_key_encoder="asm",
+        cute_topk_defer_value_gathers=True,
+    )
+    assert "'compact_pruned', 'balanced')" in code
+    assert "topk_output_max_rank" in code
+    _assert_topk_output(x, values, indices, k, largest, index_dtype=torch.int32)
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+    assert bool((value_storage[rows * k :] == 7).all())
+    assert bool((index_storage[rows * k :] == -7).all())
 
 
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:

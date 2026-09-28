@@ -130,12 +130,37 @@ def _merge_topk(keys: cute.Tensor, other: cute.Tensor) -> None:
     _merge_descending(keys)
 
 
+@functools.cache
+def _balanced_chunk_program(chunks: int) -> tuple[tuple[int, int], ...]:
+    """Sort leaves and merge equal adjacent groups in depth-first order.
+
+    Equal indices mark a leaf sort. A merge writes the left group's slot and
+    releases the right one. Depth-first order avoids keeping every sorted
+    chunk live simultaneously while preserving the balanced dependency graph.
+    """
+    assert chunks > 0 and (chunks & (chunks - 1)) == 0
+    program: list[tuple[int, int]] = []
+
+    def visit(begin: int, count: int) -> None:
+        if count == 1:
+            program.append((begin, begin))
+        else:
+            half = count // 2
+            visit(begin, half)
+            visit(begin + half, half)
+            program.append((begin, begin + half))
+
+    visit(0, chunks)
+    return tuple(program)
+
+
 @cute.jit
 def local_topk(
     keys: cute.Tensor,
     k: cutlass.Constexpr[int],
     lanes_per_row: cutlass.Constexpr[int],
     sort_network: cutlass.Constexpr[str] = "batcher",
+    merge_schedule: cutlass.Constexpr[str] = "sequential",
 ) -> cute.Tensor:
     """Return the sorted largest ``k`` keys across a contiguous lane subgroup.
 
@@ -157,6 +182,7 @@ def local_topk(
     assert 0 < lanes_per_row <= 32
     assert (lanes_per_row & (lanes_per_row - 1)) == 0
 
+    assert merge_schedule in ("sequential", "balanced")
     selected = cute.make_rmem_tensor(k, keys.element_type)
     if cutlass.const_expr(_use_pruned_sort_network(size, sort_network)):
         work = cute.make_rmem_tensor(size, keys.element_type)
@@ -176,6 +202,18 @@ def local_topk(
                 work[right] = min_fn(a, b)
         for index in cutlass.range_constexpr(k):
             selected[index] = work[index]
+    elif cutlass.const_expr(merge_schedule == "balanced" and size > k):
+        chunks = size // k
+        partials = cute.make_rmem_tensor((k, chunks), keys.element_type)
+        for left, right in _balanced_chunk_program(chunks):
+            if cutlass.const_expr(left == right):
+                for index in cutlass.range_constexpr(k):
+                    partials[index, left] = keys[left * k + index]
+                _sort_descending(partials[None, left], sort_network)
+            else:
+                _merge_topk(partials[None, left], partials[None, right])
+        for index in cutlass.range_constexpr(k):
+            selected[index] = partials[index, 0]
     else:
         for index in cutlass.range(k, unroll_full=True):
             selected[index] = keys[index]
@@ -223,6 +261,7 @@ def distributed_topk(
     k: cutlass.Constexpr[int],
     lanes_per_row: cutlass.Constexpr[int],
     sort_network: cutlass.Constexpr[str] = "batcher",
+    merge_schedule: cutlass.Constexpr[str] = "sequential",
 ) -> cute.Tensor:
     """Return top-k in cyclic rank order, with at least one key per lane.
 
@@ -236,7 +275,9 @@ def distributed_topk(
     assert k > 0 and (k & (k - 1)) == 0
     assert 0 < lanes_per_row <= 32
     assert (lanes_per_row & (lanes_per_row - 1)) == 0
-    selected = local_topk(keys, min(k, cute.size(keys.shape)), 1, sort_network)
+    selected = local_topk(
+        keys, min(k, cute.size(keys.shape)), 1, sort_network, merge_schedule
+    )
     lane = Int32(cute.arch.thread_idx()[0]) % Int32(lanes_per_row)
     max_fn = cute.arch.fmax if cutlass.const_expr(keys.element_type == Float32) else max
     min_fn = cute.arch.fmin if cutlass.const_expr(keys.element_type == Float32) else min
