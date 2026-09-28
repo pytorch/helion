@@ -839,6 +839,10 @@ CUTE_TOPK_CHOICES: dict[str, tuple[int | str, ...]] = {
     "cute_topk_lanes_per_row": (16, 1, 2, 4, 8, 32),
     "cute_topk_rows_per_block": (8, 1, 2, 4, 16, 32, 64, 128),
     "cute_topk_vector_width": (8, 1, 2, 4),
+    "cute_topk_output_vector_width": (1, 2, 4, 8),
+    "cute_topk_value_mode": ("gather", "decode"),
+    "cute_topk_key_dtype": ("int32", "float32", "float32_bits"),
+    "cute_topk_rank_mode": ("signed", "ordinal"),
 }
 CUTE_TOPK_CONFIG_KEYS: frozenset[str] = frozenset(CUTE_TOPK_CHOICES)
 

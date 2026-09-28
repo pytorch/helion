@@ -43,6 +43,10 @@ class CuteTopKPlan:
     lanes_per_row: int = 16
     rows_per_block: int = 8
     vector_width: int = 8
+    output_vector_width: int = 1
+    value_mode: str = "gather"
+    key_dtype: str = "int32"
+    rank_mode: str = "signed"
 
     @property
     def threads(self) -> int:
@@ -303,6 +307,10 @@ def plan_topk_root(
         lanes_per_row=cast("int", config.get("cute_topk_lanes_per_row", 16)),
         rows_per_block=cast("int", config.get("cute_topk_rows_per_block", 8)),
         vector_width=cast("int", config.get("cute_topk_vector_width", 8)),
+        output_vector_width=cast("int", config.get("cute_topk_output_vector_width", 1)),
+        value_mode=cast("str", config.get("cute_topk_value_mode", "gather")),
+        key_dtype=cast("str", config.get("cute_topk_key_dtype", "int32")),
+        rank_mode=cast("str", config.get("cute_topk_rank_mode", "signed")),
     )
 
 
