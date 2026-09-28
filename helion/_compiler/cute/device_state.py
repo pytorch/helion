@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopState
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
+    from .chunk_prefill import CuteChunkPrefillRegion
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
@@ -619,6 +620,7 @@ class CuteDeviceFunctionState:
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None
+        self.chunk_prefill_plan: CuteChunkPrefillRegion | None = None
         # Whole-root BT16 KDA recurrence/output schedule. Like the
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.

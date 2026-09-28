@@ -436,6 +436,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             "cute", "fixed-token rank-1 recurrence failed late validation"
         )
 
+    def _try_codegen_chunk_prefill_root(self) -> bool:
+        from .cute.chunk_prefill import codegen_chunk_prefill
+
+        return codegen_chunk_prefill(self)
+
     def _try_codegen_chunk_prepare_root(self) -> bool:
         plan = self.device_function.cute_state.chunk_prepare_plan
         if plan is None:
@@ -1405,7 +1410,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     root = root_graph_info.graph
                     if (
-                        not self._try_codegen_chunk_prepare_root()
+                        not self._try_codegen_chunk_prefill_root()
+                        and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
@@ -1837,6 +1843,7 @@ def generate_ast(
                 in {
                     "helion_small_biased_attention",
                     "helion_flash",
+                    "chunk_prefill_sm100",
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
@@ -1903,6 +1910,9 @@ def generate_ast(
                         "o_name",
                         "out_name",
                         "state_name",
+                        "initial_state_name",
+                        "final_state_name",
+                        "gate_scale_name",
                         "do_name",
                         "delta_name",
                         "dq_name",

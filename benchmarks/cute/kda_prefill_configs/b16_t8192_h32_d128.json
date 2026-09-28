@@ -1,0 +1,43 @@
+{
+  "shape": {
+    "batch": 16,
+    "seq_len": 8192,
+    "heads": 32,
+    "layout": "uniform"
+  },
+  "implementations": {
+    "helion": {
+      "schedule": "fused",
+      "partition": "all",
+      "state_abi": "fp32",
+      "topology": "parallel_prefix_tail",
+      "stage_configs": {
+        "fused_prefill": {
+          "block_sizes": [
+            64
+          ],
+          "cute_chunk_prefill_task_order": "longest_first_precompute",
+          "cute_chunk_prefill_schedule": "prefix_tail_2",
+          "cute_vector_widths": [
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "cute_lane_layouts": [
+            "blocked",
+            "blocked",
+            "blocked",
+            "blocked",
+            "blocked"
+          ],
+          "cute_reduction_reloads": [
+            "auto",
+            "auto"
+          ]
+        }
+      }
+    }
+  }
+}

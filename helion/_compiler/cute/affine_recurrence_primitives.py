@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
@@ -15,9 +16,139 @@ import cutlass
 from cutlass._mlir.dialects import llvm
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op
+import cutlass.experimental.primitives as prims
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 make_rmem_tensor = cute.make_rmem_tensor
 _LLVM_STRUCT_TYPE = cast("Any", llvm).StructType
+
+
+def packed_f32x2_binary(
+    op: Callable,
+    lhs: tuple[cutlass.Float32, cutlass.Float32],
+    rhs: tuple[cutlass.Float32, cutlass.Float32],
+) -> tuple[cutlass.Float32, cutlass.Float32]:
+    """Apply a CUTLASS packed-FP32 primitive to two scalar pairs."""
+
+    lhs_vec = cutlass.Vector.from_elements(lhs, cutlass.Float32)
+    rhs_vec = cutlass.Vector.from_elements(rhs, cutlass.Float32)
+    result = op(lhs_vec, rhs_vec, ftz=False, rnd="rn")
+    return cutlass.Float32(result[0]), cutlass.Float32(result[1])
+
+
+def fmul2(lhs, rhs):
+    return packed_f32x2_binary(prims.mul_packed_f32x2, lhs, rhs)
+
+
+def fsub2(lhs, rhs):
+    """Subtract two FP32 pairs with explicit non-FTZ round-to-nearest semantics."""
+
+    return packed_f32x2_binary(prims.sub_packed_f32x2, lhs, rhs)
+
+
+def ffma2(lhs, rhs, acc):
+    """Fused multiply-add two FP32 pairs with explicit IEEE mode."""
+
+    lhs_vec = cutlass.Vector.from_elements(lhs, cutlass.Float32)
+    rhs_vec = cutlass.Vector.from_elements(rhs, cutlass.Float32)
+    acc_vec = cutlass.Vector.from_elements(acc, cutlass.Float32)
+    result = prims.fma_packed_f32x2(lhs_vec, rhs_vec, acc_vec, ftz=False, rnd="rn")
+    return cutlass.Float32(result[0]), cutlass.Float32(result[1])
+
+
+@cute.jit
+def pack_input_b16x2_to_i32(
+    value0: cutlass.Float32,
+    value1: cutlass.Float32,
+    input_dtype: cutlass.Constexpr,
+):
+    """Pack two FP32 values through the compile-time input 16-bit dtype."""
+
+    return (
+        cutlass.Vector.from_elements(
+            (value0, value1),
+            cutlass.Float32,
+        )
+        .to(input_dtype)
+        .bitcast(cutlass.Int32)[0]
+    )
+
+
+@cute.jit
+def pack_output_b16x2_to_i32(
+    value0: cutlass.Float32,
+    value1: cutlass.Float32,
+    output_dtype: cutlass.Constexpr,
+):
+    """Pack two FP32 output values through the compile-time 16-bit dtype."""
+
+    return (
+        cutlass.Vector.from_elements(
+            (value0, value1),
+            cutlass.Float32,
+        )
+        .to(output_dtype)
+        .bitcast(cutlass.Int32)[0]
+    )
+
+
+@cute.jit
+def pack_bf16x2_inline(lo, hi):
+    """Round and pack two FP32 values with the inline-PTX CuTe path."""
+
+    return cast(
+        "cutlass.Int32",
+        prims.inline_ptx_hl(
+            "cvt.rn.bf16x2.f32 {$w0}, {$r1}, {$r0};",
+            write_only_types=[cutlass.Int32],
+            read_only_args=[cutlass.Float32(lo), cutlass.Float32(hi)],
+        ),
+    )
+
+
+@cute.jit
+def sub_b16x2_input_dtype(
+    lhs: cutlass.Int32,
+    rhs: cutlass.Int32,
+    input_dtype: cutlass.Constexpr,
+) -> cutlass.Int32:
+    """Subtract two packed pairs using the compile-time input dtype."""
+
+    if cutlass.const_expr(input_dtype is cutlass.BFloat16):
+        return cast(
+            "cutlass.Int32",
+            prims.inline_ptx_hl(
+                "sub.bf16x2 {$w0}, {$r0}, {$r1};",
+                write_only_types=[cutlass.Int32],
+                read_only_args=[lhs, rhs],
+            ),
+        )
+    return cast(
+        "cutlass.Int32",
+        prims.inline_ptx_hl(
+            "sub.f16x2 {$w0}, {$r0}, {$r1};",
+            write_only_types=[cutlass.Int32],
+            read_only_args=[lhs, rhs],
+        ),
+    )
+
+
+@cute.jit
+def movmatrix_b16_inline(value: cutlass.Int32) -> cutlass.Int32:
+    """Transpose one packed m8n8 b16 fragment through CuTe's inline-PTX helper."""
+
+    # Keep this JIT form for schedules whose generated SASS predates the
+    # equivalent lower-level ``dsl_user_op`` below.
+    return cast(
+        "cutlass.Int32",
+        prims.inline_ptx_hl(
+            "movmatrix.sync.aligned.m8n8.trans.b16 {$w0}, {$r0};",
+            write_only_types=[cutlass.Int32],
+            read_only_args=[value],
+        ),
+    )
 
 
 def _ldmatrix(count: str, trans: str, smem_ptr, num: int, *, loc=None, ip=None):
@@ -156,6 +287,13 @@ def mma_m16n8k16_bf16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=No
 
 
 @dsl_user_op
+def mma_m16n8k16_f16(a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, *, loc=None, ip=None):
+    """Accumulate one m16n8k16 FP16 MMA into four FP32 registers."""
+
+    return _mma_m16n8k16("f16", a0, a1, a2, a3, b0, b1, c0, c1, c2, c3, loc=loc, ip=ip)
+
+
+@dsl_user_op
 def pack_bf16x2(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
     """Round two FP32 values to BF16 and pack them into one b32 register."""
     from cutlass._mlir.extras import types as _T
@@ -176,6 +314,67 @@ def pack_bf16x2(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def pack_f16x2(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
+    """Round two FP32 values to FP16 and pack them into one b32 register."""
+
+    from cutlass._mlir.extras import types as _T
+
+    return cutlass.Int32(
+        llvm.inline_asm(
+            _T.IntegerType.get_signless(32),
+            [
+                cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.f16x2.f32 $0, $1, $2;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+def f16_round(value: cutlass.Float32):
+    """Round one FP32 value through FP16."""
+
+    return value.to(cutlass.Float16).to(cutlass.Float32)
+
+
+@cute.jit
+def mma_blockdiag_8x8_f16(a0, a3, b0, b3):
+    """Multiply two packed 8x8 block diagonals with one native MMA."""
+
+    zero_i32 = cutlass.Int32(0)
+    zero_f32 = cutlass.Float32(0.0)
+    return mma_m16n8k16_f16(
+        a0,
+        zero_i32,
+        zero_i32,
+        a3,
+        movmatrix_b16(b0),
+        movmatrix_b16(b3),
+        zero_f32,
+        zero_f32,
+        zero_f32,
+        zero_f32,
+    )
+
+
+@cute.jit
+def accumulator_coordinate(lane, slot):
+    """Return the logical row/column of an m16n16 accumulator slot."""
+
+    n_block = slot // 4
+    register = slot - n_block * 4
+    row = (lane // 4) + 8 * (register // 2)
+    column = 8 * n_block + 2 * (lane % 4) + (register % 2)
+    return row, column
 
 
 @dsl_user_op
@@ -336,16 +535,30 @@ def store_vec8_bf16(ptr, idx, frag):
 
 __all__ = [
     "_mma_m16n8k16",
+    "accumulator_coordinate",
+    "f16_round",
+    "ffma2",
+    "fmul2",
+    "fsub2",
     "ldmatrix_x2",
     "ldmatrix_x2_trans",
     "ldmatrix_x4_trans",
+    "mma_blockdiag_8x8_f16",
     "mma_m16n8k16_bf16",
+    "mma_m16n8k16_f16",
     "movmatrix_b16",
+    "movmatrix_b16_inline",
     "pack_bf16x2",
+    "pack_bf16x2_inline",
+    "pack_f16x2",
+    "pack_input_b16x2_to_i32",
+    "pack_output_b16x2_to_i32",
+    "packed_f32x2_binary",
     "stmatrix_x2",
     "stmatrix_x2_trans",
     "store_u32x4_if_valid",
     "store_vec8_bf16",
+    "sub_b16x2_input_dtype",
     "tma_load_3d",
     "tma_store_3d",
     "tma_store_commit_group",
