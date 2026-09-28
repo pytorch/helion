@@ -2900,6 +2900,8 @@ def _cute_vector_load_ctx(
     env = CompileEnvironment.current()
     if env.backend.name != "cute":
         return None
+    if state.device_function.cute_state.emitting_tile_loop:
+        return None
     if extra_mask is not None:
         return None
     if "None" in index_exprs:
