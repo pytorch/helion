@@ -4079,6 +4079,7 @@ def test_topk_softmax_fused_values(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(
     "k,lanes,layout,value_mode,key_dtype,largest",
     [
@@ -4089,9 +4090,15 @@ def test_topk_softmax_fused_values(
     ],
 )
 def test_topk_softmax_value_recovery(
-    k: int, lanes: int, layout: str, value_mode: str, key_dtype: str, largest: bool
+    dtype: torch.dtype,
+    k: int,
+    lanes: int,
+    layout: str,
+    value_mode: str,
+    key_dtype: str,
+    largest: bool,
 ) -> None:
-    x = torch.randn((5, 64), dtype=torch.bfloat16, device="cuda")
+    x = torch.randn((5, 64), dtype=dtype, device=DEVICE)
     x[0, 0] = float("nan")
     x[1, 0] = float("inf")
     x[2] = -torch.finfo(x.dtype).max
@@ -4128,6 +4135,26 @@ def test_topk_softmax_value_recovery(
         equal_nan=True,
     )
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@pytest.mark.parametrize("key_dtype", ["int32", "float32_native"])
+@pytest.mark.parametrize("rank_mode", ["signed", "ordinal"])
+def test_topk_softmax_decode_eliminates_value_gathers(
+    key_dtype: str, rank_mode: str
+) -> None:
+    code = _code(
+        5,
+        64,
+        64,
+        8,
+        4,
+        kernel=_softmax_row_topk,
+        value_mode="decode",
+        key_dtype=key_dtype,
+        rank_mode=rank_mode,
+    )
+    assert "import softmax_topk_values as" in code
+    assert "x[topk_row, topk_selected_index]" not in code
 
 
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
