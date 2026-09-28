@@ -842,6 +842,12 @@ VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc5",
 )
 CUTE_AFFINE_SCAN_SCHEDULE_KEY = "cute_affine_scan_schedule"
+CUTE_TOPK_CHOICES: dict[str, tuple[int | str, ...]] = {
+    "cute_topk_lanes_per_row": (16, 1, 2, 4, 8, 32),
+    "cute_topk_rows_per_block": (8, 1, 2, 4, 16, 32, 64, 128),
+    "cute_topk_vector_width": (8, 1, 2, 4),
+}
+CUTE_TOPK_CONFIG_KEYS: frozenset[str] = frozenset(CUTE_TOPK_CHOICES)
 
 
 def _cute_chunk_recurrence_config_is_safe(
@@ -918,6 +924,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        *CUTE_TOPK_CONFIG_KEYS,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -1001,6 +1008,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        *CUTE_TOPK_CONFIG_KEYS,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1430,6 +1438,9 @@ class ConfigSpec:
         # Enabled only after a generic matcher proves a compatible affine scan.
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
+        # Enabled only when the whole root is a supported top-k load/store
+        # dataflow. Its emitter owns the row geometry and vector layout.
+        self.cute_topk_search_enabled = False
         self._cute_tcgen05_config = CuteTcgen05Config(self)
         self.cute_host_paired_sum_available: bool = False
         # A separately launched, proved pointwise producer can share one
@@ -2725,6 +2736,17 @@ class ConfigSpec:
             choices=direct_affine_schedule_choices(step_count)
         )
 
+    def enable_cute_topk_search(self) -> None:
+        """Expose the independent row, lane, and vector geometry of top-k."""
+        self.cute_topk_search_enabled = True
+        # The root emitter supplies its own tiling. Ordinary block sizes do
+        # not change its code; retain valid defaults for shared compiler
+        # bookkeeping without searching duplicate generated kernels.
+        for spec in self.block_sizes:
+            target = spec._fragment(self).default_val
+            spec.autotuner_min = target
+            spec.max_size = target
+
     def _pre_normalize_cute_flash_block_sizes(self, config: dict[str, object]) -> None:
         if "block_sizes" not in config:
             return
@@ -3728,6 +3750,35 @@ class ConfigSpec:
                 )
             config.pop(key, None)
 
+    def _normalize_cute_topk(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        for key, choices in CUTE_TOPK_CHOICES.items():
+            if not self.cute_topk_search_enabled:
+                if key in config and not fix_invalid:
+                    raise InvalidConfig(f"{key} requires a compatible top-k root")
+                config.pop(key, None)
+                continue
+            value = config.setdefault(key, choices[0])
+            if type(value) is not type(choices[0]) or value not in choices:
+                if fix_invalid:
+                    config[key] = choices[0]
+                else:
+                    raise InvalidConfig(
+                        f"{key} must be one of {choices!r}, got {value!r}"
+                    )
+        if self.cute_topk_search_enabled:
+            lanes = cast("int", config["cute_topk_lanes_per_row"])
+            rows = cast("int", config["cute_topk_rows_per_block"])
+            if lanes * rows > 1024:
+                if fix_invalid:
+                    config["cute_topk_rows_per_block"] = 1024 // lanes
+                else:
+                    raise InvalidConfig(
+                        "cute_topk_lanes_per_row * cute_topk_rows_per_block "
+                        "must not exceed 1024 threads"
+                    )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -4091,6 +4142,7 @@ class ConfigSpec:
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_topk(config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
@@ -5478,7 +5530,12 @@ class ConfigSpec:
                 fields["cute_pointwise_pid_type"] = EnumFragment(
                     choices=("inherit", "flat")
                 )
-            if self.cute_tcgen05_search_enabled:
+            if self.cute_topk_search_enabled:
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in CUTE_TOPK_CHOICES.items()
+                )
+            elif self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
                 if self.cute_pointwise_region_block_ids:
                     fields["num_threads"] = self.num_threads

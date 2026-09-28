@@ -5193,6 +5193,44 @@ class CuteGdnRecurrenceHeuristic(AutotunerHeuristic):
         return seeds[0] if seeds else None
 
 
+class CuteTopKHeuristic(AutotunerHeuristic):
+    """Register the correctness facts for specialized top-k selection."""
+
+    name = "cute_topk"
+    backend = "cute"
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.memory_ops import register_cute_tensor_alias_specializations
+        from ..cute.topk import match_topk_root
+        from ..cute.topk import topk_tensors_are_proven_disjoint
+
+        host_function = device_ir.host_function
+        if host_function is None or len(device_ir.root_ids) != 1:
+            return frozenset()
+        with host_function:
+            plan = match_topk_root(
+                device_ir.graphs,
+                noncanonical_block_ids=device_ir.noncanonical_task_origin_block_ids,
+            )
+            # The structural match precedes real-argument availability. Wait
+            # until binding can prove disjoint storage before freezing generic
+            # tiling; the registered alias classifier guards bound-cache reuse.
+            if plan is not None:
+                # Singleton top-k has no reduction dimension, so the reduction
+                # registration pass may not have installed its alias facts.
+                register_cute_tensor_alias_specializations(env)
+                if topk_tensors_are_proven_disjoint(plan, env, allow_unbound=True):
+                    env.config_spec.enable_cute_topk_search()
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_topk_search_enabled
+
+
 class CuteChunkPrepareHeuristic(AutotunerHeuristic):
     """Expose exact BT16 prepare schedules with a geometry-derived seed."""
 

@@ -1331,9 +1331,13 @@ class CuteBackend(Backend):
         from .split_single_token_rank1_recurrence import (
             plan_split_single_token_rank1_recurrence,
         )
+        from .topk import plan_topk_root
         from .view_subtile import annotate_view_subtiles
 
         device_function = DeviceFunction.current()
+        device_function.cute_state.topk_plan = plan_topk_root(graphs, tile_strategy)
+        if device_function.cute_state.topk_plan is not None:
+            return
         direct_affine_requested = (
             config.cute_affine_scan_schedule != DIRECT_AFFINE_ORDINARY_SCHEDULE
         )
@@ -1485,6 +1489,12 @@ class CuteBackend(Backend):
             or key == "cute_min_blocks_per_mp"
             or key == "cute_matmul_family"
             or key == "cute_warp_mma_warps"
+            or key
+            in (
+                "cute_topk_lanes_per_row",
+                "cute_topk_rows_per_block",
+                "cute_topk_vector_width",
+            )
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )
@@ -2555,6 +2565,11 @@ class CuteBackend(Backend):
             return launcher_args
 
         direct_affine_plan = device_function.cute_state.direct_affine_plan
+        topk_plan = device_function.cute_state.topk_plan
+        if topk_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({topk_plan.threads}, 1, 1)"
+            )
         if direct_affine_plan is not None:
             x, y, z = direct_affine_plan.cta_shape
             check_thread_block_dims(
