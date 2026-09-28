@@ -354,6 +354,8 @@ def runtime_tensors_are_proven_disjoint(
     env: CompileEnvironment,
     left: torch.Tensor,
     right: torch.Tensor,
+    *,
+    allow_unbound: bool = False,
 ) -> bool:
     """Return a cache-specialized positive runtime storage-disjointness fact."""
     left_source = env.tensor_input_source(left)
@@ -364,6 +366,7 @@ def runtime_tensors_are_proven_disjoint(
         env,
         left_source,
         right_source,
+        allow_unbound=allow_unbound,
     )
 
 
@@ -371,30 +374,68 @@ def runtime_tensor_sources_are_proven_disjoint(
     env: CompileEnvironment,
     left_source: Source,
     right_source: Source,
+    *,
+    allow_unbound: bool = False,
 ) -> bool:
-    """Return a cache-specialized storage fact for explicit input Sources."""
+    """Return a cache-specialized storage fact for explicit input Sources.
+
+    Search registration runs during binding, before its immutable facts are
+    recorded. It may opt into live facts from the registered classifier.
+    Codegen must retain the default requirement for a bound fact.
+    """
     if left_source == right_source:
         return False
     specialization = env.runtime_input_specializations.get(
         _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
     )
     sources = _tensor_alias_sources(env)
-    if specialization is None or specialization.sources != sources:
+    if (
+        specialization is None
+        or specialization.sources != sources
+        or specialization.classifier_identity
+        != ("storage_span_disjoint_matrix_v1", tuple(map(repr, sources)))
+        or specialization.reusable_tensor_properties != frozenset(("storage_span",))
+    ):
         return False
+    # This immutable matrix was recorded from the bound kernel's dispatch key.
+    # Recompilation may outlive its construction tensors, which are held only
+    # weakly. Missing live arguments do not invalidate a cache-specialized fact.
+    facts = env.bound_runtime_input_specialization_results.get(
+        _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+    )
     runtime_values = tuple(
         _replay_tensor_input_source(source, env.runtime_arg_values_by_name)
         for source in sources
     )
-    facts = specialization.classifier(runtime_values)
-    if not isinstance(
-        facts, tuple
-    ) or not env.runtime_input_specialization_matches_bound(
-        _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
-        facts,
+    live_facts = specialization.classifier(runtime_values)
+    assert isinstance(live_facts, tuple)
+    if (
+        allow_unbound
+        and _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+        not in env.bound_runtime_input_specialization_results
+    ):
+        facts = live_facts
+    if (
+        not isinstance(facts, tuple)
+        or len(facts) != len(sources) * (len(sources) - 1) // 2
+        or any(type(fact) is not bool for fact in facts)
+    ):
+        return False
+    live = tuple(
+        isinstance(value, torch.Tensor) and not isinstance(value, FakeTensor)
+        for value in runtime_values
+    )
+    # Keep rejecting contradictory live arguments, including a partial weak
+    # fallback where only some construction tensors are still alive.
+    if any(
+        left_live and right_live and live_fact != fact
+        for (left_live, right_live), live_fact, fact in zip(
+            itertools.combinations(live, 2), live_facts, facts, strict=True
+        )
     ):
         return False
     wanted = frozenset((left_source, right_source))
-    for pair, fact in zip(itertools.combinations(sources, 2), facts, strict=False):
+    for pair, fact in zip(itertools.combinations(sources, 2), facts, strict=True):
         if frozenset(pair) == wanted:
             return fact is True
     return False

@@ -50,6 +50,7 @@ from .cute import CuteTcgen05ThreadLocalEpilogueHeuristic
 from .cute import CuteTileVecHeuristic
 from .cute import CuteTileVecWarpPerRowHeuristic
 from .cute import CuteTileVecWarpReduceHeuristic
+from .cute import CuteTopKHeuristic
 from .cute import grouped_full_coverage_configs
 from .cute import grouped_row_union_carrier
 from .cute import grouped_row_union_cluster4_carrier
@@ -104,6 +105,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteChunkRecurrenceHeuristic,
         CuteChunkPrepareHeuristic,
         CuteAffineScanHeuristic,
+        CuteTopKHeuristic,
         CuteFlashAttentionHeuristic,
         CutePackedSingleTokenRank1Heuristic,
         CuteFixedTokenRank1Heuristic,

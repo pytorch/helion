@@ -459,6 +459,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         return codegen_computed_fragment_root(self)
 
+    def _try_codegen_topk_root(self) -> bool:
+        plan = self.device_function.cute_state.topk_plan
+        if plan is None:
+            return False
+        from .cute.topk import codegen_topk_root
+
+        if codegen_topk_root(self, plan):
+            return True
+        raise exc.BackendUnsupported("cute", "topk failed late validation")
+
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
         if plan is None:
@@ -1498,6 +1508,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     root = root_graph_info.graph
                     if (
                         not self._try_codegen_block_scaled_root()
+                        and not self._try_codegen_topk_root()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
