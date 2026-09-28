@@ -3920,6 +3920,216 @@ def test_distributed_wide_output_exact_bits_and_tails(
     assert bool((index_storage[offset + rows * k :] == -7).all())
 
 
+# Fused softmax of the selected logits.
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _softmax_row_topk(
+    x: torch.Tensor,
+    k: int,
+    largest: hl.constexpr,
+    index_dtype: torch.dtype = torch.int64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=x.dtype, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=index_dtype, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1, largest=largest, sorted=True)
+        values[row, :] = torch.softmax(vals.to(torch.float32), dim=-1).to(x.dtype)
+        indices[row, :] = idx
+    return values, indices
+
+
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize(
+    "k,lanes,vector", [(1, 16, 1), (3, 8, 1), (8, 16, 4), (32, 2, 8)]
+)
+def test_topk_softmax_codegen(layout: str, k: int, lanes: int, vector: int) -> None:
+    code = _code(
+        5,
+        64,
+        64,
+        k,
+        vector,
+        kernel=_softmax_row_topk,
+        selection_layout=layout,
+        lanes=lanes,
+        value_mode="decode",
+        rank_mode="ordinal",
+    )
+    assert "import softmax_topk_values as" in code
+    assert "topk_softmax_values" in code
+    assert "sort_rank" not in code
+    assert code.count("@cute.kernel") == 1
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "none",
+        "sum_axis",
+        "max_axis",
+        "keepdim",
+        "sum_mask",
+        "max_mask",
+        "sum_input",
+        "precision",
+    ],
+)
+def test_topk_softmax_matcher_requires_exact_epilogue(damage: str) -> None:
+    x = torch.empty((5, 64), dtype=torch.bfloat16)
+    bound = _softmax_row_topk._bind_isolated((x, 8, True))
+    env, host = bound.env, bound.host_function
+    assert host is not None
+    with env, host:
+        candidate = match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set())
+        assert candidate is not None and candidate.softmax
+        graph = candidate.root_graph
+        nodes = list(graph.nodes)
+        maximum = next(n for n in nodes if n.target is torch.ops.aten.amax.default)
+        denominator = next(
+            n for n in nodes if n.target is torch.ops.aten.sum.dim_IntList
+        )
+        if damage in ("sum_axis", "max_axis", "keepdim"):
+            node = maximum if damage == "max_axis" else denominator
+            node.args = (
+                node.args[0],
+                [0] if damage.endswith("axis") else node.args[1],
+                damage != "keepdim",
+            )
+        elif damage in ("sum_mask", "max_mask"):
+            node = (denominator if damage == "sum_mask" else maximum).args[0]
+            assert isinstance(node, torch.fx.Node)
+            node.args = (node.args[0], 1.0)
+        elif damage == "sum_input":
+            denominator.args = (maximum.args[0], *denominator.args[1:])
+        elif damage == "precision":
+            node = next(
+                n
+                for n in nodes
+                if n.target is torch.ops.prims.convert_element_type.default
+                and n.args[1] == torch.float32
+            )
+            node.args = (node.args[0], torch.float64)
+        result = match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set())
+        assert (result is not None) == (damage == "none")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [True, False])
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize(
+    "n,k,lanes,vector", [(65, 3, 8, 1), (64, 8, 16, 4), (128, 32, 2, 8)]
+)
+def test_topk_softmax_fused_values(
+    dtype: torch.dtype,
+    largest: bool,
+    layout: str,
+    n: int,
+    k: int,
+    lanes: int,
+    vector: int,
+) -> None:
+    storage = torch.randn((19, n + 2), dtype=dtype, device=DEVICE)
+    x = storage[:, 1 : n + 1]
+    x[0] = 0
+    x[1] = -2
+    x[2] = torch.linspace(-2, 0.05, n, device=DEVICE, dtype=dtype)
+    x[3] = torch.finfo(dtype).max
+    x[4] = -torch.finfo(dtype).max
+    x[5, 0] = float("nan")
+    x[6] = float("-inf")
+    x[7] = float("inf")
+    original = x.clone()
+    code, (values, indices) = code_and_output(
+        _softmax_row_topk,
+        (x, k, largest, torch.int32),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=8,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=vector,
+        cute_topk_selection_layout=layout,
+        cute_topk_sort_network="compact_pruned",
+        cute_topk_value_mode="decode",
+        cute_topk_rank_mode="ordinal",
+    )
+    assert "import softmax_topk_values as" in code
+    assert values.dtype == dtype and indices.dtype == torch.int32
+    selected = original.gather(1, indices.long())
+    expected_logits = torch.topk(
+        original, k, dim=-1, largest=largest, sorted=True
+    ).values
+    torch.testing.assert_close(
+        selected, expected_logits, rtol=0, atol=0, equal_nan=True
+    )
+    expected = torch.softmax(selected.float(), dim=-1).to(dtype)
+    torch.testing.assert_close(
+        values,
+        expected,
+        rtol=0.008 if dtype == torch.bfloat16 else 0.001,
+        atol=1e-6,
+        equal_nan=True,
+    )
+    sorted_indices = indices.sort(dim=-1).values
+    assert bool((sorted_indices[:, 1:] != sorted_indices[:, :-1]).all())
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "k,lanes,layout,value_mode,key_dtype,largest",
+    [
+        (1, 16, "distributed", "gather", "int32", True),
+        (64, 1, "replicated", "decode", "float32_native", False),
+        (32, 4, "distributed", "decode", "float32_native", False),
+        (8, 1, "distributed", "gather", "int32", True),
+    ],
+)
+def test_topk_softmax_value_recovery(
+    k: int, lanes: int, layout: str, value_mode: str, key_dtype: str, largest: bool
+) -> None:
+    x = torch.randn((5, 64), dtype=torch.bfloat16, device="cuda")
+    x[0, 0] = float("nan")
+    x[1, 0] = float("inf")
+    x[2] = -torch.finfo(x.dtype).max
+    x[3] = 0
+    original = x.clone()
+    code, (values, indices) = code_and_output(
+        _softmax_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=8,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=8,
+        cute_topk_selection_layout=layout,
+        cute_topk_sort_network="compact_pruned",
+        cute_topk_value_mode=value_mode,
+        cute_topk_key_dtype=key_dtype,
+    )
+    assert "import softmax_topk_values as" in code
+    assert indices.dtype == torch.int64
+    logits = original.gather(1, indices)
+    torch.testing.assert_close(
+        logits,
+        torch.topk(original, k, dim=-1, largest=largest).values,
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        values,
+        torch.softmax(logits.float(), dim=-1).to(x.dtype),
+        rtol=0.008,
+        atol=1e-6,
+        equal_nan=True,
+    )
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
     return {
         "block_sizes": [1],

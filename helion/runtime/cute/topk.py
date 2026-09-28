@@ -27,6 +27,7 @@ __all__ = [
     "encode_ordered_topk_key",
     "encode_ordinal_topk_pair",
     "local_topk",
+    "softmax_topk_values",
     "transpose_topk_output",
     "transpose_topk_output_wide",
 ]
@@ -361,3 +362,40 @@ def distributed_topk(
             else:
                 selected = halves[None, 0]
     return selected
+
+
+@cute.jit
+def softmax_topk_values(
+    values: cute.Tensor,
+    maximum_offset: cutlass.Constexpr[int],
+    maximum_lane: cutlass.Constexpr[int],
+    lanes_per_row: cutlass.Constexpr[int],
+) -> None:
+    """Normalize unique selected values, with absent output slots set to -inf.
+
+    Selection already sorts the values, so the caller identifies the maximum
+    by its register and lane instead of reducing again. This also propagates
+    a selected NaN, which occupies an endpoint of the sorted sequence.
+    Every lane in the row subgroup must participate, including masked lanes.
+    """
+    assert values.element_type == Float32
+    maximum = Float32(values[maximum_offset])
+    if cutlass.const_expr(lanes_per_row > 1):
+        maximum = cute.arch.shuffle_sync(
+            maximum,
+            offset=maximum_lane,
+            mask_and_clamp=((32 - lanes_per_row) << 8) | 31,
+        )
+    # Subtract before multiplying: finite BF16 values near Float32's range
+    # can overflow if both logits and their maximum are scaled separately.
+    exponents = cute.math.exp2(
+        (values.load() - maximum) * 1.4426950408889634, fastmath=True
+    )
+    denominator = exponents.reduce(
+        cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
+    )
+    if cutlass.const_expr(lanes_per_row > 1):
+        denominator = cute.arch.warp_reduction_sum(
+            denominator, threads_in_group=lanes_per_row
+        )
+    values.store(exponents * cute.arch.rcp_approx(denominator))

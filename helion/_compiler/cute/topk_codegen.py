@@ -379,6 +379,81 @@ if not topk_value_decodable:
 {destination} = topk_value
 """
 
+    softmax_name = f"_cute_softmax_topk_values_{helper_hash}"
+    if plan.softmax:
+        cg.module_statements.append(
+            ast.ImportFrom(
+                module="helion.runtime.cute.topk",
+                names=[ast.alias(name="softmax_topk_values", asname=softmax_name)],
+                level=0,
+            )
+        )
+
+    def softmax_stores(
+        setup: str,
+        key: str,
+        groups: int,
+        vector: int,
+        lane: str,
+        guard: str,
+        *,
+        transposed: bool = False,
+    ) -> str:
+        """Keep the selected-value epilogue in the chosen output layout."""
+        group_width = plan.lanes_per_row * vector
+        endpoint = 0 if plan.largest else plan.k - 1
+        maximum_offset = endpoint // group_width * vector + endpoint % vector
+        maximum_lane = endpoint // vector % plan.lanes_per_row
+        if transposed:
+            span = plan.lanes_per_row // vector
+            maximum_lane = maximum_lane % span * vector + maximum_lane // span
+        value_load = value_store(key, "topk_softmax_value")
+        output_store = f"""
+        {values}[topk_row, topk_output_col] = topk_softmax_values[topk_j].to({value_dtype})
+        {indices}[topk_row, topk_output_col] = topk_softmax_indices[topk_j]
+"""
+        if vector > 1:
+            output_store = f"""
+        topk_value_fragment = cute.make_rmem_tensor({vector}, {value_dtype})
+        topk_index_fragment = cute.make_rmem_tensor({vector}, {output_index_dtype})
+        for topk_v in cutlass.range_constexpr({vector}):
+            topk_value_fragment[topk_v] = topk_softmax_values[topk_j * {vector} + topk_v].to({value_dtype})
+            topk_index_fragment[topk_v] = topk_softmax_indices[topk_j * {vector} + topk_v]
+        topk_output_offset = topk_row * {index_type}({plan.k}) + {index_type}(topk_output_col)
+        topk_output_offset = cute.assume(topk_output_offset, divby={vector})
+        topk_value_destination = cute.make_tensor(
+            {values}.iterator + topk_output_offset,
+            cute.make_layout({vector}, stride=1),
+        )
+        topk_index_destination = cute.make_tensor(
+            {indices}.iterator + topk_output_offset,
+            cute.make_layout({vector}, stride=1),
+        )
+        cute.autovec_copy(topk_value_fragment, topk_value_destination)
+        cute.autovec_copy(topk_index_fragment, topk_index_destination)
+"""
+        return f"""
+{setup}
+topk_softmax_values = cute.make_rmem_tensor({groups * vector}, cutlass.Float32)
+topk_softmax_values.fill(-cutlass.Float32.inf)
+topk_softmax_indices = cute.make_rmem_tensor({groups * vector}, {output_index_dtype})
+topk_softmax_indices.fill({output_index_dtype}(0))
+for topk_j in cutlass.range_constexpr({groups}):
+    topk_output_col = cutlass.Int32(topk_j * {group_width}) + {lane} * cutlass.Int32({vector})
+    if topk_valid_row & ({guard}):
+        for topk_v in cutlass.range_constexpr({vector}):
+            topk_selected_key = {key}
+            topk_selected_index = {selected_index("topk_selected_key")}
+{textwrap.indent(value_load, "            ")}
+            topk_softmax_values[topk_j * {vector} + topk_v] = cutlass.Float32(topk_softmax_value)
+            topk_softmax_indices[topk_j * {vector} + topk_v] = {output_index_dtype}(topk_selected_index)
+{softmax_name}(topk_softmax_values, {maximum_offset}, {maximum_lane}, {plan.lanes_per_row})
+for topk_j in cutlass.range_constexpr({groups}):
+    topk_output_col = cutlass.Int32(topk_j * {group_width}) + {lane} * cutlass.Int32({vector})
+    if topk_valid_row & ({guard}):
+{output_store}
+"""
+
     scalar_value_store = value_store(
         "topk_local[topk_j]", f"{values}[topk_row, topk_output_col]"
     )
@@ -397,6 +472,22 @@ for topk_j in cutlass.range_constexpr({(plan.k + plan.lanes_per_row - 1) // plan
 {textwrap.indent(scalar_value_store, "        ")}
         {indices}[topk_row, topk_output_col] = {output_index_dtype}(topk_selected_index)
 """
+    if plan.softmax:
+        scalar_setup = f"""
+topk_local = cute.make_rmem_tensor({(plan.k + plan.lanes_per_row - 1) // plan.lanes_per_row}, cutlass.Int32)
+topk_local.fill(cutlass.Int32(0))
+for topk_output in cutlass.range_constexpr({plan.k}):
+    if topk_lane == cutlass.Int32(topk_output % {plan.lanes_per_row}):
+        topk_local[topk_output // {plan.lanes_per_row}] = {selected_key}
+"""
+        scalar_stores = softmax_stores(
+            scalar_setup,
+            "topk_local[topk_j]",
+            (plan.k + plan.lanes_per_row - 1) // plan.lanes_per_row,
+            1,
+            "topk_lane",
+            output_col_guard,
+        )
     stores = scalar_stores
     if distributed:
         distributed_output_guard = (
@@ -419,6 +510,15 @@ for topk_j in cutlass.range_constexpr({selected_per_lane}):
 {textwrap.indent(distributed_value_store, "        ")}
         {indices}[topk_row, topk_output_col] = {output_index_dtype}(topk_selected_index)
 """
+        if plan.softmax:
+            stores = softmax_stores(
+                "",
+                distributed_key,
+                selected_per_lane,
+                1,
+                "topk_lane",
+                distributed_output_guard,
+            )
     output_vector = plan.output_vector_width
     if distributed:
         output_vector = min(output_vector, selected_per_lane)
@@ -564,6 +664,16 @@ if topk_valid_row:
         cute.autovec_copy(topk_value_fragments[None, topk_j], topk_value_destination)
         cute.autovec_copy(topk_index_fragments[None, topk_j], topk_index_destination)
 """
+        if plan.softmax:
+            vector_stores = softmax_stores(
+                vector_setup,
+                output_key,
+                output_groups,
+                output_vector,
+                output_lane,
+                vector_output_guard,
+                transposed=distributed and output_vector <= plan.lanes_per_row,
+            )
         # Launcher schemas specialize the actual pointer alignment, including
         # shifted out-parameters. Larger vectors use multiple 128-bit stores.
         stores = (
