@@ -1262,6 +1262,7 @@ class CuteBackend(Backend):
                 "cute_topk_key_dtype",
                 "cute_topk_rank_mode",
                 "cute_topk_selection_layout",
+                "cute_topk_sort_network",
             )
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")

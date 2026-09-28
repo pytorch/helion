@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -28,6 +29,11 @@ import helion.language as hl
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
+from helion.runtime.cute.sorting_networks import COMPACT_SORT_LAYERS
+from helion.runtime.cute.topk import _odd_even_sort_network
+from helion.runtime.cute.topk import _pruned_sort_network
+from helion.runtime.cute.topk import _sort_network
+from helion.runtime.cute.topk import _use_pruned_sort_network
 
 # Basic top-k tests.
 
@@ -465,6 +471,7 @@ def test_topk_index_output_dtype_preserves_selected_bits(
         cute_topk_key_dtype=key_dtype,
         cute_topk_rank_mode=rank_mode,
         cute_topk_selection_layout=layout,
+        cute_topk_sort_network="compact_pruned",
     )
     helper = "_cute_distributed_topk" if layout == "distributed" else "_cute_local_topk"
     # Singleton top-k simplifies to a value copy and index zero.
@@ -732,6 +739,7 @@ def test_topk_distributed_more_lanes_than_outputs(
         cute_topk_rank_mode="ordinal",
         cute_topk_value_mode="decode",
         cute_topk_selection_layout="distributed",
+        cute_topk_sort_network=network,
     )
     assert "_cute_distributed_topk" in code
     assert "cute.autovec_copy" not in code
@@ -747,6 +755,54 @@ def topk_spec(monkeypatch: pytest.MonkeyPatch) -> ConfigSpec:
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0), num_sm=1)
     spec.enable_cute_topk_search()
     return spec
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("network", ["compact", "compact_pruned"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,lanes,layout,key_dtype,rank_mode,value_mode",
+    [
+        (64, 32, 1, "replicated", "float32_bits", "ordinal", "decode"),
+        (128, 32, 2, "replicated", "float32", "signed", "decode"),
+        (128, 32, 16, "distributed", "int32", "ordinal", "decode"),
+        (65, 33, 2, "replicated", "int32", "signed", "gather"),
+        (512, 8, 2, "replicated", "float32_bits", "ordinal", "decode"),
+    ],
+)
+def test_topk_compact_selection_networks(
+    network: str,
+    dtype: torch.dtype,
+    largest: bool,
+    width: int,
+    k: int,
+    lanes: int,
+    layout: str,
+    key_dtype: str,
+    rank_mode: str,
+    value_mode: str,
+) -> None:
+    x, storage = _layout_input(5, width, dtype, 2, 1)
+    original = storage.clone()
+    code, (values, indices) = code_and_output(
+        _extra_row_topk,
+        (x, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=4,
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_value_mode=value_mode,
+        cute_topk_selection_layout=layout,
+        cute_topk_sort_network=network,
+    )
+    assert repr(network) in code
+    _assert_topk_output(x, values, indices, k, largest)
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
 
 
 @pytest.mark.parametrize(
@@ -773,6 +829,9 @@ def topk_spec(monkeypatch: pytest.MonkeyPatch) -> ConfigSpec:
         ("cute_topk_selection_layout", True),
         ("cute_topk_selection_layout", 1),
         ("cute_topk_selection_layout", "unknown"),
+        ("cute_topk_sort_network", True),
+        ("cute_topk_sort_network", 1),
+        ("cute_topk_sort_network", "unknown"),
     ],
 )
 def test_topk_config_rejects_noninteger_or_unsupported_choices(
@@ -891,6 +950,24 @@ def test_topk_invalid_selection_layout_normalizes_to_replicated(
     assert config["cute_topk_selection_layout"] == "replicated"
 
 
+@pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
+def test_topk_sort_network_config_roundtrip(
+    topk_spec: ConfigSpec, network: str
+) -> None:
+    assert topk_spec.default_config()["cute_topk_sort_network"] == "batcher"
+    config = helion.Config(cute_topk_sort_network=network)
+    topk_spec.normalize(config)
+    generation = ConfigGeneration(topk_spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+    assert helion.Config.from_json(config.to_json()) == config
+
+
+def test_topk_invalid_sort_network_normalizes_to_batcher(topk_spec: ConfigSpec) -> None:
+    config = helion.Config(cute_topk_sort_network=False)
+    topk_spec.normalize(config, _fix_invalid=True)
+    assert config["cute_topk_sort_network"] == "batcher"
+
+
 @pytest.mark.parametrize("lanes,rows", [(16, 128), (32, 64), (32, 128)])
 def test_topk_config_limits_threads_per_block(
     topk_spec: ConfigSpec, lanes: int, rows: int
@@ -993,6 +1070,7 @@ def _code(
             cute_topk_key_dtype=key_dtype,
             cute_topk_rank_mode=rank_mode,
             cute_topk_selection_layout=selection_layout,
+            cute_topk_sort_network=sort_network,
         )
         return bound.to_triton_code(config)
 
@@ -1529,6 +1607,35 @@ def test_distributed_fragment_does_not_pad_every_lane_to_k(
     assert f"topk_keys = cute.make_rmem_tensor({fragment}, cutlass.Int32)" in code
 
 
+@pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_sort_network_reaches_codegen(network: str, layout: str) -> None:
+    code = _code(
+        9, 128, 128, 32, selection_layout=layout, lanes=2, sort_network=network
+    )
+    name = "local_topk" if layout == "replicated" else "distributed_topk"
+    assert f"_cute_{name}_" in code
+    assert f"(topk_keys, 32, 2, '{network}')" in code
+
+
+def test_topk_cache_hash_includes_compact_tables() -> None:
+    from helion._compiler.cute import topk_codegen
+
+    original_getsource = topk_codegen.inspect.getsource
+
+    def changed_tables(obj: Any) -> str:
+        source = original_getsource(obj)
+        if obj is topk_codegen.runtime_sorting_networks:
+            source += "\n# test table change\n"
+        return source
+
+    before = _code(9, 128, 128, 32, sort_network="compact_pruned")
+    with patch.object(topk_codegen.inspect, "getsource", side_effect=changed_tables):
+        after = _code(9, 128, 128, 32, sort_network="compact_pruned")
+    assert before != after
+    assert "_cute_local_topk_" in before and "_cute_local_topk_" in after
+
+
 @pytest.mark.parametrize(
     "k,lanes",
     [(3, 8), (3, 4), (6, 2), (33, 1), (32, 16), (1, 32), (8, 32)],
@@ -1722,3 +1829,183 @@ def test_matcher_uses_runtime_span_alias_proof(
         bound = _out_topk._bind_isolated((x, values, indices))
         code = bound.to_triton_code(bound.config_spec.default_config())
         assert ("_cute_local_topk" in code) == (alias_kind == "separate")
+
+
+# Networks top-k tests.
+
+
+def _evaluate(values: np.ndarray, size: int, k: int, network: str) -> np.ndarray:
+    actual = values.copy()
+    program = (
+        _pruned_sort_network(size, k)
+        if network == "compact_pruned"
+        else tuple(
+            (left, right, True, True) for left, right in _sort_network(size, network)
+        )
+    )
+    for left, right, keep_left, keep_right in program:
+        a, b = actual[:, left].copy(), actual[:, right].copy()
+        if keep_left:
+            actual[:, left] = np.maximum(a, b)
+        if keep_right:
+            actual[:, right] = np.minimum(a, b)
+    return actual[:, :k]
+
+
+@pytest.mark.parametrize("size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
+def test_selection_network_exhaustive_binary(size: int, network: str) -> None:
+    values = (
+        (np.arange(1 << size, dtype=np.uint32)[:, None] >> np.arange(size)) & 1
+    ).astype(np.uint8)
+    expected = np.sort(values, axis=1)[:, ::-1]
+    # Zero-one verification proves data-independent comparator networks for
+    # every ordered input domain. Check every supported prefix length too.
+    for exponent in range(size.bit_length()):
+        k = 1 << exponent
+        np.testing.assert_array_equal(
+            _evaluate(values, size, k, network), expected[:, :k]
+        )
+
+
+@pytest.mark.parametrize("size", [32, 64, 128, 256])
+@pytest.mark.parametrize("network", ["batcher", "compact", "compact_pruned"])
+@pytest.mark.parametrize("floating", [False, True])
+def test_selection_network_random_duplicates_and_padding(
+    size: int, network: str, floating: bool
+) -> None:
+    generator = np.random.default_rng(20260926)
+    values = generator.integers(-(1 << 22), 1 << 22, size=(128, size), dtype=np.int32)
+    values[0] = 0
+    values[1] = np.iinfo(np.int32).min
+    values[2] = np.arange(size) % 4
+    for row in range(3, len(values)):
+        values[row, row % size :] = np.iinfo(np.int32).min
+        generator.shuffle(values[row])
+    if floating:
+        values = values.astype(np.float32)
+    expected = np.sort(values, axis=1)[:, ::-1]
+    for exponent in range(size.bit_length()):
+        k = 1 << exponent
+        np.testing.assert_array_equal(
+            _evaluate(values, size, k, network), expected[:, :k]
+        )
+
+
+def test_compact_network_bounds_and_operation_count() -> None:
+    for size, layers in COMPACT_SORT_LAYERS.items():
+        for layer in layers:
+            wires = [wire for pair in layer for wire in pair]
+            assert len(wires) == len(set(wires))
+            assert all(0 <= left < right < size for left, right in layer)
+    assert len(_sort_network(32, "compact")) == 185
+    assert len(_sort_network(64, "compact")) == 521
+    # For the complete local 64->32 operation: two sorts plus a bitonic
+    # top-k merge versus the pruned whole-fragment comparator program.
+    merge_operations = 32 * 6
+    assert 4 * len(_sort_network(32, "batcher")) + merge_operations == 956
+    assert 4 * len(_sort_network(32, "compact")) + merge_operations == 932
+    assert (
+        sum(left + right for _, _, left, right in _pruned_sort_network(64, 32)) == 870
+    )
+
+
+@pytest.mark.parametrize("size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+def test_network_dispatch_and_power_two_fallback(size: int) -> None:
+    assert not _use_pruned_sort_network(size, "batcher")
+    assert not _use_pruned_sort_network(size, "compact")
+    assert _use_pruned_sort_network(size, "compact_pruned") == (
+        size in COMPACT_SORT_LAYERS
+    )
+    if size not in COMPACT_SORT_LAYERS:
+        assert _sort_network(size, "compact") == _odd_even_sort_network(size)
+        assert _sort_network(size, "compact_pruned") == _odd_even_sort_network(size)
+
+
+@pytest.mark.parametrize("size,k", [(0, 1), (3, 1), (8, 0), (8, 3), (8, 16)])
+def test_pruned_network_rejects_invalid_sizes(size: int, k: int) -> None:
+    with pytest.raises(AssertionError):
+        _pruned_sort_network(size, k)
+
+
+@pytest.fixture
+def cpu_codegen() -> Any:
+    with (
+        patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
+        patch(
+            "helion._compiler.compile_environment.target_device_capability",
+            return_value=(10, 0),
+        ),
+        patch("helion.language.loops.use_tileir_tunables", return_value=False),
+        patch("helion.language.loops._supports_warp_specialize", return_value=True),
+        patch("helion._compat._supports_tensor_descriptor", return_value=True),
+        patch("helion._compat._min_dot_size", return_value=(16, 16, 16)),
+        patch("helion._compat._is_hip", return_value=False),
+    ):
+        yield
+
+
+def _composition_config(lanes: int, layout: str) -> dict[str, object]:
+    return {
+        "block_sizes": [1],
+        "cute_topk_lanes_per_row": lanes,
+        "cute_topk_rows_per_block": 4,
+        "cute_topk_vector_width": 8,
+        "cute_topk_output_vector_width": 4,
+        "cute_topk_selection_layout": layout,
+        "cute_topk_sort_network": "compact_pruned",
+        "cute_topk_value_mode": "decode",
+        "cute_topk_rank_mode": "ordinal",
+    }
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_network_sort(
+    x: torch.Tensor, descending: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor]:
+    values = torch.empty_like(x)
+    indices = torch.empty(x.shape, dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.sort(x[row, :], dim=-1, descending=descending)
+        values[row, :] = vals
+        indices[row, :] = idx
+    return values, indices
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("descending", [False, True])
+def test_sort_uses_register_selection_network(descending: bool) -> None:
+    with FakeTensorMode():
+        x = torch.empty((17, 65), dtype=torch.bfloat16)
+    bound = _row_network_sort._bind_isolated((x, descending))
+    config = bound.config_spec.default_config()
+    config.config.update(_composition_config(8, "distributed"))
+    code = bound.to_code(config)
+    assert "_cute_distributed_topk" in code
+    assert "sort_rank" not in code
+    assert code.count("@cute.kernel") == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("descending", [False, True])
+@pytest.mark.parametrize("width,layout", [(16, "replicated"), (65, "distributed")])
+def test_sort_network_preserves_values_indices_and_ties(
+    dtype: torch.dtype, descending: bool, width: int, layout: str
+) -> None:
+    x = _inputs(width, dtype)
+    original = x.clone()
+    config = _composition_config(4, layout)
+    # Sorting must enforce first-index ties even when a top-k tuning choice
+    # would otherwise distinguish signed zeros or use native float keys.
+    config.update(cute_topk_rank_mode="ordinal")
+    code, (values, indices) = code_and_output(
+        _row_network_sort, (x, descending), **config
+    )
+    assert "sort_rank" not in code
+    expected_values, expected_indices = torch.sort(
+        original, dim=-1, descending=descending, stable=True
+    )
+    torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+    assert torch.equal(values.view(torch.int16), expected_values.view(torch.int16))
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))

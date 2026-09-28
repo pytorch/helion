@@ -1,6 +1,7 @@
 """Register-resident selection networks for CuTe kernels.
 
-Local sorting uses Batcher's odd-even mergesort. Merging retains the bitonic
+Local sorting chooses Batcher's odd-even mergesort or published compact
+networks, optionally pruned to their selected prefix. Merging retains the bitonic
 network construction
 ("Sorting networks and their applications", AFIPS 1968).  Keeping only the
 larger half before each merge implements exact top-k selection.
@@ -14,6 +15,8 @@ import cutlass
 from cutlass import Float32
 from cutlass import Int32
 import cutlass.cute as cute
+
+from .sorting_networks import COMPACT_SORT_LAYERS
 
 
 @functools.cache
@@ -43,11 +46,46 @@ def _odd_even_sort_network(size: int) -> tuple[tuple[int, int], ...]:
     return tuple(comparisons)
 
 
+@functools.cache
+def _sort_network(size: int, network: str) -> tuple[tuple[int, int], ...]:
+    """Use published compact networks when available, Batcher otherwise."""
+    assert network in ("batcher", "compact", "compact_pruned")
+    if network != "batcher" and size in COMPACT_SORT_LAYERS:
+        return tuple(pair for layer in COMPACT_SORT_LAYERS[size] for pair in layer)
+    return _odd_even_sort_network(size)
+
+
+@functools.cache
+def _pruned_sort_network(size: int, k: int) -> tuple[tuple[int, int, bool, bool], ...]:
+    """Keep only comparator outputs contributing to the sorted first k wires.
+
+    Backward liveness propagates through both inputs of every needed min/max.
+    The remaining program is therefore identical on its first k outputs.
+    """
+    assert 0 < k <= size and (k & (k - 1)) == 0
+    live = set(range(k))
+    comparisons: list[tuple[int, int, bool, bool]] = []
+    for left, right in reversed(_sort_network(size, "compact")):
+        keep_left, keep_right = left in live, right in live
+        if keep_left or keep_right:
+            comparisons.append((left, right, keep_left, keep_right))
+            live.update((left, right))
+    return tuple(reversed(comparisons))
+
+
+def _use_pruned_sort_network(size: int, network: str) -> bool:
+    # Bound register/code growth to the published networks. Larger fragments
+    # continue using chunked selection and its general Batcher fallback.
+    return network == "compact_pruned" and size in COMPACT_SORT_LAYERS
+
+
 @cute.jit
-def _sort_descending(keys: cute.Tensor) -> None:
+def _sort_descending(
+    keys: cute.Tensor, network: cutlass.Constexpr[str] = "batcher"
+) -> None:
     max_fn = cute.arch.fmax if cutlass.const_expr(keys.element_type == Float32) else max
     min_fn = cute.arch.fmin if cutlass.const_expr(keys.element_type == Float32) else min
-    for left, right in _odd_even_sort_network(cute.size(keys.shape)):
+    for left, right in _sort_network(cute.size(keys.shape), network):
         a, b = keys.element_type(keys[left]), keys.element_type(keys[right])
         keys[left], keys[right] = max_fn(a, b), min_fn(a, b)
 
@@ -89,6 +127,7 @@ def local_topk(
     keys: cute.Tensor,
     k: cutlass.Constexpr[int],
     lanes_per_row: cutlass.Constexpr[int],
+    sort_network: cutlass.Constexpr[str] = "batcher",
 ) -> cute.Tensor:
     """Return the sorted largest ``k`` keys across a contiguous lane subgroup.
 
@@ -111,16 +150,35 @@ def local_topk(
     assert (lanes_per_row & (lanes_per_row - 1)) == 0
 
     selected = cute.make_rmem_tensor(k, keys.element_type)
-    for index in cutlass.range(k, unroll_full=True):
-        selected[index] = keys[index]
-    _sort_descending(selected)
-
-    for chunk in cutlass.range(1, size // k, unroll_full=True):
-        other = cute.make_rmem_tensor(k, keys.element_type)
+    if cutlass.const_expr(_use_pruned_sort_network(size, sort_network)):
+        work = cute.make_rmem_tensor(size, keys.element_type)
+        for index in cutlass.range_constexpr(size):
+            work[index] = keys[index]
+        max_fn = (
+            cute.arch.fmax if cutlass.const_expr(keys.element_type == Float32) else max
+        )
+        min_fn = (
+            cute.arch.fmin if cutlass.const_expr(keys.element_type == Float32) else min
+        )
+        for left, right, keep_left, keep_right in _pruned_sort_network(size, k):
+            a, b = keys.element_type(work[left]), keys.element_type(work[right])
+            if cutlass.const_expr(keep_left):
+                work[left] = max_fn(a, b)
+            if cutlass.const_expr(keep_right):
+                work[right] = min_fn(a, b)
+        for index in cutlass.range_constexpr(k):
+            selected[index] = work[index]
+    else:
         for index in cutlass.range(k, unroll_full=True):
-            other[index] = keys[chunk * k + index]
-        _sort_descending(other)
-        _merge_topk(selected, other)
+            selected[index] = keys[index]
+        _sort_descending(selected, sort_network)
+
+        for chunk in cutlass.range(1, size // k, unroll_full=True):
+            other = cute.make_rmem_tensor(k, keys.element_type)
+            for index in cutlass.range(k, unroll_full=True):
+                other[index] = keys[chunk * k + index]
+            _sort_descending(other, sort_network)
+            _merge_topk(selected, other)
 
     for stage in cutlass.range(lanes_per_row.bit_length() - 1, unroll_full=True):
         other = cute.make_rmem_tensor(k, keys.element_type)
@@ -156,6 +214,7 @@ def distributed_topk(
     keys: cute.Tensor,
     k: cutlass.Constexpr[int],
     lanes_per_row: cutlass.Constexpr[int],
+    sort_network: cutlass.Constexpr[str] = "batcher",
 ) -> cute.Tensor:
     """Return top-k in cyclic rank order, with at least one key per lane.
 
@@ -169,7 +228,7 @@ def distributed_topk(
     assert k > 0 and (k & (k - 1)) == 0
     assert 0 < lanes_per_row <= 32
     assert (lanes_per_row & (lanes_per_row - 1)) == 0
-    selected = local_topk(keys, min(k, cute.size(keys.shape)), 1)
+    selected = local_topk(keys, min(k, cute.size(keys.shape)), 1, sort_network)
     lane = Int32(cute.arch.thread_idx()[0]) % Int32(lanes_per_row)
     max_fn = cute.arch.fmax if cutlass.const_expr(keys.element_type == Float32) else max
     min_fn = cute.arch.fmin if cutlass.const_expr(keys.element_type == Float32) else min

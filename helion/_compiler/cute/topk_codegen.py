@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ...runtime.cute import sorting_networks as runtime_sorting_networks
 from ...runtime.cute import topk as runtime_topk
 from ..program_id import XYZProgramIDs
 from ..tile_strategy import DeviceGridState
@@ -67,7 +68,10 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
     # The persistent CuTe cache keys generated source rather than imported
     # helper code. Include the helper content in the actual imported symbol.
     helper_hash = hashlib.sha256(
-        (inspect.getsource(runtime_topk)).encode("utf-8")
+        (
+            inspect.getsource(runtime_topk)
+            + inspect.getsource(runtime_sorting_networks)
+        ).encode("utf-8")
     ).hexdigest()[:16]
     helper_function = "distributed_topk" if distributed else "local_topk"
     helper_name = f"_cute_{helper_function}_{helper_hash}"
@@ -397,7 +401,7 @@ topk_keys = cute.make_rmem_tensor({fragment_size}, {key_type})
 topk_keys.fill({key_padding})
 {loads}
 
-topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row})
+topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row}, {plan.sort_network!r})
 {stores}
 """
     statements: list[ast.AST] = []
