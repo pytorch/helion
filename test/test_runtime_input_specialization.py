@@ -543,7 +543,10 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         sources = (state_source, other_source)
         specialization = RuntimeInputSpecialization(
             sources=sources,
-            classifier_identity="state_ring_alias_test",
+            classifier_identity=(
+                "storage_span_disjoint_matrix_v1",
+                tuple(map(repr, sources)),
+            ),
             classifier=_tensor_storage_disjoint_matrix_signature,
             reusable_tensor_properties=frozenset(("storage_span",)),
         )
@@ -555,6 +558,9 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         fake_other = object()
         env = SimpleNamespace(
             input_sources={},
+            bound_runtime_input_specialization_results={
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY: bound_result
+            },
             runtime_arg_values_by_name={
                 "state": current_values[0],
                 "other": current_values[1],
@@ -564,12 +570,6 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             },
             tensor_input_source=lambda tensor: (
                 state_source if tensor is fake_state else other_source
-            ),
-            runtime_input_specialization_matches_bound=(
-                lambda key, result: (
-                    key == _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
-                    and result == bound_result
-                )
             ),
         )
 
@@ -583,11 +583,16 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 )
             )
             current_result = specialization.classifier(current_values)
-            env.runtime_input_specialization_matches_bound = lambda key, result: (
-                key == _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
-                and result == current_result
-            )
+            env.bound_runtime_input_specialization_results[
+                _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+            ] = current_result
             self.assertTrue(
+                runtime_tensors_are_proven_disjoint(
+                    cast("Any", env), cast("Any", fake_state), cast("Any", fake_other)
+                )
+            )
+            env.runtime_arg_values_by_name["other"] = current_values[0]
+            self.assertFalse(
                 runtime_tensors_are_proven_disjoint(
                     cast("Any", env), cast("Any", fake_state), cast("Any", fake_other)
                 )

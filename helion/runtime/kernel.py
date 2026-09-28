@@ -397,6 +397,19 @@ class _PreparedMetadataSpecializationExtractor:
         return self.extractor(args)
 
 
+def _capture_safe_specialization(
+    extractor: Callable[[Sequence[object]], Hashable],
+) -> bool:
+    if isinstance(extractor, _PreparedMetadataSpecializationExtractor):
+        return True
+    if isinstance(extractor, _SpecializationAlias):
+        return all(
+            _capture_safe_specialization(item)
+            for item in extractor.schemas[extractor.canonical_signature]
+        )
+    return False
+
+
 @dataclasses.dataclass(frozen=True)
 class _RuntimeInputSpecializationExtractor:
     """Runtime classifier together with its source projections."""
@@ -2030,7 +2043,17 @@ class Kernel(Generic[_R]):
             and prepared.bound._run is not None
         ):
             return prepared.bound._run(*args)
-        if self._dispatch_cache:
+        # Runtime specialization extractors can inspect pointers/storage offsets.
+        # Capture may reuse metadata-only entries; legacy Dynamo integration
+        # needs their compiled launchers and cannot trace isolated binding.
+        if self._dispatch_cache and (
+            not is_compiling
+            or all(
+                _capture_safe_specialization(extractor)
+                for extractors in self._specialize_extra.values()
+                for extractor in extractors
+            )
+        ):
             # Fast path: repeat call with argument metadata seen before. The
             # cache is only populated by calls that already took the slow
             # path below, so hitting it cannot skip autotuning/compilation.

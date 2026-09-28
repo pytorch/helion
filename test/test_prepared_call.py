@@ -24,6 +24,7 @@ from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfTileIR
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -1073,24 +1074,99 @@ class TestPreparedCall(RefEagerTestDisabled, TestCase):
 
         prepare.assert_called_once()
 
-    def test_compiler_capture_does_not_inspect_prepared_guard(self) -> None:
-        add_one = _make_add_one()
+    def test_compiler_capture_does_not_inspect_eager_dispatch_guards(self) -> None:
+        scale = _make_scale()
         x = torch.randn(64, device=DEVICE)
-        add_one(x)
+        scale(x, 3)
+        self.assertTrue(scale._dispatch_cache)  # type: ignore[attr-defined]
+        self.assertTrue(scale._has_specialization_extras)  # type: ignore[attr-defined]
 
         with (
-            patch.object(
-                torch.compiler, "is_compiling", return_value=True
-            ) as is_compiling,
+            patch.object(torch.compiler, "is_compiling", return_value=True),
             patch.object(
                 kernel_module._PreparedCall,
                 "matches",
                 side_effect=AssertionError("capture inspected prepared state"),
             ),
+            patch.object(
+                scale,
+                "_fast_dispatch_key",
+                side_effect=AssertionError("capture inspected runtime specialization"),
+            ),
         ):
-            out = add_one(x)
-        is_compiling.assert_called_once_with()
-        torch.testing.assert_close(out, x + 1)
+            out = scale(x, 3)
+        torch.testing.assert_close(out, x * 3)
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("legacy torch.compile rejects TileIR launch options")
+    def test_fullgraph_capture_without_fusion_integration_reuses_warm_dispatch(
+        self,
+    ) -> None:
+        for keyed in (False, True):
+            with self.subTest(keyed=keyed):
+
+                @helion.kernel(
+                    static_shapes=True,
+                    config=helion.Config(block_sizes=[64]),
+                    key=(lambda _x: 0) if keyed else None,
+                    torch_compile_fusion=False,
+                )
+                def add_one(x: torch.Tensor) -> torch.Tensor:
+                    out = torch.empty_like(x)
+                    for tile in hl.tile(x.size(0)):
+                        out[tile] = x[tile] + 1
+                    return out
+
+                x = torch.randn(64, device=DEVICE)
+                torch.testing.assert_close(add_one(x), x + 1)
+                self.assertTrue(add_one._dispatch_cache)  # type: ignore[attr-defined]
+                self.assertFalse(add_one._has_specialization_extras)  # type: ignore[attr-defined]
+
+                def call(x: torch.Tensor) -> torch.Tensor:
+                    return add_one(x)
+
+                with patch(
+                    "helion._compiler._dynamo.variables.supports_torch_compile_fusion",
+                    return_value=False,
+                ):
+                    compiled = torch.compile(call, fullgraph=True)
+                    torch.testing.assert_close(compiled(x), x + 1)
+                    y = torch.randn_like(x)
+                    torch.testing.assert_close(compiled(y), y + 1)
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("legacy torch.compile rejects TileIR launch options")
+    def test_fullgraph_capture_without_fusion_integration_keeps_metadata_guards(
+        self,
+    ) -> None:
+        @helion.kernel(
+            static_shapes=False,
+            config=helion.Config(block_sizes=[64]),
+            torch_compile_fusion=False,
+        )
+        def add_size(x: torch.Tensor, bias: float = 1.0) -> torch.Tensor:
+            size = hl.specialize(x.size(0))
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] + size + bias
+            return out
+
+        inputs = [torch.randn(size, device=DEVICE) for size in (64, 96)]
+        for x in inputs:
+            torch.testing.assert_close(add_size(x), x + x.numel() + 1)
+        self.assertTrue(add_size._has_specialization_extras)  # type: ignore[attr-defined]
+        self.assertTrue(add_size._specialization_aliases)  # type: ignore[attr-defined]
+
+        def call(x: torch.Tensor) -> torch.Tensor:
+            return add_size(x)
+
+        with patch(
+            "helion._compiler._dynamo.variables.supports_torch_compile_fusion",
+            return_value=False,
+        ):
+            compiled = torch.compile(call, fullgraph=True, dynamic=False)
+            for x in inputs:
+                torch.testing.assert_close(compiled(x), x + x.numel() + 1)
 
     @unittest.skipUnless(
         supports_torch_compile_fusion(),
