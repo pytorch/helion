@@ -17,11 +17,13 @@ from cutlass import Int32
 import cutlass.cute as cute
 
 from .ordered_key import encode_ordered_key_16 as encode_ordered_topk_key
+from .ordered_key import encode_ordinal_key_pair_16 as encode_ordinal_topk_pair
 from .sorting_networks import COMPACT_SORT_LAYERS
 
 __all__ = [
     "distributed_topk",
     "encode_ordered_topk_key",
+    "encode_ordinal_topk_pair",
     "local_topk",
     "transpose_topk_output",
 ]

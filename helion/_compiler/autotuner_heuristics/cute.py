@@ -5308,13 +5308,13 @@ class CuteTopKHeuristic(AutotunerHeuristic):
             )
             seeds.append(config)
         # Replicated ordinal decoding can avoid irregular value gathers. Add
-        # both encoder implementations at two bounded register-fragment sizes;
+        # all encoder implementations at two bounded register-fragment sizes;
         # these remain unpromoted search hints with the ordinary merge default.
         for target in (32, 64):
             elements_per_lane = max(padded_k, target)
             required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
             lanes = min(32, padded_k, 1 << (required_lanes - 1).bit_length())
-            for encoder in ("dsl", "asm"):
+            for encoder in ("dsl", "asm", "paired"):
                 config = env.config_spec.default_config()
                 config.config.update(
                     cute_topk_lanes_per_row=lanes,

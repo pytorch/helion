@@ -3289,7 +3289,7 @@ def test_topk_seeds_follow_fragment_geometry(
     ]
     legacy = [seed for seed in seeds if not seed["cute_topk_defer_value_gathers"]]
     assert 4 < len(legacy) <= 8
-    assert len(legacy) < len(seeds) <= 12
+    assert len(legacy) < len(seeds) <= 14
     pairs = ConfigGeneration(spec).seed_flat_config_pairs()
     normalized = copy.deepcopy(seeds)
     for config in normalized:
@@ -3520,7 +3520,11 @@ def test_topk_endpoint_encoder_seeds_are_unpromoted(
     assert [
         (seed["cute_topk_lanes_per_row"], seed["cute_topk_key_encoder"])
         for seed in seeds
-    ] == [(lanes, encoder) for lanes in expected_lanes for encoder in ("dsl", "asm")]
+    ] == [
+        (lanes, encoder)
+        for lanes in expected_lanes
+        for encoder in ("dsl", "asm", "paired")
+    ]
     for seed in seeds:
         spec.normalize(copy.deepcopy(seed))
         lanes = seed["cute_topk_lanes_per_row"]
@@ -3548,6 +3552,246 @@ def test_topk_endpoint_encoder_seeds_are_unpromoted(
     ] == normalized
     for flat, config in flattened:
         assert generation.unflatten(flat) == config
+
+
+# Paired top-k tests.
+
+
+def _prmt(word: np.ndarray, selectors: int) -> np.ndarray:
+    result = np.zeros_like(word)
+    for output_byte in range(4):
+        selector = (selectors >> (4 * output_byte)) & 15
+        byte = (word >> (8 * (selector & 3))) & 255
+        if selector & 8:
+            byte = np.where(byte & 128, 255, 0).astype(np.uint32)
+        result |= byte << (8 * output_byte)
+    return result
+
+
+def _lop3(a: np.ndarray, b: np.ndarray, c: int, table: int) -> np.ndarray:
+    result = np.zeros_like(a)
+    for index in range(8):
+        if table & (1 << index):
+            result |= (
+                (a if index & 4 else ~a)
+                & (b if index & 2 else ~b)
+                & np.uint32(c if index & 1 else c ^ 0xFFFFFFFF)
+            )
+    return result
+
+
+@pytest.mark.parametrize("infinity", [0x7C00, 0x7F80])
+@pytest.mark.parametrize("bits", range(1, 16))
+@pytest.mark.parametrize("largest", [False, True])
+def test_paired_ordinal_exhaustive(infinity: int, bits: int, largest: bool) -> None:
+    low = np.arange(65536, dtype=np.uint32)
+    # A bijection exercises every possible word in both halves; additional
+    # extremes catch cross-half carry and mixed finite/exceptional pairs.
+    partners = (
+        (low * 32771 + 1) & 65535,
+        np.zeros_like(low),
+        np.full_like(low, 65535),
+        np.full_like(low, infinity),
+    )
+    bias = 32767 - infinity
+    mask = (1 << bits) - 1
+    for high in partners:
+        words = low | (high << 16)
+        sign = _prmt(words, 0xBB99)
+        rank = _lop3(words, sign, 0x7FFF7FFF, 0x78)
+        magnitude = words & 0x7FFF7FFF
+        assert bool(((magnitude & 65535) + bias < 65536).all())
+        assert bool(((magnitude >> 16) + bias < 65536).all())
+        nan_mask = _prmt(magnitude + np.uint32(bias | (bias << 16)), 0xBB99)
+        rank = _lop3(rank, nan_mask, 0x7FFF7FFF, 0xB8)
+        ranks = (_prmt(rank, 0x9910).view(np.int32), _prmt(rank, 0xBB32).view(np.int32))
+        for actual, word in zip(ranks, (low, high), strict=True):
+            mag = (word & 32767).astype(np.int32)
+            expected = np.where(word & 32768, -1 - mag, mag)
+            expected = np.where(mag > infinity, 32767, expected).astype(np.int32)
+            np.testing.assert_array_equal(actual, expected)
+        for column in (0, (mask // 2) & ~1, mask - 1):
+            for half, (rank, word) in enumerate(zip(ranks, (low, high), strict=True)):
+                ordered = rank if largest else -rank
+                packed = (ordered << bits) | (mask - column - half)
+                restored = packed >> bits
+                if not largest:
+                    restored = -restored
+                np.testing.assert_array_equal(restored, rank)
+                np.testing.assert_array_equal(
+                    mask - (packed & mask), np.full_like(rank, column + half)
+                )
+                recovered = (restored ^ ((restored >> 31) & 32767)) & 65535
+                non_nan = (word & 32767) <= infinity
+                np.testing.assert_array_equal(recovered[non_nan], word[non_nan])
+                assert bool((restored[~non_nan] == 32767).all())
+                if bits <= 9:
+                    np.testing.assert_array_equal(
+                        packed.astype(np.float32).astype(np.int32), packed
+                    )
+                if bits <= 14:
+                    floating = (packed + 0x40000000).view(np.float32)
+                    assert bool(np.isfinite(floating).all())
+                    assert bool((floating > 0).all())
+
+
+@pytest.mark.parametrize(
+    "cols,stride,vector,rank,key,active",
+    [
+        (128, 128, 8, "ordinal", "int32", True),
+        (128, 130, 2, "ordinal", "int32", True),
+        (128, 130, 2, "ordinal", "float32_bits", True),
+        (130, 132, 2, "ordinal", "int32", True),
+        (130, 132, 2, "ordinal", "float32_bits", True),
+        (128, 128, 4, "ordinal", "float32", True),
+        (65, 66, 8, "ordinal", "int32", False),
+        (128, 130, 8, "ordinal", "int32", False),
+        (128, 128, 1, "ordinal", "int32", False),
+        (128, 128, 8, "signed", "int32", False),
+        (128, 128, 8, "ordinal", "float32_native", False),
+        (1, 1, 8, "ordinal", "int32", False),
+    ],
+)
+def test_paired_encoder_codegen_scope(
+    cols: int, stride: int, vector: int, rank: str, key: str, active: bool
+) -> None:
+    code = _code(
+        5,
+        cols,
+        stride,
+        min(cols, 32),
+        4,
+        lanes=2,
+        input_vector=vector,
+        key_encoder="paired",
+        rank_mode=rank,
+        key_dtype=key,
+        value_mode="decode",
+        defer_value_gathers=True,
+    )
+    assert ("_cute_encode_ordinal_pair" in code) == active
+    if cols > 1 and key != "float32_native":
+        assert "_cute_encode_ordered_topk" in code
+    if key == "float32_native":
+        assert "_cute_encode_ordered_topk" not in code
+    if active:
+        if vector == 2:
+            assert "ir.VectorType.get([1], cutlass.Uint32.mlir_type)" not in code
+            assert "dtype=cutlass.Uint32), cutlass.Uint32)" in code
+            assert "(topk_pairs, topk_col," in code
+        else:
+            assert (
+                f"ir.VectorType.get([{vector // 2}], cutlass.Uint32.mlir_type)" in code
+            )
+        assert f"topk_input_bits.iterator.alignment >= {vector * 2}" in code
+        assert "topk_keys[topk_i + 1]" in code
+        assert "_cute_encode_ordered_topk" in code  # Scalar ABI fallback.
+
+
+def test_paired_encoder_keeps_wide_address_math() -> None:
+    code = _code(
+        1, 128, 2**35, 32, 4, lanes=2, key_encoder="paired", rank_mode="ordinal"
+    )
+    assert "_cute_encode_ordinal_pair" in code
+    assert "topk_row * cutlass.Int64(34359738368)" in code
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize(
+    "width,k,padding,offset,vector,key,layout",
+    [
+        (128, 32, 0, 0, 8, "int32", "replicated"),
+        (128, 24, 2, 0, 2, "int32", "distributed"),
+        (128, 24, 2, 0, 2, "float32_bits", "distributed"),
+        (130, 24, 2, 0, 2, "int32", "distributed"),
+        (130, 24, 2, 0, 2, "float32_bits", "distributed"),
+        (65, 6, 1, 1, 4, "float32", "replicated"),
+        (128, 32, 0, 1, 8, "int32", "replicated"),
+    ],
+)
+def test_paired_encoder_exact_selected_bits(
+    dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    largest: bool,
+    width: int,
+    k: int,
+    padding: int,
+    offset: int,
+    vector: int,
+    key: str,
+    layout: str,
+) -> None:
+    rows = 5
+    x, storage = _layout_input(rows, width, dtype, padding, offset)
+    original = storage.clone()
+    value_storage = torch.full((rows * k + offset + 2,), 7, dtype=dtype, device=DEVICE)
+    index_storage = torch.full(
+        (rows * k + offset + 2,), -7, dtype=index_dtype, device=DEVICE
+    )
+    values = value_storage[offset : offset + rows * k].view(rows, k)
+    indices = index_storage[offset : offset + rows * k].view(rows, k)
+    code, _ = code_and_output(
+        _extra_out_topk,
+        (x, values, indices, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=2,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=vector,
+        cute_topk_output_vector_width=4,
+        cute_topk_key_encoder="paired",
+        cute_topk_key_dtype=key,
+        cute_topk_rank_mode="ordinal",
+        cute_topk_value_mode="decode",
+        cute_topk_selection_layout=layout,
+        cute_topk_sort_network="compact_pruned",
+        cute_topk_defer_value_gathers=True,
+    )
+    assert "_cute_local_topk" in code or "_cute_distributed_topk" in code
+    _assert_topk_output(x, values, indices, k, largest, index_dtype=index_dtype)
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+    assert bool((value_storage[:offset] == 7).all()) and bool(
+        (value_storage[offset + rows * k :] == 7).all()
+    )
+    assert bool((index_storage[:offset] == -7).all()) and bool(
+        (index_storage[offset + rows * k :] == -7).all()
+    )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("largest", [False, True])
+def test_paired_encoder_same_bound_alignment_transition(
+    dtype: torch.dtype, largest: bool
+) -> None:
+    rows, width, k = 5, 128, 32
+    _, source = _layout_input(rows, width, dtype, 0, 0)
+    storage = torch.cat((source, source[-1:]))
+    values = torch.empty((rows, k), dtype=dtype, device=DEVICE)
+    indices = torch.empty((rows, k), dtype=torch.int32, device=DEVICE)
+    x = storage[: rows * width].view(rows, width)
+    bound = _extra_out_topk._bind_isolated((x, values, indices, k, largest))
+    bound.set_config(
+        helion.Config(
+            block_sizes=[1],
+            cute_topk_lanes_per_row=2,
+            cute_topk_rows_per_block=4,
+            cute_topk_vector_width=8,
+            cute_topk_output_vector_width=4,
+            cute_topk_key_encoder="paired",
+            cute_topk_rank_mode="ordinal",
+            cute_topk_value_mode="decode",
+            cute_topk_defer_value_gathers=True,
+        )
+    )
+    for offset in (0, 1, 0):
+        x = storage[offset : offset + rows * width].view(rows, width)
+        bound(x, values, indices, k, largest)
+        _assert_topk_output(x, values, indices, k, largest, index_dtype=torch.int32)
 
 
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
