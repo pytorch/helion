@@ -445,6 +445,65 @@ for topk_j in cutlass.range_constexpr({output_groups}):
         cute.autovec_copy(topk_value_fragment, topk_value_destination)
         cute.autovec_copy(topk_index_fragment, topk_index_destination)
 """
+        if (
+            plan.defer_value_gathers
+            and not native_float
+            and plan.rank_mode == "ordinal"
+            and plan.value_mode == "decode"
+            and vector_output_guard == "True"
+        ):
+            undo_output_reverse = (
+                "topk_value_rank = -topk_value_rank" if not plan.largest else ""
+            )
+            # Each lane owns increasing global sorted ranks across j/v.
+            # Original ordinal ranks therefore attain their maximum at the
+            # first output for largest=True, the last for largest=False.
+            # Use the valid output length, which can differ from padded_k/L.
+            endpoint = 0 if plan.largest else output_groups * output_vector - 1
+            endpoint_key = output_key.replace(
+                f"topk_j * {output_vector} + topk_v", str(endpoint)
+            )
+            endpoint_rank = f"(({endpoint_key}) >> cutlass.Int32({index_bits}))"
+            if not plan.largest:
+                endpoint_rank = f"-({endpoint_rank})"
+            vector_stores = f"""
+{vector_setup}
+if topk_valid_row:
+    topk_value_fragments = cute.make_rmem_tensor(({output_vector}, {output_groups}), {value_dtype})
+    topk_index_fragments = cute.make_rmem_tensor(({output_vector}, {output_groups}), {output_index_dtype})
+    topk_output_max_rank = {endpoint_rank}
+    for topk_j in cutlass.range_constexpr({output_groups}):
+        for topk_v in cutlass.range_constexpr({output_vector}):
+            topk_selected_key = {output_key}
+            topk_value_rank = topk_selected_key >> cutlass.Int32({index_bits})
+{textwrap.indent(undo_output_reverse, "            ")}
+            topk_value_bits = topk_value_rank ^ ((topk_value_rank >> cutlass.Int32(31)) & cutlass.Int32(32767))
+            topk_value_fragments[topk_v, topk_j] = cutlass.Uint16(topk_value_bits).bitcast({value_dtype})
+            topk_index_fragments[topk_v, topk_j] = {output_index_dtype}({selected_index("topk_selected_key")})
+    if topk_output_max_rank == cutlass.Int32(32767):
+        for topk_j in cutlass.range_constexpr({output_groups}):
+            for topk_v in cutlass.range_constexpr({output_vector}):
+                topk_selected_key = {output_key}
+                topk_value_rank = topk_selected_key >> cutlass.Int32({index_bits})
+{textwrap.indent(undo_output_reverse, "                ")}
+                if topk_value_rank == cutlass.Int32(32767):
+                    topk_selected_index = topk_index_fragments[topk_v, topk_j]
+                    topk_value_fragments[topk_v, topk_j] = {x}[topk_row, topk_selected_index]
+    for topk_j in cutlass.range_constexpr({output_groups}):
+        topk_output_col = cutlass.Int32(topk_j * {group_width}) + {output_lane} * cutlass.Int32({output_vector})
+        topk_output_offset = topk_row * {index_type}({plan.k}) + {index_type}(topk_output_col)
+        topk_output_offset = cute.assume(topk_output_offset, divby={output_vector})
+        topk_value_destination = cute.make_tensor(
+            {values}.iterator + topk_output_offset,
+            cute.make_layout({output_vector}, stride=1),
+        )
+        topk_index_destination = cute.make_tensor(
+            {indices}.iterator + topk_output_offset,
+            cute.make_layout({output_vector}, stride=1),
+        )
+        cute.autovec_copy(topk_value_fragments[None, topk_j], topk_value_destination)
+        cute.autovec_copy(topk_index_fragments[None, topk_j], topk_index_destination)
+"""
         # Launcher schemas specialize the actual pointer alignment, including
         # shifted out-parameters. Larger vectors use multiple 128-bit stores.
         stores = (

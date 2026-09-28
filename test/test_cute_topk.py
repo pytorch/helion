@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
+import gc
 import itertools
 import random
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from typing import Any
 from unittest.mock import patch
 
@@ -18,6 +21,9 @@ import helion
 from helion import exc
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+from helion._compiler.cute.topk import match_topk_root
+from helion._compiler.cute.topk import topk_tensors_are_proven_disjoint
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
@@ -25,6 +31,9 @@ from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -1127,6 +1136,7 @@ def _code(
             cute_topk_selection_layout=selection_layout,
             cute_topk_sort_network=sort_network,
             cute_topk_key_encoder=key_encoder,
+            cute_topk_defer_value_gathers=defer_value_gathers,
         )
         return bound.to_triton_code(config)
 
@@ -2216,8 +2226,435 @@ def test_ordered_key_asm_codegen_scope(
         )
 
 
+# Packed rare top-k tests.
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_bits", range(16))
+@pytest.mark.parametrize("largest", [False, True])
+def test_packed_rare_exhaustive(
+    dtype: torch.dtype, index_bits: int, largest: bool
+) -> None:
+    words = ((torch.arange(65536, dtype=torch.int32) * 32771) & 65535).reshape(-1, 16)
+    magnitude = words & 32767
+    infinity = 0x7F80 if dtype == torch.bfloat16 else 0x7C00
+    original_rank = torch.where(words < 32768, magnitude, -1 - magnitude)
+    original_rank = torch.where(magnitude > infinity, 32767, original_rank)
+    mask = (1 << index_bits) - 1
+    for column in (0, mask // 2, mask):
+        ranked = original_rank if largest else -original_rank
+        packed = (ranked << index_bits) | (mask - column)
+        for key_dtype in ("int32", "float32", "float32_bits"):
+            if key_dtype == "float32" and index_bits <= 9:
+                selected = packed.float().to(torch.int32)
+            elif key_dtype == "float32_bits" and index_bits <= 14:
+                selected = (packed + 0x40000000).view(torch.float32).view(
+                    torch.int32
+                ) - 0x40000000
+            else:
+                selected = packed
+            rank = selected >> index_bits
+            if not largest:
+                rank = -rank
+            assert torch.equal(rank, original_rank)
+            branch = rank.amax(dim=-1, keepdim=True) == 32767
+            exceptional = magnitude > infinity
+            assert torch.equal(branch, exceptional.any(dim=-1, keepdim=True))
+            ordered_rank = selected.sort(dim=-1, descending=True).values >> index_bits
+            if not largest:
+                ordered_rank = -ordered_rank
+            endpoint = ordered_rank[:, :1] if largest else ordered_rank[:, -1:]
+            assert torch.equal(endpoint, rank.amax(dim=-1, keepdim=True))
+            assert torch.equal(endpoint == 32767, branch)
+            direct = (rank ^ ((rank >> 31) & 32767)).to(torch.int16)
+            repaired = torch.where(
+                branch & (rank == 32767), words.to(torch.int16), direct
+            )
+            assert torch.equal(repaired, words.to(torch.int16))
+            assert bool((mask - (selected & mask) == column).all())
+
+
+@pytest.mark.parametrize(
+    "key,default,valid,invalid",
+    [
+        ("cute_topk_key_encoder", "dsl", "asm", True),
+        ("cute_topk_key_encoder", "dsl", "dsl", "unknown"),
+        ("cute_topk_defer_value_gathers", False, True, 1),
+        ("cute_topk_defer_value_gathers", False, False, "true"),
+    ],
+)
+def test_packed_rare_config(
+    key: str,
+    default: object,
+    valid: object,
+    invalid: object,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("helion.autotuner.config_spec.get_num_xcd", lambda device: 1)
+    spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0), num_sm=1)
+    with pytest.raises(exc.InvalidConfig, match="compatible top-k root"):
+        spec.normalize({key: valid})
+    spec.enable_cute_topk_search()
+    assert spec.default_config()[key] == default
+    config = helion.Config()
+    config.config[key] = valid
+    spec.normalize(config)
+    generation = ConfigGeneration(spec)
+    assert generation.unflatten(generation.flatten(config)) == config
+    invalid_config = helion.Config()
+    invalid_config.config[key] = invalid
+    with pytest.raises(exc.InvalidConfig, match="must be one of"):
+        spec.normalize(invalid_config)
+    spec.normalize(invalid_config, _fix_invalid=True)
+    assert invalid_config[key] == default
+
+
+@pytest.mark.parametrize(
+    "width,k,lanes,vector,layout,key_dtype,rank_mode,value_mode,active",
+    [
+        (128, 32, 2, 4, "replicated", "int32", "ordinal", "decode", True),
+        (128, 24, 2, 4, "replicated", "float32_bits", "ordinal", "decode", True),
+        (128, 32, 4, 4, "distributed", "float32", "ordinal", "decode", True),
+        (128, 12, 2, 4, "replicated", "int32", "ordinal", "decode", False),
+        (64, 6, 2, 2, "distributed", "int32", "ordinal", "decode", False),
+        (128, 32, 2, 1, "replicated", "int32", "ordinal", "decode", False),
+        (128, 32, 2, 4, "replicated", "float32_native", "ordinal", "decode", False),
+        (128, 32, 2, 4, "replicated", "int32", "ordinal", "gather", False),
+        (128, 32, 2, 4, "replicated", "int32", "signed", "decode", False),
+        (32768, 32, 2, 4, "replicated", "float32_native", "ordinal", "decode", True),
+    ],
+)
+@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
+@pytest.mark.parametrize("largest", [False, True])
+def test_packed_rare_codegen_guard(
+    width: int,
+    k: int,
+    lanes: int,
+    vector: int,
+    layout: str,
+    key_dtype: str,
+    rank_mode: str,
+    value_mode: str,
+    active: bool,
+    key_encoder: str,
+    largest: bool,
+) -> None:
+    code = _code(
+        5,
+        width,
+        width + 2,
+        k,
+        vector,
+        largest=largest,
+        lanes=lanes,
+        key_dtype=key_dtype,
+        rank_mode=rank_mode,
+        value_mode=value_mode,
+        selection_layout=layout,
+        key_encoder=key_encoder,
+        defer_value_gathers=True,
+    )
+    assert ("topk_output_max_rank" in code) == active
+    if not active:
+        return
+    branch = next(
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "topk_output_max_rank == cutlass.Int32(32767)"
+    )
+    text = ast.unparse(branch)
+    assert (
+        "transpose" not in text and "shuffle" not in text and "autovec_copy" not in text
+    )
+    assert "x[topk_row, topk_selected_index]" in text
+    assert ("topk_value_rank = -topk_value_rank" in text) == (not largest)
+    assert code.index("topk_selected =") < code.index("if topk_output_max_rank")
+    if layout == "distributed":
+        assert code.index("topk_output_keys = _cute_transpose") < code.index(
+            "if topk_valid_row:"
+        )
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_packed_rare_wide_addresses(index_dtype: torch.dtype) -> None:
+    code = _code(
+        1,
+        128,
+        2**35,
+        32,
+        4,
+        lanes=2,
+        index_dtype=index_dtype,
+        rank_mode="ordinal",
+        value_mode="decode",
+        defer_value_gathers=True,
+    )
+    assert "topk_output_max_rank" in code
+    assert "topk_row = cutlass.Int64(" in code
+    assert "topk_output_offset = topk_row * cutlass.Int64(32)" in code
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
+@pytest.mark.parametrize(
+    "width,k,lanes,vector,layout,key_dtype,offset",
+    [
+        (128, 32, 2, 4, "replicated", "int32", 0),
+        (128, 128, 4, 8, "distributed", "float32_bits", 0),
+        (65, 8, 2, 2, "distributed", "float32", 0),
+        (64, 6, 2, 2, "distributed", "int32", 1),
+    ],
+)
+def test_packed_rare_exact_bits(
+    dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    largest: bool,
+    key_encoder: str,
+    width: int,
+    k: int,
+    lanes: int,
+    vector: int,
+    layout: str,
+    key_dtype: str,
+    offset: int,
+) -> None:
+    rows = 514 if k == 128 else 5
+    x, storage = _layout_input(rows, width, dtype, 2 if offset else 0, offset)
+    if k == 128:
+        x[2:].copy_(
+            torch.arange(65536, dtype=torch.int32)
+            .to(torch.int16)
+            .view(dtype)
+            .reshape(-1, width)
+        )
+    else:
+        x[2].fill_(1)
+        x[3].fill_(float("inf"))
+        x[3, 1::2] = -float("inf")
+        nan_words = [0x7FC1, -46] if dtype == torch.bfloat16 else [0x7E01, -478]
+        x[4].copy_(
+            torch.tensor(nan_words, dtype=torch.int16)
+            .view(dtype)
+            .repeat((width + 1) // 2)[:width]
+        )
+    original = storage.clone()
+    value_storage = torch.full((rows * k + offset + 2,), 7, dtype=dtype, device="cuda")
+    index_storage = torch.full(
+        (rows * k + offset + 2,), -7, dtype=index_dtype, device="cuda"
+    )
+    values = value_storage[offset : offset + rows * k].view(rows, k)
+    indices = index_storage[offset : offset + rows * k].view(rows, k)
+    code, _ = code_and_output(
+        _extra_out_topk,
+        (x, values, indices, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=lanes,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=vector,
+        cute_topk_selection_layout=layout,
+        cute_topk_value_mode="decode",
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode="ordinal",
+        cute_topk_sort_network="compact_pruned",
+        cute_topk_key_encoder=key_encoder,
+        cute_topk_defer_value_gathers=True,
+    )
+    assert ("topk_output_max_rank" in code) == (k != 6)
+    _assert_topk_output(x, values, indices, k, largest, index_dtype=index_dtype)
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+    assert bool((value_storage[:offset] == 7).all())
+    assert bool((value_storage[offset + rows * k :] == 7).all())
+    assert bool((index_storage[:offset] == -7).all())
+    assert bool((index_storage[offset + rows * k :] == -7).all())
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize("key_encoder", ["dsl", "asm"])
+def test_packed_rare_alignment_transition(
+    index_dtype: torch.dtype, layout: str, key_encoder: str
+) -> None:
+    rows, width, k = 5, 128, 32
+    x, storage = _layout_input(rows, width, torch.bfloat16, 0, 0)
+    original = storage.clone()
+    value_storage = torch.empty(rows * k + 2, dtype=torch.bfloat16, device="cuda")
+    index_storage = torch.empty(rows * k + 2, dtype=index_dtype, device="cuda")
+    values = value_storage[: rows * k].view(rows, k)
+    indices = index_storage[: rows * k].view(rows, k)
+    bound = _extra_out_topk._bind_isolated((x, values, indices, k, True))
+    bound.set_config(
+        helion.Config(
+            block_sizes=[1],
+            cute_topk_lanes_per_row=4,
+            cute_topk_rows_per_block=4,
+            cute_topk_vector_width=8,
+            cute_topk_output_vector_width=4,
+            cute_topk_selection_layout=layout,
+            cute_topk_key_dtype="int32",
+            cute_topk_rank_mode="ordinal",
+            cute_topk_key_encoder=key_encoder,
+            cute_topk_value_mode="decode",
+            cute_topk_defer_value_gathers=True,
+        )
+    )
+    for value_offset, index_offset in ((0, 0), (0, 1), (1, 0), (1, 1), (0, 0)):
+        value_storage.fill_(7)
+        index_storage.fill_(-7)
+        values = value_storage[value_offset : value_offset + rows * k].view(rows, k)
+        indices = index_storage[index_offset : index_offset + rows * k].view(rows, k)
+        bound(x, values, indices, k, True)
+        _assert_topk_output(x, values, indices, k, index_dtype=index_dtype)
+        assert bool((value_storage[:value_offset] == 7).all())
+        assert bool((value_storage[value_offset + rows * k :] == 7).all())
+        assert bool((index_storage[:index_offset] == -7).all())
+        assert bool((index_storage[index_offset + rows * k :] == -7).all())
+        assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+
+
+# Endpoints top-k tests.
+
+
+@pytest.mark.parametrize(
+    "k,lanes,requested,layout,last",
+    [
+        (24, 2, 4, "replicated", 11),
+        (32, 4, 4, "distributed", 7),
+        (8, 2, 8, "distributed", 3),
+    ],
+)
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("key_dtype", ["int32", "float32", "float32_bits"])
+@pytest.mark.parametrize("encoder", ["dsl", "asm"])
+def test_packed_endpoint_codegen(
+    k: int,
+    lanes: int,
+    requested: int,
+    layout: str,
+    last: int,
+    largest: bool,
+    key_dtype: str,
+    encoder: str,
+) -> None:
+    code = _code(
+        5,
+        128,
+        128,
+        k,
+        requested,
+        lanes=lanes,
+        largest=largest,
+        key_dtype=key_dtype,
+        key_encoder=encoder,
+        rank_mode="ordinal",
+        value_mode="decode",
+        selection_layout=layout,
+        defer_value_gathers=True,
+    )
+    assignments = [
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "topk_output_max_rank"
+    ]
+    assert len(assignments) == 1
+    expression = assignments[0].value
+    reads = [
+        node
+        for node in ast.walk(expression)
+        if isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "topk_output_keys"
+    ]
+    assert len(reads) == 1
+    assert ast.literal_eval(reads[0].slice) == (0 if largest else last)
+    assert isinstance(expression, ast.UnaryOp) == (not largest)
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "max"
+        for node in ast.walk(expression)
+    )
+    assert "max(topk_output_max_rank" not in code
+    if layout == "distributed" and key_dtype == "float32_bits":
+        assert ".bitcast(cutlass.Int32) - cutlass.Int32(1073741824)" in ast.unparse(
+            expression
+        )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+@pytest.mark.parametrize("encoder", ["dsl", "asm"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_packed_endpoint_non_power_two_k(
+    dtype: torch.dtype,
+    index_dtype: torch.dtype,
+    largest: bool,
+    encoder: str,
+    offset: int,
+) -> None:
+    rows, width, k = 5, 128, 24
+    x, storage = _layout_input(rows, width, dtype, 2 if offset else 0, offset)
+    nan_word = -46 if dtype == torch.bfloat16 else -478
+    nan = torch.tensor([nan_word], dtype=torch.int16, device="cuda").view(dtype)[0]
+    # Only one output-owning lane needs a NaN repair. For smallest top-k,
+    # exactly k-1 finite inputs put the selected NaN at the last valid rank.
+    if largest:
+        x[2].copy_(torch.arange(width, dtype=dtype, device="cuda"))
+        x[2, -1] = nan
+    else:
+        x[2].copy_(nan.expand(width))
+        x[2, : k - 1].copy_(torch.arange(k - 1, dtype=dtype, device="cuda"))
+    x[3].fill_(float("inf"))
+    x[3, 1::2] = -float("inf")
+    original = storage.clone()
+    values_storage = torch.full((rows * k + offset + 2,), 7, dtype=dtype, device="cuda")
+    indices_storage = torch.full(
+        (rows * k + offset + 2,), -7, dtype=index_dtype, device="cuda"
+    )
+    values = values_storage[offset : offset + rows * k].view(rows, k)
+    indices = indices_storage[offset : offset + rows * k].view(rows, k)
+    code, _ = code_and_output(
+        _extra_out_topk,
+        (x, values, indices, k, largest),
+        block_sizes=[1],
+        cute_topk_lanes_per_row=2,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=4,
+        cute_topk_key_dtype="int32",
+        cute_topk_rank_mode="ordinal",
+        cute_topk_value_mode="decode",
+        cute_topk_selection_layout="replicated",
+        cute_topk_key_encoder=encoder,
+        cute_topk_defer_value_gathers=True,
+    )
+    assert "topk_output_keys[0]" in code if largest else "topk_output_keys[11]" in code
+    _assert_topk_output(x, values, indices, k, largest, index_dtype=index_dtype)
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+    assert bool((values_storage[:offset] == 7).all())
+    assert bool((values_storage[offset + rows * k :] == 7).all())
+    assert bool((indices_storage[:offset] == -7).all())
+    assert bool((indices_storage[offset + rows * k :] == -7).all())
+
+
+# Alias cache top-k tests.
+
+
 @pytest.fixture
-def cpu_codegen() -> Any:
+def cpu_codegen() -> Iterator[None]:
     with (
         patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
         patch(
@@ -2231,6 +2668,249 @@ def cpu_codegen() -> Any:
         patch("helion._compat._is_hip", return_value=False),
     ):
         yield
+
+
+def _new_kernel() -> helion.Kernel[Any]:
+    return helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")(
+        _extra_out_topk.fn
+    )
+
+
+def _config(encoder: str) -> helion.Config:
+    return helion.Config(
+        block_sizes=[1],
+        cute_topk_lanes_per_row=2,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=4,
+        cute_topk_value_mode="decode",
+        cute_topk_key_dtype="int32",
+        cute_topk_rank_mode="ordinal",
+        cute_topk_selection_layout="replicated",
+        cute_topk_sort_network="compact_pruned",
+        cute_topk_key_encoder=encoder,
+        cute_topk_defer_value_gathers=True,
+    )
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("retain_input", [False, True])
+def test_cached_topk_recompiles_after_construction_tensors_expire(
+    retain_input: bool,
+) -> None:
+    kernel = _new_kernel()
+
+    def first_binding() -> tuple[Any, torch.Tensor | None]:
+        x = torch.empty((5, 128), dtype=torch.bfloat16)
+        values = torch.empty((5, 32), dtype=x.dtype)
+        indices = torch.empty((5, 32), dtype=torch.int32)
+        bound = kernel.bind((x, values, indices, 32, True))
+        assert "topk_output_max_rank" in bound.to_triton_code(_config("dsl"))
+        return bound, x if retain_input else None
+
+    bound, retained = first_binding()
+    gc.collect()
+    assert sum(
+        ref() is not None for ref in bound._runtime_tensor_refs_by_name.values()
+    ) == int(retain_input)
+    assert bound.env.runtime_arg_values_by_name == {}
+    x = torch.empty((5, 128), dtype=torch.bfloat16)
+    values = torch.empty((5, 32), dtype=x.dtype)
+    indices = torch.empty((5, 32), dtype=torch.int32)
+    assert kernel.bind((x, values, indices, 32, True)) is bound
+    code = bound.to_triton_code(_config("asm"))
+    assert "topk_output_max_rank" in code
+    assert "_cute_encode_ordered_topk" in code
+    assert (retained is not None) == retain_input
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("alias_kind", ["view", "dlpack"])
+@pytest.mark.parametrize("width", [1, 32])
+def test_cached_topk_alias_binding_stays_rejected_after_release(
+    alias_kind: str, width: int
+) -> None:
+    kernel = _new_kernel()
+
+    def bind_pair() -> tuple[Any, Any]:
+        x = torch.empty((5, width), dtype=torch.bfloat16)
+        values = torch.empty_like(x)
+        indices = torch.empty((5, width), dtype=torch.int32)
+        disjoint = kernel.bind((x, values, indices, width, True))
+        alias = x.view_as(x) if alias_kind == "view" else torch.from_dlpack(x)
+        overlapping = kernel.bind((x, alias, indices, width, True))
+        assert overlapping is not disjoint
+        return disjoint, overlapping
+
+    disjoint, overlapping = bind_pair()
+    gc.collect()
+    for bound, expected in ((disjoint, True), (overlapping, False)):
+        assert all(ref() is None for ref in bound._runtime_tensor_refs_by_name.values())
+        assert bound.config_spec.cute_topk_search_enabled == expected
+        assert (
+            "cute_topk_lanes_per_row" in bound.config_spec.default_config()
+        ) == expected
+        code = bound.to_triton_code(bound.config_spec.default_config())
+        assert ("_cute_local_topk" in code) == expected
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+def test_singleton_topk_search_and_recompile_after_input_release(
+    dtype: torch.dtype, index_dtype: torch.dtype, largest: bool
+) -> None:
+    kernel = _new_kernel()
+    config = helion.Config(
+        block_sizes=[1],
+        cute_topk_lanes_per_row=1,
+        cute_topk_rows_per_block=4,
+        cute_topk_vector_width=8,
+        cute_topk_output_vector_width=1,
+    )
+
+    def first_binding() -> Any:
+        x = torch.empty((5, 1), dtype=dtype)
+        values = torch.empty_like(x)
+        indices = torch.empty((5, 1), dtype=index_dtype)
+        bound = kernel.bind((x, values, indices, 1, largest))
+        assert bound.config_spec.cute_topk_search_enabled
+        assert "_cute_local_topk" in bound.to_triton_code(config)
+        return bound
+
+    bound = first_binding()
+    gc.collect()
+    assert all(ref() is None for ref in bound._runtime_tensor_refs_by_name.values())
+    assert bound.env.runtime_arg_values_by_name == {}
+    x = torch.empty((5, 1), dtype=dtype)
+    values = torch.empty_like(x)
+    indices = torch.empty((5, 1), dtype=index_dtype)
+    assert kernel.bind((x, values, indices, 1, largest)) is bound
+    config.config["cute_topk_vector_width"] = 4
+    assert "_cute_local_topk" in bound.to_triton_code(config)
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "none",
+        "missing",
+        "identity",
+        "sources",
+        "properties",
+        "length",
+        "nonbool",
+        "live_alias",
+        "partial_live_alias",
+    ],
+)
+def test_cached_topk_alias_fact_requires_matching_descriptor(damage: str) -> None:
+    x = torch.empty((5, 32), dtype=torch.bfloat16)
+    values = torch.empty_like(x)
+    indices = torch.empty((5, 32), dtype=torch.int32)
+    bound = _new_kernel().bind((x, values, indices, 32, True))
+    env = bound.env
+    key = _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+    descriptor = env.runtime_input_specializations[key]
+    if damage == "missing":
+        env.bound_runtime_input_specialization_results.clear()
+    elif damage in ("identity", "sources", "properties"):
+        changes: dict[str, Any] = {
+            "identity": {"classifier_identity": "other"},
+            "sources": {"sources": descriptor.sources[::-1]},
+            "properties": {"reusable_tensor_properties": frozenset()},
+        }[damage]
+        env.runtime_input_specializations[key] = dataclasses.replace(
+            descriptor, **changes
+        )
+    elif damage == "length":
+        env.bound_runtime_input_specialization_results[key] = (True,)
+    elif damage == "nonbool":
+        env.bound_runtime_input_specialization_results[key] = (1, True, True)
+    live_args: dict[str, object] = {}
+    if damage in ("live_alias", "partial_live_alias"):
+        live_args = {"x": x, "values": torch.from_dlpack(x)}
+        if damage == "live_alias":
+            live_args["indices"] = indices
+    host = bound.host_function
+    assert host is not None
+    with env, host, env.use_runtime_arg_values(live_args):
+        candidate = match_topk_root(
+            host.device_ir.graphs,
+            noncanonical_block_ids=host.device_ir.noncanonical_task_origin_block_ids,
+        )
+        assert candidate is not None
+        assert topk_tensors_are_proven_disjoint(candidate, env) == (damage == "none")
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize(
+    "damage",
+    ["none", "alias", "missing_argument", "identity", "bound_false", "bound_none"],
+)
+def test_search_alias_proof_requires_registered_live_facts(damage: str) -> None:
+    x = torch.empty((5, 32), dtype=torch.bfloat16)
+    values = torch.empty_like(x)
+    indices = torch.empty((5, 32), dtype=torch.int32)
+    bound = _new_kernel().bind((x, values, indices, 32, True))
+    env = bound.env
+    key = _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+    env.bound_runtime_input_specialization_results.clear()
+    runtime_args: dict[str, object] = {"x": x, "values": values, "indices": indices}
+    if damage == "alias":
+        runtime_args["values"] = torch.from_dlpack(x)
+    elif damage == "missing_argument":
+        runtime_args.pop("values")
+    elif damage == "identity":
+        env.runtime_input_specializations[key] = dataclasses.replace(
+            env.runtime_input_specializations[key], classifier_identity="other"
+        )
+    elif damage == "bound_false":
+        env.bound_runtime_input_specialization_results[key] = (False, False, False)
+    elif damage == "bound_none":
+        env.bound_runtime_input_specialization_results[key] = None
+    host = bound.host_function
+    assert host is not None
+    with env, host, env.use_runtime_arg_values(runtime_args):
+        candidate = match_topk_root(
+            host.device_ir.graphs,
+            noncanonical_block_ids=host.device_ir.noncanonical_task_origin_block_ids,
+        )
+        assert candidate is not None
+        assert not topk_tensors_are_proven_disjoint(candidate, env)
+        assert topk_tensors_are_proven_disjoint(candidate, env, allow_unbound=True) == (
+            damage == "none"
+        )
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("largest", [False, True])
+def test_cached_topk_recompiles_exact_values_after_input_release(
+    dtype: torch.dtype, index_dtype: torch.dtype, largest: bool
+) -> None:
+    kernel = _new_kernel()
+
+    def run(encoder: str) -> Any:
+        x, storage = _layout_input(5, 128, dtype, 0, 0)
+        values = torch.empty((5, 32), dtype=dtype, device="cuda")
+        indices = torch.empty((5, 32), dtype=index_dtype, device="cuda")
+        args = (x, values, indices, 32, largest)
+        bound = kernel.bind(args)
+        code, _ = code_and_output(kernel, args, **_config(encoder).config)
+        assert "topk_output_max_rank" in code
+        _assert_topk_output(x, values, indices, 32, largest, index_dtype=index_dtype)
+        assert torch.equal(x.view(torch.int16), storage.view(5, 128).view(torch.int16))
+        return bound
+
+    first = run("dsl")
+    gc.collect()
+    assert all(ref() is None for ref in first._runtime_tensor_refs_by_name.values())
+    assert run("asm") is first
 
 
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
