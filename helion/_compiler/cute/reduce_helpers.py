@@ -880,8 +880,10 @@ def _cute_grouped_reduce_cluster_body(
     Every warp's partial is warp-reduced, then pushed into EVERY peer CTA's
     SMEM receive buffer with ``st.async`` + an mbarrier transaction count;
     after the mbarrier wait each CTA folds all ``warps * cluster_n``
-    partials locally.  Each (textual) call site must execute exactly once
-    per kernel — the mbarrier is single-phase.
+    partials locally.  Small exchanges use a serial fold; larger exchanges
+    distribute the slots over warp lanes and finish with a warp reduction.
+    Each (textual) call site must execute exactly once per kernel — the
+    mbarrier is single-phase.
 
     ``buf_ptr`` (``warps * cluster_n`` Float32 slots) and ``mbar_ptr`` (one
     Int64 mbarrier, arrival count 1) must be allocated and initialized in
@@ -915,9 +917,15 @@ def _cute_grouped_reduce_cluster_body(
         )
     cute.arch.mbarrier_wait(mbar, phase=0)
     result = identity
-    for i in cutlass.range_constexpr(slots):
-        result = combine(result, buf[i])
-    return result
+    if cutlass.const_expr(slots <= 8):
+        for i in cutlass.range_constexpr(slots):
+            result = combine(result, buf[i])
+        return result
+    for i in cutlass.range_constexpr((slots + 31) // 32):
+        slot = lane + i * 32
+        if slot < slots:
+            result = combine(result, buf[slot])
+    return warp_op(result, threads_in_group=32)
 
 
 _CLUSTER_DISPATCH = {

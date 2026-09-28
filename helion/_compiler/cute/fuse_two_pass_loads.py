@@ -545,6 +545,7 @@ def _rewrite_vec_extract(
     vec_w: int,
     *,
     use_smem: bool = False,
+    pack_u16: bool = False,
     cache_size: int = 1,
     tid_expr: str = "cutlass.Int32(cute.arch.thread_idx()[0])",
 ) -> None:
@@ -567,9 +568,16 @@ def _rewrite_vec_extract(
                 inner = f"({idx_expr}) * {vec_w} + ({vi_text})"
                 if use_smem:
                     slot = f"({tid_expr}) * {cache_size * vec_w} + ({inner})"
+                    value = f"{cache}[{slot}]"
+                elif pack_u16:
+                    word = f"({inner}) // 2"
+                    slot = word
+                    shift = f"cutlass.Uint32((({inner}) % 2) * 16)"
+                    value = f"cutlass.Uint16({cache}[{slot}] >> {shift})"
                 else:
                     slot = inner
-                new = ast.parse(f"{cache}[{slot}]").body[0]
+                    value = f"{cache}[{slot}]"
+                new = ast.parse(value).body[0]
                 assert isinstance(new, ast.Expr)
                 return new.value
             return node
@@ -710,6 +718,34 @@ class _CuteFuseTwoPassLoads:
                     definitions[target] = stmt.value
         return definitions
 
+    def _load_scope_definitions(
+        self,
+        loop: ast.For,
+        container: list[ast.stmt],
+        inherited: dict[str, ast.expr],
+    ) -> dict[str, ast.expr]:
+        """Include dominating definitions from every enclosing lane loop."""
+        definitions = dict(inherited)
+        while True:
+            # A value assigned in this loop may be carried from a prior
+            # iteration. Do not substitute its pre-loop definition.
+            writes = set(ReadWrites.from_ast(loop).writes)
+            while stale := {
+                name
+                for name, value in definitions.items()
+                if name in writes or ReadWrites.from_ast(value).reads.keys() & writes
+            }:
+                writes = writes | stale
+                for name in stale:
+                    definitions.pop(name)
+            if loop.body is container:
+                return definitions
+            child = next(stmt for stmt in loop.body if isinstance(stmt, ast.For))
+            definitions = self._pure_definitions_before(
+                loop.body, loop.body.index(child), definitions
+            )
+            loop = child
+
     @staticmethod
     def _reduction_block_id(loop: ast.For) -> int | None:
         if not isinstance(loop.target, ast.Name):
@@ -827,10 +863,10 @@ class _CuteFuseTwoPassLoads:
           B) One nested for-loop (lane loop): ``for lane in range(K)`` —
              cache index is ``(offset - start) // step * K + lane`` and the
              container is the lane loop body.
-          C) Two nested for-loops (lane + constexpr vec lane) — the load
-             dispatcher hoists vec loads ABOVE the constexpr loop, so the
-             container is the lane loop body (between base_stmt and
-             vec_for); index is ``(offset - start) // step * K + lane``.
+          C) Two nested for-loops (lane + constexpr vec lane) — vectorized
+             loads live above the constexpr loop and use one cache slot per
+             lane iteration. Scalar fallback loads remain inside it and use
+             one cache slot per scalar lane.
         """
         body = outer_loop.body
         assert isinstance(outer_loop.target, ast.Name)
@@ -859,6 +895,8 @@ class _CuteFuseTwoPassLoads:
         if lane_range is None:
             return None
         lane_start, lane_end, lane_step = lane_range
+        if _node_text(lane_start) != "0" or _node_text(lane_step) != "1":
+            return None
         lane_trip = _trip_count_for(
             lane_start, lane_end, lane_step, self._constexpr_values
         )
@@ -876,12 +914,33 @@ class _CuteFuseTwoPassLoads:
             return lane_loop.body, cache_index, trip * lane_trip
         if len(lane_inner_fors) != 1:
             return None
-        # Shape C: cache the hoisted vec loads (which sit BEFORE the
-        # constexpr loop).  The constexpr V-loop itself is left alone
-        # because it only reads ``hoist_var[vi].bitcast(...)`` — once the
-        # hoist is replaced by a cache read, those inner extracts still
-        # work unchanged.
-        return lane_loop.body, cache_index, trip * lane_trip
+        # Shape C normally caches hoisted vec loads that sit before the
+        # constexpr loop. Some layouts cannot prove the vector access legal,
+        # leaving scalar loads inside that loop. Cache those scalars too: both
+        # loop bounds are constexpr, so the combined slot remains a static
+        # register-fragment index after unrolling.
+        vec_loop = lane_inner_fors[0]
+        direct_load = any(
+            isinstance(stmt, ast.Assign)
+            and _load_kind(stmt.value, self._tensor_dtypes) is not None
+            for stmt in lane_loop.body
+            if stmt is not vec_loop
+        )
+        if direct_load:
+            return lane_loop.body, cache_index, trip * lane_trip
+        if not isinstance(vec_loop.target, ast.Name):
+            return None
+        vec_range = _range_bounds(vec_loop.iter)
+        if vec_range is None:
+            return None
+        vec_start, _, vec_step = vec_range
+        if _node_text(vec_start) != "0" or _node_text(vec_step) != "1":
+            return None
+        vec_trip = _trip_count_for(*vec_range, self._constexpr_values)
+        if vec_trip is None or vec_trip < 1 or vec_trip > 16:
+            return None
+        vec_index = f"({cache_index}) * {vec_trip} + ({vec_loop.target.id})"
+        return vec_loop.body, vec_index, trip * lane_trip * vec_trip
 
     def _build_second_alias(
         self, first_loop: ast.For, second_loop: ast.For
@@ -939,7 +998,7 @@ class _CuteFuseTwoPassLoads:
                 # sweep's name so textual comparison succeeds.
                 alias[second_var] = first_var
         # ``vec_lane_<N>`` is a for-loop target, not an assignment.
-        for prefix in ("vec_lane_",):
+        for prefix in ("reduction_vec_lane_", "vec_lane_"):
             first_var = _collect_for_target(first_loop, prefix)
             second_var = _collect_for_target(second_loop, prefix)
             if first_var and second_var and first_var != second_var:
@@ -1046,6 +1105,9 @@ class _CuteFuseTwoPassLoads:
             first_scope_definitions = self._pure_definitions_before(
                 new_body, first_loop_index
             )
+            first_scope_definitions = self._load_scope_definitions(
+                first_loop, first_container, first_scope_definitions
+            )
 
             # Gather ALL subsequent sweeps in the group that share the
             # first sweep's container shape.  Multi-pass kernels (e.g.
@@ -1071,6 +1133,9 @@ class _CuteFuseTwoPassLoads:
                     self._build_second_alias(first_loop, loop_k)
                 )
                 scope_definitions = self._pure_definitions_before(new_body, body_idx)
+                scope_definitions = self._load_scope_definitions(
+                    loop_k, ctx_k[0], scope_definitions
+                )
                 sweeps.append(
                     (
                         body_idx,
@@ -1319,7 +1384,7 @@ class _CuteFuseTwoPassLoads:
             #   - SMEM tensor for larger caches: allocated once at the
             #     top, indexed per-thread.  Sync inserted between the
             #     sweeps so the consume reads see populated slots.
-            cache_names: dict[str, tuple[str, int]] = {}
+            cache_names: dict[str, tuple[str, int, bool]] = {}
             cache_decls: list[ast.stmt] = []
             # Build the linear per-thread index expression covering all
             # populated thread-block axes (axis 0 = warp lanes, axis 1
@@ -1343,7 +1408,8 @@ class _CuteFuseTwoPassLoads:
                 if dtype is None or vec_w is None:
                     continue
                 cache = self._new_cache_name()
-                cache_names[key] = (cache, vec_w)
+                pack_u16 = not use_smem and vec_w > 1 and dtype == "cutlass.Uint16"
+                cache_names[key] = (cache, vec_w, pack_u16)
                 cache_total_per_thread = cache_size * vec_w
                 if use_smem:
                     cache_total = cache_total_per_thread * self._thread_count
@@ -1359,10 +1425,15 @@ class _CuteFuseTwoPassLoads:
                         ]
                     )
                 else:
-                    cache_total = cache_total_per_thread
+                    cache_total = (
+                        cache_total_per_thread // 2
+                        if pack_u16
+                        else cache_total_per_thread
+                    )
+                    cache_dtype = "cutlass.Uint32" if pack_u16 else dtype
                     cache_decls.append(
                         statement_from_string(
-                            f"{cache} = cute.make_rmem_tensor({cache_total}, {dtype})"
+                            f"{cache} = cute.make_rmem_tensor({cache_total}, {cache_dtype})"
                         )
                     )
             if not cache_names:
@@ -1418,7 +1489,7 @@ class _CuteFuseTwoPassLoads:
                     entry = cache_names.get(key)
                     if entry is None:
                         continue
-                    cache, vec_w = entry
+                    cache, vec_w, pack_u16 = entry
                     name = s.targets[0].id
                     if vec_w == 1:
                         slot = _slot_expr(cache_index, 1, "0")
@@ -1426,11 +1497,27 @@ class _CuteFuseTwoPassLoads:
                             statement_from_string(f"{cache}[{slot}] = {name}")
                         )
                     else:
-                        for v in range(vec_w):
-                            slot = _slot_expr(cache_index, vec_w, str(v))
-                            new_first_body.append(
-                                statement_from_string(f"{cache}[{slot}] = {name}[{v}]")
-                            )
+                        if pack_u16:
+                            for v in range(0, vec_w, 2):
+                                inner = f"({cache_index}) * {vec_w} + ({v})"
+                                word = f"({inner}) // 2"
+                                slot = word
+                                new_first_body.append(
+                                    statement_from_string(
+                                        f"{cache}[{slot}] = "
+                                        f"cutlass.Uint32({name}[{v}]) | "
+                                        f"(cutlass.Uint32({name}[{v + 1}]) "
+                                        "<< cutlass.Uint32(16))"
+                                    )
+                                )
+                        else:
+                            for v in range(vec_w):
+                                slot = _slot_expr(cache_index, vec_w, str(v))
+                                new_first_body.append(
+                                    statement_from_string(
+                                        f"{cache}[{slot}] = {name}[{v}]"
+                                    )
+                                )
             first_container[:] = new_first_body
 
             # Rewrite each subsequent sweep's container: replace each
@@ -1451,7 +1538,7 @@ class _CuteFuseTwoPassLoads:
                 if not matches:
                     continue
                 vec_extract_rewrites: list[
-                    tuple[str, str, str, int, bool, int, str]
+                    tuple[str, str, str, int, bool, bool, int, str]
                 ] = []
                 new_sweep_body: list[ast.stmt] = []
                 matched_by_index = {j: key for j, _name, key in matches}
@@ -1469,7 +1556,7 @@ class _CuteFuseTwoPassLoads:
                                 continue
                             entry = cache_names.get(key)
                             if entry is not None:
-                                cache, vec_w = entry
+                                cache, vec_w, pack_u16 = entry
                                 name = s.targets[0].id
                                 if vec_w == 1:
                                     slot = _slot_expr(cache_index_k, 1, "0")
@@ -1491,6 +1578,7 @@ class _CuteFuseTwoPassLoads:
                                             cache_index_k,
                                             vec_w,
                                             use_smem,
+                                            pack_u16,
                                             cache_size,
                                             tid_expr,
                                         )
@@ -1504,6 +1592,7 @@ class _CuteFuseTwoPassLoads:
                     idx_expr,
                     vec_w,
                     use_smem_,
+                    pack_u16_,
                     cache_size_,
                     tid_expr_,
                 ) in vec_extract_rewrites:
@@ -1515,6 +1604,7 @@ class _CuteFuseTwoPassLoads:
                             idx_expr,
                             vec_w,
                             use_smem=use_smem_,
+                            pack_u16=pack_u16_,
                             cache_size=cache_size_,
                             tid_expr=tid_expr_,
                         )

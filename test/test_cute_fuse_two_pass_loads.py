@@ -95,6 +95,57 @@ def test_nested_persistent_sweeps_gmem_reload(
     assert code.count(".load()") == 5
 
 
+@pytest.mark.parametrize("second_offset", (0, 100))
+@pytest.mark.parametrize("vec_range", ("8", "2, 6", "0, 8, 2"))
+def test_scalar_fallback_inside_reduction_vec_loop_is_cached(
+    monkeypatch: pytest.MonkeyPatch,
+    second_offset: int,
+    vec_range: str,
+) -> None:
+    """A failed vectorization keeps scalar loads inside the constexpr V-loop.
+
+    Both loop indices are static, so the two-sweep cache can still use exact
+    register-fragment slots instead of reloading the input from global memory.
+    """
+    monkeypatch.delenv("HELION_FUSER_MODE", raising=False)
+    second_base_offset = f" + {second_offset}" if second_offset else ""
+    body = ast.parse(
+        f"""
+lane_stride = 4096
+for roffset_1 in range(0, 32768, 32768):
+    for reduction_lane_1 in range(8):
+        reduction_lane_base_1 = roffset_1 + tid * 8 + reduction_lane_1 * lane_stride
+        for reduction_vec_lane_1 in cutlass.range_constexpr({vec_range}):
+            rindex_1 = reduction_lane_base_1 + reduction_vec_lane_1
+            before = (x.iterator + rindex_1).load()
+reduced = before
+for roffset_1 in range(0, 32768, 32768):
+    for reduction_lane_1 in range(8):
+        reduction_lane_base_2 = roffset_1 + tid * 8 + reduction_lane_1 * lane_stride{second_base_offset}
+        for reduction_vec_lane_2 in cutlass.range_constexpr({vec_range}):
+            rindex_1 = reduction_lane_base_2 + reduction_vec_lane_2
+            after = (x.iterator + rindex_1).load()
+            (out.iterator + rindex_1).store(after * reduced)
+"""
+    ).body
+
+    result = fuse_two_pass_loads(
+        body,
+        tensor_dtypes={"x": "cutlass.BFloat16", "out": "cutlass.BFloat16"},
+        reload_modes={1: "register"},
+        proven_disjoint_tensor_pairs={frozenset(("x", "out"))},
+    )
+    code = ast.unparse(ast.Module(body=result, type_ignores=[]))
+
+    if second_offset == 0 and vec_range == "8":
+        assert "cute.make_rmem_tensor(64, cutlass.BFloat16)" in code
+        assert code.count("(x.iterator + rindex_1).load()") == 1
+        assert "after = _fuse_cache_0" in code
+    else:
+        assert "cute.make_rmem_tensor" not in code
+        assert code.count("(x.iterator + rindex_1).load()") == 2
+
+
 @pytest.mark.parametrize("prove_x_y_disjoint", (False, True))
 def test_persistent_sweep_cache_invalidated_by_intervening_store(
     monkeypatch: pytest.MonkeyPatch,

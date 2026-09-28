@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -21,11 +22,13 @@ from helion.autotuner.base_search import _normalize_spec_key_str
 from helion.autotuner.config_fragment import Category
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import NumThreadsFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import FlattenLoopSpec
 from helion.autotuner.config_spec import LoopOrderSpec
+from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import RangeUnrollFactorSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.autotuner.local_cache import LocalAutotuneCache
@@ -384,6 +387,38 @@ class TestBestAvailable(unittest.TestCase):
                 [None],
                 f"persistent must still round-trip for rnumel={size_hint}",
             )
+
+    def test_non_power_of_two_reduction_loop_is_cute_only(self):
+        triton_spec = ReductionLoopSpec(block_id=1, size_hint=3584)
+        with self.assertRaises(InvalidConfig):
+            triton_spec._normalize("reduction_loops", 3584)
+
+        config_spec = ConfigSpec(backend=TritonBackend())
+        config_spec.block_sizes.append(
+            BlockSizeSpec(block_id=0, size_hint=64, min_size=16, max_size=256)
+        )
+        config_spec.reduction_loops.append(
+            ReductionLoopSpec(
+                block_id=1,
+                size_hint=3584,
+                allow_non_power_of_two=True,
+            )
+        )
+        config_gen = ConfigGeneration(config_spec)
+        config = config_spec.default_config()
+        config.config["reduction_loops"] = [3584]
+        config_spec.normalize(config.config)
+
+        restored = config_gen.unflatten(config_gen.flatten(config))
+
+        self.assertEqual(restored.config["reduction_loops"], [3584])
+
+    def test_non_power_of_two_cute_num_threads_seed(self):
+        spec = NumThreadsSpec(block_id=0, size_hint=7168)
+        self.assertEqual(spec._normalize("num_threads", 224), 224)
+        fragment = NumThreadsFragment(1024)
+        self.assertEqual(fragment.pattern_neighbors(224), [0, 128, 256])
+        self.assertEqual(fragment.encode(224), [math.log2(224.0) + 1.0])
 
 
 class TestCacheMatching(unittest.TestCase):
