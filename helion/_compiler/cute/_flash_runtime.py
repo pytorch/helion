@@ -2901,6 +2901,72 @@ def fa4_correction_epilogue_to_smem_scoped_2cta(
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
 
 
+def fa4_correction_epilogue_partitions(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    use_2cta_instrs: bool = False,
+) -> tuple[object, object, cute.Tensor, cute.Tensor, cute.Tensor]:
+    """Copy views of the chunked FA4 correction epilogue for inline programs.
+
+    Mirrors ``fa4_correction_epilogue_to_smem_scoped[_2cta]`` but returns the
+    tiled copies and per-thread partitions instead of running the identity
+    epilogue, so a fused row epilogue can walk the chunks itself.  Returns
+    ``(tiled_t2r, tiled_r2s, tOtO_t2r, tOsO_r2s, tOcO_t2r)``.
+    """
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    mma_rows = 256 if use_2cta_instrs else 128
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (mma_rows, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=use_2cta_instrs,
+    )
+    cO = cute.make_identity_tensor((mma_rows, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+    # sO is per CTA, so both CTAs use the rank-zero SMEM mapping.
+    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    smem_atom = sm100_utils_flash.get_smem_store_op(
+        o_layout, o_dtype, cutlass.Float32, tiled_t2r
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+    return tiled_t2r, tiled_r2s, tOtO_t2r, tOsO_r2s, tOcO_t2r
+
+
+def fa4_correction_epilogue_gmem_partition(
+    tiled_t2r: object,
+    tidx: object,
+    tOgX: cute.Tensor,
+    corr_tile_size: int,
+) -> cute.Tensor:
+    """Per-thread chunk partition of an MMA-partitioned global tile.
+
+    ``tOgX`` is ``thr_mma.partition_C`` of a flat-divided ``(128, head_dim)``
+    tile with the output's geometry, so element ``[None, 0, 0, i]`` addresses
+    exactly the rows/columns this thread's O chunk ``i`` covers.
+    """
+    tOgX_i = cute.logical_divide(tOgX, cute.make_layout((128, corr_tile_size)))
+    thr_t2r = cast("Any", tiled_t2r).get_slice(tidx)
+    return thr_t2r.partition_D(tOgX_i[(None, None), None])
+
+
 def fa4_correction_epilogue_handoff_to_smem_scoped(
     o_full_ptr_stage: object,
     o_full_phase: object,
