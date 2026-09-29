@@ -2431,6 +2431,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 from .._compiler.cute.aux_tensor import (
                     host_function_matmul_has_non_tcgen05_operand,
                 )
+                from .._compiler.cute.aux_tensor import (
+                    host_function_tcgen05_rowvec_aux_facts,
+                )
 
                 self.env.config_spec.cute_tcgen05_aux_kernel_detected = (
                     host_function_has_tcgen05_aux_kernel_pattern(self.host_function)
@@ -2442,6 +2445,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                 )
                 self.env.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand = (
                     host_function_matmul_has_non_tcgen05_operand(self.host_function)
+                )
+                self.env.config_spec.cute_tcgen05_rowvec_aux_facts = (
+                    host_function_tcgen05_rowvec_aux_facts(self.host_function)
                 )
                 if not self.env.settings.disable_autotuner_heuristics:
                     for seed_config in self.env.config_spec.autotune_seed_configs():

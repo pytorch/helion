@@ -57,6 +57,7 @@ from .._compiler.cute.tcgen05_constants import (
 )
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_SKIP_EPILOGUE_STORE
 from .._compiler.cute.tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
@@ -171,6 +172,17 @@ class _RowvecAuxStageRecord:
     copy_elems: int
     aux_extent: int
     warp_private: bool
+    # SMEM element type of the stage. It differs from the source only for the
+    # promoted 16-bit row vector (``promote``): the row is converted to FP32
+    # once, cooperatively, by the epilogue warps (one 128-thread copy plus one
+    # epilogue barrier before the accumulator wait), so the per-subtile reads
+    # skip the 64 per-thread fp16->fp32 converts the FP32 carrier op would
+    # otherwise repeat for every subtile.
+    stage_dtype: str = ""
+    promote: bool = False
+    # Threads of the one cooperative copy filling a promoted stage (a
+    # multiple of 32, at most the epilogue warps' threads).
+    copy_threads: int = 0
 
 
 def _tcgen05_rowvec_aux_stage_copy_elems(
@@ -2092,6 +2104,54 @@ def _cute_leading_passthrough_view_2d(
     )
 
 
+def _check_tcgen05_tma_store_destination(
+    tensor: torch.Tensor,
+    tensor_name: str,
+    *,
+    transposed_store: bool,
+    output_column_major: bool,
+) -> None:
+    """Refuse a TMA store whose destination is known to break TensorMap rules.
+
+    The pipeline decision proves plain destinations and falls back to the
+    SIMT store otherwise; this is the last line for the paths it does not
+    gate (grouped and row-union stores, untraced fan-outs).  A static stride
+    or storage offset that is not a 16-byte multiple, an argument whose
+    bound base residue is not zero, or a plain MN destination whose
+    contiguous axis is not the one the staged D layout assumes would be
+    stored silently wrong, so fail loudly instead.  Unknown (symbolic)
+    facts are not judged here.
+    """
+    from .._compiler.cute.cute_mma import _tcgen05_tma_matrix_major
+    from .._compiler.cute.memory_ops import _bound_vec_alignment_signature
+
+    env = CompileEnvironment.current()
+    element_size = tensor.element_size()
+    problems: list[str] = []
+    for dim, stride in enumerate(tensor.stride()):
+        if type(stride) is int and stride != 1 and (stride * element_size) % 16:
+            problems.append(f"stride({dim})={stride} ({stride * element_size} B)")
+    offset = tensor.storage_offset()
+    if type(offset) is int and (offset * element_size) % 16:
+        problems.append(f"storage_offset={offset} ({offset * element_size} B)")
+    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
+    if signature is not None and signature[0] != 0:
+        problems.append(f"base address residue {signature[0]} B")
+    if not transposed_store and tensor.ndim in (2, 3):
+        expected_major = "col" if output_column_major else "row"
+        if _tcgen05_tma_matrix_major(tensor) != expected_major:
+            problems.append(
+                f"{'N' if expected_major == 'row' else 'M'}-contiguous storage expected"
+            )
+    if problems:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"the tcgen05 TMA store cannot address {tensor_name}: "
+            + ", ".join(problems)
+            + " (a TensorMap needs a 16-byte base and 16-byte outer strides)",
+        )
+
+
 def _codegen_cute_store_tcgen05_tile(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -2620,11 +2680,20 @@ def _codegen_cute_store_tcgen05_tile(
             and tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
             and broadcast_axis == 1
             and copy_elems is not None
+            # The warp-private stage is one ``make_tiled_copy_tv`` over 32
+            # lanes x ``copy_elems`` values; a row shorter than that tile
+            # would let the upper lanes copy past the row (into the next
+            # warp's stage or beyond the allocation).
+            and tcgen05_value.bn % (32 * copy_elems) == 0
             and not has_full_register_hoist
         )
 
     def is_profitable_rowvec_per_warp_config(aux_dtype_bits: int) -> bool:
-        """Whether reuse should amortize this warp-private FP32 stage."""
+        """Whether reuse should amortize this warp-private FP32 stage.
+
+        16-bit rows take the promoted shared stage instead
+        (``rowvec_stage_promotes_to_f32``).
+        """
 
         if aux_dtype_bits != 32:
             return False
@@ -2634,6 +2703,58 @@ def _codegen_cute_store_tcgen05_tile(
         # B200 sweep boundaries: bn=32 only breaks even, and the largest
         # winning stage used 4 KiB without changing occupancy.
         return tcgen05_value.bn >= 64 and stage_bytes <= 4 * 1024
+
+    def rowvec_stage_promotes_to_f32(rec: _AuxStepRecord) -> bool:
+        """16-bit row vector consumed only by the FP32 carrier op.
+
+        The chain's root ``acc <op> aux`` promotes the 16-bit operand to FP32
+        (the result dtype is FP32, so ``_round_epilogue_expression`` left the
+        template unrounded) and the leaf carries no cast wrapper, so staging
+        the row already converted is bit-identical: fp16/bf16 -> fp32 is
+        exact. Any other use (a rounded 16-bit sub-expression, a wrapped
+        leaf, a multi-step chain) takes no stage: the row is read from GMEM
+        per subtile in its source dtype. The predicate
+        (``aux_leaf_takes_promoted_f32_stage``) is shared with the matmul
+        plan, which picks the (128, 32) subtile for these rows.
+        """
+        from .._compiler.cute.cute_epilogue import aux_leaf_takes_promoted_f32_stage
+
+        return epilogue_chain is not None and aux_leaf_takes_promoted_f32_stage(
+            epilogue_chain,
+            rec.expr,
+            aux_dtype_bits=rec.aux_dtype_bits,
+            epi_warp_count=tcgen05_value.epi_warp_count,
+            bn=tcgen05_value.bn,
+            aux_extent=rec.aux_extent,
+        )
+
+    def shared_rowvec_stage_copy_shape(
+        rec: _AuxStepRecord,
+    ) -> tuple[int, int] | None:
+        """``(threads, elems)`` of the one cooperative copy filling the stage."""
+        from .._compiler.cute.cute_epilogue import tcgen05_rowvec_stage_copy_shape
+
+        return tcgen05_rowvec_stage_copy_shape(
+            epi_warp_count=tcgen05_value.epi_warp_count,
+            bn=tcgen05_value.bn,
+            aux_extent=rec.aux_extent,
+        )
+
+    def can_stage_rowvec_shared_f32(
+        rec: _AuxStepRecord, copy_elems: int | None
+    ) -> bool:
+        """Whether this 16-bit rowvec uses the promoted CTA-shared FP32 stage."""
+
+        return (
+            tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and tcgen05_value.use_tma_store_epilogue
+            and not tcgen05_value.partial_output_tma_store
+            and not tcgen05_value.output_column_major
+            and tcgen05_epi_tile_m >= _TCGEN05_TMEM_DATAPATH_M
+            and copy_elems is not None
+            and rec.aux_rmem_full is None
+            and rowvec_stage_promotes_to_f32(rec)
+        )
 
     use_full_tile_bm256_broadcast_aux = (
         tcgen05_aux_load_placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
@@ -2933,7 +3054,20 @@ def _codegen_cute_store_tcgen05_tile(
             copy_elems,
             has_full_register_hoist=rec.aux_rmem_full is not None,
         ) and is_profitable_rowvec_per_warp_config(rec.aux_dtype_bits)
-        if stage_partial_tma_rowvec or stage_rowvec_per_warp:
+        shared_copy_shape = shared_rowvec_stage_copy_shape(rec)
+        shared_copy_threads, shared_copy_elems = (
+            shared_copy_shape if shared_copy_shape is not None else (0, None)
+        )
+        stage_rowvec_shared_f32 = (
+            not stage_partial_tma_rowvec
+            and not stage_rowvec_per_warp
+            and can_stage_rowvec_shared_f32(rec, shared_copy_elems)
+        )
+        if stage_rowvec_shared_f32:
+            assert shared_copy_elems is not None
+            copy_elems = shared_copy_elems
+            copy_bits = rec.aux_dtype_bits * shared_copy_elems
+        if stage_partial_tma_rowvec or stage_rowvec_per_warp or stage_rowvec_shared_f32:
             assert rec.aux_extent is not None
             assert copy_elems is not None
             rowvec_aux_stage_records.append(
@@ -2953,6 +3087,11 @@ def _codegen_cute_store_tcgen05_tile(
                     copy_elems=copy_elems,
                     aux_extent=rec.aux_extent,
                     warp_private=stage_rowvec_per_warp,
+                    stage_dtype=(
+                        "cutlass.Float32" if stage_rowvec_shared_f32 else rec.aux_dtype
+                    ),
+                    promote=stage_rowvec_shared_f32,
+                    copy_threads=shared_copy_threads if stage_rowvec_shared_f32 else 0,
                 )
             )
         else:
@@ -2968,8 +3107,7 @@ def _codegen_cute_store_tcgen05_tile(
         """Emit compact per-tile SMEM allocation for staged row-vector aux."""
 
         lines: list[str] = []
-        for aux_idx, rec in enumerate(aux_step_records):
-            stage = rowvec_aux_stage_records[aux_idx]
+        for stage in rowvec_aux_stage_records:
             if stage is None:
                 continue
             lines.extend(
@@ -2985,7 +3123,7 @@ def _codegen_cute_store_tcgen05_tile(
                     ),
                     (
                         f"{stage.smem_ptr} = cute.arch.alloc_smem("
-                        f"{rec.aux_dtype}, cute.cosize({stage.smem_layout}), "
+                        f"{stage.stage_dtype}, cute.cosize({stage.smem_layout}), "
                         "alignment=128)"
                     ),
                     (
@@ -3003,6 +3141,61 @@ def _codegen_cute_store_tcgen05_tile(
         for aux_idx, rec in enumerate(aux_step_records):
             stage = rowvec_aux_stage_records[aux_idx]
             if stage is None:
+                continue
+            if stage.promote:
+                # One cooperative copy by the epilogue warps: each thread loads
+                # its ``copy_elems`` source elements, converts them once, and
+                # stores FP32; the epilogue barrier publishes the row before
+                # the accumulator wait.  The per-subtile reads below then load
+                # FP32 straight into the carrier op.
+                # Rows narrower than the epilogue warps' thread count are
+                # copied by whole warps (one element per thread); the other
+                # warps skip straight to the barrier.
+                threads = stage.copy_threads or tcgen05_aux_epi_warp_count * 32
+                copy_indent = "    "
+                copy_guard = ""
+                if threads < tcgen05_aux_epi_warp_count * 32:
+                    copy_guard = (
+                        f"    if {tcgen05_aux_epi_tidx} < cutlass.Int32({threads}):\n"
+                    )
+                    copy_indent = "        "
+                r16 = f"{stage.smem_part}_src"
+                r32 = f"{stage.smem_part}_f32"
+                copy_body = (
+                    f"{stage.tiled_copy} = cute.make_tiled_copy_tv("
+                    f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
+                    f"{rec.aux_dtype}, num_bits_per_copy={stage.copy_bits}), "
+                    f"cute.make_layout({threads}), "
+                    f"cute.make_layout({stage.copy_elems}))\n"
+                    f"{stage.thr_copy} = {stage.tiled_copy}.get_slice("
+                    f"{tcgen05_aux_epi_tidx})\n"
+                    f"{stage.gmem_tile} = cute.local_tile("
+                    f"{rec.aux_tensor_name}, ({tcgen05_aux_bn},), "
+                    f"({tile_coord_n},))\n"
+                    f"{stage.gmem_part} = {stage.thr_copy}.partition_S("
+                    f"{stage.gmem_tile})\n"
+                    f"{stage.smem_part} = cute.make_tiled_copy_tv("
+                    f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
+                    f"{stage.stage_dtype}, num_bits_per_copy={32 * stage.copy_elems}), "
+                    f"cute.make_layout({threads}), "
+                    f"cute.make_layout({stage.copy_elems})).get_slice("
+                    f"{tcgen05_aux_epi_tidx}).partition_D({stage.smem})\n"
+                    f"{r16} = cute.make_rmem_tensor("
+                    f"{stage.gmem_part}.shape, {rec.aux_dtype})\n"
+                    f"cute.autovec_copy({stage.gmem_part}, {r16})\n"
+                    f"{r32} = cute.make_rmem_tensor("
+                    f"{stage.gmem_part}.shape, {stage.stage_dtype})\n"
+                    f"{r32}.store({r16}.load().to({stage.stage_dtype}))\n"
+                    f"cute.autovec_copy({r32}, {stage.smem_part})"
+                )
+                lines.append(
+                    f"if {tcgen05_aux_epi_active}:\n"
+                    + copy_guard
+                    + "".join(
+                        f"{copy_indent}{line}\n" for line in copy_body.split("\n")
+                    )
+                    + f"    {epilog_sync_barrier}.arrive_and_wait()"
+                )
                 continue
             if stage.warp_private:
                 copy_thread_layout = "32"
@@ -3506,8 +3699,13 @@ def _codegen_cute_store_tcgen05_tile(
         *,
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
+        unconditional_full_tile: bool = False,
     ) -> str:
         """Per-subtile aux GMEM-load source lines (one per aux step).
+
+        ``unconditional_full_tile``: every tile is statically full (the
+        register-direct store on a divisible output), so the direct GMEM
+        form loads without the runtime full-tile guard or its edge loop.
 
         Each step emits the per-thread GMEM subtile slice of
         ``tTR_gAux_grouped_<idx>`` followed by a ``.load()`` call
@@ -3735,6 +3933,15 @@ def _codegen_cute_store_tcgen05_tile(
                     f"{rec.aux_rmem}.load()\n"
                 )
                 continue
+            if rowvec_stage is None and unconditional_full_tile:
+                lines.append(
+                    f"{prelude_indent}{rec.ttr_aux_subtile} = "
+                    f"{rec.ttr_aux_grouped}"
+                    f"[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+                    f"{prelude_indent}{rec.aux_loaded} = "
+                    f"{rec.ttr_aux_subtile}.load()\n"
+                )
+                continue
             if rowvec_stage is None and (
                 safe_direct_aux_with_full_tile or not tcgen05_aux_use_tma_store_epilogue
             ):
@@ -3760,13 +3967,14 @@ def _codegen_cute_store_tcgen05_tile(
             if rowvec_stage is not None and not force_simt_edge_aux:
                 # Row-vector staging broadcasts through a stride-0 M mode; filter
                 # that layout so the SMEM read does not reload duplicate lanes.
+                # A promoted stage already holds FP32.
                 lines.append(
                     f"{prelude_indent}{rec.ttr_aux_subtile} = "
                     f"{rec.ttr_aux_grouped}"
                     "[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
                     f"{prelude_indent}{rec.aux_rmem} = "
                     f"cute.make_rmem_tensor({rec.ttr_aux_subtile}.layout, "
-                    f"{rec.aux_dtype})\n"
+                    f"{rowvec_stage.stage_dtype})\n"
                     f"{prelude_indent}cute.autovec_copy("
                     f"cute.filter_zeros({rec.ttr_aux_subtile}), "
                     f"cute.filter_zeros({rec.aux_rmem}))\n"
@@ -3862,6 +4070,7 @@ def _codegen_cute_store_tcgen05_tile(
         force_simt_edge_aux: bool = False,
         safe_direct_aux_with_full_tile: bool = False,
         coord_layout: str = "ttr",
+        unconditional_full_tile: bool = False,
     ) -> tuple[str, str, str]:
         """Return ``(early_aux_prelude, late_prelude, assignment_rhs)``.
 
@@ -3942,6 +4151,7 @@ def _codegen_cute_store_tcgen05_tile(
             carrier_name,
             force_simt_edge_aux=force_simt_edge_aux,
             safe_direct_aux_with_full_tile=safe_direct_aux_with_full_tile,
+            unconditional_full_tile=unconditional_full_tile,
         )
         aux_locals_by_expr = {rec.expr: rec.aux_loaded for rec in aux_step_records}
         assert len(aux_locals_by_expr) == len(aux_step_records)
@@ -4006,6 +4216,12 @@ def _codegen_cute_store_tcgen05_tile(
         and bool(tcgen05_value.tail_tma_store_tensor)
     )
     if tcgen05_value.use_tma_store_epilogue:
+        _check_tcgen05_tma_store_destination(
+            tensor,
+            tensor_name,
+            transposed_store=tcgen05_nm_store or row_union is not None,
+            output_column_major=tcgen05_value.output_column_major,
+        )
         df.placeholder_args.add(tensor_name)
         df.wrapper_only_params.extend(
             [
@@ -4424,9 +4640,56 @@ def _codegen_cute_store_tcgen05_tile(
                     f"cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), "
                     f"{rec.aux_dtype})"
                 )
-    simt_static_store_setup, simt_tile_store_setup = store_common_setup(
-        tensor_name, include_full_tile=not simt_edge_only
+    # ``tcgen05_c_store_mode="direct"`` on a statically full-tiled output:
+    # every tile of this store is a whole tile (the output extents divide the
+    # tile; no segment, grouped-tail or row-union remap), so the SIMT body
+    # writes each subtile with one vectorized ``CopyR2GOp`` copy and carries
+    # neither the runtime full-tile predicate nor the scalar edge loop.
+    direct_full_tile_store = (
+        state.device_function.config.get(
+            TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL
+        )
+        == TCGEN05_C_STORE_MODE_DIRECT
+        and not tcgen05_value.use_tma_store_epilogue
+        and not simt_edge_only
+        and row_union is None
+        and not segment_store
+        and not grouped_tail_store
+        and isinstance(static_m_size, int)
+        and isinstance(static_n_size, int)
+        and tcgen05_value.bm > 0
+        and tcgen05_value.bn > 0
+        and static_m_size % tcgen05_value.bm == 0
+        and static_n_size % tcgen05_value.bn == 0
     )
+    simt_static_store_setup, simt_tile_store_setup = store_common_setup(
+        tensor_name,
+        include_full_tile=not simt_edge_only and not direct_full_tile_store,
+    )
+    # Vector width of the direct store.  The DSL only knows the kernel
+    # argument's pointer alignment; the tile / thread offsets it adds are
+    # dynamic, so it would fall back to element-wide stores.  With static
+    # strides the alignment of every per-thread chunk is provable at codegen
+    # time: the row (and batch) strides are whole 16-byte multiples, each
+    # thread's chunk starts at a column that is a whole multiple of its own
+    # width (the T2R partition tiles the subtile by the thread's chunk), and
+    # the tile / subtile column offsets are multiples of the chunk too.  The
+    # generated code then re-asserts that alignment on the per-subtile pointer
+    # (``make_ptr(..., assumed_align=...)`` on the same address: no rounding,
+    # so a wrong claim faults loudly instead of corrupting the output) and the
+    # copy atom widens to 128-bit stores.
+    direct_store_align_bytes: int | None = None
+    if direct_full_tile_store:
+        elem_bytes = tensor.element_size()
+        strides = tuple(tensor.stride())
+        if (
+            all(isinstance(stride, int) for stride in strides)
+            and strides[-1] == 1
+            and not tcgen05_value.output_column_major
+            and all((stride * elem_bytes) % 16 == 0 for stride in strides[:-1])
+            and (tcgen05_value.bn * elem_bytes) % 16 == 0
+        ):
+            direct_store_align_bytes = 16
     if fragment_epilogue is not None and fragment_epilogue.changes_shape:
         simt_early_aux = simt_late_prelude = ""
         simt_acc_vec_rhs = ""
@@ -4435,6 +4698,7 @@ def _codegen_cute_store_tcgen05_tile(
             ttr_racc,
             "        ",
             force_simt_edge_aux=simt_edge_only,
+            unconditional_full_tile=direct_full_tile_store,
         )
     simt_acc_vec_prelude = simt_early_aux + simt_late_prelude
     # SIMT auxiliary loads are independent of the accumulator. Edge-only
@@ -4671,6 +4935,10 @@ def _codegen_cute_store_tcgen05_tile(
             ttr_gc_subtile,
             include_coord_setup=not simt_store_edge_coord_preloaded,
         )
+    elif direct_full_tile_store:
+        simt_store_copy_source = (
+            f"        cute.copy({simt_atom}, {ttr_rd}, {ttr_gc_subtile})\n"
+        )
     else:
         simt_store_copy_source = (
             f"        if {full_tile}:\n"
@@ -4742,6 +5010,10 @@ def _codegen_cute_store_tcgen05_tile(
             if simt_edge_only
             else (
                 f"{num_bits} = min("
+                f"min({tensor_name}.iterator.alignment, {direct_store_align_bytes}) * 8, "
+                f"cute.size({mcld}) * {target_dtype}.width)"
+                if direct_store_align_bytes is not None
+                else f"{num_bits} = min("
                 f"{ttr_gc_grouped}.iterator.alignment * 8, "
                 f"cute.size({mcld}) * {target_dtype}.width, 256)"
             )
@@ -4773,6 +5045,14 @@ def _codegen_cute_store_tcgen05_tile(
             f"    if {tcgen05_lifecycle.epi_active}:\n"
             f"        {ttr_tacc_mn} = {ttr_tacc}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
             f"        {ttr_gc_subtile} = {ttr_gc_grouped}[(None, None, None, cutlass.Int32(_tcgen05_subtile))]\n"
+            + (
+                f"        {ttr_gc_subtile} = cute.make_tensor(cute.make_ptr({target_dtype}, "
+                f"{ttr_gc_subtile}.iterator.toint(), cute.AddressSpace.gmem, "
+                f"assumed_align=min({tensor_name}.iterator.alignment, {direct_store_align_bytes})), "
+                f"{ttr_gc_subtile}.layout)\n"
+                if direct_store_align_bytes is not None
+                else ""
+            )
             + (f"{simt_early_aux}{simt_acc_wait}" if prefetch_simt_aux else "")
             + f"        cute.copy({tiled_copy_t2r}, {ttr_tacc_mn}, {ttr_racc})\n"
             + (
@@ -5186,6 +5466,19 @@ def _codegen_cute_store_tcgen05_tile(
         raise exc.BackendUnsupported(
             "cute", "tcgen05 output fanout requires the standard epilogue body"
         )
+    # ``cute_mma`` lets the one-tile epilogue free TMEM only when the
+    # accumulator reaches a single store through the normal TMA body; every
+    # variant below that drops, splits or duplicates the t2r region is
+    # excluded there, so the free is emitted exactly once and the post-loop
+    # teardown (``render_store_post_loop_lines``) skips its own.
+    assert not tcgen05_lifecycle.free_tmem_in_epilogue or not (
+        has_store_fanout
+        or has_store_warp
+        or compact_fragment_store
+        or diagnose_skip_epilogue_store
+        or diagnose_split_epilogue_layout
+        or tcgen05_pure_matmul_object is not None
+    )
     elide_role_local_epi_active = (
         tcgen05_value.use_role_local_epi
         and tcgen05_value.use_tma_store_epilogue
@@ -5487,6 +5780,8 @@ def _codegen_cute_store_tcgen05_tile(
             coord_layout="trs",
         )
         # The final fanout store owns release, after every output's TMEM read.
+        # The one-tile epilogue's TMEM free follows the subtile loop
+        # (``epilogue_tmem_free_src``), not this release.
         acc_release = (
             ""
             if not is_final_store
@@ -6352,15 +6647,44 @@ def _codegen_cute_store_tcgen05_tile(
             )
         )
         fanout_advance = tma_store_acc_advance
+        # One tile per CTA and a single store (asserted above): free TMEM once
+        # the last subtile's TMA store is issued, so the dealloc handshake with
+        # the MMA warp (the ``tmem_alloc_barrier`` meet; the MMA warp arrives
+        # after its last commit, ahead of its own ``producer_tail``) overlaps
+        # the store drain instead of holding the last subtile's SMEM staging
+        # behind it. Measured under flushed graph
+        # replay (device time): bmm 8x256x256x512 one-CTA 4.58 -> 4.45 us,
+        # fp8 1024^3 one-CTA 128x64x128 4.96 -> 4.83 us; freeing before the
+        # staging (the previous placement) or issuing the next subtile's TMEM
+        # load early measured neutral.
+        epilogue_tmem_free_src = (
+            ""
+            if not (tcgen05_lifecycle.free_tmem_in_epilogue and is_final_store)
+            else (
+                f"if {tcgen05_lifecycle.epi_active}:\n"
+                + "".join(
+                    f"    {line}\n"
+                    for line in tcgen05_lifecycle.render_epilogue_tmem_free_lines()
+                )
+            )
+        )
+
+        def with_epilogue_tmem_free(loop_src: str) -> str:
+            if not epilogue_tmem_free_src:
+                return loop_src
+            return loop_src.rstrip("\n") + "\n" + epilogue_tmem_free_src
+
         tma_store_body_core = [
             *tma_store_body_setup_core,
-            tma_store_subtile_loop + tma_store_acc_advance,
+            with_epilogue_tmem_free(tma_store_subtile_loop + tma_store_acc_advance),
             *tma_store_pipeline_tail_lines,
         ]
         if grouped_dynamic_d_tensormap_edge_only:
             dynamic_d_tma_store_body_core = [
                 *dynamic_d_tma_store_body_setup_core,
-                dynamic_d_tma_store_subtile_loop + tma_store_acc_advance,
+                with_epilogue_tmem_free(
+                    dynamic_d_tma_store_subtile_loop + tma_store_acc_advance
+                ),
                 *tma_store_pipeline_tail_lines,
             ]
     if compact_fragment_store and tcgen05_value.use_tma_store_epilogue:

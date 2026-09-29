@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -248,3 +249,70 @@ def _cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
             requires_grad=tensor.requires_grad,
         )
     return FakeTensor(tensor.fake_mode, meta, torch.device("cuda:0"))
+
+
+_PREFETCH = "cute.nvgpu.cpasync.prefetch_descriptor("
+_PREFETCH_RE = re.escape(_PREFETCH)
+
+
+@pytest.mark.parametrize(
+    ("pid_type", "two_cta"),
+    [
+        ("flat", False),
+        ("persistent_interleaved", False),
+        ("persistent_interleaved", True),
+    ],
+)
+def test_plain_gemm_prefetches_every_tma_descriptor_once(
+    pid_type: Literal["flat", "persistent_interleaved"], two_cta: bool
+) -> None:
+    bound = _bind(torch.bfloat16, (2048, 4096, 1024))
+    if two_cta:
+        requested = helion.Config(
+            block_sizes=[256, 256, 128],
+            loop_orders=[[0, 1]],
+            indexing=["tensor_descriptor"] * 3,
+            pid_type=pid_type,
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=3,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_tvm_ffi_launch=False,
+        )
+    else:
+        requested = helion.Config(
+            block_sizes=[128, 64, 64],
+            loop_orders=[[0, 1]],
+            indexing=["tensor_descriptor"] * 3,
+            pid_type=pid_type,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_tvm_ffi_launch=False,
+        )
+    with bound.env:
+        config = bound.config_spec.normalized_config(requested)
+    source = bound.to_code(config)
+    # The native tcgen05 TMA mainloop and the TMA-store epilogue are active.
+    assert "cute.nvgpu.cpasync.tma_partition(tma_atom_a" in source
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    # Every descriptor the kernel receives as an argument is prefetched exactly
+    # once at kernel entry: A/B by the TMA-load warp, D by epilogue warp 0.
+    assert source.count(_PREFETCH) == 3
+    for atom in ("tma_atom_a", "tma_atom_b", "tcgen05_tma_store_atom"):
+        assert source.count(f"{_PREFETCH}{atom}") == 1, atom
+    assert re.search(
+        rf"if tcgen05_tma_warp:\n\s+{_PREFETCH_RE}tma_atom_a\w*\)\n"
+        rf"\s+{_PREFETCH_RE}tma_atom_b\w*\)",
+        source,
+    )
+    assert re.search(
+        rf"if tcgen05_warp_idx == cutlass\.Int32\(0\):\n"
+        rf"\s+{_PREFETCH_RE}tcgen05_tma_store_atom\w*\)",
+        source,
+    )
+    ab_prefetch = source.index(f"{_PREFETCH}tma_atom_a")
+    assert ab_prefetch < source.index("cute.copy(tma_atom_a")
+    d_prefetch = source.index(f"{_PREFETCH}tcgen05_tma_store_atom")
+    assert d_prefetch < source.index("cute.copy(tcgen05_tma_store_atom")

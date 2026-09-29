@@ -349,7 +349,13 @@ def _detect_mma_loop(
 
 def _specialized_mma_root_thread_layout(
     root_block_ids: Sequence[int], config: Config
-) -> tuple[int, int, int, int] | None:
+) -> tuple[int, int, int, int, bool, bool] | None:
+    """``(bm, bn, m_threads, n_threads, m_explicit, n_explicit)`` of the root.
+
+    An automatic thread count (``num_threads`` of 0) stands in as the block
+    size, trimmed to the 1024-thread CTA budget; the flags tell the MMA
+    support predicate whether the M / N counts were requested by the config.
+    """
     from ..compile_environment import CompileEnvironment
 
     if len(root_block_ids) != 2:
@@ -384,6 +390,8 @@ def _specialized_mma_root_thread_layout(
         root_block_sizes[1],
         root_thread_counts[0],
         root_thread_counts[1],
+        not root_thread_auto[0],
+        not root_thread_auto[1],
     )
 
 
@@ -394,15 +402,38 @@ def _specialized_mma_root_threads_support_impl(
     bn: int,
     root_m_threads: int,
     root_n_threads: int,
+    root_m_threads_explicit: bool,
+    root_n_threads_explicit: bool,
 ) -> bool:
     from .cute_mma import _mma_active_n_threads
     from .cute_mma import _tcgen05_root_m_threads
+    from .cute_mma import _tcgen05_root_n_threads
 
     if mma_impl == "tcgen05":
+        # The tcgen05 role launch is one physical warp per role row (see
+        # ``_tcgen05_root_m_threads``) and its y extent is the role warp
+        # count, clamped by the SIMT N axis (``_tcgen05_root_n_threads``):
+        # an explicit M or N thread count has to be exactly the width the
+        # launch planning resolves, so another request takes the generic
+        # SIMT path instead of launching warps the role predicates and the
+        # pipeline-init barrier do not count, or too few warps for the
+        # roles.  Automatic counts arrive here as the tile extents and are
+        # resolved by the launch planning.
+        physical_m_threads = _tcgen05_root_m_threads(bm, bn)
+        if root_m_threads_explicit:
+            m_threads_supported = root_m_threads == physical_m_threads
+        else:
+            m_threads_supported = physical_m_threads <= root_m_threads <= bm
+        if root_n_threads_explicit:
+            n_threads_supported = root_n_threads == _tcgen05_root_n_threads(bn)
+        else:
+            n_threads_supported = (
+                _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
+            )
         return (
-            _tcgen05_root_m_threads(bm, bn) <= root_m_threads <= bm
+            m_threads_supported
             and bm % root_m_threads == 0
-            and _mma_active_n_threads("tcgen05") <= root_n_threads <= bn
+            and n_threads_supported
             and bn % root_n_threads == 0
             and root_m_threads * root_n_threads <= 1024
         )
@@ -464,7 +495,14 @@ def _detect_grouped_rank3_specialized_mma_loop(
     root_layout = _specialized_mma_root_thread_layout(mn_root_grid_ids, config)
     if root_layout is None:
         return False
-    bm, bn, root_m_threads, root_n_threads = root_layout
+    (
+        bm,
+        bn,
+        root_m_threads,
+        root_n_threads,
+        root_m_threads_explicit,
+        root_n_threads_explicit,
+    ) = root_layout
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
@@ -474,6 +512,8 @@ def _detect_grouped_rank3_specialized_mma_loop(
         bn=bn,
         root_m_threads=root_m_threads,
         root_n_threads=root_n_threads,
+        root_m_threads_explicit=root_m_threads_explicit,
+        root_n_threads_explicit=root_n_threads_explicit,
     ):
         return False
 
@@ -545,7 +585,14 @@ def _detect_specialized_mma_loop(
     root_layout = _specialized_mma_root_thread_layout(root_mn_block_ids, config)
     if root_layout is None:
         return False
-    bm, bn, root_m_threads, root_n_threads = root_layout
+    (
+        bm,
+        bn,
+        root_m_threads,
+        root_n_threads,
+        root_m_threads_explicit,
+        root_n_threads_explicit,
+    ) = root_layout
     (bk,) = block_sizes
     if not isinstance(bk, int):
         return False
@@ -575,6 +622,8 @@ def _detect_specialized_mma_loop(
                 bn=bn,
                 root_m_threads=root_m_threads,
                 root_n_threads=root_n_threads,
+                root_m_threads_explicit=root_m_threads_explicit,
+                root_n_threads_explicit=root_n_threads_explicit,
             ):
                 return True
             continue
@@ -584,6 +633,8 @@ def _detect_specialized_mma_loop(
             bn=bn,
             root_m_threads=root_m_threads,
             root_n_threads=root_n_threads,
+            root_m_threads_explicit=root_m_threads_explicit,
+            root_n_threads_explicit=root_n_threads_explicit,
         ):
             if mma_impl == "tcgen05" and not ensure_tcgen05_fragment_epilogue_plan(
                 fn,
@@ -2992,6 +3043,22 @@ class CuteBackend(Backend):
                             ),
                         )
 
+        if tcgen05_compact_dims is not None and any(
+            launched < planned
+            for launched, planned in zip(dims, tcgen05_compact_dims, strict=True)
+        ):
+            # The role launch addresses every warp of the plan's block shape
+            # (MMA, TMA, scheduler and C-input warps by linear warp id, the
+            # pipeline-init barrier by their thread count); a launch narrower
+            # than the plan would never start some of them and deadlock on
+            # the first barrier.  The MMA detection declines the thread
+            # layouts that get here, so this is a last line.
+            raise exc.BackendUnsupported(
+                self.name,
+                f"tcgen05 role launch needs block={tuple(tcgen05_compact_dims)} "
+                f"but the thread layout launches block={tuple(dims)}: a role "
+                "warp would never start",
+            )
         check_thread_block_dims(dims, context=str(tuple(dims)))
         if symbolic_axes:
             return launcher_args_with_compile_options(
@@ -3425,6 +3492,7 @@ class CuteBackend(Backend):
                     and specialized_mma_plan.impl == "tcgen05"
                 ):
                     from .cute_mma import _tcgen05_root_m_threads
+                    from .cute_mma import _tcgen05_root_n_threads
 
                     m_axis = block_ids.index(specialized_mma_plan.m_block_id)
                     n_axis = block_ids.index(specialized_mma_plan.n_block_id)
@@ -3447,7 +3515,7 @@ class CuteBackend(Backend):
                         else num_threads_config[m_axis]
                     )
                     root_n_threads = (
-                        min(int(n_block_size), 8)
+                        _tcgen05_root_n_threads(int(n_block_size))
                         if original_num_threads_config[n_axis] == 0
                         and isinstance(n_block_size, int)
                         else num_threads_config[n_axis]

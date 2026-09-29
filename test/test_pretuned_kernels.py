@@ -1359,9 +1359,12 @@ class TestPretunedCuteCodegen(TestCase):
         self.assertIn(
             "while tcgen05_role_local_0_work_tile.is_valid_tile", persistent_code
         )
-        self.assertIn(
+        # One tile per CTA makes the raster swizzle a no-op; the plan drops it
+        # and the swizzle-8 render is the one-shot render, byte for byte.
+        self.assertNotIn(
             "while tcgen05_role_local_0_work_tile.is_valid_tile", swizzled_code
         )
+        self.assertEqual(swizzled_code, one_shot_code)
         self.assertNotIn("while tcgen05_work_tile_valid", one_shot_code)
         self.assertNotIn("while tcgen05_work_tile_valid", persistent_code)
 

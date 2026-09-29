@@ -99,7 +99,12 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
     assert after[1].index("cute.arch.griddepcontrol_wait()") < after[1].index(
         "cute.copy(tma_atom_"
     )
-    assert "sync_threads()" in after[1]
+    # The plain clustered consumer publishes its pipeline init through the
+    # cluster-wide ``pipeline_init_wait`` and the TMEM allocation through
+    # ``wait_for_alloc``; the CTA-wide ``sync_threads`` stays only on the grouped
+    # and row-union kernels, whose prologues publish SMEM tables through it.
+    assert "sync_threads()" not in after[1]
+    assert "pipeline_init_wait(" in after[1]
     assert after[1].count("wait_for_alloc()") == 1
     assert after[1].replace(", 'use_pdl': True", "") == before[1]
     # Full caller/allocation/ABI inverse, including the embedded source hashes.
@@ -527,16 +532,17 @@ def test_codegen_rejects_a_wait_after_the_materialized_operand_loads() -> None:
 
 
 def test_one_cta_pdl_waits_inside_the_persistent_tile_loop() -> None:
-    # Four SMs for sixteen 64x16 tiles: the TMA role loops over tiles and the
-    # split prefetch, wait included, sits inside that loop.
+    # Three SMs for sixteen 128x16 tiles (the 64-row small-grid seeds are only
+    # offered within one wave, which three SMs cannot give): the TMA role loops
+    # over tiles and the split prefetch, wait included, sits inside that loop.
     with (
-        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=4),
-        patch("helion.runtime.get_num_sm", return_value=4),
+        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=3),
+        patch("helion.runtime.get_num_sm", return_value=3),
     ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
         with bound.env:
             config = _producer_seed(bound, tcgen05_cta_group="auto")
-        assert config.block_sizes[2:] == [64, 16, 128]
+        assert config.block_sizes[2:] == [128, 16, 128]
         producer, consumer = _stage_sources(bound.to_code(config))
     assert "cute.arch.griddepcontrol_launch_dependents()" in producer
     assert ".is_valid_tile:" in consumer

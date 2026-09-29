@@ -34,6 +34,7 @@ from helion._compiler.cute.epilogue_fanout import prove_paired_fanout
 from helion._compiler.cute.epilogue_fanout import render_chain
 from helion._compiler.cute.epilogue_fanout import render_shared_suffix
 from helion._compiler.cute.epilogue_fanout import schedule_supported
+from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from helion._compiler.type_info import LiteralType
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
@@ -661,6 +662,38 @@ def test_live_typed_store_proof_negatives(change: str) -> None:
     finally:
         second.args = original
         target.meta["val"] = target_value
+
+
+@skipUnlessBackends(["cute"])
+def test_store_mode_field_survives_the_fanout_registration() -> None:
+    # The fan-out carriers are normalized before the heuristic flips
+    # ``epilogue_fanout_search_enabled``; a store-mode field that left the
+    # search surface with that flip stranded the carriers' ``normal`` on a
+    # key the flat schema no longer had (coverage transfer failed).  The field
+    # stays on the surface and only the TMA store is sampled.
+    bound = original_bound()
+    spec = bound.config_spec
+    assert spec._cute_tcgen05_config.epilogue_fanout_search_enabled
+    fragment = spec._flat_fields()[TCGEN05_C_STORE_MODE_CONFIG_KEY]
+    assert fragment.choices == ("normal", "direct")
+    assert fragment.search_choices == ("normal",)
+    (group,) = [g for g in spec.compiler_coverage_groups if g.key == FANOUT_CONFIG_KEY]
+    assert all(
+        witness.carrier.config[TCGEN05_C_STORE_MODE_CONFIG_KEY] == "normal"
+        for witness in group.witnesses
+    )
+    # ``direct`` is the plain store protocol: with the fan-out epilogue on it
+    # is repaired back to the TMA store (search) or rejected (explicit).
+    carrier = group.witnesses[0].carrier
+    carrier.config[FANOUT_CONFIG_KEY] = "shared"
+    carrier.config[TCGEN05_C_STORE_MODE_CONFIG_KEY] = "direct"
+    with bound.env:
+        repaired = dict(carrier.config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert repaired[TCGEN05_C_STORE_MODE_CONFIG_KEY] == "normal"
+        assert repaired[FANOUT_CONFIG_KEY] == "shared"
+        with pytest.raises(InvalidConfig, match="owns the output store"):
+            spec.normalize(dict(carrier.config))
 
 
 @skipUnlessBackends(["cute"])

@@ -1780,10 +1780,30 @@ def test_grouped_worklist_nm_compiler_facts_reject_over_budget_profile() -> None
         patch_cute_mma_support(),
         pytest.raises(
             helion.exc.InvalidConfig,
-            match="tcgen05_ab_stages",
+            match="tcgen05_ab_stages=7 exceeds the grouped N,M worklist per-CTA "
+            "SMEM footprint",
         ),
     ):
         bound.to_triton_code(config)
+    # The rejection names what the config missed: the footprint for a
+    # worklist-shaped ring, the envelope for a ring outside the worklist
+    # shape (cluster_n=2, a third C stage, more than seven AB stages).
+    tcgen05 = bound.env.config_spec._cute_tcgen05_config
+    values = dict(config.config)
+    footprint = tcgen05._grouped_worklist_nm_ab_config_mismatch(values, 7)
+    assert footprint is not None
+    assert "per-CTA SMEM footprint" in footprint
+    assert tcgen05._grouped_worklist_nm_ab_config_mismatch(values, 6) is None
+    for override, ab_stages in (
+        ({"tcgen05_cluster_n": 2}, 6),
+        ({"tcgen05_c_stages": 4}, 6),
+        ({}, 8),
+    ):
+        mismatch = tcgen05._grouped_worklist_nm_ab_config_mismatch(
+            {**values, **override}, ab_stages
+        )
+        assert mismatch is not None
+        assert "outside the grouped N,M worklist envelope" in mismatch
 
 
 def test_grouped_worklist_nm_rejects_shifted_load_mask() -> None:
