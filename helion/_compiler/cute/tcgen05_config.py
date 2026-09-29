@@ -37,6 +37,9 @@ from .pipeline_smem import Tcgen05PipelineSmemFacts
 from .pipeline_smem import max_pipeline_ab_stages
 from .pipeline_smem import pipeline_smem_bytes
 from .strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
+from .strategies import TCGEN05_BATCH_RASTER_CHOICES
+from .strategies import TCGEN05_BATCH_RASTER_CONFIG_KEY
+from .strategies import TCGEN05_BATCH_RASTER_SLOWEST
 from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -65,6 +68,7 @@ from .strategies import Tcgen05PersistenceModel
 from .strategies import Tcgen05Strategy
 from .strategies import derive_persistence_model_from_pid_type
 from .strategies import layout_overrides_from_config
+from .strategies import tcgen05_explicit_epilogue_tile_supported
 from .strategies import validate_tcgen05_strategy_invariants
 from .strategies import warp_spec_from_config
 from .tcgen05_constants import TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY
@@ -99,6 +103,7 @@ from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODES
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENTS
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
@@ -106,6 +111,7 @@ from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENTS
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_C_STORE_MODES
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
@@ -115,6 +121,7 @@ from .tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUT_NORMAL
 from .tcgen05_constants import TCGEN05_EPILOGUE_LAYOUTS
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_MODES
@@ -150,15 +157,20 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_STAGE_CONFIGS
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
 from .tcgen05_constants import TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_SCHED_CONSUMER_WAIT_MODES
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNTS
+from .tcgen05_constants import TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN
+from .tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
+from .tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from .tcgen05_constants import TCGEN05_TWO_CTA_DEEP_AB_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_AB_STAGES
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K
 from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_CLC_AUX_TMA_ACC_STAGES
@@ -179,13 +191,18 @@ from .tcgen05_constants import TCGEN05_TWO_CTA_EDGE_K_TAIL_SCHEDULER_L2_SWIZZLE_
 from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .tcgen05_constants import TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
 from .tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from .tcgen05_constants import Tcgen05RowvecAuxFacts
 from .tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from .tcgen05_constants import tcgen05_ab_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from .tcgen05_constants import tcgen05_default_epilogue_tile_size
 from .tcgen05_constants import tcgen05_direct_entry_stage_tuple_allowed
+from .tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from .tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from .tcgen05_constants import tcgen05_round_up_smem_bytes
+from .tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 from .tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 
 if TYPE_CHECKING:
@@ -213,6 +230,16 @@ class Tcgen05ClusterM2SearchConstraints(NamedTuple):
     # ``_tcgen05_use_2cta_instrs`` (``bm == 128 and is_fp8``). See the
     # ``TCGEN05_TWO_CTA_FP8_SMALL_GRID_*`` constants.
     allow_fp8_small_grid: bool = False
+    # When True, sampled bm=256 / bn in TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+    # cluster_m=2 candidates keep their narrow N tile instead of the 256x256
+    # projection (GEMMs whose 256x256 grid cannot fill the SMs).
+    allow_one_wave_tiles: bool = False
+    # When True, the one-wave tiles are the only reason cluster_m=2 search is
+    # on: the plain 256x256 two-CTA grid would not fill a quarter of the SMs,
+    # so its families stay off (the 2x2 / CLC / M-pair / C-input seeds, the
+    # FFI direct-entry coordinate, the aux-TMA surface) and a sampled
+    # cluster_m=2 candidate that is not a one-wave tile runs on one CTA.
+    one_wave_only: bool = False
 
 
 class Tcgen05AbStagesThreeSearchConstraints(NamedTuple):
@@ -231,6 +258,14 @@ class Tcgen05GroupedWorklistSmemFacts(NamedTuple):
     device_split_sizes: bool
 
 
+TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH = (
+    "is outside the grouped N,M worklist envelope (a 256x128 tile with a "
+    "resolvable MMA profile, tcgen05_cluster_n=1, tcgen05_acc_stages=2, "
+    "tcgen05_c_stages=2 and 4 <= tcgen05_ab_stages <= 7)"
+)
+TCGEN05_GROUPED_WORKLIST_NM_FOOTPRINT_MISMATCH = (
+    "exceeds the grouped N,M worklist per-CTA SMEM footprint"
+)
 TCGEN05_GROUPED_DYNAMIC_AB4_STAGE = 4
 TCGEN05_GROUPED_DYNAMIC_STAGE_TUPLES = ((4, 2), (8, 4))
 
@@ -369,6 +404,7 @@ CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
     TCGEN05_C_STORE_MODE_CONFIG_KEY,
     "tcgen05_num_epi_warps",
     TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
+    TCGEN05_BATCH_RASTER_CONFIG_KEY,
 )
 CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS: frozenset[str] = frozenset(
     {
@@ -455,9 +491,15 @@ class CuteTcgen05Config:
         ) = None
         self.matmul_input_dtype: torch.dtype | None = None
         self.matmul_has_leading_passthrough: bool = False
+        # Product of the leading passthrough (batch) extents: the work-tile
+        # multiplier of every (m, n) tile grid.
+        self.matmul_leading_work_multiplier: int = 1
         self.matmul_explicit_epi_tile_compatible: bool | None = None
         self.aux_kernel_detected: bool = False
         self.exact_shape_aux_kernel_detected: bool = False
+        # Row-vector aux rows of the analyzed stores (``aux_tensor``): the SMEM
+        # model of the ``pre_acc_wait`` row stages the seeds request.
+        self.rowvec_aux_facts: Tcgen05RowvecAuxFacts | None = None
         # True when the kernel feeds a matmul an operand sourced from a load
         # whose dtype is not a tcgen05-native MMA dtype (e.g. an int16 tensor
         # cast to bf16, ``w.to(bfloat16)``). Such an operand cannot be TMA-staged
@@ -519,6 +561,7 @@ class CuteTcgen05Config:
         input_dtype: torch.dtype,
         has_leading_passthrough: bool,
         explicit_epi_tile_compatible: bool,
+        leading_work_multiplier: int = 1,
     ) -> None:
         """Record semantic axes from the structurally accepted MMA candidate."""
         assert self.matmul_block_ids is None, "tcgen05 MMA analysis registered twice"
@@ -526,6 +569,7 @@ class CuteTcgen05Config:
         self.matmul_compile_time_static_extents = compile_time_static_extents
         self.matmul_input_dtype = input_dtype
         self.matmul_has_leading_passthrough = has_leading_passthrough
+        self.matmul_leading_work_multiplier = max(1, leading_work_multiplier)
         self.matmul_explicit_epi_tile_compatible = explicit_epi_tile_compatible
 
     def _matmul_block_indices(self) -> tuple[int, int, int] | None:
@@ -875,6 +919,12 @@ class CuteTcgen05Config:
         two-CTA seeds above cover the machine-filling shapes. The tiles are
         chosen from the problem's geometry only: whole tiles, the widest K
         packet the search admits, and an AB ring no deeper than the K loop.
+
+        Where the search admits both 64- and 128-row tiles, the 64-row tiles
+        are seeded only while their grid stays within one wave: the row split
+        halves each CTA's A tile and its share of the cold-L2 fetch (fp8 256^3
+        on 64x16 tiles: 2.8 -> 2.6 us device span, cuBLAS's 64x8 tiles 2.6),
+        while a second wave of narrow tiles only re-runs the per-CTA prologue.
         """
         extents = self.matmul_compile_time_static_extents
         fragments = self._matmul_block_fragments()
@@ -884,13 +934,16 @@ class CuteTcgen05Config:
             or extents is None
             or fragments is None
             or any(value is None or value <= 0 for value in extents)
-            or self.matmul_has_leading_passthrough
             or "persistent_interleaved" not in self.allowed_pid_types
         ):
             return []
         m, n, k = cast("tuple[int, int, int]", extents)
         bm_fragment, bn_fragment, bk_fragment = fragments
-        standard_tiles = -(-m // 128) * -(-n // 128)
+        # A leading passthrough (batch) axis multiplies the tile count: the
+        # batched 4 x 64x128x128 GEMM has four 128x128 tiles and wants the
+        # same 64x{16,32,64} spread (cuBLAS runs it as 64 CTAs of 64x8).
+        batch = self.matmul_leading_work_multiplier
+        standard_tiles = batch * -(-m // 128) * -(-n // 128)
         if standard_tiles >= self.device_sm_count:
             return []
         bk = bk_fragment.high
@@ -898,37 +951,316 @@ class CuteTcgen05Config:
             bk //= 2
         if bk < bk_fragment.low or bk < 16:
             return []
+        rowvec_aux_only = (
+            self.aux_kernel_detected and not self.exact_shape_aux_kernel_detected
+        )
         seeds: list[Config] = []
+        wide_rows_admitted = bm_fragment.low <= 128 <= bm_fragment.high and m % 128 == 0
         for bm in (64, 128):
             if not bm_fragment.low <= bm <= bm_fragment.high or m % bm:
                 continue
+            narrow_rows_need_one_wave = bm == 64 and wide_rows_admitted
             for bn in (16, 32, 64):
                 if not bn_fragment.low <= bn <= bn_fragment.high or n % bn:
+                    continue
+                if (
+                    narrow_rows_need_one_wave
+                    and batch * (m // bm) * (n // bn) > self.device_sm_count
+                ):
                     continue
                 block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
                 assert block_sizes is not None
                 fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
-                stages = min(k // bk, fit if fit > 0 else 2)
-                seeds.append(
-                    Config(
-                        block_sizes=block_sizes,
-                        pid_type="persistent_interleaved",
-                        tcgen05_cta_group="auto",
-                        tcgen05_cluster_m=1,
-                        tcgen05_cluster_n=1,
-                        tcgen05_ab_stages=max(1, stages),
-                        tcgen05_c_stages=2,
-                        tcgen05_acc_stages=2,
-                        tcgen05_persistence_model="static_persistent",
-                        tcgen05_strategy="role_local_monolithic",
-                        tcgen05_layout_strategy="default",
-                        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                stages = max(1, min(k // bk, fit if fit > 0 else 2))
+                seed_config: dict[str, Any] = {
+                    "block_sizes": block_sizes,
+                    "pid_type": "persistent_interleaved",
+                    "tcgen05_cta_group": "auto",
+                    "tcgen05_cluster_m": 1,
+                    "tcgen05_cluster_n": 1,
+                    "tcgen05_ab_stages": stages,
+                    "tcgen05_c_stages": 2,
+                    "tcgen05_acc_stages": 2,
+                    "tcgen05_persistence_model": "static_persistent",
+                    "tcgen05_strategy": "role_local_monolithic",
+                    "tcgen05_layout_strategy": "default",
+                    **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                }
+                # A row-vector epilogue (bias) on a one-tile-per-CTA kernel has
+                # nothing to hide the row's cold-L2 load behind unless it is
+                # issued before the accumulator wait: the promoted row stage
+                # loads it at the start of the epilogue role (fp16 256^3 +
+                # bias: 4.0 -> 3.0 us device time with ``pre_acc_wait``).
+                if rowvec_aux_only and self.rowvec_aux_stage_fits(
+                    bm=bm,
+                    bn=bn,
+                    bk=bk,
+                    cluster_m=1,
+                    ab_stages=stages,
+                    c_stages=2,
+                ):
+                    seed_config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                        TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
                     )
+                seeds.append(Config(**seed_config))
+                if bn <= TCGEN05_SMALL_GRID_DIRECT_STORE_MAX_BN:
+                    # Narrow tiles store one or two 16-byte chunks per thread:
+                    # the register-direct store beats the SMEM-staged TMA
+                    # store's fixed cost there (fp8 256^3, 128x16 tiles:
+                    # 3.25 -> 2.88 us device span, cuBLAS 2.91), while wide
+                    # tiles keep the TMA store's coalescing.  Seed the twin and
+                    # let the timer decide.
+                    direct_seed_config: dict[str, Any] = dict(seed_config)
+                    direct_seed_config[TCGEN05_C_STORE_MODE_CONFIG_KEY] = (
+                        TCGEN05_C_STORE_MODE_DIRECT
+                    )
+                    seeds.append(Config(**direct_seed_config))
+        return seeds
+
+    def _one_wave_two_cta_tile_is_valid(self, bm: object, bn: object) -> bool:
+        """Whole 256 x {128, 64} CtaGroup.TWO tiles of the static problem."""
+        extents = self.matmul_compile_time_static_extents
+        if extents is None:
+            return False
+        m, n, _k = extents
+        return (
+            type(bm) is int
+            and type(bn) is int
+            and bm == TCGEN05_TWO_CTA_BLOCK_M
+            and bn in TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS
+            and isinstance(m, int)
+            and isinstance(n, int)
+            and m % bm == 0
+            and n % bn == 0
+        )
+
+    def _one_wave_cluster_n2_is_valid(self, bn: object) -> bool:
+        extents = self.matmul_compile_time_static_extents
+        if extents is None or type(bn) is not int or bn <= 0:
+            return False
+        n = extents[1]
+        return (
+            not self.matmul_has_leading_passthrough
+            and isinstance(n, int)
+            and n % bn == 0
+            and (n // bn) % 2 == 0
+        )
+
+    def _batched_multi_tile_seed_configs(self) -> list[Config]:
+        """Persistent two-CTA seeds for batched GEMMs with several tiles per pair.
+
+        cuBLAS runs 16 x 512x768x1024 fp16 as ``nvjet 128x256_64x6_2x2_2cta``:
+        the 256x256 pair tile in 2x2 clusters with a six-deep 64-wide K ring,
+        and a batch-major grid (batch on grid z) so the four clusters of a
+        batch share its A tile across the N peers and its B tile across the
+        M clusters at the same time.  The persistent equivalent is the
+        ``batch_slowest`` raster at the co-resident 4-CTA cluster count: its
+        per-stage cost matches cuBLAS's (394 vs 389 ns per 64-K per tile on
+        the K sweep; the batch-fastest 2x2 ring paid 471 and re-fetched B from
+        DRAM), 16.3 vs 15.0 us at the campaign shape (2x1 pair 16.9).  The
+        search's timer cannot tell these structures apart inside its ~2 us
+        quantum at this shape, so the recipe arrives as a seed, next to the
+        same ring on the 2x1 pair.  Geometry only: batched 16-bit GEMMs
+        whose 256x256 two-CTA grid fills the machine, with even M/N tile
+        counts and K in whole 64-wide steps.
+        """
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        dtype = self.matmul_input_dtype
+        constraints = self.cluster_m2_search_constraints
+        if (
+            not self.search_enabled
+            or not self.matmul_has_leading_passthrough
+            or self.aux_kernel_detected
+            or self.device_sm_count <= 0
+            or extents is None
+            or fragments is None
+            or dtype not in (torch.float16, torch.bfloat16)
+            or constraints is None
+            or constraints.one_wave_only
+            or any(value is None or value <= 0 for value in extents)
+            or TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types
+        ):
+            return []
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        batch = self.matmul_leading_work_multiplier
+        bm, bn, bk = (
+            TCGEN05_TWO_CTA_BLOCK_M,
+            TCGEN05_TWO_CTA_BLOCK_N,
+            TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K,
+        )
+        if (
+            m % bm
+            or n % bn
+            or k % bk
+            or (n // bn) % 2
+            or not (bm_fragment.low <= bm <= bm_fragment.high)
+            or not (bn_fragment.low <= bn <= bn_fragment.high)
+            or not (bk_fragment.low <= bk <= bk_fragment.high)
+            or not self.cluster_m2_bk_is_valid(bk, constraints)
+            or batch * (m // bm) * (n // bn) * 2 < self.device_sm_count
+        ):
+            return []
+        ab_stages = 6
+        if not self.ab_stages_three_fits(
+            bm=bm, bn=bn, bk=bk, cluster_m=2, ab_stages=ab_stages
+        ):
+            return []
+        block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+        assert block_sizes is not None
+        seeds: list[Config] = []
+        for cluster_n in (2, 1):
+            seed_config: dict[str, Any] = {
+                "block_sizes": block_sizes,
+                "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+                "tcgen05_cta_group": "auto",
+                "tcgen05_cluster_m": 2,
+                "tcgen05_cluster_n": cluster_n,
+                "tcgen05_ab_stages": ab_stages,
+                "tcgen05_c_stages": 2,
+                "tcgen05_acc_stages": 2,
+                "l2_groupings": [1],
+                TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 1,
+                TCGEN05_BATCH_RASTER_CONFIG_KEY: TCGEN05_BATCH_RASTER_SLOWEST,
+                "tcgen05_persistence_model": "static_persistent",
+                "tcgen05_strategy": "role_local_monolithic",
+                "tcgen05_layout_strategy": "default",
+                **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+            }
+            seeds.append(Config(**seed_config))
+        return seeds
+
+    def _one_wave_seed_configs(self) -> list[Config]:
+        """One-tile-per-CTA seeds for GEMMs whose 256x256 grid leaves SMs idle.
+
+        cuBLAS's small-shape heuristic (fp16 1024^3, batched 8x256x256x512,
+        fp8 512x1024x512) picks 2-CTA 128x64 / 256x64 tiles in 2x2 clusters
+        with a ten-deep 64-wide K ring: every SM gets one tile and the ring
+        keeps the whole K loop in flight.  The search's timer cannot separate
+        the small-tile families inside its ~2 us quantum, so the recipe has
+        to arrive as a seed.  Geometry only: the one-CTA tile and the
+        two-CTA tile whose one-tile-per-CTA grid comes closest to the SM
+        count without exceeding it, at the narrowest K step the search
+        admits, with the deepest AB ring that fits the SMEM budget (no deeper
+        than the K loop).  fp16 1024^3 with a bias epilogue: the seeded
+        2-CTA 256x64x64 ring of 9 runs 6.24 us vs 7.8 for the one-CTA
+        128x64x128 winner the unseeded search found (cuBLAS 5.6).
+        """
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        dtype = self.matmul_input_dtype
+        if (
+            not self.search_enabled
+            or self.device_sm_count <= 0
+            or extents is None
+            or fragments is None
+            or dtype is None
+            or any(value is None or value <= 0 for value in extents)
+            or (self.aux_kernel_detected and self.exact_shape_aux_kernel_detected)
+            or "persistent_interleaved" not in self.allowed_pid_types
+        ):
+            return []
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        batch = self.matmul_leading_work_multiplier
+        sm_count = self.device_sm_count
+        if batch * -(-m // 256) * -(-n // 256) * 2 >= sm_count:
+            # The 256x256 two-CTA seeds already fill the machine.
+            return []
+        dtype_bytes = torch.empty((), dtype=dtype).element_size()
+        bk_choices = (64, 128) if dtype_bytes >= 2 else (128, 64)
+        bk = next(
+            (
+                value
+                for value in bk_choices
+                if k % value == 0 and bk_fragment.low <= value <= bk_fragment.high
+            ),
+            None,
+        )
+        if bk is None:
+            return []
+        rowvec_aux_only = (
+            self.aux_kernel_detected and not self.exact_shape_aux_kernel_detected
+        )
+        seeds: list[Config] = []
+
+        def emit(bm: int, bn: int, cluster_m: int, cluster_n: int) -> None:
+            block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+            assert block_sizes is not None
+            fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=cluster_m)
+            stages = max(1, min(k // bk, fit if fit > 0 else 2))
+            seed_config: dict[str, Any] = {
+                "block_sizes": block_sizes,
+                "pid_type": "persistent_interleaved",
+                "tcgen05_cta_group": "auto",
+                "tcgen05_cluster_m": cluster_m,
+                "tcgen05_cluster_n": cluster_n,
+                "tcgen05_ab_stages": stages,
+                "tcgen05_c_stages": 2,
+                "tcgen05_acc_stages": 2,
+                "l2_groupings": [1],
+                "tcgen05_l2_swizzle_size": 1,
+                "tcgen05_persistence_model": "static_persistent",
+                "tcgen05_strategy": "role_local_monolithic",
+                "tcgen05_layout_strategy": "default",
+                **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+            }
+            if rowvec_aux_only and self.rowvec_aux_stage_fits(
+                bm=bm,
+                bn=bn,
+                bk=bk,
+                cluster_m=cluster_m,
+                ab_stages=stages,
+                c_stages=2,
+            ):
+                seed_config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
                 )
-            # 64-row tiles double the CTA count of every 128-row tile; seed the
-            # wider rows only when the narrow ones are out of reach.
-            if seeds:
-                break
+            seeds.append(Config(**seed_config))
+
+        def in_range(fragment: BlockSizeFragment, value: int) -> bool:
+            return fragment.low <= value <= fragment.high
+
+        one_cta: tuple[tuple[int, int], int, int] | None = None
+        for bm in (128, 64):
+            for bn in (128, 64, 32):
+                if (
+                    m % bm
+                    or n % bn
+                    or not in_range(bm_fragment, bm)
+                    or not in_range(bn_fragment, bn)
+                ):
+                    continue
+                ctas = batch * (m // bm) * (n // bn)
+                if ctas > sm_count:
+                    continue
+                key = (ctas, bm * bn)
+                if one_cta is None or key > one_cta[0]:
+                    one_cta = (key, bm, bn)
+        if one_cta is not None:
+            emit(one_cta[1], one_cta[2], 1, 1)
+        constraints = self.cluster_m2_search_constraints
+        if (
+            constraints is not None
+            and constraints.allow_one_wave_tiles
+            and self.cluster_m2_bk_is_valid(bk, constraints)
+            and m % TCGEN05_TWO_CTA_BLOCK_M == 0
+            and in_range(bm_fragment, TCGEN05_TWO_CTA_BLOCK_M)
+        ):
+            two_cta: tuple[int, int] | None = None
+            for bn in TCGEN05_TWO_CTA_ONE_WAVE_BLOCK_NS:
+                if n % bn or not in_range(bn_fragment, bn):
+                    continue
+                ctas = batch * (m // TCGEN05_TWO_CTA_BLOCK_M) * (n // bn) * 2
+                if ctas > sm_count:
+                    continue
+                if two_cta is None or ctas > two_cta[0]:
+                    two_cta = (ctas, bn)
+            if two_cta is not None:
+                emit(TCGEN05_TWO_CTA_BLOCK_M, two_cta[1], 2, 1)
+                if self._one_wave_cluster_n2_is_valid(two_cta[1]):
+                    emit(TCGEN05_TWO_CTA_BLOCK_M, two_cta[1], 2, 2)
         return seeds
 
     def _one_cta_persistent_parameters(
@@ -1122,14 +1454,19 @@ class CuteTcgen05Config:
         max_k_tiles: int = TCGEN05_TWO_CTA_MAX_K_TILES,
         allow_edge_k_tail_family: bool = False,
         allow_fp8_small_grid: bool = False,
+        allow_one_wave_tiles: bool = False,
+        one_wave_only: bool = False,
     ) -> None:
         assert static_k > 0, "static_k is required for cluster_m=2 K-cap checks"
         assert max_k_tiles > 0, "cluster_m=2 max K tiles must be positive"
+        assert allow_one_wave_tiles or not one_wave_only
         self.cluster_m2_search_constraints = Tcgen05ClusterM2SearchConstraints(
             static_k=static_k,
             max_k_tiles=max_k_tiles,
             allow_edge_k_tail_family=allow_edge_k_tail_family,
             allow_fp8_small_grid=allow_fp8_small_grid,
+            allow_one_wave_tiles=allow_one_wave_tiles,
+            one_wave_only=one_wave_only,
         )
         self.restrict_cluster_m_search((1, 2))
 
@@ -1169,7 +1506,11 @@ class CuteTcgen05Config:
         if self.aux_kernel_detected or self.matmul_has_leading_passthrough:
             return False
         constraints = self.cluster_m2_search_constraints
-        if constraints is None or constraints.allow_edge_k_tail_family:
+        if (
+            constraints is None
+            or constraints.allow_edge_k_tail_family
+            or constraints.one_wave_only
+        ):
             return False
         for fact in self.config_spec.matmul_facts:
             if (
@@ -1194,6 +1535,7 @@ class CuteTcgen05Config:
         if (
             constraints is None
             or constraints.allow_edge_k_tail_family
+            or constraints.one_wave_only
             or fragments is None
         ):
             return None
@@ -1224,7 +1566,11 @@ class CuteTcgen05Config:
         if self.matmul_has_non_tcgen05_operand:
             return False
         constraints = self.cluster_m2_search_constraints
-        if constraints is None or constraints.allow_edge_k_tail_family:
+        if (
+            constraints is None
+            or constraints.allow_edge_k_tail_family
+            or constraints.one_wave_only
+        ):
             return False
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return False
@@ -1329,7 +1675,7 @@ class CuteTcgen05Config:
         if not self.aux_kernel_detected:
             return None
         constraints = self.cluster_m2_search_constraints
-        if constraints is None:
+        if constraints is None or constraints.one_wave_only:
             return None
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return None
@@ -1419,7 +1765,7 @@ class CuteTcgen05Config:
         if not self._clc_persistence_search_enabled():
             return None
         constraints = self.cluster_m2_search_constraints
-        if constraints is None:
+        if constraints is None or constraints.one_wave_only:
             return None
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return None
@@ -1489,7 +1835,7 @@ class CuteTcgen05Config:
         if not self._m_pair_block_m_is_valid():
             return None
         constraints = self.cluster_m2_search_constraints
-        if constraints is None:
+        if constraints is None or constraints.one_wave_only:
             return None
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return None
@@ -1628,7 +1974,7 @@ class CuteTcgen05Config:
             seed_config["indexing"] = ["tensor_descriptor"] * 3
         return Config(**seed_config)
 
-    def _plain_cluster_n2_seed_config(self) -> Config | None:
+    def _plain_cluster_n2_seed_config(self, *, deep: bool = False) -> Config | None:
         """Autotune seed for the 4-CTA (cluster 2x2) multicast family.
 
         B multicast on top of the 2-CTA A multicast halves B traffic, which
@@ -1637,11 +1983,33 @@ class CuteTcgen05Config:
         seeds the static-persistent monolithic family; a CLC-persistent
         variant is layered on in ``autotune_seed_configs`` and the search's
         terminal refinement arbitrates between them.
+
+        ``deep`` is nvjet's ``64x6`` staging of the same tile: bk=64 with a
+        six-deep AB ring (same SMEM as bk=128/ab=3). The finer stages land the
+        first MMA earlier and shorten the drain after the last stage, which is
+        the whole difference on one-wave shapes where every CTA runs a single
+        tile (fp16 2048x4096x2048 with a bias epilogue: 28.3 vs 29.0 us device
+        time, cuBLAS 26.7).
+
+        Row-vector broadcast epilogues (``acc + bias[n]``) ride the same
+        family: their per-tile aux is a 512 B row staged once per warp in SMEM,
+        so they take the plain seed plus the ``pre_acc_wait`` placement that
+        enables the stage. Exact-shape (source-C) epilogues keep their own
+        C-input seeds.
         """
-        if self.aux_kernel_detected or self.matmul_has_leading_passthrough:
+        rowvec_aux_only = (
+            self.aux_kernel_detected and not self.exact_shape_aux_kernel_detected
+        )
+        if (
+            self.aux_kernel_detected and not rowvec_aux_only
+        ) or self.matmul_has_leading_passthrough:
             return None
         constraints = self.cluster_m2_search_constraints
-        if constraints is None or constraints.allow_edge_k_tail_family:
+        if (
+            constraints is None
+            or constraints.allow_edge_k_tail_family
+            or constraints.one_wave_only
+        ):
             return None
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in self.allowed_pid_types:
             return None
@@ -1654,13 +2022,32 @@ class CuteTcgen05Config:
             and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
         ):
             return None
-        bk = bk_fragment.high
-        while bk >= bk_fragment.low:
-            if self.cluster_m2_bk_is_valid(bk, constraints):
-                break
-            bk //= 2
+        if deep:
+            bk = TCGEN05_TWO_CTA_EDGE_K_TAIL_DEEP_BLOCK_K
+            ab_stages = self._two_cta_deep_ab_stages(bk)
+            if not (
+                bk_fragment.low <= bk <= bk_fragment.high
+                and self.cluster_m2_bk_is_valid(bk, constraints)
+                and self.ab_stages_three_fits(
+                    bm=TCGEN05_TWO_CTA_BLOCK_M,
+                    bn=TCGEN05_TWO_CTA_BLOCK_N,
+                    bk=bk,
+                    cluster_m=2,
+                    ab_stages=ab_stages,
+                )
+            ):
+                return None
         else:
-            return None
+            bk = bk_fragment.high
+            while bk >= bk_fragment.low:
+                if self.cluster_m2_bk_is_valid(bk, constraints):
+                    break
+                bk //= 2
+            else:
+                return None
+            # ab=3 only where the SMEM-budget gate admits it (B200-class
+            # optin); sub-B200 devices keep the known-good ab=2 envelope.
+            ab_stages = 3 if self.ab_stages_three_search_constraints is not None else 2
         seed_config: dict[str, Any] = {
             "block_sizes": [
                 TCGEN05_TWO_CTA_BLOCK_M,
@@ -1672,15 +2059,90 @@ class CuteTcgen05Config:
             "tcgen05_cluster_m": 2,
             "tcgen05_cluster_n": 2,
             "tcgen05_num_epi_warps": 4,
-            # ab=3 only where the SMEM-budget gate admits it (B200-class
-            # optin); sub-B200 devices keep the known-good ab=2 envelope.
-            "tcgen05_ab_stages": (
-                3 if self.ab_stages_three_search_constraints is not None else 2
-            ),
+            "tcgen05_ab_stages": ab_stages,
         }
+        if deep:
+            seed_config["tcgen05_c_stages"] = 2
+        if rowvec_aux_only and self.rowvec_aux_stage_fits(
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=bk,
+            cluster_m=2,
+            ab_stages=ab_stages,
+            c_stages=2,
+        ):
+            seed_config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            )
         if self.config_spec.indexing.length == 3:
             seed_config["indexing"] = ["tensor_descriptor"] * 3
         return Config(**seed_config)
+
+    def _two_cta_deep_ab_stages(self, bk: int) -> int:
+        """AB depth of the deep (bk=64) 256x256 two-CTA seed.
+
+        nvjet's 64x6 ring for 16-bit operands; fp8 operands halve the
+        per-stage SMEM, so the ring goes as deep as the budget admits (12 at
+        256x256x64, nvjet's fp8 kernels run 128x6 = the same bytes in flight).
+        Row-vector aux kernels whose seed stages the row hand it one AB
+        stage where that is what admits the stage
+        (``_deep_ab_stages_with_rowvec_stage``).
+        """
+        constraints = self.ab_stages_three_search_constraints
+        if constraints is None or constraints.dtype_bytes != 1:
+            ab_stages = TCGEN05_TWO_CTA_DEEP_AB_STAGES
+        else:
+            fit = self.max_ab_stages_that_fit(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=bk,
+                cluster_m=2,
+            )
+            ab_stages = max(TCGEN05_TWO_CTA_DEEP_AB_STAGES, fit)
+        return self._deep_ab_stages_with_rowvec_stage(ab_stages, bk=bk)
+
+    def _deep_ab_stages_with_rowvec_stage(self, ab_stages: int, *, bk: int) -> int:
+        """Make room for the deep seed's ``pre_acc_wait`` row stage.
+
+        The AB-only depth fills the budget the seed gates see, so a row stage
+        that the full SMEM model (``rowvec_aux_stage_fits``: AB ring + C ring
+        + row stage) does not admit next to it would cost the seed its
+        placement. Where one stage less admits the stage, take it: a 32-bit
+        row's 4 KiB warp-private stage overflows next to the 192 KiB ring and
+        the 32 KiB (128, 64) C ring at ab=6 (fp16) and ab=12 (fp8), and ab=5
+        / ab=11 with the stage measured 2.1 us faster than the nominal depth
+        without it at 2048x4096x2048 (fp16 33.8 vs 35.8 us, fp8 20.6 vs
+        22.7 us; the shallower ring alone costs nothing there, and the same
+        holds on the 2x1 twin). Rows that take no stage (unpromoted 16-bit
+        rows) and exact-shape epilogues keep the nominal depth, as does a
+        stage that one AB stage does not make room for.
+        """
+        facts = self.rowvec_aux_facts
+        if (
+            facts is None
+            or not self.aux_kernel_detected
+            or self.exact_shape_aux_kernel_detected
+            or ab_stages <= 1
+            or tcgen05_rowvec_stage_smem_bytes(
+                rows=facts.rows, bn=TCGEN05_TWO_CTA_BLOCK_N, epi_warps=4
+            )
+            == 0
+        ):
+            return ab_stages
+
+        def fits(depth: int) -> bool:
+            return self.rowvec_aux_stage_fits(
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=bk,
+                cluster_m=2,
+                ab_stages=depth,
+                c_stages=2,
+            )
+
+        if fits(ab_stages) or not fits(ab_stages - 1):
+            return ab_stages
+        return ab_stages - 1
 
     def _aux_tma_edge_search_enabled(self) -> bool:
         # The TMA aux producer's original admission: the validated Target8-style
@@ -1707,6 +2169,7 @@ class CuteTcgen05Config:
             and not self.matmul_has_leading_passthrough
             and constraints is not None
             and not constraints.allow_edge_k_tail_family
+            and not constraints.one_wave_only
         )
 
     def _aux_tma_search_enabled(self) -> bool:
@@ -1831,9 +2294,13 @@ class CuteTcgen05Config:
         ):
             return None
         constraints = self.cluster_m2_search_constraints
-        if constraints is None or not self.cluster_m2_bk_is_valid(
-            TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
-            constraints,
+        if (
+            constraints is None
+            or constraints.one_wave_only
+            or not self.cluster_m2_bk_is_valid(
+                TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
+                constraints,
+            )
         ):
             return None
         seed_config: dict[str, Any] = dict(clc_aux_tma_seed.config)
@@ -1851,6 +2318,8 @@ class CuteTcgen05Config:
     def autotune_seed_configs(self) -> list[Config]:
         seeds = self._paired_pipeline_seed_configs()
         seeds.extend(self._small_grid_seed_configs())
+        seeds.extend(self._one_wave_seed_configs())
+        seeds.extend(self._batched_multi_tile_seed_configs())
         plain_clc_seed = self._plain_clc_seed_config()
         if plain_clc_seed is not None:
             seeds.append(plain_clc_seed)
@@ -1893,6 +2362,17 @@ class CuteTcgen05Config:
         plain_cluster_n2_seed = self._plain_cluster_n2_seed_config()
         if plain_cluster_n2_seed is not None:
             seeds.append(plain_cluster_n2_seed)
+            deep_cluster_n2_seed = self._plain_cluster_n2_seed_config(deep=True)
+            if deep_cluster_n2_seed is not None:
+                seeds.append(deep_cluster_n2_seed)
+                # The same deep ring on the 2x1 cluster: for fp8
+                # 2048x4096x2048 it lands 190/200 flushed replays in cuBLAS's
+                # timer bucket where the 2x2 rings straddle it.
+                deep_cluster_n1_seed_config: dict[str, Any] = dict(
+                    deep_cluster_n2_seed.config
+                )
+                deep_cluster_n1_seed_config["tcgen05_cluster_n"] = 1
+                seeds.append(Config(**deep_cluster_n1_seed_config))
             if plain_clc_seed is not None:
                 # 4-CTA multicast + CLC dynamic persistence (Quack's
                 # dynamic-persistent 2x2 topology): reuse the validated CLC
@@ -2036,6 +2516,7 @@ class CuteTcgen05Config:
         sampled_bm = block_sizes[m_index]
         if (
             constraints.allow_fp8_small_grid
+            and not constraints.one_wave_only
             and not edge_k_tail_family
             and isinstance(sampled_bm, int)
             and not isinstance(sampled_bm, bool)
@@ -2043,6 +2524,31 @@ class CuteTcgen05Config:
         ):
             block_sizes[m_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
             block_sizes[n_index] = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            return
+        if (
+            constraints.allow_one_wave_tiles
+            and not edge_k_tail_family
+            and not is_narrow_clc_aux_tma
+            # Exact-shape (source-C) epilogues keep the validated 256x256
+            # aux-TMA regime, as ``_one_wave_seed_configs`` does.
+            and not self.exact_shape_aux_kernel_detected
+            and self._one_wave_two_cta_tile_is_valid(
+                block_sizes[m_index], block_sizes[n_index]
+            )
+        ):
+            # One-wave family: a sampled 256 x {128, 64} CtaGroup.TWO tile
+            # keeps its narrow N (the 256x256 projection would leave most SMs
+            # idle on these shapes).  cluster_n=2 needs an even N tile count.
+            if config.get("tcgen05_cluster_n", 1) == 2 and not (
+                self._one_wave_cluster_n2_is_valid(block_sizes[n_index])
+            ):
+                config["tcgen05_cluster_n"] = 1
+            return
+        if constraints.one_wave_only:
+            # The one-wave tiles are the only two-CTA geometry admitted on
+            # this shape (its 256x256 grid would idle most SMs); any other
+            # sample keeps its tile on one CTA.
+            config["tcgen05_cluster_m"] = 1
             return
         if (
             block_sizes[m_index] == 2 * TCGEN05_TWO_CTA_BLOCK_M
@@ -2062,6 +2568,7 @@ class CuteTcgen05Config:
             block_sizes[n_index] = TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_N
         else:
             block_sizes[n_index] = TCGEN05_TWO_CTA_BLOCK_N
+        self._fix_batched_cluster_n2_search_config(config, block_sizes[n_index])
         if edge_k_tail_family:
             if (
                 not self.aux_kernel_detected
@@ -2094,6 +2601,42 @@ class CuteTcgen05Config:
                 config["l2_groupings"] = [
                     TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_L2_GROUPING
                 ]
+
+    def _fix_batched_cluster_n2_search_config(
+        self, config: dict[str, object], bn: object
+    ) -> None:
+        """Project a batched cluster_n=2 sample onto what its codegen admits.
+
+        The batched cluster_n=2 kernel pairs N tiles on the scheduler's
+        swapped dim 1 (``program_id``), so it needs whole N-tile pairs and
+        the plain raster: the L2-grouped and L2-swizzled pid decodes pair the
+        cluster lanes on the first two grid dims, which are (batch, m) on a
+        batched grid, and an odd M-tile count under ``l2_groupings > 1``
+        hangs the multicast peers (``cute_mma`` rejects both). Odd N-tile
+        counts fall back to cluster_n=1; the other samples keep cluster_n=2
+        with ``l2_groupings`` of 1 and no L2 swizzle.
+        """
+        if not (
+            self.matmul_has_leading_passthrough
+            and config.get("tcgen05_cluster_n", 1) == 2
+        ):
+            return
+        extents = self.matmul_compile_time_static_extents
+        n = extents[1] if extents is not None else None
+        if not (
+            type(bn) is int
+            and isinstance(n, int)
+            and bn > 0
+            and n % bn == 0
+            and (n // bn) % 2 == 0
+        ):
+            config["tcgen05_cluster_n"] = 1
+            return
+        groupings = config.get("l2_groupings")
+        if isinstance(groupings, list) and any(g != 1 for g in groupings):
+            config["l2_groupings"] = [1] * len(groupings)
+        if config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) != 1:
+            config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
 
     def _fix_grouped_worklist_search_config(self, config: dict[str, object]) -> None:
         """Project worklist search neighbors onto the validated logical tile."""
@@ -2526,9 +3069,32 @@ class CuteTcgen05Config:
                 "role-local TMA epilogue"
             )
 
+    def _normalize_batch_raster(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``tcgen05_batch_raster`` names a walk over a batched grid only.
+
+        Plain grids raster through ``loop_orders``; a raster carried onto a
+        plain bind (config reuse across kernels) is dropped by the fix pass
+        and rejected by validation.  Batched binds validate the value through
+        the optional fragment.
+        """
+        if TCGEN05_BATCH_RASTER_CONFIG_KEY not in config:
+            return
+        if self.matmul_has_leading_passthrough:
+            return
+        if fix_invalid:
+            config.pop(TCGEN05_BATCH_RASTER_CONFIG_KEY, None)
+        else:
+            raise InvalidConfig(
+                f"{TCGEN05_BATCH_RASTER_CONFIG_KEY} requires a batched "
+                "(leading passthrough) tcgen05 GEMM"
+            )
+
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        self._normalize_batch_raster(config, fix_invalid=fix_invalid)
         # An explicit physical schedule owns its projection.  Validate the
         # requested carrier before generic block normalization can repair it.
         self._normalize_grouped_row_union(
@@ -2799,6 +3365,209 @@ class CuteTcgen05Config:
         )
         return bytes_per_cta <= constraints.per_cta_smem_budget_bytes
 
+    def rowvec_aux_stage_fits(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        ab_stages: int,
+        c_stages: int,
+        epi_warps: int = 4,
+        acc_stages: int = 2,
+    ) -> bool:
+        """Whether ``pre_acc_wait`` row stages fit next to a tile's rings.
+
+        Row-vector aux seeds and samples add the placement that stages the
+        row in SMEM (``memory_ops``); the stage shares the per-CTA opt-in
+        capacity with the AB ring and the C ring, which the AB-only gates
+        (``ab_stages_three_fits``) do not count. ``default_layout_smem_fits``
+        models the kernel's whole static arena against the raw capacity: a
+        32-bit row on 16-bit inputs at the 2x2 256x256 ab=3 seed (192 KiB AB
+        + 32 KiB (128, 64) C + 4 KiB warp-private stage) overflows, so that
+        seed keeps the default placement, while the promoted 16-bit row
+        ((128, 32) subtile, 1 KiB stage) fits, as does the 2 KiB stage next
+        to the 192 KiB ring and 32 KiB c=4 ring of a 256x128x64 tile.
+        """
+        return self.default_layout_smem_fits(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            ab_stages=ab_stages,
+            c_stages=c_stages,
+            stage_rows=True,
+            epi_warps=epi_warps,
+            acc_stages=acc_stages,
+        )
+
+    def default_layout_smem_bytes(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        ab_stages: int,
+        c_stages: int,
+        stage_rows: bool,
+        epi_warps: int = 4,
+        acc_stages: int = 2,
+    ) -> int | None:
+        """Modelled static SMEM arena of a DEFAULT-layout tile, in bytes.
+
+        The AB ring, the TMA-store C ring, with ``stage_rows`` the
+        ``pre_acc_wait`` row stages of the store lowering
+        (``tcgen05_rowvec_stage_smem_bytes``, occupying whole KiB ahead of
+        the C ring's alignment) and the fixed allocations
+        (``tcgen05_fixed_smem_overhead_bytes``), laid out as ptxas lays the
+        kernel's allocations out (``tcgen05_constants``); exact for the
+        measured plain and row-vector kernels. The C subtile follows the
+        matmul plan (``cute_mma``): (128, 32) for a 16-bit output whose
+        row-vector rows are all promoted and staged, or for a plain 16-bit
+        store on the 256-wide two-CTA tile, otherwise CuTe's with-source rule
+        at the output width, which the role-local epilogue applies whether
+        or not a source-C tensor exists ((128, 64) on a 256-wide 16-bit
+        tile, (128, 32) on narrower ones). ``None`` without a
+        recorded SMEM budget, and without store facts when rows are staged;
+        rings without facts are sized for the widest (32-bit) output the
+        epilogue stores (the with-source subtile rule makes that ring at
+        least as large as any narrower output's), so an unanalyzed store
+        chain is judged conservatively rather than refused.
+        """
+        constraints = self.ab_stages_three_search_constraints
+        facts = self.rowvec_aux_facts
+        if constraints is None or cluster_m not in (1, 2):
+            return None
+        if facts is None and stage_rows:
+            return None
+        if bm <= 0 or bn <= 0 or bk <= 0 or ab_stages <= 0 or c_stages <= 0:
+            return None
+        if acc_stages <= 0 or epi_warps <= 0:
+            return None
+        ab_bytes = tcgen05_ab_smem_bytes_per_cta(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            dtype_bytes=constraints.dtype_bytes,
+            ab_stages=ab_stages,
+            cluster_m=cluster_m,
+        )
+        if facts is None:
+            output_itemsize = 4
+            narrow_subtile = False
+            stage_bytes = 0
+        else:
+            output_itemsize = facts.output_itemsize
+            # The matmul plan's (128, 32) subtile: promoted 16-bit rows that
+            # are staged, or a plain 16-bit store on the 256-wide two-CTA
+            # tile (``tcgen05_plain_narrow_subtile``; the plan also asks for
+            # a single static-full-tile store, which every plain kernel the
+            # gates see has).
+            narrow_subtile = (
+                facts.output_itemsize == 2
+                and (
+                    (
+                        stage_rows
+                        and bool(facts.rows)
+                        and all(row.promoted for row in facts.rows)
+                    )
+                    or (
+                        not facts.rows
+                        and constraints.dtype_bytes == 2
+                        and cluster_m == 2
+                        and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+                    )
+                )
+                and tcgen05_explicit_epilogue_tile_supported(
+                    is_two_cta=cluster_m == 2,
+                    bm=bm,
+                    bn=bn,
+                    tile_shape=(128, 32, 32),
+                )
+            )
+            stage_bytes = (
+                tcgen05_rowvec_stage_smem_bytes(
+                    rows=facts.rows, bn=bn, epi_warps=epi_warps
+                )
+                if stage_rows
+                else 0
+            )
+        if stage_bytes:
+            # The row stages lead the arena and the C ring's 1 KiB alignment
+            # follows them: a 256 B or 512 B promoted row occupies a whole KiB.
+            stage_bytes = tcgen05_round_up_smem_bytes(
+                stage_bytes, TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
+            )
+        out_bits = output_itemsize * 8
+        if narrow_subtile:
+            epi_tile_m, epi_tile_n = 128, 32
+        else:
+            epi_tile_m, epi_tile_n = tcgen05_default_epilogue_tile_size(
+                bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
+            )
+        c_bytes = tcgen05_c_smem_bytes_per_cta(
+            epi_tile_m=epi_tile_m,
+            epi_tile_n=epi_tile_n,
+            dtype_bytes=output_itemsize,
+            c_stages=c_stages,
+        )
+        return (
+            ab_bytes
+            + c_bytes
+            + stage_bytes
+            + tcgen05_fixed_smem_overhead_bytes(
+                ab_stages=ab_stages, acc_stages=acc_stages, cluster_m=cluster_m
+            )
+        )
+
+    def default_layout_smem_fits(
+        self,
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+        ab_stages: int,
+        c_stages: int,
+        stage_rows: bool,
+        epi_warps: int = 4,
+        acc_stages: int = 2,
+    ) -> bool:
+        """Whether a DEFAULT-layout tile's SMEM plan fits the opt-in capacity.
+
+        ``default_layout_smem_bytes`` plus the allowance for the small
+        allocations the model does not enumerate
+        (``TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES``) against the raw
+        per-CTA capacity, which the arena may fill exactly. Fails closed:
+        ``False`` without a recorded SMEM budget, or without store facts
+        when rows are staged.
+        """
+        arena_bytes = self.default_layout_smem_bytes(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            ab_stages=ab_stages,
+            c_stages=c_stages,
+            stage_rows=stage_rows,
+            epi_warps=epi_warps,
+            acc_stages=acc_stages,
+        )
+        if arena_bytes is None:
+            return False
+        constraints = self.ab_stages_three_search_constraints
+        assert constraints is not None
+        # ``per_cta_smem_budget_bytes`` is the opt-in capacity less the fixed
+        # AB-gate reservation (``per_cta_ab_smem_budget_bytes``); the arena is
+        # modelled in full here, so compare against the capacity itself.
+        capacity = (
+            constraints.per_cta_smem_budget_bytes
+            + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+        )
+        return arena_bytes + TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES <= capacity
+
     def c_stages_fits(
         self,
         *,
@@ -2899,6 +3668,20 @@ class CuteTcgen05Config:
     def _grouped_worklist_nm_ab_config_matches(
         self, config: dict[str, object], ab_stages: object
     ) -> bool:
+        return self._grouped_worklist_nm_ab_config_mismatch(config, ab_stages) is None
+
+    def _grouped_worklist_nm_ab_config_mismatch(
+        self, config: dict[str, object], ab_stages: object
+    ) -> str | None:
+        """Why ``config`` at ``ab_stages`` is not an admitted N,M worklist ring.
+
+        ``None`` when it is: the worklist shape (a 256x128 logical tile with a
+        resolvable MMA profile, ``tcgen05_cluster_n=1``, two accumulator and
+        C stages, four to seven AB stages) whose exact per-CTA footprint
+        (``tcgen05_grouped_worklist_smem_bytes``) fits the target capacity.
+        The shape and the footprint are reported apart, so a rejected explicit
+        config learns which one it missed.
+        """
         config_view = self._matmul_config_view(config)
         if config_view is None:
             block_sizes = config.get("block_sizes")
@@ -2907,7 +3690,7 @@ class CuteTcgen05Config:
                 or not isinstance(block_sizes, list)
                 or len(block_sizes) != 3
             ):
-                return False
+                return TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH
             # Reviewed/AOT configs can be normalized by a standalone ConfigSpec
             # before compiler MMA analysis registers semantic block IDs.  That
             # schema is exactly the canonical [M, N, K] triple.  Real kernels
@@ -2930,12 +3713,12 @@ class CuteTcgen05Config:
             and block_sizes[m_index] == TCGEN05_TWO_CTA_BLOCK_M
             and block_sizes[n_index] == 128
         ):
-            return False
+            return TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH
         constraints = self.ab_stages_three_search_constraints
         if constraints is None:
             # Fixed configs can be normalized before their input device is known.
             # CuTe MMA selection applies the real target's SMEM limit at codegen.
-            return True
+            return None
         target_capacity_bytes = (
             constraints.per_cta_smem_budget_bytes
             + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
@@ -2958,10 +3741,12 @@ class CuteTcgen05Config:
                 ab_stages=ab_stages,
                 cluster_m=profile.cluster_m,
             )
-            return required_ab_bytes <= target_capacity_bytes
+            if required_ab_bytes <= target_capacity_bytes:
+                return None
+            return TCGEN05_GROUPED_WORKLIST_NM_FOOTPRINT_MISMATCH
         sched_stage_count = config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1)
         if type(sched_stage_count) is not int or sched_stage_count <= 0:
-            return False
+            return TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH
         physical_bm, physical_bn = profile.mma_m, profile.mma_n
         # The generic AB search budget reserves 28 KiB, which is deliberately
         # conservative for general matmuls but would reject the valid
@@ -2981,7 +3766,9 @@ class CuteTcgen05Config:
             c_stages=2,
             cluster_m=profile.cluster_m,
         )
-        return required_bytes <= target_capacity_bytes
+        if required_bytes <= target_capacity_bytes:
+            return None
+        return TCGEN05_GROUPED_WORKLIST_NM_FOOTPRINT_MISMATCH
 
     def grouped_dynamic_stages_fit_for_target(
         self,
@@ -3040,18 +3827,20 @@ class CuteTcgen05Config:
         # ``_fix_ab_stages_three_search_config``: when a config carries c=4 from
         # ANY source and ``c_stages_fits`` is False, demote it to 2.
         #
-        # Scope: judge ONLY the canonical full-tile 256x256 DEFAULT-layout path,
-        # which is exactly where the AB+C arithmetic is calibrated (the validated
-        # CtaGroup.TWO cosize shapes) and where the role-local C ring lives. The
-        # narrow-N / bm=128 edge family (``_fix_aux_edge_search_config`` sets its
-        # own validated c=4 at a different cosize that the analytic model would
-        # mis-judge) and the EXPLICIT_EPI_TILE direct-entry seeds (separate
+        # Scope: the canonical full-tile 256x256 DEFAULT-layout path, which is
+        # exactly where the AB+C arithmetic is calibrated (the validated
+        # CtaGroup.TWO cosize shapes) and where the role-local C ring lives,
+        # plus the one-CTA bm=128 tiles (``_fix_one_cta_c_stages_search_config``).
+        # The narrow-N / bm=128 edge family (``_fix_aux_edge_search_config`` sets
+        # its own validated c=4 at a different cosize that the analytic model
+        # would mis-judge) and the EXPLICIT_EPI_TILE direct-entry seeds (separate
         # (128, 32) tile + own admission) keep their c=4 untouched.
         if not self.search_enabled:
             return
         if config.get("tcgen05_c_stages") != TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES:
             return
         if not self._is_default_layout_full_tile_config(config):
+            self._fix_one_cta_c_stages_search_config(config)
             return
         # Fail CLOSED: the ``(2, 4)`` c-stages fragment is offered on every
         # device, but with no SMEM budget recorded (non-B200 / CPU host) we
@@ -3065,17 +3854,208 @@ class CuteTcgen05Config:
             return
         block_sizes, m_index, n_index, k_index = config_view
         cluster_m = cast("int", config.get("tcgen05_cluster_m", 1))
-        ab_stages = cast("int", config.get("tcgen05_ab_stages", 2))
+        bm = cast("int", block_sizes[m_index])
+        bn = cast("int", block_sizes[n_index])
+        bk = cast("int", block_sizes[k_index])
+        # Judge at the depth the AB envelope leaves, like the one-CTA branch
+        # and the row-stage gate: a sampled ab=12 reaches codegen at the
+        # deepest AB-only fit, and that is the ring the C ring shares SMEM
+        # with.
         if not self.c_stages_fits(
-            bm=cast("int", block_sizes[m_index]),
-            bn=cast("int", block_sizes[n_index]),
-            bk=cast("int", block_sizes[k_index]),
+            bm=bm,
+            bn=bn,
+            bk=bk,
             cluster_m=cluster_m,
-            ab_stages=ab_stages,
+            ab_stages=self._projected_ab_stages(
+                config, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
+            ),
             c_stages=TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES,
             has_source_c=self.aux_kernel_detected,
         ):
             config["tcgen05_c_stages"] = 2
+
+    def _fix_one_cta_c_stages_search_config(self, config: dict[str, object]) -> None:
+        """Demote a sampled c=4 that overflows SMEM on a one-CTA bm=128 tile.
+
+        The 256x256 gate never sees the one-CTA ``[128, 256, bk]`` tiles that
+        the persistent bm clamp (``_fix_cluster_m1_persistent_search_config``)
+        and the one-wave-only fallback land samples on, while the AB envelope
+        fills their budget on its own (128x256x64 ab=4 and 128x256x128 ab=2
+        are 192 KiB) and a 4-stage (128, 64) 16-bit C ring adds 64 KiB: NVVM
+        rejected 2 of the 308 configs projected from an fp16 1024^3 sweep
+        (the c=2 twins and ab<=3 compile). Judge the tile with the measured
+        DEFAULT-layout arena model at the depth the envelope leaves, counting
+        the row stages a kept ``pre_acc_wait`` adds: 128x128x64 ab=6 keeps
+        c=4 with a 2 KiB fp32 row stage (231 588 B of 232 448), 128x256x64
+        ab=4 does not. Grouped kernels keep their own stage admission, and
+        the aux output-edge family keeps its validated c=4
+        (``_fix_aux_edge_search_config``).
+        """
+        if (
+            config.get(
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+                Tcgen05LayoutStrategy.DEFAULT.value,
+            )
+            != Tcgen05LayoutStrategy.DEFAULT.value
+            or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            or config.get("tcgen05_cluster_m", 1) != 1
+        ):
+            return
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return
+        block_sizes, m_index, n_index, k_index = config_view
+        bm = block_sizes[m_index]
+        bn = block_sizes[n_index]
+        bk = block_sizes[k_index]
+        if not (
+            isinstance(bm, int)
+            and isinstance(bn, int)
+            and isinstance(bk, int)
+            and bm == TCGEN05_ONE_CTA_MAX_BLOCK_M
+        ):
+            return
+        if self.aux_kernel_detected and self._has_any_matmul_fact_edge_tile(config):
+            return
+        if not self.default_layout_smem_fits(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=1,
+            ab_stages=self._projected_ab_stages(
+                config, bm=bm, bn=bn, bk=bk, cluster_m=1
+            ),
+            c_stages=TCGEN05_RESIDUAL_FULL_TILE_DEEP_C_STAGES,
+            stage_rows=self._store_lowering_stages_rows(config),
+            epi_warps=self._config_epi_warps(config),
+            acc_stages=self._config_acc_stages(config),
+        ):
+            config["tcgen05_c_stages"] = 2
+
+    def _fix_rowvec_stage_search_config(self, config: dict[str, object]) -> None:
+        """Demote a sampled ``pre_acc_wait`` whose row stages overflow SMEM.
+
+        ``tcgen05_aux_load_placement`` is a search fragment on every
+        row-vector kernel, so a sample reaches codegen with the placement on
+        whatever rings it carries: the seed builders apply
+        ``rowvec_aux_stage_fits`` but the projection did not, and the fp16
+        2048x4096x2048 GEMM with a 32-bit row died in NVVM on the 256x256
+        deep rings (bk=64 ab=6 and bk=128 ab=3, cluster_n 1 and 2: 4 dead
+        configs of 326 projected) once the 4 KiB warp-private stage joined
+        them. Judge the final rings (after the c-stages gate) at the depth
+        the AB envelope leaves, with the measured arena model: the 2 KiB
+        stage of a 128-wide tile fits next to a 192 KiB ring and a 32 KiB
+        c=4 ring (256x128x64 ab=8, 256x128x128 ab=4, one-CTA 128x128x{32,
+        64, 128} at ab 12/6/3: 231 596-231 716 B of 232 448), the 4 KiB
+        stage of a 256-wide tile does not. A row that takes no stage keeps
+        the placement, the C-input strategy renders no stage
+        (``_store_lowering_stages_rows``) and non-DEFAULT layouts keep their
+        own admission.
+        """
+        if not self.search_enabled:
+            return
+        facts = self.rowvec_aux_facts
+        if (
+            facts is None
+            or not facts.rows
+            or not self._store_lowering_stages_rows(config)
+            or config.get(
+                TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY,
+                Tcgen05LayoutStrategy.DEFAULT.value,
+            )
+            != Tcgen05LayoutStrategy.DEFAULT.value
+        ):
+            return
+        config_view = self._matmul_config_view(config)
+        if config_view is None:
+            return
+        block_sizes, m_index, n_index, k_index = config_view
+        bm = block_sizes[m_index]
+        bn = block_sizes[n_index]
+        bk = block_sizes[k_index]
+        if not (isinstance(bm, int) and isinstance(bn, int) and isinstance(bk, int)):
+            return
+        epi_warps = self._config_epi_warps(config)
+        if (
+            tcgen05_rowvec_stage_smem_bytes(rows=facts.rows, bn=bn, epi_warps=epi_warps)
+            == 0
+        ):
+            return
+        cluster_m = config.get("tcgen05_cluster_m", 1)
+        c_stages = config.get("tcgen05_c_stages", 2)
+        if not (isinstance(cluster_m, int) and isinstance(c_stages, int)):
+            return
+        if not self.rowvec_aux_stage_fits(
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            ab_stages=self._projected_ab_stages(
+                config, bm=bm, bn=bn, bk=bk, cluster_m=cluster_m
+            ),
+            c_stages=c_stages,
+            epi_warps=epi_warps,
+            acc_stages=self._config_acc_stages(config),
+        ):
+            config[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = (
+                TCGEN05_AUX_LOAD_PLACEMENT_POST_ACC_WAIT
+            )
+
+    def _projected_ab_stages(
+        self,
+        config: dict[str, object],
+        *,
+        bm: int,
+        bn: int,
+        bk: int,
+        cluster_m: int,
+    ) -> int:
+        """The AB depth the search's final envelope leaves on ``config``.
+
+        ``_validate_direct_entry_ab_stage_envelope`` runs after every family
+        fixup and clamps a sampled depth above 3 on a DEFAULT-layout tile to
+        the deepest AB-only fit (``max_ab_stages_that_fit``), so the ring
+        gates that run before it judge a sampled ab=12 at the depth codegen
+        will see instead of demoting a knob the clamp was about to rescue.
+        """
+        ab_stages = config.get("tcgen05_ab_stages", 2)
+        if not isinstance(ab_stages, int) or ab_stages <= 0:
+            return 2
+        if ab_stages <= 3:
+            return ab_stages
+        fit_max = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=cluster_m)
+        return min(ab_stages, fit_max) if fit_max > 0 else 3
+
+    @staticmethod
+    def _store_lowering_stages_rows(config: dict[str, object]) -> bool:
+        """Whether the store lowering stages ``pre_acc_wait`` rows for ``config``.
+
+        The C-input strategy is excluded: with a productive C-input warp the
+        epilogue renders the plain (128, 64) subtile and no row stage (the
+        row-vector C-input seed compiles to its rings plus the fixed
+        overhead, 165 068 B with a promoted bias row), so the stage model
+        does not apply there.
+        """
+        placement = config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+        return placement == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT and not config.get(
+            TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY
+        )
+
+    @staticmethod
+    def _config_epi_warps(config: dict[str, object]) -> int:
+        """Epilogue warps of ``config`` (the row stages are sized per warp)."""
+        epi_warps = config.get("tcgen05_num_epi_warps", 4)
+        if isinstance(epi_warps, int) and epi_warps > 0:
+            return epi_warps
+        return 4
+
+    @staticmethod
+    def _config_acc_stages(config: dict[str, object]) -> int:
+        """Accumulator stages of ``config`` (16 B of mbarriers each)."""
+        acc_stages = config.get("tcgen05_acc_stages", 2)
+        if isinstance(acc_stages, int) and acc_stages > 0:
+            return acc_stages
+        return 2
 
     def _is_default_layout_full_tile_config(self, config: dict[str, object]) -> bool:
         # The canonical 256x256 DEFAULT-layout role-local tile, where the C-ring
@@ -3104,7 +4084,8 @@ class CuteTcgen05Config:
         The maximum practical ab_stages depends on dtype size because
         smaller dtypes fit more pipeline stages in the same SMEM budget:
         - FP8 (1 byte): 12 stages - validated on B200, fits 2x bf16
-        - FP16/BF16 (2 bytes): 6 stages - TVM-FFI seed validated
+        - FP16/BF16 (2 bytes): 12 stages - the per-CTA SMEM budget decides
+          (256x256x64 two-CTA fits 6, 256x64x64 two-CTA fits 9)
         - FP32 (4 bytes): 3 stages - baseline for larger dtypes
 
         Args:
@@ -3118,7 +4099,7 @@ class CuteTcgen05Config:
         if dtype_bytes == 1:  # FP8
             return 12
         if dtype_bytes == 2:  # FP16/BF16
-            return 6
+            return 12
         # FP32 or larger
         return 3
 
@@ -3302,7 +4283,15 @@ class CuteTcgen05Config:
         elif strategy == Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value:
             if scheduler_warps != 1:
                 config[TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY] = 1
-        if ab_stages == 3 and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1:
+        # A productive C-input warp stages the exact-shape aux ring next to
+        # the AB ring; codegen rejects every ``tcgen05_ab_stages >= 3`` with
+        # it (``cute_mma``), so deeper samples keep the ring depth and drop
+        # the producer warp.
+        if (
+            type(ab_stages) is int
+            and ab_stages >= 3
+            and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY) == 1
+        ):
             config[TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY] = 0
 
     def _fix_aux_tma_search_config(self, config: dict[str, object]) -> None:
@@ -3433,6 +4422,7 @@ class CuteTcgen05Config:
             not self.aux_kernel_detected
             and not self.matmul_has_leading_passthrough
             and constraints is not None
+            and not constraints.one_wave_only
         )
 
     def _is_clc_aux_tma_request(self, config: dict[str, object]) -> bool:
@@ -3509,6 +4499,30 @@ class CuteTcgen05Config:
             return
         if self._grouped_worklist_nm_ab_config_matches(config, ab_stages):
             return
+        if (
+            config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+            == TCGEN05_GROUPED_MODE_WORKLIST_NM
+        ):
+            # The worklist scheduler's records and mailboxes are not in the
+            # plain-GEMM SMEM model below, which admits 16-bit rings up to the
+            # budget (source-256/BK64/AB7 fits that model at 8 but exceeds the
+            # exact worklist footprint).  A worklist ring the exact footprint
+            # rejects clamps to the deepest depth it admits, or is rejected;
+            # a config outside the worklist shape (cluster_n=2, other stage
+            # counts, ab>7) is rejected for its shape, not its footprint.
+            if fix_invalid:
+                config["tcgen05_ab_stages"] = next(
+                    (
+                        depth
+                        for depth in range(ab_stages - 1, 3, -1)
+                        if self._grouped_worklist_nm_ab_config_matches(config, depth)
+                    ),
+                    3,
+                )
+                return
+            mismatch = self._grouped_worklist_nm_ab_config_mismatch(config, ab_stages)
+            assert mismatch is not None
+            raise InvalidConfig(f"tcgen05_ab_stages={ab_stages} {mismatch}")
         # After the grouped dynamic/worklist exceptions above, ab>3 is only valid
         # on the TVM-FFI direct-entry path and for its accepted (bk, ab, c) tuples
         # (bk=64 admits (ab=6, c=4)). Everything else clamps or rejects to ab=3.
@@ -3916,7 +4930,11 @@ class CuteTcgen05Config:
         if config.get("tcgen05_cluster_m") != 2:
             return False
         constraints = self.cluster_m2_search_constraints
-        if constraints is None or constraints.allow_edge_k_tail_family:
+        if (
+            constraints is None
+            or constraints.allow_edge_k_tail_family
+            or constraints.one_wave_only
+        ):
             return False
         if config.get("pid_type") != TCGEN05_TWO_CTA_SEED_PID_TYPE:
             return False
@@ -3993,6 +5011,8 @@ class CuteTcgen05Config:
         cluster_m2_static_k: int | None = None,
         allow_cluster_m2_edge_k_tail_family: bool = False,
         allow_cluster_m2_fp8_small_grid: bool = False,
+        allow_cluster_m2_one_wave_tiles: bool = False,
+        cluster_m2_one_wave_only: bool = False,
         ab_stages_three_dtype_bytes: int | None = None,
         ab_stages_three_device: torch.device | None = None,
     ) -> None:
@@ -4042,6 +5062,8 @@ class CuteTcgen05Config:
                 static_k=cluster_m2_static_k_int,
                 allow_edge_k_tail_family=allow_cluster_m2_edge_k_tail_family,
                 allow_fp8_small_grid=allow_cluster_m2_fp8_small_grid,
+                allow_one_wave_tiles=allow_cluster_m2_one_wave_tiles,
+                one_wave_only=cluster_m2_one_wave_only,
             )
         else:
             self.restrict_cluster_m_search((1,))
@@ -4100,14 +5122,18 @@ class CuteTcgen05Config:
             # SEARCH stays capped at 3 (budget-aware) since the generalized seed
             # runs at ab=3 and deeper pipelines are not worth searching.
             ab_stages_max = 6 if self.deep_direct_entry_validation_enabled else 3
-            # FP8 (1-byte) operands fit a deeper AB pipeline than the bf16-tuned
-            # cap; admit a frozen deep-staged fp8 config on the validation
-            # surface too (``_validate_direct_entry_ab_stage_envelope`` clamps it to
-            # the actual per-CTA SMEM budget for the chosen block sizes).
+            # Operands whose AB SMEM fits the per-CTA budget run the dtype's
+            # deep AB pipeline (12 stages for fp8 and 16-bit operands): small
+            # tiles such as the 256x64x64 two-CTA GEMM fit 9 stages, which is
+            # what hides the TMA latency of a 16-step K loop on one-wave
+            # shapes (fp16 1024^3: cuBLAS's 64x10 ring).
+            # ``_validate_direct_entry_ab_stage_envelope`` clamps the depth
+            # to the actual per-CTA SMEM budget for the chosen block sizes.
             constraints = self.ab_stages_three_search_constraints
-            if constraints is not None and constraints.dtype_bytes == 1:  # FP8
-                ab_stages_max = self._get_dtype_ab_stages_hard_cap(
-                    constraints.dtype_bytes
+            if constraints is not None:
+                ab_stages_max = max(
+                    ab_stages_max,
+                    self._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes),
                 )
         elif self.ab_stages_three_search_constraints is not None:
             # Cycle 97: make ab=3 BUDGET-AWARE-SEARCHABLE. Where the device/dtype
@@ -4154,6 +5180,13 @@ class CuteTcgen05Config:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
+        if self.matmul_has_leading_passthrough:
+            # The persistent walk over a batched grid (see
+            # ``TCGEN05_BATCH_RASTER_CONFIG_KEY``); plain grids raster through
+            # ``loop_orders`` and do not carry the knob.
+            fragments[TCGEN05_BATCH_RASTER_CONFIG_KEY] = EnumFragment(
+                TCGEN05_BATCH_RASTER_CHOICES
+            )
         if not for_search or self.grouped_full_coverage_eligible:
             fragments[TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY] = EnumFragment(
                 TCGEN05_GROUPED_FULL_COVERAGE_MODES
@@ -4188,6 +5221,37 @@ class CuteTcgen05Config:
             fragments[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY] = EnumFragment(
                 TCGEN05_C_ACQUIRE_PLACEMENTS
             )
+        # The register-direct output store (``tcgen05_c_store_mode="direct"``)
+        # is an exact alternative to the SMEM-staged TMA store: no C ring, no
+        # epilogue named barriers, no async-proxy fence, no bulk-store drain.
+        # It wins when a CTA's whole epilogue is exposed (one or two tiles per
+        # CTA) and loses to the TMA store's coalescing once the store drain
+        # overlaps the next tile, so it is searched rather than decided.  The
+        # field is on the search surface of every tcgen05 kernel: the family
+        # flags below are set by later heuristics (the fan-out and grouped
+        # registrations), and a field that came and went with them left the
+        # coverage carriers normalized before the flip carrying a key the flat
+        # schema no longer had.  Where the knob is inert -- the fan-out
+        # epilogue owns the C ring, the grouped / row-union families keep
+        # their own store protocols -- only the TMA store is sampled, and
+        # ``normalize_pre_pid_type`` repairs a ``direct`` that a config pairs
+        # with one of those protocols.  Explicit configs may always name the
+        # mode on the plain protocol.
+        direct_store_inert = (
+            self.epilogue_fanout_search_enabled
+            or self.grouped_full_coverage_eligible
+            or self.grouped_row_union_eligible
+            or self.grouped_row_union_cluster4_eligible
+            or self.grouped_row_union_paired_clc_eligible
+        )
+        fragments[TCGEN05_C_STORE_MODE_CONFIG_KEY] = EnumFragment(
+            (TCGEN05_C_STORE_MODE_NORMAL, TCGEN05_C_STORE_MODE_DIRECT)
+            if for_search
+            else TCGEN05_C_STORE_MODES,
+            search_choices=(TCGEN05_C_STORE_MODE_NORMAL,)
+            if for_search and direct_store_inert
+            else None,
+        )
         if len(self.materialized_matmul_block_ids) >= 2:
             fragments["tcgen05_region_ab_stages"] = ListOf(
                 IntegerFragment(0, 16, 0), len(self.materialized_matmul_block_ids)
@@ -4835,7 +5899,9 @@ class CuteTcgen05Config:
             (
                 TCGEN05_C_STORE_MODE_CONFIG_KEY,
                 TCGEN05_C_STORE_MODES,
-                TCGEN05_C_STORE_MODE_NORMAL,
+                # The register-direct store is an exact alternative body, not a
+                # diagnostic: it needs no invalid-output opt-in.
+                (TCGEN05_C_STORE_MODE_NORMAL, TCGEN05_C_STORE_MODE_DIRECT),
             ),
             (
                 TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
@@ -4926,6 +5992,60 @@ class CuteTcgen05Config:
             TCGEN05_EPILOGUE_LAYOUTS,
             fix_invalid=fix_invalid,
         )
+        # The split / module-helper layouts rearrange the role-local
+        # TMA-store epilogue (T2R halves, store tails); the register-direct
+        # store renders none of it and codegen rejects the pair.  Repaired
+        # (search) configs fall back to the normal layout instead of burning
+        # a compile failure on the combination; explicit configs are told.
+        if (
+            config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY) == TCGEN05_C_STORE_MODE_DIRECT
+            and config.get(
+                TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, TCGEN05_EPILOGUE_LAYOUT_NORMAL
+            )
+            != TCGEN05_EPILOGUE_LAYOUT_NORMAL
+        ):
+            if fix_invalid:
+                config[TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY] = (
+                    TCGEN05_EPILOGUE_LAYOUT_NORMAL
+                )
+            else:
+                raise InvalidConfig(
+                    f"{TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY}="
+                    f"{config[TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY]!r} splits the "
+                    "TMA-store epilogue; the register-direct "
+                    f"{TCGEN05_C_STORE_MODE_CONFIG_KEY}="
+                    f"{TCGEN05_C_STORE_MODE_DIRECT!r} renders no TMA store"
+                )
+        # The register-direct store is the plain role-local store protocol.
+        # The fan-out epilogue owns the C ring and the grouped / row-union
+        # families keep their own store protocols, so ``direct`` paired with
+        # one of them in a config changes nothing of the kernel.  Repaired
+        # (search) configs keep the protocol and fall back to the TMA store;
+        # explicit configs are told.
+        if config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY) == TCGEN05_C_STORE_MODE_DIRECT:
+            other_protocol = None
+            if config.get(FANOUT_CONFIG_KEY, FANOUT_MODES[0]) != FANOUT_MODES[0]:
+                other_protocol = f"{FANOUT_CONFIG_KEY}={config[FANOUT_CONFIG_KEY]!r}"
+            elif config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) in TCGEN05_GROUPED_MODES:
+                other_protocol = (
+                    f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
+                    f"{config[TCGEN05_GROUPED_MODE_CONFIG_KEY]!r}"
+                )
+            elif config.get(GROUPED_ROW_UNION_KEY, False) is not False:
+                other_protocol = (
+                    f"{GROUPED_ROW_UNION_KEY}={config[GROUPED_ROW_UNION_KEY]!r}"
+                )
+            if other_protocol is not None:
+                if fix_invalid:
+                    config[TCGEN05_C_STORE_MODE_CONFIG_KEY] = (
+                        TCGEN05_C_STORE_MODE_NORMAL
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{other_protocol} owns the output store; the register-direct "
+                        f"{TCGEN05_C_STORE_MODE_CONFIG_KEY}="
+                        f"{TCGEN05_C_STORE_MODE_DIRECT!r} is the plain store protocol"
+                    )
         self._validate_enum_config(
             config,
             TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
@@ -5027,10 +6147,12 @@ class CuteTcgen05Config:
         config: dict[str, object],
         key: str,
         modes: tuple[str, ...],
-        normal_mode: str,
+        normal_mode: str | tuple[str, ...],
         *,
         fix_invalid: bool,
     ) -> None:
+        """Validate a mode knob; ``normal_mode`` lists the exact (non-diagnostic) values."""
+        exact_modes = (normal_mode,) if isinstance(normal_mode, str) else normal_mode
         if key not in config:
             return
         if not self.search_enabled:
@@ -5046,7 +6168,7 @@ class CuteTcgen05Config:
                 return
             raise InvalidConfig(f"{key} must be one of {modes!r}, got {config[key]!r}")
         if (
-            config[key] != normal_mode
+            config[key] not in exact_modes
             and config.get(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY) is not True
         ):
             if fix_invalid:
@@ -5108,6 +6230,25 @@ class CuteTcgen05Config:
         self._fix_cluster_m1_persistent_search_config(config)
         if (
             self.search_enabled
+            and self.matmul_input_dtype is not None
+            and self.matmul_input_dtype.itemsize <= 2
+            # A 16-bit MMA fed by a cast from a non-native load (bf16 x int16)
+            # takes the non-tcgen05 fallback and keeps the knob; fp8 operands
+            # trip the same flag but run on tcgen05.
+            and not (
+                self.matmul_has_non_tcgen05_operand
+                and self.matmul_input_dtype.itemsize == 2
+            )
+        ):
+            # The tcgen05 store splice emits one store per output tile, so a
+            # sampled ``epilogue_subtile`` only makes a 16-bit / fp8 candidate
+            # fail at codegen (the cluster_m=2 projection already drops it; on
+            # one CTA it cost 16 of the 165 compiles of the fp8 512x1024x512
+            # cold autotune). fp32 keeps the knob, which there selects the
+            # exact SIMT lowering.
+            config.pop("epilogue_subtile", None)
+        if (
+            self.search_enabled
             and config.get("tcgen05_cluster_m", 1) == 1
             and config.get("tcgen05_cluster_n", 1) == 2
         ):
@@ -5134,6 +6275,10 @@ class CuteTcgen05Config:
         # validated c=4 (residual ab=2 projection above; edge/seed families,
         # which this gate's scope excludes) is set first.
         self._fix_c_stages_search_config(config)
+        # A sampled ``pre_acc_wait`` stages its rows next to the final rings;
+        # demote it where the stage does not fit (the seeds' gate, applied to
+        # the projection).
+        self._fix_rowvec_stage_search_config(config)
         # CLC admission depends on the projected cluster/pid/strategy tuple
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)

@@ -48,6 +48,7 @@ from ..matmul_utils import _needs_f32_accumulator
 from ..tile_strategy import DeviceLoopState
 from .aux_tensor import analyze_tcgen05_matmul_store_chains
 from .aux_tensor import discover_tcgen05_aux_tensor_descriptors
+from .aux_tensor import tcgen05_promoted_rowvec_epilogue
 from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
 from .cute_epilogue import find_tcgen05_grouped_tail_epilogue_for_mma
@@ -105,6 +106,7 @@ from .strategies import l2_swizzle_size_from_config
 from .strategies import layout_overrides_from_config
 from .strategies import smem_swizzle_min_major_mode_bytes
 from .strategies import tcgen05_explicit_epilogue_tile_expr
+from .strategies import tcgen05_explicit_epilogue_tile_supported
 from .strategies import tcgen05_resolve_epilogue_tile
 from .strategies import tcgen05_smem_layout_expr
 from .strategies import warp_spec_from_config
@@ -133,9 +135,14 @@ from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_ACC_PRODUCER_MODE_SKIP_UMMA
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_AUX_LOAD_MODE_TMA
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_CHOICES
 from .tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
 from .tcgen05_constants import TCGEN05_AUX_STAGES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_DIRECT
+from .tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from .tcgen05_constants import TCGEN05_CLUSTER_M2_ONE_CTA_ROLE_LOCAL_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CHOICES
 from .tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
@@ -174,6 +181,7 @@ from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PID_TYPE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_PROBLEM_SHAPE
 from .tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
+from .tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
 from .tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -258,35 +266,6 @@ _TCGEN05_EXPLICIT_EPI_TILE_VALIDATED_SHAPE = (
 )
 
 
-def _tcgen05_explicit_epilogue_tile_supported(
-    *,
-    is_two_cta: bool,
-    bm: int,
-    bn: int,
-    tile_shape: tuple[int | None, int | None, int | None],
-) -> bool:
-    """Whether the current tcgen05 explicit-epilogue path supports the tile."""
-    epi_tile_m, epi_tile_n, d_store_box_n = tile_shape
-    return (
-        # Four epilogue warps own 16 or 32 supported TMEM datapaths each.
-        epi_tile_m in (64, 128)
-        # Use the dtype-independent, power-of-two TMA store widths validated by
-        # this backend; 16 is the minimum that also gives FP8 a 128-bit row.
-        and epi_tile_n in (16, 32, 64)
-        # Helion emits one epilogue subtile per TMA store box.
-        and d_store_box_n == epi_tile_n
-        # Every MMA M tile must partition into whole epilogue subtiles.
-        and bm % epi_tile_m == 0
-        # Every MMA N tile must partition into whole store boxes.
-        and bn % epi_tile_n == 0
-        # Explicit 2CTA uses the established per-CTA M128 partition.
-        and (not is_two_cta or epi_tile_m == 128)
-        # 2CTA BM128 needs a permuted per-CTA M64 layout that integer explicit
-        # tile overrides cannot express, so it stays on the implicit path.
-        and not (is_two_cta and bm == 128)
-    )
-
-
 # Cluster-leader (cta_rank == 0) form. Used only when V-leader semantics
 # degenerate to cluster-leader -- i.e. cluster_size == V (no V-non-leader
 # CTAs), today's cluster_m=2 cluster_n=1 use_2cta=True path. Preserves the
@@ -312,6 +291,7 @@ _TCGEN05_V_LEADER_PREDICATE = (
 # barrier is added.
 _TCGEN05_TMEM_ALLOC_BARRIER_ID = 1
 _TCGEN05_EPILOG_SYNC_BARRIER_ID = 2
+_TCGEN05_PIPELINE_INIT_BARRIER_ID = 3
 
 
 @dataclass(frozen=True)
@@ -1124,14 +1104,28 @@ def _tcgen05_tma_operand_is_aligned(
     key, including every stride's byte residue. Unproved layouts retain the
     scalar shared-memory producer while keeping native MMA.
     """
+    if operand.matrix_major is None:
+        return False
+    return _tcgen05_tma_tensor_is_aligned(env, operand.source_fake)
+
+
+def _tcgen05_tma_tensor_is_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor
+) -> bool:
+    """Prove a TensorMap over ``tensor``: 16-byte base and outer strides.
+
+    Kernel arguments carry the bound kernel's pointer/stride residue
+    specialization (the dispatch cache re-checks it before reusing the code
+    for later tensors), fresh host allocations are allocator-aligned at
+    offset zero, and a static alias view of exactly one input inherits that
+    input's guarded base.  Exactly one unit stride; every other stride a
+    whole 16-byte multiple.  Shared by the TMA-load operands and the
+    TMA-store destination.
+    """
     from .input_view_layout import input_view_copy_facts
     from .memory_ops import tensor_has_specialized_tma_alignment
     from .promote_output_axis import _fresh_tensors
 
-    tensor = operand.source_fake
-    major = operand.matrix_major
-    if major is None:
-        return False
     if tensor in env.cute_proven_tma_inputs:
         return True
     if env.tensor_input_source(tensor) is not None:
@@ -1160,6 +1154,27 @@ def _tcgen05_tma_operand_is_aligned(
         elif stride * tensor.element_size() % 16:
             return False
     return unit_strides == 1
+
+
+def _tcgen05_tma_destination_is_legal(
+    env: CompileEnvironment, store: Node, *, output_column_major: bool
+) -> bool:
+    """Whether the TMA store may address ``store``'s destination.
+
+    The epilogue stages the D tile in the layout the store analysis chose
+    (row-major for the plain MN epilogue, column-major when the analysis
+    saw a column-major destination); the destination's contiguous axis has
+    to be that one, and its base and outer strides have to satisfy the
+    TensorMap proof above.
+    """
+    tensor_node = store.args[0] if store.args else None
+    tensor = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
+    if not isinstance(tensor, torch.Tensor):
+        return False
+    expected_major = "col" if output_column_major else "row"
+    return _tcgen05_tma_matrix_major(
+        tensor
+    ) == expected_major and _tcgen05_tma_tensor_is_aligned(env, tensor)
 
 
 def _compose_axis_orders(
@@ -6185,6 +6200,19 @@ def _initial_prefetch_copy_b_src(
     )
 
 
+def _initial_producer_acquire_src(
+    args: _InitialPrefetchTmaArgs, *, fresh_ring: bool
+) -> str:
+    """``producer_acquire`` line of an initial-prefill stage.
+
+    See ``_build_initial_prefetch_if`` for the fresh-ring token.
+    """
+    token = ", True" if fresh_ring else ""
+    return (
+        f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state}{token})\n"
+    )
+
+
 def _build_initial_prefetch_if(
     args: _InitialPrefetchTmaArgs,
     *,
@@ -6192,6 +6220,7 @@ def _build_initial_prefetch_if(
     k_offset: str,
     skip_producer_acquire: bool | None = None,
     gate_tma_warp: bool = True,
+    fresh_ring: bool = False,
 ) -> ast.stmt:
     """Initial-prefetch ``if`` block for stage ``k_offset``.
 
@@ -6203,6 +6232,20 @@ def _build_initial_prefetch_if(
     / producer_commit`` and optional producer-state ``advance``. Optional edges
     are omitted only when config explicitly requests skipping them. Caller
     passes a literal ``cutlass.Int32(stage_idx)`` for ``k_offset``.
+
+    ``fresh_ring`` marks the once-per-launch prefill of a pipeline nobody has
+    consumed from yet (one tile per CTA, ``one_shot_role_scheduler``): the
+    producer start state's phase makes the empty-barrier wait of every one of
+    its first ``num_stages`` acquires pass by construction, so the acquire
+    takes ``True`` as its try-acquire token and skips the ``try_wait`` round
+    trip while still arming the full barrier (``arrive_and_expect_tx``). A
+    multi-tile persistent kernel re-runs this prefill per tile on a ring the
+    previous tile's MMA is still releasing, so its acquires keep the wait
+    (skipping it there arms a barrier still in flight and the launch fails).
+    The round trip sat on the TMA warp's serial issue path: with it the bmm
+    8x256x256x512 one-CTA kernel issued its four stages 170 ns apart, without
+    it 107 ns (%globaltimer probes; the last stage landed 176 ns earlier, the
+    fp8 1024^3 one-CTA kernel's eighth stage 384 ns earlier).
     """
     predicate_terms = [*full_tile_gates]
     if gate_tma_warp:
@@ -6220,7 +6263,7 @@ def _build_initial_prefetch_if(
     ) + _initial_prefetch_copy_b_src(args, k_offset=k_offset)
     src = f"if {predicate}:\n"
     if not skip_producer_acquire:
-        src += f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+        src += _initial_producer_acquire_src(args, fresh_ring=fresh_ring)
     src += (
         f"    {args.tma_barrier_ptr} = "
         f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
@@ -6239,6 +6282,7 @@ def _build_split_initial_prefetch(
     clone_state: str,
     clone_barrier: str,
     gate_tma_warp: bool,
+    fresh_ring: bool = False,
 ) -> list[ast.stmt]:
     """Initial prefetch split around a programmatic dependency wait.
 
@@ -6272,9 +6316,7 @@ def _build_split_initial_prefetch(
     for gates, k_offset, skip_producer_acquire in stages:
         src = f"if {predicate(gates)}:\n"
         if not skip_producer_acquire:
-            src += (
-                f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
-            )
+            src += _initial_producer_acquire_src(args, fresh_ring=fresh_ring)
         src += (
             f"    {args.tma_barrier_ptr} = "
             f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
@@ -7887,6 +7929,18 @@ def _emit_mma_pipeline(
     )
     if _has_non_root_lane_loops(cg, allowed_loop_states=allowed_k_lane_loops):
         return None
+    if (
+        mma_impl == "tcgen05"
+        and m_block_id is not None
+        and _grid_thread_extent(cg, m_block_id) > 32
+    ):
+        # The tcgen05 role launch is one physical warp per role row (see
+        # ``_tcgen05_root_m_threads``).  Only an explicit ``num_threads``
+        # request maps more threads along M; the MMA detection already
+        # declined it (``_specialized_mma_root_threads_support_impl``), so the
+        # matmul takes the generic SIMT lowering like any other unsupported
+        # thread layout instead of reaching the launch guard below.
+        return None
     zero_acc_expr = acc_expr is not None and _is_zero_acc_expr(acc_expr)
     if (
         analysis is None
@@ -7954,22 +8008,40 @@ def _emit_mma_pipeline(
     if tcgen05_nm_orientation and tcgen05_cluster_m == 2:
         tcgen05_requested_two_cta = True
     tcgen05_cluster_n_requested = _tcgen05_cluster_n(df.config)
-    # A leading-batch grid axis composes with the CtaGroup.TWO cluster (cluster_m,
-    # cluster_n=1): the 2-CTA MMA/TMA-multicast operate within each (m, n) tile
-    # while the batch axis only offsets the per-tile TMA source. The cluster_n>1
-    # (4-CTA) multicast does NOT yet compose with batch (produces wrong results),
-    # so keep it on the scalar fallback for batched kernels.
+    # A leading-batch grid axis composes with the CtaGroup.TWO cluster: the
+    # 2-CTA MMA/TMA-multicast operate within each (m, n) tile while the batch
+    # axis only offsets the per-tile TMA source.  The cluster_n=2 A-multicast
+    # needs the scheduler's dim 1 to be N (``program_id`` swaps the trailing
+    # dims for batched grids) and whole N-tile pairs, and the plain raster:
+    # the L2-grouped and L2-swizzled pid decodes pair the cluster lanes on the
+    # first two grid dims, which are (batch, m) on a batched grid, so under
+    # ``l2_groupings > 1`` an odd M-tile count decodes tiles that do not exist
+    # and the multicast peers wait forever.
     if (
         analysis is not None
         and analysis.has_leading_passthrough
         and mma_impl == "tcgen05"
         and tcgen05_cluster_n_requested != 1
     ):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05 matmul with a leading passthrough axis does not support "
-            "tcgen05_cluster_n != 1",
+        tcgen05_batched_n_tiles = (
+            n_size // bn if isinstance(n_size, int) and bn > 0 else None
         )
+        if (
+            tcgen05_batched_n_tiles is None
+            or n_size % bn != 0
+            or tcgen05_batched_n_tiles % tcgen05_cluster_n_requested != 0
+            or l2_swizzle_size_from_config(df.config) != 1
+            or any(
+                grouping != 1
+                for grouping in cast("list[int]", df.config.get("l2_groupings", []))
+            )
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "tcgen05 matmul with a leading passthrough axis supports "
+                "tcgen05_cluster_n=2 only for whole N-tile pairs without an L2 "
+                "swizzle or L2 grouping",
+            )
     # N,M worklists keep the public 256x128 logical scheduler tile, while their
     # physical output tile is source_m_tile x physical_mma_m. Edge admission
     # must use that physical orientation for both CTA-group sizes.
@@ -8529,11 +8601,51 @@ def _emit_mma_pipeline(
     # same TMA-store path for interior full tiles while retaining the predicated
     # SIMT fallback for fringe tiles, but only when the AB-stage count leaves
     # enough SMEM budget for the extra epilogue tile.
+    tcgen05_direct_store_requested = (
+        df.config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL)
+        == TCGEN05_C_STORE_MODE_DIRECT
+    )
+    # Every store this accumulator reaches (``None`` when the fan-out is
+    # untraced; the store lowering then limits it to one store).
+    tcgen05_traced_output_stores = (
+        _trace_mma_to_stores(fx_node, cg.codegen_graphs)
+        if mma_impl == "tcgen05" and fx_node is not None
+        else None
+    )
+    # The TMA store needs a TensorMap over the destination: a 16-byte-aligned
+    # base, outer strides that are whole 16-byte multiples and a matrix whose
+    # contiguous axis is the one the staged D layout assumes.  The host
+    # wrapper builds the descriptor from the launch tensor without checking
+    # any of this, and a violating output (row stride 1032 B, an N-major
+    # view, an 8-byte-aligned base) was stored silently wrong.  The proof
+    # reuses the TMA-load operands' facts (the bound kernel's pointer/stride
+    # residue specialization for arguments, the allocator alignment of fresh
+    # host tensors, static alias views of one input); an unproved destination
+    # takes the SIMT store body, which addresses every element itself.  The
+    # grouped and row-union families (transposed NM stores, packed and
+    # segmented destinations) keep their own store protocols; the store
+    # lowering still refuses a destination known to break the rules.
+    tcgen05_output_tma_store_proven = (
+        tcgen05_nm_orientation
+        or row_union_plan is not None
+        or rhs_rank3_group_expr is not None
+        or bool(rhs_rank3_segment_metadata)
+        or grouped_mode is not None
+        or tcgen05_traced_output_stores is None
+        or all(
+            _tcgen05_tma_destination_is_legal(
+                env, store, output_column_major=output_column_major
+            )
+            for store in tcgen05_traced_output_stores
+        )
+    )
     tcgen05_use_tma_store_epilogue = (
         mma_impl == "tcgen05"
         and (row_union_plan is None or row_profile is not None)
         and tcgen05_use_tma_pipeline
         and not prefer_simt_narrow_store
+        and not tcgen05_direct_store_requested
+        and tcgen05_output_tma_store_proven
         and (
             tcgen05_static_full_tiles
             or (row_profile is not None and row_profile.linear_record_clc)
@@ -9860,19 +9972,27 @@ def _emit_mma_pipeline(
         if tcgen05_use_cluster_deferred_pipelines:
             # Keep the two-CTA cluster rendezvous after the AB/acc pipeline
             # objects exist and before any role allocates or retrieves TMEM.
-            prefix.append(
-                statement_from_string(
-                    "cutlass.pipeline.pipeline_init_arrive("
-                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk}, "
-                    "is_relaxed=True)"
-                )
+            tcgen05_cluster_init_arrive = statement_from_string(
+                "cutlass.pipeline.pipeline_init_arrive("
+                f"cluster_shape_mn={tcgen05_cluster_layout_vmnk}, "
+                "is_relaxed=True)"
             )
-            prefix.append(
-                statement_from_string(
-                    "cutlass.pipeline.pipeline_init_wait("
-                    f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
-                )
+            prefix.append(tcgen05_cluster_init_arrive)
+            tcgen05_cluster_init_wait = (
+                "cutlass.pipeline.pipeline_init_wait("
+                f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})"
             )
+            if tcgen05_hoist_tma_role:
+                # The TMA-load warp's role block is moved right after the
+                # arrive and carries its own wait (ahead of its first stage);
+                # every other warp waits here.
+                df.cute_state.tcgen05_tma_role_hoist_anchor = (
+                    tcgen05_cluster_init_arrive
+                )
+                tcgen05_cluster_init_wait = (
+                    f"if not {tma_warp}:\n    {tcgen05_cluster_init_wait}"
+                )
+            prefix.append(statement_from_string(tcgen05_cluster_init_wait))
         if row_union_plan is not None and row_union_plan.linear_record_clc:
             assert warp_idx is not None and lane_idx is not None
             prefix.extend(
@@ -9886,7 +10006,7 @@ def _emit_mma_pipeline(
                 f"    {tcgen05_plan.tmem_allocator}.allocate({tcgen05_plan.acc_tmem_cols})"
                 + (
                     f"\n    {tcgen05_plan.tmem_allocator}.relinquish_alloc_permit()"
-                    if row_union_plan is not None and row_union_plan.resident_ctas == 2
+                    if tcgen05_relinquish_permit_early
                     else ""
                 )
             )
@@ -9908,19 +10028,79 @@ def _emit_mma_pipeline(
         # in the hoisted setup with a different CuTe type and break the
         # persistent ``while`` ("acc_frag is structured different after
         # this while").
-        # The compiler can hoist the shared allocation-address read out of
-        # role predicates. Publish it to every CTA thread before any role
-        # retrieves a pointer, including warps without TMEM consumers.
-        tcgen05_tmem_publication = statement_from_string("cute.arch.sync_threads()")
-        prefix.append(tcgen05_tmem_publication)
+        # Publish the TMEM allocation (and, on the plain path, the pipeline
+        # init) before any role retrieves a tensor-memory pointer.  The
+        # compiler may hoist the holding-buffer read out of the role
+        # predicates below, so every thread whose role uses the result must
+        # order that read after the allocating warp's write.
+        if tcgen05_use_merged_pipeline_init:
+            # Every pipeline above was created with ``defer_sync=True``; this
+            # fence and the two named barriers below are their (single) init
+            # rendezvous, so no role touches an mbarrier before it is
+            # initialized and visible.  Warp 0 (the initializing warp) arrives
+            # on both: the non-epilogue warps meet it on the pipeline-init
+            # barrier and proceed straight to their roles (the TMA warp issues
+            # its first loads while the epilogue warps are still waiting for
+            # the TMEM allocation); the MMA and epilogue warps meet it on
+            # ``tmem_alloc_barrier`` (``wait_for_alloc`` below), which also
+            # publishes the allocation result.  The TMA, scheduler and
+            # padding warps never wait for warp 1's ``tcgen05.alloc``: neither
+            # ``retrieve_ptr`` below is theirs, so a hoisted pre-allocation
+            # holding-buffer read on those threads is dead, while the MMA and
+            # epilogue warps read it only after their ``tmem_alloc_barrier``
+            # wait.
+            assert warp_idx is not None
+            tcgen05_init_fence = statement_from_string(
+                "cute.arch.mbarrier_init_fence()"
+            )
+            prefix.append(tcgen05_init_fence)
+            tcgen05_init_waiters = f"not {epi_active}"
+            if tcgen05_hoist_tma_role:
+                # The TMA-load warp's role block is moved right after the
+                # fence and arrives on the pipeline-init barrier from inside
+                # the role (ahead of its first stage); every other
+                # non-epilogue warp still meets warp 0 here.
+                df.cute_state.tcgen05_tma_role_hoist_anchor = tcgen05_init_fence
+                tcgen05_init_waiters = f"(not {epi_active} and not {tma_warp})"
+            tcgen05_tmem_publication = statement_from_string(
+                f"if {tcgen05_init_waiters} or {warp_idx} == cutlass.Int32(0):\n"
+                f"    {tcgen05_pipeline_init_barrier}.arrive_and_wait()"
+            )
+        elif (
+            tcgen05_use_cluster_deferred_pipelines
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+        ):
+            # Plain clustered GEMM: the cluster-wide ``pipeline_init_arrive`` /
+            # ``pipeline_init_wait`` above already published every pipeline's
+            # mbarrier init; the only state left to publish is the TMEM
+            # allocation, and the ``tmem_alloc_barrier`` meet in
+            # ``wait_for_alloc`` below (the allocating epilogue warp arrives
+            # after ``tcgen05.alloc``) orders that for the two roles that
+            # retrieve the pointer.  A CTA-wide ``sync_threads`` here only held
+            # the TMA-load warp behind the ~150 ns allocation; later prefix
+            # insertions anchor on the ``wait_for_alloc`` statement instead.
+            tcgen05_tmem_publication = None
+        else:
+            # The grouped and row-union kernels keep the CTA-wide barrier: their
+            # prologues publish CTA-local SMEM tables through it (the
+            # linear-record profile's coverage flag and fallback intervals,
+            # written by the coverage warp in ``cooperative_setup`` right above
+            # and read by the epilogue warps), and the paired startup prefill
+            # anchors ahead of it.  Dropping it left those reads unordered
+            # (99.9% mismatches on test_ordinary_paired_profile_cuda).
+            tcgen05_tmem_publication = statement_from_string("cute.arch.sync_threads()")
+        if tcgen05_tmem_publication is not None:
+            prefix.append(tcgen05_tmem_publication)
         # All participating roles must reach the same named-barrier wait before
         # they retrieve their role-local tensor-memory pointers.
-        prefix.append(
-            statement_from_string(
-                f"if {tcgen05_plan.exec_active} or {epi_active}:\n"
-                f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()"
-            )
+        tcgen05_wait_for_alloc = statement_from_string(
+            f"if {tcgen05_plan.exec_active} or {epi_active}:\n"
+            f"    {tcgen05_plan.tmem_allocator}.wait_for_alloc()"
         )
+        if tcgen05_tmem_publication is None:
+            tcgen05_tmem_publication = tcgen05_wait_for_alloc
+        prefix.append(tcgen05_wait_for_alloc)
         prefix.append(
             statement_from_string(
                 f"if {tcgen05_plan.exec_active}:\n"
@@ -10080,6 +10260,21 @@ def _emit_mma_pipeline(
         # while the generated predicates still depend on them.
         mma_physical_m_threads = max(mma_physical_m_threads, 32)
         tcgen05_cta_thread_count = max(tcgen05_cta_thread_count, 4 * 32)
+    if mma_impl == "tcgen05" and mma_physical_m_threads > 32:
+        # The role launch is ``(physical_m_threads, launched_warps, 1)`` with
+        # warps indexed linearly: a wider row launches spare warps the role
+        # predicates and the pipeline-init barrier do not count (see
+        # ``_tcgen05_root_m_threads``).  The detection predicate
+        # (``_specialized_mma_root_threads_support_impl``) routes an explicit
+        # ``num_threads`` request of another width to the generic SIMT path
+        # before planning, so this is a last line: fail loudly rather than
+        # launch them.
+        raise exc.BackendUnsupported(
+            "cute",
+            "tcgen05 role launch needs a 32-lane M axis (one physical warp per "
+            f"role row); the root tile maps {mma_physical_m_threads} threads "
+            "along M",
+        )
     if mma_impl == "tcgen05" and tcgen05_cluster_m * tcgen05_cluster_n > 1:
         df.cute_state.cluster_shape = (tcgen05_cluster_m, tcgen05_cluster_n, 1)
     # PipelineTmaUmma empty barriers are released by the leader CTA with the
@@ -10109,8 +10304,40 @@ def _emit_mma_pipeline(
         tcgen05_ab_consumer_arrive_count_value = num_mcast_ctas_a + num_mcast_ctas_b - 1
     else:
         tcgen05_ab_consumer_arrive_count_value = 1
+    # Plain (single-CTA, non-grouped) tcgen05 kernels initialize every
+    # pipeline's mbarriers with ``defer_sync=True`` and publish them all with
+    # ONE ``mbarrier_init_fence`` followed by two named barriers in
+    # ``_emit_tcgen05_tmem_setup`` (the pipeline-init barrier for the
+    # non-epilogue warps, ``tmem_alloc_barrier`` for the TMEM consumers).
+    # Each ``Pipeline*.create`` otherwise ends in its own fence +
+    # ``__syncthreads``, so a kernel with acc + AB (+ sched / aux) pipelines
+    # serializes two to four CTA-wide barriers before the TMA warp can issue
+    # its first load (~100 ns each on B200).  Clustered kernels keep
+    # their cluster-wide ``pipeline_init_arrive`` / ``pipeline_init_wait``
+    # rendezvous (a multicast peer may arrive on this CTA's barriers, so the
+    # init must be published cluster-wide); the grouped and row-union families
+    # keep their validated per-pipeline syncs.
+    tcgen05_use_merged_pipeline_init = (
+        mma_impl == "tcgen05"
+        and tcgen05_use_tma_pipeline
+        and not tcgen05_use_cluster_deferred_pipelines
+        and tcgen05_cluster_m == 1
+        and tcgen05_cluster_n == 1
+        and row_union_plan is None
+        and tcgen05_grouped_plan is None
+    )
     tcgen05_defer_pipeline_sync_arg = (
-        ", defer_sync=True" if tcgen05_use_cluster_deferred_pipelines else ""
+        ", defer_sync=True"
+        if tcgen05_use_cluster_deferred_pipelines or tcgen05_use_merged_pipeline_init
+        else ""
+    )
+    # Relinquish the TMEM allocation permit right after the (single)
+    # allocation on the plain path, as CUTLASS's sm100 kernels do, so the
+    # teardown does not serialize it behind the epilogue drain.
+    tcgen05_relinquish_permit_early = (
+        tcgen05_use_merged_pipeline_init
+        or tcgen05_use_cluster_deferred_pipelines
+        or (row_union_plan is not None and row_union_plan.resident_ctas == 2)
     )
     tcgen05_matmul_plan: CuteTcgen05MatmulPlan | None = None
     tcgen05_mma_owner_active: str | None = None
@@ -10119,6 +10346,12 @@ def _emit_mma_pipeline(
     # it never uses; consumed only at later tcgen05-gated emission
     # sites that share this `if mma_impl == "tcgen05":` predicate.
     tcgen05_epi_warp_count_value = 0
+    tcgen05_tmem_allocator_warp = 0
+    tcgen05_pipeline_init_barrier = ""
+    tcgen05_free_tmem_in_epilogue = False
+    tcgen05_one_shot_role_scheduler = False
+    tcgen05_hoist_tma_role = False
+    tcgen05_output_stores_value: tuple[Node, ...] | None = None
     tcgen05_tmem_barrier_thread_count_value = 0
     tcgen05_acc_consumer_arrive_count_value = 0
     # Layout-override values are read by separate later
@@ -10129,6 +10362,8 @@ def _emit_mma_pipeline(
     # below when the branch is entered.
     tcgen05_smem_swizzle_a: int | None = None
     tcgen05_smem_swizzle_b: int | None = None
+    tcgen05_explicit_epi_tile_configured = False
+    tcgen05_narrow_subtile_nounroll_k_loop = False
     tcgen05_explicit_epi_tile_m: int | None = None
     tcgen05_explicit_epi_tile_n: int | None = None
     tcgen05_explicit_d_store_box_n: int | None = None
@@ -10192,6 +10427,17 @@ def _emit_mma_pipeline(
                     "tcgen05 N,M store requires explicit epi_tile=(128, 32) "
                     "and d_store_box_n=32",
                 )
+        # The explicit tile the config (or the N,M worklist default) requested,
+        # taken before the matmul plan adds its own subtile below: the
+        # explicit-store family's no-unroll K loop keys off it.
+        tcgen05_explicit_epi_tile_configured = any(
+            value is not None
+            for value in (
+                tcgen05_explicit_epi_tile_m,
+                tcgen05_explicit_epi_tile_n,
+                tcgen05_explicit_d_store_box_n,
+            )
+        )
         if tcgen05_edge_scalar_fallback_needs_inter_smem_a:
             # The mixed TMA/scalar edge path writes logical (_row, _col)
             # coordinates into the tcgen05 A SMEM view. With bk=128,
@@ -10338,6 +10584,9 @@ def _emit_mma_pipeline(
             "matmul fx_node graph must be a registered codegen graph"
         )
         df.cute_state.matmul_fx_nodes.add(fx_node)
+        # Every output store this accumulator reaches (``None`` when the
+        # fanout is untraced, which the store lowering limits to one store).
+        tcgen05_output_stores_value = tcgen05_traced_output_stores
         aux_tensor_descriptors_value = discover_tcgen05_aux_tensor_descriptors(
             cg, fx_node
         )
@@ -10395,6 +10644,100 @@ def _emit_mma_pipeline(
                 )
         if row_profile is not None:
             tcgen05_tma_store_full_tiles_only = True
+        # Promoted row-vector epilogues (a 16-bit bias / scale row staged as
+        # FP32 by the store lowering, see ``memory_ops``) keep the FP32 row,
+        # the FP32 accumulator subtile and the packed output live at once; at
+        # the default (128, 64) subtile ptxas spills (12 LDL / 8 STL per
+        # subtile at 255 registers), so they take the (128, 32) subtile of the
+        # no-source CUTLASS rule (2048x4096x2048 fp16 bias GEMM: 27.0 vs
+        # 27.2 us). Decided here, on the same three values a configured
+        # explicit tile sets and on the store-site facts the store lowering's
+        # staging admission reads (one shared predicate,
+        # ``aux_leaf_takes_promoted_f32_stage``), so the matmul plan, the store
+        # body and the wrapper-side TMA store box agree and the subtile is only
+        # taken with the stage; a configured tile wins.
+        tcgen05_promoted_rowvec_subtile = (
+            not tcgen05_explicit_epi_tile_configured
+            and not tcgen05_nm_orientation
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+            and tcgen05_use_tma_store_epilogue
+            and df.config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+            == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+            and epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=tcgen05_is_two_cta,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                tile_shape=(128, 32, 32),
+            )
+            and tcgen05_promoted_rowvec_epilogue(
+                cg,
+                fx_node,
+                epi_warp_count=tcgen05_epi_warp_count_value,
+                bn=tcgen05_mma_bn,
+                output_column_major=output_column_major,
+                partial_output_tma_store=tcgen05_partial_output_tma_store,
+            )
+        )
+        if tcgen05_promoted_rowvec_subtile:
+            tcgen05_explicit_epi_tile_m = 128
+            tcgen05_explicit_epi_tile_n = 32
+            tcgen05_explicit_d_store_box_n = 32
+        # Plain 16-bit epilogues (no auxiliary GMEM operand: the accumulator
+        # is converted and stored once, static full tiles) take the same
+        # (128, 32) subtile on the two-CTA 256-wide tile, where CuTe's
+        # with-source rule would give (128, 64): halving the subtile doubles
+        # the T2R/R2S/TMA-store iterations but shortens each and lets the C
+        # ring turn over twice as often. Same-process A/B under flushed graph
+        # replay (device time), 2x1 256x256x64 ab6 c2 persistent fp16: plain
+        # 4096x1024x4096 (3.5 tiles per CTA pair) 29.4 -> 28.3 us with the
+        # subtile alone, 28.1 with the no-unroll loop as well (cuBLAS 27.0);
+        # bmm 16x512x768x1024 (2 tiles per pair) 17.15 -> 16.96; plain
+        # 2048x4096x2048 (one tile per pair) 26.8 -> 26.4, within noise. A
+        # configured tile wins, aux epilogues keep the promoted rule above,
+        # and narrower tiles already take (128, 32) from the default rule.
+        tcgen05_plain_narrow_subtile = (
+            not tcgen05_explicit_epi_tile_configured
+            and not tcgen05_promoted_rowvec_subtile
+            and not tcgen05_nm_orientation
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+            and tcgen05_use_tma_store_epilogue
+            and tcgen05_static_full_tiles
+            and tcgen05_is_two_cta
+            and not output_column_major
+            and not aux_tensor_descriptors_value
+            and tcgen05_output_stores_value is not None
+            and len(tcgen05_output_stores_value) == 1
+            and input_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+            and epi_elem_dtype_str in ("cutlass.Float16", "cutlass.BFloat16")
+            and tcgen05_mma_bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+            and tcgen05_explicit_epilogue_tile_supported(
+                is_two_cta=tcgen05_is_two_cta,
+                bm=tcgen05_mma_bm,
+                bn=tcgen05_mma_bn,
+                tile_shape=(128, 32, 32),
+            )
+        )
+        if tcgen05_plain_narrow_subtile:
+            tcgen05_explicit_epi_tile_m = 128
+            tcgen05_explicit_epi_tile_n = 32
+            tcgen05_explicit_d_store_box_n = 32
+        # Both narrow subtiles also take the explicit-store family's no-unroll
+        # K loop (``cutlass.range(..., unroll=1)`` on the TMA and MMA warps,
+        # ``tcgen05_use_nounroll_k_loop`` below), decided here by name rather
+        # than inherited from the tile values. Same-process A/B under flushed
+        # graph replay (device time) at 4096x1024x4096 fp16 bias, 512 CTAs and
+        # 16 K steps: the subtile alone saves 1.8 us, the no-unroll loop alone
+        # 1.9 us, both 2.9 us (37.1 -> 34.2 us; cuBLAS 26.8); the plain kernel
+        # at the same shape: subtile 1.1 us, no-unroll 0.5 us, both 1.35 us;
+        # at 2048x4096x2048 (one tile per CTA) both are within noise. Whether
+        # every two-CTA bk=64 kernel should take the no-unroll loop is a
+        # separate measurement.
+        tcgen05_narrow_subtile_nounroll_k_loop = (
+            tcgen05_promoted_rowvec_subtile or tcgen05_plain_narrow_subtile
+        )
         explicit_epi_tile_requested = any(
             value is not None
             for value in (
@@ -10420,7 +10763,7 @@ def _emit_mma_pipeline(
             != TCGEN05_AUX_LOAD_MODE_TMA
         )
         explicit_epi_tile_supported = (
-            _tcgen05_explicit_epilogue_tile_supported(
+            tcgen05_explicit_epilogue_tile_supported(
                 is_two_cta=tcgen05_is_two_cta,
                 bm=tcgen05_mma_bm,
                 bn=tcgen05_mma_bn,
@@ -10521,7 +10864,30 @@ def _emit_mma_pipeline(
         # static-full grids and the validated FP8 role-local N-edge path.
         one_shot_m_slots = ((m_size + bm - 1) // bm) * (2 if tcgen05_is_two_cta else 1)
         one_shot_n_slots = (n_size + bn - 1) // bn
-        one_shot_work_ctas = one_shot_m_slots * one_shot_n_slots
+        # A leading passthrough (batch) axis is one of the scheduler's
+        # dimensions (its position follows the loop order). Its tile size is
+        # pinned to 1 by ``_analyze_mma_operands``, so the static extent is its
+        # slot count; a symbolic extent, or a cluster (whose divisibility
+        # proofs below assume the scheduler M/N dims are the matrix dims),
+        # keeps the persistent while.
+        one_shot_l_slots: int | None = 1
+        if analysis is not None and analysis.has_leading_passthrough:
+            lp_block_id = analysis.leading_passthrough_block_id
+            assert lp_block_id is not None
+            lp_extent = env.block_sizes[lp_block_id].size
+            one_shot_l_slots = (
+                lp_extent
+                if isinstance(lp_extent, int)
+                and not isinstance(lp_extent, bool)
+                and tcgen05_cluster_m == 1
+                and tcgen05_cluster_n == 1
+                else None
+            )
+        one_shot_work_ctas = (
+            one_shot_m_slots * one_shot_n_slots * one_shot_l_slots
+            if one_shot_l_slots is not None
+            else None
+        )
         tcgen05_one_shot_role_scheduler = (
             tcgen05_pid_is_persistent
             and row_union_plan is None
@@ -10531,7 +10897,7 @@ def _emit_mma_pipeline(
                     tcgen05_role_local_n_edge_tma and input_dtype == torch.float8_e4m3fn
                 )
             )
-            and (analysis is None or not analysis.has_leading_passthrough)
+            and one_shot_work_ctas is not None
             and one_shot_work_ctas <= env.config_spec.num_sm
             # A partial cluster could access out of bounds.
             and one_shot_m_slots % tcgen05_cluster_m == 0
@@ -10539,7 +10905,85 @@ def _emit_mma_pipeline(
             and tcgen05_use_role_local_persistent_body
             and tcgen05_effective_scheduler_warps == 0
             and tcgen05_grouped_plan is None
-            and tcgen05_l2_swizzle_size_value == 1
+        )
+        # With one tile per CTA every tile is in flight at once, so the L2
+        # raster swizzle (a permutation of the tile -> CTA map that only
+        # matters when CTAs walk several tiles) cannot change which lines are
+        # live together; the plan drops it on this path so the role-local
+        # schedulers take the unpadded identity raster (no swizzle padding
+        # slots, no padding guard) and the one-shot form is reached from any
+        # ``tcgen05_l2_swizzle_size`` the search picked.
+        tcgen05_plan_l2_swizzle_size = (
+            1 if tcgen05_one_shot_role_scheduler else tcgen05_l2_swizzle_size_value
+        )
+        # One tile per CTA: the epilogue frees TMEM right after issuing its
+        # last subtile's TMA store (the last ``tcgen05.ld`` fence + acc release
+        # stay at that subtile) so the dealloc handshake with the MMA warp
+        # overlaps the store drain instead of holding the last subtile's
+        # staging behind it or following the drain.  This
+        # is the single decision both sides follow: the store lowering emits
+        # the free in the plain full-tile TMA-store body and the post-loop
+        # teardown (``Tcgen05LifecycleContext.render_store_post_loop_lines``)
+        # drops its own handshake + free.  The accumulator must therefore
+        # reach exactly one store (a second store would register the full
+        # teardown before the final store's free: two handshakes against one
+        # MMA arrive, two deallocs) and the C-store body must be the normal
+        # one: the ``skip_epilogue_store`` diagnostic drops the whole t2r
+        # region, free included, the split epilogue layouts relocate it, and
+        # the compact (shape-changing) fragment epilogue owns T2R in its own
+        # SIMT schedule and never renders the TMA body.
+        tcgen05_fragment_plan = df.cute_state.tcgen05_fragment_epilogue_plan_for_anchor(
+            fx_node
+        )
+        tcgen05_free_tmem_in_epilogue = (
+            (tcgen05_use_merged_pipeline_init or tcgen05_use_cluster_deferred_pipelines)
+            and tcgen05_one_shot_role_scheduler
+            and tcgen05_static_full_tiles
+            and tcgen05_use_tma_store_epilogue
+            and tcgen05_m_subtile_count == 1
+            and (
+                tcgen05_output_stores_value is None
+                or len(tcgen05_output_stores_value) == 1
+            )
+            and df.config.get(
+                TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL
+            )
+            == TCGEN05_C_STORE_MODE_NORMAL
+            and df.config.get(
+                TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY, TCGEN05_EPILOGUE_LAYOUT_NORMAL
+            )
+            == TCGEN05_EPILOGUE_LAYOUT_NORMAL
+            and not (
+                candidate is not None
+                and candidate.requires_fragment_epilogue
+                and (
+                    tcgen05_fragment_plan is None or tcgen05_fragment_plan.changes_shape
+                )
+            )
+        )
+        # One tile per CTA: the TMA-load warp's whole role (scheduler, tile
+        # coordinates, TMA partitions, prefill, K loop) is re-emitted right
+        # after the pipeline objects exist (after the cluster
+        # ``pipeline_init_arrive`` on the clustered path, after the mbarrier
+        # init fence on the plain merged-init path) and the warp joins the
+        # init rendezvous itself just before its first stage (``program_id``
+        # moves the role block; the wait is the per-tile statement emitted
+        # ahead of the stage-0 prefetch below: ``pipeline_init_wait`` or the
+        # plain path's pipeline-init named barrier).  The ~300 ns of dependent
+        # uniform-datapath math before the first TMA issue then overlaps the
+        # rendezvous and ``tcgen05.alloc`` instead of following them; the
+        # other warps wait in the prefix as before.  Only the role-local TMA
+        # producer of a one-shot kernel qualifies: its per-tile statements run
+        # exactly once, so the wait is executed once, and the row-union
+        # startup prefill (which already issues its first stages ahead of the
+        # publication) is excluded.
+        tcgen05_hoist_tma_role = (
+            (tcgen05_use_cluster_deferred_pipelines or tcgen05_use_merged_pipeline_init)
+            and tcgen05_one_shot_role_scheduler
+            and tcgen05_use_role_local_tma_producer
+            and row_union_plan is None
+            and tcgen05_grouped_plan is None
+            and not df.config.get(STARTUP_PREFILL_KEY, False)
         )
         tcgen05_matmul_plan = CuteTcgen05MatmulPlan(
             bm=tcgen05_mma_bm,
@@ -10578,7 +11022,7 @@ def _emit_mma_pipeline(
             store_warp_count=tcgen05_warp_spec.store_warps,
             persistence_model=tcgen05_persistence_model_for_plan,
             cluster_n=tcgen05_cluster_n,
-            l2_swizzle_size=tcgen05_l2_swizzle_size_value,
+            l2_swizzle_size=tcgen05_plan_l2_swizzle_size,
             tma_store_full_tiles_only=tcgen05_tma_store_full_tiles_only,
             m_subtile_count=tcgen05_m_subtile_count,
             aux_tensor_descriptors=aux_tensor_descriptors_value,
@@ -10945,12 +11389,47 @@ def _emit_mma_pipeline(
                 f"num_threads={tcgen05_tmem_barrier_thread_count_value})"
             )
         )
+        if tcgen05_use_merged_pipeline_init:
+            # Named barrier between the mbarrier-initializing warp (warp 0)
+            # and every warp that is not an epilogue warp: the TMA-load, MMA,
+            # scheduler and padding warps.  It publishes the pipeline init to
+            # those warps without making them wait for the TMEM allocation;
+            # the epilogue warps (and, again, the MMA warp) get the same
+            # publication from warp 0's arrival on ``tmem_alloc_barrier``.
+            assert tcgen05_matmul_plan is not None
+            tcgen05_launched_warps = (
+                tcgen05_matmul_plan.flat_role_launch_warp_count
+                if tcgen05_matmul_plan.flat_role_launch_warp_count is not None
+                else tcgen05_matmul_plan.launched_warp_count
+            )
+            tcgen05_pipeline_init_barrier = df.new_var("tcgen05_pipeline_init_barrier")
+            prefix.append(
+                statement_from_string(
+                    f"{tcgen05_pipeline_init_barrier} = cutlass.pipeline.NamedBarrier("
+                    f"barrier_id={_TCGEN05_PIPELINE_INIT_BARRIER_ID}, "
+                    f"num_threads={32 * (tcgen05_launched_warps - tcgen05_epi_warp_count_value + 1)})"
+                )
+            )
+        # ``tcgen05.alloc`` stalls the issuing warp for ~150 ns on B200 and the
+        # DSL's mbarrier init runs on warp 0.  On the plain path let epilogue
+        # warp 1 allocate so the two prologue steps overlap instead of
+        # serializing on warp 0 (the MMA and epilogue warps wait for both at
+        # ``tmem_alloc_barrier``; the other warps wait only for the init, on
+        # the pipeline-init barrier).  ``free`` and ``relinquish`` follow the
+        # allocator warp inside ``TmemAllocator``; the retrieve barrier is
+        # unchanged.
+        tcgen05_tmem_allocator_warp = (
+            1
+            if tcgen05_use_merged_pipeline_init and tcgen05_epi_warp_count_value >= 2
+            else 0
+        )
         prefix.append(
             statement_from_string(
                 f"{tcgen05_plan.tmem_allocator} = cutlass.utils.TmemAllocator("
                 f"{tcgen05_plan.tmem_holding_buf}, "
                 f"barrier_for_retrieve={tcgen05_plan.tmem_alloc_barrier}, "
-                f"allocator_warp_id=0, is_two_cta={tcgen05_is_two_cta!s}, "
+                f"allocator_warp_id={tcgen05_tmem_allocator_warp}, "
+                f"is_two_cta={tcgen05_is_two_cta!s}, "
                 f"two_cta_tmem_dealloc_mbar_ptr={tcgen05_plan.tmem_dealloc_mbar_ptr})"
             )
         )
@@ -11144,7 +11623,10 @@ def _emit_mma_pipeline(
                     sched_stage_count=tcgen05_matmul_plan.sched_stage_count,
                     consumer_arrive_count=tcgen05_sched_consumer_arrive_count,
                     cluster_size=tcgen05_sched_cluster_size,
-                    defer_sync=tcgen05_use_cluster_deferred_pipelines,
+                    defer_sync=(
+                        tcgen05_use_cluster_deferred_pipelines
+                        or tcgen05_use_merged_pipeline_init
+                    ),
                     consumer_mask_to_leader=tcgen05_sched_consumer_mask_to_leader,
                     # One leader thread (lane 0 of the scheduler
                     # warp) arrives on the full barrier per stage
@@ -11371,7 +11853,10 @@ def _emit_mma_pipeline(
                         # The emitter uses warp count for TMA and
                         # thread count for SIMT releases.
                         epi_warp_count=tcgen05_matmul_plan.epi_warp_count,
-                        defer_sync=tcgen05_use_cluster_deferred_pipelines,
+                        defer_sync=(
+                            tcgen05_use_cluster_deferred_pipelines
+                            or tcgen05_use_merged_pipeline_init
+                        ),
                     )
                 )
         if not tcgen05_use_tma:
@@ -12106,32 +12591,37 @@ def _emit_mma_pipeline(
             ):
                 ab_tma_plan["use_pdl"] = True
             cg.cute_wrapper_plans.append(ab_tma_plan)
-            if tcgen05_grouped_static_persistent and (
-                tcgen05_grouped_dynamic_ab_tensormaps
-                or tcgen05_grouped_fixed_tensormaps
-            ):
-                assert tma_warp is not None
-                assert warp_idx is not None
+            # Prefetch every TMA descriptor the kernel receives as an argument
+            # once at kernel entry, mirroring the CUTLASS sm100 kernels and the
+            # flash emitter: the TMA-load warp warms the A/B descriptors before
+            # its first ``producer_acquire`` and epilogue warp 0 warms the D
+            # store descriptor(s) so the first TMA store after the mainloop does
+            # not pay a cold descriptor fetch. Every launch after an L2 flush
+            # starts with cold descriptors, so this applies to the plain
+            # persistent and non-persistent GEMM families as well as the grouped
+            # ones (which additionally re-point their descriptors in-kernel).
+            assert tma_warp is not None
+            assert warp_idx is not None
+            prefix.append(
+                statement_from_string(
+                    f"if {tma_warp}:\n"
+                    f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_a})\n"
+                    f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_b})"
+                )
+            )
+            if tcgen05_use_tma_store_epilogue:
+                d_prefetch_atoms = [tma_store_atom]
+                if tail_tma_store_atom:
+                    d_prefetch_atoms.append(tail_tma_store_atom)
                 prefix.append(
                     statement_from_string(
-                        f"if {tma_warp}:\n"
-                        f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_a})\n"
-                        f"    cute.nvgpu.cpasync.prefetch_descriptor({tma_atom_b})"
-                    )
-                )
-                if tcgen05_use_tma_store_epilogue:
-                    grouped_d_prefetch_atoms = [tma_store_atom]
-                    if tail_tma_store_atom:
-                        grouped_d_prefetch_atoms.append(tail_tma_store_atom)
-                    prefix.append(
-                        statement_from_string(
-                            f"if {warp_idx} == cutlass.Int32(0):\n"
-                            + "\n".join(
-                                f"    cute.nvgpu.cpasync.prefetch_descriptor({atom})"
-                                for atom in grouped_d_prefetch_atoms
-                            )
+                        f"if {warp_idx} == cutlass.Int32(0):\n"
+                        + "\n".join(
+                            f"    cute.nvgpu.cpasync.prefetch_descriptor({atom})"
+                            for atom in d_prefetch_atoms
                         )
                     )
+                )
         prefix.append(
             statement_from_string(
                 f"{smem_a_ptr} = cute.arch.alloc_smem("
@@ -12972,6 +13462,7 @@ def _emit_mma_pipeline(
                                     ),
                                     clone_barrier=df.new_var("tcgen05_pdl_barrier"),
                                     gate_tma_warp=not tcgen05_use_role_local_tma_producer,
+                                    fresh_ring=tcgen05_one_shot_role_scheduler,
                                 )
                             )
                             df.cute_state.tcgen05_pdl_wait_in_prefetch = True
@@ -12992,8 +13483,27 @@ def _emit_mma_pipeline(
                                         k_offset=k_offset,
                                         skip_producer_acquire=skip_acquire,
                                         gate_tma_warp=not tcgen05_use_role_local_tma_producer,
+                                        fresh_ring=tcgen05_one_shot_role_scheduler,
                                     )
                                 )
+                        if tcgen05_hoist_tma_role:
+                            # The hoisted TMA-load role joins the pipeline-init
+                            # rendezvous here (the cluster wait, or the plain
+                            # path's named barrier with warp 0), after its
+                            # tile math and before its first mbarrier / TMA
+                            # operation.
+                            first_prefetch_block = next(
+                                index
+                                for index, item in enumerate(initial_prefetch)
+                                if not isinstance(item, str)
+                            )
+                            initial_prefetch.insert(
+                                first_prefetch_block,
+                                f"{tcgen05_pipeline_init_barrier}.arrive_and_wait()"
+                                if tcgen05_use_merged_pipeline_init
+                                else "cutlass.pipeline.pipeline_init_wait("
+                                f"cluster_shape_mn={tcgen05_cluster_layout_vmnk})",
+                            )
                         for item in initial_prefetch:
                             if isinstance(item, str):
                                 _emit_per_tile(
@@ -13273,14 +13783,15 @@ def _emit_mma_pipeline(
             # range with no-unroll metadata so its guarded K-iteration body
             # remains compact.  The generated N,M worklist admits BK64 and
             # BK128; other explicit-store families keep their BK64 envelope.
+            # The narrow-subtile epilogues opt in by name
+            # (``tcgen05_narrow_subtile_nounroll_k_loop``: promoted row-vector
+            # rows and plain 16-bit stores on the 256-wide two-CTA tile,
+            # decided with their subtile); every other kernel keeps the
+            # unrolled ``range``.
             tcgen05_use_nounroll_k_loop = (
-                any(
-                    value is not None
-                    for value in (
-                        tcgen05_explicit_epi_tile_m,
-                        tcgen05_explicit_epi_tile_n,
-                        tcgen05_explicit_d_store_box_n,
-                    )
+                (
+                    tcgen05_explicit_epi_tile_configured
+                    or tcgen05_narrow_subtile_nounroll_k_loop
                 )
                 and tcgen05_static_full_tiles
                 and tcgen05_is_two_cta
@@ -13945,9 +14456,10 @@ def _emit_mma_pipeline(
             is_two_cta=tcgen05_is_two_cta,
             use_tma=tcgen05_use_tma,
             skip_ab_producer_advance=diagnose_skip_ab_producer_advance,
-            tmem_permit_released_early=(
-                row_union_plan is not None and row_union_plan.resident_ctas == 2
-            ),
+            tmem_permit_released_early=tcgen05_relinquish_permit_early,
+            use_merged_pipeline_init=tcgen05_use_merged_pipeline_init,
+            tmem_allocator_warp=tcgen05_tmem_allocator_warp,
+            free_tmem_in_epilogue=tcgen05_free_tmem_in_epilogue,
         )
         tcgen05_pure_matmul_object = (
             Tcgen05PureMatmulObjectModel(
@@ -14030,11 +14542,7 @@ def _emit_mma_pipeline(
                 lifecycle_context=tcgen05_lifecycle_context,
                 output_block_ids=output_block_ids,
                 pure_matmul_object=tcgen05_pure_matmul_object,
-                output_stores=(
-                    _trace_mma_to_stores(fx_node, cg.codegen_graphs)
-                    if fx_node is not None
-                    else None
-                ),
+                output_stores=tcgen05_output_stores_value,
                 bm=tcgen05_mma_bm,
                 bn=tcgen05_mma_bn,
                 bk=bk,
@@ -14142,11 +14650,36 @@ def _mma_active_n_threads(mma_impl: str) -> int:
 
 
 def _tcgen05_root_m_threads(bm: int, bn: int) -> int:
-    # Wide tcgen05 tiles use a compact physical M thread map plus root-lane
-    # serialization. Narrow N=8 tiles keep the original full-M thread family.
-    if bn <= 8:
-        return bm
+    # The tcgen05 role launch is one physical warp per role row: the plan's
+    # block shape multiplies this width by the launched warp count, and the
+    # role predicates, ``epi_tidx`` and the pipeline-init named barrier (sized
+    # from the launched warps) all index warps linearly.  So the SIMT M axis
+    # of a tcgen05 root is one warp wide whatever the tile, and the root lane
+    # loops over the rest of M are the ones the MMA lowering suppresses.  The
+    # narrow N=8 tiles used to keep a tile-wide M axis for a direct
+    # accumulator drain that no longer exists: it launched 64-lane rows (twice
+    # the warps the roles and the init barrier counted; the spare warps could
+    # release the TMA warp from the init barrier before warp 0 had initialized
+    # the mbarriers, an illegal-instruction fault on its first ``try_wait``),
+    # and, with no root lane loops, the thread-barrier pass ran over the body
+    # and put CTA-wide ``sync_threads`` between the TMA prologue stages, which
+    # deadlocks the one-shot role-local chain whenever the K extent exceeds
+    # the AB ring (the TMA warp cannot reach the barrier before the MMA warp
+    # releases a stage, and the MMA warp waits at the barrier).
     return min(32, bm)
+
+
+def _tcgen05_root_n_threads(bn: int) -> int:
+    # The SIMT N axis of a tcgen05 root.  The launch planning resolves an
+    # automatic count to this width, and the launch shape takes the smaller
+    # of it and the plan's role warp count along y (six warps, eight with a
+    # scheduler or C-input warp), so it has to cover every role warp: a
+    # narrower explicit count (four) launched a CTA without the MMA and TMA
+    # role warps and the 96-thread pipeline-init barrier could never
+    # complete, a wider one was only ever clamped to the role count.  An
+    # explicit count of another width is declined by the MMA detection
+    # (``_specialized_mma_root_threads_support_impl``) like the M axis.
+    return min(bn, 8)
 
 
 def _tcgen05_tmem_barrier_thread_count(epi_warp_count: int) -> int:

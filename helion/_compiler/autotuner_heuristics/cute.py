@@ -5439,7 +5439,9 @@ class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
         spec = env.config_spec
         constraints = spec._tcgen05_cluster_m2_search_constraints
-        if constraints is None:
+        if constraints is None or constraints.one_wave_only:
+            # One-wave-only shapes seed their narrow tiles from the config
+            # spec; the 256x256 two-CTA seed would idle most SMs there.
             return False
         if TCGEN05_TWO_CTA_SEED_PID_TYPE not in spec.allowed_pid_types:
             return False

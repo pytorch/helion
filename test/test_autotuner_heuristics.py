@@ -10399,8 +10399,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
         # The plain output has an exact allocation proof for deeper paired-CTA
-        # pipelines. Auxiliary loads retain the legacy six-stage fragment and
-        # its separate AB/source-C budget checks below.
+        # pipelines. Auxiliary loads keep the legacy fragment, whose high is
+        # the operand dtype's deep-ring cap (12 for 16-bit operands: the
+        # one-wave 256x64x64 ring runs 9 stages, the one-CTA 128x64x64 ring
+        # 8); the separate AB/source-C budget checks below decide what fits.
         self.assertTrue(plain_tcfg.paired_pipeline_search_enabled())
         self.assertEqual(
             plain_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
@@ -10409,7 +10411,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         for tcfg in (bias_tcfg, residual_tcfg):
             self.assertIsNone(tcfg.pipeline_smem_facts)
             ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(ab_fragment.high, 6)
+            self.assertEqual(
+                ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
+            )
+            self.assertEqual(ab_fragment.high, 12)
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(

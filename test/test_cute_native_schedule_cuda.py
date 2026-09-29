@@ -157,7 +157,7 @@ def _row_union_bound(
         assert normalized[SCHEDULE_KEY] == TRANSPOSED_SCHEDULE
         assert ab["row_union_schedule"] == TRANSPOSED_SCHEDULE
         assert (ab["cluster_m"], ab["cluster_n"]) == (2, 2)
-        assert "_NUM_SM // 4" in source
+        assert "_MAX_ACTIVE_CLUSTERS" in source and "_NUM_SM // 4" not in source
     else:
         assert normalized[RESIDENT_CTAS_KEY] == 2
         assert (ab["bm"], ab["bn"], ab["bk"]) == (128, 64, 128)

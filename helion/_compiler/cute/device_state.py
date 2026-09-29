@@ -717,6 +717,10 @@ class CuteDeviceFunctionState:
         # initial AB prefetch (independent operand first); the role-local
         # prelude must not wait again ahead of those loads.
         self.tcgen05_pdl_wait_in_prefetch: bool = False
+        # One-shot clustered tcgen05 kernels: the cluster ``pipeline_init_arrive``
+        # statement after which ``program_id`` re-emits the TMA-load warp's
+        # role block (see ``cute_mma`` ``tcgen05_hoist_tma_role``).
+        self.tcgen05_tma_role_hoist_anchor: ast.stmt | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()

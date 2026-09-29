@@ -1092,6 +1092,19 @@ class DeviceFunction:
             )
         self._constexpr_host_defs.add(name)
 
+    def host_constexpr_def(self, name: str, host_expr: str) -> str:
+        """Define a host-only constant once (launch-grid inputs, not kernel args).
+
+        Returns ``name``; the definition is appended to the host statements
+        the first time it is requested for this function.
+        """
+        if name not in self._constexpr_host_defs:
+            self._constexpr_host_defs.add(name)
+            self.codegen.host_statements.append(
+                statement_from_string(f"{name} = {host_expr}")
+            )
+        return name
+
     def _format_constexpr_value(self, value: object) -> str:
         if isinstance(value, str):
             return value
