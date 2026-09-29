@@ -18,6 +18,7 @@ from helion._compiler.program_id import PIDInfo
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -298,6 +299,7 @@ def test_clc_source_is_outside_static_padding_change(swizzle: int) -> None:
     assert code == old
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mailbox", [False, True])
 @pytest.mark.parametrize("swizzle", [2, 4, 8])
@@ -336,6 +338,7 @@ def test_padding_runtime_batched_full_history(
     assert torch.equal(rhs, original[1])
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("cluster_n", [1, 2])
 @pytest.mark.parametrize("swizzle", [2, 4])

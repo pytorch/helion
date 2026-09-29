@@ -16,6 +16,7 @@ import helion
 from helion._compiler.program_id import _build_sched_pipeline_consumer_release_block
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -182,6 +183,7 @@ def test_grouped_worklist_mailbox_releases_all_lanes() -> None:
     assert "worklist_metadata" in code
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires TCgen05 GPU")
 @pytest.mark.parametrize(
     "cluster_n,clc,stages",
