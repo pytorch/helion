@@ -25,6 +25,7 @@ library_imports: dict[str, str] = {
     "triton_helpers": "from torch._inductor.runtime import triton_helpers",
     "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
     "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
+    "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
     "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
 }
 

@@ -64,6 +64,59 @@ def is_cute_shape_chain_target(target: object) -> bool:
     return target in _CUTE_SHAPE_CHAIN_TARGETS
 
 
+def is_cute_direct_iota_index(node: object) -> bool:
+    """Whether *node* is the zero-based, unit-stride iota for a tile axis."""
+    if not isinstance(node, Node) or node.op != "call_function":
+        return False
+    if node.target is not torch.ops.prims.iota.default:
+        return False
+    start = node.kwargs.get("start", 0)
+    step = node.kwargs.get("step", 1)
+    return isinstance(start, int) and start == 0 and isinstance(step, int) and step == 1
+
+
+def is_cute_unit_stride_iota_index(node: object) -> bool:
+    """Whether *node* is a unit-stride iota with only a scalar offset applied."""
+    if not isinstance(node, Node) or node.op != "call_function":
+        return False
+    if node.target is torch.ops.prims.iota.default:
+        step = node.kwargs.get("step", 1)
+        return isinstance(step, int) and step == 1
+    if node.target not in {
+        operator.add,
+        operator.sub,
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+    }:
+        return False
+    lhs, rhs = node.args[:2]
+
+    def is_scalar(value: object) -> bool:
+        if isinstance(value, Node):
+            value = value.meta.get("val")
+        return isinstance(value, (int, torch.SymInt))
+
+    if node.target is torch.ops.aten.add.Tensor:
+        alpha = node.kwargs.get("alpha", 1)
+        return (
+            is_cute_unit_stride_iota_index(lhs)
+            and is_scalar(rhs)
+            or (
+                isinstance(alpha, int)
+                and alpha == 1
+                and is_scalar(lhs)
+                and is_cute_unit_stride_iota_index(rhs)
+            )
+        )
+    if node.target is operator.add:
+        return (
+            is_cute_unit_stride_iota_index(lhs)
+            and is_scalar(rhs)
+            or (is_scalar(lhs) and is_cute_unit_stride_iota_index(rhs))
+        )
+    return is_cute_unit_stride_iota_index(lhs) and is_scalar(rhs)
+
+
 def _match_constant_multiple(value: object) -> tuple[object, int]:
     if (
         isinstance(value, Node)

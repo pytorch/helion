@@ -6190,9 +6190,16 @@ def test_attention_required_full_autotune_accepts_isolated_rebenchmark_invalidat
 
 
 def test_attention_required_full_autotune_rejects_invalidated_compiler_seed():
-    seed_id = _full_autotune_trial()["search_phase_metrics"]["initial_results"][-1][
-        "config_id"
-    ]
+    phase = _full_autotune_trial()["search_phase_metrics"]
+    retained_ids = set(phase["leaf_results"][0]["retained_config_ids"])
+    compiler_seed_ids = [
+        result["config_id"]
+        for result in reversed(phase["initial_results"])
+        if result["status"] in {"ok", "deduplicated"}
+    ][:2]
+    seed_id = next(
+        config_id for config_id in compiler_seed_ids if config_id not in retained_ids
+    )
     trial, invalidated_id = _full_autotune_trial_with_isolated_rebenchmark_invalidation(
         "timeout", invalidated_id=seed_id
     )

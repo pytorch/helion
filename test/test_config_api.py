@@ -81,7 +81,10 @@ from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
+from helion.autotuner.config_fragment import ListOf
+from helion.autotuner.config_fragment import PowerOfTwoFragment
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
 from helion.autotuner.config_spec import MatmulFact
@@ -171,6 +174,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
             "cross_loop_pipeline": st.sampled_from(["barrier", "static", "dynamic"]),
+            "host_tensor_descriptors": st.booleans(),
             "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
             "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
             "cute_chunk_prepare_schedule": st.sampled_from(
@@ -339,6 +343,85 @@ class TestPallasLoadBufferCountConfig(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestConfigAPI(TestCase):
+    def test_num_sm_multiplier_explicit_values_and_search_space(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        for value in (1, 3, 128):
+            config = helion.Config(
+                pid_type="persistent_blocked", num_sm_multiplier=value
+            )
+            spec.normalize(config)
+            self.assertEqual(config.num_sm_multiplier, value)
+
+        for value in (0, 129, 3.0, True):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pid_type": "persistent_blocked",
+                            "num_sm_multiplier": value,
+                        }
+                    )
+                )
+
+        fragment = spec._flat_fields()["num_sm_multiplier"]
+        self.assertIsInstance(fragment, PowerOfTwoFragment)
+        assert isinstance(fragment, PowerOfTwoFragment)
+        self.assertEqual(
+            fragment.search_values(),
+            [1, 2, 4, 8, 16, 32, 64, 128],
+        )
+
+    def test_maxnreg_explicit_values_and_search_space(self) -> None:
+        with (
+            patch("helion.autotuner.config_spec.supports_maxnreg", return_value=True),
+            patch("helion.autotuner.config_spec._regs_per_block", return_value=65536),
+            patch(
+                "helion.autotuner.config_spec.warps_to_threads",
+                side_effect=lambda num_warps: num_warps * 32,
+            ),
+        ):
+            spec = ConfigSpec(backend=TritonBackend())
+            for value in (1, 80, 100, 256):
+                config = helion.Config(pid_type="persistent_blocked", maxnreg=value)
+                spec.normalize(config)
+                self.assertEqual(config.maxnreg, value)
+
+            unlimited = helion.Config.from_dict(
+                {"pid_type": "persistent_blocked", "maxnreg": None}
+            )
+            spec.normalize(unlimited)
+            self.assertIsNone(unlimited.maxnreg)
+
+            for value in (0, 257, 32.0, True):
+                with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                    spec.normalize(
+                        helion.Config.from_dict(
+                            {"pid_type": "persistent_blocked", "maxnreg": value}
+                        )
+                    )
+
+            fragment = spec._flat_fields()["maxnreg"]
+            self.assertIsInstance(fragment, EnumFragment)
+            assert isinstance(fragment, EnumFragment)
+            self.assertEqual(fragment.search_values(), [None, 32, 64, 128, 256])
+
+            repaired = helion.Config(
+                pid_type="persistent_blocked", num_warps=32, maxnreg=100
+            )
+            spec.normalize(repaired, _fix_invalid=True)
+            self.assertEqual(repaired.maxnreg, 64)
+
+            round_trip = helion.Config.from_json(
+                helion.Config(
+                    pid_type="persistent_blocked",
+                    num_sm_multiplier=3,
+                    maxnreg=100,
+                ).to_json()
+            )
+            spec.normalize(round_trip)
+            self.assertEqual(round_trip.num_sm_multiplier, 3)
+            self.assertEqual(round_trip.maxnreg, 100)
+
     def test_config_import_path_stability(self) -> None:
         runtime = importlib.import_module("helion.runtime")
 
@@ -430,6 +513,7 @@ class TestConfigAPI(TestCase):
             "num_stages",
             "pid_type",
             "cross_loop_pipeline",
+            "host_tensor_descriptors",
             "indexing",
         }
         compiler_internal = {
@@ -565,6 +649,79 @@ class TestConfigAPI(TestCase):
                 num_sm=1,
             )
             self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
+
+    def test_host_tensor_descriptors_require_cuda_host_support(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            xpu_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("xpu"),
+                num_sm=1,
+            )
+            self.assertTrue(cuda_spec.supports_config_key("host_tensor_descriptors"))
+            self.assertFalse(xpu_spec.supports_config_key("host_tensor_descriptors"))
+            pre_hopper_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(8, 0),
+            )
+            self.assertFalse(
+                pre_hopper_spec.supports_config_key("host_tensor_descriptors")
+            )
+
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=False,
+        ):
+            cuda_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            self.assertFalse(cuda_spec.supports_config_key("host_tensor_descriptors"))
+
+    def test_host_tensor_descriptors_autotune_and_normalize(self) -> None:
+        with patch(
+            "helion._compat.supports_host_tensor_descriptor",
+            return_value=True,
+        ):
+            spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cuda"),
+                num_sm=1,
+                target_device_capability=(9, 0),
+            )
+            choices = EnumFragment(("pointer", "tensor_descriptor"))
+            spec.indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
+
+            pointer = helion.Config(indexing="pointer", host_tensor_descriptors=True)
+            spec.normalize(pointer)
+            self.assertFalse(pointer.host_tensor_descriptors)
+
+            descriptor = helion.Config(
+                indexing="tensor_descriptor", host_tensor_descriptors=True
+            )
+            spec.normalize(descriptor)
+            self.assertTrue(descriptor.host_tensor_descriptors)
+
+            spec.indexing = ListOf(choices, length=0)
+            spec.atomic_indexing = ListOf(choices, length=1)
+            self.assertIsInstance(
+                spec._flat_fields()["host_tensor_descriptors"], BooleanFragment
+            )
 
     def test_cute_chunk_internal_config_mapping_serialization(self) -> None:
         from helion.autotuner.local_cache import parse_cache_entry

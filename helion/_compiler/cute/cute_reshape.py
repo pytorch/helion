@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from ..compile_environment import Config
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
+    from ..tile_strategy import TileStrategy
 
 CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
 
@@ -221,6 +222,20 @@ def _get_block_local_coord(cg: GenerateAST, block_id: int) -> str | None:
     return None
 
 
+def _per_thread_nd_tile_offset(strategy: TileStrategy, block_id: int) -> str | None:
+    """Return the uniform tile base for the given index's owning strategy.
+
+    Unlike flattened strategies, PerThreadND keeps the tile offset separate
+    from its lane-dependent index, for every blocked/strided vector layout.
+    Callers must pass the strategy that owns the index being reconstructed.
+    """
+    from ..tile_strategy import PerThreadNDTileStrategy
+
+    if isinstance(strategy, PerThreadNDTileStrategy) and block_id in strategy.block_ids:
+        return strategy.offset_var(block_id)
+    return None
+
+
 def _grid_local_coord_expr(
     cg: GenerateAST,
     block_id: int,
@@ -232,6 +247,11 @@ def _grid_local_coord_expr(
         return coord
 
     strategy = cg.current_grid_state.strategy
+    if (tile_offset := _per_thread_nd_tile_offset(strategy, block_id)) is not None:
+        # The emitted index already includes the selected blocked/strided
+        # layout and any vector-lane partition. Reconstructing tid * EPT +
+        # lane here silently changes those layouts (including tile.begin).
+        return f"(({strategy.index_var(block_id)}) - ({tile_offset}))"
     lane_vars = getattr(strategy, "_lane_var_by_block", None)
     if not isinstance(lane_vars, dict) or block_id not in lane_vars:
         return coord

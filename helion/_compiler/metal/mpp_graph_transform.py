@@ -7,7 +7,7 @@ normal scalar Metal lowering path.
 
 Recognition is conservative: the K-loop must return a supported 2D matmul
 accumulator, the root graph must have a single owner chain from
-``getitem -> _phi`` to one store, and A/B/output views must match the canonical
+``getitem -> _phi`` to one store, and lhs/rhs/output views must match the canonical
 matmul tile.  Non-fusible same-shape scalar postprocessing is handled by first
 materializing the MPP result, then reloading it in scalar code.
 """
@@ -20,9 +20,11 @@ import operator
 
 import torch
 from torch.fx import Graph
+from torch.fx.experimental.symbolic_shapes import is_concrete_int
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
+from ... import exc
 from ..compile_environment import CompileEnvironment
 from ..cute.cute_mma import _trace_to_load_tensor
 from ..device_ir import DeviceIR
@@ -31,6 +33,7 @@ from ..device_ir import RootGraphInfo
 from ..inductor_lowering import APIFuncLowering
 from .mpp_graph_codegen import MPPGraphInfo
 from .mpp_graph_codegen import _mpp_graph
+from .mpp_graph_codegen import _MPPOperandLayout
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
@@ -68,6 +71,8 @@ class _Candidate:
     mma_node: Node
     lhs_view: _MPPLoadView
     rhs_view: _MPPLoadView
+    lhs_layout: _MPPOperandLayout
+    rhs_layout: _MPPOperandLayout
     bias_view: _MPPLoadView | None
     acc_dtype: torch.dtype
     store_view: _MPPStoreView
@@ -225,7 +230,7 @@ def _classify_phi_users(
     operand_info = _mpp_operand_views(mma_node)
     if operand_info is None:
         return None
-    lhs_view, rhs_view, bias_view, acc_dtype = operand_info
+    lhs_view, rhs_view, lhs_layout, rhs_layout, bias_view, acc_dtype = operand_info
     epilogue_nodes: list[Node] = []
     cur = phi_node
     visited: set[Node] = set()
@@ -255,6 +260,8 @@ def _classify_phi_users(
                 mma_node=mma_node,
                 lhs_view=lhs_view,
                 rhs_view=rhs_view,
+                lhs_layout=lhs_layout,
+                rhs_layout=rhs_layout,
                 bias_view=bias_view,
                 acc_dtype=acc_dtype,
                 store_view=store_view,
@@ -282,6 +289,8 @@ def _classify_phi_users(
                 mma_node=mma_node,
                 lhs_view=lhs_view,
                 rhs_view=rhs_view,
+                lhs_layout=lhs_layout,
+                rhs_layout=rhs_layout,
                 bias_view=bias_view,
                 acc_dtype=acc_dtype,
                 store_view=store_view,
@@ -341,8 +350,18 @@ def _find_materialized_scalar_store(
 
 def _mpp_operand_views(
     mma_node: Node,
-) -> tuple[_MPPLoadView, _MPPLoadView, _MPPLoadView | None, torch.dtype] | None:
-    """Extract validated A/B/bias views and accumulator dtype from matmul."""
+) -> (
+    tuple[
+        _MPPLoadView,
+        _MPPLoadView,
+        _MPPOperandLayout,
+        _MPPOperandLayout,
+        _MPPLoadView | None,
+        torch.dtype,
+    ]
+    | None
+):
+    """Extract validated lhs/rhs/bias views, layouts, and accumulator dtype."""
     lhs_idx = 1 if mma_node.target is torch.ops.aten.addmm.default else 0
     rhs_idx = 2 if mma_node.target is torch.ops.aten.addmm.default else 1
     acc_idx = 0 if mma_node.target is torch.ops.aten.addmm.default else None
@@ -360,6 +379,8 @@ def _mpp_operand_views(
         return None
     if lhs_view.tensor.dtype != rhs_view.tensor.dtype:
         return None
+    lhs_layout = _classify_mpp_operand(lhs_view.tensor, role="lhs")
+    rhs_layout = _classify_mpp_operand(rhs_view.tensor, role="rhs")
     acc_dtype = _tensor_dtype_from_meta(mma_node)
     if acc_dtype is None:
         return None
@@ -368,7 +389,7 @@ def _mpp_operand_views(
         acc_node = mma_node.args[acc_idx]
         if isinstance(acc_node, Node):
             bias_view = _trace_to_load_view(acc_node)
-    return lhs_view, rhs_view, bias_view, acc_dtype
+    return lhs_view, rhs_view, lhs_layout, rhs_layout, bias_view, acc_dtype
 
 
 def _trace_to_load_view(node: Node) -> _MPPLoadView | None:
@@ -416,7 +437,78 @@ def _validated_mpp_store_view(
         lhs_view, rhs_view, mpp_output_node, store_view, acc_dtype
     ):
         return None
+    # The single choke point for destination validation: the store writes
+    # through a packed handle, so a strided destination is refused here --
+    # where the candidate is created -- rather than in the tile-strategy
+    # pass, which keys on grid positions the rewrite does not use.
+    _require_packed_mpp_destination(store_view.tensor)
     return store_view
+
+
+def _classify_mpp_operand(tensor: torch.Tensor, *, role: str) -> _MPPOperandLayout:
+    """Describe how an MPP matmul operand occupies device memory.
+
+    Packed, transposed, and row-padded 2D operands all lower correctly: the
+    layout records the storage row width plus whether the descriptor
+    must read the operand transposed.
+    Anything else (column strides, broadcasts, negative strides, views with
+    symbolic strides) has no MPP handle representation and is refused with
+    the strides named.  Declining the rewrite quietly is not an option:
+    there is no scalar ``addmm`` lowering to fall back to.
+    """
+    rows, cols = tensor.shape
+    if not isinstance(tensor.storage_offset(), int):
+        raise exc.BackendUnsupported(
+            "metal",
+            f"matmul {role} with non-integral storage offset for shape "
+            f"{tuple(tensor.shape)}: MPP requires a statically described view",
+        )
+    if tensor.is_contiguous():
+        return _MPPOperandLayout(transposed=False, storage_row_width=cols)
+    strides = tensor.stride()
+    if len(strides) != 2:
+        raise exc.BackendUnsupported(
+            "metal",
+            f"matmul {role} with strides {tuple(strides)} for shape "
+            f"{tuple(tensor.shape)}: MPP only reads 2D packed, transposed, "
+            "or row-padded operands",
+        )
+    layout_values = (*strides, rows, cols)
+    if all(is_concrete_int(value) for value in layout_values):
+        stride_rows, stride_cols, nrows, ncols = map(int, layout_values)
+        if (stride_rows, stride_cols) == (1, nrows):
+            # Column-major strides: the transpose of a contiguous matrix.  The
+            # handle covers the storage as (rows, cols) and the descriptor reads
+            # it transposed.
+            return _MPPOperandLayout(transposed=True, storage_row_width=nrows)
+        if stride_cols == 1 and stride_rows >= ncols:
+            # Row-padded: rows are ``stride_rows`` apart.  The handle covers the
+            # storage with that row width; emission requires tail-free tiles
+            # on the padded side.
+            return _MPPOperandLayout(transposed=False, storage_row_width=stride_rows)
+    raise exc.BackendUnsupported(
+        "metal",
+        f"matmul {role} with strides {tuple(strides)} for shape "
+        f"{tuple(tensor.shape)}: MPP only reads 2D packed, transposed, or "
+        "row-padded operands",
+    )
+
+
+def _require_packed_mpp_destination(tensor: torch.Tensor) -> None:
+    """Refuse a strided MPP store destination with the strides named.
+
+    The cooperative store writes through a packed ``tensor_inline`` handle,
+    so unlike the operands there is no transpose or padding support to drop
+    into: a strided destination is refused rather than mis-stored.
+    """
+    if not tensor.is_contiguous():
+        raise exc.BackendUnsupported(
+            "metal",
+            f"matmul destination with strides {tuple(tensor.stride())} for "
+            f"shape {tuple(tensor.shape)}: MPP stores the product as packed "
+            "row-major, so a transposed or padded destination would be "
+            "written at the wrong offsets",
+        )
 
 
 def _is_canonical_mpp_view(
@@ -424,7 +516,7 @@ def _is_canonical_mpp_view(
     rhs_view: _MPPLoadView,
     store_view: _MPPStoreView,
 ) -> bool:
-    """Return whether A/B/output views match canonical matmul layout."""
+    """Return whether lhs/rhs/output views match canonical matmul layout."""
     if not (
         _same_dim(lhs_view.tensor.shape[0], store_view.tensor.shape[0])
         and _same_dim(rhs_view.tensor.shape[1], store_view.tensor.shape[1])
@@ -435,7 +527,7 @@ def _is_canonical_mpp_view(
     rhs_k, rhs_n = rhs_view.indices
     out_m, out_n = store_view.indices
     # Shape checks prove the tensor extents match.  Integer index checks prove
-    # the matched tile axes are wired as A[M,K], B[K,N], C[M,N].
+    # the matched tile axes are wired as lhs[M,K], rhs[K,N], output[M,N].
     if not all(
         isinstance(index, int) for index in (lhs_m, lhs_k, rhs_k, rhs_n, out_m, out_n)
     ):
@@ -533,6 +625,8 @@ def _append_mpp_graph(device_ir: DeviceIR, candidate: _Candidate) -> int:
             out_tensor=candidate.store_view.tensor,
             out_dtype=candidate.store_view.tensor.dtype,
             needs_store_barrier=candidate.reload_value_node is not None,
+            lhs_layout=candidate.lhs_layout,
+            rhs_layout=candidate.rhs_layout,
             m_block_id=_index_block_id(candidate.lhs_view.indices[0]),
             n_block_id=_index_block_id(candidate.rhs_view.indices[1]),
         )

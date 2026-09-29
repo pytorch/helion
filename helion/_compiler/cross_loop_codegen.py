@@ -24,6 +24,7 @@ from .cross_loop_scheduler import ReadinessProducer
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .cross_loop_scheduler import nested_wait_placement
 from .device_function import TensorArg
+from .device_function import TensorDescriptorArg
 from .host_function import HostFunction
 from .program_id import _clone_ast_value
 from .program_id import _clone_stmt
@@ -478,16 +479,30 @@ def _register_cross_loop_state(
 ) -> str:
     """Register launch-persistent global state owned by the Triton launcher."""
     like = next(
-        argument
-        for argument in device_function.arguments
-        if isinstance(argument, TensorArg) and argument._host_str is not None
+        (
+            argument
+            for argument in device_function.arguments
+            if isinstance(argument, TensorArg)
+            and not isinstance(argument, TensorDescriptorArg)
+            and argument._host_str is not None
+        ),
+        None,
     )
+    if like is None:
+        descriptor = next(
+            argument
+            for argument in device_function.arguments
+            if isinstance(argument, TensorDescriptorArg)
+        )
+        like_host = (
+            HostFunction.current().tensor_to_origin[descriptor.fake_value].host_str()
+        )
+    else:
+        like_host = like.host_str()
     name = device_function.new_var(name_hint, dce=False)
     device_function.wrapper_only_params.append(name)
     device_function.triton_persistent_state_args.append(name)
-    device_function.triton_persistent_state_specs.append(
-        (like.host_str(), numel, str(dtype))
-    )
+    device_function.triton_persistent_state_specs.append((like_host, numel, str(dtype)))
     return name
 
 

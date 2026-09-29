@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 import torch
 
+from helion import exc
 from helion._hardware import HardwareInfo
 from helion._testing import onlyBackends
 import helion.autotuner.aot_cache as aot_cache_module
@@ -800,6 +801,27 @@ def test_static_standalone_call_key_covers_runtime_specialization() -> None:
         _standalone_call_key((Point(1, 2),))
 
 
+def test_static_standalone_call_key_covers_descriptor_predicates() -> None:
+    backing = torch.empty(32, dtype=torch.float32)
+    aligned = backing.as_strided((2, 3), (4, 1), storage_offset=0)
+    unaligned = backing.as_strided((2, 3), (4, 1), storage_offset=1)
+    aligned_offset = backing.as_strided((2, 3), (4, 1), storage_offset=4)
+    other_aligned = torch.empty_strided((2, 3), (4, 1))
+
+    assert aligned.data_ptr() % 16 == 0
+    assert unaligned.data_ptr() % 16 != 0
+    assert aligned_offset.data_ptr() % 16 == 0
+    assert aligned_offset.storage_offset() != 0
+    assert _standalone_call_key((aligned,)) == _standalone_call_key((unaligned,))
+
+    def descriptor_key(tensor: torch.Tensor) -> tuple[object, ...]:
+        return _standalone_call_key((tensor,), tensor_descriptor_guards=True)
+
+    assert descriptor_key(aligned) == descriptor_key(other_aligned)
+    assert descriptor_key(aligned) != descriptor_key(unaligned)
+    assert descriptor_key(aligned) != descriptor_key(aligned_offset)
+
+
 def test_aot_cache_canonicalizes_defaults_for_compile_get(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -869,6 +891,86 @@ def test_standalone_preserves_cute_launcher_import(tmp_path: Path) -> None:
         "from helion.runtime import default_cute_launcher as _default_cute_launcher"
         in source
     )
+
+
+@pytest.mark.parametrize(
+    "descriptor_config",
+    [
+        {"block_sizes": [16], "indexing": "tensor_descriptor"},
+        {"block_sizes": [16], "atomic_indexing": ["tensor_descriptor"]},
+    ],
+)
+def test_dynamic_standalone_rejects_tensor_descriptors_before_codegen(
+    tmp_path: Path,
+    descriptor_config: dict[str, object],
+) -> None:
+    source_path = tmp_path / "source.py"
+    source_path.write_text("def demo(x):\n    return x\n")
+    namespace: dict[str, object] = {}
+    exec(compile(source_path.read_text(), str(source_path), "exec"), namespace)
+    kernel_function = namespace["demo"]
+    heuristic_path = tmp_path / "_helion_aot_demo_cuda_sm100.py"
+    heuristic_path.write_text(f"CONFIGS = [{descriptor_config!r}]\n")
+    normalized: list[Config] = []
+    codegen_calls: list[Config] = []
+
+    def normalize(config: Config) -> Config:
+        normalized.append(config)
+        return config
+
+    cache = object.__new__(AOTAutotuneCache)
+    cache.data_dir = tmp_path
+    cache.hardware_id = "test-hardware"
+    cache.kernel = SimpleNamespace(
+        settings=SimpleNamespace(static_shapes=False),
+        kernel=SimpleNamespace(name="demo", __code__=kernel_function.__code__),
+        _normalized_config_copy=normalize,
+        to_triton_code=lambda config: codegen_calls.append(config),
+    )
+    cache._find_heuristic_file = lambda: heuristic_path
+
+    AOTAutotuneCache.clear_caches()
+    with pytest.raises(exc.InvalidAPIUsage, match="dynamic standalone AOT"):
+        cache._maybe_run_compile()
+    assert len(normalized) == 1
+    assert codegen_calls == []
+    assert "demo" not in AOTAutotuneCache._compiled_kernels
+    assert not (tmp_path / "source_demo_standalone.py").exists()
+    AOTAutotuneCache.clear_caches()
+
+
+def test_dynamic_standalone_still_accepts_pointer_config(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.py"
+    source_path.write_text("def demo(x):\n    return x\n")
+    namespace: dict[str, object] = {}
+    exec(compile(source_path.read_text(), str(source_path), "exec"), namespace)
+    kernel_function = namespace["demo"]
+    heuristic_path = tmp_path / "_helion_aot_demo_cuda_sm100.py"
+    heuristic_path.write_text(
+        "CONFIGS = [{'block_sizes': [16], 'indexing': 'pointer'}]\n"
+    )
+    codegen_calls: list[Config] = []
+
+    def to_triton_code(config: Config) -> str:
+        codegen_calls.append(config)
+        return "from __future__ import annotations\n\ndef demo(x):\n    return x\n"
+
+    cache = object.__new__(AOTAutotuneCache)
+    cache.data_dir = tmp_path
+    cache.hardware_id = "test-hardware"
+    cache.kernel = SimpleNamespace(
+        settings=SimpleNamespace(static_shapes=False),
+        kernel=SimpleNamespace(name="demo", __code__=kernel_function.__code__),
+        _normalized_config_copy=lambda config: config,
+        to_triton_code=to_triton_code,
+    )
+    cache._find_heuristic_file = lambda: heuristic_path
+
+    AOTAutotuneCache.clear_caches()
+    cache._maybe_run_compile()
+    assert len(codegen_calls) == 1
+    assert (tmp_path / "source_demo_standalone.py").exists()
+    AOTAutotuneCache.clear_caches()
 
 
 def test_static_aot_compile_accumulates_observed_shapes(
@@ -953,6 +1055,60 @@ def test_static_aot_compile_accumulates_observed_shapes(
     with pytest.raises(RuntimeError, match="variant failed to compile"):
         cache._compile_current_static_shape(heuristic_path, "demo")
     assert output_path.read_text() == prior_source
+    AOTAutotuneCache.clear_caches()
+
+
+def test_static_aot_compile_dispatches_descriptor_alignment(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.py"
+    source_path.write_text("def demo(x):\n    return x\n")
+    namespace: dict[str, object] = {}
+    exec(compile(source_path.read_text(), str(source_path), "exec"), namespace)
+    kernel_function = namespace["demo"]
+    heuristic_path = tmp_path / "_helion_aot_demo_cuda_sm100.py"
+    heuristic_path.write_text("def autotune_demo(*args):\n    return {}\n")
+    config = Config(block_sizes=[16])
+
+    backing = torch.empty(32, dtype=torch.float32)
+    aligned = backing.as_strided((2, 3), (4, 1), storage_offset=0)
+    unaligned = backing.as_strided((2, 3), (4, 1), storage_offset=1)
+    aligned_offset = backing.as_strided((2, 3), (4, 1), storage_offset=4)
+
+    cache = object.__new__(AOTAutotuneCache)
+    cache.data_dir = tmp_path
+    cache.hardware_id = "test-hardware"
+    cache._get_heuristic_config = lambda _args: config
+    result = 0
+
+    def to_triton_code(_config: Config) -> str:
+        return (
+            f"from __future__ import annotations\n\ndef demo(x):\n    return {result}\n"
+        )
+
+    cache.kernel = SimpleNamespace(
+        kernel=SimpleNamespace(
+            __code__=kernel_function.__code__,
+            name="demo",
+            normalize_args=lambda *args: tuple(args),
+        ),
+        to_triton_code=to_triton_code,
+    )
+
+    AOTAutotuneCache.clear_caches()
+    for tensor, expected in ((aligned, 1), (unaligned, 2)):
+        cache.args = (tensor,)
+        result = expected
+        cache._compile_current_static_shape(
+            heuristic_path,
+            "demo",
+            tensor_descriptor_guards=True,
+        )
+
+    output_path = tmp_path / "source_demo_standalone.py"
+    module = _load_generated(output_path, "test_static_aot_descriptor_alignment")
+    assert module.demo(torch.empty_strided((2, 3), (4, 1))) == 1
+    assert module.demo(unaligned) == 2
+    with pytest.raises(ValueError, match="No standalone variant"):
+        module.demo(aligned_offset)
     AOTAutotuneCache.clear_caches()
 
 
@@ -1047,6 +1203,7 @@ def test_static_aot_compile_serializes_concurrent_variants(
         output_dir: Path,
         kernel_source_file: str | None = None,
         dispatch_keys: list[tuple[object, ...]] | None = None,
+        tensor_descriptor_guards: bool = False,
     ) -> Path:
         nonlocal active_writers, max_active_writers
         with writers_lock:
@@ -1061,6 +1218,7 @@ def test_static_aot_compile_serializes_concurrent_variants(
                 output_dir,
                 kernel_source_file,
                 dispatch_keys,
+                tensor_descriptor_guards,
             )
         finally:
             with writers_lock:

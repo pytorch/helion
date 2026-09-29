@@ -831,19 +831,8 @@ class DeviceFunction:
                 permutation.pop(stride_one_dim)
                 permutation.append(stride_one_dim)
 
-            # Create the regular tensor arg and size/stride args
-            tensor_arg = self.tensor_arg(fake_value)
-            size_args = [
-                self.tensor_size(fake_value, i) for i in range(fake_value.ndim)
-            ]
-            stride_args = [
-                self.tensor_stride(fake_value, i) for i in range(fake_value.ndim)
-            ]
-
             # Apply permutation if needed
             if permutation is not None:
-                size_args = [size_args[i] for i in permutation]
-                stride_args = [stride_args[i] for i in permutation]
                 block_size = [block_size[i] for i in permutation]
                 # Update block_size_expr for the permuted order
                 block_size_expr = ", ".join(map(self.literal_expr, block_size))
@@ -852,29 +841,63 @@ class DeviceFunction:
                 permutation if permutation is not None else [*range(fake_value.ndim)]
             )
             assert descriptor_dims[-1] == stride_one_dim
-            # The descriptor permutation above makes the last descriptor
-            # dimension the proven stride-one dimension. Triton checks this
-            # predicate at JIT time, so emit it as a literal even when other
-            # dynamic strides are runtime scalars.
-            stride_args[-1] = StaticShape(1)
-
-            # Add tl.make_tensor_descriptor call to preamble
-            sizes = ", ".join([arg.name for arg in size_args])
-            strides = ", ".join([arg.name for arg in stride_args])
-
-            tensor_descriptor_fn_name = get_tensor_descriptor_fn_name()
-            descriptor_stmt = statement_from_string(
-                f"{desc_name} = {tensor_descriptor_fn_name}({tensor_arg.name}, [{sizes}], [{strides}], [{block_size_expr}])"
-            )
-            self.preamble.append(descriptor_stmt)
-
-            arg = TensorDescriptorArg(
-                desc_name,
-                fake_value,
-                None,  # No host_str since this is device-only
-                permutation,
-            )
-            # Don't add to self.arguments since this is device-only
+            if self.config.host_tensor_descriptors:
+                tensor_host = origin.host_str()
+                tensor_base = env.backend.tensor_descriptor_host_base(
+                    fake_value, tensor_host
+                )
+                sizes = [
+                    f"{tensor_host}.size({dimension})" for dimension in descriptor_dims
+                ]
+                strides = [
+                    f"{tensor_host}.stride({dimension})"
+                    for dimension in descriptor_dims
+                ]
+                # The layout proof above establishes this exactly. Keeping it
+                # literal avoids specializing a dynamic stride solely to build
+                # a launch-time descriptor.
+                strides[-1] = "1"
+                host_block_size = ", ".join(map(host_function.literal_expr, block_size))
+                arg = TensorDescriptorArg(
+                    desc_name,
+                    fake_value,
+                    f"_helion_tensor_descriptor({tensor_base}, [{', '.join(sizes)}], "
+                    f"[{', '.join(strides)}], [{host_block_size}])",
+                    permutation,
+                )
+                self.arguments.append(arg)
+            else:
+                # Create the regular tensor arg and size/stride args used by
+                # tl.make_tensor_descriptor in each device program.
+                tensor_arg = self.tensor_arg(fake_value)
+                size_args = [
+                    self.tensor_size(fake_value, i) for i in range(fake_value.ndim)
+                ]
+                stride_args = [
+                    self.tensor_stride(fake_value, i) for i in range(fake_value.ndim)
+                ]
+                if permutation is not None:
+                    size_args = [size_args[i] for i in permutation]
+                    stride_args = [stride_args[i] for i in permutation]
+                # The descriptor permutation above makes the last descriptor
+                # dimension the proven stride-one dimension. Triton checks this
+                # predicate at JIT time, so emit it as a literal even when other
+                # dynamic strides are runtime scalars.
+                stride_args[-1] = StaticShape(1)
+                sizes = ", ".join(arg.name for arg in size_args)
+                strides = ", ".join(arg.name for arg in stride_args)
+                tensor_descriptor_fn_name = get_tensor_descriptor_fn_name()
+                self.preamble.append(
+                    statement_from_string(
+                        f"{desc_name} = {tensor_descriptor_fn_name}({tensor_arg.name}, [{sizes}], [{strides}], [{block_size_expr}])"
+                    )
+                )
+                arg = TensorDescriptorArg(
+                    desc_name,
+                    fake_value,
+                    None,  # No host_str since this is device-only
+                    permutation,
+                )
             self._tensor_descriptor_args[key] = arg
         return self._tensor_descriptor_args[key]
 

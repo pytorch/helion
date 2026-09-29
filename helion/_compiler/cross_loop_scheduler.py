@@ -1758,6 +1758,11 @@ def _build_readiness_events(
     all_obligations_by_pair = {
         pair: set(obligations) for pair, obligations in obligations_by_root_pair
     }
+    producer_access_by_dependency_id = {
+        dependency.dependency_id: dependency.producer_access_id
+        for edge in dependency_graph.edges
+        for dependency in edge.access_dependencies
+    }
 
     implied_obligations: dict[DependencyObligation, set[DependencyObligation]] = {}
     for preceding_dependency in exact_dependencies:
@@ -1784,9 +1789,6 @@ def _build_readiness_events(
                 or later_producers is None
                 or preceding_dependency.consumer_root != later_dependency.consumer_root
                 or preceding_dependency.producer_root != later_dependency.producer_root
-                or preceding_dependency.producer_site_id
-                != later_dependency.producer_site_id
-                or preceding_producers.target_domain != later_producers.target_domain
                 or not charge(
                     1 + len(preceding_producers.pieces) * len(later_producers.pieces)
                 )
@@ -1802,6 +1804,46 @@ def _build_readiness_events(
             acquired = (
                 None if preceding is None else preceding.then(preceding_producers)
             )
+            # A completion publication may also cover payload writes at an
+            # earlier producer site. Compose both sides' local program order
+            # before comparing the producer sets.
+            if acquired is not None and (
+                preceding_dependency.producer_site_id
+                != later_dependency.producer_site_id
+                or acquired.target_domain != later_producers.target_domain
+            ):
+                producer_site_id = preceding_dependency.producer_site_id
+                payload_site_id = later_dependency.producer_site_id
+                producer_access_id = producer_access_by_dependency_id.get(
+                    preceding_dependency.dependency_id
+                )
+                producer_site = (
+                    None if producer_site_id is None else site_by_id[producer_site_id]
+                )
+                producer_precedence = (
+                    None
+                    if producer_site_id is None
+                    or payload_site_id is None
+                    or producer_access_id is None
+                    # Only root-task completion has an unambiguous ordering
+                    # contract across sites: it occurs after every nested and
+                    # conditional access in that task.  A nested completion
+                    # could precede a later access in one of its ancestors.
+                    or producer_site is None
+                    or not producer_site.is_root
+                    else consumer_to_preceding_site_relation(
+                        dependency_graph,
+                        site_domains=site_domains,
+                        preceding_site_id=payload_site_id,
+                        consumer_site_id=producer_site_id,
+                        consumer_access_id=producer_access_id,
+                    )
+                )
+                acquired = (
+                    None
+                    if producer_precedence is None
+                    else acquired.then(producer_precedence)
+                )
             if acquired is not None and acquired.covers(later_producers):
                 implied_obligations.setdefault(preceding_obligation, set()).add(
                     (

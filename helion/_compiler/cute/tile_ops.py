@@ -29,6 +29,13 @@ def _(state: CodegenState) -> ast.AST:
     thread_axis = None
     loops = state.codegen.active_device_loops.get(index)
     if loops:
+        from .cute_reshape import _per_thread_nd_tile_offset
+
+        # Use the same innermost owner as GenerateAST.index_var, not a
+        # possibly different outer/current grid in a nested loop.
+        tile_offset = _per_thread_nd_tile_offset(loops[-1].strategy, index)
+        if tile_offset is not None:
+            return expr_from_string(tile_offset)
         thread_axis = loops[-1].block_thread_axes.get(index)
     if thread_axis is None:
         grid_state = state.codegen.current_grid_state

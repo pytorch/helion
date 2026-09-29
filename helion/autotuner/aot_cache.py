@@ -40,7 +40,9 @@ from typing import Literal
 
 import torch
 
+from .. import exc
 from .._hardware import get_hardware_info
+from .._utils import indexing_uses_tensor_descriptor
 from ..runtime.config import Config
 from .aot_kernel import _flatten_key_value
 from .aot_kernel import extract_key_features
@@ -67,6 +69,12 @@ HEURISTIC_DIR_ENV = "HELION_HEURISTIC_DIR"
 AOT_VERBOSE_ENV = "HELION_AOT_VERBOSE"
 
 AOTMode = Literal["collect", "measure", "evaluate", "compile", "disabled"]
+
+
+def _config_uses_tensor_descriptor(config: Config) -> bool:
+    return indexing_uses_tensor_descriptor(
+        config.indexing
+    ) or indexing_uses_tensor_descriptor(config.atomic_indexing)
 
 
 def get_aot_mode() -> AOTMode:
@@ -309,7 +317,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
     # call signature and rewrites the dispatcher whenever a shape is observed.
     _compiled_kernel_variants: ClassVar[
         dict[
-            tuple[str, str, str, str, str],
+            tuple[str, str, str, str, str, bool],
             dict[tuple[object, ...], tuple[str, str]],
         ]
     ] = {}
@@ -861,19 +869,45 @@ class AOTAutotuneCache(AutotuneCacheBase):
             spec.loader.exec_module(module)
             AOTAutotuneCache._heuristic_modules[heuristic_file] = module
 
-        if self.kernel.settings.static_shapes:
-            self._compile_current_static_shape(heuristic_file, kernel_name)
-            return
-
         # -- extract selected configs ---------------------------------------
         # nearest_neighbor backend: module-level CONFIGS
         # decision_tree backend: _C = [...] inside autotune_<kernel>
         configs_list: list[dict[str, object]] | None = getattr(module, "CONFIGS", None)
         if configs_list is None:
             configs_list = self._parse_configs_from_autotune(module, kernel_name)
+
+        if self.kernel.settings.static_shapes:
+            # Static dispatch already keys exact shape and stride. Enable the two
+            # remaining descriptor predicates consistently for the whole file if
+            # any heuristic-selected config can use descriptor indexing.
+            tensor_descriptor_guards = configs_list is None or any(
+                _config_uses_tensor_descriptor(
+                    # pyrefly: ignore [bad-argument-type]
+                    self.kernel._normalized_config_copy(Config(**config_dict))
+                )
+                for config_dict in configs_list
+            )
+            self._compile_current_static_shape(
+                heuristic_file,
+                kernel_name,
+                tensor_descriptor_guards=tensor_descriptor_guards,
+            )
+            return
+
         if configs_list is None:
             log.warning("Cannot extract configs from heuristic for '%s'", kernel_name)
             return
+
+        configs = [
+            # pyrefly: ignore [bad-argument-type]
+            self.kernel._normalized_config_copy(Config(**config_dict))
+            for config_dict in configs_list
+        ]
+        if any(map(_config_uses_tensor_descriptor, configs)):
+            raise exc.InvalidAPIUsage(
+                "dynamic standalone AOT does not support tensor-descriptor "
+                "indexing; use pointer or block-pointer indexing"
+            )
 
         if kernel_name in AOTAutotuneCache._compiled_kernels:
             return
@@ -881,8 +915,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         # -- generate Triton code for each config --------------------------
         triton_codes: list[str] = []
-        for i, config_dict in enumerate(configs_list):
-            config = Config(**config_dict)  # pyrefly: ignore [bad-argument-type]
+        for i, config in enumerate(configs):
             try:
                 triton_codes.append(self.kernel.to_triton_code(config))
             except Exception:
@@ -913,6 +946,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self,
         heuristic_file: Path,
         kernel_name: str,
+        *,
+        tensor_descriptor_guards: bool = False,
     ) -> None:
         """Compile one observed static call and update its exact dispatcher."""
         normalized_args = self.kernel.kernel.normalize_args(*self.args)
@@ -927,7 +962,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         from .aot_compile import _standalone_call_key
         from .aot_compile import generate_standalone_file
 
-        call_key = _standalone_call_key(normalized_args)
+        call_key = _standalone_call_key(
+            normalized_args,
+            tensor_descriptor_guards=tensor_descriptor_guards,
+        )
         code_object = self.kernel.kernel.__code__
         source_path = Path(code_object.co_filename).resolve()
         if source_path.is_file():
@@ -948,6 +986,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             self.hardware_id,
             hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
             source_digest,
+            tensor_descriptor_guards,
         )
         config_fingerprint = json.dumps(dict(config), sort_keys=True, default=repr)
         try:
@@ -989,6 +1028,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 output_dir=self.data_dir,
                 kernel_source_file=kernel_source_file,
                 dispatch_keys=[variant[0] for variant in ordered],
+                tensor_descriptor_guards=tensor_descriptor_guards,
             )
             variants[call_key] = (config_fingerprint, code)
         print(f"[AOT] Standalone: {out_path}", file=sys.stderr)

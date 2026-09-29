@@ -68,16 +68,31 @@ class TritonBackend(Backend):
         tensor_host_args: list[str],
     ) -> str:
         from ..device_function import TensorArg
+        from ..device_function import TensorDescriptorArg
 
         # Bind fp4x2 storage as uint8; Triton has no pointer type for the shell dtype.
         if (
             isinstance(arg, TensorArg)
+            and not isinstance(arg, TensorDescriptorArg)
             and arg.fake_value.dtype is torch.float4_e2m1fn_x2
         ):
             return f"{host_str}.view(torch.uint8)"
         return host_str
 
+    def tensor_descriptor_host_base(
+        self, fake_value: torch.Tensor, host_str: str
+    ) -> str:
+        # Triton's host descriptor does not recognize PyTorch's packed FP4
+        # shell dtype, but its byte view has the same storage geometry.
+        if fake_value.dtype is torch.float4_e2m1fn_x2:
+            return f"{host_str}.view(torch.uint8)"
+        return host_str
+
     def supports_config_key(self, key: str) -> bool:
+        if key == "host_tensor_descriptors":
+            from ..._compat import supports_host_tensor_descriptor
+
+            return self.name == "triton" and supports_host_tensor_descriptor()
         if key == "cross_loop_pipeline":
             from ..._compat import is_hip
 
@@ -389,6 +404,7 @@ class TritonBackend(Backend):
             "triton_helpers": "from torch._inductor.runtime import triton_helpers",
             "tl_math": "from torch._inductor.runtime.triton_helpers import math as tl_math",
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
+            "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",

@@ -1085,6 +1085,12 @@ class Backend(abc.ABC):
         """
         return host_str
 
+    def tensor_descriptor_host_base(
+        self, fake_value: torch.Tensor, host_str: str
+    ) -> str:
+        """Return the host tensor expression used to construct a descriptor."""
+        return host_str
+
     def scalar_arg_preamble(self, arg: Argument) -> list[ast.AST]:
         """Generate preamble statements for scalar arguments in the device function.
 

@@ -400,21 +400,46 @@ class ConfigGeneration:
             for idx, _ in self._cute_num_thread_block_pairs
             if type(flat_config[idx]) is int and cast("int", flat_config[idx]) > 0
         ]
-        thread_product = functools.reduce(
-            operator.mul,
-            (cast("int", flat_config[idx]) for idx in explicit_indices),
-            1,
-        )
-        while thread_product > 1024 and explicit_indices:
-            largest_idx = max(
-                explicit_indices,
-                key=lambda idx: cast("int", flat_config[idx]),
-            )
-            largest = cast("int", flat_config[largest_idx])
-            if largest <= 1:
-                break
-            flat_config[largest_idx] = largest // 2
-            thread_product //= 2
+        for indices in self._cute_coexisting_thread_groups(explicit_indices):
+            thread_product = math.prod(cast("int", flat_config[idx]) for idx in indices)
+            while thread_product > 1024 and indices:
+                largest_idx = max(
+                    indices,
+                    key=lambda idx: cast("int", flat_config[idx]),
+                )
+                largest = cast("int", flat_config[largest_idx])
+                if largest <= 1:
+                    break
+                flat_config[largest_idx] = largest // 2
+                thread_product //= 2
+
+    def _cute_coexisting_thread_groups(self, indices: list[int]) -> list[list[int]]:
+        """Repair simultaneous axes, not the product of independent root grids.
+
+        Root ownership does not predict physical axis placement. The backend's
+        final-AST launch check still rejects independent grids whose per-axis
+        maximum requires more than 1024 threads. Unowned/nested axes remain in
+        every group conservatively; missing topology retains the old bound.
+        """
+        topology = self.config_spec.kernel_grid_fact
+        if topology is None or len(topology.roots) < 2:
+            return [indices]
+        roots = [set(root.block_ids) for root in topology.roots]
+        root_ids = set().union(*roots)
+        owners = {
+            self._cute_num_thread_index_by_id[item.block_id]: set(item.block_ids)
+            for item in self.config_spec.num_threads
+            if item.block_id in self._cute_num_thread_index_by_id
+        }
+        return [
+            [
+                index
+                for index in indices
+                if not owners[index].intersection(root_ids)
+                or owners[index].intersection(root)
+            ]
+            for root in roots
+        ]
 
     def flatten(self, config: Config) -> FlatConfig:
         """Inverse of unflatten: convert a Config to a FlatConfig."""

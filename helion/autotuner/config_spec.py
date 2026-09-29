@@ -73,6 +73,7 @@ from .._compiler.cute.tcgen05_config import CuteTcgen05Config
 from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._utils import indexing_uses_tensor_descriptor
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
@@ -859,6 +860,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_min_blocks_per_mp",
         "load_cache_modifiers",
         "store_cache_modifiers",
+        "host_tensor_descriptors",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -898,6 +900,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "load_eviction_policies",
         "load_cache_modifiers",
         "store_cache_modifiers",
+        "host_tensor_descriptors",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -946,9 +949,14 @@ EPILOGUE_SUBTILE_EXTENDED_CHOICES = (None, 2, 4)
 EPILOGUE_SUBTILE_DEFAULT_CHOICES = (None, 2)
 EPILOGUE_SUBTILE_MIN_K_HINT = 1024
 EPILOGUE_SUBTILE_MIN_K_HINT_EXTENDED = 16384
-# maxnreg values: None means no limit, otherwise limit to this many registers per thread
-# Lower values allow higher occupancy but may hurt performance for register-heavy kernels
-VALID_MAXNREG = (None, 32, 64, 128, 256)
+# None means no limit. The autotuner retains this deliberately small search
+# domain, while explicit configs may select any positive integer up to the
+# existing supported upper bound.
+AUTOTUNED_MAXNREG = (None, 32, 64, 128, 256)
+# Backward-compatible name for callers that inspect the autotuning surface.
+VALID_MAXNREG = AUTOTUNED_MAXNREG
+MIN_MAXNREG = 1
+MAX_MAXNREG = 256
 DEFAULT_MAXNREG = None
 _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
     {
@@ -2369,6 +2377,14 @@ class ConfigSpec:
         )
 
     def supports_config_key(self, key: str) -> bool:
+        if key == "host_tensor_descriptors":
+            return (
+                self.device is not None
+                and self.device.type == "cuda"
+                and self.target_device_capability is not None
+                and self.target_device_capability >= (9, 0)
+                and self.backend.supports_config_key(key)
+            )
         if (
             key == "cross_loop_pipeline"
             and self.device is not None
@@ -3102,6 +3118,7 @@ class ConfigSpec:
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
+            "host_tensor_descriptors",
         ):
             if not self.supports_config_key(name):
                 config.pop(name, None)
@@ -3110,6 +3127,13 @@ class ConfigSpec:
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
         if self.supports_config_key("num_stages"):
             config.setdefault("num_stages", self._default_num_stages())
+        if self.supports_config_key("host_tensor_descriptors"):
+            value = config.setdefault("host_tensor_descriptors", False)
+            if type(value) is not bool:
+                if _fix_invalid:
+                    config["host_tensor_descriptors"] = False
+                else:
+                    raise InvalidConfig("host_tensor_descriptors must be a bool")
         if self.supports_config_key("load_eviction_policies"):
             config.setdefault(
                 "load_eviction_policies", self.load_eviction_policies.default()
@@ -3132,6 +3156,15 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if config.get("host_tensor_descriptors"):
+            indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
+            uses_tensor_descriptor = any(
+                map(indexing_uses_tensor_descriptor, indexing_values)
+            )
+            if not uses_tensor_descriptor:
+                # Host and device materialization are identical when no memory
+                # operation selected descriptor indexing. Keep one tune point.
+                config["host_tensor_descriptors"] = False
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
@@ -3390,17 +3423,18 @@ class ConfigSpec:
             self._normalize_cute_flash(config, fix_invalid=_fix_invalid)
 
         if self.supports_config_key("num_sm_multiplier"):
-            # Validate num_sm_multiplier is a power of two in range
+            # The default autotuning domain remains powers of two, while an
+            # explicitly selected configuration may use an intermediate worker
+            # count when occupancy has a narrow optimum.
             if "num_sm_multiplier" in config:
                 val = config["num_sm_multiplier"]
                 if (
-                    not isinstance(val, int)
+                    type(val) is not int
                     or val < MIN_NUM_SM_MULTIPLIER
                     or val > MAX_NUM_SM_MULTIPLIER
-                    or (val & (val - 1)) != 0  # not a power of two
                 ):
                     raise InvalidConfig(
-                        f"Invalid value for 'num_sm_multiplier': {val!r} must be a power of two between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
+                        f"Invalid value for 'num_sm_multiplier': {val!r} must be an integer between {MIN_NUM_SM_MULTIPLIER} and {MAX_NUM_SM_MULTIPLIER}"
                     )
             else:
                 config["num_sm_multiplier"] = DEFAULT_NUM_SM_MULTIPLIER
@@ -3408,12 +3442,15 @@ class ConfigSpec:
         # Only validate maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             if "maxnreg" in config:
-                if config["maxnreg"] not in VALID_MAXNREG:
+                value = config["maxnreg"]
+                if value is not None and (
+                    type(value) is not int or value < MIN_MAXNREG or value > MAX_MAXNREG
+                ):
                     raise InvalidConfig(
-                        f"Invalid value for 'maxnreg': {config['maxnreg']!r} must be one of {list(VALID_MAXNREG)!r}"
+                        f"Invalid value for 'maxnreg': {value!r} must be None or an integer between {MIN_MAXNREG} and {MAX_MAXNREG}"
                     )
             else:
-                config["maxnreg"] = VALID_MAXNREG[0]
+                config["maxnreg"] = DEFAULT_MAXNREG
 
             # Cap maxnreg so that maxnreg * threads_per_block doesn't exceed
             # the register file.  On sm100+ ptxas honours .maxnreg over
@@ -3426,7 +3463,7 @@ class ConfigSpec:
                 if maxnreg > limit:
                     if _fix_invalid:
                         valid = [
-                            v for v in VALID_MAXNREG if v is not None and v <= limit
+                            v for v in AUTOTUNED_MAXNREG if v is not None and v <= limit
                         ]
                         if valid:
                             config["maxnreg"] = max(valid)
@@ -3824,6 +3861,33 @@ class ConfigSpec:
             self.tensor_numel_constraints, block_sizes, min_sizes
         )
 
+    def shrink_block_sizes_once(self, config: helion.Config) -> helion.Config | None:
+        """Return a copy of *config* with its largest block size halved.
+
+        ``None`` once every block size sits at its minimum.  Used to back off a
+        config Helion chose itself after the backend compiler rejected it for a
+        hardware limit Helion cannot model (scratch space, shared memory,
+        register pressure).
+        """
+        block_sizes = config.config.get("block_sizes")
+        if not isinstance(block_sizes, list) or not block_sizes:
+            return None
+        best_idx: int | None = None
+        best_val = -1
+        for i, value in enumerate(block_sizes):
+            if not isinstance(value, int):
+                continue
+            if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
+                best_val = value
+                best_idx = i
+        if best_idx is None:
+            return None
+        shrunk = [*block_sizes]
+        shrunk[best_idx] //= 2
+        new_config = helion.Config.from_dict({**config.config, "block_sizes": shrunk})
+        self.normalize(new_config, _fix_invalid=True)
+        return new_config
+
     def iter_search_dimensions(
         self, value_limit: int = 100
     ) -> Iterator[SearchDimensionInfo]:
@@ -4082,6 +4146,10 @@ class ConfigSpec:
             fields["indexing"] = self.indexing
         if self.supports_config_key("atomic_indexing"):
             fields["atomic_indexing"] = self.atomic_indexing
+        if self.supports_config_key("host_tensor_descriptors") and (
+            self.indexing.length > 0 or self.atomic_indexing.length > 0
+        ):
+            fields["host_tensor_descriptors"] = BooleanFragment()
         if (
             self.supports_config_key("pallas_load_buffer_count")
             and self.has_pallas_inner_loops
@@ -4161,7 +4229,7 @@ class ConfigSpec:
                 fields["pallas_fold_dot_lhs_cast"] = BooleanFragment()
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
-            fields["maxnreg"] = EnumFragment(VALID_MAXNREG)
+            fields["maxnreg"] = EnumFragment(AUTOTUNED_MAXNREG)
         if self.epilogue_subtile_autotune_choices is not None:
             fields["epilogue_subtile"] = EnumFragment(
                 choices=self.epilogue_subtile_autotune_choices

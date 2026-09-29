@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 import dataclasses
 import enum
 import math
@@ -215,6 +216,14 @@ class BaseIntegerFragment(ConfigSpecFragment):
 
 
 class PowerOfTwoFragment(BaseIntegerFragment):
+    def _power_values(self) -> list[int]:
+        assert_integer_power_of_two(self.low)
+        assert_integer_power_of_two(self.high)
+        return [
+            1 << exponent
+            for exponent in range(self.low.bit_length() - 1, self.high.bit_length())
+        ]
+
     def random(self) -> int:
         assert_integer_power_of_two(self.low)
         assert_integer_power_of_two(self.high)
@@ -228,7 +237,15 @@ class PowerOfTwoFragment(BaseIntegerFragment):
 
         assert_integer_power_of_two(self.high)
         assert_integer_power_of_two(self.low)
-        assert_integer_power_of_two(current)
+        choices = self._power_values()
+        if current not in choices:
+            insertion = bisect_left(choices, current)
+            return cast(
+                "list[object]",
+                choices[
+                    max(0, insertion - radius) : min(len(choices), insertion + radius)
+                ],
+            )
 
         cur_exp = current.bit_length() - 1
         low_exp = self.low.bit_length() - 1
@@ -238,9 +255,22 @@ class PowerOfTwoFragment(BaseIntegerFragment):
         return [2**e for e in range(lower, upper + 1) if e != cur_exp]
 
     def differential_mutation(self, a: object, b: object, c: object) -> int:
-        ai = assert_integer_power_of_two(a)
         assert isinstance(b, int)
         assert isinstance(c, int)
+        if type(a) is not int or a <= 0:
+            raise TypeError(f"Expected positive int, got {a!r}")
+        choices = self._power_values()
+        if a not in choices:
+            insertion = bisect_left(choices, a)
+            lower = choices[max(0, insertion - 1)]
+            upper = choices[min(len(choices) - 1, insertion)]
+            if b < c:
+                return lower
+            if b > c:
+                return upper
+            return min((lower, upper), key=lambda value: (abs(value - a), value))
+
+        ai = assert_integer_power_of_two(a)
         # TODO(jansel): should we take more than one step at a time?
         # the logic of *2 or //2 is we are dealing with rather small ranges and overflows are likely
         if b < c:
@@ -265,9 +295,7 @@ class PowerOfTwoFragment(BaseIntegerFragment):
         return self.high.bit_length() - self.low.bit_length() + 1
 
     def search_values(self, limit: int = 100) -> list[object] | None:
-        values = [
-            1 << e for e in range(self.low.bit_length() - 1, self.high.bit_length())
-        ]
+        values = self._power_values()
         if len(values) > limit:
             return None
         return list(values)
