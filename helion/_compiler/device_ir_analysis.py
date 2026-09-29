@@ -309,8 +309,10 @@ def _subscript_chain_is_affine(env: CompileEnvironment, subscript: object) -> bo
             node = args[0]
         elif target in (torch.ops.aten.add.Tensor, torch.ops.aten.mul.Tensor):
             operands = [arg for arg in args if isinstance(arg, torch.fx.Node)]
-            if len(args) != 2 or len(operands) != 1 or not any(
-                type(arg) is int for arg in args
+            if (
+                len(args) != 2
+                or len(operands) != 1
+                or not any(type(arg) is int for arg in args)
             ):
                 return False
             node = operands[0]
@@ -1709,6 +1711,7 @@ class DeviceIRAnalysis:
         """Record allocation-coordinate accesses used for cross-root scheduling."""
         from ..language import memory_ops
         from ..language.atomic_ops import ATOMIC_OPS
+        from .distributed_ll import TILE_ACCESS_KEY_META
         from .tile_dependency import CoordinateDomain
         from .tile_dependency import CoordinateRelation
         from .tile_dependency import TileAccess
@@ -1746,6 +1749,10 @@ class DeviceIRAnalysis:
                 is_atomic = node.target in ATOMIC_OPS
                 if not (is_load or is_store or is_atomic):
                     continue
+                node.meta[TILE_ACCESS_KEY_META] = (
+                    graph_analysis.graph_id,
+                    graph_node_index,
+                )
 
                 fake = _accessed_tensor_fake(node)
                 origin = (
@@ -1864,7 +1871,10 @@ class DeviceIRAnalysis:
                             if exact
                             else (None, 1)
                             for position, point, exact in zip(
-                                subscript_dims, scalar_points, affine_chains, strict=True
+                                subscript_dims,
+                                scalar_points,
+                                affine_chains,
+                                strict=True,
                             )
                         )
                         subscript_affine_block_ids = tuple(
@@ -1880,7 +1890,10 @@ class DeviceIRAnalysis:
                             if exact
                             else None
                             for position, point, exact in zip(
-                                subscript_dims, scalar_points, affine_chains, strict=True
+                                subscript_dims,
+                                scalar_points,
+                                affine_chains,
+                                strict=True,
                             )
                         )
                         subscript_is_scalar = tuple(

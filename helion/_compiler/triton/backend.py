@@ -582,7 +582,9 @@ class TritonBackend(Backend):
                     f"_remote_barrier_process_group_name={process_group_name!r}",
                 ]
             )
-        if device_fn.triton_distributed_readiness_signal_slots:
+        readiness_slots = device_fn.triton_distributed_readiness_signal_slots
+        ll_mailbox_words = device_fn.triton_distributed_ll_mailbox_words
+        if readiness_slots or ll_mailbox_words:
             device_anchor = device_fn.triton_distributed_readiness_device_anchor
             world_size = device_fn.triton_distributed_readiness_world_size
             process_group_name = CompileEnvironment.current().process_group_name
@@ -599,14 +601,13 @@ class TritonBackend(Backend):
             out.extend(
                 [
                     f"_distributed_readiness_device_anchor={device_anchor}",
-                    (
-                        "_distributed_readiness_signal_slots="
-                        f"{device_fn.triton_distributed_readiness_signal_slots}"
-                    ),
+                    f"_distributed_readiness_signal_slots={readiness_slots}",
                     f"_distributed_readiness_world_size={world_size}",
                     f"_distributed_readiness_process_group_name={process_group_name!r}",
                 ]
             )
+            if ll_mailbox_words:
+                out.append(f"_distributed_ll_mailbox_words={ll_mailbox_words}")
         if device_fn.triton_remote_copy_scratch_specs:
             specs = ", ".join(
                 f"({tensor}, {numel})"

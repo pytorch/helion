@@ -173,6 +173,7 @@ def default_launcher(
     _distributed_readiness_signal_slots: int = 0,
     _distributed_readiness_world_size: int = 0,
     _distributed_readiness_process_group_name: str | None = None,
+    _distributed_ll_mailbox_words: int = 0,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
     _minimum_resident_programs: int = 0,
@@ -213,7 +214,7 @@ def default_launcher(
         )
         args = (*args, signal)
     distributed_launch_fingerprint: str | None = None
-    if _distributed_readiness_signal_slots:
+    if _distributed_readiness_signal_slots or _distributed_ll_mailbox_words:
         if (
             _distributed_readiness_device_anchor is None
             or _distributed_readiness_process_group_name is None
@@ -240,7 +241,11 @@ def default_launcher(
                 math.prod(grid) * _remote_barrier_signal_slots_per_program
             ),
             readiness_slots=_distributed_readiness_signal_slots,
+            ll_mailbox_words=_distributed_ll_mailbox_words,
         )
+    if _distributed_readiness_signal_slots:
+        assert _distributed_readiness_device_anchor is not None
+        assert _distributed_readiness_process_group_name is not None
         signal, signal_ptrs, signal_offset = _get_distributed_readiness_signal(
             triton_kernel,
             _distributed_readiness_device_anchor,
@@ -250,6 +255,18 @@ def default_launcher(
             launch_fingerprint=distributed_launch_fingerprint,
         )
         args = (*args, signal, signal_ptrs, signal_offset)
+    if _distributed_ll_mailbox_words:
+        assert _distributed_readiness_device_anchor is not None
+        assert _distributed_readiness_process_group_name is not None
+        mailbox, mailbox_ptrs, rank = _get_distributed_ll_mailbox(
+            triton_kernel,
+            _distributed_readiness_device_anchor,
+            _distributed_readiness_process_group_name,
+            _distributed_ll_mailbox_words,
+            expected_world_size=_distributed_readiness_world_size,
+            launch_fingerprint=distributed_launch_fingerprint,
+        )
+        args = (*args, mailbox, mailbox_ptrs, rank)
     for slot, (scratch_like, numel_per_program) in enumerate(
         _remote_copy_scratch_specs
     ):
@@ -330,6 +347,7 @@ def _distributed_launch_fingerprint(
     remote_copy_slots: int = 0,
     remote_barrier_slots: int = 0,
     readiness_slots: int = 0,
+    ll_mailbox_words: int = 0,
 ) -> str:
     """Fingerprint the compiled schedule while ignoring dynamic tensor extents."""
 
@@ -379,6 +397,7 @@ def _distributed_launch_fingerprint(
         remote_copy_slots,
         remote_barrier_slots,
         readiness_slots,
+        ll_mailbox_words,
     )
     return hashlib.sha256(repr(payload).encode()).hexdigest()
 
@@ -456,6 +475,91 @@ def _get_remote_barrier_signal(
     return signal_pad.narrow(0, capacity - required_slots, required_slots)
 
 
+def _symmetric_pool_device(device: torch.device) -> torch.device:
+    """Return the device spelling that PyTorch's symmetric pool already uses."""
+    import torch.distributed._symmetric_memory as symm_mem
+
+    # PyTorch currently keys its symmetric pool by the spelling originally
+    # passed to symm_mem.empty (for example ``cuda`` versus ``cuda:0``), while
+    # NVSHMEM's process-global team manager requires that spelling to remain
+    # stable. Reuse the established spelling for this physical device.
+    for pool_device in getattr(symm_mem, "_symm_mem_pools", {}):
+        candidate = torch.device(pool_device)
+        candidate_index = (
+            torch.cuda.current_device() if candidate.index is None else candidate.index
+        )
+        if candidate.type == device.type and candidate_index == device.index:
+            return candidate
+    return device
+
+
+def _get_distributed_ll_mailbox(
+    triton_kernel: object,
+    dst: torch.Tensor,
+    process_group_name: str,
+    words: int,
+    *,
+    expected_world_size: int,
+    launch_fingerprint: str | None,
+) -> tuple[torch.Tensor, int, int]:
+    """Return this rank's LL mailbox, the peer mailbox pointer table, and rank.
+
+    First use is an SPMD collective, like distributed readiness state.
+    """
+    if dst.device.type != "cuda" or torch.version.hip is not None:
+        raise RuntimeError("compiler-derived LL readiness requires NVIDIA CUDA")
+    import torch.distributed as dist
+    import torch.distributed._symmetric_memory as symm_mem
+    import torch.distributed.distributed_c10d as c10d
+
+    group = c10d._resolve_process_group(
+        process_group_name  # pyrefly: ignore[bad-argument-type]
+    )
+    actual_world_size = dist.get_world_size(group)
+    if actual_world_size != expected_world_size:
+        raise RuntimeError(
+            f"LL readiness was compiled for world size {expected_world_size}, "
+            f"but process group {process_group_name!r} has {actual_world_size}"
+        )
+    cache = vars(triton_kernel).setdefault("_helion_distributed_ll_mailbox_cache", {})
+    stream = torch.cuda.current_stream(dst.device)
+    key = (
+        dst.device,
+        process_group_name,
+        id(group),
+        launch_fingerprint,
+        words,
+        stream.cuda_stream,
+    )
+    entry = cache.get(key)
+    if entry is None:
+        with torch.cuda.device(dst.device):
+            mailbox = symm_mem.empty(
+                words, dtype=torch.uint64, device=_symmetric_pool_device(dst.device)
+            )
+            handle = symm_mem.rendezvous(
+                mailbox,
+                group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+            )
+            # Kernels address peers by buffer base, so the mailbox must start there.
+            if handle.buffer_ptrs[handle.rank] != mailbox.data_ptr():
+                raise RuntimeError("LL mailbox is not at its symmetric buffer base")
+            mailbox.zero_()
+            # Complete initialization before any peer may push into this mailbox.
+            stream.synchronize()
+            fingerprints: list[str | None] = [None] * actual_world_size
+            dist.all_gather_object(fingerprints, launch_fingerprint, group=group)
+        if fingerprints != fingerprints[:1] * len(fingerprints):
+            raise RuntimeError(
+                "LL readiness requires identical kernel schedules and launch "
+                f"geometry on every rank; got {fingerprints!r}"
+            )
+        entry = (group, mailbox, handle)
+        cache[key] = entry
+    _group, mailbox, handle = entry
+    return mailbox, handle.buffer_ptrs_dev, handle.rank
+
+
 def _get_distributed_readiness_signal(
     triton_kernel: object,
     dst: torch.Tensor,
@@ -507,25 +611,9 @@ def _get_distributed_readiness_signal(
         return signal_pad, handle.signal_pad_ptrs_dev, offset
 
     with torch.cuda.device(dst.device):
-        allocation_device = dst.device
-        # PyTorch currently keys its symmetric pool by the spelling originally
-        # passed to symm_mem.empty (for example ``cuda`` versus ``cuda:0``), while
-        # NVSHMEM's process-global team manager requires that spelling to remain
-        # stable. Reuse the established spelling for this physical device.
-        for pool_device in getattr(symm_mem, "_symm_mem_pools", {}):
-            candidate = torch.device(pool_device)
-            candidate_index = (
-                torch.cuda.current_device()
-                if candidate.index is None
-                else candidate.index
-            )
-            if (
-                candidate.type == dst.device.type
-                and candidate_index == dst.device.index
-            ):
-                allocation_device = candidate
-                break
-        workspace = symm_mem.empty(1, dtype=torch.uint8, device=allocation_device)
+        workspace = symm_mem.empty(
+            1, dtype=torch.uint8, device=_symmetric_pool_device(dst.device)
+        )
         handle = symm_mem.rendezvous(
             workspace,
             group=process_group_name,  # pyrefly: ignore[bad-argument-type]

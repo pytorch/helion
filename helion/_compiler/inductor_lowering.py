@@ -6,6 +6,7 @@ import dataclasses
 import functools
 from operator import getitem
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import ContextManager
 from typing import NamedTuple
 from typing import cast
@@ -57,6 +58,7 @@ from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
 from .node_masking import mask_node_inputs
+from .triton.distributed_ll import flush_ll_polls
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -1500,7 +1502,13 @@ class GraphInterpreter(LoweringContext, Interpreter):
         if isinstance(self.cg, GenerateAST) and self.cg._track_statement_owners:
             self.cg.record_codegen_result(node, result)
 
+    def run(self, *args: object, **kwargs: Any) -> Any:  # noqa: ANN401
+        result = super().run(*args, **kwargs)
+        flush_ll_polls(self.cg, self.graph)
+        return result
+
     def run_node(self, n: Node) -> object:
+        flush_ll_polls(self.cg, self.graph, user=n)
         if n.op == "call_function":
             with (
                 self.cg.statement_owner_node(n),

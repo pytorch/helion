@@ -418,6 +418,9 @@ class _Settings:
     distributed: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED", False)
     )
+    distributed_ll: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED_LL", True)
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_log_details: bool = dataclasses.field(
@@ -667,6 +670,11 @@ class Settings(_Settings):
             "limits, and process-group resolution). Normally auto-detected from symmetric-memory "
             "tensor arguments; set this for distributed kernels whose symmetric memory is not passed "
             "as a detectable tensor. Set HELION_DISTRIBUTED=1 to force globally."
+        ),
+        "distributed_ll": (
+            "Carry cross-rank tile readiness in-band (epoch-tagged mailbox words) for "
+            "eligible symmetric allocations under cross_loop_pipeline='dynamic' instead of "
+            "readiness counters. Set HELION_DISTRIBUTED_LL=0 to always use counters."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "

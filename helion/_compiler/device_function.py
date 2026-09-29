@@ -52,10 +52,12 @@ from .variable_origin import TileBeginOrigin
 if TYPE_CHECKING:
     from ..runtime.config import Config
     from .device_ir import HelperFunctionGraphInfo
+    from .distributed_ll import DistributedLLPlan
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
     from .tile_dispatch import TileStrategyDispatch
+    from .triton.distributed_ll import LLPendingPoll
     from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
@@ -396,6 +398,17 @@ class DeviceFunction:
         self.triton_distributed_readiness_device_anchor: str | None = None
         self.triton_distributed_readiness_signal_slots = 0
         self.triton_distributed_readiness_world_size: int | None = None
+        # In-band (LL) readiness: a symmetric mailbox appended by the launcher
+        # after the readiness signal arguments (local tensor, peer table, rank).
+        self.distributed_ll_plan: DistributedLLPlan | None = None
+        self.distributed_ll_emitted: set[tuple[str, tuple[int, int]]] = set()
+        self.triton_distributed_ll_mailbox_arg: str | None = None
+        self.triton_distributed_ll_mailbox_ptrs_arg: str | None = None
+        self.triton_distributed_ll_rank_arg: str | None = None
+        self.triton_distributed_ll_tag_var: str | None = None
+        self.triton_distributed_ll_parity_var: str | None = None
+        self.triton_distributed_ll_mailbox_words = 0
+        self.distributed_ll_pending_polls: list[LLPendingPoll] = []
         # NVSHMEM takes pointer sources. Computed Triton tiles are materialized
         # into compiler-owned global scratch before the transfer starts.
         self.triton_remote_copy_scratch_args: list[str] = []
@@ -1106,6 +1119,16 @@ class DeviceFunction:
             remote_copy_params.add(self.triton_distributed_readiness_signal_arg)
         if self.triton_distributed_readiness_signal_offset_arg is not None:
             remote_copy_params.add(self.triton_distributed_readiness_signal_offset_arg)
+        ll_args = [
+            name
+            for name in (
+                self.triton_distributed_ll_mailbox_arg,
+                self.triton_distributed_ll_mailbox_ptrs_arg,
+                self.triton_distributed_ll_rank_arg,
+            )
+            if name is not None
+        ]
+        remote_copy_params.update(ll_args)
         wrapper_only_params = [
             name for name in self.wrapper_only_params if name not in remote_copy_params
         ]
@@ -1123,6 +1146,7 @@ class DeviceFunction:
             wrapper_only_params.append(
                 self.triton_distributed_readiness_signal_offset_arg
             )
+        wrapper_only_params.extend(ll_args)
         wrapper_only_params.extend(self.triton_remote_copy_scratch_args)
         wrapper_only_params.extend(self.triton_persistent_state_args)
         args.extend(create_arg(name) for name in wrapper_only_params)

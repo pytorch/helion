@@ -38,6 +38,7 @@ from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
 from .tile_strategy import ForiLoopState
+from .triton.distributed_ll import register_distributed_ll
 from .variable_origin import ArgumentOrigin
 
 if TYPE_CHECKING:
@@ -1757,6 +1758,7 @@ def generate_ast(
                 config=config,
                 tile_strategy=codegen.device_function.tile_strategy,
             )
+            register_distributed_ll(codegen.device_function, func.device_ir, config)
 
             # Emit the worklist builder + record its offset params BEFORE the host
             # body is visited (the launcher call -- which reads the offset params

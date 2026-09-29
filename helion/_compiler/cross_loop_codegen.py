@@ -25,6 +25,7 @@ from .cross_loop_scheduler import build_static_pipeline_plan
 from .cross_loop_scheduler import nested_wait_placement
 from .device_function import TensorArg
 from .device_function import TensorDescriptorArg
+from .distributed_ll import without_ll_dependencies
 from .host_function import HostFunction
 from .program_id import _clone_ast_value
 from .program_id import _clone_stmt
@@ -664,6 +665,21 @@ def _has_opaque_distributed_protocol(device_ir: object) -> bool:
     )
 
 
+def _ll_epoch_statements(
+    device_function: DeviceFunction, epoch_var: str
+) -> list[ast.stmt]:
+    """Define the LL mailbox tag and parity from this launch's epoch."""
+    tag = device_function.triton_distributed_ll_tag_var
+    parity = device_function.triton_distributed_ll_parity_var
+    assert tag is not None and parity is not None
+    return [
+        statement_from_string(
+            f"{tag} = tl.cast(tl.cast({epoch_var}, tl.uint32), tl.uint64)"
+        ),
+        statement_from_string(f"{parity} = tl.cast({epoch_var} & 1, tl.int32)"),
+    ]
+
+
 def _has_compiler_distributed_dependency(device_ir: DeviceIR) -> bool:
     """Return whether the memory DAG contains a true cross-rank obligation."""
     dependency_graph = device_ir.tile_dependency_graph
@@ -738,8 +754,22 @@ def emit_cross_loop_schedule(
         for root, body in enumerate(case_bodies)
         if _triton_root_requires_kernel_scope(body, target_device_capability)
     )
-    dependency_graph = device_ir.tile_dependency_graph
-    assert dependency_graph is not None
+    assert device_ir.tile_dependency_graph is not None
+    ll_plan = device_function.distributed_ll_plan
+    dependency_graph = without_ll_dependencies(device_ir.tile_dependency_graph, ll_plan)
+    if ll_plan is not None:
+        if pipeline != "dynamic":
+            raise AssertionError("distributed LL requires dynamic dispatch")
+        expected = {("store", key) for key in ll_plan.stores} | {
+            ("load", key) for key in ll_plan.loads
+        }
+        if (
+            device_function.distributed_ll_emitted != expected
+            or device_function.distributed_ll_pending_polls
+        ):
+            raise exc.InvalidConfig(
+                "distributed LL lowering did not reach every planned memory op"
+            )
     indexing = device_function.config.get("indexing", ())
 
     def uses_tensor_descriptor(memory_op_index: int) -> bool:
@@ -812,7 +842,13 @@ def emit_cross_loop_schedule(
         site_domains=site_domains,
         worker_count=configured_worker_count,
         publishable_site_ids=publishable_site_ids,
-        continuation_ineligible_roots=kernel_scope_roots,
+        # An LL consumer polls peers, so it must hold a dispatch ticket that
+        # follows every producer ticket rather than run inside a producer.
+        continuation_ineligible_roots=(
+            kernel_scope_roots
+            if ll_plan is None
+            else kernel_scope_roots | ll_plan.consumer_roots
+        ),
         prove_nonnegative=CompileEnvironment.current().known_nonnegative,
         cross_loop_dispatch_mode=cast("CrossLoopDispatchMode", pipeline),
     )
@@ -849,10 +885,17 @@ def emit_cross_loop_schedule(
         next(iter(distributed_world_sizes)) if distributed_world_sizes else None
     )
     distributed_device_anchor = _cross_loop_state_device_anchor(device_function)
-    if distributed_counter_plans and distributed_device_anchor is None:
+    if (distributed_counter_plans or ll_plan is not None) and (
+        distributed_device_anchor is None
+    ):
         raise exc.InvalidConfig(
             "distributed readiness requires a tensor argument as a device anchor"
         )
+    if ll_plan is not None:
+        device_function.triton_distributed_readiness_device_anchor = (
+            distributed_device_anchor
+        )
+        device_function.triton_distributed_readiness_world_size = ll_plan.world_size
     root_barrier_edges = static_pipeline_plan.root_barrier_edges
     nested_loop_counter_plans = tuple(
         plan
@@ -1034,6 +1077,8 @@ def emit_cross_loop_schedule(
                 f"{'tl.uint64' if distributed_counter_plans else 'tl.uint32'})"
             ),
         ]
+    if ll_plan is not None:
+        result.extend(_ll_epoch_statements(device_function, epoch_var))
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
         consumer: tuple(
             sorted(

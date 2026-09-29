@@ -18,6 +18,11 @@ from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import store
 from ..ast_extension import statement_from_string
+from ..distributed_ll import TILE_ACCESS_KEY_META
+from .distributed_ll import codegen_ll_poll
+from .distributed_ll import codegen_ll_push
+from .distributed_ll import ll_load_source
+from .distributed_ll import ll_store_allocation
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -64,6 +69,15 @@ def _(state: CodegenState) -> ast.AST:
             modifiers = state.config.store_cache_modifiers
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
+
+        ll_allocation = ll_store_allocation(state)
+        if ll_allocation is not None:
+            value = codegen_ll_push(
+                state, tensor, [*subscript], value, extra_mask, ll_allocation
+            )
+            device_fn.distributed_ll_emitted.add(
+                ("store", fx_node.meta[TILE_ACCESS_KEY_META])
+            )
 
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
@@ -161,6 +175,17 @@ def _(state: CodegenState) -> ast.AST:
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
+
+        ll_source = ll_load_source(state)
+        if ll_source is not None:
+            assert state.fx_node is not None
+            device_fn.distributed_ll_emitted.add(
+                ("load", state.fx_node.meta[TILE_ACCESS_KEY_META])
+            )
+            allocation, source_rank = ll_source
+            return codegen_ll_poll(
+                state, tensor, [*subscript], extra_mask, allocation, source_rank
+            )
 
         if state.codegen.load_transform is not None:
             return state.codegen.load_transform(
