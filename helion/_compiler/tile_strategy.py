@@ -81,6 +81,42 @@ def _lane_loop_iter(extent: int) -> ast.AST:
 
 
 def _static_lane_loop_extent(loop: ast.For) -> int | None:
+    """Trip count of a synthetic lane loop, or ``None`` for any other loop.
+
+    Recognizes the ascending ``range(N)`` form and the descending
+    ``range(N - 1, -1, -1)`` form produced by :func:`_reverse_lane_loop_iter`
+    for reverse scans; both visit the same ``N`` lanes.
+    """
+    iterator = loop.iter
+    if not isinstance(iterator, ast.Call) or iterator.keywords:
+        return None
+    function = ast.unparse(iterator.func)
+    if function not in ("range", "cutlass.range_constexpr"):
+        return None
+    args = iterator.args
+    if not all(
+        isinstance(arg, ast.Constant) and isinstance(arg.value, int) for arg in args
+    ):
+        return None
+    values = [cast("int", cast("ast.Constant", arg).value) for arg in args]
+    if len(values) == 1:
+        extent = values[0]
+    elif len(values) == 3 and values[1] == -1 and values[2] == -1:
+        extent = values[0] + 1
+    else:
+        return None
+    if extent <= 1:
+        return None
+    return extent
+
+
+def _ascending_lane_loop_form(loop: ast.For) -> tuple[str, int] | None:
+    """``(range function, extent)`` of a plain ascending synthetic lane loop.
+
+    Matches ``range(N)`` / ``cutlass.range_constexpr(N)`` with a literal
+    ``N >= 1``; anything else (already reversed, keyword arguments, dynamic
+    bounds) yields ``None``.
+    """
     iterator = loop.iter
     if (
         not isinstance(iterator, ast.Call)
@@ -94,10 +130,37 @@ def _static_lane_loop_extent(loop: ast.For) -> int | None:
         function not in ("range", "cutlass.range_constexpr")
         or not isinstance(extent, ast.Constant)
         or not isinstance(extent.value, int)
-        or extent.value <= 1
+        or extent.value < 1
     ):
         return None
-    return extent.value
+    return function, extent.value
+
+
+def _lane_loop_reversible(loop: ast.For) -> bool:
+    """Whether :func:`_reverse_lane_loop_iter` would succeed on ``loop``.
+
+    A pure check: callers use it to decide *before* mutating anything.
+    """
+    return _ascending_lane_loop_form(loop) is not None
+
+
+def _reverse_lane_loop_iter(loop: ast.For) -> bool:
+    """Rewrite an ascending lane loop to visit its lanes in descending order.
+
+    ``range(N)`` / ``cutlass.range_constexpr(N)`` become the ``(N - 1, -1, -1)``
+    forms.  Lane bodies are order-independent except for a reverse
+    ``hl.associative_scan`` carried across the lanes, which requests this.
+    Returns ``False`` (leaving the loop untouched) when the iterator is not the
+    plain ascending form, e.g. because it was already reversed.
+    """
+    form = _ascending_lane_loop_form(loop)
+    if form is None:
+        return False
+    function, extent = form
+    reversed_iter = expr_from_string(f"{function}({extent - 1}, -1, -1)")
+    assert isinstance(reversed_iter, ast.expr)
+    loop.iter = reversed_iter
+    return True
 
 
 def _create_lane_loop(lane_var: str, extent: int, body: list[ast.AST]) -> ast.For:
@@ -111,6 +174,29 @@ def _create_lane_loop(lane_var: str, extent: int, body: list[ast.AST]) -> ast.Fo
     )
     setattr(loop, HELION_LANE_LOOP_VAR_ATTR, lane_var)
     return loop
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteLaneAxis:
+    """How a CuTe per-thread strategy distributes one block axis of a tile.
+
+    ``threads`` CUDA threads split the ``extent`` elements of the axis; each
+    thread walks its remaining elements in ``lane_steps`` iterations of the
+    ``lane_var`` lane loop, optionally as ``vec_width``-wide vectors whose
+    elements the constexpr ``vec_lane_var`` loop (``vloop``) enumerates.
+    ``strided`` lane steps are ``threads``-wide chunks of consecutive elements
+    (``index = thread + step * threads``); blocked steps give every thread one
+    contiguous slice.  Returned by the strategies' ``cute_lane_axis`` so
+    consumers such as the scan lowering need not read strategy internals.
+    """
+
+    extent: int
+    threads: int
+    lane_var: str | None
+    lane_steps: int
+    vec_lane_var: str | None
+    vec_width: int
+    strided: bool
 
 
 def _clone_lane_loop_with_body(loop: ast.For, body: list[ast.AST]) -> ast.For:
@@ -4919,6 +5005,11 @@ class DeviceGridState(DeviceLoopOrGridState):
     deferred_vector_ops: list[tuple[ast.For, ast.AST, Callable[[], ast.AST | None]]] = (
         dataclasses.field(default_factory=list)
     )
+    # Lane vars whose loops must visit lanes in descending order because a
+    # reverse ``hl.associative_scan`` carries its suffix across them (see
+    # ``cute/scan_ops.py``).  Applied when ``wrap_body`` materializes the
+    # loops; never names a lane with a ``vec_lane_wrappers`` entry.
+    reversed_lane_vars: set[str] = dataclasses.field(default_factory=set)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -5082,6 +5173,14 @@ class DeviceGridState(DeviceLoopOrGridState):
                 ):
                     continue
                 wrapper.vloop.body = wrapped  # type: ignore[assignment]
+                if lane_var in self.reversed_lane_vars:
+                    # The vector store protocol appends the V results of the
+                    # constexpr vector loop in iteration order, so this
+                    # partition cannot run backwards; the scan declines such
+                    # shapes before requesting a reversal.
+                    raise exc.BackendUnsupported(
+                        "cute", "reverse scan over a vectorised lane loop"
+                    )
                 wrapped = (
                     list(wrapper.outer_for.body)
                     if wrapper.elide_outer_loop
@@ -5090,7 +5189,14 @@ class DeviceGridState(DeviceLoopOrGridState):
                 continue
             if lane_var not in needed:
                 continue
-            wrapped = [_create_lane_loop(lane_var, extent, wrapped)]
+            lane_loop = _create_lane_loop(lane_var, extent, wrapped)
+            if lane_var in self.reversed_lane_vars and not _reverse_lane_loop_iter(
+                lane_loop
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "reverse scan lane loop is not reversible"
+                )
+            wrapped = [lane_loop]
         return wrapped
 
 
@@ -7252,6 +7358,68 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return thread_extent
         return self._configured_block_size_int(thread_extent)
 
+    def cute_tile_base_expr(self, block_id: int) -> str | None:
+        """Uniform expression of the tile's first index along ``block_id``.
+
+        The per-element index is ``base + <thread / lane partition>``, so
+        ``index - base`` is the block-local position of the current element.
+        """
+        if self.mma_mode or block_id not in self.block_ids:
+            return None
+        return self.offset_var(block_id)
+
+    def cute_lane_axis(self, block_id: int) -> CuteLaneAxis | None:
+        """Static thread / lane distribution of ``block_id``, or ``None``.
+
+        ``None`` when the axis has no plain per-thread partition: MMA mode, an
+        inactive or cluster-split block, a dynamic extent, or a thread count
+        that does not tile the extent exactly.
+        """
+        if (
+            self.mma_mode
+            or block_id not in self.block_ids
+            or block_id in self.inactive_block_ids
+            or block_id in self._cute_cluster_by_block
+        ):
+            return None
+        block_size = self.block_size[self.block_ids.index(block_id)]
+        extent = self._configured_block_size_int(block_size)
+        threads = self._static_thread_extent_for_block(block_id, block_size)
+        if extent is None or threads is None or threads <= 0:
+            return None
+        elements_per_thread = self._elements_per_thread_for_block(block_id)
+        if threads * elements_per_thread != extent:
+            return None
+        lane_var = self._lane_var_by_block.get(block_id)
+        vec_lane_var = self._cute_vec_lane_var_by_block.get(block_id)
+        vec_width = (
+            self._cute_lane_vec_width_by_block.get(block_id, 1)
+            if vec_lane_var is not None
+            else 1
+        )
+        if lane_var is None:
+            if elements_per_thread != 1:
+                return None
+            lane_steps = 1
+        elif elements_per_thread % vec_width:
+            return None
+        else:
+            lane_steps = elements_per_thread // vec_width
+        return CuteLaneAxis(
+            extent=extent,
+            threads=threads,
+            lane_var=lane_var,
+            lane_steps=lane_steps,
+            vec_lane_var=vec_lane_var,
+            vec_width=vec_width,
+            strided=(
+                lane_var is not None
+                and threads > 1
+                and self._cute_lane_layout_by_block.get(block_id, "blocked")
+                == "strided"
+            ),
+        )
+
     def thread_block_sizes(self) -> list[int]:
         sizes: list[int] = []
         block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
@@ -7884,6 +8052,9 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         # which ``_cute_vector_load_ctx`` gates per tensor.
         self._cute_lane_layout: str = "blocked"
         self._cute_flat_multi: bool = len(block_ids) > 1
+        # ``pid * BLOCK`` of the lane-looped grid: the flattened index var
+        # aliases its offset var, so the tile base is recorded separately.
+        self._cute_tile_base_expr: str | None = None
         self._cute_lane_vec_width_by_block: dict[int, int] = {}
         self._cute_vec_lane_var_by_block: dict[int, str] = {}
         self._cute_lane_base_index_var_by_block: dict[int, str] = {}
@@ -7951,6 +8122,59 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
                 ),
             )
         return self._num_threads
+
+    def cute_tile_base_expr(self, block_id: int) -> str | None:
+        """Uniform ``pid * BLOCK`` of a single lane-looped flattened block.
+
+        ``offset_var`` is the per-element index here (``indices = offsets``),
+        so the tile base is recorded by ``codegen_grid`` instead.  ``None``
+        for the multi-block form and for grids without a lane loop.
+        """
+        if self.block_ids != [block_id]:
+            return None
+        return self._cute_tile_base_expr
+
+    def cute_lane_axis(self, block_id: int) -> CuteLaneAxis | None:
+        """Static thread / lane distribution of a single flattened block.
+
+        A flattened multi-block tile walks one merged index whose lanes do not
+        follow any single block axis, so only the one-block form qualifies.
+        """
+        if self.block_ids != [block_id] or not isinstance(self.block_size, int):
+            return None
+        extent = self.block_size
+        threads = self._num_threads if self._num_threads > 0 else extent
+        elements_per_thread = self._elements_per_thread
+        if threads <= 0 or threads * elements_per_thread != extent:
+            return None
+        lane_var = self._lane_var
+        vec_lane_var = self._cute_vec_lane_var_by_block.get(block_id)
+        vec_width = (
+            self._cute_lane_vec_width_by_block.get(block_id, 1)
+            if vec_lane_var is not None
+            else 1
+        )
+        if lane_var is None:
+            if elements_per_thread != 1:
+                return None
+            lane_steps = 1
+        elif elements_per_thread % vec_width:
+            return None
+        else:
+            lane_steps = elements_per_thread // vec_width
+        return CuteLaneAxis(
+            extent=extent,
+            threads=threads,
+            lane_var=lane_var,
+            lane_steps=lane_steps,
+            vec_lane_var=vec_lane_var,
+            vec_width=vec_width,
+            strided=(
+                lane_var is not None
+                and threads > 1
+                and self._cute_lane_layout == "strided"
+            ),
+        )
 
     def thread_block_sizes(self) -> list[int]:
         if not self._uses_thread_axis():
@@ -8104,6 +8328,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             )
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
+        self._cute_tile_base_expr = f"({pid_var}) * ({block_size_var})"
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
