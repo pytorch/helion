@@ -756,6 +756,86 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             self.assertIn("tl.atomic_cas", code)
 
     @onlyBackends("triton")
+    @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    def test_release_acquire_atomics_sync_program(self):
+        """Release and acquire atomics order every thread of the program, not only the issuing one."""
+        config = helion.Config(block_sizes=[128], num_warps=4)
+
+        @helion.kernel(config=config, static_shapes=True)
+        def release_unused(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                hl.atomic_add(count, [0], 1, sem="release")
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def acq_rel_unused(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                hl.atomic_add(count, [0], 1, sem="acq_rel")
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def acq_rel_used(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                arrived = hl.atomic_add(count, [0], 1, sem="acq_rel")
+                if arrived == 3:
+                    done[0] = 1
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def cas_acquire_unused(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                hl.atomic_cas(done, [0], 0, 1, sem="acquire")
+                hl.atomic_add(count, [0], 1, sem="relaxed")
+                out[tile] = x[tile] * 2.0
+            return out
+
+        @helion.kernel(config=config, static_shapes=True)
+        def relaxed(
+            out: torch.Tensor, x: torch.Tensor, count: torch.Tensor, done: torch.Tensor
+        ) -> torch.Tensor:
+            for tile in hl.tile(x.size(0)):
+                out[tile] = x[tile] * 2.0
+                hl.atomic_add(count, [0], 1, sem="relaxed")
+            return out
+
+        # kernel: (atomic call, barrier before it, barrier after it, final done)
+        cases = {
+            release_unused: ("tl.atomic_add(", True, False, 0),
+            acq_rel_unused: ("tl.atomic_add(", True, True, 0),
+            # Triton itself broadcasts a used scalar result behind a bar.sync.
+            acq_rel_used: ("tl.atomic_add(", True, False, 1),
+            cas_acquire_unused: ("tl.atomic_cas(", False, True, 1),
+            relaxed: ("tl.atomic_add(", False, False, 0),
+        }
+        x = torch.randn(512, device=DEVICE)
+        for kernel, (call, before, after, final_done) in cases.items():
+            out = torch.empty_like(x)
+            count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+            done = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+            code, result = code_and_output(kernel, (out, x, count, done))
+            torch.testing.assert_close(result, x * 2.0)
+            self.assertEqual(int(count.item()), 4)
+            self.assertEqual(int(done.item()), final_done)
+            atomic = code.index(call)
+            barrier = code.rfind("tl.debug_barrier()", 0, atomic)
+            if before:
+                self.assertGreater(barrier, code.rfind("tl.store(", 0, atomic))
+            else:
+                self.assertEqual(barrier, -1)
+            self.assertEqual(code.find("tl.debug_barrier()", atomic) != -1, after)
+
+    @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not support descriptor atomics")
     def test_atomic_td_fallbacks(self):
