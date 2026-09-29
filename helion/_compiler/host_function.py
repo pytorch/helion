@@ -367,7 +367,10 @@ class HostFunction:
     def set_local_types(self, local_types: dict[str, TypeInfo]) -> None:
         self.local_types = local_types
         for name, type_info in local_types.items():
-            type_info.populate_symbol_origins(NameOrigin(name, self))
+            # Locals leaked from an earlier root's device code are not host
+            # names; lifting their symbols would pass an undefined host arg.
+            if type_info.origin.is_host():
+                type_info.populate_symbol_origins(NameOrigin(name, self))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         env = CompileEnvironment.current()
