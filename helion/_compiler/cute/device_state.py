@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from .completed_matmul_sum import CompletedMatmulSum
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_flash_bwd import AttentionBwdMatch
+    from .cute_flash_gated import GatedAttentionMatch
+    from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .direct_affine_candidate import DirectAffineCandidate
@@ -800,6 +802,16 @@ class CuteDeviceFunctionState:
         # Launch block thread count for the flash path: 128 (single-warpgroup
         # Stage-3) or 256 (Stage-4 warp-spec, double-buffered-S overlap).
         self.attention_flash_threads: int = 128
+        # Set by the gated (softmax-free) attention detector: the matched
+        # kernel facts plus the config-selected KV tile / TMA ring depth.
+        self.attention_flash_gated_match: GatedAttentionPlan | None = None
+        # Config-independent gated match, probed once per device function
+        # (``attention_flash_gated_probed`` records that the probe ran).
+        self.attention_flash_gated_probe: GatedAttentionMatch | None = None
+        self.attention_flash_gated_probed: bool = False
+        # The fused body may run one CTA per (grid index, lane): the launch
+        # grid is the PID strategy's grid times this factor.
+        self.launch_grid_multiplier: int = 1
         # Set by the backward-attention detector (cute_flash_bwd.py): the
         # matched kernel facts and the inner Q-loop block ids.
         self.attention_flash_bwd_match: AttentionBwdMatch | None = None

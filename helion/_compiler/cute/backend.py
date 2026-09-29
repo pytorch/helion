@@ -612,7 +612,15 @@ def _detect_attention_mma_loop(
         return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
-        return False
+        # Softmax-free (gated) attention over jagged rows: same tcgen05 body
+        # family, selected by the same config envelope (128-row tiles).
+        from .cute_flash_gated import detect_gated_attention_loop
+
+        gated = detect_gated_attention_loop(fn, block_ids, config=config)
+        if gated is None:
+            return False
+        fn.cute_state.attention_flash_gated_match = gated
+        return True
     from ..host_function import HostFunction
 
     device_ir = HostFunction.current().device_ir

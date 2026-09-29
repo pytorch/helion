@@ -988,6 +988,81 @@ def _append_cute_wrapper_plan(
         if plan.get("epi_aux_tma"):
             call_args.extend(["_flash_tma_aux0", "_flash_mEpiAux0t"])
         return
+    if kind == "helion_flash_gated":
+        # Imported here: the gated module pulls in the compiler's device IR,
+        # which imports the runtime package this module belongs to.
+        from ..._compiler.cute.cute_flash_gated import GATED_KERNEL_PARAMS
+
+        # Fused tcgen05 gated attention over jagged rows: Q/K/V/O are rank-3
+        # ``[rows, D, lanes]`` (or ``[lanes, rows, D]``) host tensors. The TMA
+        # descriptors cover the whole tensor with its runtime row extent so the
+        # device body can ``domain_offset`` to any row base and partial tiles
+        # past the end are zero-filled. Layout literals come from the
+        # ``arg{i}_shape{d}`` / ``arg{i}_stride{d}`` wrapper bindings.
+        q_idx = plan_int("q_idx")
+        k_idx = plan_int("k_idx")
+        v_idx = plan_int("v_idx")
+        o_idx = plan_int("o_idx")
+        hd = plan_int("head_dim")
+        bn = plan_int("kv_tile")
+        bm = plan_int("q_tile", default=128)
+        kv_stage = plan_int("kv_stage")
+        dtype = str(plan.get("dtype", "cutlass.Float16"))
+        assert dtype in ("cutlass.Float16", "cutlass.BFloat16", "cutlass.Float32")
+        # fp32 tensors run the MMA as tf32 (Helion's default dot precision):
+        # the gmem tensors keep Float32, the smem layouts / MMA use TFloat32
+        # and the TMA descriptors recast via ``internal_type`` (same width).
+        mma_dtype = str(plan.get("mma_dtype", dtype))
+        tma_internal = (
+            ", internal_type=cutlass.TFloat32"
+            if mma_dtype == "cutlass.TFloat32"
+            else ""
+        )
+
+        def rows_layout(idx: int, key: str) -> str:
+            row_dim = plan_int(f"{key}_row_dim")
+            lane_dim = plan_int(f"{key}_lane_dim")
+            return (
+                f"cute.make_layout((arg{idx}_shape{row_dim}, {hd}, "
+                f"arg{idx}_shape{lane_dim}), stride=(arg{idx}_stride{row_dim}, 1, "
+                f"arg{idx}_stride{lane_dim}))"
+            )
+
+        def cols_layout(idx: int, key: str) -> str:
+            row_dim = plan_int(f"{key}_row_dim")
+            lane_dim = plan_int(f"{key}_lane_dim")
+            return (
+                f"cute.make_layout(({hd}, arg{idx}_shape{row_dim}, "
+                f"arg{idx}_shape{lane_dim}), stride=(1, arg{idx}_stride{row_dim}, "
+                f"arg{idx}_stride{lane_dim}))"
+            )
+
+        bw = "cutlass.utils.blackwell_helpers"
+        qkd = f"({bm}, {bn}, {hd})"
+        pvd = f"({bm}, {hd}, {bn})"
+        majk = "cute.nvgpu.OperandMajorMode.K"
+        cg1 = "cute.nvgpu.tcgen05.CtaGroup.ONE"
+        sel = "cute.select"
+        gated_lines = [
+            f"_flash_mQ = cute.make_tensor(arg{q_idx}.iterator, {rows_layout(q_idx, 'q')})",
+            f"_flash_mK = cute.make_tensor(arg{k_idx}.iterator, {rows_layout(k_idx, 'k')})",
+            f"_flash_mV = cute.make_tensor(arg{v_idx}.iterator, {cols_layout(v_idx, 'v')})",
+            f"_flash_mOt = cute.make_tensor(arg{o_idx}.iterator, {rows_layout(o_idx, 'o')})",
+            f"_flash_qk_mma = {bw}.make_trivial_tiled_mma({mma_dtype}, {mma_dtype}, {majk}, {majk}, cutlass.Float32, {cg1}, ({bm}, {bn}))",
+            f"_flash_pv_mma = {bw}.make_trivial_tiled_mma({mma_dtype}, {mma_dtype}, {majk}, cute.nvgpu.OperandMajorMode.MN, cutlass.Float32, {cg1}, ({bm}, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)",
+            "_flash_cluster_layout_vmnk = cute.tiled_divide(cute.make_layout((1, 1, 1)), (_flash_qk_mma.thr_id.shape,))",
+            f"_flash_qsl = {bw}.make_smem_layout_a(_flash_qk_mma, {qkd}, {mma_dtype}, 1)",
+            f"_flash_ksl = {bw}.make_smem_layout_b(_flash_qk_mma, {qkd}, {mma_dtype}, {kv_stage})",
+            f"_flash_vsl = {bw}.make_smem_layout_b(_flash_pv_mma, {pvd}, {mma_dtype}, {kv_stage})",
+            f"_flash_ptl = {bw}.make_smem_layout_a(_flash_pv_mma, {pvd}, {mma_dtype}, 1)",
+            f"_flash_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp({cg1})",
+            f"_flash_tma_q, _flash_mQt = cute.nvgpu.make_tiled_tma_atom_A(_flash_op, _flash_mQ, {sel}(_flash_qsl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+            f"_flash_tma_k, _flash_mKt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mK, {sel}(_flash_ksl, mode=[0, 1, 2]), {qkd}, _flash_qk_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+            f"_flash_tma_v, _flash_mVt = cute.nvgpu.make_tiled_tma_atom_B(_flash_op, _flash_mV, {sel}(_flash_vsl, mode=[0, 1, 2]), {pvd}, _flash_pv_mma, _flash_cluster_layout_vmnk.shape{tma_internal})",
+        ]
+        body.extend(f"    {line}" for line in gated_lines)
+        call_args.extend(GATED_KERNEL_PARAMS)
+        return
     if kind == "helion_flash_bwd" and plan.get("two_cta"):
         # 2-CTA cluster variant (FA4 SM100 backward layout): all M-widened
         # tiled_mmas are CtaGroup.TWO; Q/dO get separate natural- and

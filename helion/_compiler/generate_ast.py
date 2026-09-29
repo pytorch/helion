@@ -271,6 +271,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 in {
                     "helion_small_biased_attention",
                     "helion_flash",
+                    "helion_flash_gated",
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
@@ -477,6 +478,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         cute_state = self.device_function.cute_state
         cute_state.attention_flash_block_ids = None
         cute_state.attention_flash_score_plan = None
+        cute_state.attention_flash_gated_match = None
         cute_state.attention_flash_threads = 128
 
     def _try_codegen_attention_flash_root(self) -> bool:
@@ -493,6 +495,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             )
         if cute_state.attention_flash_block_ids is None:
             return False
+
+        if cute_state.attention_flash_gated_match is not None:
+            from .cute.cute_flash_gated import codegen_gated_attention_flash
+
+            if codegen_gated_attention_flash(self):
+                return True
+            self._clear_attention_flash_state()
+            raise exc.BackendUnsupported(
+                "cute", "gated attention failed late validation"
+            )
 
         from .cute.cute_flash import codegen_attention_flash
 

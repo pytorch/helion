@@ -3377,9 +3377,15 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # ordinary cute kernels.
             from .backend import detect_flash_search_surface
             from .cute.cute_flash_bwd import detect_flash_bwd_search_surface
+            from .cute.cute_flash_gated import detect_flash_gated_search_surface
 
             detect_flash_bwd_search_surface(device_ir)
             flash_shape = detect_flash_search_surface(device_ir)
+            gated_surface = (
+                None
+                if flash_shape is not None
+                else detect_flash_gated_search_surface(device_ir)
+            )
             if flash_shape is not None:
                 from ..language.matmul_ops import _cuda_num_sms_or_zero
 
@@ -3402,6 +3408,23 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     plain_row_body=flash_shape.plain_row_body,
                     device_sm_count=_cuda_num_sms_or_zero(
                         CompileEnvironment.current().device
+                    ),
+                )
+            elif gated_surface is not None:
+                # The fused gated body owns the whole root; tcgen05 matmul
+                # planning would add search fields that hide the gated knob.
+                config_spec.enable_cute_flash_gated_search(
+                    block_size_targets=gated_surface.block_size_targets,
+                    kv_block_id=gated_surface.kv_block_id,
+                    q_block_id=gated_surface.q_block_id,
+                    q_tile_choices=gated_surface.q_tile_choices,
+                    kv_tile_choices=gated_surface.kv_tile_choices,
+                    kv_stage_choices=gated_surface.kv_stage_choices,
+                    kv_stage_default=gated_surface.kv_stage_default,
+                    gate_warpgroup_choices=gated_surface.gate_warpgroup_choices,
+                    gate_warpgroup_default=gated_surface.gate_warpgroup_default,
+                    kv_stage_choices_by_tile=dict(
+                        gated_surface.kv_stage_choices_by_tile
                     ),
                 )
             else:
