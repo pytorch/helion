@@ -334,7 +334,7 @@ class TileBeginOrigin(GridOrigin):
     def host_str(self) -> str:
         from .device_function import DeviceFunction
 
-        return DeviceFunction.current().codegen.offset_var(self.block_id)
+        return DeviceFunction.current().codegen.tile_begin_var(self.block_id)
 
 
 @dataclasses.dataclass
@@ -345,7 +345,7 @@ class TileEndOrigin(GridOrigin):
 
         device_fn = DeviceFunction.current()
         codegen = device_fn.codegen
-        offset = codegen.offset_var(self.block_id)
+        offset = codegen.tile_begin_var(self.block_id)
         block_size = device_fn.block_size_var(self.block_id) or "1"
         naive_end = f"{offset} + {block_size}"
         mask = codegen.mask_var(self.block_id)
@@ -386,7 +386,7 @@ class TileIdOrigin(GridOrigin):
         from .device_function import DeviceFunction
 
         device_fn = DeviceFunction.current()
-        offset = device_fn.codegen.offset_var(self.block_id)
+        offset = device_fn.codegen.tile_begin_var(self.block_id)
         block_size = device_fn.block_size_var(self.block_id)
         if block_size is None:
             return offset

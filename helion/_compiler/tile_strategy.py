@@ -29,6 +29,7 @@ from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
 from .device_function import DeviceFunction
 from .host_function import HostFunction
+from .host_function import NoCurrentFunction
 from .program_id import FlatProgramIDs
 from .program_id import ForEachProgramID
 from .program_id import L2GroupingProgramIDs
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from .cute.memory_ops import CuteLaneRelocation
     from .inductor_lowering import CodegenState
     from .pallas.dma import DmaResources
 
@@ -5010,6 +5012,16 @@ class DeviceGridState(DeviceLoopOrGridState):
     # ``cute/scan_ops.py``).  Applied when ``wrap_body`` materializes the
     # loops; never names a lane with a ``vec_lane_wrappers`` entry.
     reversed_lane_vars: set[str] = dataclasses.field(default_factory=set)
+    # Lane vars whose loops a later pass rewrites structurally (resident
+    # reductions); ``wrap_body`` keeps the full nest around them.
+    undistributable_lane_vars: set[str] = dataclasses.field(default_factory=set)
+    # Body definitions that packet loads hoisted into a vec wrapper read
+    # (``cute/memory_ops.py`` records them while lowering the body).
+    # ``wrap_body`` emits them before that lane loop or, when it keeps the
+    # full nest, moves them into the wrapper above the V-loop.
+    pending_relocations: list[CuteLaneRelocation] = dataclasses.field(
+        default_factory=list
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -5160,44 +5172,179 @@ class DeviceGridState(DeviceLoopOrGridState):
                 else:
                     fallback_setup.append(stmt)
 
+        live_loops = [
+            (lane_var, extent)
+            for lane_var, extent in self.lane_loops
+            if self._lane_loop_is_live(lane_var, needed, spliced_wrappers)
+        ]
+        # A statement that reads none of a lane loop's coordinates runs once
+        # per iteration of that loop for nothing; place each statement inside
+        # only the loops it depends on (``cute/lane_loop_distribution.py``).
+        # The full nest stays when every statement depends on every loop or
+        # the redistribution cannot be proven safe, and for loops other passes
+        # rewrite structurally (resident reductions, reverse scans).
+        placement = None
+        if (
+            live_loops
+            and not self.reversed_lane_vars
+            and not self.undistributable_lane_vars & {lane for lane, _ in live_loops}
+            and not any(
+                setup_by_lane[lane_var]
+                for lane_var, _extent in self.lane_loops
+                if lane_var not in dict(live_loops)
+            )
+        ):
+            from .cute.lane_loop_distribution import LaneScope
+            from .cute.lane_loop_distribution import check_full_nest
+            from .cute.lane_loop_distribution import definitions_precede_loop
+            from .cute.lane_loop_distribution import distribute_lane_loops
+
+            # A vec wrapper's outer lane body carries statements of its own
+            # besides the V-loop: the per-thread lane base, packet loads
+            # hoisted above the V-loop and store flushes after it.  Their
+            # definitions are the loop's, and the body statements that move
+            # past the loop are ordered against their memory accesses.
+            attached = {
+                lane_var: self._vec_wrapper_statements(lane_var)
+                for lane_var, _extent in live_loops
+            }
+            scope_names = {
+                lane_var: frozenset(lane_scope_names[lane_var]).union(
+                    *(
+                        ReadWrites.from_ast(stmt).writes
+                        for stmt in [*setup_by_lane[lane_var], *attached[lane_var]]
+                    )
+                )
+                for lane_var, _extent in live_loops
+            }
+            scopes = [
+                LaneScope(
+                    lane_var,
+                    scope_names[lane_var],
+                    frozenset(
+                        other
+                        for other, names in scope_names.items()
+                        if other != lane_var
+                        and any(
+                            set(ReadWrites.from_ast(stmt).reads) & names
+                            for stmt in setup_by_lane[lane_var]
+                        )
+                    ),
+                    tuple(attached[lane_var]),
+                    frozenset(lane_scope_names[lane_var]),
+                )
+                for lane_var, _extent in live_loops
+            ]
+            try:
+                renames = DeviceFunction.current()._variable_renames
+            except NoCurrentFunction:
+                # Unit tests build the grid state outside a device function.
+                renames = {}
+            rename_groups = {name: aliases[0] for name, aliases in renames.items()}
+            placement = distribute_lane_loops(body, scopes, rename_groups=rename_groups)
+            # The definitions a hoisted packet load reads stay body statements
+            # here; they must come out before the loop that hoisted the load.
+            # Otherwise the full nest stays, if it is exact.
+            if placement is not None and not all(
+                definitions_precede_loop(
+                    placement,
+                    self._vec_wrapper_lane_var(relocation.vloop),
+                    relocation.statements,
+                )
+                for relocation in self.pending_relocations
+            ):
+                check_full_nest(body, scopes, rename_groups=rename_groups)
+                placement = None
+        if placement is not None:
+            from .cute.lane_loop_distribution import LanePlacement
+
+            extents = dict(live_loops)
+
+            def materialize(items: list[ast.AST | LanePlacement]) -> list[ast.AST]:
+                result: list[ast.AST] = []
+                for item in items:
+                    if isinstance(item, LanePlacement):
+                        result.extend(
+                            self._materialize_lane_loop(
+                                item.lane_var,
+                                extents[item.lane_var],
+                                [
+                                    *setup_by_lane[item.lane_var],
+                                    *materialize(item.items),
+                                ],
+                            )
+                        )
+                    else:
+                        result.append(item)
+                return result
+
+            return [*fallback_setup, *materialize(placement)]
+
+        for relocation in self.pending_relocations:
+            relocation.apply(body)
         wrapped: list[ast.AST] = [*fallback_setup, *body]
         for lane_var, extent in reversed(self.lane_loops):
             wrapped = [*setup_by_lane[lane_var], *wrapped]
-            wrapper = self.vec_lane_wrappers.get(lane_var)
-            if wrapper is not None:
-                # The per-element index var reads ``base_index_var`` +
-                # ``vec_lane_var`` (not ``lane_var`` directly), so test all
-                # three before dropping the structure as dead.
-                if lane_var not in spliced_wrappers and not (
-                    {lane_var, wrapper.vec_lane_var, wrapper.base_index_var} & needed
-                ):
-                    continue
-                wrapper.vloop.body = wrapped  # type: ignore[assignment]
-                if lane_var in self.reversed_lane_vars:
-                    # The vector store protocol appends the V results of the
-                    # constexpr vector loop in iteration order, so this
-                    # partition cannot run backwards; the scan declines such
-                    # shapes before requesting a reversal.
-                    raise exc.BackendUnsupported(
-                        "cute", "reverse scan over a vectorised lane loop"
-                    )
-                wrapped = (
-                    list(wrapper.outer_for.body)
-                    if wrapper.elide_outer_loop
-                    else [wrapper.outer_for]
-                )
+            if not self._lane_loop_is_live(lane_var, needed, spliced_wrappers):
                 continue
-            if lane_var not in needed:
-                continue
-            lane_loop = _create_lane_loop(lane_var, extent, wrapped)
-            if lane_var in self.reversed_lane_vars and not _reverse_lane_loop_iter(
-                lane_loop
-            ):
-                raise exc.BackendUnsupported(
-                    "cute", "reverse scan lane loop is not reversible"
-                )
-            wrapped = [lane_loop]
+            wrapped = self._materialize_lane_loop(lane_var, extent, wrapped)
         return wrapped
+
+    def _vec_wrapper_statements(self, lane_var: str) -> list[ast.AST]:
+        """Statements ``lane_var``'s vec wrapper emits besides its V-loop."""
+        wrapper = self.vec_lane_wrappers.get(lane_var)
+        if wrapper is None:
+            return []
+        return [stmt for stmt in wrapper.outer_for.body if stmt is not wrapper.vloop]
+
+    def _vec_wrapper_lane_var(self, vloop: ast.For) -> str:
+        """The lane var whose vec wrapper owns the constexpr V-loop ``vloop``."""
+        for lane_var, wrapper in self.vec_lane_wrappers.items():
+            if wrapper.vloop is vloop:
+                return lane_var
+        raise AssertionError("relocation recorded for an unknown V-loop")
+
+    def _lane_loop_is_live(
+        self, lane_var: str, needed: set[str], spliced_wrappers: set[str]
+    ) -> bool:
+        wrapper = self.vec_lane_wrappers.get(lane_var)
+        if wrapper is None:
+            return lane_var in needed
+        # The per-element index var reads ``base_index_var`` +
+        # ``vec_lane_var`` (not ``lane_var`` directly), so test all three
+        # before dropping the structure as dead.
+        return lane_var in spliced_wrappers or bool(
+            {lane_var, wrapper.vec_lane_var, wrapper.base_index_var} & needed
+        )
+
+    def _materialize_lane_loop(
+        self, lane_var: str, extent: int, wrapped: list[ast.AST]
+    ) -> list[ast.AST]:
+        """Wrap ``wrapped`` in the (pre-built or plain) loop of ``lane_var``."""
+        wrapper = self.vec_lane_wrappers.get(lane_var)
+        if wrapper is not None:
+            wrapper.vloop.body = wrapped  # type: ignore[assignment]
+            if lane_var in self.reversed_lane_vars:
+                # The vector store protocol appends the V results of the
+                # constexpr vector loop in iteration order, so this
+                # partition cannot run backwards; the scan declines such
+                # shapes before requesting a reversal.
+                raise exc.BackendUnsupported(
+                    "cute", "reverse scan over a vectorised lane loop"
+                )
+            return (
+                list(wrapper.outer_for.body)
+                if wrapper.elide_outer_loop
+                else [wrapper.outer_for]
+            )
+        lane_loop = _create_lane_loop(lane_var, extent, wrapped)
+        if lane_var in self.reversed_lane_vars and not _reverse_lane_loop_iter(
+            lane_loop
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "reverse scan lane loop is not reversible"
+            )
+        return [lane_loop]
 
 
 @dataclasses.dataclass
@@ -5267,6 +5414,16 @@ class TileStrategy:
 
     def offset_var(self, block_idx: int) -> str:
         return self.offset_vars[block_idx]
+
+    def tile_begin_var(self, block_idx: int) -> str:
+        """Uniform first index of the current tile along ``block_idx``.
+
+        ``tile.begin`` / ``tile.end`` / ``tile.id`` render through this. It is
+        the loop offset for every strategy whose ``offset_var`` names the tile
+        start; strategies whose offset is already the per-element index (the
+        CuTe per-thread flattened tile) override it with the tile base.
+        """
+        return self.offset_var(block_idx)
 
     def index_var(self, block_idx: int) -> str:
         return self.index_vars[block_idx]
@@ -7699,6 +7856,28 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             )
             if mask_statement is not None:
                 target.append(mask_statement)
+            wrapper = vec_wrappers.get(self._lane_var_by_block.get(block_idx, ""))
+            if wrapper is not None and env.backend_name == "cute":
+                from .cute.device_state import CuteVloopWrapperFact
+
+                vec_width = self._cute_lane_vec_width_by_block.get(block_idx, 1)
+                self.fn.cute_state.vloop_sink_wrappers[wrapper.vec_lane_var] = (
+                    CuteVloopWrapperFact(
+                        block_id=block_idx,
+                        vec_width=vec_width,
+                        lane_var=self._lane_var_by_block[block_idx],
+                        vec_lane_var=wrapper.vec_lane_var,
+                        base_index_var=wrapper.base_index_var,
+                        index_var=index_var,
+                        mask_var=self.mask_vars.get(block_idx),
+                        # ``base = begin + pid * block + ... * V`` is V-aligned
+                        # only from a zero origin, and a V-wide chunk cannot
+                        # straddle an extent that is a multiple of V.
+                        uniform_vector_mask=isinstance(begin, int)
+                        and begin == 0
+                        and env.specialized_multiple(numel, vec_width),
+                    )
+                )
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
             pids.append(pid)
         pids.codegen(state)
@@ -8133,6 +8312,36 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if self.block_ids != [block_id]:
             return None
         return self._cute_tile_base_expr
+
+    def tile_begin_var(self, block_idx: int) -> str:
+        # ``offset_var`` is the per-element index on this strategy, so
+        # ``tile.begin`` must not fall back to it (it would broadcast
+        # ``w[tile.begin]`` per element). A single lane-looped block records
+        # its uniform ``pid * BLOCK`` base; otherwise (multi-block flattened
+        # tiles, grids without a lane loop) derive the tile start from the
+        # per-element index: tiles are aligned to their static block size, so
+        # ``index - index % BLOCK`` is the same value for every element of the
+        # tile even though it is rendered per element.
+        base = self.cute_tile_base_expr(block_idx)
+        if base is not None:
+            return base
+        if self.block_ids != [block_idx]:
+            # A flattened multi-block tile is a contiguous range of the
+            # flattened iteration space, not a rectangle, so its
+            # per-dimension begin is the per-element coordinate (as on the
+            # Triton flattened strategy).
+            return self.offset_var(block_idx)
+        extent = self._configured_block_size_int(self.block_size)
+        if extent is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "tile.begin / tile.end / tile.id of a flattened per-thread tile "
+                "needs a static block size",
+            )
+        index = self.index_var(block_idx)
+        if extent == 1:
+            return index
+        return f"(({index}) - (({index}) % {extent}))"
 
     def cute_lane_axis(self, block_id: int) -> CuteLaneAxis | None:
         """Static thread / lane distribution of a single flattened block.

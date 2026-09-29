@@ -1225,6 +1225,8 @@ class CuteBackend(Backend):
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
+            or key == "cute_vloop_sink"
+            or key == "cute_lane_unroll"
             or key
             in (
                 "cute_split_k_workspace",
@@ -1525,6 +1527,7 @@ class CuteBackend(Backend):
             ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
+            "_cute_grouped_reduce_shared_two_stage_fragment": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage_fragment",
             "_cute_resident_load_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_load_vector",
             "_cute_resident_store_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_store_vector",
             "_cute_resident_copy_async": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_copy_async",

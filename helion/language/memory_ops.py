@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
     from .._compiler.cute.epilogue_fanout import RenderedChain
     from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .._compiler.cute.signed_bitfield import PackedStoreValue
     from .._compiler.cute.signed_bitfield import SignedByteSite
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
@@ -588,7 +589,9 @@ def _cute_index_exprs(
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
-            return state.codegen.offset_var(block_id)
+            # The uniform tile base, not ``offset_var``: on the CuTe per-thread
+            # flattened strategy the offset is already the per-element index.
+            return state.codegen.tile_begin_var(block_id)
         begin_var = "0"
         if loop_info is not None and loop_info.begin_var_name is not None:
             begin_var = loop_info.begin_var_name
@@ -1015,7 +1018,7 @@ def _cute_register_tile_unroll_vec_store(
     dtype: torch.dtype = torch.float16,
     *,
     lane_axis_pos: int | None = None,
-    packed_values_expr: str | None = None,
+    packed_values: PackedStoreValue | None = None,
 ) -> ast.stmt | None:
     """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
 
@@ -1030,8 +1033,13 @@ def _cute_register_tile_unroll_vec_store(
     mask expression, whose per-element vars hold the last unrolled lane's
     (uniform) value after the V-loop.
 
-    Returns the per-lane append statement, or None when the lane context
-    isn't available.
+    With ``packed_values`` the flush converts a whole signed byte packet at
+    once, so the site appends nothing: it binds the packet under the flush
+    operand's name, which keeps the store's place in the body for the
+    lane-loop distribution (``PackedStoreValue``).
+
+    Returns the per-lane site statement (an append onto the list, or the
+    packet binding), or None when the lane context isn't available.
     """
     base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
     lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
@@ -1067,13 +1075,15 @@ def _cute_register_tile_unroll_vec_store(
     )
     sites.append(list_var)
     vloop_pos = _cute_lane_vloop_insert_pos(strategy, block_id, lane_body)
-    if packed_values_expr is None:
+    if packed_values is None:
         lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     flush_helper = (
         "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
     )
-    flush_values = packed_values_expr if packed_values_expr is not None else list_var
+    flush_values = (
+        list_var if packed_values is None else packed_values.flush_operand(list_var)
+    )
     flush_expr = f"{flush_helper}({base_ptr_expr}, {flush_values})"
     if mask_expr is not None:
         flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
@@ -1085,8 +1095,8 @@ def _cute_register_tile_unroll_vec_store(
         _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
         flush_stmt,
     )
-    if packed_values_expr is not None:
-        return ast.Pass()
+    if packed_values is not None:
+        return statement_from_string(f"{list_var} = {packed_values.carrier}")
     return statement_from_string(
         f"{list_var}.append(({value_expr}).bitcast({carrier}))"
     )
@@ -1424,7 +1434,8 @@ def _cute_combined_mask(
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
-            return state.codegen.offset_var(block_id)
+            # The uniform tile base, not ``offset_var`` (see the load helper).
+            return state.codegen.tile_begin_var(block_id)
         global_index = active_index_var(block_id)
         local_coord = active_local_coord(block_id)
         if global_index is not None and local_coord is not None:

@@ -216,8 +216,10 @@ def generate_materialized_fission(
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
 ) -> ast.Module:
+    from ..generate_ast import VloopSinkNotApplied
     from ..generate_ast import emit_main_def
     from ..generate_ast import generate_ast
+    from ..generate_ast import vloop_sink_off_config
 
     env = CompileEnvironment.current()
     roots = func.body[plan.root_index : plan.root_index + plan.region_count]
@@ -245,15 +247,13 @@ def generate_materialized_fission(
     }
     used_names.update(arg.arg for arg in func.args.args)
     used_names.update(extra_params or ())
-    for stage_index, root in enumerate(roots):
-        assert isinstance(root, ast.For)
-        graph_ids = _region_graph_ids(graphs, func.device_ir.root_ids[stage_index])
-        assert not claimed_graphs.intersection(graph_ids)
-        claimed_graphs.update(graph_ids)
-        stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)
-        module = generate_ast(
+
+    def generate_stage(
+        stage: HostFunction, stage_config: Config, stage_index: int
+    ) -> ast.Module:
+        return generate_ast(
             stage,
-            _stage_config(config, plan, stage_index, stage),
+            _stage_config(stage_config, plan, stage_index, stage),
             False,
             store_transform=store_transform,
             load_transform=load_transform,
@@ -262,6 +262,30 @@ def generate_materialized_fission(
             _memory_counters=memory_counters,
             _host_prefix=prefix if stage_index == 0 else None,
         )
+
+    for stage_index, root in enumerate(roots):
+        assert isinstance(root, ast.For)
+        graph_ids = _region_graph_ids(graphs, func.device_ir.root_ids[stage_index])
+        assert not claimed_graphs.intersection(graph_ids)
+        claimed_graphs.update(graph_ids)
+        stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)
+        try:
+            module = generate_stage(stage, config, stage_index)
+        except VloopSinkNotApplied:
+            # ``cute_vloop_sink`` shaped this stage's thread layout but sank
+            # nothing.  The knob must not change the code by itself, so
+            # regenerate exactly the knob-off stage, from graphs the knob-on
+            # layout planning has not annotated.
+            off_config = vloop_sink_off_config(config)
+            stage = _stage_host(
+                func,
+                root,
+                stage_index,
+                func.device_ir.build_codegen_graphs(off_config),
+                graph_ids,
+                plan,
+            )
+            module = generate_stage(stage, off_config, stage_index)
         pdl_roots = env.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
         if (
             config.get("tcgen05_materialized_pdl", False)

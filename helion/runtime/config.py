@@ -70,6 +70,8 @@ class Config(Mapping[str, object]):
         cute_independent_reduction: bool | None = None,
         cute_replicated_reduction: bool | None = None,
         cute_vector_packet_unroll: bool | None = None,
+        cute_vloop_sink: bool | None = None,
+        cute_lane_unroll: int | None = None,
         cute_packet_prefetch: int | None = None,
         cute_reduction_pipeline_depth: int | None = None,
         cute_host_paired_sum: CuteHostPairedSumLiteral | None = None,
@@ -135,6 +137,14 @@ class Config(Mapping[str, object]):
                 each warp using one shared-memory barrier. Disabled by default.
             cute_vector_packet_unroll: Fully unroll small straight-line vector
                 packet loops. Disabled by default to retain compact code.
+            cute_vloop_sink: Sink a grid constexpr vector loop into the serial
+                reduction nest it wraps (column sums): one vector load per row,
+                per-lane register accumulators, one grouped cross-thread combine
+                per row tile. Disabled by default. Kernels where nothing can be
+                sunk generate exactly the knob-off code.
+            cute_lane_unroll: Unroll factor (1, 2, 4, 8, 16) for the row lane
+                loop of a sunk vector nest; every copy's vector loads issue
+                before any copy's accumulates. Only applies with cute_vloop_sink.
             cute_packet_prefetch: Prefetch 2, 4, or 8 independent vector packets
                 in a proved complete tile; 0 (the default) keeps the original order.
                 Requires cute_proven_bounds and storage-disjointness proof.
@@ -221,6 +231,8 @@ class Config(Mapping[str, object]):
             "cute_independent_reduction": cute_independent_reduction,
             "cute_replicated_reduction": cute_replicated_reduction,
             "cute_vector_packet_unroll": cute_vector_packet_unroll,
+            "cute_vloop_sink": cute_vloop_sink,
+            "cute_lane_unroll": cute_lane_unroll,
             "cute_packet_prefetch": cute_packet_prefetch,
             "cute_reduction_pipeline_depth": cute_reduction_pipeline_depth,
             "cute_host_paired_sum": cute_host_paired_sum,

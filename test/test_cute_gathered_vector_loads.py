@@ -53,11 +53,26 @@ def _vector_loop(function: ast.FunctionDef) -> ast.For:
 
 
 def _statements_above(function: ast.FunctionDef, vloop: ast.For) -> list[ast.stmt]:
-    """Statements of the outer lane loop that precede the V-loop."""
-    for node in ast.walk(function):
-        if isinstance(node, ast.For) and any(stmt is vloop for stmt in node.body):
-            return node.body[: node.body.index(vloop)]
-    raise AssertionError("the V-loop has no enclosing lane loop")
+    """Statements that run before the V-loop, from the kernel body inwards.
+
+    The gathered index is bound wherever the lane-loop placement leaves it:
+    before the outer lane loop when it does not depend on the lane, or inside
+    that loop above the V-loop.
+    """
+
+    def walk(body: list[ast.stmt]) -> list[ast.stmt] | None:
+        for index, stmt in enumerate(body):
+            if stmt is vloop:
+                return list(body[:index])
+            if isinstance(stmt, ast.For):
+                inner = walk(stmt.body)
+                if inner is not None:
+                    return [*body[:index], *inner]
+        return None
+
+    above = walk(function.body)
+    assert above is not None, "the V-loop has no enclosing lane loop"
+    return above
 
 
 def _load_calls(node: ast.AST) -> list[ast.Call]:

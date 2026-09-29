@@ -11948,6 +11948,8 @@ class TestCuteAutotuner(TestCase):
                 "cute_independent_reduction",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",
+                "cute_vloop_sink",
+                "cute_lane_unroll",
                 "load_eviction_policies",
             },
         )
@@ -11977,6 +11979,8 @@ class TestCuteAutotuner(TestCase):
                     "cute_independent_reduction",
                     "cute_replicated_reduction",
                     "cute_vector_packet_unroll",
+                    "cute_vloop_sink",
+                    "cute_lane_unroll",
                     "load_eviction_policies",
                 },
             )

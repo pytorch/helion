@@ -770,8 +770,10 @@ class DeviceFunction:
             resolved = env.resolve_codegen_block_id(
                 origin.origin.block_id, self.codegen
             )
-            if type(origin.origin) in (GridOrigin, TileBeginOrigin):
+            if type(origin.origin) is GridOrigin:
                 return self.codegen.offset_var(resolved)
+            if type(origin.origin) is TileBeginOrigin:
+                return self.codegen.tile_begin_var(resolved)
             # Render through the origin so each derived edge keeps its own
             # formula, but on the resolved live loop: host_str() reads
             # offset_var and active_device_loops by block_id, and an aliased

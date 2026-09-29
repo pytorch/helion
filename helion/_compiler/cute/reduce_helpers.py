@@ -413,6 +413,31 @@ _SERIAL_DISPATCH = {
     "prod": (_warp_reduce_prod, operator.mul),
 }
 
+
+def _cute_scalar_combine(reduction_type: str, identity: cute.Numeric) -> object:
+    """The scalar combine of ``reduction_type`` for ``identity``'s dtype.
+
+    ``cute.arch.fmax``/``fmin`` are one FMNMX for fp32; Python ``max``/``min``
+    lower to compare+select for the other dtypes.
+    """
+    if reduction_type == "max":
+        return (
+            _cute_scalar_combine_max
+            if type(identity) is cutlass.Float32
+            else _cute_scalar_combine_generic_max
+        )
+    if reduction_type == "min":
+        return (
+            _cute_scalar_combine_f32_min
+            if type(identity) is cutlass.Float32
+            else _cute_scalar_combine_min
+        )
+    entry = _SERIAL_DISPATCH.get(reduction_type)
+    if entry is None:
+        raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
+    return entry[1]
+
+
 # Above this many warps the serial fold's per-thread chain outgrows the
 # two-stage form's constant shuffle cost.
 _SERIAL_MAX_WARPS = 8
@@ -428,25 +453,14 @@ def _cute_grouped_reduce_shared_serial(
 ) -> cute.Numeric:
     if reduction_type == "max":
         warp_op = _warp_reduce_max
-        # cute.arch.fmax/fmin are one FMNMX; Python max/min lower to
-        # compare+select.
-        combine = (
-            _cute_scalar_combine_max
-            if type(identity) is cutlass.Float32
-            else _cute_scalar_combine_generic_max
-        )
     elif reduction_type == "min":
         warp_op = _warp_reduce_min
-        combine = (
-            _cute_scalar_combine_f32_min
-            if type(identity) is cutlass.Float32
-            else _cute_scalar_combine_min
-        )
     else:
         entry = _SERIAL_DISPATCH.get(reduction_type)
         if entry is None:
             raise ValueError(f"unsupported CuTe reduction type: {reduction_type!r}")
-        warp_op, combine = entry
+        warp_op = entry[0]
+    combine = _cute_scalar_combine(reduction_type, identity)
     return _cute_grouped_reduce_shared_serial_body(
         input_value,
         warp_op,
@@ -1101,4 +1115,102 @@ def _cute_grouped_reduce_cluster_online_pair(
         cluster_n,
         scale,
         fastmath,
+    )
+
+
+# Fragment form of the two-stage grouped reduce: combines ``count`` per-thread
+# accumulators (a register fragment) across the group with ONE pair of
+# barriers instead of ``count`` two-stage reduces.  Stage 1 folds each value
+# across the warp with a strided butterfly (xor offsets ``pre``..16 keep the
+# interleaved sibling coordinate ``lane % pre`` fixed), one representative
+# lane per sibling class stages the warp partials of all ``count`` values in
+# shared memory, stage 2 has one thread per (sibling, value) slot fold the
+# ``group_span // 32`` warp partials serially, and every thread reads back
+# its sibling class's ``count`` results.
+
+
+@cute.jit
+def _cute_grouped_reduce_shared_two_stage_fragment_body(
+    values: cute.Tensor,
+    results: cute.Tensor,
+    combine: object,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    lane_mod_pre_var: cutlass.Int32,
+    count: int,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> None:
+    dtype = type(identity)
+    warps_per_group = group_span // 32
+    slots = pre * count
+    partials_size = group_count * slots * warps_per_group
+    results_size = group_count * slots
+    smem_ptr = cute.arch.alloc_smem(dtype, partials_size + results_size)
+    smem = cute.make_tensor(smem_ptr, (partials_size + results_size,))
+    group_id = lane_var // group_span
+    lane_in_warp = lane_var % 32
+    warp_in_group = lane_in_group_var // 32
+    partials_base = group_id * (slots * warps_per_group)
+    results_base = partials_size + group_id * slots
+    for i in cutlass.range_constexpr(count):
+        value = values[i]
+        for shift in cutlass.range_constexpr(pre.bit_length() - 1, 5):
+            value = combine(
+                value,
+                dtype(
+                    cute.arch.shuffle_sync_bfly(
+                        value, offset=1 << shift, mask=-1, mask_and_clamp=31
+                    )
+                ),
+            )
+        if lane_in_warp < pre:
+            smem[
+                partials_base
+                + (lane_in_warp * count + i) * warps_per_group
+                + warp_in_group
+            ] = value
+    cute.arch.sync_threads()
+    if lane_in_group_var < slots:
+        total = smem[partials_base + lane_in_group_var * warps_per_group]
+        for w in cutlass.range_constexpr(1, warps_per_group):
+            total = combine(
+                total, smem[partials_base + lane_in_group_var * warps_per_group + w]
+            )
+        smem[results_base + lane_in_group_var] = total
+    cute.arch.sync_threads()
+    for i in cutlass.range_constexpr(count):
+        results[i] = smem[results_base + lane_mod_pre_var * count + i]
+
+
+def _cute_grouped_reduce_shared_two_stage_fragment(
+    values: cute.Tensor,
+    results: cute.Tensor,
+    reduction_type: str,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    lane_mod_pre_var: cutlass.Int32,
+    *,
+    count: int,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> None:
+    """Reduce the ``count`` values of ``values`` into ``results`` across the
+    ``group_span``-thread groups (``pre`` interleaved siblings kept apart)."""
+    _cute_grouped_reduce_shared_two_stage_fragment_body(
+        values,
+        results,
+        _cute_scalar_combine(reduction_type, identity),
+        identity,
+        lane_var,
+        lane_in_group_var,
+        lane_mod_pre_var,
+        count,
+        pre,
+        group_span,
+        group_count,
     )

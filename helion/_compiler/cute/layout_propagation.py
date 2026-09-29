@@ -295,6 +295,18 @@ def _plan_warp_per_row_execution(
         return
     if m_strategy.thread_axes_used() != 1:
         return
+    if (
+        m_strategy.fn.config.config.get("cute_vloop_sink") is True
+        and m_strategy._cute_lane_vec_width_by_block.get(m_block_id, 1) > 1
+    ):
+        # Vector-loop sinking vectorizes the OUTER grid axis (a column sum
+        # loads V contiguous columns per row): adjacent column chunks must
+        # sit in adjacent threads, so the grid axis keeps thread_idx[0] and
+        # the inner reduced axis stays above it.  Record that the knob shaped
+        # the layout: should no V-loop be sunk after all, codegen restarts
+        # with the knob off so the knob alone never changes the code.
+        m_strategy.fn.cute_state.vloop_sink_layout_applied = True
+        return
     m_threads = tile_strategy.thread_extent_for_block_id(m_block_id)
     if not isinstance(m_threads, int) or m_threads < 2:
         return
