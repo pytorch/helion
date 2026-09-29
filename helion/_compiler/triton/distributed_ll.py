@@ -37,6 +37,11 @@ _MASKED_PUSH_ASM = (
     "{ .reg .pred p; setp.ne.b32 p, $3, 0; "
     "@p st.relaxed.sys.global.u64 [$1], $2; } mov.u32 $0, 0;"
 )
+_MULTICAST_PUSH_ASM = "multimem.st.relaxed.sys.global.b64 [$1], $2; mov.u32 $0, 0;"
+_MASKED_MULTICAST_PUSH_ASM = (
+    "{ .reg .pred p; setp.ne.b32 p, $3, 0; "
+    "@p multimem.st.relaxed.sys.global.b64 [$1], $2; } mov.u32 $0, 0;"
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,7 +77,11 @@ def register_distributed_ll(
         or not graph.has_cross_rank_dependencies()
     ):
         return
-    plan = plan_distributed_ll(graph, device_ir)
+    plan = plan_distributed_ll(
+        graph,
+        device_ir,
+        pack_bf16=env.settings.distributed_ll_multicast,
+    )
     if plan is None:
         return
     device_function.distributed_ll_plan = plan
@@ -90,6 +99,10 @@ def register_distributed_ll(
         device_function.triton_distributed_ll_mailbox_ptrs_arg,
         device_function.triton_distributed_ll_rank_arg,
     ) = names
+    if env.settings.distributed_ll_multicast:
+        multicast = device_function.new_var("tile_dependency_ll_multicast", dce=False)
+        device_function.wrapper_only_params.append(multicast)
+        device_function.triton_distributed_ll_multicast_arg = multicast
     device_function.triton_distributed_ll_tag_var = device_function.new_var(
         "tile_dependency_ll_tag", dce=False
     )
@@ -178,6 +191,114 @@ def _bits_type(dtype: torch.dtype) -> str:
     return f"tl.uint{dtype.itemsize * 8}"
 
 
+def _pair_shapes(
+    state: CodegenState,
+    output_size: list[int | torch.SymInt],
+) -> tuple[str, str, str]:
+    """Return actual codegen numel, ``[pairs, 2]``, and ``[pairs]`` shapes."""
+    dimensions = state.tile_strategy.shape_dims(output_size)
+    numel = " * ".join(f"({dimension})" for dimension in dimensions) or "1"
+    pair_count = f"({numel}) // 2"
+    return numel, f"[{pair_count}, 2]", f"[{pair_count}]"
+
+
+def _split_pairs(
+    state: CodegenState,
+    pairs: ast.Name,
+    prefix: str,
+) -> tuple[str, str]:
+    """Split a final size-two dimension without unsupported tensor indexing."""
+    low = state.device_function.new_var(f"{prefix}_low", dce=True)
+    high = state.device_function.new_var(f"{prefix}_high", dce=True)
+    state.add_statement(statement_from_string(f"{low}, {high} = tl.split({pairs.id})"))
+    return low, high
+
+
+def _push_statement(
+    sink: str,
+    address: str,
+    word: str,
+    mask: str | None,
+    *,
+    multicast: bool,
+) -> ast.stmt:
+    if multicast:
+        asm = _MULTICAST_PUSH_ASM
+        masked_asm = _MASKED_MULTICAST_PUSH_ASM
+    else:
+        asm = _PUSH_ASM
+        masked_asm = _MASKED_PUSH_ASM
+    if mask is None:
+        constraints, args = "=r,l,l", f"{address}, {word}"
+    else:
+        asm = masked_asm
+        constraints, args = "=r,l,l,r", f"{address}, {word}, {mask}"
+    return statement_from_string(
+        f"{sink} = tl.inline_asm_elementwise(asm={asm!r}, "
+        f"constraints={constraints!r}, args=[{args}], dtype=tl.int32, "
+        "is_pure=False, pack=1)"
+    )
+
+
+def _ll_push_transport(
+    device_function: DeviceFunction,
+    mailbox_ptrs: str,
+    multicast_ptr: str | None,
+    slot: str,
+    offset: str,
+    word: str,
+    mask: str | None,
+    world_size: int,
+) -> list[ast.stmt]:
+    """Emit one optional multicast push with the exact unicast fallback."""
+    unicast: list[ast.stmt] = []
+    for peer in range(world_size):
+        base = device_function.new_var("ll_peer_mailbox", dce=True)
+        sink = device_function.new_var("ll_push", dce=False)
+        unicast.extend(
+            (
+                statement_from_string(
+                    f"{base} = tl.load(({mailbox_ptrs}).to("
+                    f"tl.pointer_type(tl.uint64)) + {peer}).to("
+                    "tl.pointer_type(tl.uint64))"
+                ),
+                _push_statement(
+                    sink,
+                    f"{base} + ({slot}) + {offset}",
+                    word,
+                    mask,
+                    multicast=False,
+                ),
+            )
+        )
+    if multicast_ptr is None:
+        return unicast
+
+    base = device_function.new_var("ll_multicast_mailbox", dce=True)
+    sink = device_function.new_var("ll_multicast_push", dce=False)
+    multicast = [
+        statement_from_string(
+            f"{base} = tl.cast({multicast_ptr}, tl.int64).to("
+            "tl.pointer_type(tl.uint64))"
+        ),
+        _push_statement(
+            sink,
+            f"{base} + ({slot}) + {offset}",
+            word,
+            mask,
+            multicast=True,
+        ),
+    ]
+    return [
+        create(
+            ast.If,
+            test=expr_from_string(f"{multicast_ptr} != 0"),
+            body=multicast,
+            orelse=unicast,
+        )
+    ]
+
+
 def codegen_ll_push(
     state: CodegenState,
     fake_tensor: torch.Tensor,
@@ -192,16 +313,12 @@ def codegen_ll_push(
     """
     device_function = state.device_function
     _mailbox, mailbox_ptrs, rank, tag, parity = _ll_names(device_function)
+    multicast_ptr = device_function.triton_distributed_ll_multicast_arg
     backend = CompileEnvironment.current().backend
     indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
     output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
     if not isinstance(value, ast.Constant):
         value = state.codegen.lift(value, dce=True, prefix="ll_value")
-    word_value: ast.AST = value
-    if not indexing.block_shaped_offset and output_size:
-        word_value = expr_from_string(
-            backend.reshape_expr("{value}", "[]"), value=value
-        )
     offset: ast.AST = indexing.index_expr
     if indexing.needs_broadcast():
         shape_str = state.tile_strategy.shape_str(output_size)
@@ -210,16 +327,6 @@ def codegen_ll_push(
         )
     offset = state.codegen.lift(offset, dce=True, prefix="ll_offset")
     dtype = backend.dtype_str(allocation.dtype)
-    word = state.codegen.lift(
-        expr_from_string(
-            f"tl.cast(tl.cast(tl.cast({{value}}, {dtype}), "
-            f"{_bits_type(allocation.dtype)}, bitcast=True), tl.uint64) "
-            f"| ({tag} << 32)",
-            value=word_value,
-        ),
-        dce=True,
-        prefix="ll_word",
-    )
     mask: ast.Name | None = None
     if indexing.has_mask():
         mask = state.codegen.lift(
@@ -227,32 +334,92 @@ def codegen_ll_push(
             dce=True,
             prefix="ll_mask",
         )
+    if allocation.elements_per_word == 2:
+        # A single atomic b64 store carries both BF16 payloads and the full tag:
+        # [epoch:32 | odd payload:16 | even payload:16].
+        block_numel, pair_shape, _packed_shape = _pair_shapes(state, output_size)
+        state.add_statement(
+            statement_from_string(f"tl.static_assert(({block_numel}) % 2 == 0)")
+        )
+        output_shape = state.tile_strategy.shape_str(output_size)
+        expanded_value = expr_from_string(
+            backend.broadcast_to_expr("{value}", output_shape), value=value
+        )
+        pairs = state.codegen.lift(
+            expr_from_string(
+                f"tl.reshape({{value}}, {pair_shape})", value=expanded_value
+            ),
+            dce=True,
+            prefix="ll_pairs",
+        )
+        pair_low, pair_high = _split_pairs(state, pairs, "ll_pair")
+        word = state.codegen.lift(
+            expr_from_string(
+                f"tl.cast(tl.cast(tl.cast({pair_low}, {dtype}), "
+                "tl.uint16, bitcast=True), tl.uint64) | "
+                f"(tl.cast(tl.cast(tl.cast({pair_high}, {dtype}), "
+                "tl.uint16, bitcast=True), tl.uint64) << 16) | "
+                f"({tag} << 32)"
+            ),
+            dce=True,
+            prefix="ll_word",
+        )
+        offset_pairs = state.codegen.lift(
+            expr_from_string(f"tl.reshape({{offset}}, {pair_shape})", offset=offset),
+            dce=True,
+            prefix="ll_offset_pairs",
+        )
+        offset_low, _offset_high = _split_pairs(state, offset_pairs, "ll_offset_pair")
+        offset = state.codegen.lift(
+            expr_from_string(f"{offset_low} // 2"),
+            dce=True,
+            prefix="ll_word_offset",
+        )
+        if mask is not None:
+            mask_pairs = state.codegen.lift(
+                expr_from_string(f"tl.reshape({{mask}}, {pair_shape})", mask=mask),
+                dce=True,
+                prefix="ll_mask_pairs",
+            )
+            mask_low, mask_high = _split_pairs(state, mask_pairs, "ll_mask_pair")
+            mask = state.codegen.lift(
+                expr_from_string(
+                    f"tl.cast({mask_low} | {mask_high}, tl.int32)",
+                ),
+                dce=True,
+                prefix="ll_word_mask",
+            )
+    else:
+        word_value: ast.AST = value
+        if not indexing.block_shaped_offset and output_size:
+            word_value = expr_from_string(
+                backend.reshape_expr("{value}", "[]"), value=value
+            )
+        word = state.codegen.lift(
+            expr_from_string(
+                f"tl.cast(tl.cast(tl.cast({{value}}, {dtype}), "
+                f"{_bits_type(allocation.dtype)}, bitcast=True), tl.uint64) "
+                f"| ({tag} << 32)",
+                value=word_value,
+            ),
+            dce=True,
+            prefix="ll_word",
+        )
     slot = (
-        f"{allocation.mailbox_offset} + {rank} * {allocation.numel} + "
+        f"{allocation.mailbox_offset} + {rank} * {allocation.words_per_source()} + "
         f"{parity} * {allocation.slot_words()}"
     )
-    for peer in range(allocation.world_size):
-        base = device_function.new_var("ll_peer_mailbox", dce=True)
-        sink = device_function.new_var("ll_push", dce=False)
-        state.add_statement(
-            statement_from_string(
-                f"{base} = tl.load(({mailbox_ptrs}).to(tl.pointer_type(tl.uint64)) "
-                f"+ {peer}).to(tl.pointer_type(tl.uint64))"
-            )
-        )
-        address = f"{base} + ({slot}) + {offset.id}"
-        if mask is None:
-            asm, constraints, args = _PUSH_ASM, "=r,l,l", f"{address}, {word.id}"
-        else:
-            asm, constraints = _MASKED_PUSH_ASM, "=r,l,l,r"
-            args = f"{address}, {word.id}, {mask.id}"
-        state.add_statement(
-            statement_from_string(
-                f"{sink} = tl.inline_asm_elementwise(asm={asm!r}, "
-                f"constraints={constraints!r}, args=[{args}], dtype=tl.int32, "
-                "is_pure=False, pack=1)"
-            )
-        )
+    for statement in _ll_push_transport(
+        device_function,
+        mailbox_ptrs,
+        multicast_ptr,
+        slot,
+        offset.id,
+        word.id,
+        None if mask is None else mask.id,
+        allocation.world_size,
+    ):
+        state.add_statement(statement)
     return value
 
 
@@ -271,6 +438,15 @@ def codegen_ll_poll(
     backend = env.backend
     indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
     output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+    assert state.fx_node is not None
+    access_key = state.fx_node.meta[TILE_ACCESS_KEY_META]
+    plan = device_function.distributed_ll_plan
+    assert plan is not None
+    coalesce_pairs = (
+        allocation.elements_per_word == 2
+        and access_key in plan.packed_loads
+        and not indexing.needs_broadcast()
+    )
     offset: ast.AST = indexing.index_expr
     block_shaped = indexing.block_shaped_offset
     if indexing.has_mask() and not block_shaped:
@@ -280,10 +456,39 @@ def codegen_ll_poll(
             offset=offset,
         )
         block_shaped = True
+    element_offset = offset
+    packed_shape: str | None = None
+    pair_shape: str | None = None
+    if coalesce_pairs:
+        block_numel, pair_shape, packed_shape = _pair_shapes(state, output_size)
+        state.add_statement(
+            statement_from_string(f"tl.static_assert(({block_numel}) % 2 == 0)")
+        )
+        element_offset = state.codegen.lift(
+            offset,
+            dce=True,
+            prefix="ll_element_offset",
+        )
+        offset_pairs = state.codegen.lift(
+            expr_from_string(
+                f"tl.reshape({{offset}}, {pair_shape})", offset=element_offset
+            ),
+            dce=True,
+            prefix="ll_offset_pairs",
+        )
+        offset_low, _offset_high = _split_pairs(state, offset_pairs, "ll_offset_pair")
+        offset = expr_from_string(f"{offset_low} // 2")
+    elif allocation.elements_per_word == 2:
+        element_offset = state.codegen.lift(
+            offset,
+            dce=True,
+            prefix="ll_element_offset",
+        )
+        offset = expr_from_string("{offset} // 2", offset=element_offset)
     address = state.codegen.lift(
         expr_from_string(
             f"{mailbox} + ({allocation.mailbox_offset} + "
-            f"{source_rank * allocation.numel} + "
+            f"{source_rank * allocation.words_per_source()} + "
             f"{parity} * {allocation.slot_words()}) + {{offset}}",
             offset=offset,
         ),
@@ -294,13 +499,48 @@ def codegen_ll_poll(
     load = f"tl.load({address.id}, volatile=True)"
     if indexing.has_mask():
         mask = state.codegen.lift(indexing.mask_expr, dce=True, prefix="ll_mask")
+        if coalesce_pairs:
+            assert pair_shape is not None
+            mask_pairs = state.codegen.lift(
+                expr_from_string(
+                    f"tl.reshape({{mask}}, {pair_shape})",
+                    mask=mask,
+                ),
+                dce=True,
+                prefix="ll_mask_pairs",
+            )
+            mask_low, mask_high = _split_pairs(state, mask_pairs, "ll_mask_pair")
+            mask = state.codegen.lift(
+                expr_from_string(f"{mask_low} | {mask_high}"),
+                dce=True,
+                prefix="ll_word_mask",
+            )
         load = f"tl.load({address.id}, {mask.id}, other={tag} << 32, volatile=True)"
     word = device_function.new_var("ll_word", dce=False)
     state.add_statement(statement_from_string(f"{word} = {load}"))
-    result = expr_from_string(
-        f"tl.cast(tl.cast({word}, {_bits_type(allocation.dtype)}), "
-        f"{backend.dtype_str(allocation.dtype)}, bitcast=True)"
-    )
+    if coalesce_pairs:
+        output_shape = state.tile_strategy.shape_str(output_size)
+        low = (
+            f"tl.cast(tl.cast({word}, tl.uint16), "
+            f"{backend.dtype_str(allocation.dtype)}, bitcast=True)"
+        )
+        high = (
+            f"tl.cast(tl.cast({word} >> 16, tl.uint16), "
+            f"{backend.dtype_str(allocation.dtype)}, bitcast=True)"
+        )
+        result = expr_from_string(f"tl.reshape(tl.join({low}, {high}), {output_shape})")
+    elif allocation.elements_per_word == 2:
+        result = expr_from_string(
+            f"tl.cast(tl.cast({word} >> "
+            "(tl.cast({offset} & 1, tl.uint64) * 16), tl.uint16), "
+            f"{backend.dtype_str(allocation.dtype)}, bitcast=True)",
+            offset=element_offset,
+        )
+    else:
+        result = expr_from_string(
+            f"tl.cast(tl.cast({word}, {_bits_type(allocation.dtype)}), "
+            f"{backend.dtype_str(allocation.dtype)}, bitcast=True)"
+        )
     shape = None
     if indexing.needs_broadcast():
         shape_str = state.tile_strategy.shape_str(output_size)
@@ -308,9 +548,8 @@ def codegen_ll_poll(
             backend.broadcast_to_expr("{value}", shape_str), value=result
         )
     elif block_shaped:
-        shape = state.tile_strategy.shape_str(output_size)
+        shape = packed_shape or state.tile_strategy.shape_str(output_size)
     value = device_function.new_var("ll_value", dce=False)
-    assert state.fx_node is not None
     device_function.distributed_ll_pending_polls.append(
         LLPendingPoll(
             node=state.fx_node,

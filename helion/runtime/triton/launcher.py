@@ -174,6 +174,7 @@ def default_launcher(
     _distributed_readiness_world_size: int = 0,
     _distributed_readiness_process_group_name: str | None = None,
     _distributed_ll_mailbox_words: int = 0,
+    _distributed_ll_multicast: bool = False,
     _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
     _persistent_state_specs: tuple[tuple[torch.Tensor, int, torch.dtype], ...] = (),
     _minimum_resident_programs: int = 0,
@@ -242,6 +243,7 @@ def default_launcher(
             ),
             readiness_slots=_distributed_readiness_signal_slots,
             ll_mailbox_words=_distributed_ll_mailbox_words,
+            ll_multicast=_distributed_ll_multicast,
         )
     if _distributed_readiness_signal_slots:
         assert _distributed_readiness_device_anchor is not None
@@ -258,15 +260,18 @@ def default_launcher(
     if _distributed_ll_mailbox_words:
         assert _distributed_readiness_device_anchor is not None
         assert _distributed_readiness_process_group_name is not None
-        mailbox, mailbox_ptrs, rank = _get_distributed_ll_mailbox(
+        mailbox, mailbox_ptrs, rank, multicast_ptr = _get_distributed_ll_mailbox(
             triton_kernel,
             _distributed_readiness_device_anchor,
             _distributed_readiness_process_group_name,
             _distributed_ll_mailbox_words,
+            multicast=_distributed_ll_multicast,
             expected_world_size=_distributed_readiness_world_size,
             launch_fingerprint=distributed_launch_fingerprint,
         )
         args = (*args, mailbox, mailbox_ptrs, rank)
+        if _distributed_ll_multicast:
+            args = (*args, multicast_ptr)
     for slot, (scratch_like, numel_per_program) in enumerate(
         _remote_copy_scratch_specs
     ):
@@ -348,6 +353,7 @@ def _distributed_launch_fingerprint(
     remote_barrier_slots: int = 0,
     readiness_slots: int = 0,
     ll_mailbox_words: int = 0,
+    ll_multicast: bool = False,
 ) -> str:
     """Fingerprint the compiled schedule while ignoring dynamic tensor extents."""
 
@@ -398,6 +404,7 @@ def _distributed_launch_fingerprint(
         remote_barrier_slots,
         readiness_slots,
         ll_mailbox_words,
+        ll_multicast,
     )
     return hashlib.sha256(repr(payload).encode()).hexdigest()
 
@@ -499,12 +506,14 @@ def _get_distributed_ll_mailbox(
     process_group_name: str,
     words: int,
     *,
+    multicast: bool = False,
     expected_world_size: int,
     launch_fingerprint: str | None,
-) -> tuple[torch.Tensor, int, int]:
-    """Return this rank's LL mailbox, the peer mailbox pointer table, and rank.
+) -> tuple[torch.Tensor, int, int, int]:
+    """Return the local mailbox, peer pointers, rank, and multicast address.
 
-    First use is an SPMD collective, like distributed readiness state.
+    A zero multicast address selects the generated peer-store fallback. First
+    use is an SPMD collective, like distributed readiness state.
     """
     if dst.device.type != "cuda" or torch.version.hip is not None:
         raise RuntimeError("compiler-derived LL readiness requires NVIDIA CUDA")
@@ -529,18 +538,33 @@ def _get_distributed_ll_mailbox(
         id(group),
         launch_fingerprint,
         words,
+        multicast,
         stream.cuda_stream,
     )
     entry = cache.get(key)
     if entry is None:
         with torch.cuda.device(dst.device):
-            mailbox = symm_mem.empty(
-                words, dtype=torch.uint64, device=_symmetric_pool_device(dst.device)
-            )
-            handle = symm_mem.rendezvous(
-                mailbox,
-                group=process_group_name,  # pyrefly: ignore[bad-argument-type]
-            )
+            if multicast:
+                from torch._C._distributed_c10d import _SymmetricMemory
+
+                mailbox = _SymmetricMemory.empty_strided_p2p(
+                    (words,),
+                    (1,),
+                    torch.uint64,
+                    dst.device,
+                    process_group_name,
+                )
+                handle = _SymmetricMemory.rendezvous(mailbox)
+            else:
+                mailbox = symm_mem.empty(
+                    words,
+                    dtype=torch.uint64,
+                    device=_symmetric_pool_device(dst.device),
+                )
+                handle = symm_mem.rendezvous(
+                    mailbox,
+                    group=process_group_name,  # pyrefly: ignore[bad-argument-type]
+                )
             # Kernels address peers by buffer base, so the mailbox must start there.
             if handle.buffer_ptrs[handle.rank] != mailbox.data_ptr():
                 raise RuntimeError("LL mailbox is not at its symmetric buffer base")
@@ -557,7 +581,8 @@ def _get_distributed_ll_mailbox(
         entry = (group, mailbox, handle)
         cache[key] = entry
     _group, mailbox, handle = entry
-    return mailbox, handle.buffer_ptrs_dev, handle.rank
+    multicast_ptr = int(handle.multicast_ptr) if multicast else 0
+    return mailbox, handle.buffer_ptrs_dev, handle.rank, multicast_ptr
 
 
 def _get_distributed_readiness_signal(

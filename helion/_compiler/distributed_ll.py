@@ -7,10 +7,12 @@ epoch, into every peer's mailbox, and a peer-view load becomes a poll of the
 reader's own mailbox.  The covered dependencies need no readiness counters,
 completion counters, or terminal drain.
 
-Mailbox layout per allocation: ``[2 parity][world source][numel]`` uint64 words
-holding ``epoch << 32 | element bits``.  Parity double buffering is WAR-safe
-because every rank reads every source each launch (so no rank can run two
-launches ahead of a reader) and kernels on one stream never overlap.
+Mailbox layout per allocation: ``[2 parity][world source][words]``. A uint64
+word holds a 32-bit epoch and either one element, or two adjacent BF16 elements
+when the opt-in multicast path can prove pair alignment. Parity double
+buffering is WAR-safe because every rank reads every source each launch (so no
+rank can run two launches ahead of a reader) and kernels on one stream never
+overlap.
 """
 
 from __future__ import annotations
@@ -47,12 +49,16 @@ class LLAllocation:
     dtype: torch.dtype
     numel: int
     world_size: int
-    # First mailbox word of this allocation's [2][world][numel] region.
+    # First mailbox word of this allocation's [2][world][words] region.
     mailbox_offset: int
     producer_root: int
+    elements_per_word: int = 1
+
+    def words_per_source(self) -> int:
+        return (self.numel + self.elements_per_word - 1) // self.elements_per_word
 
     def slot_words(self) -> int:
-        return self.world_size * self.numel
+        return self.world_size * self.words_per_source()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,6 +70,8 @@ class DistributedLLPlan:
     stores: dict[AccessKey, LLAllocation]
     # Peer-view load -> (allocation, source rank named by the view).
     loads: dict[AccessKey, tuple[LLAllocation, int]]
+    # Pair-packed loads whose index vector itself can be halved before polling.
+    packed_loads: frozenset[AccessKey]
     covered_dependency_ids: frozenset[int]
     consumer_roots: frozenset[int]
 
@@ -167,9 +175,89 @@ def _writes_each_element_once(
     )
 
 
+def _access_is_pair_aligned(
+    access: TileAccess,
+    shape: tuple[int, ...],
+) -> bool:
+    """Whether each access invocation consists of aligned adjacent pairs."""
+
+    def even_base(value: object) -> bool:
+        expression = sympy.expand(sympy.sympify(value))
+        concrete = _as_int(expression)
+        if concrete is not None:
+            return concrete % 2 == 0
+        from .compile_environment import CompileEnvironment
+        from .host_function import HostFunction
+        from .variable_origin import TileBeginOrigin
+
+        env = CompileEnvironment.current()
+        replacements: dict[sympy.Symbol, sympy.Integer] = {}
+        for symbol in expression.free_symbols:
+            origin_info = HostFunction.current().expr_to_origin.get(symbol)
+            origin = origin_info.origin if origin_info is not None else None
+            coefficient = expression.coeff(symbol)
+            if not isinstance(origin, TileBeginOrigin) or not isinstance(
+                coefficient, sympy.Integer
+            ):
+                return False
+            block = env.block_sizes[env.canonical_block_id(origin.block_id)].size_hint()
+            if int(coefficient) * block % 2:
+                return False
+            replacements[symbol] = sympy.Integer(0)
+        remainder = _as_int(expression.xreplace(replacements))
+        return remainder is not None and remainder % 2 == 0
+
+    if (
+        len(shape) != 1
+        or shape[0] % 2
+        or access.subscript_dims != (0,)
+        or access.subscript_is_scalar != (False,)
+        or access.subscript_index_scales != (1,)
+    ):
+        return False
+    if access.subscript_is_full_slice == (True,):
+        return True
+    ranges = access.affine_subscript_ranges
+    if ranges is not None and len(ranges) == 1:
+        coefficients, begin, end, step = ranges[0]
+        extent = _as_int(sympy.simplify(end - begin))
+        concrete_coefficients = tuple(
+            _as_int(coefficient) for _axis, coefficient, _divisor in coefficients
+        )
+        if (
+            step == 1
+            and even_base(begin)
+            and extent is not None
+            and extent % 2 == 0
+            and all(
+                coefficient is not None and coefficient % 2 == 0
+                for coefficient in concrete_coefficients
+            )
+        ):
+            return True
+    if not access.subscript_offsets or access.subscript_offsets[0] is None:
+        return False
+    if not even_base(access.subscript_offsets[0]):
+        return False
+    if access.subscript_static_extents:
+        static_extent = access.subscript_static_extents[0]
+        if static_extent is not None:
+            return static_extent % 2 == 0
+    (block_id,) = access.subscript_affine_block_ids
+    if block_id is None:
+        return False
+    from .compile_environment import CompileEnvironment
+
+    env = CompileEnvironment.current()
+    block = env.block_sizes[env.canonical_block_id(block_id)].size_hint()
+    return block % 2 == 0
+
+
 def plan_distributed_ll(
     graph: TileDependencyGraph,
     device_ir: DeviceIR,
+    *,
+    pack_bf16: bool = False,
 ) -> DistributedLLPlan | None:
     """Select symmetric allocations whose cross-rank readiness can be in-band."""
     by_allocation: dict[int, list[TileAccess]] = {}
@@ -192,6 +280,7 @@ def plan_distributed_ll(
     allocations: list[LLAllocation] = []
     stores: dict[AccessKey, LLAllocation] = {}
     loads: dict[AccessKey, tuple[LLAllocation, int]] = {}
+    packed_loads: set[AccessKey] = set()
     covered: set[int] = set()
     consumer_roots: set[int] = set()
     mailbox_offset = 0
@@ -260,12 +349,24 @@ def plan_distributed_ll(
             world_size=world_size,
             mailbox_offset=mailbox_offset,
             producer_root=store.root,
+            elements_per_word=(
+                2
+                if pack_bf16
+                and dtype == torch.bfloat16
+                and _access_is_pair_aligned(store, layout[0])
+                else 1
+            ),
         )
         mailbox_offset += 2 * allocation.slot_words()
         allocations.append(allocation)
         stores[(store.graph_id, store.graph_node_index)] = allocation
         for access, rank in peer_loads:
-            loads[(access.graph_id, access.graph_node_index)] = (allocation, rank)
+            key = access.graph_id, access.graph_node_index
+            loads[key] = (allocation, rank)
+            if allocation.elements_per_word == 2 and _access_is_pair_aligned(
+                access, layout[0]
+            ):
+                packed_loads.add(key)
             consumer_roots.add(access.root)
         covered.update(dependency_ids)
     if not allocations:
@@ -275,6 +376,7 @@ def plan_distributed_ll(
         allocations=tuple(allocations),
         stores=stores,
         loads=loads,
+        packed_loads=frozenset(packed_loads),
         covered_dependency_ids=frozenset(covered),
         consumer_roots=frozenset(consumer_roots),
     )

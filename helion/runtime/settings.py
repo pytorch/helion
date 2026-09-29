@@ -421,6 +421,11 @@ class _Settings:
     distributed_ll: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED_LL", True)
     )
+    distributed_ll_multicast: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_DISTRIBUTED_LL_MULTICAST", False
+        )
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_log_details: bool = dataclasses.field(
@@ -675,6 +680,14 @@ class Settings(_Settings):
             "Carry cross-rank tile readiness in-band (epoch-tagged mailbox words) for "
             "eligible symmetric allocations under cross_loop_pipeline='dynamic' instead of "
             "readiness counters. Set HELION_DISTRIBUTED_LL=0 to always use counters."
+        ),
+        "distributed_ll_multicast": (
+            "Use one NVLS multicast b64 store per compiler-derived LL mailbox word, "
+            "with a runtime fallback to peer stores when no multicast mapping is "
+            "available. Adjacent BF16 payloads are paired under one full 32-bit "
+            "epoch when their alignment is proven. Disabled by default; set "
+            "HELION_DISTRIBUTED_LL_MULTICAST=1 on multicast-capable NVIDIA systems "
+            "to enable."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "

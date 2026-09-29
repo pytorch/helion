@@ -608,6 +608,8 @@ class TritonBackend(Backend):
             )
             if ll_mailbox_words:
                 out.append(f"_distributed_ll_mailbox_words={ll_mailbox_words}")
+                if device_fn.triton_distributed_ll_multicast_arg is not None:
+                    out.append("_distributed_ll_multicast=True")
         if device_fn.triton_remote_copy_scratch_specs:
             specs = ", ".join(
                 f"({tensor}, {numel})"
