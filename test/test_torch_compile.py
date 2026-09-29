@@ -5594,6 +5594,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             autotune_with_torch_compile_fusion=True,
             autotune_max_generations=1,
             autotune_effort="quick",
+            # The search only has to reach the fused benchmark path; cap its
+            # wall clock so a shared-GPU runner cannot stretch it past the
+            # per-test timeout.
+            autotune_budget_seconds=30,
         )
         def k_add_no_configs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)

@@ -143,7 +143,10 @@ class TestRegisterTunable(RefEagerTestBase, TestCase):
 
         x = torch.randn(1024, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(fn, (x,), block_size=64)
-        torch.testing.assert_close(result, x.sum())
+        # The blocked partial sums reorder a float32 reduction over values of
+        # magnitude ~1; a near-zero total leaves nothing for rtol to scale, so
+        # allow the reordering noise explicitly instead of the 1e-5 default.
+        torch.testing.assert_close(result, x.sum(), rtol=1e-4, atol=1e-4)
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfSharedMemoryLessThan(
