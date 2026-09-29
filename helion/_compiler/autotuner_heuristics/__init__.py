@@ -17,6 +17,7 @@ from ..cute.grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_
 from ..cute.grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
 from ..cute.grouped_row_union import STARTUP_PREFILL_KEY
 from ..cute.grouped_row_union import TRANSPOSED_SCHEDULE
+from ..cute.split_k_cluster_config import FINALIZER_KEY
 from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
@@ -69,6 +70,10 @@ from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
+from .cute_split_k_cluster import CuteSplitKClusterHeuristic
+from .cute_split_k_cluster import cluster_carrier
+from .cute_split_k_cluster import register_cluster_coverage
+from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
 from .register_chain import CuteRegisterChainHeuristic
@@ -102,6 +107,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFlashAttentionHeuristic,
         CutePackedSingleTokenRank1Heuristic,
         CuteFixedTokenRank1Heuristic,
+        CuteSplitKWorkspaceHeuristic,
         CuteCollectiveMatmulHeuristic,
         CuteGroupedRnaHeuristic,
         CuteBlockScaledMmaHeuristic,
@@ -134,6 +140,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteBoundedLoopCacheHeuristic,
         CuteHostPairedSumHeuristic,
         CuteTcgen05GroupedSource64Heuristic,
+        CuteSplitKClusterHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -327,6 +334,12 @@ def compiler_seed_configs(
         if carrier is not None:
             configs.append(carrier)
     if env.backend_name == "cute":
+        cluster = cluster_carrier(env, device_ir)
+        if cluster is not None:
+            configs.append(cluster)
+            # Append the dependent finalizer after the complete legacy prefix.
+            configs.append(Config.from_dict(cluster.config | {FINALIZER_KEY: 4}))
+    if env.backend_name == "cute":
         serial_output = CuteResidentReductionHeuristic.serial_output_carrier(
             env, device_ir
         )
@@ -362,6 +375,7 @@ def register_compiler_coverage_groups(
     """
     if env.backend_name != "cute":
         return
+    register_cluster_coverage(env, device_ir)
     register_epilogue_fanout_coverage(env, device_ir)
     register_materialized_pdl_coverage(env, device_ir)
     configs = grouped_full_coverage_configs(env, device_ir)
