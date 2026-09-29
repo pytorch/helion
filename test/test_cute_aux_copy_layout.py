@@ -18,6 +18,7 @@ from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -175,6 +176,7 @@ def test_aux_copy_persistent_fringe_host_admission(m: int) -> None:
 
 
 @skipUnlessBackends(["cute"])
+@skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("mixed", [False, True])
