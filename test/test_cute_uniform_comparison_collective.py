@@ -7,8 +7,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
 from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_collective_matmul import _cpu_bind
 from test.test_cute_collective_native_seeded import _config
 
 import helion
@@ -59,6 +59,8 @@ def _code(*, static_shapes: bool, structural_flags: bool, config: helion.Config)
         backend="cute",
         static_shapes=static_shapes,
         autotune_effort="none",
+        cute_region_fission=structural_flags,
+        cute_materialize_transformed_operands=structural_flags,
         cute_full_slice_matmul_tiling=structural_flags,
         cute_segmented_matmul_tiling=structural_flags,
         cute_flatten_nested_reductions=structural_flags,

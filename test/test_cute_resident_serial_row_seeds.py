@@ -95,6 +95,8 @@ def _bind(
         backend="cute",
         static_shapes=static,
         autotune_effort="full",
+        cute_region_fission=True,
+        cute_materialize_transformed_operands=True,
         cute_full_slice_matmul_tiling=True,
         cute_segmented_matmul_tiling=True,
         cute_flatten_nested_reductions=True,

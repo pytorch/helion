@@ -108,6 +108,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         store_transform: Callable[..., ast.AST] | None = None,
         load_transform: Callable[..., ast.AST] | None = None,
         extra_params: list[str] | None = None,
+        codegen_graphs: list[GraphInfo] | None = None,
     ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
@@ -122,7 +123,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # Initialize our attributes
         self.host_function = func
         config = CompileEnvironment.current().backend.codegen_config(config)
-        self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
+        self.codegen_graphs = (
+            func.device_ir.build_codegen_graphs(config)
+            if codegen_graphs is None
+            else codegen_graphs
+        )
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
@@ -1944,21 +1949,82 @@ def generate_ast(
     store_transform: Callable[..., ast.AST] | None = None,
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
+    _codegen_graphs: list[GraphInfo] | None = None,
+    _memory_counters: dict[str, int] | None = None,
+    _host_prefix: list[ast.AST] | None = None,
     _bounded_cache_request: BoundedCacheRequest | None = None,
 ) -> ast.Module:
     with func:
         env = CompileEnvironment.current()
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_materialized_operand_schedule", "off") != "off"
+        ):
+            from .cute.packed_operand_codegen import generate_packed_operand
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+                or config.get("cute_materialized_schedule", "off") != "off"
+            ):
+                raise exc.InvalidConfig(
+                    "packed-operand schedule requires complete ordinary codegen"
+                )
+            return generate_packed_operand(func, config, emit_repro_caller)
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_materialized_schedule", "off") != "off"
+        ):
+            from .cute.row_resident_codegen import generate_row_resident
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+            ):
+                raise exc.InvalidConfig(
+                    "row-resident schedule does not support external transforms or partial codegen"
+                )
+            return generate_row_resident(func, config, emit_repro_caller)
         if env.backend.name == "cute" and config.get("cute_reduction_sequence") in {
             "bounded",
             "bounded_layout",
         }:
-            if store_transform is None and load_transform is None and not extra_params:
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+            ):
                 from .cute.bounded_cache_codegen import generate_bounded_cache
 
                 return generate_bounded_cache(func, config, emit_repro_caller)
             # Unsupported external transforms keep the ordinary lowering.
             config = type(config).from_dict(
                 {**config.config, "cute_reduction_sequence": "scalar"}
+            )
+        if env.cute_fission_plan is not None and len(func.device_ir.root_ids) > 1:
+            from .cute.materialized_fission_codegen import generate_materialized_fission
+
+            return generate_materialized_fission(
+                func,
+                config,
+                emit_repro_caller,
+                env.cute_fission_plan,
+                store_transform=store_transform,
+                load_transform=load_transform,
+                extra_params=extra_params,
             )
         env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
@@ -1970,7 +2036,11 @@ def generate_ast(
             store_transform=store_transform,
             load_transform=load_transform,
             extra_params=extra_params,
+            codegen_graphs=_codegen_graphs,
         )
+        if _memory_counters is not None:
+            for name, value in _memory_counters.items():
+                setattr(codegen.device_function, name, value)
         with codegen.device_function:
             CompileEnvironment.current().backend.pre_codegen(
                 graphs=codegen.codegen_graphs,
@@ -1983,7 +2053,16 @@ def generate_ast(
             # via build_launcher_args -- is generated during that visit).
             _maybe_emit_compact_worklist_builder(codegen)
 
+            prefix_recorded = False
             for stmt in func.body:
+                if (
+                    _host_prefix is not None
+                    and not prefix_recorded
+                    and isinstance(stmt, ExtendedAST)
+                    and stmt._loop_type is LoopType.GRID
+                ):
+                    _host_prefix.extend(codegen.host_statements)
+                    prefix_recorded = True
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             if _bounded_cache_request is None:
@@ -2259,6 +2338,9 @@ def generate_ast(
             result.body[insert_at:insert_at] = [
                 statement_from_string(line) for line in missing_imports
             ]
+            if _memory_counters is not None:
+                for name in _memory_counters:
+                    _memory_counters[name] = getattr(codegen.device_function, name)
             # break circular reference for better GC
             del codegen.device_function.codegen
             return result

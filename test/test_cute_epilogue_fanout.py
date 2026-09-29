@@ -11,13 +11,14 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
+from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 from torch._inductor.runtime.hints import DeviceProperties
 from torch._subclasses.fake_tensor import FakeTensor
 
 from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_shared_rhs_grouped import _target
+from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.ast_extension import ExtendedAST
@@ -428,6 +429,48 @@ def test_unproved_protocol_compositions_decline(key: str, value: object) -> None
     assert not schedule_supported({key: value})
 
 
+def original_bound() -> BoundKernel[Any]:
+    args = tuple(
+        torch.empty(shape, dtype=torch.float16, requires_grad=True)
+        for shape in (
+            (4096, 1024),
+            (1024, 512),
+            (512, 1024),
+        )
+    )
+    kernel = helion.kernel(
+        squeeze_and_excitation_net_fwd.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="full",
+        cute_region_fission=True,
+        cute_full_slice_matmul_tiling=True,
+    )
+    return kernel._bind_isolated(args)
+
+
+@skipUnlessBackends(["cute"])
+def test_original_cuda_traced_two_region_binding() -> None:
+    bound = original_bound()
+    plan = plan_for(bound)
+    assert plan.shape == (4096, 1024)
+    assert plan.prefix_steps == 1 and plan.rounded_suffix
+    assert bound.host_function is not None
+    assert len(bound.host_function.device_ir.root_ids) == 2
+    selected = helion.Config(
+        block_sizes=[128] * 6,
+        pid_type="persistent_interleaved",
+        tcgen05_cluster_m=1,
+        tcgen05_cluster_n=1,
+        tcgen05_ab_stages=2,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=4,
+        tcgen05_num_epi_warps=4,
+    )
+    selected.config[FANOUT_CONFIG_KEY] = "shared"
+    assert bound.to_code(selected)
+
+
 @pytest.mark.parametrize(
     "statement",
     (
@@ -592,6 +635,46 @@ def test_live_typed_store_proof_negatives(change: str) -> None:
     finally:
         second.args = original
         target.meta["val"] = target_value
+
+
+@skipUnlessBackends(["cute"])
+def test_registered_witnesses_are_independent_and_cache_visible() -> None:
+    bound = original_bound()
+    spec = bound.config_spec
+    (group,) = [g for g in spec.compiler_coverage_groups if g.key == FANOUT_CONFIG_KEY]
+    assert len(group.witnesses) == 4
+    payload = [w.carrier.config for w in group.witnesses]
+    assert [row["tcgen05_c_stages"] for row in payload] == [4, 4, 2, 2]
+    identities = [
+        {key: value for key, value in row.items() if key != "tcgen05_c_stages"}
+        for row in payload
+    ]
+    assert all(row == identities[0] for row in identities)
+    first = group.witnesses[0].carrier
+    first.block_sizes[0] = 999
+    assert [w.carrier.config for w in group.witnesses] == payload
+    assert all(FANOUT_CONFIG_KEY not in c.config for c in spec.compiler_seed_configs)
+    assert spec.compiler_default_config is not None
+    assert FANOUT_CONFIG_KEY not in spec.compiler_default_config.config
+    old_fingerprint = spec.cache_fingerprint_hash()
+    old_groups = spec._compiler_coverage_groups
+    try:
+        spec._compiler_coverage_groups = tuple(
+            replace(g, version=2) if g.key == FANOUT_CONFIG_KEY else g
+            for g in old_groups
+        )
+        assert spec.cache_fingerprint_hash() != old_fingerprint
+    finally:
+        spec._compiler_coverage_groups = old_groups
+    with bound.env:
+        gen = spec.create_config_generation()
+        for witness in group.witnesses:
+            requested = witness.carrier
+            requested.config[FANOUT_CONFIG_KEY] = witness.value
+            flat, effective = gen.strict_config_pair(requested)
+            assert effective.config.get(FANOUT_CONFIG_KEY, "off") == witness.value
+            assert gen.unflatten(flat) == effective
+            assert gen.strict_config_pair(effective) == (flat, effective)
 
 
 def _rendered_plan(

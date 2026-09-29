@@ -74,7 +74,9 @@ def _config(
 
 
 def _original_bound(
-    shape: tuple[int, int, int] = (73, 78, 41), dtype: torch.dtype = torch.bfloat16
+    shape: tuple[int, int, int] = (73, 78, 41),
+    dtype: torch.dtype = torch.bfloat16,
+    **settings: object,
 ) -> BoundKernel:
     m, k, n = shape
     kernel = helion.kernel(
@@ -82,6 +84,7 @@ def _original_bound(
         backend="cute",
         static_shapes=matmul_bf16_int4.settings.static_shapes,
         autotune_effort="none",
+        **settings,
     )
     return _cpu_bind(
         kernel,

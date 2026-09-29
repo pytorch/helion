@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+from dataclasses import replace
 import random
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -119,6 +120,8 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
         "HELION_AUTOTUNER",
         "HELION_AUTOTUNER_INITIAL_POPULATION",
         "HELION_AUTOTUNE_CONFIG_OVERRIDES",
+        "HELION_CUTE_REGION_FISSION",
+        "HELION_CUTE_MATERIALIZE_TRANSFORMED_OPERANDS",
         "HELION_CUTE_FULL_SLICE_MATMUL_TILING",
         "HELION_CUTE_SEGMENTED_MATMUL_TILING",
         "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS",
@@ -743,3 +746,212 @@ def test_inactive_fanout_nondefault_placement_is_preserved(
     selected = bound._normalized_config_copy(seed)
     assert selected["tcgen05_c_acquire_placement"] == placement
     assert bound._normalized_config_copy(selected) == selected
+
+
+def _materialized_bind(
+    kind: str = "matmul", dtype: torch.dtype = torch.float16, **settings: object
+) -> tuple[BoundKernel, tuple[torch.Tensor, ...]]:
+    return _bind(
+        kind,
+        dtype,
+        **{
+            "cute_region_fission": True,
+            "cute_materialize_transformed_operands": True,
+        }
+        | settings,
+    )
+
+
+@pytest.mark.parametrize("value", (2, 3, 4, 6))
+@pytest.mark.parametrize("disabled", (False, True))
+def test_materialized_global_positive_override_preserves_other_coverage_groups(
+    value: int, disabled: bool
+) -> None:
+    settings = {
+        "autotune_config_overrides": {MIN_BLOCKS_KEY: value},
+        "disable_autotuner_heuristics": disabled,
+    }
+    with patch(REGISTRATION):
+        previous, previous_args = _materialized_bind("se", **settings)
+    bound, args = _materialized_bind("se", **settings)
+    spec = bound.config_spec
+    assert not spec.cute_matmul_min_blocks_search_enabled
+    assert MIN_BLOCKS_KEY not in spec._flat_fields()
+    assert (
+        spec.compiler_coverage_groups == previous.config_spec.compiler_coverage_groups
+    )
+    # Row-resident coverage is declared independently of heuristic seeds;
+    # disabling heuristics suppresses additions, not this declaration.
+    assert [group.mechanism for group in spec.compiler_coverage_groups] == (
+        ["cute.materialized_rows"]
+        if disabled
+        else ["cute.epilogue_fanout", "cute.materialized_rows"]
+    )
+    assert all(not group.dependencies for group in spec.compiler_coverage_groups)
+    assert (
+        spec.structural_fingerprint() == previous.config_spec.structural_fingerprint()
+    )
+    assert (
+        spec.cache_fingerprint_hash() == previous.config_spec.cache_fingerprint_hash()
+    )
+    assert spec.default_config() == previous.config_spec.default_config()
+    assert spec.compiler_seed_configs == previous.config_spec.compiler_seed_configs
+    old, search = _search(previous, previous_args), _search(bound, args)
+    with (
+        previous.env,
+        patch.object(old, "_find_similar_cached_configs", return_value=[]),
+    ):
+        random.seed(2026091481)
+        old_rows = deepcopy(checked_initial_population(old))
+        old_rng = random.getstate()
+    with (
+        bound.env,
+        patch.object(search, "_find_similar_cached_configs", return_value=[]),
+    ):
+        random.seed(2026091481)
+        rows = checked_initial_population(search)
+        assert random.getstate() == old_rng
+        assert rows == old_rows
+        assert all(
+            search.config_gen.unflatten(row)[MIN_BLOCKS_KEY] == value for row in rows
+        )
+    assert vars(search).get("compiler_coverage_outcomes") == vars(old).get(
+        "compiler_coverage_outcomes"
+    )
+    # Each unchanged registry's actual additions were independently checked.
+    for group in spec.compiler_coverage_groups:
+        for witness in group.witnesses:
+            requested = witness.carrier
+            requested.config[group.key] = witness.value
+            requested.config[MIN_BLOCKS_KEY] = value
+            assert bound._normalize_config(requested) == previous._normalize_config(
+                requested
+            )
+
+
+@pytest.mark.parametrize("disabled", (False, True))
+def test_materialized_inactive_fanout_default_placement_seed_roundtrip(
+    disabled: bool,
+) -> None:
+    base, _ = _materialized_bind("se")
+    seed = _group(base).witnesses[0].carrier
+    seed.config[MIN_BLOCKS_KEY] = 0
+    seed.config.pop("tcgen05_c_acquire_placement", None)
+    bound, _ = _materialized_bind("se", disable_autotuner_heuristics=disabled)
+    implicit = bound._normalized_config_copy(seed)
+    seed.config["tcgen05_c_acquire_placement"] = "pre_loop"
+    explicit = bound._normalized_config_copy(seed)
+    assert explicit == implicit
+    assert "tcgen05_c_acquire_placement" not in explicit.config
+    with bound.env:
+        generation = bound.config_spec.create_config_generation()
+        flat, selected = generation.strict_config_pair(seed)
+        assert selected == explicit
+        assert generation.unflatten(flat) == explicit
+
+
+@pytest.mark.parametrize("disabled", (False, True))
+@pytest.mark.parametrize("placement", ("first_in_loop", "later_before_barrier"))
+def test_materialized_inactive_fanout_nondefault_placement_is_preserved(
+    disabled: bool, placement: str
+) -> None:
+    base, _ = _materialized_bind("se")
+    seed = _group(base).witnesses[0].carrier
+    seed.config["tcgen05_c_acquire_placement"] = placement
+    bound, _ = _materialized_bind("se", disable_autotuner_heuristics=disabled)
+    selected = bound._normalized_config_copy(seed)
+    assert selected["tcgen05_c_acquire_placement"] == placement
+    assert bound._normalized_config_copy(selected) == selected
+
+
+@pytest.mark.parametrize("value", (2, 3, 4, 6))
+@pytest.mark.parametrize("disabled", (False, True))
+def test_materialized_seed_local_positive_keeps_automatic_pair_and_other_groups(
+    value: int, disabled: bool
+) -> None:
+    base, _ = _materialized_bind("se")
+    seed = _group(base).witnesses[0].carrier
+    seed.config[MIN_BLOCKS_KEY] = value
+    settings = {
+        "autotune_seed_configs": [seed],
+        "disable_autotuner_heuristics": disabled,
+    }
+    with patch(REGISTRATION):
+        previous, previous_args = _materialized_bind("se", **settings)
+    bound, args = _materialized_bind("se", **settings)
+    assert _group(bound).domain == (0, 1)
+    old_groups = {
+        group.mechanism: group
+        for group in previous.config_spec.compiler_coverage_groups
+    }
+    other_groups = {
+        group.mechanism: group
+        for group in bound.config_spec.compiler_coverage_groups
+        if group.key != MIN_BLOCKS_KEY
+    }
+    assert other_groups.keys() == old_groups.keys()
+    for mechanism, group in other_groups.items():
+        old_group = old_groups[mechanism]
+        if mechanism != "cute.materialized_rows":
+            assert group == old_group
+            continue
+        assert not old_group.dependencies
+        assert [
+            (item.mechanism, item.key, item.value) for item in group.dependencies
+        ] == [("cute.matmul_min_blocks", MIN_BLOCKS_KEY, 1)]
+        assert (
+            replace(group, dependencies=(), witnesses=old_group.witnesses) == old_group
+        )
+        for current, old_witness in zip(
+            group.witnesses, old_group.witnesses, strict=True
+        ):
+            assert current.value == old_witness.value
+            carrier = current.carrier
+            assert carrier.config.pop(MIN_BLOCKS_KEY) == 1
+            assert carrier == old_witness.carrier
+    old, search = _search(previous, previous_args), _search(bound, args)
+    with (
+        previous.env,
+        patch.object(old, "_find_similar_cached_configs", return_value=[]),
+    ):
+        random.seed(2026091482)
+        old_rows = deepcopy(checked_initial_population(old))
+        old_rng = random.getstate()
+    with (
+        bound.env,
+        patch.object(search, "_find_similar_cached_configs", return_value=[]),
+    ):
+        random.seed(2026091482)
+        rows = checked_initial_population(search)
+        # The old schema drops this explicit value and deduplicates its
+        # ordinary carrier with the default. Retaining the value adds one
+        # explicit seed at row 1, so the existing builder draws one fewer
+        # random padding row. This is the intentional v1 seed behavior;
+        # the v2 global-override repair must not veto local positive seeds.
+        assert random.getstate() != old_rng
+        indices, sequence = search.config_gen._key_to_flat_indices[MIN_BLOCKS_KEY]
+        assert not sequence and len(indices) == 1
+        assert [
+            [entry for index, entry in enumerate(row) if index != indices[0]]
+            for row_index, row in enumerate(rows[:100])
+            if row_index != 1
+        ] == old_rows[:99]
+        configs = [search.config_gen.unflatten(row) for row in rows]
+    assert configs[1] == bound._normalize_config(seed)
+    assert bound._normalize_config(seed) in configs
+    if disabled:
+        assert len(rows) == 100
+        assert "compiler_coverage_outcomes" not in vars(search)
+    else:
+        outcomes = search.compiler_coverage_outcomes
+        assert all(
+            entry.outcome in ("added", "already_present")
+            for entry in outcomes
+            if entry.mechanism == "cute.epilogue_fanout"
+        )
+        assert any(
+            entry.mechanism == "cute.matmul_min_blocks"
+            and entry.requested[MIN_BLOCKS_KEY] == 1
+            and entry.outcome in ("added", "already_present")
+            for entry in outcomes
+        )

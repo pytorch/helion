@@ -54,9 +54,11 @@ def _bound(
         backend="cute",
         static_shapes=static,
         autotune_effort=effort,
+        cute_region_fission=True,
         cute_full_slice_matmul_tiling=True,
         cute_segmented_matmul_tiling=True,
         cute_flatten_nested_reductions=True,
+        cute_materialize_transformed_operands=True,
     )
     return kernel._bind_isolated((x,))
 
