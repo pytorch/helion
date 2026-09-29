@@ -18,6 +18,7 @@ from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
+from ...language.memory_ops import load as language_load
 from ...runtime.config import Config
 from ..compile_environment import ConfigValueExpression
 from ..compile_environment import FixedBlockSizeSource
@@ -1540,6 +1541,61 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         return tuple(axes)
 
     @staticmethod
+    def _gathered_candidate(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        """A cheap structural superset of the late gathered-row proof.
+
+        This only seeds direct rank-2 gathered A and rank-3 group-indexed B.
+        Complete effects, masks, alignment, zero seed and scatter equivalence
+        are proved by generated-AST admission before this schedule can run.
+        """
+        placements = cute_matmul_root_placements(env, device_ir)
+        if len(placements) != 1:
+            return False
+        fact, root = placements[0]
+        if fact.m_block_id in root or len(root) != 2:
+            return False
+        contractions = [
+            node
+            for graph in device_ir.graphs
+            for node in graph.graph.nodes
+            if node.op == "call_function"
+            and node.target is torch.ops.aten.addmm.default
+        ]
+        if len(contractions) != 1:
+            return False
+        node = contractions[0]
+        operands = node.args[1:3]
+        if any(
+            not isinstance(operand, torch.fx.Node)
+            or operand.target is not language_load
+            or not isinstance(operand.args[0], torch.fx.Node)
+            for operand in operands
+        ):
+            return False
+        lhs, rhs = cast("tuple[torch.fx.Node, torch.fx.Node]", operands)
+        lhs_base, rhs_base = lhs.args[0], rhs.args[0]
+        assert isinstance(lhs_base, torch.fx.Node) and isinstance(
+            rhs_base, torch.fx.Node
+        )
+        lhs_tensor, rhs_tensor = lhs_base.meta.get("val"), rhs_base.meta.get("val")
+        indices = lhs.args[1]
+        if (
+            not isinstance(lhs_tensor, torch.Tensor)
+            or not isinstance(rhs_tensor, torch.Tensor)
+            or (lhs_tensor.ndim, rhs_tensor.ndim) != (2, 3)
+            or not isinstance(indices, (tuple, list))
+            or len(indices) != 2
+            or not isinstance(indices[0], torch.fx.Node)
+        ):
+            return False
+        gathered_rows = indices[0].meta.get("val")
+        return (
+            isinstance(gathered_rows, torch.Tensor)
+            and gathered_rows.ndim == 1
+            and gathered_rows.dtype == torch.int32
+        )
+
+    @staticmethod
     def _bounded_k_seeds(
         env: CompileEnvironment,
         device_ir: DeviceIR,
@@ -1821,6 +1877,38 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                             native_seed.config | {"cute_collective_native_seeded": True}
                         )
                     )
+        if (
+            len(axes) == 1
+            and axes[0][3] == 1
+            and spec.target_device_capability is not None
+            and spec.target_device_capability[0] == 10
+            and cls._gathered_candidate(env, device_ir)
+        ):
+            m, n, k, _factor = axes[0]
+            base = next(
+                (
+                    seed
+                    for seed in result
+                    if spec.block_sizes.config_get(seed.block_sizes, m) == 128
+                    and spec.block_sizes.config_get(seed.block_sizes, n) == 32
+                    and spec.block_sizes.config_get(seed.block_sizes, k) == 64
+                ),
+                None,
+            )
+            if base is not None:
+                result.extend(
+                    Config.from_dict(
+                        base.config
+                        | {
+                            "cute_collective_compute": "tma_gather",
+                            "cute_gathered_mma_n": columns,
+                            "cute_gathered_mma_stages": stages,
+                        }
+                    )
+                    for columns in (128, 256, 512)
+                    for stages in (2, 3, 4)
+                    if columns != 512 or stages == 2
+                )
         result.extend(
             [
                 Config.from_dict(seed.config | {"cute_collective_stages": stages})
@@ -1849,6 +1937,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                         and seed.get("cute_collective_copy") == "scalar"
                     )
                 )
+                and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 and seed.get("cute_collective_stages", 1) == 1
                 for recipe in ("vector", "vector_unrolled")
             ]
@@ -1918,6 +2007,7 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
                     in ("vector", "vector_unrolled")
                     and seed.get("cute_collective_copy") == "scalar"
                     and seed.get("cute_collective_stages", 1) == 1
+                    and seed.get("cute_collective_compute", "warp") != "tma_gather"
                 ]
             )
         return cls._interleave_bounded_k_seeds(
