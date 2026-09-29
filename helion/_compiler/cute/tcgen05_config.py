@@ -13,8 +13,28 @@ from ...autotuner.config_fragment import BooleanFragment
 from ...autotuner.config_fragment import ConfigSpecFragment
 from ...autotuner.config_fragment import EnumFragment
 from ...autotuner.config_fragment import IntegerFragment
+from ...autotuner.config_fragment import ListOf
 from ...exc import InvalidConfig
 from ...runtime.config import Config
+from .epilogue_fanout import FANOUT_CONFIG_KEY
+from .epilogue_fanout import FANOUT_MODES
+from .epilogue_fanout import schedule_supported as fanout_schedule_supported
+from .grouped_full_coverage import full_coverage_pipeline_supported
+from .grouped_full_coverage import full_coverage_smem_upper_bound
+from .grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
+from .grouped_row_union import LEGACY_SCHEDULE
+from .grouped_row_union import PAIRED_CLC_SCHEDULE
+from .grouped_row_union import RESIDENT_CTAS_KEY as GROUPED_RESIDENT_CTAS_KEY
+from .grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
+from .grouped_row_union import STARTUP_PREFILL_KEY
+from .grouped_row_union import TRANSPOSED_SCHEDULE
+from .grouped_row_union import physical_schedule
+from .grouped_row_union import schedule_supported as row_union_schedule_supported
+from .pipeline_smem import TCGEN05_CTA_GROUP_CHOICES
+from .pipeline_smem import TCGEN05_CTA_GROUP_CONFIG_KEY
+from .pipeline_smem import TCGEN05_SMEM_AWARE_MAX_AB_STAGES
+from .pipeline_smem import Tcgen05PipelineSmemFacts
+from .pipeline_smem import max_pipeline_ab_stages
 from .strategies import ROLE_LOCAL_MONOLITHIC_DEFAULT_WARP_SPEC
 from .strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from .strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
@@ -99,6 +119,11 @@ from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_MODES
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_MODES
+from .tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_OFF
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_DIRECT
 from .tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
@@ -111,10 +136,13 @@ from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
 from .tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_SEARCH_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+from .tcgen05_constants import TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_BLOCK_SIZES
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CLUSTER_M
 from .tcgen05_constants import TCGEN05_LARGE_BN_PROOF_CONFIG_KEY
@@ -168,6 +196,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_fragment import BlockSizeFragment
     from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import PidTypeLiteral
+    from .epilogue_fanout import PairedFanoutPlan
 
 
 class Tcgen05ClusterM2SearchConstraints(NamedTuple):
@@ -317,6 +346,13 @@ TCGEN05_GROUPED_DYNAMIC_RESERVED_SMEM_BYTES = 2 * 1024
 
 
 CUTE_TCGEN05_TUNABLE_KEYS: tuple[str, ...] = (
+    GROUPED_ROW_UNION_KEY,
+    GROUPED_ROW_UNION_SCHEDULE_KEY,
+    STARTUP_PREFILL_KEY,
+    GROUPED_RESIDENT_CTAS_KEY,
+    FANOUT_CONFIG_KEY,
+    TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY,
+    TCGEN05_CTA_GROUP_CONFIG_KEY,
     "tcgen05_cluster_m",
     "tcgen05_cluster_n",
     "tcgen05_ab_stages",
@@ -421,7 +457,19 @@ class CuteTcgen05Config:
             Tcgen05AbStagesThreeSearchConstraints | None
         ) = None
         self.grouped_worklist_smem_facts: Tcgen05GroupedWorklistSmemFacts | None = None
+        self.grouped_full_coverage_supported: bool = False
+        self.grouped_full_coverage_eligible: bool = False
+        self.grouped_row_union_supported: bool = False
+        self.grouped_row_union_cluster4_supported: bool = False
+        self.grouped_row_union_cluster4_eligible: bool = False
+        self.grouped_row_union_paired_clc_supported: bool = False
+        self.grouped_row_union_paired_clc_eligible: bool = False
+        self.grouped_row_union_eligible: bool = False
+        self.grouped_row_union_multi_resident_supported: bool = False
+        self.epilogue_fanout_plans: tuple[PairedFanoutPlan, ...] = ()
+        self.epilogue_fanout_search_enabled: bool = False
         self.deep_direct_entry_validation_enabled: bool = False
+        self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
         self.num_epi_warps_search_choices: tuple[int, ...] | None = None
         self.num_epi_warps_validation_choices: tuple[int, ...] | None = None
 
@@ -469,6 +517,211 @@ class CuteTcgen05Config:
         if any(index is None for index in indices):
             return None
         return cast("tuple[int, int, int]", indices)
+
+    def row_union_profile_supported(self, name: str) -> bool:
+        if name == TRANSPOSED_SCHEDULE:
+            return self.grouped_row_union_cluster4_supported
+        if name == PAIRED_CLC_SCHEDULE:
+            return self.grouped_row_union_paired_clc_supported
+        return False
+
+    def project_row_union_codegen(self, config: Config) -> Config:
+        profile = physical_schedule(config)
+        if profile is None:
+            return config
+        indices = self._matmul_block_indices()
+        if (
+            not self.row_union_profile_supported(profile.name)
+            or indices is None
+            or config.get(GROUPED_ROW_UNION_KEY, False) is not True
+            or not row_union_schedule_supported(
+                config,
+                cast(
+                    "tuple[int, int, int]",
+                    tuple(config.block_sizes[i] for i in indices),
+                ),
+            )
+        ):
+            raise InvalidConfig(
+                "row-union physical codegen projection lacks its typed schedule proof"
+            )
+        blocks = list(config.block_sizes)
+        for index, value in zip(indices, profile.source_tile, strict=True):
+            blocks[index] = value
+        return Config.from_dict(
+            config.config | profile.codegen_values() | {"block_sizes": blocks}
+        )
+
+    def register_pipeline_smem_facts(self, facts: Tcgen05PipelineSmemFacts) -> None:
+        self.pipeline_smem_facts = facts
+        if self.paired_pipeline_search_enabled():
+            # The explicit instruction family owns its own 128-row geometry.
+            # It need not satisfy the older 256x256 search projection.
+            for pid_type in ("persistent_blocked", "persistent_interleaved"):
+                if pid_type not in self.allowed_pid_types:
+                    self.allowed_pid_types = (
+                        *self.allowed_pid_types,
+                        cast("PidTypeLiteral", pid_type),
+                    )
+
+    def paired_pipeline_search_enabled(self) -> bool:
+        facts = self.pipeline_smem_facts
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            or facts is None
+            or extents is None
+            or fragments is None
+            or any(value is None or value <= 0 for value in extents)
+        ):
+            return False
+        m, n, k = cast("tuple[int, int, int]", extents)
+        return (
+            m % 128 == 0
+            and n % 64 == 0
+            and k % 64 == 0
+            and all(
+                fragment.low <= value <= fragment.high
+                for fragment, value in zip(fragments, (128, 64, 64), strict=True)
+            )
+        )
+
+    def _paired_pipeline_parameters(
+        self, config: dict[str, object]
+    ) -> tuple[int, int, int, int, int] | None:
+        """Exact allocation family supported by the smaller SMEM reservation."""
+        facts = self.pipeline_smem_facts
+        view = self._matmul_config_view(config)
+        if (
+            facts is None
+            or view is None
+            or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two"
+            or config.get("tcgen05_cluster_m", 1) != 2
+            or config.get("tcgen05_cluster_n", 1) != 1
+            or config.get("pid_type")
+            not in (
+                "persistent_blocked",
+                "persistent_interleaved",
+            )
+            or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is not None
+            or config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY)
+            or config.get(TCGEN05_STRATEGY_CONFIG_KEY, "role_local_monolithic")
+            != "role_local_monolithic"
+            or config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, "static_persistent")
+            != "static_persistent"
+            or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, "default") != "default"
+            or any(config.get(key) is not None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
+            or any(
+                config.get(key, 0) != 0
+                for key in (
+                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+                    TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
+                )
+            )
+        ):
+            return None
+        blocks, mi, ni, ki = view
+        bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+        c_stages = config.get("tcgen05_c_stages", 2)
+        acc_stages = config.get("tcgen05_acc_stages", 2)
+        if (
+            bm not in (128, 256)
+            or bn not in (64, 128, 256)
+            or bk not in (64, 128, 256)
+            or c_stages not in (2, 4)
+            or acc_stages not in (1, 2)
+        ):
+            return None
+        return cast(
+            "tuple[int, int, int, int, int]", (bm, bn, bk, c_stages, acc_stages)
+        )
+
+    def _paired_pipeline_stage_limit(self, config: dict[str, object]) -> int | None:
+        parameters = self._paired_pipeline_parameters(config)
+        if parameters is None:
+            return None
+        facts = self.pipeline_smem_facts
+        assert facts is not None
+        bm, bn, bk, c_stages, acc_stages = parameters
+        return max_pipeline_ab_stages(
+            facts,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            c_stages=c_stages,
+            acc_stages=acc_stages,
+        )
+
+    def _validate_cta_group_config(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) != "two":
+            return
+        limit = self._paired_pipeline_stage_limit(config)
+        if limit is not None and limit > 0:
+            return
+        if fix_invalid:
+            config[TCGEN05_CTA_GROUP_CONFIG_KEY] = "auto"
+            return
+        raise InvalidConfig(
+            "tcgen05_cta_group='two' requires one row-major half/bfloat16 MMA "
+            "with a single output, no auxiliary tensor loads, a static "
+            "persistent two-CTA schedule, and supported shared-memory geometry"
+        )
+
+    def _paired_pipeline_seed_configs(self) -> list[Config]:
+        if not self.paired_pipeline_search_enabled():
+            return []
+        facts = self.pipeline_smem_facts
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        assert facts is not None and extents is not None and fragments is not None
+        m, n, k = cast("tuple[int, int, int]", extents)
+        seeds: list[Config] = []
+        for bm in (128, 256):
+            for bn in (64, 128, 256):
+                for bk in (64, 128):
+                    values = (bm, bn, bk)
+                    if any(
+                        extent % value != 0
+                        or not fragment.low <= value <= fragment.high
+                        for extent, value, fragment in zip(
+                            (m, n, k), values, fragments, strict=True
+                        )
+                    ):
+                        continue
+                    block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+                    assert block_sizes is not None
+                    maximum = max_pipeline_ab_stages(
+                        facts, bm=bm, bn=bn, bk=bk, c_stages=2, acc_stages=2
+                    )
+                    # Include a shallow ring so the tuner can choose occupancy
+                    # over latency hiding. Geometry and memory capacity decide
+                    # these seeds; no workload name or problem-size table does.
+                    for stages in dict.fromkeys((min(2, maximum), maximum)):
+                        if stages <= 0:
+                            continue
+                        seeds.append(
+                            Config(
+                                block_sizes=block_sizes,
+                                pid_type="persistent_blocked",
+                                tcgen05_cta_group="two",
+                                tcgen05_cluster_m=2,
+                                tcgen05_cluster_n=1,
+                                tcgen05_ab_stages=stages,
+                                tcgen05_c_stages=2,
+                                tcgen05_acc_stages=2,
+                                tcgen05_persistence_model="static_persistent",
+                                tcgen05_strategy="role_local_monolithic",
+                                tcgen05_layout_strategy="default",
+                                tcgen05_tvm_ffi_launch=False,
+                                tcgen05_flat_role_coordinates=False,
+                                **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                            )
+                        )
+        return seeds
 
     def _matmul_config_view(
         self, config: dict[str, object]
@@ -549,6 +802,17 @@ class CuteTcgen05Config:
                     f"{name} must be in [{fragment.low}, {fragment.high}], got {value!r}"
                 )
             return value
+        if isinstance(fragment, ListOf):
+            if not isinstance(value, list) or len(value) != fragment.length:
+                raise InvalidConfig(
+                    f"{name} requires a list of length {fragment.length}"
+                )
+            return [
+                CuteTcgen05Config._validate_optional_fragment_value(
+                    f"{name}[{index}]", fragment.inner, item
+                )
+                for index, item in enumerate(value)
+            ]
         raise InvalidConfig(f"Unsupported optional fragment type for {name}")
 
     def restrict_cluster_m_search(self, choices: tuple[int, ...]) -> None:
@@ -701,7 +965,9 @@ class CuteTcgen05Config:
             cluster_m=2,
         )
 
-    def full_tile_direct_entry_seed_config(self) -> Config | None:
+    def full_tile_direct_entry_seed_config(
+        self, *, l2_groupings: list[object] | None = None
+    ) -> Config | None:
         """Generalized TVM-FFI direct-entry seed config for the live shape.
 
         Single source of truth for the FFI ``explicit_epi_tile`` + flat-role +
@@ -724,9 +990,20 @@ class CuteTcgen05Config:
         )
         if block_sizes is None:
             return None
+        # A materializer or another root owns its own grouping coordinate.
+        # Preserve those values when projecting an existing configuration.
+        l2_groupings = (
+            [item._fill_missing() for item in self.config_spec.l2_groupings]
+            if l2_groupings is None
+            else list(l2_groupings)
+        )
+        assert self.matmul_block_ids is not None
+        l2_groupings[
+            self.config_spec.l2_groupings.block_id_to_index(self.matmul_block_ids[0])
+        ] = 2
         seed: dict[str, Any] = {
             "block_sizes": block_sizes,
-            "l2_groupings": [2],
+            "l2_groupings": l2_groupings,
             "num_warps": 8,
             "num_stages": 4,
             "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
@@ -1278,7 +1555,7 @@ class CuteTcgen05Config:
         return Config(**seed_config)
 
     def autotune_seed_configs(self) -> list[Config]:
-        seeds: list[Config] = []
+        seeds = self._paired_pipeline_seed_configs()
         plain_clc_seed = self._plain_clc_seed_config()
         if plain_clc_seed is not None:
             seeds.append(plain_clc_seed)
@@ -1374,6 +1651,21 @@ class CuteTcgen05Config:
             config["tcgen05_cluster_m"] = 1
             return
         block_sizes, m_index, n_index, k_index = config_view
+        if (
+            config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two"
+            and self.paired_pipeline_search_enabled()
+        ):
+            # This family uses the sampled MMA geometry rather than the
+            # historical automatic 256x256 cluster projection.
+            block_sizes[m_index] = 256 if block_sizes[m_index] == 256 else 128
+            if block_sizes[n_index] not in (64, 128, 256):
+                block_sizes[n_index] = 128
+            if block_sizes[k_index] not in (64, 128, 256):
+                block_sizes[k_index] = 64
+            config["tcgen05_cluster_n"] = 1
+            config["pid_type"] = "persistent_blocked"
+            config.pop("epilogue_subtile", None)
+            return
 
         def is_grouped_worklist_two_cta() -> bool:
             return (
@@ -1520,7 +1812,8 @@ class CuteTcgen05Config:
         source_m_tile = config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
         if (
             type(source_m_tile) is not int
-            or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            or source_m_tile
+            not in TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
         ):
             return
         config_view = self._matmul_config_view(config)
@@ -1530,7 +1823,11 @@ class CuteTcgen05Config:
         block_sizes[m_index] = TCGEN05_TWO_CTA_BLOCK_M
         block_sizes[n_index] = 128
         sampled_bk = block_sizes[k_index]
-        block_k_choices = TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+        block_k_choices = (
+            (128,)
+            if source_m_tile == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+            else TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+        )
         known_static_ks = {
             fact.static_k
             for fact in self.config_spec.matmul_facts
@@ -1567,8 +1864,10 @@ class CuteTcgen05Config:
             if type(sampled_bk) is int
             else block_k_choices[0]
         )
-        if source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
-            # Only the compact source-32 profile supports CtaGroup.ONE. The
+        if source_m_tile == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE:
+            config["tcgen05_cluster_m"] = 1
+        elif source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+            # The established compact source-32 profile also supports CtaGroup.ONE. The
             # reviewed source-224/256 profiles are CtaGroup.TWO even when a
             # pattern neighbor independently mutates the cluster fragment.
             config["tcgen05_cluster_m"] = 2
@@ -1591,9 +1890,295 @@ class CuteTcgen05Config:
             and TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY not in config
         )
 
+    def _normalize_grouped_full_coverage(
+        self,
+        config: dict[str, object],
+        *,
+        fix_invalid: bool,
+        validate_schedule: bool = False,
+    ) -> None:
+        key = TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
+        value = config.get(key, TCGEN05_GROUPED_FULL_COVERAGE_OFF)
+        source_m_tile = config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
+        if (
+            source_m_tile == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+            and value != TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+        ):
+            raise InvalidConfig(
+                "source64 requires the proved grouped dense-local profile"
+            )
+        if value == TCGEN05_GROUPED_FULL_COVERAGE_OFF:
+            config.pop(key, None)
+            return
+        valid = (
+            type(value) is str
+            and value
+            in (
+                TCGEN05_GROUPED_FULL_COVERAGE_DENSE,
+                TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL,
+            )
+            and self.grouped_full_coverage_supported
+        )
+        if valid and validate_schedule:
+            blocks = config.get("block_sizes")
+            indices = self._matmul_block_indices()
+            valid = (
+                isinstance(blocks, list)
+                and indices is not None
+                and max(indices) < len(blocks)
+                and full_coverage_pipeline_supported(
+                    blocks[indices[2]],
+                    config.get("tcgen05_ab_stages", 2),
+                    config.get(
+                        TCGEN05_CONSUMER_REGS_CONFIG_KEY,
+                        TCGEN05_CONSUMER_REGS_DEFAULT,
+                    ),
+                    source_m_tile=source_m_tile,
+                )
+                and config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
+                == TCGEN05_GROUPED_MODE_WORKLIST_NM
+                and source_m_tile
+                in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+                and config.get(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, False)
+                is False
+                and config.get(
+                    TCGEN05_GROUPED_EXTERNAL_DIRECT_POINTERS_CONFIG_KEY, False
+                )
+                is False
+                and config.get(
+                    TCGEN05_GROUPED_EXTERNAL_DIRECT_STRIDES_CONFIG_KEY, False
+                )
+                is False
+                and config.get(TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY)
+                is None
+                and not self._is_grouped_clc_config(config)
+                and config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto") in ("auto", "one")
+                and config.get("tcgen05_cluster_m", 1) == 1
+                and config.get("tcgen05_cluster_n", 1) == 1
+                and config.get("tcgen05_acc_stages", 2) == 2
+                and config.get("tcgen05_c_stages", 2) == 2
+                and config.get("tcgen05_num_epi_warps", 4) == 4
+                and config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1) == 1
+                and config.get(TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY, 1) == 1
+                and config.get(TCGEN05_WARP_SPEC_STORE_WARPS_KEY, 0) == 0
+                and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY, 0) == 0
+                and config.get(TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY, 0) == 0
+                and config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, "default")
+                == "default"
+                and all(
+                    config.get(key) is None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS
+                )
+                and config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False) is False
+                and config.get(TCGEN05_DIAGNOSTIC_INVALID_OUTPUT_CONFIG_KEY, False)
+                is False
+                and all(
+                    config.get(key, "normal") == "normal"
+                    for key in (
+                        TCGEN05_AB_CONSUMER_PHASE_MODE_CONFIG_KEY,
+                        TCGEN05_AB_CONSUMER_WAIT_MODE_CONFIG_KEY,
+                        TCGEN05_AB_INITIAL_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+                        TCGEN05_AB_PRODUCER_ACQUIRE_MODE_CONFIG_KEY,
+                        TCGEN05_AB_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+                        TCGEN05_ACC_PRODUCER_ADVANCE_MODE_CONFIG_KEY,
+                        TCGEN05_ACC_PRODUCER_MODE_CONFIG_KEY,
+                        TCGEN05_C_STORE_MODE_CONFIG_KEY,
+                        TCGEN05_EPILOGUE_LAYOUT_CONFIG_KEY,
+                        TCGEN05_SCHED_CONSUMER_WAIT_MODE_CONFIG_KEY,
+                    )
+                )
+            )
+            if valid and config.get("tcgen05_ab_stages", 2) == 4:
+                facts = self.grouped_worklist_smem_facts
+                constraints = self.ab_stages_three_search_constraints
+                if facts is not None and constraints is not None:
+                    valid = full_coverage_smem_upper_bound(
+                        facts.group_count,
+                        128,
+                        4,
+                        source_m_tile=cast("int", source_m_tile),
+                    ) <= (
+                        constraints.per_cta_smem_budget_bytes
+                        + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
+                    )
+        if valid:
+            return
+        if fix_invalid and source_m_tile != TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE:
+            config.pop(key, None)
+        else:
+            raise InvalidConfig(
+                f"{key}={value!r} requires a proved pure shared-RHS BF16 "
+                "Int32-offset worklist with ONE/source32, BK64/AB2/regs240 or "
+                "BK128/AB4/regs256 (also ONE/source64 dense-local), ACC2/C2, four epilogue warps, one scheduler "
+                "stage and sufficient per-CTA shared memory"
+            )
+
+    def _normalize_grouped_row_union(
+        self,
+        config: dict[str, object],
+        *,
+        fix_invalid: bool,
+        validate_schedule: bool = False,
+    ) -> None:
+        value = config.get(GROUPED_ROW_UNION_KEY, False)
+        schedule = config.get(GROUPED_ROW_UNION_SCHEDULE_KEY, LEGACY_SCHEDULE)
+        if schedule == LEGACY_SCHEDULE:
+            config.pop(GROUPED_ROW_UNION_SCHEDULE_KEY, None)
+        elif not (
+            isinstance(schedule, str)
+            and self.row_union_profile_supported(schedule)
+            and value is True
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "row-union physical schedule requires its typed BF16 shared-RHS proof"
+                )
+            config.pop(GROUPED_ROW_UNION_SCHEDULE_KEY, None)
+            schedule = LEGACY_SCHEDULE
+        prefill = config.get(STARTUP_PREFILL_KEY, False)
+        if prefill is False:
+            config.pop(STARTUP_PREFILL_KEY, None)
+        elif not (
+            prefill is True
+            and value is True
+            and schedule == PAIRED_CLC_SCHEDULE
+            and self.grouped_row_union_paired_clc_supported
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "AB startup prefill requires the proved linear-record paired CLC profile"
+                )
+            config.pop(STARTUP_PREFILL_KEY, None)
+        ctas = config.get(GROUPED_RESIDENT_CTAS_KEY, 1)
+        valid_ctas = type(ctas) is int and (
+            ctas == 1
+            or (
+                ctas == 2
+                and value is True
+                and self.grouped_row_union_multi_resident_supported
+            )
+        )
+        if not valid_ctas:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{GROUPED_RESIDENT_CTAS_KEY}={ctas!r} requires the proved "
+                    "single-CTA row-union resource domain"
+                )
+            ctas = 1
+        if ctas == 1:
+            config.pop(GROUPED_RESIDENT_CTAS_KEY, None)
+        if value is False:
+            config.pop(GROUPED_ROW_UNION_KEY, None)
+            return
+        valid = value is True and (
+            self.grouped_row_union_supported
+            if schedule == LEGACY_SCHEDULE
+            else self.row_union_profile_supported(cast("str", schedule))
+        )
+        if valid and validate_schedule:
+            indices = self._matmul_block_indices()
+            blocks = config.get("block_sizes")
+            valid = (
+                indices is not None
+                and isinstance(blocks, list)
+                and max(indices) < len(blocks)
+                and row_union_schedule_supported(
+                    config, tuple(blocks[index] for index in indices)
+                )
+            )
+        if valid:
+            return
+        if fix_invalid:
+            config.pop(GROUPED_ROW_UNION_KEY, None)
+            config.pop(STARTUP_PREFILL_KEY, None)
+            config.pop(GROUPED_ROW_UNION_SCHEDULE_KEY, None)
+            config.pop(GROUPED_RESIDENT_CTAS_KEY, None)
+        else:
+            raise InvalidConfig(
+                f"{GROUPED_ROW_UNION_KEY}={value!r} requires a proved pure "
+                "shared-RHS BF16 Int32-offset union, fresh contiguous output, "
+                "full 128x64x128 tiles and the ordinary single-CTA AB2/ACC2 "
+                "role-local dense pipeline"
+            )
+
+    def epilogue_fanout_config_supported(self, config: dict[str, object]) -> bool:
+        if not self.epilogue_fanout_plans or not fanout_schedule_supported(config):
+            return False
+        blocks = config.get("block_sizes")
+        if not isinstance(blocks, list):
+            return False
+        for plan in self.epilogue_fanout_plans:
+            for block_id, extent in zip(plan.block_ids, plan.shape, strict=True):
+                index = self._config_block_index(block_id)
+                if index is None or index >= len(blocks):
+                    return False
+                block = blocks[index]
+                if type(block) is not int or block <= 0 or extent % block:
+                    return False
+            if config.get("tcgen05_cluster_m", 1) == 2:
+                index = self._config_block_index(plan.block_ids[0])
+                assert index is not None
+                n_index = self._config_block_index(plan.block_ids[1])
+                assert n_index is not None
+                if (
+                    blocks[index] != 256
+                    or blocks[n_index] != 128
+                    or plan.output_dtype.itemsize != 2
+                ):
+                    return False
+            if (
+                config.get("tcgen05_aux_load_placement") == "pre_acc_wait"
+                and not plan.pre_wait_aux_safe
+            ):
+                return False
+        return True
+
+    def _normalize_epilogue_fanout(
+        self,
+        config: dict[str, object],
+        *,
+        fix_invalid: bool,
+        validate_schedule: bool = False,
+    ) -> None:
+        if config.get(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY) == "pre_loop":
+            # Keep the inert default implicit in both fanout controls so carriers
+            # also round-trip when fanout search and its coordinate are disabled.
+            config.pop(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY)
+        value = config.get(FANOUT_CONFIG_KEY, "off")
+        if type(value) is str and value == "off":
+            if config.get(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY) == "before_store":
+                if not fix_invalid:
+                    raise InvalidConfig("before_store requires a proved shared fanout")
+                config.pop(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY)
+            config.pop(FANOUT_CONFIG_KEY, None)
+            return
+        if (
+            type(value) is str
+            and value == "shared"
+            and self.epilogue_fanout_plans
+            and (not validate_schedule or self.epilogue_fanout_config_supported(config))
+        ):
+            return
+        if fix_invalid:
+            config.pop(FANOUT_CONFIG_KEY, None)
+        else:
+            raise InvalidConfig(
+                f"{FANOUT_CONFIG_KEY}={value!r} requires a proved equal-layout "
+                "fresh-output fanout and a static-full standard "
+                "role-local TMA epilogue"
+            )
+
     def prepare_normalization(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        # An explicit physical schedule owns its projection.  Validate the
+        # requested carrier before generic block normalization can repair it.
+        self._normalize_grouped_row_union(
+            config,
+            fix_invalid=fix_invalid,
+            validate_schedule=physical_schedule(config) is not None,
+        )
+        self._normalize_grouped_full_coverage(config, fix_invalid=fix_invalid)
+        self._normalize_epilogue_fanout(config, fix_invalid=fix_invalid)
         grouped_mode = config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
         if (
             grouped_mode in TCGEN05_GROUPED_MODES
@@ -1637,7 +2222,8 @@ class CuteTcgen05Config:
         source_m_tile = config.get(source_m_tile_key)
         if source_m_tile_key in config and (
             type(source_m_tile) is not int
-            or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+            or source_m_tile
+            not in TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
             or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
             != TCGEN05_GROUPED_MODE_WORKLIST_NM
         ):
@@ -1648,7 +2234,7 @@ class CuteTcgen05Config:
                     f"{source_m_tile_key} requires "
                     f"{TCGEN05_GROUPED_MODE_CONFIG_KEY}="
                     f"{TCGEN05_GROUPED_MODE_WORKLIST_NM!r} and one of "
-                    f"{TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES}, got "
+                    f"{TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES}, got "
                     f"{source_m_tile!r}"
                 )
         signature_key = TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY
@@ -2546,6 +3132,18 @@ class CuteTcgen05Config:
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
         ab_stages = config.get("tcgen05_ab_stages")
+        if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
+            fit_max = self._paired_pipeline_stage_limit(config)
+            if fit_max is not None and type(ab_stages) is int:
+                if ab_stages <= fit_max:
+                    return
+                if fix_invalid and fit_max > 0:
+                    config["tcgen05_ab_stages"] = fit_max
+                    return
+                raise InvalidConfig(
+                    "tcgen05 AB pipeline and output store ring exceed "
+                    f"per-CTA shared memory (maximum AB stages: {fit_max})"
+                )
         if type(ab_stages) is not int or ab_stages <= 3:
             return
         if self._grouped_dynamic_deep_config_matches(config):
@@ -2879,7 +3477,7 @@ class CuteTcgen05Config:
         config["tcgen05_c_stages"] = 4
         config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = 1
         if isinstance(config.get("l2_groupings"), list):
-            config["l2_groupings"] = [1]
+            config["l2_groupings"] = [1] * len(self.config_spec.l2_groupings)
         if isinstance(config.get("indexing"), list):
             indexing = cast("list[object]", config["indexing"])
             for i in range(len(indexing)):
@@ -3004,10 +3602,10 @@ class CuteTcgen05Config:
             and block_sizes[n_index] == 128
             and block_sizes[k_index] in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
             and config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
-            == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+            in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
         ):
             # The logical DSL tile remains 256x128 while the N,M-oriented
-            # collective resolves to a physical 128x32 CtaGroup.ONE MMA.
+            # collective resolves to a physical 128x32/64 CtaGroup.ONE MMA.
             return
         constraints = self.cluster_m2_search_constraints
         if constraints is not None and constraints.allow_edge_k_tail_family:
@@ -3109,6 +3707,9 @@ class CuteTcgen05Config:
             cluster_m_choices = self.cluster_m_search_choices
         else:
             cluster_m_choices = (1, 2)
+        paired_search = self.paired_pipeline_search_enabled()
+        if paired_search:
+            cluster_m_choices = tuple(dict.fromkeys((*cluster_m_choices, 2)))
         # cluster_n=2 (the Quack-canonical 4-CTA cluster: B multicast on top
         # of the 2-CTA A multicast) is searchable on every cluster_m=2
         # family — it wins big on B-heavy problems (fp16 4096x4096x32768:
@@ -3170,6 +3771,8 @@ class CuteTcgen05Config:
             ab_stages_max = self._get_dtype_ab_stages_hard_cap(constraints.dtype_bytes)
         else:
             ab_stages_max = 2
+        if self.pipeline_smem_facts is not None and (not for_search or paired_search):
+            ab_stages_max = max(ab_stages_max, TCGEN05_SMEM_AWARE_MAX_AB_STAGES)
         if for_search:
             l2_swizzle_choices = tuple(
                 v for v in TCGEN05_LEGAL_L2_SWIZZLE_SIZES if v <= 8
@@ -3177,6 +3780,11 @@ class CuteTcgen05Config:
         else:
             l2_swizzle_choices = TCGEN05_LEGAL_L2_SWIZZLE_SIZES
         fragments: dict[str, ConfigSpecFragment] = {
+            TCGEN05_CTA_GROUP_CONFIG_KEY: EnumFragment(
+                TCGEN05_CTA_GROUP_CHOICES
+                if not for_search or paired_search
+                else ("auto",)
+            ),
             "tcgen05_cluster_m": EnumFragment(cluster_m_choices),
             "tcgen05_cluster_n": EnumFragment(cluster_n_choices),
             "tcgen05_ab_stages": IntegerFragment(1, ab_stages_max, 2),
@@ -3185,7 +3793,45 @@ class CuteTcgen05Config:
             "tcgen05_num_epi_warps": num_epi_warps_fragment,
             TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: EnumFragment(l2_swizzle_choices),
         }
-        if self.aux_kernel_detected or not for_search:
+        if not for_search or self.grouped_full_coverage_eligible:
+            fragments[TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY] = EnumFragment(
+                TCGEN05_GROUPED_FULL_COVERAGE_MODES
+            )
+        if (
+            not for_search
+            or self.grouped_row_union_eligible
+            or self.grouped_row_union_cluster4_eligible
+            or self.grouped_row_union_paired_clc_eligible
+        ):
+            fragments[GROUPED_ROW_UNION_KEY] = BooleanFragment()
+        if (
+            not for_search
+            or self.grouped_row_union_cluster4_eligible
+            or self.grouped_row_union_paired_clc_eligible
+        ):
+            choices = [LEGACY_SCHEDULE]
+            if not for_search or self.grouped_row_union_cluster4_eligible:
+                choices.append(TRANSPOSED_SCHEDULE)
+            if not for_search or self.grouped_row_union_paired_clc_eligible:
+                choices.append(PAIRED_CLC_SCHEDULE)
+            fragments[GROUPED_ROW_UNION_SCHEDULE_KEY] = EnumFragment(tuple(choices))
+        if not for_search or self.grouped_row_union_paired_clc_eligible:
+            fragments[STARTUP_PREFILL_KEY] = BooleanFragment()
+        if not for_search or (
+            self.grouped_row_union_eligible
+            and self.grouped_row_union_multi_resident_supported
+        ):
+            fragments[GROUPED_RESIDENT_CTAS_KEY] = EnumFragment((1, 2))
+        if not for_search or self.epilogue_fanout_search_enabled:
+            fragments[FANOUT_CONFIG_KEY] = EnumFragment(FANOUT_MODES)
+            fragments[TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY] = EnumFragment(
+                TCGEN05_C_ACQUIRE_PLACEMENTS
+            )
+        if (
+            self.aux_kernel_detected
+            or self.epilogue_fanout_search_enabled
+            or not for_search
+        ):
             fragments[TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY] = EnumFragment(
                 TCGEN05_AUX_LOAD_PLACEMENTS
             )
@@ -3199,7 +3845,7 @@ class CuteTcgen05Config:
                     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
                     *(
                         choice
-                        for choice in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+                        for choice in TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
                         if choice != TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
                     ),
                 )
@@ -3211,12 +3857,24 @@ class CuteTcgen05Config:
             # Validation exposes the two direct-entry controls for explicit
             # configs. Layout overrides already have a generic validation path
             # below; only the seed/search surface narrows them to its fixed tile.
+            # The FFI arm projects to one validated seed. Keep it as the
+            # default and as an explicit/seed value, while random exploration
+            # samples the ordinary arm. Sampling the seed's redundant role
+            # and layout payload independently would request FFI promotion
+            # again and erase the sampled geometry and pipeline choices.
             tvm_ffi_launch_fragment: ConfigSpecFragment = (
-                EnumFragment((True,)) if for_search else BooleanFragment()
+                EnumFragment((True, False), search_choices=(False,))
+                if for_search
+                else BooleanFragment()
+            )
+            flat_role_fragment: ConfigSpecFragment = (
+                EnumFragment((False, True), search_choices=(False,))
+                if for_search
+                else BooleanFragment()
             )
             fragments.update(
                 {
-                    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: BooleanFragment(),
+                    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY: flat_role_fragment,
                     TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY: tvm_ffi_launch_fragment,
                 }
             )
@@ -3224,13 +3882,13 @@ class CuteTcgen05Config:
                 fragments.update(
                     {
                         TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY: EnumFragment(
-                            (None, 128)
+                            (None, 128), search_choices=(None,) if for_search else None
                         ),
                         TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_N_KEY: EnumFragment(
-                            (None, 32)
+                            (None, 32), search_choices=(None,) if for_search else None
                         ),
                         TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY: EnumFragment(
-                            (None, 32)
+                            (None, 32), search_choices=(None,) if for_search else None
                         ),
                     }
                 )
@@ -3259,7 +3917,9 @@ class CuteTcgen05Config:
         # candidates onto the validated CtaGroup.TWO envelope for ANY eligible
         # shape (returns None for ineligible shapes, in which case the
         # promotion surface is stripped back to the DEFAULT layout below).
-        seed = self.full_tile_direct_entry_seed_config()
+        seed = self.full_tile_direct_entry_seed_config(
+            l2_groupings=cast("list[object] | None", config.get("l2_groupings"))
+        )
         if not self._target1_tvm_ffi_promotion_requested(config):
             return
         if seed is None:
@@ -3478,7 +4138,12 @@ class CuteTcgen05Config:
                 search_choices=strategy_choices,
                 search_only_if_widened=True,
             ),
-            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(layout_choices),
+            TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY: EnumFragment(
+                layout_choices,
+                search_choices=(Tcgen05LayoutStrategy.DEFAULT.value,)
+                if direct_entry_seed_eligible
+                else None,
+            ),
             TCGEN05_WARP_SPEC_MMA_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_AB_LOAD_WARPS_KEY: EnumFragment((1,)),
             TCGEN05_WARP_SPEC_EPI_LOAD_WARPS_KEY: EnumFragment((0,)),
@@ -3588,6 +4253,11 @@ class CuteTcgen05Config:
         raise InvalidConfig(f"tcgen05 strategy invariants violated: {message}")
 
     def _clamp_l2_swizzle_size_to_shape(self, config: dict[str, object]) -> None:
+        if TCGEN05_GROUPED_STATIC_PROBLEM_SIGNATURE_CONFIG_KEY in config:
+            # A grouped signature has no single N extent to clamp against.
+            # Preserve the requested value so lowering can reject swizzling
+            # that the static grouped scheduler does not support.
+            return
         if (
             config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
             == TCGEN05_GROUPED_MODE_WORKLIST_NM
@@ -3674,6 +4344,7 @@ class CuteTcgen05Config:
                     else:
                         config[key] = optional_search_fragments[key].default()
             self._clamp_l2_swizzle_size_to_shape(config)
+            self._validate_cta_group_config(config, fix_invalid=fix_invalid)
             self._validate_direct_entry_ab_stage_envelope(
                 config, fix_invalid=fix_invalid
             )
@@ -4015,10 +4686,57 @@ class CuteTcgen05Config:
             )
 
     def fix_search_config(self, config: dict[str, object]) -> None:
+        if config.get(TCGEN05_CTA_GROUP_CONFIG_KEY) == "two":
+            if self.paired_pipeline_search_enabled():
+                config["tcgen05_cluster_m"] = 2
+                config[TCGEN05_STRATEGY_CONFIG_KEY] = (
+                    Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value
+                )
+                config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+                    Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+                )
+                config[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY] = (
+                    Tcgen05LayoutStrategy.DEFAULT.value
+                )
+                # The paired pipeline disables direct-entry controls. Repair
+                # must use the search schema's canonical representation, so
+                # inactive controls cannot survive only one side of flatten.
+                search_fields = self.optional_fragments(for_search=True)
+                for key in (
+                    TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY,
+                    TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
+                ):
+                    if key in search_fields:
+                        config[key] = False
+                    else:
+                        config.pop(key, None)
+                for key in TCGEN05_LAYOUT_OVERRIDES_KEYS:
+                    config[key] = None
+                for key in (
+                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+                    TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
+                ):
+                    config[key] = 0
+                self._fix_cluster_m2_search_config(config)
+                self._clamp_l2_swizzle_size_to_shape(config)
+                self._validate_cta_group_config(config, fix_invalid=True)
+                self._validate_direct_entry_ab_stage_envelope(config, fix_invalid=True)
+                return
+            config[TCGEN05_CTA_GROUP_CONFIG_KEY] = "auto"
         self._fix_grouped_worklist_search_config(config)
         self._fix_aux_edge_search_config(config)
         self._fix_cluster_m2_search_config(config)
         self._fix_cluster_m1_persistent_search_config(config)
+        if (
+            self.search_enabled
+            and config.get("tcgen05_cluster_m", 1) == 1
+            and config.get("tcgen05_cluster_n", 1) == 2
+        ):
+            # The validated N multicast needs the two-CTA M family. A
+            # one-CTA sample must retain its geometry with no N multicast;
+            # explicit configurations still go through the unchanged guard.
+            config["tcgen05_cluster_n"] = 1
         self._fix_ab_stages_three_search_config(config)
         self._fix_target1_tvm_ffi_search_config(config)
         self._fix_aux_tma_full_tile_search_config(config)
@@ -4042,6 +4760,8 @@ class CuteTcgen05Config:
         # above, including the scheduler/c-input warp fix-ups.
         self._fix_clc_persistence_search_config(config)
         self._validate_sched_stage_count_config(config, fix_invalid=True)
+        self._validate_cta_group_config(config, fix_invalid=True)
+        self._validate_direct_entry_ab_stage_envelope(config, fix_invalid=True)
 
     def normalize_strategy(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -4117,6 +4837,15 @@ class CuteTcgen05Config:
             # a CLC persistence model.
             self._fix_aux_tma_search_config(config)
         self._normalize_grouped_static_reserved_sms(config)
+        self._normalize_grouped_full_coverage(
+            config, fix_invalid=fix_invalid, validate_schedule=True
+        )
+        self._normalize_grouped_row_union(
+            config, fix_invalid=fix_invalid, validate_schedule=True
+        )
+        self._normalize_epilogue_fanout(
+            config, fix_invalid=fix_invalid, validate_schedule=True
+        )
 
     def flat_fields(
         self,
@@ -4194,7 +4923,9 @@ class CuteTcgen05Config:
             seeds,
             TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY,
             int,
-            lambda value: value in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
+            lambda value: (
+                value in TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
+            ),
         )
         if source_m_tiles:
             fields[TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY] = (

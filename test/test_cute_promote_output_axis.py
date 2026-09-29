@@ -562,6 +562,7 @@ def test_grouped_gemm_keeps_dynamic_row_loop(static_shapes: bool) -> None:
         grouped_gemm_jagged.fn,
         backend="cute",
         static_shapes=static_shapes,
+        cute_segmented_matmul_tiling=False,
     )
     bound = _bind(
         kernel,
@@ -573,4 +574,39 @@ def test_grouped_gemm_keeps_dynamic_row_loop(static_shapes: bool) -> None:
     code = bound.to_code(helion.Config(block_sizes=[16, 32, 16]))
     ast.parse(code)
     assert "for tile_offset_1 in range" in code
+    assert "for tile_offset_2 in range" not in code
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_grouped_gemm_segmented_rows_use_masked_grid(static_shapes: bool) -> None:
+    kernel = helion.kernel(
+        grouped_gemm_jagged.fn,
+        backend="cute",
+        static_shapes=static_shapes,
+        cute_segmented_matmul_tiling=True,
+    )
+    bound = _bind(
+        kernel,
+        torch.empty((128, 256), dtype=torch.bfloat16),
+        torch.empty((256, 128), dtype=torch.bfloat16),
+        torch.empty(5, dtype=torch.int32),
+    )
+    host = _host(bound)
+    assert host.device_ir.grid_block_ids == [[0, 1, 2]]
+    assert [
+        graph.block_ids
+        for graph in host.device_ir.graphs
+        if type(graph) is ForLoopGraphInfo
+    ] == [[3]]
+    masks = [
+        ast.unparse(keyword.value)
+        for node in ast.walk(ast.Module(body=host.body, type_ignores=[]))
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+        if keyword.arg == "extra_mask"
+    ]
+    assert masks == ["_helion_segment_valid[:, None]"] * 2
+    code = bound.to_code(helion.Config(block_sizes=[16, 32, 16]))
+    ast.parse(code)
+    assert "for tile_offset_1 in range" not in code
     assert "for tile_offset_2 in range" not in code

@@ -99,6 +99,9 @@ def captured() -> Iterator[_Capture]:
         original_kernel.fn,
         backend="cute",
         static_shapes=True,
+        cute_full_slice_matmul_tiling=False,
+        cute_segmented_matmul_tiling=False,
+        cute_flatten_nested_reductions=False,
     )
     consume = completion.completed_matmul_sum_input
     observations: list[_Capture] = []

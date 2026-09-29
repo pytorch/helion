@@ -602,6 +602,21 @@ class _Settings:
         )
     )
     pallas_topk_recall_target: float = 0.99
+    cute_full_slice_matmul_tiling: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_FULL_SLICE_MATMUL_TILING", False
+        )
+    )
+    cute_segmented_matmul_tiling: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_SEGMENTED_MATMUL_TILING", False
+        )
+    )
+    cute_flatten_nested_reductions: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS", False
+        )
+    )
     triton_do_not_specialize: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_TRITON_DO_NOT_SPECIALIZE", False
@@ -731,6 +746,21 @@ class Settings(_Settings):
         "pallas_topk_recall_target": (
             "Recall target for the Pallas approximate top-k lowering. Must be in "
             "(0, 1]; use 1.0 when exact top-k results are required. Default 0.99."
+        ),
+        "cute_full_slice_matmul_tiling": (
+            "If True, give eligible direct full-slice half/BF16 matmuls an "
+            "explicit, tunable contraction tile loop on CuTe. Defaults to "
+            "HELION_CUTE_FULL_SLICE_MATMUL_TILING (False)."
+        ),
+        "cute_segmented_matmul_tiling": (
+            "If True, expose proven offset-delimited independent matrix rows "
+            "to the CuTe grouped scheduler. Defaults to "
+            "HELION_CUTE_SEGMENTED_MATMUL_TILING (False)."
+        ),
+        "cute_flatten_nested_reductions": (
+            "If True, flatten proven FP32 joint jagged/feature reductions and "
+            "independent fresh-output stores on CuTe. Defaults to "
+            "HELION_CUTE_FLATTEN_NESTED_REDUCTIONS (False)."
         ),
         "triton_do_not_specialize": (
             "If True, pass do_not_specialize for every dynamic size/stride/symbol "

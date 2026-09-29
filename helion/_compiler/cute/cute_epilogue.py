@@ -25,9 +25,10 @@ expression for two cases:
   ``helion.language.load(aux_tensor, [...])`` calls as the other.
   Auxiliary expressions may use the same whitelisted unary and
   scalar-binary operations as the carrier chain without flattening
-  their floating-point association. Explicit FP16/BF16/FP32 conversions
-  within auxiliary expressions preserve each rounding boundary; casts on
-  the accumulator carrier remain outside the whitelist.
+  their floating-point association. Explicit FP16/BF16/FP32 conversions are
+  explicit steps in auxiliary expressions and on the accumulator carrier;
+  each converts through the requested type and back to FP32 so every
+  rounding boundary is preserved.
   Two aux load shapes are accepted: the
   exact-shape rank-2 form (``residual[tile_m, tile_n]``) and the
   rank-1 trailing-axis (rowvec) broadcast form (``bias[tile_n]``).
@@ -67,6 +68,7 @@ from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+from .math_templates import SIGMOID_TEMPLATE
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -97,6 +99,47 @@ class _UnaryOp:
 
     op_name: str
     template: str
+
+
+_FLOAT_CAST_TYPES = {
+    torch.float16: "cutlass.Float16",
+    torch.bfloat16: "cutlass.BFloat16",
+    torch.float32: "cutlass.Float32",
+}
+
+
+def _round_epilogue_expression(template: str, dtype: torch.dtype | None) -> str:
+    """Keep each low-precision FX result's rounding before later FP32 math."""
+    if dtype not in (torch.float16, torch.bfloat16):
+        return template
+    assert dtype is not None
+    return f"({template}).to({_FLOAT_CAST_TYPES[dtype]}).to(cutlass.Float32)"
+
+
+def _round_unary_step(step: _UnaryOp, node: torch.fx.Node) -> _UnaryOp:
+    return dataclasses.replace(
+        step,
+        template=_round_epilogue_expression(step.template, _node_tensor_dtype(node)),
+    )
+
+
+def _floating_cast_step(
+    node: torch.fx.Node,
+) -> tuple[_UnaryOp, torch.fx.Node] | None:
+    """Return the explicit FP16/BF16/FP32 conversion step and its operand."""
+    cast_operand = _auxiliary_cast_operand(node)
+    if cast_operand is None:
+        return None
+    operand, _source_dtype, dtype = cast_operand
+    # Tensor-core epilogues compute in FP32. A conversion through the requested
+    # type retains the explicit rounding without changing subsequent math's
+    # compute type. The final store still performs its own target conversion.
+    template = (
+        "{inner}.to(cutlass.Float32)"
+        if dtype is torch.float32
+        else _round_epilogue_expression("{inner}", dtype)
+    )
+    return _UnaryOp(op_name=f"to_{dtype}", template=template), operand
 
 
 @dataclasses.dataclass(frozen=True)
@@ -136,15 +179,6 @@ class _UnaryTensorExpr:
 
 
 @dataclasses.dataclass(frozen=True)
-class _CastTensorExpr:
-    """An explicit auxiliary conversion; never fold a narrowing/widening pair."""
-
-    operand: _TensorExpr
-    source_dtype: torch.dtype
-    target_dtype: torch.dtype
-
-
-@dataclasses.dataclass(frozen=True)
 class _BinaryTensorExpr:
     """A binary operation preserving the auxiliary FX tree's association."""
 
@@ -155,18 +189,8 @@ class _BinaryTensorExpr:
 
 
 _TensorExpr = (
-    _CurrentTensorExpr
-    | _AuxiliaryTensorLoadExpr
-    | _UnaryTensorExpr
-    | _CastTensorExpr
-    | _BinaryTensorExpr
+    _CurrentTensorExpr | _AuxiliaryTensorLoadExpr | _UnaryTensorExpr | _BinaryTensorExpr
 )
-
-_AUX_CAST_DTYPES: dict[torch.dtype, str] = {
-    torch.float16: "cutlass.Float16",
-    torch.bfloat16: "cutlass.BFloat16",
-    torch.float32: "cutlass.Float32",
-}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -265,17 +289,13 @@ _EXP_TEMPLATE = "cute.math.exp({inner})"
 _LOG_TEMPLATE = "cute.math.log({inner})"
 _SQRT_TEMPLATE = "cute.math.sqrt({inner})"
 _ERF_TEMPLATE = "cute.math.erf({inner})"
-# ``sigmoid`` and ``silu`` share the base-2 exp2 sigmoid form used by
-# inductor's cutedsl op overrides
-# (``torch/_inductor/codegen/cutedsl/cutedsl_op_overrides.py``):
-# ``1 / (1 + exp(-x)) == 1 / (1 + exp2(-x * log2(e)))``. Using
-# ``cute.math.exp2`` matches the existing pointwise sigmoid lowering and
-# keeps numerics bit-identical with the inductor path. The constant
-# ``1/ln(2)`` is spelled as a literal float so the rendered Python is
-# byte-identical across machines (same idiom as the GELU constants in
-# ``helion/language/_gelu_tanh_approx.py``).
+# Use the same FP32 expression as the default pointwise sigmoid lowering.
+# The chain renderer retains each result's dtype rounding separately.
+_SIGMOID_TEMPLATE = SIGMOID_TEMPLATE.format(x="{inner}")
+
+# SiLU also accepts an explicit division-based decomposition. Keep its
+# existing arithmetic form separate from the standalone sigmoid contract.
 _LOG2_E = 1.4426950408889634
-_SIGMOID_TEMPLATE = f"(1.0 / (1.0 + cute.math.exp2(-({{inner}}) * {_LOG2_E!r})))"
 # ``silu(x) = x * sigmoid(x)``. The chain renderer always binds
 # ``{inner}`` to a fresh local before formatting, so the two
 # references to ``{inner}`` here resolve to a single SSA name (no
@@ -365,11 +385,9 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     torch.ops.aten.sqrt.default: _UnaryOp(op_name="sqrt", template=_SQRT_TEMPLATE),
     torch.ops.aten.erf.default: _UnaryOp(op_name="erf", template=_ERF_TEMPLATE),
     # ``aten.sigmoid.default`` is accepted as a standalone unary step so
-    # ``out[tile] = sigmoid(acc).to(...)`` fuses end-to-end. The same
-    # template is also embedded inside ``_SILU_TEMPLATE`` for the
-    # ``x * sigmoid(x)`` fusion below — keeping both paths on the
-    # ``cute.math.exp2`` form matches the inductor cutedsl pointwise
-    # sigmoid lowering byte-for-byte.
+    # ``out[tile] = sigmoid(acc).to(...)`` fuses end-to-end. Its FP32
+    # expression matches the default pointwise sigmoid lowering;
+    # low-precision results retain their separate rounding step.
     torch.ops.aten.sigmoid.default: _UnaryOp(
         op_name="sigmoid",
         template=_SIGMOID_TEMPLATE,
@@ -386,15 +404,8 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
         op_name="gelu_tanh_approx",
         template=epilogue_unary_step_template(),
     ),
-    # NOTE: ``prims.convert_element_type.default`` is intentionally
-    # absent. A user-explicit intermediate cast (e.g.,
-    # ``out[tile] = relu(acc).to(d_inter)`` written to a
-    # ``d_target != d_inter`` tensor) shows up as a second
-    # ``convert_element_type`` mid-chain; rejecting it by whitelist
-    # falls through to the loud-failure backstop and prevents
-    # silently dropping the intermediate cast (which would change
-    # rounding). Pinned by
-    # ``test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch``.
+    # Conversions require their dtype argument and are handled separately by
+    # _floating_cast_step so intermediate rounding is retained explicitly.
 }
 
 
@@ -518,8 +529,8 @@ def _auxiliary_cast_operand(
     if (
         not isinstance(source, torch.Tensor)
         or not isinstance(result, torch.Tensor)
-        or source.dtype not in _AUX_CAST_DTYPES
-        or target_dtype not in _AUX_CAST_DTYPES
+        or source.dtype not in _FLOAT_CAST_TYPES
+        or target_dtype not in _FLOAT_CAST_TYPES
         or result.dtype != target_dtype
         or tuple(source.shape) != tuple(result.shape)
     ):
@@ -584,7 +595,9 @@ def _aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
     load_dtype = _node_tensor_dtype(load_node)
     if load_dtype is None or not load_dtype.is_floating_point:
         return node, "{aux}"
-    return load_node, f"(({inner_template}) * {scalar!r})"
+    return load_node, _round_epilogue_expression(
+        f"(({inner_template}) * {scalar!r})", _node_tensor_dtype(node)
+    )
 
 
 def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
@@ -596,9 +609,9 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
         return True
     if node.op != "call_function" or node.kwargs:
         return False
-    cast_operand = _auxiliary_cast_operand(node)
-    if cast_operand is not None:
-        return _is_auxiliary_tensor_expr_node(cast_operand[0], depth + 1)
+    cast_step = _floating_cast_step(node)
+    if cast_step is not None:
+        return _is_auxiliary_tensor_expr_node(cast_step[1], depth + 1)
     unary_step = _ZERO_ARG_TARGETS.get(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:
@@ -636,7 +649,7 @@ def _auxiliary_tensor_expr_operands(
         return ()
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
         return (expr,)
-    if isinstance(expr, (_UnaryTensorExpr, _CastTensorExpr)):
+    if isinstance(expr, _UnaryTensorExpr):
         return _auxiliary_tensor_expr_operands(expr.operand)
     if isinstance(expr, _BinaryTensorExpr):
         return (
@@ -651,7 +664,7 @@ def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
         return True
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
         return False
-    if isinstance(expr, (_UnaryTensorExpr, _CastTensorExpr)):
+    if isinstance(expr, _UnaryTensorExpr):
         return _tensor_expr_contains_current(expr.operand)
     if isinstance(expr, _BinaryTensorExpr):
         return _tensor_expr_contains_current(expr.lhs) or _tensor_expr_contains_current(
@@ -679,7 +692,7 @@ def _render_auxiliary_tensor_expr(
         assert isinstance(local, str)
         rendered = expr.template.format(aux=aux_local)
         return f"{prelude_indent}{local} = {rendered}\n", local
-    if isinstance(expr, (_UnaryTensorExpr, _CastTensorExpr)):
+    if isinstance(expr, _UnaryTensorExpr):
         prelude, operand = _render_auxiliary_tensor_expr(
             expr.operand,
             carrier_name,
@@ -694,11 +707,7 @@ def _render_auxiliary_tensor_expr(
         )
         local = local_name_factory(local_prefix)  # type: ignore[operator]
         assert isinstance(local, str)
-        rendered = (
-            expr.step.template.format(inner=operand)
-            if isinstance(expr, _UnaryTensorExpr)
-            else f"({operand}).to({_AUX_CAST_DTYPES[expr.target_dtype]})"
-        )
+        rendered = expr.step.template.format(inner=operand)
         return prelude + f"{prelude_indent}{local} = {rendered}\n", local
     if isinstance(expr, _BinaryTensorExpr):
         lhs_prelude, lhs = _render_auxiliary_tensor_expr(
@@ -952,7 +961,7 @@ def _classify_silu(
     fall through to ``_classify_binary`` for ordinary scalar /
     aux-tensor binaries.
     """
-    if cur.kwargs:
+    if cur.kwargs or _node_tensor_dtype(cur) in (torch.float16, torch.bfloat16):
         return None
     if len(cur.args) < 2:
         return None
@@ -1053,7 +1062,9 @@ def _classify_binary(
             _AuxiliaryTensorExprStep(
                 expr=_BinaryTensorExpr(
                     op_name=op_name,
-                    op_template=_AUX_EXPR_BINARY_TEMPLATES[target],
+                    op_template=_round_epilogue_expression(
+                        _AUX_EXPR_BINARY_TEMPLATES[target], _node_tensor_dtype(cur)
+                    ),
                     lhs=current_expr if forward_form else aux_expr,
                     rhs=aux_expr if forward_form else current_expr,
                 )
@@ -1093,7 +1104,9 @@ def _classify_binary(
             expr=_UnaryTensorExpr(
                 step=_UnaryOp(
                     op_name=_BINARY_OP_NAMES[target],
-                    template=template,
+                    template=_round_epilogue_expression(
+                        template, _node_tensor_dtype(cur)
+                    ),
                 ),
                 operand=_CurrentTensorExpr(),
             )
@@ -1152,11 +1165,11 @@ def _classify_auxiliary_tensor_expr_impl(
 
     if node.op != "call_function" or node.kwargs:
         return None
-    cast_operand = _auxiliary_cast_operand(node)
-    if cast_operand is not None:
-        operand_node, source_dtype, target_dtype = cast_operand
+    cast_step = _floating_cast_step(node)
+    if cast_step is not None:
+        unary_step, unary_operand = cast_step
         operand_expr = _classify_auxiliary_tensor_expr_impl(
-            operand_node,
+            unary_operand,
             carrier_tile_shape=carrier_tile_shape,
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
@@ -1164,11 +1177,7 @@ def _classify_auxiliary_tensor_expr_impl(
         )
         if operand_expr is None:
             return None
-        return _CastTensorExpr(
-            operand=operand_expr,
-            source_dtype=source_dtype,
-            target_dtype=target_dtype,
-        )
+        return _UnaryTensorExpr(step=unary_step, operand=operand_expr)
     unary_step = _ZERO_ARG_TARGETS.get(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:
@@ -1196,7 +1205,9 @@ def _classify_auxiliary_tensor_expr_impl(
         )
         if operand_expr is None:
             return None
-        return _UnaryTensorExpr(step=unary_step, operand=operand_expr)
+        return _UnaryTensorExpr(
+            step=_round_unary_step(unary_step, node), operand=operand_expr
+        )
 
     if node.target not in _SCALAR_BINARY_TARGETS or len(node.args) != 2:
         return None
@@ -1235,7 +1246,9 @@ def _classify_auxiliary_tensor_expr_impl(
             return None
         return _BinaryTensorExpr(
             op_name=_BINARY_OP_NAMES[node.target],
-            op_template=_AUX_EXPR_BINARY_TEMPLATES[node.target],
+            op_template=_round_epilogue_expression(
+                _AUX_EXPR_BINARY_TEMPLATES[node.target], result_dtype
+            ),
             lhs=lhs_expr,
             rhs=rhs_expr,
         )
@@ -1255,7 +1268,7 @@ def _classify_auxiliary_tensor_expr_impl(
         return _UnaryTensorExpr(
             step=_UnaryOp(
                 op_name=_BINARY_OP_NAMES[node.target],
-                template=template,
+                template=_round_epilogue_expression(template, lhs_dtype),
             ),
             operand=lhs_expr,
         )
@@ -1275,7 +1288,7 @@ def _classify_auxiliary_tensor_expr_impl(
         return _UnaryTensorExpr(
             step=_UnaryOp(
                 op_name=_BINARY_OP_NAMES[node.target],
-                template=template,
+                template=_round_epilogue_expression(template, rhs_dtype),
             ),
             operand=rhs_expr,
         )
@@ -1411,14 +1424,10 @@ def analyze_tcgen05_unary_epilogue_chain(
     (``bias[tile_m]``), kwargs — are rejected so the loud-failure
     backstop fires.
 
-    A user-written intermediate cast like
-    ``out[tile] = relu(acc).to(d_inter)`` with ``d_inter`` not equal
-    to the store target's dtype shows up as a *second*
-    ``convert_element_type`` inside the chain. The chain step loop
-    rejects that because ``convert_element_type`` is not on the
-    whitelist; the loud-failure backstop then fires. This means the
-    splice cannot silently drop a user-explicit intermediate cast —
-    pinned by ``test_tcgen05_fused_chain_rejects_intermediate_cast_dtype_mismatch``.
+    Intermediate FP16/BF16/FP32 casts remain explicit steps. The rendered
+    value converts through the requested type and back to FP32; later
+    low-precision arithmetic also rounds after each FX step. The final
+    store conversion is separate, including stores with a different dtype.
 
     Returns ``(chain, matmul_anchor)`` on success — the rendered chain
     excludes the optional trailing ``convert_element_type`` (the splice site
@@ -1496,6 +1505,22 @@ def analyze_tcgen05_unary_epilogue_chain(
         if cur.op != "call_function":
             return None
         target = cur.target
+        cast_step = _floating_cast_step(cur)
+        if cast_step is not None:
+            step, arg = cast_step
+            steps.append(
+                _AuxiliaryTensorExprStep(
+                    expr=_UnaryTensorExpr(step=step, operand=_CurrentTensorExpr())
+                )
+            )
+            anchor = walk_carrier_to_tcgen05_matmul(
+                arg, target_fx_nodes, inner_outputs_by_graph_id
+            )
+            if anchor is not None:
+                steps.reverse()
+                return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
+            cur = arg
+            continue
         # Zero-arg unary ops.
         if target in _ZERO_ARG_TARGETS:
             if cur.kwargs:
@@ -1506,7 +1531,7 @@ def analyze_tcgen05_unary_epilogue_chain(
             steps.append(
                 _AuxiliaryTensorExprStep(
                     expr=_UnaryTensorExpr(
-                        step=_ZERO_ARG_TARGETS[target],
+                        step=_round_unary_step(_ZERO_ARG_TARGETS[target], cur),
                         operand=_CurrentTensorExpr(),
                     )
                 )

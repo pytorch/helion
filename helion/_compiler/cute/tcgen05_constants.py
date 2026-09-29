@@ -223,12 +223,14 @@ def tcgen05_c_smem_bytes_per_cta(
 # faster first-in-loop / before-subtile-loop pair.
 TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY = "tcgen05_c_acquire_placement"
 TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP = "pre_loop"
+TCGEN05_C_ACQUIRE_PLACEMENT_BEFORE_STORE = "before_store"
 TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP = "first_in_loop"
 TCGEN05_C_ACQUIRE_PLACEMENT_LATER_BEFORE_BARRIER = "later_before_barrier"
 TCGEN05_C_ACQUIRE_PLACEMENTS = (
     TCGEN05_C_ACQUIRE_PLACEMENT_PRE_LOOP,
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
     TCGEN05_C_ACQUIRE_PLACEMENT_LATER_BEFORE_BARRIER,
+    TCGEN05_C_ACQUIRE_PLACEMENT_BEFORE_STORE,
 )
 TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY = "tcgen05_acc_wait_placement"
 TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP = "subtile_loop"
@@ -456,6 +458,15 @@ TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY = "tcgen05_flat_role_coordinates"
 # Grouped persistent scheduler/codegen mode for rank3 RHS grouped GEMM.
 # Codegen owns the narrow envelope check before admitting generated kernels.
 TCGEN05_GROUPED_MODE_CONFIG_KEY = "tcgen05_grouped_mode"
+TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY = "tcgen05_grouped_full_coverage"
+TCGEN05_GROUPED_FULL_COVERAGE_OFF = "off"
+TCGEN05_GROUPED_FULL_COVERAGE_DENSE = "fixed_tma_dense"
+TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL = "fixed_tma_dense_local"
+TCGEN05_GROUPED_FULL_COVERAGE_MODES = (
+    TCGEN05_GROUPED_FULL_COVERAGE_OFF,
+    TCGEN05_GROUPED_FULL_COVERAGE_DENSE,
+    TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL,
+)
 TCGEN05_GROUPED_MODE_STATIC = "static"
 TCGEN05_GROUPED_MODE_DYNAMIC = "dynamic"
 TCGEN05_GROUPED_MODE_DIRECT = "direct"
@@ -530,6 +541,17 @@ TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES = (
 # N,M orientation maps the packed source-M tile onto the physical MMA-N mode.
 # Keep the role-specific alias so descriptor assertions do not appear to be
 # validating an MMA dimension against an unrelated packing knob.
+# The established external/TWO domain remains unchanged. Source64 is a
+# device-offset ONE profile, admitted only by the dense-local proof.
+TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE = 64
+TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES = (
+    TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+    TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE,
+)
+TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES = (
+    *TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
+    TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE,
+)
 TCGEN05_GROUPED_WORKLIST_MMA_N_CHOICES = TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
 TCGEN05_GROUPED_WORKLIST_MMA_M_TILE = 256
 TCGEN05_GROUPED_WORKLIST_STORE_SHAPE = (128, 32, 32)
@@ -588,7 +610,7 @@ def resolve_tcgen05_grouped_worklist_mma_shape(
 
     The public DSL tile remains 256x128 for every grouped N,M worklist.  The
     physical collective is instead 256x``source_m_tile`` for CtaGroup.TWO, or
-    128x32 for the compact CtaGroup.ONE profile.  Keep this policy shared by
+    128x32, or the BK128-only 128x64 CtaGroup.ONE profile. Keep this shared by
     MMA selection, codegen, and SMEM validation so logical tile dimensions do
     not accidentally leak into physical resource accounting.
     """
@@ -597,14 +619,22 @@ def resolve_tcgen05_grouped_worklist_mma_shape(
         or type(block_k) is not int
         or type(source_m_tile) is not int
         or block_k not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
-        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES
     ):
         return None
     if cluster_m == 1:
-        if source_m_tile != TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+        if source_m_tile not in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES:
+            return None
+        if (
+            source_m_tile == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+            and block_k != 128
+        ):
             return None
         return TCGEN05_ONE_CTA_MAX_BLOCK_M, source_m_tile
-    if cluster_m == 2:
+    if (
+        cluster_m == 2
+        and source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+    ):
         return TCGEN05_GROUPED_WORKLIST_MMA_M_TILE, source_m_tile
     return None
 

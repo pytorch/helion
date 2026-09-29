@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import math
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
+from examples.jagged_layer_norm import jagged_layer_norm_kernel
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _mock_cuda_unavailable
+
 import helion
 from helion._compiler.backend import CuteBackend
+from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -42,6 +48,48 @@ def _round_trip(
     return generation.unflatten(
         generation.flatten(helion.Config(block_sizes=sizes, num_threads=threads))
     )
+
+
+@skipUnlessBackends(["cute"])
+def test_registered_jagged_seeds_retain_shared_512_thread_launch() -> None:
+    kernel = helion.kernel(
+        jagged_layer_norm_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_flatten_nested_reductions=True,
+    )
+    with (
+        _mock_cuda_unavailable(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+    ):
+        bound = _cpu_bind(
+            kernel,
+            (torch.empty((32641, 128)), torch.empty(257, dtype=torch.int64), 1e-6),
+        )
+        spec = bound.config_spec
+        assert spec.cute_tile_loop_paths == (
+            ((0,), (1,)),
+            ((0,), (2,)),
+            ((0,), (3,)),
+        )
+        generation = ConfigGeneration(spec)
+        seeds = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if seed.block_sizes == [1, 32768, 32768, 32768]
+            and seed.num_threads == [1, 512, 512, 512]
+        ]
+        assert seeds
+        for seed in seeds:
+            repaired = generation.unflatten(generation.flatten(seed))
+            assert repaired.block_sizes == seed.block_sizes
+            assert repaired.num_threads == seed.num_threads
+            with patch(
+                "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+                return_value=232448,
+            ):
+                assert "block=(512, 1, 1)" in bound.to_code(repaired)
 
 
 @pytest.mark.parametrize("automatic", (False, True))

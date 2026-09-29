@@ -7135,7 +7135,10 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 )
             resolved_block_size = static_block_size
         if resolved_block_size % nt != 0 and not (
-            block_id in self._shared_thread_extents and resolved_block_size < nt
+            (block_id in self._shared_thread_extents and resolved_block_size < nt)
+            or CompileEnvironment.current().backend.collective_owns_tile(
+                self.fn, block_id
+            )
         ):
             raise exc.BackendUnsupported(
                 backend_name,

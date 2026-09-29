@@ -40,6 +40,10 @@ from torch.utils.weak import WeakIdKeyDictionary
 
 from ... import exc
 from ..._compiler.cute.device_state import Tcgen05GroupedSchedulerMode
+from ..._compiler.cute.grouped_full_coverage import full_coverage_index_domain
+from ..._compiler.cute.grouped_row_union import (
+    schedule_by_name as row_union_schedule_by_name,
+)
 from ..._compiler.cute.grouped_worklist import GroupedWorklistRows
 from ..._compiler.cute.grouped_worklist import Tcgen05GroupedWorklistValidationError
 from ..._compiler.cute.grouped_worklist import (
@@ -53,6 +57,9 @@ from ..._compiler.cute.strategies import tcgen05_default_epilogue_tile_expr
 from ..._compiler.cute.strategies import tcgen05_explicit_d_store_tile_expr
 from ..._compiler.cute.strategies import tcgen05_smem_layout_expr
 from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL,
+)
+from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_RUNTIME_TILE_FIELD_COUNT
@@ -64,6 +71,9 @@ from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
 )
 from ..._compiler.cute.tcgen05_constants import TCGEN05_GROUPED_WORKLIST_STORE_SHAPE
+from ..._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE,
+)
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
 from ..triton.launcher import get_num_sm
 from .source_dependencies import wrapper_source_dependencies
@@ -288,6 +298,7 @@ def _append_cute_wrapper_plan(
     plan: dict[str, object],
     num_sm: int | None = None,
 ) -> None:
+
     def plan_int(key: str, default: int | None = None) -> int:
         value = plan.get(key, default) if default is not None else plan[key]
         assert isinstance(value, int)
@@ -410,6 +421,7 @@ def _append_cute_wrapper_plan(
             if worklist_nm_store
             else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, 0)"
         )
+        gmem_layout = f"{rank3_gmem_shape}, stride={rank3_gmem_stride}"
         # Keep these layout arguments in sync with the device-side
         # ``make_smem_layout_epi`` calls; the wrapper's TMA atom and the kernel's
         # SMEM staging must slice the same epilogue tile shape.
@@ -428,7 +440,7 @@ def _append_cute_wrapper_plan(
                             f"    {gmem_tensor} = cute.make_tensor("
                             f"arg{tensor_idx}.iterator, "
                             "layout=cute.make_layout("
-                            f"{rank3_gmem_shape}, stride={rank3_gmem_stride}))"
+                            f"{gmem_layout}))"
                         ),
                     )
                     if rank3_mnl_tensor
@@ -1211,6 +1223,7 @@ def _append_cute_wrapper_plan(
     rhs_tma_order = plan_optional_order("rhs_tma_order")
     rhs_rank3_grouped_nt = bool(plan.get("rhs_rank3_grouped_nt"))
     lhs_rank3_grouped_nt = bool(plan.get("lhs_rank3_grouped_nt"))
+    shared_rhs = bool(plan.get("shared_rhs"))
     orientation = _tcgen05_plan_orientation(plan)
     swapped_nm = orientation == "nm"
     dynamic_ab_tensormaps = bool(plan.get("dynamic_ab_tensormaps"))
@@ -1226,7 +1239,35 @@ def _append_cute_wrapper_plan(
             "fixed full-allocation A/B TensorMaps require the N,M worklist "
             "orientation and cannot also be dynamic",
         )
-    if swapped_nm and not (dynamic_ab_tensormaps or fixed_ab_tensormaps):
+    row_union_schedule = plan.get("row_union_schedule")
+    row_profile = row_union_schedule_by_name(row_union_schedule)
+    if row_union_schedule is not None and row_profile is None:
+        raise exc.BackendUnsupported("cute", "unknown row-union physical descriptor")
+    if row_profile is not None:
+        expected = {
+            "row_union_schedule": row_profile.name,
+            "bm": row_profile.mma_m,
+            "bn": row_profile.mma_n,
+            "bk": row_profile.block_k,
+            "orientation": "nm",
+            "cluster_m": row_profile.cluster_m,
+            "cluster_n": row_profile.cluster_n,
+            "ab_stage_count": row_profile.ab_stages,
+            "a_producer_partition": row_profile.producer_cluster,
+            "lhs_tma_order": (1, 0),
+            "rhs_tma_order": (0, 1),
+            "input_dtype": "cutlass.BFloat16",
+            "acc_dtype": "cutlass.Float32",
+            "a_k_major": False,
+            "b_k_major": True,
+        }
+        if any(plan.get(key) != value for key, value in expected.items()) or (
+            dynamic_ab_tensormaps or fixed_ab_tensormaps or shared_rhs
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "row-union physical descriptor contract"
+            )
+    if swapped_nm and not (dynamic_ab_tensormaps or fixed_ab_tensormaps or row_profile):
         raise exc.BackendUnsupported(
             "cute",
             "tcgen05 N,M-oriented A/B TensorMaps require dynamic per-group or "
@@ -1235,6 +1276,16 @@ def _append_cute_wrapper_plan(
     dynamic_ab_tensormap_rank2 = (
         dynamic_ab_tensormaps and _tcgen05_grouped_dynamic_ab_tensormap_rank(plan) == 2
     )
+    if shared_rhs and (
+        not swapped_nm
+        or not dynamic_ab_tensormap_rank2
+        or lhs_rank3_grouped_nt
+        or rhs_rank3_grouped_nt
+        or fixed_ab_tensormaps
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "shared rank-2 RHS requires the N,M dynamic rank-2 worklist route"
+        )
     kernel_args = [str(arg) for arg in cast("list[object]", plan["kernel_args"])]
     assert len(kernel_args) == 4
     tma_atom_a, tma_tensor_a, tma_atom_b, tma_tensor_b = kernel_args
@@ -1280,12 +1331,20 @@ def _append_cute_wrapper_plan(
     )
     rhs_tma = f"{tma_atom_b}_rhs_tma"
     if swapped_nm:
-        if not lhs_rank3_grouped_nt:
+        if not (lhs_rank3_grouped_nt or shared_rhs or row_profile):
             raise exc.BackendUnsupported(
                 "cute",
                 "tcgen05 N,M-oriented A/B TensorMaps require grouped rank-3 logical A",
             )
-        if fixed_ab_tensormaps:
+        if shared_rhs or row_profile is not None:
+            # Physical A is the one shared logical B[K,N]. Its immutable
+            # rank-2 descriptor is reused for every group; only the packed
+            # logical A and output descriptors require per-group updates.
+            lhs_tma_layout = (
+                f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape0), "
+                f"stride=(arg{lhs_idx}_stride1, arg{lhs_idx}_stride0)"
+            )
+        elif fixed_ab_tensormaps:
             if fixed_grouped_b_rank3:
                 lhs_tma_layout = (
                     f"(arg{lhs_idx}_shape1, arg{lhs_idx}_shape2, "
@@ -1464,7 +1523,13 @@ def _append_cute_wrapper_plan(
                 f"{lhs_tma_arg}, "
                 f"cute.slice_({smem_a_layout}, (None, None, None, 0)), "
                 f"({bm}, {bn}, {bk}), {tiled_mma}"
-                + (f", {cluster_layout_vmnk}.shape" if cluster_n > 1 else "")
+                + (
+                    f", cute.tiled_divide(cute.make_layout({row_profile.producer_cluster!r}), ({tiled_mma}.thr_id.shape,)).shape"
+                    if row_profile is not None
+                    else f", {cluster_layout_vmnk}.shape"
+                    if cluster_n > 1
+                    else ""
+                )
                 + tma_internal_type_arg
                 + ")"
             ),
@@ -1476,8 +1541,12 @@ def _append_cute_wrapper_plan(
                 "cutlass.utils.blackwell_helpers.cluster_shape_to_tma_atom_B("
                 f"{cluster_shape}, {tiled_mma}.thr_id), "
                 f"{rhs_tma}, "
-                f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
-                f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape"
+                + (
+                    f"cute.select({smem_b_layout}, mode=[0, 1, 2]), "
+                    if row_profile is not None
+                    else f"cute.slice_({smem_b_layout}, (None, None, None, 0)), "
+                )
+                + f"({bm}, {bn}, {bk}), {tiled_mma}, {cluster_layout_vmnk}.shape"
                 f"{tma_internal_type_arg})"
             ),
         )
@@ -2962,6 +3031,79 @@ def _tcgen05_grouped_static_layout_arg(
     return layout
 
 
+def _tcgen05_grouped_device_source_m_tile_supported(plan: dict[str, object]) -> bool:
+    """Keep legacy widths and admit source64 only with its compiler proof."""
+    source_m_tile = plan.get("source_m_tile")
+    if source_m_tile in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+        return True
+    if (
+        type(source_m_tile) is not int
+        or source_m_tile != TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+    ):
+        return False
+    profile = plan.get("source64_profile")
+    expected_profile = {
+        "full_coverage_mode": TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL,
+        "consumer_local": True,
+        "use_2cta_instrs": False,
+        "ab_stage_count": 4,
+        "acc_stage_count": 2,
+        "c_stage_count": 2,
+        "consumer_regs": 256,
+        "input_dtype": "cutlass.BFloat16",
+        "acc_dtype": "cutlass.Float32",
+        "offset_dtype": "torch.int32",
+    }
+    if type(profile) is not dict or profile.keys() != expected_profile.keys():
+        return False
+    if any(
+        type(profile[key]) is not type(value) or profile[key] != value
+        for key, value in expected_profile.items()
+    ):
+        return False
+    required_plan = {
+        "kind": "tcgen05_grouped_static_persistent",
+        "scheduler_mode": "device_group_search",
+        "bm": 128,
+        "bn": 64,
+        "bk": 128,
+        "cluster_m": 1,
+        "cluster_n": 1,
+        "orientation": "nm",
+        "shared_rhs": True,
+        "worklist_metadata": True,
+        "device_split_sizes": True,
+        "device_layout_kind": "offsets",
+        "dynamic_ab_tensormaps": True,
+        "dynamic_ab_tensormap_rank": 2,
+        "dynamic_d_tensormap": True,
+    }
+    if any(
+        type(plan.get(key)) is not type(value) or plan.get(key) != value
+        for key, value in required_plan.items()
+    ):
+        return False
+    if any(
+        plan.get(key, False) is not False
+        for key in (
+            "fixed_tensormaps",
+            "direct_pointer_metadata",
+            "external_direct_pointer_metadata",
+            "use_2cta_instrs",
+        )
+    ):
+        return False
+    return full_coverage_index_domain(
+        cast("int", plan.get("group_count")),
+        cast("int", plan.get("m_size")),
+        cast("int", plan.get("n_size")),
+        cast("int", plan.get("k_total_size")),
+        source_m_tile,
+        128,
+        128,
+    )
+
+
 def _validate_tcgen05_grouped_device_split_sizes(
     plan: dict[str, object],
     split_sizes: torch.Tensor,
@@ -2997,7 +3139,7 @@ def _validate_tcgen05_grouped_device_split_sizes(
         )
     if (
         bk not in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
-        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        or not _tcgen05_grouped_device_source_m_tile_supported(plan)
         or n_size % TCGEN05_GROUPED_WORKLIST_STORE_SHAPE[2] != 0
         or k_total_size % bk != 0
     ):
@@ -3006,6 +3148,13 @@ def _validate_tcgen05_grouped_device_split_sizes(
             "tcgen05 grouped device split_sizes requires block_k 64 or 128, "
             "a validated source M tile, output N divisible by 32, and K "
             "divisible by the CTA K tile",
+        )
+    if (
+        source_m_tile == TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE
+        and split_sizes.dtype != torch.int32
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "source64 device offsets require the proved Int32 layout dtype"
         )
     if (
         not bool(plan.get("dynamic_ab_tensormaps"))
@@ -3041,7 +3190,7 @@ def _tcgen05_grouped_device_split_total_clusters(
         or m_size <= 0
         or n_size <= 0
         or physical_mma_m <= 0
-        or source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+        or not _tcgen05_grouped_device_source_m_tile_supported(plan)
     ):
         raise exc.BackendUnsupported(
             "cute",
@@ -3469,6 +3618,42 @@ def _validate_tcgen05_grouped_dynamic_ab_tensormaps(
             "cute",
             "tcgen05 grouped dynamic A/B TensorMaps require rank-2 A",
         )
+    if bool(plan.get("shared_rhs")):
+        if (
+            rank != 2
+            or _tcgen05_plan_orientation(plan) != "nm"
+            or rhs.ndim != 2
+            or lhs.dtype not in (torch.float16, torch.bfloat16)
+            or rhs.dtype != lhs.dtype
+            or lhs.shape
+            != (_plan_int_value(plan, "m_size"), _plan_int_value(plan, "k_total_size"))
+            or rhs.shape
+            != (_plan_int_value(plan, "k_total_size"), _plan_int_value(plan, "n_size"))
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "shared RHS worklist requires matching rank-2 FP16/BF16 matrices",
+            )
+        rhs_k_contiguous = rhs.stride(0) == 1 and rhs.stride(1) == rhs.size(0)
+        rhs_n_contiguous = rhs.stride(1) == 1 and rhs.stride(0) == rhs.size(1)
+        if lhs.stride() != (lhs.size(1), 1) or not (
+            rhs_k_contiguous or rhs_n_contiguous
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "shared RHS worklist requires contiguous matrix storage"
+            )
+        rhs_outer_stride = rhs.stride(1) if rhs_k_contiguous else rhs.stride(0)
+        if (
+            int(lhs.data_ptr()) % 16
+            or int(rhs.data_ptr()) % 16
+            or int(lhs.stride(0)) * lhs.element_size() % 16
+            or int(rhs_outer_stride) * rhs.element_size() % 16
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "shared RHS worklist requires 16-byte-aligned bases and outer strides",
+            )
+        return
     if rhs.ndim != 3:
         raise exc.BackendUnsupported(
             "cute",
@@ -3565,8 +3750,8 @@ def _validate_tcgen05_grouped_fixed_tensormaps(
     bk = _plan_int_value(plan, "bk")
     physical_mma_m = _plan_int_value(plan, "bm")
     if (
-        lhs.dtype is not torch.bfloat16
-        or rhs.dtype is not torch.bfloat16
+        lhs.dtype not in (torch.float16, torch.bfloat16)
+        or rhs.dtype != lhs.dtype
         or int(lhs.size(1)) != k_total_size
         or int(rhs.size(1)) != n_size
         or int(rhs.size(2)) != k_total_size
@@ -3576,7 +3761,7 @@ def _validate_tcgen05_grouped_fixed_tensormaps(
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "fixed full-allocation TensorMaps require contiguous BF16 "
+            "fixed full-allocation TensorMaps require matching contiguous FP16/BF16 "
             "A[Mtotal,K] and B[G,N,K], N divisible by the physical MMA-M "
             "tile, and K divisible by block_k",
         )
@@ -3607,14 +3792,14 @@ def _validate_tcgen05_grouped_fixed_tensormaps(
         )
     if (
         output.device.type != "cuda"
-        or output.dtype is not torch.bfloat16
+        or output.dtype != lhs.dtype
         or output.ndim != 2
         or tuple(int(size) for size in output.shape) != (int(lhs.size(0)), n_size)
         or tuple(int(stride) for stride in output.stride()) != (n_size, 1)
     ):
         raise exc.BackendUnsupported(
             "cute",
-            "fixed full-allocation TensorMaps require contiguous BF16 "
+            "fixed full-allocation TensorMaps require matching contiguous FP16/BF16 "
             "D[Mtotal,N] matching packed A and grouped B",
         )
     alignment = 16

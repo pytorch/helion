@@ -58,6 +58,7 @@ from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import RuntimeInputSpecialization
 from ..compile_environment import _replay_tensor_input_source
+from .cute_epilogue import _ZERO_ARG_TARGETS
 from .cute_epilogue import analyze_tcgen05_unary_epilogue_chain
 from .cute_fx_walk import reach_tcgen05_matmul_anchors
 from .indexing import is_cute_direct_iota_index
@@ -2244,6 +2245,39 @@ def _codegen_cute_store_expand_broadcast_tile(
     return ast.Constant(value=None)
 
 
+def _pure_epilogue_ancestors(value_node: torch.fx.Node) -> tuple[torch.fx.Node, ...]:
+    """Pure pointwise definitions that may become dead after an epilogue splice.
+
+    Stop at memory operations and graph/loop boundaries. Only making these
+    assignments DCE candidates, rather than deleting the FX slice, preserves
+    scalar definitions shared with an unfused use.
+    """
+    pending = [value_node]
+    visited: set[torch.fx.Node] = set()
+    result = []
+    while pending:
+        node = pending.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+        if node.graph is not value_node.graph or node.op != "call_function":
+            continue
+        target = node.target
+        if isinstance(target, torch._ops.OpOverload):
+            if (
+                torch.Tag.pointwise not in target.tags
+                or torch.Tag.nondeterministic_seeded in target.tags
+                or target._schema.is_mutable
+                or node.is_impure()
+            ):
+                continue
+        elif target not in _ZERO_ARG_TARGETS:
+            continue
+        result.append(node)
+        pending.extend(node.all_input_nodes)
+    return tuple(result)
+
+
 def _try_splice_tcgen05_unary_epilogue(
     state: CodegenState,
     tensor: object,
@@ -2298,6 +2332,13 @@ def _try_splice_tcgen05_unary_epilogue(
     )
     if rewritten_stmt is None:
         return None
+    # The splice computes these pure operations from TMEM. Their earlier
+    # scalar lowering may use the accumulator's placeholder value, whose
+    # dtype intentionally does not track intermediate casts. Remove it only
+    # when no actual emitted consumer remains; shared CSE values stay live.
+    state.codegen.allow_dead_assignments_owned_by_nodes(
+        _pure_epilogue_ancestors(value_node)
+    )
     stmts = rewritten_stmt if isinstance(rewritten_stmt, list) else [rewritten_stmt]
     for stmt in stmts:
         state.add_statement(stmt)
