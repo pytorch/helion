@@ -59,6 +59,10 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
 
         Returns (helion_code, triton_code) for additional assertions.
         """
+        # Deterministic inputs: the tf32 matmul tests compare two different
+        # accumulation orders under a tolerance that unseeded draws crossed
+        # once in a while.
+        torch.manual_seed(0)
         if inputs_fn is None:
             inputs = [
                 torch.randn(*shape, device=DEVICE, dtype=torch.float32)
@@ -503,7 +507,10 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
                 torch.randn(48, 32, device=DEVICE, dtype=torch.float32),
             ],
             rtol=1e-2,
-            atol=1e-2,
+            # Both sides run tf32 with different accumulation orders over
+            # K=48 products of unit-normal values; 1e-2 sits at about three
+            # standard deviations of that difference.
+            atol=2e-2,
         )
 
     def test_single_loop_matmul_low_precision(self):

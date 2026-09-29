@@ -150,11 +150,28 @@ jobs:
           source .venv/bin/activate
           echo "LD_LIBRARY_PATH=$VIRTUAL_ENV/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
 
+      - name: Cache Triton third-party downloads
+        if: matrix.triton-pin != ''
+        uses: actions/cache@v6
+        with:
+          # Triton's build_helpers.py streams a multi-hundred-MB LLVM tarball
+          # (plus the JSON and NVIDIA toolchain archives) from its blob store
+          # into these directories and reuses them whenever the recorded
+          # version.txt still matches the pinned URL.
+          path: |
+            ~/.triton/llvm
+            ~/.triton/json
+            ~/.triton/nvidia
+          key: triton-thirdparty-${{ matrix.alias }}-${{ matrix.backend }}-${{ matrix.triton-pin }}
+
       - name: Install Triton from source
         if: matrix.triton-pin != ''
         run: |
           set -x
           source .venv/bin/activate
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
           apt-get update
           apt-get install -y git clang-20 clang++-20 zlib1g-dev
           export CC=clang-20
@@ -167,8 +184,11 @@ jobs:
           git clone --recursive "$REPO" triton
           git -C triton checkout ${{ matrix.triton-pin }}
           cd triton/
-          uv pip install -r python/requirements.txt
-          MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
+          retry uv pip install -r python/requirements.txt
+          # The LLVM download inside the build has a single 300s socket timeout
+          # and no retry of its own; an interrupted attempt leaves no
+          # version.txt, so the next one starts the download over.
+          retry env MAX_JOBS=$(nproc) TRITON_PARALLEL_LINK_JOBS=2 uv pip install .
           cd /tmp/$USER
           rm -rf triton/
           python -c "import triton; print(f'Triton version: {triton.__version__}')"
