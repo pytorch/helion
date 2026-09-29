@@ -296,6 +296,30 @@ class TestStackTensor(RefEagerTestDisabled, TestCase):
         code, result = code_and_output(stack_load_kernel, (tensor_ptrs, tensor_list[0]))
         torch.testing.assert_close(result, torch.stack(tensor_list))
 
+    def test_stack_load_ellipsis_rectangular(self):
+        @helion.kernel
+        def stack_load_kernel(
+            dev_ptrs: torch.Tensor,
+            example_tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            M = hl.specialize(dev_ptrs.size(0))
+            N = example_tensor.size(0)
+            out = torch.empty(M, N, dtype=torch.bfloat16, device=dev_ptrs.device)
+            for _ in hl.grid(1):
+                ptr_tile = dev_ptrs[:]
+                tensors = hl.stacktensor_like(example_tensor, ptr_tile)
+                out[:, :] = tensors[...]
+            return out
+
+        tensor_list = [
+            torch.randn(8, device=DEVICE, dtype=torch.bfloat16) for _ in range(3)
+        ]
+        tensor_ptrs = torch.as_tensor(
+            [p.data_ptr() for p in tensor_list], device=DEVICE, dtype=torch.uint64
+        )
+        code, result = code_and_output(stack_load_kernel, (tensor_ptrs, tensor_list[0]))
+        torch.testing.assert_close(result, torch.stack(tensor_list))
+
     def test_stack_load_ellipsis_2d(self):
         @helion.kernel
         def stack_load_kernel(

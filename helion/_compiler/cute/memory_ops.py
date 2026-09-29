@@ -1328,6 +1328,13 @@ def _codegen_cute_store_stack_load(
             isinstance(idx, slice) and idx == slice(None)
             for idx in subscript[: dev_ptrs.ndim]
         )
+        and (
+            dev_ptrs.ndim == 2
+            or any(
+                isinstance(idx, slice) and idx == slice(None)
+                for idx in subscript[dev_ptrs.ndim :]
+            )
+        )
     ):
         return _codegen_cute_stack_load_loop(
             state,
