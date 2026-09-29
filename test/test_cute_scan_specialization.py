@@ -109,6 +109,33 @@ def test_container_grid_dispatch_does_not_recompile_without_alias_consumer() -> 
     torch.testing.assert_close(out, x + y)
 
 
+def _matmul_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for row, column in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([row, column], dtype=torch.float32)
+        for reduction in hl.tile(a.size(1)):
+            acc = torch.addmm(acc, a[row, reduction], b[reduction, column])
+        out[row, column] = acc.to(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_grid_contraction_registers_alias_facts(static_shapes: bool) -> None:
+    kernel = helion.kernel(_matmul_into, backend="cute", static_shapes=static_shapes)
+    a = torch.empty((64, 32), dtype=torch.float16, device=CPU_DEVICE)
+    b = torch.empty((32, 48), dtype=torch.float16, device=CPU_DEVICE)
+    out = torch.empty((64, 48), dtype=torch.float16, device=CPU_DEVICE)
+    bound = kernel.bind((a, b, out))
+    # Collective MMA schedules prove the epilogue store disjoint from operand
+    # loads only through these facts, so an aliasing launch cannot reuse the
+    # bound kernel compiled for disjoint storage.
+    assert _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY in (
+        bound.env.runtime_input_specializations
+    )
+    shared = torch.empty(out.numel(), dtype=torch.float16, device=CPU_DEVICE)
+    overlapping = (shared[: a.numel()].view_as(a), b, shared.view_as(out))
+    assert kernel.bind(overlapping) is not bound
+
+
 def _scan_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     for channel, row in hl.tile([x.size(1), x.size(0)], block_size=[1, 128]):
         out[row, channel] = hl.cumsum(x[row, channel], dim=0)

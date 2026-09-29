@@ -7,6 +7,7 @@ import dataclasses
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -123,7 +124,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
-        self.cute_uses_matmul: bool = False
+        self._cute_uses_matmul: bool = False
+        self._cute_matmul_declaration_count = 0
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
@@ -210,6 +212,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # Same, for a store->load read-after-write *within* one loop body.
         self._compute_intra_loop_barriers()
 
+    @property
+    def cute_uses_matmul(self) -> bool:
+        return self._cute_uses_matmul
+
+    @cute_uses_matmul.setter
+    def cute_uses_matmul(self, value: bool) -> None:
+        self._cute_uses_matmul = value
+        # Count declarations, not False-to-True transitions: an unrelated
+        # matmul path must not inherit a register chain's shape-bake exemption.
+        if value:
+            self._cute_matmul_declaration_count += 1
+
     def _cute_can_bake_tensor_shapes(self) -> bool:
         if not self.cute_uses_matmul:
             return True
@@ -226,7 +240,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 }
                 for plan in self.cute_wrapper_plans
             )
-        return False
+        state = self.device_function.cute_state
+        return (
+            state.collective_register_chain_lowered
+            and self._cute_matmul_declaration_count >= 2
+            and self._cute_matmul_declaration_count == len(state.collective_mma_sites)
+        ) or self._cute_has_complete_static_collectives()
 
     def allow_dead_assignments_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
         """Allow liveness-based DCE for assignments from proven pure FX nodes.
@@ -700,6 +719,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if key not in self._codegen_results_by_owner_node_id:
             return False, None
         return True, self._codegen_results_by_owner_node_id[key]
+
+    def _cute_has_complete_static_collectives(self) -> bool:
+        state = self.device_function.cute_state
+        return (
+            cast(
+                "bool",
+                self.device_function.config.get(
+                    "cute_collective_static_layouts", False
+                ),
+            )
+            and not self.cute_wrapper_plans
+            and state.collective_mma_static_layouts
+            and self._cute_matmul_declaration_count > 0
+            and self._cute_matmul_declaration_count == len(state.collective_mma_sites)
+        )
 
     def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
         owner_node = self._statement_owner_fx_node
@@ -1840,6 +1874,20 @@ def generate_ast(
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
             kernel_def = codegen.device_function.codegen_function_def()
+            block_dims = (
+                codegen.device_function.cute_state.collective_register_chain_block_dims
+            )
+            if block_dims is not None:
+                from .cute.thread_block_projection import update_launch_block
+
+                assert (
+                    update_launch_block(
+                        codegen.host_statements,
+                        codegen.device_function.name,
+                        block_dims,
+                    )
+                    > 0
+                )
             codegen.host_dead_code_elimination()
 
             # Retarget output-only tensor allocations to ``device='meta'`` so

@@ -6,9 +6,14 @@ import pytest
 import torch
 
 from test import test_cute_rank3_rhs_b_tma as grouped
+from test.test_autotuner_heuristics import _grouped_worklist_bind_patches
 
 import helion
+from helion._compiler.autotuner_heuristics.register_chain import (
+    CuteRegisterChainHeuristic,
+)
 from helion._compiler.cute import cute_epilogue
+import helion.language as hl
 from helion.language import memory_ops
 
 pytestmark = grouped.pytestmark
@@ -150,3 +155,90 @@ def test_actual_grouped_mask_rejections(mutation: str) -> None:
             setattr(obj, name, old)
         for node in inserted:
             graph.erase_node(node)
+
+
+@helion.kernel(backend="cute", static_shapes=False, disable_autotuner_heuristics=True)
+def _plain(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _k, n = y.size()
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile((m, n)):
+        acc = hl.zeros((tm, tn), dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=False, disable_autotuner_heuristics=True)
+def _chain(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _k, n = y.size()
+    out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile((m, n)):
+        acc = hl.zeros((tm, tn), dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        other = hl.zeros((tm, tn), dtype=torch.float32)
+        for tk2 in hl.tile(k):
+            other = torch.addmm(other, x[tm, tk2], z[tk2, tn])
+        out[tm, tn] = (acc + other).to(out.dtype)
+    return out
+
+
+def _inputs(size: int, count: int) -> tuple[torch.Tensor, ...]:
+    grouped._require_cuda("grouped binding facts require CUDA fake inputs")
+    return tuple(
+        torch.empty((size, size), dtype=torch.bfloat16, device=grouped.DEVICE)
+        for _ in range(count)
+    )
+
+
+def test_plain_matmul_retains_dynamic_binding_without_chain_facts() -> None:
+    # Isolate chain facts: collective copies independently require metadata.
+    with (
+        _grouped_worklist_bind_patches(runtime_n_ptx=None),
+        patch(
+            "helion._compiler.autotuner_heuristics.get_heuristics",
+            return_value=[CuteRegisterChainHeuristic],
+        ),
+    ):
+        first = _plain.bind(_inputs(128, 2))
+        rebound = _plain.bind(_inputs(256, 2))
+    assert first is rebound
+    assert first._compiler_seed_specialization_extractors == ()
+    assert first.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts is None
+
+
+def test_two_site_chain_keeps_metadata_with_heuristics_disabled() -> None:
+    # A different heuristic must not conceal missing chain specialization.
+    with (
+        _grouped_worklist_bind_patches(runtime_n_ptx=None),
+        patch(
+            "helion._compiler.autotuner_heuristics.get_heuristics",
+            return_value=[CuteRegisterChainHeuristic],
+        ),
+    ):
+        first = _chain.bind(_inputs(128, 3))
+        rebound = _chain.bind(_inputs(256, 3))
+    assert first.kernel.settings.disable_autotuner_heuristics is True
+    assert first is not rebound
+    assert [x.fact for x in first._compiler_seed_specialization_extractors] == [
+        "input_tensor_metadata"
+    ]
+
+
+def test_plain_collective_matmul_keeps_metadata_with_heuristics_disabled() -> None:
+    kernel = helion.kernel(
+        backend="cute", static_shapes=False, disable_autotuner_heuristics=True
+    )(_plain.fn)
+    with _grouped_worklist_bind_patches(runtime_n_ptx=None):
+        first = kernel.bind(_inputs(128, 2))
+        rebound = kernel.bind(_inputs(256, 2))
+    assert first is not rebound
+    assert first.config_spec.compiler_seed_configs == []
+    assert first.config_spec.autotuner_heuristics == []
+    assert [x.fact for x in first._compiler_seed_specialization_extractors] == [
+        "input_tensor_metadata"
+    ]
+    assert first.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts is None

@@ -65,6 +65,7 @@ def _cute_mma_matches_dot_semantics(
 
 @_decorators.codegen(dot, "cute")
 def _(state: CodegenState) -> object:
+    from .collective_matmul import mark_collective_dot
 
     lhs_proxy = state.proxy_args[0]
     assert isinstance(lhs_proxy, FakeTensor)
@@ -150,6 +151,19 @@ def _(state: CodegenState) -> object:
             state.codegen, packed_node.meta["val"].shape[0]
         )
     assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
+    if (
+        not is_acc_none
+        and _cute_mma_matches_dot_semantics(
+            lhs_proxy.dtype, rhs_proxy.dtype, acc_dtype, out_dtype
+        )
+        and (
+            collective := mark_collective_dot(
+                state, k_block_id=k_block_id, lhs=lhs_ast, rhs=rhs_ast, acc=acc_ast
+            )
+        )
+        is not None
+    ):
+        return collective
     static_k_extent = None
     if k_block_id is None and state.fx_node is not None:
         lhs_node = state.fx_node.args[0] if len(state.fx_node.args) > 0 else None

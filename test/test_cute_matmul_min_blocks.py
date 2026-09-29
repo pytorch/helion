@@ -592,6 +592,71 @@ def test_failed_carrier_transfer_keeps_old_registry_and_domain() -> None:
 
 @pytest.mark.parametrize("value", (2, 3, 4, 6))
 @pytest.mark.parametrize("disabled", (False, True))
+def test_global_positive_override_preserves_other_coverage_groups(
+    value: int, disabled: bool
+) -> None:
+    settings = {
+        "autotune_config_overrides": {MIN_BLOCKS_KEY: value},
+        "disable_autotuner_heuristics": disabled,
+    }
+    with patch(REGISTRATION):
+        previous, previous_args = _bind("collective", **settings)
+    bound, args = _bind("collective", **settings)
+    spec = bound.config_spec
+    assert not spec.cute_matmul_min_blocks_search_enabled
+    assert MIN_BLOCKS_KEY not in spec._flat_fields()
+    assert (
+        spec.compiler_coverage_groups == previous.config_spec.compiler_coverage_groups
+    )
+    # Ordinary warp collectives supply a real unrelated group even when
+    # automatic heuristic use is disabled. No materialized bundle is needed.
+    assert [group.mechanism for group in spec.compiler_coverage_groups] == [
+        "cute.collective_static_layouts"
+    ]
+    assert all(not group.dependencies for group in spec.compiler_coverage_groups)
+    assert (
+        spec.structural_fingerprint() == previous.config_spec.structural_fingerprint()
+    )
+    assert (
+        spec.cache_fingerprint_hash() == previous.config_spec.cache_fingerprint_hash()
+    )
+    assert spec.default_config() == previous.config_spec.default_config()
+    assert spec.compiler_seed_configs == previous.config_spec.compiler_seed_configs
+    old, search = _search(previous, previous_args), _search(bound, args)
+    with (
+        previous.env,
+        patch.object(old, "_find_similar_cached_configs", return_value=[]),
+    ):
+        random.seed(2026091481)
+        old_rows = deepcopy(checked_initial_population(old))
+        old_rng = random.getstate()
+    with (
+        bound.env,
+        patch.object(search, "_find_similar_cached_configs", return_value=[]),
+    ):
+        random.seed(2026091481)
+        rows = checked_initial_population(search)
+        assert random.getstate() == old_rng
+        assert rows == old_rows
+        assert all(
+            search.config_gen.unflatten(row)[MIN_BLOCKS_KEY] == value for row in rows
+        )
+    assert vars(search).get("compiler_coverage_outcomes") == vars(old).get(
+        "compiler_coverage_outcomes"
+    )
+    # Each unchanged registry's actual additions were independently checked.
+    for group in spec.compiler_coverage_groups:
+        for witness in group.witnesses:
+            requested = witness.carrier
+            requested.config[group.key] = witness.value
+            requested.config[MIN_BLOCKS_KEY] = value
+            assert bound._normalize_config(requested) == previous._normalize_config(
+                requested
+            )
+
+
+@pytest.mark.parametrize("value", (2, 3, 4, 6))
+@pytest.mark.parametrize("disabled", (False, True))
 def test_seed_local_positive_keeps_automatic_pair(value: int, disabled: bool) -> None:
     base, _ = _bind("matmul")
     seed = _group(base).witnesses[0].carrier

@@ -1016,21 +1016,28 @@ class DeviceIR:
         # kernels register their tile slots after the reduction-loop pass below.
         if env.backend_name == "cute" and not rdims:
             from ..language.scan_ops import _associative_scan
+            from .cute.collective_matmul import has_collective_matmul_candidate
             from .cute.memory_ops import register_cute_tensor_alias_specializations
             from .cute.memory_ops import stores_into_input_storage
 
             self._register_cute_tile_vec_slots(env)
             # Grid scans also reorder input reads across warps and need the
-            # same cache-specialized alias facts as reduction kernels. Vector
-            # memory passes likewise move input loads across a store into an
-            # external tensor only under a disjointness proof. Do not add
+            # same cache-specialized alias facts as reduction kernels.
+            # Collective MMA schedules prove operand loads disjoint from
+            # row-loop stores only through them, and vector memory passes
+            # likewise move input loads across a store into an external
+            # tensor only under a disjointness proof. Do not add
             # storage-dependent dispatch guards to unrelated grid kernels,
             # whose stores land in fresh host allocations.
-            if any(
-                node.op == "call_function" and node.target is _associative_scan
-                for graph_info in self.graphs
-                for node in graph_info.graph.nodes
-            ) or stores_into_input_storage(self.graphs, env):
+            if (
+                any(
+                    node.op == "call_function" and node.target is _associative_scan
+                    for graph_info in self.graphs
+                    for node in graph_info.graph.nodes
+                )
+                or has_collective_matmul_candidate(self.graphs)
+                or stores_into_input_storage(self.graphs, env)
+            ):
                 register_cute_tensor_alias_specializations(env)
         if not rdims:
             return
