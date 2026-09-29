@@ -53,6 +53,7 @@ from .cute import grouped_full_coverage_configs
 from .cute import grouped_row_union_carrier
 from .cute import grouped_row_union_cluster4_carrier
 from .cute import grouped_row_union_paired_clc_carrier
+from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
@@ -103,6 +104,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFixedTokenRank1Heuristic,
         CuteCollectiveMatmulHeuristic,
         CuteGroupedRnaHeuristic,
+        CuteBlockScaledMmaHeuristic,
         CuteMaterializedMmaHeuristic,
         CuteMaterializedOperandHeuristic,
         CuteTcgen05ClusterM2FfiHeuristic,

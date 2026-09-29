@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -23,9 +23,6 @@ from helion.autotuner.precompile_future import _serialize_compiled_fn
 from helion.autotuner.precompile_future import _unload_compiled_fn
 from helion.runtime.cute import launcher
 from helion.runtime.cute import source_dependencies
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @pytest.fixture
@@ -58,6 +55,11 @@ def _key(kernel: SimpleNamespace) -> str | None:
 @pytest.mark.parametrize(
     "kind,edited,unrelated",
     [
+        (
+            "gathered_mma_tma",
+            "_compiler/cute/gathered_mma_runtime.py",
+            "block_scaled_mma",
+        ),
         (
             "gathered_mma_tma",
             "_compiler/cute/gathered_mma_runtime.py",
@@ -265,3 +267,80 @@ def test_missing_single_helper_source_disables_only_single_disk_reuse(
     source_dependencies.set_helper_source_hash(paired, "paired_host_sum")
     assert _key(single) is None
     assert _key(paired) is not None
+
+
+@pytest.mark.parametrize(
+    "edited",
+    [
+        "_compiler/cute/block_scaled_config.py",
+        "_compiler/cute/block_scaled_prepare.py",
+        "_compiler/cute/block_scaled_runtime.py",
+    ],
+)
+def test_helper_only_edit_changes_key_without_wrapper_or_plan_change(
+    source_tree: Path, edited: str
+) -> None:
+    scaled = _kernel("block_scaled_mma")
+    gathered = _kernel("gathered_mma_tma")
+    plain = _kernel(None)
+    before = tuple(_key(kernel) for kernel in (scaled, gathered, plain))
+    assert all(key is not None for key in before)
+    (source_tree / edited).write_text("def device_helper():\n    return 2\n")
+    after = tuple(_key(kernel) for kernel in (scaled, gathered, plain))
+    assert before[0] != after[0]
+    assert before[1:] == after[1:]
+
+
+def test_missing_required_source_disables_disk_reuse(source_tree: Path) -> None:
+    unrelated = _kernel("gathered_mma_tma")
+    before = _key(unrelated)
+    (source_tree / "_compiler/cute/block_scaled_prepare.py").unlink()
+    assert _key(_kernel("block_scaled_mma")) is None
+    assert _key(unrelated) == before
+
+
+def test_each_dependency_is_read_once_for_multiple_plans(source_tree: Path) -> None:
+    kinds = ["block_scaled_mma", "gathered_mma_tma", "block_scaled_mma"]
+    reads: list[Path] = []
+    original = Path.read_bytes
+
+    def read(path: Path) -> bytes:
+        reads.append(path)
+        return original(path)
+
+    with patch.object(Path, "read_bytes", read):
+        result = source_dependencies.wrapper_source_dependencies(kinds)
+    assert result is not None
+    assert len(reads) == len(set(reads)) == len(result)
+    assert source_tree / "_compiler/cute/block_scaled_prepare.py" in reads
+
+
+def test_cached_launcher_does_not_rehash_helpers_on_relaunch(source_tree: Path) -> None:
+    kernel = _kernel("block_scaled_mma")
+    original = source_dependencies.wrapper_source_dependencies
+    with (
+        patch.object(launcher, "_create_cute_wrapper", return_value=object()),
+        patch.object(
+            launcher, "wrapper_source_dependencies", wraps=original
+        ) as fingerprint,
+    ):
+        first = launcher._get_compiled_cute_launcher(kernel, (), (192, 1, 1))
+        second = launcher._get_compiled_cute_launcher(kernel, (), (192, 1, 1))
+    assert first is second
+    assert fingerprint.call_count == 1
+
+
+def test_source_checkout_path_does_not_enter_key(
+    source_tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = _key(_kernel("block_scaled_mma"))
+    other = tmp_path / "second-checkout"
+    for relative in (
+        *source_dependencies._COMMON_DEPENDENCIES,
+        *source_dependencies._WRAPPER_DEPENDENCIES["block_scaled_mma"],
+    ):
+        filename = other / relative
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        filename.write_bytes((source_tree / relative).read_bytes())
+    monkeypatch.setattr(source_dependencies, "_PACKAGE_ROOT", other)
+    assert _key(_kernel("block_scaled_mma")) == before
