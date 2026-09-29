@@ -1264,7 +1264,9 @@ class PopulationBasedSearch(BaseSearch):
             # 3: an in-process fallback for a mutated-argument kernel gives
             # every finalist private storage, preventing cross-config L2
             # eviction-priority leakage.
-            "timing_version": 3,
+            # Fresh finalist processes cannot inherit cached argument storage
+            # or live allocations from candidates measured earlier in search.
+            "timing_version": 4,
             "top_k": self._final_rebenchmark_top_k(),
             "target_ms": self._final_rebenchmark_target_ms(),
             "isolated": self._final_rebenchmark_use_isolated(),
@@ -2094,8 +2096,8 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
-            candidate_private_args: When an isolated worker is unavailable,
-                keep mutated argument storage private to each candidate.
+            candidate_private_args: Use a fresh worker process per candidate;
+                when unavailable, keep argument storage private in-process.
         """
         if len(members) < 2:
             return
@@ -2126,6 +2128,7 @@ class PopulationBasedSearch(BaseSearch):
                     target_ms, self.settings.autotune_benchmark_timeout
                 ),
                 desc=desc,
+                fresh_process=candidate_private_args,
             )
             if isolated_results is not None:
                 new_timings, failure_statuses = (
