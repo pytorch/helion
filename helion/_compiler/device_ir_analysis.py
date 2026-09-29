@@ -454,16 +454,20 @@ def _subscript_dense_span(
     ):
         return None
     axis = origin.block_id
-    block_size = env.block_sizes[env.canonical_block_id(axis)].var
+    info = env.block_sizes[env.canonical_block_id(axis)]
+    block_sizes: list[object] = [info.var]
+    # ``hl.tile(n, block_size=1)`` keeps a symbolic var, but ``arange(1 * s)``
+    # traces as a constant extent; accept either spelling of the size.
+    if isinstance(info.block_size_source, FixedBlockSizeSource):
+        block_sizes.append(info.block_size_source.value)
     extent = scalar_expression(contiguous.extent)
-    block_size_expression = scalar_expression(block_size)
-    if (
-        extent is None
-        or block_size_expression is None
-        or env.shape_env.simplify(
-            cast("Any", extent) - cast("Any", coefficient) * block_size_expression
+    if extent is None or not any(
+        (size := scalar_expression(block_size)) is not None
+        and env.shape_env.simplify(
+            cast("Any", extent) - cast("Any", coefficient) * size
         )
-        != 0
+        == 0
+        for block_size in block_sizes
     ):
         return None
     return axis, int(coefficient), int(remainder)

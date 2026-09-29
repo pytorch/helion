@@ -1696,6 +1696,71 @@ class TestCrossLoopScheduler(TestCase):
             (hoisted,),
         )
 
+    def test_dynamic_exact_preserves_per_iteration_nested_readiness(self) -> None:
+        producer_root = _domain((10, 4, 1), identity=0)
+        consumer_root = _domain((20, 2, 1), identity=1)
+        consumer_site = _domain((20, 2, 1), (21, 2, 1), identity=7)
+        keys = CoordinateDomain.scalar(4, kind="event", identity=0)
+        key_axis = coordinate_axis_symbol(keys.axis_order[0])
+        outer = coordinate_axis_symbol(20)
+        nested = coordinate_axis_symbol(21)
+        obligation = (0, None, 7)
+        producer = _producer(
+            0,
+            _full_point_map(keys, producer_root, key_axis),
+        )
+        consumer = _consumer(
+            1,
+            _full_point_map(consumer_site, keys, 2 * outer + nested),
+            site_id=7,
+            obligations=frozenset((obligation,)),
+        )
+        counter = ReadinessCounterPlan((producer,), (consumer,))
+        readiness = ReadinessGraph(
+            (producer_root, consumer_root),
+            (ReadinessEvent((producer,), (consumer,)),),
+        )
+        kwargs = {
+            "readiness_graph": readiness,
+            "obligations_by_root_pair": (((0, 1), frozenset((obligation,))),),
+            "configured_orders": (_dense(producer_root), _dense(consumer_root)),
+            "worker_count": 4,
+            "readiness_counters": (counter,),
+            "root_barrier_edges": frozenset(),
+            "dispatch_mode": "dynamic",
+        }
+
+        original = cross_loop_scheduler._compact_nested_loop_counters_for_schedule
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_compact_nested_loop_counters_for_schedule",
+            wraps=original,
+        ) as compact_call:
+            compact = cross_loop_scheduler._try_finalize_pipeline_proposal(
+                **kwargs,
+                preserve_exact_nested_readiness=False,
+                charge=cross_loop_scheduler._new_relation_work_budget(),
+            )
+            self.assertGreater(compact_call.call_count, 0)
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "_compact_nested_loop_counters_for_schedule",
+            side_effect=AssertionError("exact mode must not coarsen nested readiness"),
+        ):
+            exact = cross_loop_scheduler._try_finalize_pipeline_proposal(
+                **kwargs,
+                preserve_exact_nested_readiness=True,
+                charge=cross_loop_scheduler._new_relation_work_budget(),
+            )
+
+        self.assertIsNotNone(compact)
+        self.assertIsNotNone(exact)
+        assert compact is not None and exact is not None
+        self.assertEqual(compact.readiness_counters[0].readiness_key_domain.size, 4)
+        self.assertEqual(exact.readiness_counters, (counter,))
+        self.assertEqual(exact.readiness_counters[0].readiness_key_domain.size, 4)
+        self.assertEqual(exact.readiness_counters[0].uniform_arrival_count(), 1)
+
     def test_nested_counter_admission_counts_clipped_uniform_fanout(self) -> None:
         producer_root = _domain((10, 2, 1), identity=0)
         consumer_root = _domain((20, 3, 1), identity=1)

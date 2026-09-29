@@ -3145,6 +3145,7 @@ def _try_finalize_pipeline_proposal(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
     dispatch_mode: CrossLoopDispatchMode,
+    preserve_exact_nested_readiness: bool,
     charge: Callable[[int], bool],
 ) -> StaticPipelinePlan | None:
     """Freeze one canonical placement, then lower its final counters."""
@@ -3212,12 +3213,16 @@ def _try_finalize_pipeline_proposal(
             charge,
         ):
             return None
-        compact_counters = _compact_nested_loop_counters_for_schedule(
-            readiness_graph,
-            candidate,
-            readiness_counters,
-            static_producers,
-            charge,
+        compact_counters = (
+            readiness_counters
+            if preserve_exact_nested_readiness
+            else _compact_nested_loop_counters_for_schedule(
+                readiness_graph,
+                candidate,
+                readiness_counters,
+                static_producers,
+                charge,
+            )
         )
         if compact_counters == readiness_counters:
             return candidate
@@ -3270,6 +3275,7 @@ def build_static_pipeline_plan(
     continuation_ineligible_roots: frozenset[int] = frozenset(),
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
     cross_loop_dispatch_mode: CrossLoopDispatchMode = "static",
+    preserve_exact_nested_readiness: bool = False,
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
     if cross_loop_dispatch_mode not in ("static", "dynamic"):
@@ -3332,6 +3338,7 @@ def build_static_pipeline_plan(
             readiness_counters=counters,
             root_barrier_edges=barriers,
             dispatch_mode=dispatch_mode,
+            preserve_exact_nested_readiness=preserve_exact_nested_readiness,
             charge=charge,
         )
 
@@ -3386,8 +3393,12 @@ def build_static_pipeline_plan(
             "admit a progress-safe all-resident cross-loop schedule"
         )
 
-    cheaper_counters = _without_wave_dominated_nested_counters(
-        all_resident_plan, cross_loop_dispatch_mode
+    cheaper_counters = (
+        all_resident_plan.readiness_counters
+        if preserve_exact_nested_readiness
+        else _without_wave_dominated_nested_counters(
+            all_resident_plan, cross_loop_dispatch_mode
+        )
     )
     if cheaper_counters != all_resident_plan.readiness_counters:
         with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):

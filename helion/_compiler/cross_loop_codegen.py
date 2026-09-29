@@ -713,7 +713,9 @@ def emit_cross_loop_schedule(
     corresponding counters. The targets are epoch-scaled, so fixed CUDA
     Graph arguments need neither a reset kernel nor a host-side epoch update.
     """
-    pipeline = device_function.config.cross_loop_pipeline
+    configured_pipeline = device_function.config.cross_loop_pipeline
+    preserve_exact_nested_readiness = configured_pipeline == "dynamic_exact"
+    pipeline = "dynamic" if preserve_exact_nested_readiness else configured_pipeline
     device_ir = HostFunction.current().device_ir
     has_compiler_distributed_dependency = _has_compiler_distributed_dependency(
         device_ir
@@ -864,6 +866,7 @@ def emit_cross_loop_schedule(
         ),
         prove_nonnegative=CompileEnvironment.current().known_nonnegative,
         cross_loop_dispatch_mode=cast("CrossLoopDispatchMode", pipeline),
+        preserve_exact_nested_readiness=preserve_exact_nested_readiness,
     )
     # StaticPipelinePlan accepts only a fixed physical task universe.  Convert
     # task-family offsets only after that invariant has been established.

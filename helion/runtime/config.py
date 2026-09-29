@@ -16,7 +16,7 @@ PidTypeLiteral = Literal[
     "persistent_blocked",
     "persistent_interleaved",
 ]
-CrossLoopPipelineLiteral = Literal["barrier", "static", "dynamic"]
+CrossLoopPipelineLiteral = Literal["barrier", "static", "dynamic", "dynamic_exact"]
 EvictionPolicyLiteral = Literal["", "first", "last"]
 LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
@@ -125,6 +125,9 @@ class Config(Mapping[str, object]):
                 grid synchronization. ``"static"`` and ``"dynamic"`` execute
                 the same compiler-derived dependency schedule with fixed worker
                 ownership or one-shot packet dispatch, respectively.
+                ``"dynamic_exact"`` uses dynamic dispatch while retaining exact
+                nested-loop readiness instead of replacing it with cheaper
+                root-entry waits or barriers.
                 Unsupported kernels reject this field.
             num_sm_multiplier: Positive integer multiplier for the number of SMs
                 in persistent kernels. The autotuner searches powers of two, but

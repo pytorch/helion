@@ -173,7 +173,9 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "pid_type": st.sampled_from(
                 ["flat", "xyz", "persistent_blocked", "persistent_interleaved"]
             ),
-            "cross_loop_pipeline": st.sampled_from(["barrier", "static", "dynamic"]),
+            "cross_loop_pipeline": st.sampled_from(
+                ["barrier", "static", "dynamic", "dynamic_exact"]
+            ),
             "host_tensor_descriptors": st.booleans(),
             "cute_chunk_recurrence_dv_partitions": st.sampled_from([2, 4]),
             "cute_chunk_recurrence_register_cap": st.sampled_from([72, 76, 80]),
@@ -540,6 +542,10 @@ class TestConfigAPI(TestCase):
             helion.Config(cross_loop_pipeline="dynamic").cross_loop_pipeline,
             "dynamic",
         )
+        self.assertEqual(
+            helion.Config(cross_loop_pipeline="dynamic_exact").cross_loop_pipeline,
+            "dynamic_exact",
+        )
 
         with patch("helion._compat.is_hip", return_value=False):
             spec = ConfigSpec(backend=TritonBackend())
@@ -556,7 +562,9 @@ class TestConfigAPI(TestCase):
             self.assertIsInstance(field, EnumFragment)
             assert isinstance(field, EnumFragment)
             self.assertIs(field, spec.cross_loop_pipeline)
-            self.assertEqual(field.choices, ("barrier", "static", "dynamic"))
+            self.assertEqual(
+                field.choices, ("barrier", "static", "dynamic", "dynamic_exact")
+            )
             self.assertEqual(
                 spec.default_config()["cross_loop_pipeline"],
                 "barrier",

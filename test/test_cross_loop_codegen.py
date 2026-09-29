@@ -841,9 +841,61 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
         torch.testing.assert_close(out, (x + 1) * 2 + 3)
         self.assertIn("tile_dependency_raw_dispatch_ticket", code)
+        self.assertNotIn("fence.proxy.async.global", code)
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("_minimum_resident_programs=", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_exact_retains_small_producer_nested_stream(self) -> None:
+        x = torch.arange(64, device=DEVICE, dtype=torch.float32).reshape(1, 64)
+        ordinary_code, ordinary_out = code_and_output(
+            streamed_singleton_reduction,
+            (x,),
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        exact_code, exact_out = code_and_output(
+            streamed_singleton_reduction,
+            (x,),
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic_exact",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(ordinary_out, exact_out)
+
+        def wait_is_nested(code: str) -> bool:
+            tree = ast.parse(code)
+            parents = {
+                child: parent
+                for parent in ast.walk(tree)
+                for child in ast.iter_child_nodes(parent)
+            }
+            wait = next(
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name)
+                    and target.id.startswith("tile_dependency_nested_loop_wait")
+                    for target in node.targets
+                )
+            )
+            parent = parents.get(wait)
+            while parent is not None and not isinstance(parent, ast.For):
+                parent = parents.get(parent)
+            return isinstance(parent, ast.For)
+
+        self.assertFalse(wait_is_nested(ordinary_code))
+        self.assertTrue(wait_is_nested(exact_code))
+        self.assertNotIn("tile_dependency_root_barrier_wait", exact_code)
 
     @skipIfNotCUDA()
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")

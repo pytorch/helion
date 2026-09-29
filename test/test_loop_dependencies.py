@@ -318,7 +318,9 @@ class TestTritonTileDependencyLowering(TestCase):
         fragment = bound.config_spec._flat_fields()["cross_loop_pipeline"]
         self.assertIsInstance(fragment, EnumFragment)
         assert isinstance(fragment, EnumFragment)
-        self.assertEqual(fragment.choices, ("barrier", "static", "dynamic"))
+        self.assertEqual(
+            fragment.choices, ("barrier", "static", "dynamic", "dynamic_exact")
+        )
         self.assertEqual(
             bound.config_spec.default_config()["cross_loop_pipeline"],
             "barrier",
