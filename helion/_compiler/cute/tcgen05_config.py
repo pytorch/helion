@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import PidTypeLiteral
     from .epilogue_fanout import PairedFanoutPlan
+    from .materialized_pdl import MaterializedOperandPdl
 
 
 class Tcgen05ClusterM2SearchConstraints(NamedTuple):
@@ -485,9 +486,12 @@ class CuteTcgen05Config:
         self.deep_direct_entry_validation_enabled: bool = False
         self.pipeline_smem_facts: Tcgen05PipelineSmemFacts | None = None
         # Root identities from the typed operand-materialization dependency proof.
-        self.materialized_operand_pdl_roots: tuple[int, int] | None = None
+        self.materialized_operand_pdl_roots: MaterializedOperandPdl | None = None
         self.num_epi_warps_search_choices: tuple[int, ...] | None = None
         self.num_epi_warps_validation_choices: tuple[int, ...] | None = None
+        # SM count of the bound device (0 when unknown); small-grid seeds use
+        # it to decide whether the standard tiling can fill the machine.
+        self.device_sm_count: int = 0
 
     @property
     def allowed_pid_types(self) -> tuple[PidTypeLiteral, ...]:
@@ -861,27 +865,152 @@ class CuteTcgen05Config:
                         )
         return seeds
 
+    def _small_grid_seed_configs(self) -> list[Config]:
+        """One-CTA seeds for problems the standard 128x128 tiling cannot fill.
+
+        A GEMM with fewer 128x128 output tiles than SMs is bound by per-CTA
+        fixed latency and by each SM's L2->SMEM bandwidth, not by MMA
+        throughput. Small one-CTA tiles spread the operand re-reads over more
+        SMs (the cuBLAS heuristic picks 64x8 .. 64x32 tiles there); the paired
+        two-CTA seeds above cover the machine-filling shapes. The tiles are
+        chosen from the problem's geometry only: whole tiles, the widest K
+        packet the search admits, and an AB ring no deeper than the K loop.
+        """
+        extents = self.matmul_compile_time_static_extents
+        fragments = self._matmul_block_fragments()
+        if (
+            not self.search_enabled
+            or self.device_sm_count <= 0
+            or extents is None
+            or fragments is None
+            or any(value is None or value <= 0 for value in extents)
+            or self.matmul_has_leading_passthrough
+            or "persistent_interleaved" not in self.allowed_pid_types
+        ):
+            return []
+        m, n, k = cast("tuple[int, int, int]", extents)
+        bm_fragment, bn_fragment, bk_fragment = fragments
+        standard_tiles = -(-m // 128) * -(-n // 128)
+        if standard_tiles >= self.device_sm_count:
+            return []
+        bk = bk_fragment.high
+        while bk >= bk_fragment.low and (k % bk or bk % 16):
+            bk //= 2
+        if bk < bk_fragment.low or bk < 16:
+            return []
+        seeds: list[Config] = []
+        for bm in (64, 128):
+            if not bm_fragment.low <= bm <= bm_fragment.high or m % bm:
+                continue
+            for bn in (16, 32, 64):
+                if not bn_fragment.low <= bn <= bn_fragment.high or n % bn:
+                    continue
+                block_sizes = self._matmul_seed_block_sizes(bm=bm, bn=bn, bk=bk)
+                assert block_sizes is not None
+                fit = self.max_ab_stages_that_fit(bm=bm, bn=bn, bk=bk, cluster_m=1)
+                stages = min(k // bk, fit if fit > 0 else 2)
+                seeds.append(
+                    Config(
+                        block_sizes=block_sizes,
+                        pid_type="persistent_interleaved",
+                        tcgen05_cta_group="auto",
+                        tcgen05_cluster_m=1,
+                        tcgen05_cluster_n=1,
+                        tcgen05_ab_stages=max(1, stages),
+                        tcgen05_c_stages=2,
+                        tcgen05_acc_stages=2,
+                        tcgen05_persistence_model="static_persistent",
+                        tcgen05_strategy="role_local_monolithic",
+                        tcgen05_layout_strategy="default",
+                        **dict.fromkeys(TCGEN05_LAYOUT_OVERRIDES_KEYS),
+                    )
+                )
+            # 64-row tiles double the CTA count of every 128-row tile; seed the
+            # wider rows only when the narrow ones are out of reach.
+            if seeds:
+                break
+        return seeds
+
+    def _one_cta_persistent_parameters(
+        self, config: dict[str, object]
+    ) -> tuple[int, int, int] | None:
+        """Plain one-CTA static-persistent role-local family (cluster 1x1).
+
+        The same role-local ``while`` builder that emits the two-CTA TMA-role
+        dependency wait serves this family, so its TMA warp can wait on a
+        programmatic dependency before its first operand read.
+        """
+        view = self._matmul_config_view(config)
+        if (
+            view is None
+            or config.get(TCGEN05_CTA_GROUP_CONFIG_KEY, "auto") != "auto"
+            or config.get("tcgen05_cluster_m", 1) != 1
+            or config.get("tcgen05_cluster_n", 1) != 1
+            or config.get("pid_type")
+            not in (
+                "persistent_blocked",
+                "persistent_interleaved",
+            )
+            or config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY) is not None
+            or config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY)
+            or config.get(TCGEN05_STRATEGY_CONFIG_KEY, "role_local_monolithic")
+            != "role_local_monolithic"
+            or config.get(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, "static_persistent")
+            != "static_persistent"
+            or config.get(TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY, "default") != "default"
+            or any(config.get(key) is not None for key in TCGEN05_LAYOUT_OVERRIDES_KEYS)
+            or any(
+                config.get(key, 0) != 0
+                for key in (
+                    TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY,
+                    TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY,
+                    TCGEN05_WARP_SPEC_STORE_WARPS_KEY,
+                )
+            )
+        ):
+            return None
+        blocks, mi, ni, ki = view
+        bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+        if (
+            bm not in (64, 128)
+            or not isinstance(bn, int)
+            or not isinstance(bk, int)
+            or not 8 <= bn <= 256
+            or bn % 8
+            or not 16 <= bk <= 256
+            or bk % 16
+        ):
+            return None
+        return cast("tuple[int, int, int]", (bm, bn, bk))
+
     def materialized_operand_pdl_supported(self, config: dict[str, object]) -> bool:
-        # This exact static TWO schedule emits a TMA-role dependency wait before
-        # all initial/refill operand reads. Alternative/fused schedules do not
+        # The static persistent role-local schedules (the paired TWO family and
+        # the plain one-CTA family) emit a TMA-role dependency wait before all
+        # initial/refill operand reads. Alternative/fused schedules do not
         # inherit this proof or the separate producer launch.
         parameters = self._paired_pipeline_parameters(config)
+        tiles = (
+            parameters[:3]
+            if parameters is not None
+            else self._one_cta_persistent_parameters(config)
+        )
         extents = self.matmul_compile_time_static_extents
         if (
             self.materialized_operand_pdl_roots is None
-            or parameters is None
+            or tiles is None
             or extents is None
             or any(
                 extent is None or extent % tile != 0
-                for extent, tile in zip(extents, parameters[:3], strict=True)
+                for extent, tile in zip(extents, tiles, strict=True)
             )
         ):
             return False
-        limit = self._paired_pipeline_stage_limit(config)
+        if parameters is not None:
+            limit = self._paired_pipeline_stage_limit(config)
+            if limit is None or limit <= 0:
+                return False
         return (
-            limit is not None
-            and limit > 0
-            and config.get(FANOUT_CONFIG_KEY, "off") == "off"
+            config.get(FANOUT_CONFIG_KEY, "off") == "off"
             and config.get("cute_materialized_operand_schedule", "off") == "off"
             and config.get("cute_materialized_schedule", "off") == "off"
             and not config.get("cute_split_k_workspace")
@@ -1721,6 +1850,7 @@ class CuteTcgen05Config:
 
     def autotune_seed_configs(self) -> list[Config]:
         seeds = self._paired_pipeline_seed_configs()
+        seeds.extend(self._small_grid_seed_configs())
         plain_clc_seed = self._plain_clc_seed_config()
         if plain_clc_seed is not None:
             seeds.append(plain_clc_seed)

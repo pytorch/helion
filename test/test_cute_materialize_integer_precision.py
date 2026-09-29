@@ -188,6 +188,8 @@ def _derived_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     (
         (torch.int8, True),
         (torch.uint8, True),
+        (torch.int16, False),
+        (torch.int32, False),
     ),
 )
 @pytest.mark.parametrize("derived", (False, True))

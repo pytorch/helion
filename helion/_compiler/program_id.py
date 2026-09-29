@@ -3378,15 +3378,27 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         work_tile_var = device_function.new_var(f"{scheduler_var_prefix}_work_tile")
 
         prelude: list[ast.stmt] = []
-        if (
-            emit_pdl_wait
-            and self._tcgen05_is_two_cta()
-            and (
-                role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
-                or device_function.config.get("tcgen05_materialized_pdl", False)
-                and device_function.config.get("tcgen05_epilogue_fanout") == "shared"
-                and role_block.role_predicate == self._tcgen05_epi_role_predicate()
+        materialized_pdl = bool(
+            device_function.config.get("tcgen05_materialized_pdl", False)
+        )
+        tma_load_role = (
+            role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            and not device_function.cute_state.tcgen05_pdl_wait_in_prefetch
+        )
+        if emit_pdl_wait and (
+            (
+                self._tcgen05_is_two_cta()
+                and (
+                    tma_load_role
+                    or materialized_pdl
+                    and device_function.config.get("tcgen05_epilogue_fanout")
+                    == "shared"
+                    and role_block.role_predicate == self._tcgen05_epi_role_predicate()
+                )
             )
+            # The one-CTA family waits only when a materialized producer is
+            # launched ahead of it, so its plain generated code is unchanged.
+            or (materialized_pdl and tma_load_role)
         ):
             # PDL parity with Quack/CUTLASS: TMA producers wait before
             # touching scheduler state or issuing global-memory TMA work.

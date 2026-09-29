@@ -597,14 +597,23 @@ def test_known_metadata_constants_and_fp32_outputs_remain_supported() -> None:
 
 @skipUnlessBackends(["cute"])
 def test_carrierless_binding_keeps_old_search_registry() -> None:
-    for bound in (bind(), bind(rows=257)):
+    # A 256x128 output has fewer 128x128 tiles than SMs, so the tcgen05 seeds
+    # include one-CTA small-grid tiles (128x{16,32,64}x64), and those carry
+    # the fanout. Carrierless bindings therefore need a geometry no small
+    # tile divides: odd rows, or a column count off the 16/32/64 tile widths.
+    for bound in (bind(rows=257), bind(columns=120)):
         assert plan_for(bound)
+        assert not bound.config_spec.compiler_seed_configs
         state = bound.config_spec._cute_tcgen05_config
         assert not state.epilogue_fanout_search_enabled
         assert not any(
             group.key == FANOUT_CONFIG_KEY
             for group in bound.config_spec.compiler_coverage_groups
         )
+    seeded = bind()
+    assert plan_for(seeded)
+    assert seeded.config_spec.compiler_seed_configs
+    assert seeded.config_spec._cute_tcgen05_config.epilogue_fanout_search_enabled
 
 
 @pytest.mark.parametrize(

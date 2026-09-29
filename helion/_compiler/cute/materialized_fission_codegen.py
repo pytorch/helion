@@ -50,6 +50,82 @@ _MEMORY_COUNTERS = (
 )
 
 
+_WARP_ROLE_SELECTOR = "cute.arch.make_warp_uniform(cute.arch.warp_idx())"
+
+
+def _is_griddepcontrol_wait(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and ast.unparse(stmt.value.func) == "cute.arch.griddepcontrol_wait"
+    )
+
+
+def _loads_through_atom(node: ast.AST, atom: str) -> bool:
+    """Whether ``node`` issues a TMA load through ``atom``.
+
+    ``cute.copy(atom, ...)`` is the one statement that reads operand memory
+    through a TMA atom; ``tma_partition`` and ``prefetch_descriptor`` also
+    name the atom but read layout and descriptor metadata only.
+    """
+    return any(
+        isinstance(call, ast.Call)
+        and ast.unparse(call.func) == "cute.copy"
+        and bool(call.args)
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == atom
+        for call in ast.walk(node)
+    )
+
+
+def _dependent_load_before_wait(body: list[ast.stmt], atom: str) -> bool:
+    """Whether a load through ``atom`` in ``body`` runs before any wait.
+
+    Statements execute in source order, so a ``griddepcontrol_wait`` at the
+    top level of ``body`` covers every later statement of that body.  A wait
+    nested in a branch or loop body covers only the rest of that body: a load
+    after the nested block still needs a wait of its own.  Any other compound
+    statement holding a load fails closed.
+    """
+    for stmt in body:
+        if _is_griddepcontrol_wait(stmt):
+            return False
+        if isinstance(stmt, (ast.If, ast.While, ast.For)):
+            if any(
+                _dependent_load_before_wait(nested, atom)
+                for nested in (stmt.body, stmt.orelse)
+            ):
+                return True
+            continue
+        if _loads_through_atom(stmt, atom):
+            return True
+    return False
+
+
+def _tma_role_waits_before_dependent_loads(device: ast.FunctionDef, atom: str) -> bool:
+    """Whether the TMA-load role waits on the producer grid ahead of ``atom``.
+
+    Every load through the dependent operand's atom must sit in one warp-role
+    block ``if <warp selector> == <n>:`` of the device function, and inside
+    it, in the one-shot and the ``while ... is_valid_tile`` layouts alike, a
+    ``griddepcontrol_wait`` must dominate the first such load.
+    """
+    roles = [stmt for stmt in device.body if _loads_through_atom(stmt, atom)]
+    if len(roles) != 1:
+        return False
+    role = roles[0]
+    if not (
+        isinstance(role, ast.If)
+        and not role.orelse
+        and isinstance(role.test, ast.Compare)
+        and ast.unparse(role.test.left) == _WARP_ROLE_SELECTOR
+        and len(role.test.ops) == 1
+        and isinstance(role.test.ops[0], ast.Eq)
+    ):
+        return False
+    return not _dependent_load_before_wait(role.body, atom)
+
+
 def _stage_config(
     config: Config,
     plan: MaterializedFissionPlan,
@@ -313,15 +389,45 @@ def generate_materialized_fission(
                 for item in env.cute_resolved_wrapper_plans
                 if item["kind"] == "tcgen05_ab_tma"
             ]
-            if not (
-                len(ab_plans) == 1
-                and ab_plans[0].get("use_pdl") is True
-                and ab_plans[0].get("use_2cta_instrs", ab_plans[0]["bm"] == 256)
-                and ab_plans[0]["cluster_m"] == 2
-                and ab_plans[0]["cluster_n"] == 1
-            ):
+            device = next(
+                stmt
+                for stmt in module.body
+                if isinstance(stmt, ast.FunctionDef)
+                and stmt.name == f"_helion_{stage.name}"
+            )
+            # The consumer must launch with the programmatic dependency AND its
+            # TMA role must wait on it before its first load of the
+            # materialized operand (the ordinary operand's initial loads may
+            # precede the wait); the static persistent role-local builder
+            # emits that wait for the paired TWO family and, on request, for
+            # the plain one-CTA family.
+            consumer_ok = False
+            if len(ab_plans) == 1:
+                ab_plan = ab_plans[0]
+                atom_a, _tensor_a, atom_b, _tensor_b = cast(
+                    "list[str]", ab_plan["kernel_args"]
+                )
+                dependent_atom = atom_b if pdl_roots.dependent_side == "rhs" else atom_a
+                consumer_ok = (
+                    ab_plan.get("use_pdl") is True
+                    and ab_plan["cluster_n"] == 1
+                    and (
+                        (
+                            ab_plan.get("use_2cta_instrs", ab_plan["bm"] == 256)
+                            and ab_plan["cluster_m"] == 2
+                        )
+                        or (
+                            not ab_plan.get("use_2cta_instrs", False)
+                            and ab_plan["cluster_m"] == 1
+                        )
+                    )
+                    and _tma_role_waits_before_dependent_loads(device, dependent_atom)
+                )
+            if not consumer_ok:
                 raise InvalidConfig(
-                    "materialized operand PDL requires the emitted native TWO TMA consumer"
+                    "materialized operand PDL requires the emitted native TMA "
+                    "consumer whose TMA role waits on the dependency before its "
+                    "first load of the materialized operand"
                 )
         resolved_plans.extend(env.cute_resolved_wrapper_plans)
         host_def = next(

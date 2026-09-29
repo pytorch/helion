@@ -848,15 +848,20 @@ _CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
 }
 
 # ``unroll`` mode loads inputs as same-width INTEGER vectors (Uint16 for
-# bf16/fp16, Uint32 for fp32) and bitcasts each extracted lane back to the
-# original dtype.  This avoids the CuTe DSL crash that fires when
+# bf16/fp16/int16, Uint32 for fp32/int32) and bitcasts each extracted lane
+# back to the original dtype.  This avoids the CuTe DSL crash that fires when
 # subscripting a bf16/fp16 vector value, and for fp32 sidesteps the retired
-# explicit-vec mode (see ``_cute_vec_kernel_mode``).  Maps the tensor dtype
-# to the cutlass scalar type of the extracted lane.
+# explicit-vec mode (see ``_cute_vec_kernel_mode``).  Signed 16/32-bit
+# integer inputs (an int16 weight cast to bf16 inside the kernel) take the
+# same carrier packets; the lane bitcast is exact and the program's own cast
+# runs on the extracted scalar unchanged.  Maps the tensor dtype to the
+# cutlass scalar type of the extracted lane.
 _CUTE_VECTOR_UNROLL_DTYPES: dict[torch.dtype, str] = {
     torch.float16: "cutlass.Float16",
     torch.bfloat16: "cutlass.BFloat16",
     torch.float32: "cutlass.Float32",
+    torch.int16: "cutlass.Int16",
+    torch.int32: "cutlass.Int32",
 }
 
 # Integer carrier type for an unroll-mode vector load of a given dtype.
@@ -864,6 +869,8 @@ _CUTE_VECTOR_UNROLL_CARRIER: dict[torch.dtype, str] = {
     torch.float16: "cutlass.Uint16",
     torch.bfloat16: "cutlass.Uint16",
     torch.float32: "cutlass.Uint32",
+    torch.int16: "cutlass.Uint16",
+    torch.int32: "cutlass.Uint32",
 }
 
 # One-byte FP8 and signed INT8 inputs use ``unroll`` mode. Rather than a
@@ -1075,7 +1082,7 @@ def _cute_register_tile_unroll_vec_store(
         lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     flush_helper = (
-        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+        "_cute_store_u32_vec" if dtype.itemsize == 4 else "_cute_store_u16_vec"
     )
     flush_values = (
         list_var if packed_values is None else packed_values.flush_operand(list_var)
@@ -1154,7 +1161,7 @@ def _cute_register_reduction_unroll_vec_store(
     lane_body.insert(_vloop_pos(), statement_from_string(f"{list_var} = []"))
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     flush_helper = (
-        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+        "_cute_store_u32_vec" if dtype.itemsize == 4 else "_cute_store_u16_vec"
     )
     flush_expr = f"{flush_helper}({base_ptr_expr}, {list_var})"
     if mask_expr is not None:

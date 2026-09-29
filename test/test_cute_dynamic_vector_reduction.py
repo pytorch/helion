@@ -129,7 +129,7 @@ def _dynamic_rows_between_static_column_sweeps(
 
 
 def _rms_norm_of_bf16_bits(x_bits: torch.Tensor) -> torch.Tensor:
-    """The bf16 rows live behind an int16 input, whose alignment is not keyed."""
+    """The bf16 rows live behind an int16 input that owns their storage."""
     x = x_bits.view(torch.bfloat16)
     m, n = x.size()
     out = torch.empty_like(x)
@@ -522,21 +522,23 @@ def test_wrapper_allocations_prove_the_output_base(
 
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("static_shapes", [False, True])
-def test_dtype_punning_view_of_an_input_stays_scalar(static_shapes: bool) -> None:
-    # The bf16 rows are a ``view(torch.bfloat16)`` of an int16 input: they have
-    # no replayable input source and are not a wrapper allocation, so no
-    # cache-key-backed alignment fact covers their base and the packet is
-    # refused.  The freshly allocated output keeps its vector stores when its
-    # row stride is static; with a symbolic row length the int16 input's size
-    # residue is not keyed either, so the output row stride cannot be proven a
-    # multiple of V and its stores stay scalar too.
+def test_dtype_punning_view_reads_its_owners_keyed_alignment(
+    static_shapes: bool,
+) -> None:
+    # The bf16 rows are a ``view(torch.bfloat16)`` of an int16 input.  Every
+    # packet dtype keys its inputs' pointer/stride residues, so with static
+    # shapes the zero-offset view that this one input owns reads the input's
+    # bound base residue and keeps its packet; the symbolic view has no owner
+    # proof and stays scalar.  The freshly allocated output proves its base
+    # either way and its row stride from the static extent or the keyed size
+    # residue, so its vector stores stay.
     x_bits = torch.empty((64, 4096), dtype=torch.int16)
     bound, _arguments = _bind(
         _dynamic_kernel(_rms_norm_of_bf16_bits, static_shapes=static_shapes), (x_bits,)
     )
     code = bound.to_code(_rolled_config(bound, threads=128, vec=8, chunk=1024))
-    assert VEC_LOAD not in code
-    assert ("_cute_store_u16_vec" in code) == static_shapes
+    assert (VEC_LOAD in code) is static_shapes
+    assert "_cute_store_u16_vec" in code
 
 
 @skipUnlessBackends(["cute"])

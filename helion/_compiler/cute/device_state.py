@@ -711,6 +711,10 @@ class CuteDeviceFunctionState:
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
         self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
+        # The materialized-operand dependency wait was emitted inside the
+        # initial AB prefetch (independent operand first); the role-local
+        # prelude must not wait again ahead of those loads.
+        self.tcgen05_pdl_wait_in_prefetch: bool = False
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()

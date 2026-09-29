@@ -373,6 +373,54 @@ def test_nonzero_grid_origin_keeps_per_element_masks_and_scalar_loads(
     assert "block=(128, 4, 1)" in code
 
 
+def _strided_view(view: str) -> torch.Tensor:
+    if view == "offset_2":
+        # Base four bytes into the allocation: misaligned for the 8-byte packet.
+        return torch.empty(4096, 4112, dtype=torch.bfloat16)[:, 2:4098]
+    if view == "row_stride_4098":
+        # 8196-byte rows: every odd row starts four bytes into a packet.
+        return torch.empty(4096, 4098, dtype=torch.bfloat16)[:, :4096]
+    assert view == "row_stride_4100"
+    # 8200-byte rows are 8-byte aligned, so the packet is legal.
+    return torch.empty(4096, 4100, dtype=torch.bfloat16)[:, :4096]
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("view", ["offset_2", "row_stride_4098"])
+def test_misaligned_input_views_stay_scalar_with_the_knob_on(
+    cpu_only: None, view: str
+) -> None:
+    """The sinkable-load fact shares the tile hoist's base and stride proof
+    (``cute_reduction_vector_layout_aligned``): a view whose base or row
+    stride is not a multiple of the packet records no fact, nothing sinks and
+    the knob-on code is the knob-off code, which the hoist had already left
+    on scalar loads."""
+    code = _both(
+        col_reduce_sum_static,
+        (_strided_view(view),),
+        **_sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+        ),
+    )
+    assert "cute.arch.load(" not in code
+    assert ".load()" in ast.unparse(_loop(code, "lane_0"))
+    assert FRAGMENT_REDUCE not in code
+    assert code.count(TWO_STAGE_REDUCE) == 1
+
+
+@skipUnlessBackends(["cute"])
+def test_an_aligned_row_stride_still_sinks(cpu_only: None) -> None:
+    code = _cpu_code(
+        col_reduce_sum_static,
+        (_strided_view("row_stride_4100"),),
+        **_sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+        ),
+    )
+    assert len(_vector_loads(_loop(code, "lane_0").body)) == 8
+    assert ".load()" not in code
+
+
 @skipUnlessBackends(["cute"])
 def test_per_element_load_conditions_are_unsupported(cpu_only: None) -> None:
     """A load under a condition that differs per V lane (an ``extra_mask``
