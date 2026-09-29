@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .resident_reductions import ResidentReductionLayout
@@ -781,6 +782,10 @@ class CuteDeviceFunctionState:
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
         self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
+        # Whole-root gated-delta-rule (gdn_fwd_h) chunk recurrence.  Installed
+        # only after the semantic two-contraction graph match and the shape
+        # admission limits of the SM100 tcgen05 schedule both hold.
+        self.gdn_recurrence_plan: CuteGdnRecurrencePlan | None = None
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the

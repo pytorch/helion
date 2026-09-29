@@ -272,6 +272,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
+                    "gdn_recurrence_sm100",
                     "helion_flash_bwd",
                     "gathered_mma_tma",
                     "block_scaled_mma",
@@ -573,6 +574,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         self.device_function.cute_state.chunk_recurrence_plan = None
         raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
+
+    def _try_codegen_gdn_recurrence_root(self) -> bool:
+        plan = self.device_function.cute_state.gdn_recurrence_plan
+        if plan is None:
+            return False
+        from .cute.gdn_recurrence import codegen_gdn_recurrence
+
+        if codegen_gdn_recurrence(self):
+            return True
+        self.device_function.cute_state.gdn_recurrence_plan = None
+        raise exc.BackendUnsupported("cute", "gdn recurrence failed late validation")
 
     def _try_lower_direct_affine_root(
         self,
@@ -1540,6 +1552,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         not self._try_codegen_block_scaled_root()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
+                        and not self._try_codegen_gdn_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
@@ -2504,6 +2517,9 @@ def _generate_ast(
                         "q_name",
                         "k_name",
                         "g_name",
+                        "w_name",
+                        "u_name",
+                        "h_name",
                         "beta_name",
                         "a_log_name",
                         "dt_name",

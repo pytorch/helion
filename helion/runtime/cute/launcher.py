@@ -596,6 +596,9 @@ def _append_cute_wrapper_plan(
                 "cute", "invalid SM100 chunk-recurrence schedule ABI"
             )
         return
+    if kind == "gdn_recurrence_sm100":
+        _validate_gdn_recurrence_plan(plan)
+        return
     if kind == "chunk_recurrence_warp_dv4":
         outputs_scaled = plan.get("outputs_scaled")
         factor_key_xor = plan.get("factor_key_xor")
@@ -1821,6 +1824,191 @@ def _append_sm100_chunk_recurrence_host_call(
         raise exc.BackendUnsupported("cute", "empty SM100 recurrence launch")
 
 
+def _gdn_recurrence_plan_int(plan: dict[str, object], key: str) -> int:
+    value = plan.get(key)
+    if type(value) is not int:
+        raise exc.BackendUnsupported("cute", f"invalid gdn recurrence plan {key}")
+    return value
+
+
+_GDN_RECURRENCE_HOST_CONSTEXPR_KEYS: tuple[str, ...] = (
+    "block_v",
+    "chunk",
+    "dhead",
+    "epilogue_warps",
+    "stages",
+    "token_groups",
+    "mma_m",
+    "state_col",
+    "state_image_col",
+    "acc_col",
+    "update_image_col",
+    "tmem_cols",
+)
+
+
+def _validate_gdn_recurrence_plan(plan: dict[str, object]) -> None:
+    """Re-prove the gdn recurrence schedule ABI carried by the wrapper plan."""
+
+    from ..._compiler.cute.gdn_recurrence_geometry import GDN_RECURRENCE_DEVICE_ABI
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_cta_warps
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_epilogue_warp_choices
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_mma_m_choices
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_shape_admitted
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_smem_bytes
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_stage_choices
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_tmem_layout
+    from ..._compiler.cute.gdn_recurrence_geometry import gdn_token_group_choices
+
+    values = {
+        key: _gdn_recurrence_plan_int(plan, key)
+        for key in (
+            "batch",
+            "heads",
+            "seqlen",
+            "num_chunks",
+            "threads",
+            "smem_bytes",
+            "device_abi",
+            *_GDN_RECURRENCE_HOST_CONSTEXPR_KEYS,
+        )
+    }
+    tmem = gdn_tmem_layout(values["dhead"], values["chunk"])
+    if (
+        values["device_abi"] != GDN_RECURRENCE_DEVICE_ABI
+        or min(values["batch"], values["heads"], values["seqlen"]) <= 0
+        or values["num_chunks"] != -(-values["seqlen"] // values["chunk"])
+        or not gdn_shape_admitted(
+            dhead=values["dhead"],
+            chunk=values["chunk"],
+            dstate=_gdn_recurrence_plan_int(plan, "dstate"),
+            block_v=values["block_v"],
+        )
+        or values["epilogue_warps"]
+        not in gdn_epilogue_warp_choices(values["chunk"], values["dhead"])
+        or values["mma_m"]
+        not in gdn_mma_m_choices(
+            values["chunk"],
+            values["dhead"],
+            values["block_v"],
+            values["epilogue_warps"],
+        )
+        or values["stages"]
+        not in gdn_stage_choices(
+            values["chunk"], values["dhead"], values["block_v"], values["mma_m"]
+        )
+        or values["threads"]
+        != 32
+        * gdn_cta_warps(values["block_v"], values["epilogue_warps"], values["mma_m"])
+        or values["token_groups"]
+        not in gdn_token_group_choices(
+            values["chunk"],
+            values["block_v"],
+            values["epilogue_warps"],
+            values["mma_m"],
+        )
+        or values["smem_bytes"]
+        != gdn_smem_bytes(
+            values["chunk"],
+            values["dhead"],
+            values["block_v"],
+            values["stages"],
+            values["mma_m"],
+        )
+        or tmem is None
+        or (
+            values["state_col"],
+            values["state_image_col"],
+            values["acc_col"],
+            values["update_image_col"],
+            values["tmem_cols"],
+        )
+        != (
+            tmem.state_col,
+            tmem.state_image_col,
+            tmem.acc_col,
+            tmem.update_image_col,
+            tmem.alloc_cols,
+        )
+    ):
+        raise exc.BackendUnsupported("cute", "invalid gdn recurrence schedule ABI")
+
+
+def _append_gdn_recurrence_host_call(body: list[str], plan: dict[str, object]) -> None:
+    """Call the gdn recurrence host schedule with the wrapper's tensor views."""
+
+    _validate_gdn_recurrence_plan(plan)
+    tensors = ", ".join(
+        f"arg{_gdn_recurrence_plan_int(plan, key)}"
+        for key in ("k_idx", "w_idx", "u_idx", "g_idx", "h_idx")
+    )
+    constexprs = ", ".join(
+        str(_gdn_recurrence_plan_int(plan, key))
+        for key in _GDN_RECURRENCE_HOST_CONSTEXPR_KEYS
+    )
+    body.extend(
+        (
+            "    _helion_cute_kernel_tag = 'gdn_recurrence_sm100'",
+            f"    _helion_gdn_recurrence_host({tensors}, stream, {constexprs})",
+        )
+    )
+
+
+def _validate_gdn_recurrence_launch_args(
+    plan: dict[str, object], args: tuple[object, ...]
+) -> None:
+    """Check the runtime tensors against the geometry baked into the plan."""
+
+    from ..._compiler.cute.gdn_recurrence_geometry import GDN_TMA_ALIGNMENT_BYTES
+
+    _validate_gdn_recurrence_plan(plan)
+    batch = _gdn_recurrence_plan_int(plan, "batch")
+    heads = _gdn_recurrence_plan_int(plan, "heads")
+    seqlen = _gdn_recurrence_plan_int(plan, "seqlen")
+    dhead = _gdn_recurrence_plan_int(plan, "dhead")
+    dstate = _gdn_recurrence_plan_int(plan, "dstate")
+    num_chunks = _gdn_recurrence_plan_int(plan, "num_chunks")
+    expected = (
+        ("k_idx", torch.bfloat16, (batch, seqlen, heads, dhead)),
+        ("w_idx", torch.bfloat16, (batch, seqlen, heads, dhead)),
+        ("u_idx", torch.bfloat16, (batch, seqlen, heads, dstate)),
+        ("g_idx", torch.float32, (batch, seqlen, heads)),
+        ("h_idx", torch.bfloat16, (batch, num_chunks, heads, dhead, dstate)),
+    )
+    tensors: list[torch.Tensor] = []
+    for key, dtype, shape in expected:
+        index = _gdn_recurrence_plan_int(plan, key)
+        tensor = args[index] if 0 <= index < len(args) else None
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.dtype != dtype
+            or tuple(tensor.shape) != shape
+            or not tensor.is_contiguous()
+            or tensor.device.type != "cuda"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", f"gdn recurrence {key} does not match the compiled geometry"
+            )
+        tensors.append(tensor)
+    if any(tensor.device != tensors[0].device for tensor in tensors):
+        raise exc.BackendUnsupported(
+            "cute", "gdn recurrence tensors must share one CUDA device"
+        )
+    output = tensors[-1]
+    output_begin = output.data_ptr()
+    output_end = output_begin + output.numel() * output.element_size()
+    for tensor in tensors[:-1]:
+        begin = tensor.data_ptr()
+        end = begin + tensor.numel() * tensor.element_size()
+        if begin < output_end and output_begin < end:
+            raise exc.BackendUnsupported(
+                "cute", "gdn recurrence output must not alias its inputs"
+            )
+    # k, w and u are read through TMA tensor maps.
+    if any(tensor.data_ptr() % GDN_TMA_ALIGNMENT_BYTES for tensor in tensors[:3]):
+        raise exc.BackendUnsupported("cute", "gdn recurrence TMA base is misaligned")
+
+
 def _append_sm100_warp_dv4_host_call(body: list[str], plan: dict[str, object]) -> None:
     """Launch the selected warp-HMMA DV4 schedule through its pinned host entry."""
 
@@ -2096,9 +2284,18 @@ def _create_cute_wrapper(
     block_scaled_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "block_scaled_mma"
     ]
+    gdn_recurrence_plans = [
+        plan for plan in wrapper_plans if plan.get("kind") == "gdn_recurrence_sm100"
+    ]
     if block_scaled_plans and (len(wrapper_plans) != 1 or block != (192, 1, 1)):
         raise exc.BackendUnsupported(
             "cute", "native block scaling must own the complete device root"
+        )
+    if len(gdn_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple gdn recurrence plans")
+    if gdn_recurrence_plans and len(wrapper_plans) != 1:
+        raise exc.BackendUnsupported(
+            "cute", "gdn recurrence must own the complete device root"
         )
     if len(sm100_recurrence_plans) > 1:
         raise exc.BackendUnsupported("cute", "multiple SM100 recurrence plans")
@@ -2178,6 +2375,8 @@ def _create_cute_wrapper(
         _append_sm100_chunk_recurrence_host_call(body, sm100_recurrence_plans[0])
     elif warp_dv4_recurrence_plans:
         _append_sm100_warp_dv4_host_call(body, warp_dv4_recurrence_plans[0])
+    elif gdn_recurrence_plans:
+        _append_gdn_recurrence_host_call(body, gdn_recurrence_plans[0])
     else:
         body.extend(
             (
@@ -2224,6 +2423,10 @@ def _create_cute_wrapper(
         from ..._compiler.cute.chunk_recurrence_dv4_sm100 import _recurrence_entry
 
         namespace["_helion_sm100_warp_dv4_host"] = _recurrence_entry
+    elif gdn_recurrence_plans:
+        from ..._compiler.cute.gdn_recurrence_sm100 import host_gdn_recurrence
+
+        namespace["_helion_gdn_recurrence_host"] = host_gdn_recurrence
     filename = f"<helion_cute_launcher:{kernel_tag}:{schema_key!r}:{block!r}>"
     linecache.cache[filename] = (
         len(source),
@@ -5047,6 +5250,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
         "chunk_prepare_tma",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
+        "gdn_recurrence_sm100",
         "gathered_mma_tma",
         "block_scaled_mma",
     }:
@@ -5873,6 +6077,18 @@ def _build_cute_schema_and_args(
             sm100_recurrence_plans[0], args, validate_only=True
         )
 
+    gdn_recurrence_plans = [
+        cast("dict[str, object]", plan)
+        for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ())
+        if plan.get("kind") == "gdn_recurrence_sm100"
+    ]
+    if len(gdn_recurrence_plans) > 1:
+        raise exc.BackendUnsupported("cute", "multiple gdn recurrence plans")
+    if gdn_recurrence_plans:
+        # The nested CuTe host builds its TMA descriptors from the baked tensor
+        # views, so the runtime tensors must match the compiled geometry.
+        _validate_gdn_recurrence_launch_args(gdn_recurrence_plans[0], args)
+
     launch_args.extend(grid)
     # The stream is intentionally NOT appended here; it is sampled fresh per
     # launch by the caller so CUDA graph capture sees the capture stream.
@@ -6223,6 +6439,7 @@ def _cute_build_fast_relaunch(
             "chunk_prepare_tma",
             "chunk_recurrence_sm100",
             "chunk_recurrence_warp_dv4",
+            "gdn_recurrence_sm100",
             "gathered_mma_tma",
             "block_scaled_mma",
         }

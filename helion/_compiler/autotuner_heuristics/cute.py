@@ -18,6 +18,10 @@ from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
+from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
+from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
+from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
@@ -107,6 +111,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ReductionLoopSpec
     from ..compile_environment import CompileEnvironment
     from ..cute.cute_mma import Tcgen05GroupedWorklistAnalysis
+    from ..cute.gdn_recurrence import GdnRecurrenceGeometry
     from ..cute.grouped_worklist_policy import GroupedWorklistTargetPolicy
     from ..device_ir import DeviceIR
     from .registry import CompilerHeuristicSpecializationFact
@@ -4797,6 +4802,149 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
             for register_cap in register_caps
             if _cute_chunk_recurrence_config_is_safe(partitions, register_cap)
         ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteGdnRecurrenceHeuristic(AutotunerHeuristic):
+    """Seed the tcgen05 schedule of the gated-delta-rule chunk recurrence.
+
+    The whole-root ``gdn_recurrence`` planner fires only for the dstate tiles
+    its geometry admits (a 128-row TMEM tile, replicated for narrower tiles),
+    so the seeds pin
+    ``block_sizes`` to the preferred tile and its half to make sure the
+    autotuner measures the tensor-core path.  The TMA ring depth and the
+    epilogue warp count are real trade-offs and stay searchable knobs: the
+    depth domain is the union over every tile the planner lowers, including
+    the wider tiles the ``block_sizes`` search reaches for a non-power-of-two
+    dstate, and ``normalize`` re-validates it per tile.  Every seed is legal
+    as written, and no searched config reaches codegen with a depth its tile
+    cannot hold.  The dstate tile's own floor is raised to the smallest
+    admitted tile: the SM100 dot minimum leaves it at one row, and no lowering
+    of this kernel compiles a narrower tile, so the autotuner must not sample
+    one.
+    """
+
+    name = "cute_gdn_recurrence"
+    backend = "cute"
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _geometry(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> GdnRecurrenceGeometry | None:
+        from ..cute.gdn_recurrence import detect_gdn_recurrence_search_geometry
+
+        capability = env.config_spec.target_device_capability
+        host_function = device_ir.host_function
+        if capability is None or capability[0] != 10 or host_function is None:
+            return None
+        with host_function:
+            return detect_gdn_recurrence_search_geometry(device_ir.graphs)
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ..cute.gdn_recurrence import gdn_recurrence_mma_m_choices_by_tile
+        from ..cute.gdn_recurrence import gdn_recurrence_stage_choices_by_tile
+        from ..cute.gdn_recurrence import gdn_recurrence_token_group_choices_by_tile
+        from ..cute.gdn_recurrence_geometry import GDN_ADMITTED_BLOCK_V
+        from ..cute.gdn_recurrence_geometry import gdn_epilogue_warp_choices
+
+        geometry = cls._geometry(env, device_ir)
+        if geometry is None:
+            return frozenset()
+        # Both dots of this kernel need a 16-row dstate tile in every lowering
+        # (tensor-core or SIMT), but the SM100 dot minimum leaves the tile's
+        # spec at one row: raise the hard floor so no sampled config can fail.
+        env.config_spec.block_sizes.block_id_lookup(geometry.value_block_id).update_min(
+            GDN_ADMITTED_BLOCK_V[-1]
+        )
+        env.config_spec.enable_cute_gdn_recurrence_search(
+            value_block_id=geometry.value_block_id,
+            stage_choices_by_tile=gdn_recurrence_stage_choices_by_tile(geometry),
+            epilogue_warp_choices=gdn_epilogue_warp_choices(
+                geometry.chunk, geometry.dhead
+            ),
+            mma_m_choices_by_tile=gdn_recurrence_mma_m_choices_by_tile(geometry),
+            token_group_choices_by_tile=gdn_recurrence_token_group_choices_by_tile(
+                geometry
+            ),
+        )
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            env.config_spec.cute_gdn_recurrence_stages is not None
+            and env.config_spec.cute_gdn_recurrence_epilogue_warps is not None
+            and env.config_spec.cute_gdn_recurrence_token_groups is not None
+            and env.config_spec.cute_gdn_recurrence_mma_m is not None
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        from ..cute.gdn_recurrence import gdn_recurrence_warp_choices
+        from ..cute.gdn_recurrence import gdn_seed_block_sizes
+        from ..cute.gdn_recurrence_geometry import gdn_mma_m_choices
+        from ..cute.gdn_recurrence_geometry import gdn_stage_choices
+        from ..cute.gdn_recurrence_geometry import gdn_token_group_choices
+
+        spec = env.config_spec
+        if (
+            spec.cute_gdn_recurrence_stages is None
+            or spec.cute_gdn_recurrence_epilogue_warps is None
+            or spec.cute_gdn_recurrence_token_groups is None
+            or spec.cute_gdn_recurrence_mma_m is None
+        ):
+            return None
+        geometry = cls._geometry(env, device_ir)
+        if geometry is None:
+            return None
+        # The seed pins the whole block_sizes list, so it is only sound when
+        # the dstate tile is the sole tunable tile of the kernel.
+        if spec.block_sizes.valid_block_ids() != [geometry.value_block_id]:
+            return None
+        seeds: list[Config] = []
+        # Seed the preferred dstate tile and its half; the remaining admitted
+        # tiles stay reachable through the ordinary block_sizes search.  Each
+        # seed carries the preferred tcgen05 M of its tile and warps (M = 64
+        # for tiles of at most 64 rows) and that M's preferred depths.
+        for block_v in gdn_seed_block_sizes(geometry):
+            for warps in gdn_recurrence_warp_choices(geometry, block_v):
+                mma_m = gdn_mma_m_choices(
+                    geometry.chunk, geometry.dhead, block_v, warps
+                )[0]
+                stage_choices = gdn_stage_choices(
+                    geometry.chunk, geometry.dhead, block_v, mma_m
+                )
+                for stages in stage_choices[:2]:
+                    seeds.append(
+                        Config.from_dict(
+                            {
+                                "block_sizes": [block_v],
+                                CUTE_GDN_RECURRENCE_STAGES_KEY: stages,
+                                CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY: warps,
+                                CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY: (
+                                    gdn_token_group_choices(
+                                        geometry.chunk, block_v, warps, mma_m
+                                    )[0]
+                                ),
+                                CUTE_GDN_RECURRENCE_MMA_M_KEY: mma_m,
+                            }
+                        )
+                    )
+        return seeds or None
 
     @classmethod
     def get_seed_config(
