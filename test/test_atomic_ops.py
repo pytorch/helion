@@ -659,7 +659,10 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             block_sizes=[2, 2],
         )
 
-        expected = torch.tensor([4, 0, 4, 0], device=DEVICE, dtype=x.dtype)
+        # ``x[tile_m, tile_n]`` covers both tile axes, so every element of a
+        # tile is added to ``out[tile_m.begin]``: two column tiles of four
+        # ones per row tile, whatever the thread mapping of the row axis.
+        expected = torch.tensor([8, 0, 8, 0], device=DEVICE, dtype=x.dtype)
         torch.testing.assert_close(result, expected)
 
     @xfailIfPallas("AtomicOnDeviceTensor error message differs on Pallas")

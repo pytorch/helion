@@ -257,11 +257,14 @@ def test_loaded_flag_in_the_mask_is_relocated_not_inlined() -> None:
 def _atomic_flag_columns(x: torch.Tensor, counter: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile0, tile1 in hl.tile(out.size()):
-        old = hl.atomic_add(counter, [tile0], 1)
+        # One atomic per element: a leader-issued atomic's result is not
+        # shared with the other threads, so a per-row one could not feed the
+        # mask of every column.
+        old = hl.atomic_add(counter, [tile0, tile1], 1)
         out[tile0, tile1] = hl.load(
             x,
             [tile0, tile1],
-            extra_mask=(old >= 0)[:, None] & (tile1.index < 512)[None, :],
+            extra_mask=(old >= 0) & (tile1.index < 512)[None, :],
         )
     return out
 
@@ -269,7 +272,7 @@ def _atomic_flag_columns(x: torch.Tensor, counter: torch.Tensor) -> torch.Tensor
 def test_atomic_result_in_the_mask_keeps_scalar_loads() -> None:
     # An atomic's result cannot move above the V-loop and is never inlined
     # into a guard: the site keeps its scalar loads and the single atomic.
-    args = (torch.empty((8, 1024)), torch.zeros((8,), dtype=torch.int32))
+    args = (torch.empty((8, 1024)), torch.zeros((8, 1024), dtype=torch.int32))
     code = _generate(_atomic_flag_columns, args, **_ROW_CONFIG)
     vloop = _vector_loop(code)
     assert not _packet_loads(_lane_body(code, vloop)), code

@@ -1560,6 +1560,7 @@ class CuteBackend(Backend):
             "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
+            "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
             "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
             "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",

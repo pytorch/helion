@@ -14,6 +14,7 @@ from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
 
+from ...autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
 from ...autotuner.config_spec import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
@@ -26,6 +27,7 @@ from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
 from ...autotuner.config_spec import get_valid_eviction_policies
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
 from ...language.memory_ops import load as language_load
+from ...language.scan_ops import _associative_scan
 from ...runtime.config import Config
 from ..compile_environment import ConfigValueExpression
 from ..compile_environment import FixedBlockSizeSource
@@ -1542,6 +1544,230 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
             return Config(**seed)
         except Exception:
             return None
+
+
+class CuteScanTileHeuristic(AutotunerHeuristic):
+    """Seed for a 2-D grid tile scanned along one axis.
+
+    ``hl.associative_scan(fn, x[tile_rows, tile_cols], dim=0)`` (a segmented
+    reduction, a per-column prefix over a row tile) puts the scan on the
+    dependence-carrying axis and leaves the other axis embarrassingly
+    parallel.  The autotuner's natural winners split the scan axis over
+    threads, paying a shuffle scan per row and one scalar load per element.
+    Seed the layout that needs neither: one thread per V-wide strip of the
+    contiguous axis owning the whole scan axis (a carried in-register prefix,
+    no cross-thread traffic), 16-byte vector loads and, for atomic outputs,
+    16-byte vector atomics along the strip, and the scan lane loop unrolled
+    loads-first (``cute_lane_unroll``) so every row's loads are in flight
+    before the first row computes.  The unroll depth becomes a searchable
+    knob once seeded.  Seeds only layouts the vector protocol realises: the
+    strip is the innermost grid block and its extent is a multiple of the
+    vector width.
+    """
+
+    name = "cute_scan_tile"
+    backend = "cute"
+    SCAN_ROWS = 16
+    ALTERNATE_SCAN_ROWS = 32
+    # Column strips per CTA (one warp of 16-byte strips).
+    STRIP_THREADS = 32
+    # Shrink the row tile of a small problem until the grid holds at least
+    # this many CTAs per SM (a 2000-row input at 16 rows is 125 CTAs).
+    MIN_CTAS_PER_SM = 2
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.dtype] | None:
+        """``(scan_block_id, strip_block_id, dtype)`` when the kernel is a
+        single 2-D grid tile whose body scans a ``[scan, strip]``-shaped tile
+        along ``scan`` and loads such a tile from a 16/32-bit tensor
+        contiguous along ``strip``."""
+        spec = env.config_spec
+        if spec.matmul_facts or spec.reduction_loops:
+            return None
+        if len(spec.block_sizes) != 2 or any(
+            len(item.block_ids) != 1 for item in spec.block_sizes
+        ):
+            return None
+        if spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1:
+            return None
+        block_ids = [item.block_ids[0] for item in spec.block_sizes]
+        if set(block_ids) != set(spec.grid_block_ids):
+            return None
+        for sequence in (
+            spec.num_threads,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+        ):
+            if not set(block_ids).issubset(sequence.valid_block_ids()):
+                return None
+        symbols = {
+            block_id: _symint_sympy_expr(env.block_sizes[block_id].var)
+            for block_id in block_ids
+        }
+
+        def block_of(size: object) -> int | None:
+            if not isinstance(size, torch.SymInt):
+                return None
+            expr = _symint_sympy_expr(size)
+            return next((b for b in block_ids if symbols[b] == expr), None)
+
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function" or node.target is not _associative_scan:
+                    continue
+                inputs = node.args[1]
+                dim = node.args[2]
+                first = (
+                    inputs[0]
+                    if isinstance(inputs, (tuple, list)) and inputs
+                    else inputs
+                )
+                value = (
+                    first.meta.get("val") if isinstance(first, torch.fx.Node) else None
+                )
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.ndim != 2
+                    or not isinstance(dim, int)
+                    or dim not in (-2, -1, 0, 1)
+                ):
+                    continue
+                dim %= 2
+                scan_block = block_of(value.shape[dim])
+                strip_block = block_of(value.shape[1 - dim])
+                if (
+                    scan_block is None
+                    or strip_block is None
+                    or scan_block == strip_block
+                ):
+                    continue
+                dtype = cls._strip_load_dtype(
+                    device_ir, scan_block, strip_block, symbols
+                )
+                if dtype is not None:
+                    return scan_block, strip_block, dtype
+        return None
+
+    @classmethod
+    def _strip_load_dtype(
+        cls,
+        device_ir: DeviceIR,
+        scan_block: int,
+        strip_block: int,
+        symbols: dict[int, sympy.Expr],
+    ) -> torch.dtype | None:
+        """dtype of a ``[scan, strip]`` (or transposed) tile load whose source
+        tensor is contiguous along the strip axis."""
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function" or node.target is not language_load:
+                    continue
+                loaded = node.meta.get("val")
+                tensor_node = node.args[0] if node.args else None
+                tensor = (
+                    tensor_node.meta.get("val")
+                    if isinstance(tensor_node, torch.fx.Node)
+                    else None
+                )
+                if (
+                    not isinstance(loaded, torch.Tensor)
+                    or loaded.ndim != 2
+                    or loaded.dtype
+                    not in (torch.float16, torch.bfloat16, torch.float32)
+                    or not isinstance(tensor, torch.Tensor)
+                    or tensor.ndim != 2
+                ):
+                    continue
+                shape = [
+                    _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else None
+                    for size in loaded.shape
+                ]
+                for strip_dim in (0, 1):
+                    if (
+                        shape[strip_dim] == symbols[strip_block]
+                        and shape[1 - strip_dim] == symbols[scan_block]
+                        and tensor.stride(strip_dim) == 1
+                    ):
+                        return loaded.dtype
+        return None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls.get_seed_config(env, device_ir) is not None
+
+    @classmethod
+    def _seed(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, rows: int
+    ) -> Config | None:
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        scan_block, strip_block, dtype = match
+        spec = env.config_spec
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        strip_spec = spec.block_sizes.block_id_lookup(strip_block)
+        scan_spec = spec.block_sizes.block_id_lookup(scan_block)
+        # The tile vector protocol (16-byte packets, the vector atomic flush)
+        # runs on the innermost grid block and needs the strip extent to be a
+        # multiple of the vector width; a strip elsewhere (a column-major
+        # input) or of another width (98 columns) would seed scalar code.
+        if (
+            strip_block != spec.block_sizes[-1].block_ids[0]
+            or strip_spec.size_hint % vec
+        ):
+            return None
+        strip = min(strip_spec.max_size, cls.STRIP_THREADS * vec)
+        rows = min(rows, scan_spec.max_size)
+        if strip % vec or strip < vec or rows < 2:
+            return None
+        ctas_wanted = cls.MIN_CTAS_PER_SM * max(spec.num_sm, 1)
+        strips = -(-max(strip_spec.size_hint, 1) // strip)
+        while (
+            rows > 2 and -(-max(scan_spec.size_hint, 1) // rows) * strips < ctas_wanted
+        ):
+            rows //= 2
+        unroll = max(
+            choice
+            for choice in _CUTE_LANE_UNROLL_CHOICES
+            if choice <= rows and rows % choice == 0
+        )
+        sizes = {scan_block: rows, strip_block: strip}
+        seed: dict[str, Any] = {
+            "block_sizes": [sizes[item.block_ids[0]] for item in spec.block_sizes],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {scan_block: 1, strip_block: strip // vec}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {strip_block: vec}
+            ),
+            "cute_lane_unroll": unroll,
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        return cls._seed(env, device_ir, cls.SCAN_ROWS)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        alternate = cls._seed(env, device_ir, cls.ALTERNATE_SCAN_ROWS)
+        if alternate is None or alternate.config == primary.config:
+            return [primary]
+        return [primary, alternate]
 
 
 class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):

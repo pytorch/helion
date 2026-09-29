@@ -6,7 +6,16 @@ ran once per lane of ``y``'s slice (and vice versa).  Statements now live
 inside only the lane loops whose coordinates they depend on.  When the
 transform cannot place a statement, the full nest stays only if it is exact:
 a nest that would repeat a lane-invariant memory access around per-lane
-accesses of its tensor is rejected instead.
+accesses of its tensor is rejected instead.  Whether an access repeats is
+decided by the values it reads, not by the loops the structure places it in: a
+partial tile's masks tie every access to every loop, and a device loop's lane
+loops are built around its body before the body exists (that nest is checked
+the same way, never redistributed).  A placement is checked like the nest it
+replaces: an inner loop nested inside an outer one (by its hoisted packets, or
+because a statement needs both and each loop is materialized once) runs its
+statements inside the outer loop whether or not their values change with it.
+A ``tile.begin`` access carries no lane mask, so on a partial tile it is
+placed as on a full one.
 """
 
 from __future__ import annotations
@@ -150,29 +159,39 @@ _TWO_SLICE_CONFIG = {
 }
 
 
-def test_statement_with_unknown_effects_keeps_the_exact_full_nest() -> None:
-    # An atomic is not a plain store: it is pinned inside both slices' lane
-    # loops, so the copy cannot leave the atomic's loop without a second
-    # instance of its own.  The transform fails closed to the full nest, which
-    # repeats the copy per lane of the atomic's slice: exact, since the
-    # atomic touches neither of the copy's tensors.
+def test_per_lane_atomic_and_copy_become_sibling_lane_loops() -> None:
+    # The atomic accumulates x's slice per lane of x's loop and reads nothing
+    # of y's loop; placed like a store, it leaves the loop it does not depend
+    # on instead of pinning the full nest, so neither statement repeats per
+    # lane of the other's slice.
     args = (torch.empty((64, 512)), torch.empty((64, 768)))
     code = _generate(_atomic_then_copy, args, **_TWO_SLICE_CONFIG)
     function = _kernel_function(code)
     (x_loop,) = _loops(function, "synthetic_lane_1")
     (y_loop,) = _loops(function, "synthetic_lane_2")
-    assert y_loop in x_loop.body or x_loop in y_loop.body, code
-    assert _accesses(x_loop, "x") and _accesses(y_loop, "y")
+    assert x_loop in function.body and y_loop in function.body, code
+    assert function.body.index(x_loop) < function.body.index(y_loop)
+    assert _accesses(x_loop, "acc") and not _accesses(y_loop, "acc")
+    assert _accesses(y_loop, "out") and not _accesses(x_loop, "out")
+    assert "atomic_add" in ast.unparse(x_loop)
+    assert "atomic_add" not in ast.unparse(y_loop)
 
 
-def test_unknown_effects_on_the_repeated_stores_tensor_reject_the_config() -> None:
-    # The same nest with the atomic accumulating into the tensor the copy
-    # stores to: the transform cannot tell the atomic's elements from the
-    # copy's, so the nest, which re-applies the copy's store per lane of the
-    # atomic, is not provably the program and the config is rejected.
+def test_per_lane_atomic_into_the_copied_tensor_keeps_the_copy_after_its_loop() -> None:
+    # The atomic and the copy write disjoint slices of one tensor.  The
+    # transform cannot tell the slices apart, so the copy keeps its place
+    # after the atomic's loop; both still run once per lane of their own
+    # slice.
     args = (torch.empty((64, 512)), torch.empty((64, 768)))
-    with pytest.raises(exc.BackendUnsupported, match="lane loop nest"):
-        _generate(_atomic_into_the_copied_tensor, args, **_TWO_SLICE_CONFIG)
+    code = _generate(_atomic_into_the_copied_tensor, args, **_TWO_SLICE_CONFIG)
+    function = _kernel_function(code)
+    (x_loop,) = _loops(function, "synthetic_lane_1")
+    (y_loop,) = _loops(function, "synthetic_lane_2")
+    assert x_loop in function.body and y_loop in function.body, code
+    assert function.body.index(x_loop) < function.body.index(y_loop)
+    assert _accesses(x_loop, "out") and _accesses(y_loop, "out")
+    assert "atomic_add" in ast.unparse(x_loop)
+    assert "atomic_add" not in ast.unparse(y_loop)
 
 
 @pytest.mark.parametrize("vec_width", [1, 4])
@@ -637,7 +656,7 @@ def _copy_zero_copy(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     for tile0, tile1 in hl.tile(packed.shape):
         y = packed[tile0, tile1].to(torch.bfloat16)
         out[tile0, tile1] = y
-        out[tile0.begin, 0] = 0.0
+        out[tile0.begin, 255] = 0.0
         out2[tile0, tile1] = y
     return out, out2
 
@@ -764,3 +783,286 @@ def test_read_before_a_flushed_store_precedes_the_loop() -> None:
     assert "_cute_store_u32_vec(out.iterator" in ast.unparse(lane_loop), code
     assert any(_accesses(stmt, "first") for stmt in function.body[:position]), code
     assert not any(_accesses(stmt, "first") for stmt in function.body[position:])
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_row_then_update_all(x: torch.Tensor) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        first = x[tile0.begin, tile1]
+        x[tile0, tile1] = x[tile0, tile1] + first[None, :]
+    return x
+
+
+# Four rows per thread around the column lane loop, vectorized or scalar.
+_NESTED_CONFIG = {
+    "block_sizes": [4, 256],
+    "num_threads": [1, 64],
+    "cute_vector_widths": [1, 4],
+}
+_NESTED_SCALAR_CONFIG = {**_NESTED_CONFIG, "cute_vector_widths": [1, 1]}
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+@pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
+def test_tile_uniform_load_repeated_around_per_lane_stores_rejects_the_config(
+    shape: tuple[int, int], config: dict[str, object]
+) -> None:
+    # The original nest is emitted as is: on the full tile the first row's
+    # packet load belongs to the column loop, which the copy's packet nests
+    # in the row loop (or the column loop would need two instances); on the
+    # partial tile every access reads the row mask.  The first row's load
+    # changes with neither the row lane nor its mask, so every row iteration
+    # would re-issue it after the earlier rows' stores to the same tensor.
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant load of x would repeat"
+    ):
+        _generate(_first_row_then_update_all, (torch.empty(shape),), **config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _zero_first_row_then_copy(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0.begin, tile1] = 0.0
+        out[tile0, tile1] = x[tile0, tile1]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _copy_then_zero_first_row(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0, tile1] = x[tile0, tile1]
+        out[tile0.begin, tile1] = 0.0
+    return out
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+def test_masked_tile_uniform_store_before_per_lane_stores_rejects_the_config(
+    config: dict[str, object],
+) -> None:
+    # On a partial tile the zeroing store reads the row mask, which keeps it
+    # inside the row loop; its address does not change with the row lane, so
+    # the second row iteration would zero the first row again after the first
+    # iteration's copy wrote it.
+    args = (torch.empty((6, 250)), torch.empty((6, 250)))
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
+    ):
+        _generate(_zero_first_row_then_copy, args, **config)
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+def test_masked_tile_uniform_store_after_per_lane_stores_keeps_the_nest(
+    config: dict[str, object],
+) -> None:
+    # Repeated after every row's copy, the zeroing store leaves the first row
+    # zero in every order: the nest is exact and kept, the store inside the
+    # row loop.
+    args = (torch.empty((6, 250)), torch.empty((6, 250)))
+    code = _generate(_copy_then_zero_first_row, args, **config)
+    function = _kernel_function(code)
+    (row_loop,) = _loops(function, "lane_0")
+    zero_stores = [
+        call
+        for call in ast.walk(row_loop)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "store"
+        and "tile_offset_0" in ast.unparse(call.func.value)
+    ]
+    assert zero_stores, code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _zero_first_column_then_copy_in_inner_tile(
+    x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile0 in hl.tile(x.size(0)):
+        for tile1 in hl.tile(x.size(1)):
+            out[tile0, tile1.begin] = 0.0
+            out[tile0, tile1] = x[tile0, tile1]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _copy_then_zero_first_column_in_inner_tile(
+    x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile0 in hl.tile(x.size(0)):
+        for tile1 in hl.tile(x.size(1)):
+            out[tile0, tile1] = x[tile0, tile1]
+            out[tile0, tile1.begin] = 0.0
+    return out
+
+
+# One row per program; the inner column loop walks 32 threads x 8 lanes.
+_INNER_LANES_CONFIG = {
+    "block_sizes": [1, 256],
+    "num_threads": [0, 32],
+    "cute_vector_widths": [1, 1],
+}
+
+
+def test_tile_uniform_store_in_an_inner_loops_lane_nest_is_checked() -> None:
+    # A device loop's lane loops are built around its body before the body
+    # exists and are never redistributed, so the nest must be the tile
+    # program.  The zeroing store ignores the column lane: before the copy it
+    # would be re-applied after the first lane's copy of the same element ...
+    args = (torch.empty((8, 512)), torch.empty((8, 512)))
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
+    ):
+        _generate(
+            _zero_first_column_then_copy_in_inner_tile, args, **_INNER_LANES_CONFIG
+        )
+    # ... and after every lane's copy it is exact, inside the inner loop's
+    # lane loop.
+    code = _generate(
+        _copy_then_zero_first_column_in_inner_tile, args, **_INNER_LANES_CONFIG
+    )
+    function = _kernel_function(code)
+    (lane_loop,) = _loops(function, "lane_1")
+    (tile_loop,) = _loops(function, "tile_offset_1")
+    assert any(node is lane_loop for node in ast.walk(tile_loop)), code
+    assert _accesses(lane_loop, "out") and _accesses(lane_loop, "x"), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_row_then_update_all_plus_one(x: torch.Tensor) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        first = x[tile0.begin, tile1]
+        x[tile0, tile1] = x[tile0, tile1] + first[None, :] + 1.0
+    return x
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _zero_first_row_then_copy_plus_one(
+    x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0.begin, tile1] = 0.0
+        out[tile0, tile1] = x[tile0, tile1] + 1.0
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_row_increment_beside_copy(
+    x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    for tile0, tile1 in hl.tile(x.shape):
+        x[tile0.begin, tile1] = x[tile0.begin, tile1] + 1.0
+        out[tile0, tile1] = y[tile0, tile1]
+    return x, out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_row_scaled_beside_copy(
+    x: torch.Tensor, out: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    for tile0, tile1 in hl.tile(x.shape):
+        out[tile0.begin, tile1] = x[tile0.begin, tile1] * 2.0
+        y[tile0, tile1] = x[tile0, tile1]
+    return out, y
+
+
+# A loop-invariant constant in the body leaves the lane loops, so these bodies
+# are emitted as placements rather than as the original nest.
+_PLACED_REPETITION_CASES = [
+    pytest.param(_first_row_then_update_all_plus_one, 1, "load of x", id="update"),
+    pytest.param(_zero_first_row_then_copy_plus_one, 2, "store to out", id="zero"),
+    pytest.param(_first_row_increment_beside_copy, 3, "load of x", id="increment"),
+]
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+@pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
+@pytest.mark.parametrize(("kernel", "arity", "access"), _PLACED_REPETITION_CASES)
+def test_placed_nest_repeating_a_tile_uniform_access_rejects_the_config(
+    kernel: object,
+    arity: int,
+    access: str,
+    shape: tuple[int, int],
+    config: dict[str, object],
+) -> None:
+    # The first row's access belongs to the column loop, which the copy's
+    # packet (its per-lane index) nests inside the row loop: it runs once per
+    # row iteration, after the earlier rows' stores to the same tensor, in
+    # the placement exactly as in the original nest.
+    args = tuple(torch.empty(shape) for _ in range(arity))
+    with pytest.raises(
+        exc.BackendUnsupported, match=f"lane-invariant {access} would repeat"
+    ):
+        _generate(kernel, args, **config)
+
+
+@pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
+def test_placed_nest_repeating_an_idempotent_store_keeps_the_placement(
+    shape: tuple[int, int],
+) -> None:
+    # The scaled first row is stored again by every row iteration, over
+    # itself, and its load only reads ``x``: the repetition is exact and the
+    # placement stands, the constant bound before the row loop.  On the
+    # partial tile the first row's accesses need the column loop only; the
+    # copy needs both, so the column loop's one instance sits in the row
+    # loop and the first row's accesses run there too.
+    args = tuple(torch.empty(shape) for _ in range(3))
+    code = _generate(_first_row_scaled_beside_copy, args, **_NESTED_CONFIG)
+    function = _kernel_function(code)
+    (row_loop,) = _loops(function, "lane_0")
+    position = function.body.index(row_loop)
+    assert any("2.0" in ast.unparse(s) for s in function.body[:position]), code
+    assert _accesses(row_loop, "out") and _accesses(row_loop, "y"), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _first_row_to_vector(
+    x: torch.Tensor, first: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    for tile0, tile1 in hl.tile(x.shape):
+        first[tile1] = x[tile0.begin, tile1]
+        out[tile0, tile1] = x[tile0, tile1]
+    return out
+
+
+def _guards(function: ast.FunctionDef, address: str) -> list[str]:
+    """The conditions guarding the accesses whose address mentions ``address``."""
+    guards = []
+    for node in ast.walk(function):
+        if isinstance(node, ast.IfExp):
+            call, test = node.body, node.test
+        elif isinstance(node, ast.If) and len(node.body) == 1:
+            call, test = node.body[0], node.test
+        else:
+            continue
+        if isinstance(call, ast.Expr):
+            call = call.value
+        if isinstance(call, ast.Call) and address in ast.unparse(call.func):
+            guards.append(ast.unparse(test))
+    return guards
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+def test_tile_begin_access_carries_no_lane_mask(config: dict[str, object]) -> None:
+    # A ``tile.begin`` component is one address for the whole tile, in range
+    # whenever the tile is.  Guarded by the row mask as well, the first row's
+    # load would be gated to zero in the lanes past the tile's last row, and
+    # the store of ``first`` (a tensor without a row axis, guarded by the
+    # column mask only) would write that zero.
+    args = (torch.empty((6, 250)), torch.empty(250), torch.empty((6, 250)))
+    function = _kernel_function(_generate(_first_row_to_vector, args, **config))
+    first_row = _guards(function, "tile_offset_0")
+    assert first_row and all("mask_0" not in guard for guard in first_row), first_row
+    (store,) = _guards(function, "first.iterator")
+    assert "mask_0" not in store and "mask_1" in store, store
+    # The per-lane copy keeps both masks.
+    copy = _guards(function, "indices_0")
+    assert copy and all("mask_0" in guard for guard in copy), copy

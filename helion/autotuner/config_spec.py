@@ -3286,8 +3286,10 @@ class ConfigSpec:
     def _normalize_cute_vloop_sink(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        """``cute_vloop_sink`` is a boolean; ``cute_lane_unroll`` only applies
-        to the lane loops of a sunk vector nest and is 1 otherwise."""
+        """``cute_vloop_sink`` is a boolean; ``cute_lane_unroll`` applies to
+        the lane loops of a sunk vector nest or, without sinking, to the grid
+        lane loops the config forms (``cute/unroll_lane_loads.py``), and is 1
+        when the config has neither."""
         sink = config.get("cute_vloop_sink", False)
         if type(sink) is not bool:
             if not fix_invalid:
@@ -3302,10 +3304,33 @@ class ConfigSpec:
                     f"cute_lane_unroll must be one of {_CUTE_LANE_UNROLL_CHOICES}"
                 )
             unroll = 1
-        if not sink:
+        if not sink and not self._cute_config_forms_grid_lane_loop(config):
             unroll = 1
         if "cute_lane_unroll" in config or unroll != 1:
             config["cute_lane_unroll"] = unroll
+
+    def _cute_config_forms_grid_lane_loop(self, config: dict[str, object]) -> bool:
+        """Whether some grid tile axis gets a per-thread lane loop: an explicit
+        thread count below its static block size that divides it (the
+        condition ``PerThreadNDTileStrategy`` allocates a lane variable on)."""
+        # Runs before the sequences are normalized: a single-block kernel may
+        # still spell them as scalars.
+        nt_list = _as_sequence(config.get("num_threads"))
+        bs_list = _as_sequence(config.get("block_sizes"))
+        thread_block_ids = self.num_threads.valid_block_ids()
+        for block_id in self.grid_block_ids:
+            if block_id not in thread_block_ids:
+                continue
+            nt = self.num_threads.config_get(nt_list, block_id, 0)
+            bs = self.block_sizes.config_get(bs_list, block_id, 1)
+            if (
+                isinstance(nt, int)
+                and isinstance(bs, int)
+                and 0 < nt < bs
+                and bs % nt == 0
+            ):
+                return True
+        return False
 
     def _normalize_cute_register_chain(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -5401,6 +5426,10 @@ class ConfigSpec:
                         seed.config.get("cute_vloop_sink") is True
                         for seed in self.compiler_seed_configs
                     )
+                    unroll_seeded = any(
+                        cast("int", seed.config.get("cute_lane_unroll", 1)) > 1
+                        for seed in self.compiler_seed_configs
+                    )
                     fields["cute_vloop_sink"] = EnumFragment(
                         (False, True),
                         search_choices=(False, True) if sink_seeded else (False,),
@@ -5408,7 +5437,7 @@ class ConfigSpec:
                     fields["cute_lane_unroll"] = EnumFragment(
                         _CUTE_LANE_UNROLL_CHOICES,
                         search_choices=_CUTE_LANE_UNROLL_CHOICES
-                        if sink_seeded
+                        if sink_seeded or unroll_seeded
                         else (1,),
                     )
                 if self.cute_rng_packet_enabled:
@@ -6180,6 +6209,15 @@ _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
 _CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
 # Manual unroll of the row lane loop of a sunk vector nest (``cute_vloop_sink``).
 _CUTE_LANE_UNROLL_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
+
+
+def _as_sequence(value: object) -> list[object]:
+    """A config entry as a list: scalars name a single block, ``None`` is empty."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
 
 
 class CuteReductionReloadSpec(_BlockIdItem):
