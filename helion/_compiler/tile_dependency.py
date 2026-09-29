@@ -871,13 +871,11 @@ class CoordinateRelation:
         dense_inverse = _dense_point_fiber_inverse(self)
         if dense_inverse is not None:
             return dense_inverse
-        source_symbols = {coordinate_axis_symbol(axis) for axis in source.axis_order}
         parameters = source.parameter_symbols | self.target_domain.parameter_symbols
         if all(
             step == 1
-            and sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
-            and not (begin.free_symbols & source_symbols)
             and begin.free_symbols <= parameters
+            and end.free_symbols <= parameters
             for piece in self.pieces
             for _axis, begin, end, step in piece.target_ranges
         ) and all(
@@ -885,9 +883,9 @@ class CoordinateRelation:
             for piece in self.pieces
             for _axis, begin, end, _step in piece.source_bounds_items
         ):
-            # A constant owner map (every execution rank names one peer) is
-            # many-to-one, but its converse is still an exact relation: that
-            # owner rank maps back to the complete guarded execution fiber.
+            # Pieces with source-independent targets are rectangles (e.g. a
+            # constant owner map, or one task reading a fixed producer range);
+            # the converse swaps each rectangle's source and target boxes.
             return CoordinateRelation(
                 self.target_domain,
                 source,

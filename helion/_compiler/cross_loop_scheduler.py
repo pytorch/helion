@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING
 from typing import Literal
 from typing import cast
 
-import sympy
-
 from .. import exc
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
@@ -26,6 +24,8 @@ from .tile_dependency import nested_logical_axes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    import sympy
 
     _StaticProducerResolver = Callable[
         [tuple["ReadinessProducer", ...]], tuple[tuple[int, Incidence], ...] | None
@@ -402,9 +402,13 @@ class ReadinessCounterPlan:
     def distributed_consumer_task_count(self) -> int | None:
         """Return how many tasks consume this cross-rank counter, if uniform per key."""
         distributed = [c for c in self.consumers if c.rank_relation is not None]
-        if len(distributed) != 1 or distributed[0].incidence.count_by_key is None:
+        if len(distributed) != 1:
             return None
-        low, high = distributed[0].incidence.count_by_key.value_bounds()
+        count_by_key = distributed[0].incidence.count_by_key
+        bounds = None if count_by_key is None else count_by_key.value_bounds()
+        if bounds is None:
+            return None
+        low, high = bounds
         if low != high or low <= 0:
             return None
         return int(low) * self.readiness_key_domain.size
@@ -1995,8 +1999,10 @@ def _build_readiness_events(
 
     # Consumer keys carry a fallback flag: root-entry projections of nested
     # consumers stay out of direct root events so a nested counter can drop them.
+    # They also split local from cross-rank producers: one event cannot mix a
+    # local counter with a remote signal, so each class gets its own event.
     exact_relations: dict[
-        tuple[int, int | None, CoordinateDomain, bool],
+        tuple[int, int | None, CoordinateDomain, bool, bool],
         dict[
             tuple[int, int | None, CoordinateDomain],
             list[
@@ -2021,7 +2027,13 @@ def _build_readiness_events(
         fallback: bool = False,
     ) -> None:
         relation = incidence.items_by_key
-        consumer = (consumer_root, consumer_site_id, relation.source_domain, fallback)
+        consumer = (
+            consumer_root,
+            consumer_site_id,
+            relation.source_domain,
+            fallback,
+            rank_relation is not None,
+        )
         producer = (producer_root, producer_site_id, relation.target_domain)
         exact_relations.setdefault(consumer, {}).setdefault(producer, []).extend(
             (incidence, obligation, rank_relation) for obligation in covered_obligations
@@ -2178,9 +2190,12 @@ def _build_readiness_events(
             item[0][0],
             -1 if item[0][1] is None else item[0][1],
             item[0][3],
+            item[0][4],
         ),
     ):
-        consumer_root, consumer_site_id, consumer_domain, _fallback = consumer
+        consumer_root, consumer_site_id, consumer_domain, _fallback, _distributed = (
+            consumer
+        )
         merged_relations: list[
             tuple[
                 tuple[int, int | None, CoordinateDomain],
@@ -2351,7 +2366,6 @@ def _build_readiness_events(
             unsupported_indices: tuple[int, ...] = ()
             should_split = (
                 consumer_site_id is None
-                and consumer_rank_relation is None
                 and not mixed_event_probe_exhausted
                 and 0 < len(directly_lowerable_indices) < len(full_producers)
             )
