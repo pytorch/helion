@@ -1017,16 +1017,20 @@ class DeviceIR:
         if env.backend_name == "cute" and not rdims:
             from ..language.scan_ops import _associative_scan
             from .cute.memory_ops import register_cute_tensor_alias_specializations
+            from .cute.memory_ops import stores_into_input_storage
 
             self._register_cute_tile_vec_slots(env)
             # Grid scans also reorder input reads across warps and need the
-            # same cache-specialized alias facts as reduction kernels. Do not
-            # add storage-dependent dispatch guards to unrelated grid kernels.
+            # same cache-specialized alias facts as reduction kernels. Vector
+            # memory passes likewise move input loads across a store into an
+            # external tensor only under a disjointness proof. Do not add
+            # storage-dependent dispatch guards to unrelated grid kernels,
+            # whose stores land in fresh host allocations.
             if any(
                 node.op == "call_function" and node.target is _associative_scan
                 for graph_info in self.graphs
                 for node in graph_info.graph.nodes
-            ):
+            ) or stores_into_input_storage(self.graphs, env):
                 register_cute_tensor_alias_specializations(env)
         if not rdims:
             return
@@ -3164,6 +3168,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             raise exc.NoDeviceLoopsInKernel
         from ..language.random_ops import rewrite_implicit_random_ops
 
+        if CompileEnvironment.current().settings.cute_rng_stream in ("auto", "philox4"):
+            from .cute.philox_stream import rewrite_random_stream
+
+            for graph in device_ir.graphs:
+                rewrite_random_stream(graph.graph)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
         if CompileEnvironment.current().backend.name == "cute":

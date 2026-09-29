@@ -395,6 +395,7 @@ class _Settings:
         default_factory=_get_index_dtype
     )
     dot_precision: DotPrecision = dataclasses.field(default_factory=_get_dot_precision)
+    cute_rng_stream: Literal["auto", "word0", "philox4"] = "word0"
     fast_math: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_FAST_MATH", False)
     )
@@ -660,6 +661,14 @@ class Settings(_Settings):
             "Override with HELION_INDEX_DTYPE=<dtype> (or set to 'auto')."
         ),
         "dot_precision": "Precision for dot products. For Triton backend, see `triton.language.dot` (can be 'tf32', 'tf32x3', 'ieee'). For JAX/Pallas backend, accepted values emit Pallas default precision on TPU. Unified mappings exist so that any value can be used on any backend.",
+        "cute_rng_stream": (
+            "CuTe RNG policy: auto (CuTe default) uses philox4 for explicit hl.rand "
+            "and preserves other RNG operations. philox4 maps logical offset i "
+            "to Philox(seed, i // 4)[i % 4], independently of configuration. "
+            "Set word0 for the previous reproducible stream; other backends "
+            "default to word0. Explicit philox4 rejects unsupported RNG operations. "
+            "Override with HELION_CUTE_RNG_STREAM."
+        ),
         "fast_math": (
             "If True, enable fast math approximations (Helion-level and Inductor-level). "
             "May reduce numerical precision and change NaN/Inf behavior. "
@@ -908,6 +917,12 @@ class Settings(_Settings):
         """
         if "backend" not in settings:
             settings["backend"] = _get_backend()
+        if "cute_rng_stream" not in settings:
+            settings["cute_rng_stream"] = _env_get_literal(
+                "HELION_CUTE_RNG_STREAM",
+                "auto" if settings["backend"] == "cute" else "word0",
+                mapping={"auto": "auto", "word0": "word0", "philox4": "philox4"},
+            )
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 

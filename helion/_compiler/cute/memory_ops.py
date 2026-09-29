@@ -26,6 +26,7 @@ from torch.fx.node import map_arg
 
 from ... import exc
 from ...language import _decorators
+from ...language.atomic_ops import ATOMIC_OPS
 from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ...language.memory_ops import _CUTE_VECTOR_DTYPES
 from ...language.memory_ops import _CUTE_VECTOR_MAX_BYTES
@@ -70,6 +71,7 @@ if TYPE_CHECKING:
 
     from torch._guards import Source
 
+    from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
 
 log = logging.getLogger(__name__)
@@ -316,6 +318,36 @@ def register_cute_tensor_alias_specializations(env: CompileEnvironment) -> None:
             reusable_tensor_properties=frozenset(("storage_span",)),
         ),
     )
+
+
+def stores_into_input_storage(
+    graphs: Sequence[GraphInfo], env: CompileEnvironment
+) -> bool:
+    """Whether a device store or atomic targets storage owned by a kernel input.
+
+    A store into a fresh host allocation cannot alias an input, so grid
+    kernels that only write such outputs need no storage-overlap dispatch
+    guards.  Writing into an external tensor (an ``out`` argument or a view
+    of one) does: vector memory passes move input loads across that store
+    only under a cache-specialized disjointness proof.
+    """
+    input_storages = {id(tensor.untyped_storage()) for tensor in env.input_sources}
+    for graph_info in graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or (
+                node.target is not store and node.target not in ATOMIC_OPS
+            ):
+                continue
+            target = node.args[0]
+            if not isinstance(target, torch.fx.Node):
+                continue
+            value = target.meta.get("val")
+            if (
+                isinstance(value, torch.Tensor)
+                and id(value.untyped_storage()) in input_storages
+            ):
+                return True
+    return False
 
 
 def runtime_tensors_are_proven_disjoint(

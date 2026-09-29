@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from ...autotuner.config_spec import ConfigSpec
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
+    from ..aten_lowering import Lowering
     from ..device_function import Argument
     from ..device_function import DeviceFunction
     from ..device_ir import GraphInfo
@@ -1044,6 +1045,14 @@ class CuteBackend(Backend):
         }
         return priors
 
+    def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
+        from .uniform_comparison import UniformComparisonLowering
+        from .uniform_comparison import match_uniform_float_gt
+
+        if match_uniform_float_gt(node) is not None:
+            return UniformComparisonLowering()
+        return None
+
     def customize_ast(self, hf: HostFunction) -> None:
         """CuTe-specific AST rewrites that rewrite high-level patterns into
         equivalent forms that compile to materially faster code.
@@ -1142,6 +1151,25 @@ class CuteBackend(Backend):
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
+    def reference_override(
+        self, function: object, args: tuple[object, ...]
+    ) -> tuple[bool, object]:
+        from ..compile_environment import CompileEnvironment
+        from .philox_stream import reference_override
+
+        policy = CompileEnvironment.current().settings.cute_rng_stream
+        if policy in ("auto", "philox4"):
+            return reference_override(function, args, strict=policy == "philox4")
+        return False, None
+
+    def validate_implicit_rng_reference(self) -> None:
+        from ..compile_environment import CompileEnvironment
+
+        if CompileEnvironment.current().settings.cute_rng_stream == "philox4":
+            raise exc.BackendUnsupported(
+                "cute", "philox4 supports explicit uniform hl.rand only"
+            )
+
     def supports_config_key(self, key: str) -> bool:
         if (
             key == "num_threads"
@@ -1152,6 +1180,11 @@ class CuteBackend(Backend):
             or key == "cute_bf16x2_recurrence"
             or key == "cute_signed_bitfield_bf16"
             or key == "cute_proven_bounds"
+            or key == "cute_rng_packet"
+            or key == "cute_independent_reduction"
+            or key == "cute_replicated_reduction"
+            or key == "cute_vector_packet_unroll"
+            or key == "cute_packet_prefetch"
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"

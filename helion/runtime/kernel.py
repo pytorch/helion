@@ -2437,6 +2437,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     f"cute_flatten_nested_reductions={settings.cute_flatten_nested_reductions}",
                 ]
             )
+        if settings.backend == "cute" or settings.cute_rng_stream != "word0":
+            parts.append(f"cute_rng_stream={settings.cute_rng_stream!r}")
         return f"@helion.kernel({', '.join(parts)})"
 
     def to_code(
