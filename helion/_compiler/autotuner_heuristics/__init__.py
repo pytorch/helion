@@ -35,6 +35,7 @@ from .cute import CutePersistentSubwarpRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
+from .cute import CuteRegisterTileHeuristic
 from .cute import CuteResidentMultiRowHeuristic
 from .cute import CuteResidentRowHeuristic
 from .cute import CuteResidentRowWideClusterHeuristic
@@ -121,6 +122,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05GroupedDynamicBk64Heuristic,
         CuteTcgen05ThreadLocalEpilogueHeuristic,
         CuteReductionTileHeuristic,
+        CuteRegisterTileHeuristic,
         CuteReductionWideChunkHeuristic,
         CuteResidentReductionHeuristic,
         CuteResidentSequenceHeuristic,

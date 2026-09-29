@@ -39,6 +39,7 @@ from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .fuse_two_pass_loads import _is_store_call
 from .fuse_two_pass_loads import _store_tensor_roots
 from .fuse_two_pass_loads import _tensor_arg_roots
@@ -111,11 +112,7 @@ _PURE_WARP_REDUCTION_CALLS = {
     "cute.arch.warp_reduction_max",
     "cute.arch.warp_reduction_sum",
 }
-_PURE_LOAD_HELPERS = {
-    "_cute_load_l2_evict_last",
-    "_cute_load_l1_l2_evict_first",
-    "_cute_load_l1_l2_evict_last",
-}
+_PURE_LOAD_HELPERS = _CUTE_CACHE_LOAD_HELPER_NAMES
 _CUTLASS_SCALAR_TYPES = {
     "cutlass.BFloat16": 2,
     "cutlass.Boolean": 1,
@@ -334,7 +331,7 @@ def _load_pointer(call: ast.Call) -> ast.AST | None:
     path = _call_path(call.func)
     if path == "cute.arch.load":
         return call.args[0] if call.args else None
-    if path is not None and path.startswith("_cute_load_"):
+    if path in _PURE_LOAD_HELPERS:
         return call.args[0] if call.args else None
     if isinstance(call.func, ast.Attribute) and call.func.attr == "load":
         return call.func.value

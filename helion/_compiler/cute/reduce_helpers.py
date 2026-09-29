@@ -484,6 +484,91 @@ def _use_serial_block_reduce(pre: int, group_span: int, group_count: int) -> boo
     )
 
 
+def _cute_grouped_reduce_shared_columns(
+    values: list,
+    reduction_type: str,
+    identity: cute.Numeric,
+    lane_var: cutlass.Int32,
+    lane_in_group_var: cutlass.Int32,
+    *,
+    pre: int,
+    group_span: int,
+    group_count: int,
+) -> list:
+    """Reduce ``len(values)`` independent per-thread partials across a thread
+    group with one shared-memory round trip.
+
+    Each element of ``values`` is a separate reduction (one output column of
+    a register tile).  The group is ``group_span`` consecutive linear threads
+    and ``lane_in_group_var`` the thread's position in it; ``pre`` sibling
+    coordinates occupy the low strides of the group, so the reduction
+    coordinate is ``lane_in_group // pre`` and the ``pre`` threads sharing a
+    reduction coordinate hold distinct columns.
+
+    * ``pre == 1`` (reduction threads consecutive, ``group_span`` a multiple
+      of 32): every warp first folds each column with a shuffle butterfly, so
+      all of its lanes hold the warp partial and write it to the warp's column
+      slot without a lane predicate; after one barrier every thread sums its
+      group's ``group_span // 32`` partials per column.
+    * ``pre > 1`` (threads laid out along the vector axis first): every thread
+      writes its partials, and after one barrier every thread sums the
+      ``group_span // pre`` partials of its own sibling coordinate per column.
+
+    Either way the whole tile costs two barriers, against one two-stage reduce
+    (two barriers, and ``pre`` masked shuffles per stage) per column.  The
+    trailing barrier matters at a multi-trip call site (a persistent
+    ``pid_type`` loop has no other barrier per trip): without it a fast warp's
+    next-trip writes could overwrite partials a slower warp has not read yet.
+    Called during ``@cute.kernel`` tracing as plain Python (no dynamic control
+    flow), like the vector store helpers; returns one value per column.
+    """
+    entry = _SERIAL_DISPATCH.get(reduction_type)
+    if entry is None:
+        raise ValueError(f"unsupported CuTe column reduction type: {reduction_type!r}")
+    warp_fold, combine = entry
+    width = len(values)
+    dtype = type(identity)
+    group_id = lane_var // group_span
+    results = []
+    if pre == 1:
+        warps_per_group = group_span // 32
+        smem_size = group_count * warps_per_group * width
+        smem_ptr = cute.arch.alloc_smem(dtype, smem_size)
+        smem = cute.make_tensor(smem_ptr, (smem_size,))
+        warp_in_group = lane_in_group_var // 32
+        group_base = group_id * (warps_per_group * width)
+        slot_base = group_base + warp_in_group * width
+        for column, value in enumerate(values):
+            smem[slot_base + column] = warp_fold(value, threads_in_group=32)
+        cute.arch.sync_threads()
+        for column in range(width):
+            total = identity
+            for warp_index in range(warps_per_group):
+                total = combine(total, smem[group_base + warp_index * width + column])
+            results.append(total)
+        cute.arch.sync_threads()
+        return results
+    reduce_extent = group_span // pre
+    smem_size = group_count * group_span * width
+    smem_ptr = cute.arch.alloc_smem(dtype, smem_size)
+    smem = cute.make_tensor(smem_ptr, (smem_size,))
+    group_base = group_id * (group_span * width)
+    slot_base = group_base + lane_in_group_var * width
+    for column, value in enumerate(values):
+        smem[slot_base + column] = value
+    cute.arch.sync_threads()
+    sibling_base = group_base + (lane_in_group_var % pre) * width
+    for column in range(width):
+        total = identity
+        for reduce_index in range(reduce_extent):
+            total = combine(
+                total, smem[sibling_base + reduce_index * (pre * width) + column]
+            )
+        results.append(total)
+    cute.arch.sync_threads()
+    return results
+
+
 def _cute_grouped_reduce_shared_two_stage(
     input_value: cute.Numeric,
     reduction_type: str,

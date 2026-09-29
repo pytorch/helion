@@ -20,6 +20,18 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
 
 MAX_THREADS_PER_BLOCK = 1024
+# Largest per-thread register tile (reduction lanes x vector elements) that a
+# scalar synthetic reduction lane unrolls at trace time outside the one-vector
+# tile wrappers (``DeviceGridState.nest_reduction_lane_outside_vector_tiles``).
+# Every unrolled element of every loaded tensor stays live across the register
+# tile, so wider products keep the rolled lane loop.
+CUTE_REGISTER_TILE_MAX_ELEMENTS = 64
+# Largest number of values one register tile keeps live across its unrolled
+# element loops: the intermediates stashed for the consume pass (one entry per
+# lane per element for every stashed name) plus the per-element accumulators of
+# every reduction, one register each.  Three full tiles already approach the
+# 255-register file; wider tiles reject the config instead of spilling.
+CUTE_REGISTER_TILE_MAX_LIVE_VALUES = 3 * CUTE_REGISTER_TILE_MAX_ELEMENTS
 
 
 def tile_loop_thread_count(

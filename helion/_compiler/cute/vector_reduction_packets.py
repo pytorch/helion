@@ -16,6 +16,7 @@ from ..ast_extension import ExtendedAST
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import _assignment_lhs_name
 from ._ast_pass_utils import _names_read
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -109,16 +110,7 @@ _SCALAR_TYPES = frozenset(
         "Uint32",
     )
 )
-_VECTOR_LOADS = frozenset(
-    {
-        "cute.arch.load",
-        "_cute_load_l2_evict_last",
-        "_cute_load_l1_l2_evict_first",
-        "_cute_load_l1_l2_evict_last",
-        "_cute_load_l1_l2_evict_first_8b",
-        "_cute_load_l1_l2_evict_last_8b",
-    }
-)
+_VECTOR_LOADS = frozenset({"cute.arch.load", *_CUTE_CACHE_LOAD_HELPER_NAMES})
 
 
 def _pure_scalar(node: ast.expr, scalars: set[str], vectors: set[str]) -> bool:
