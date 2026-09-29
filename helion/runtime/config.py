@@ -62,6 +62,7 @@ class Config(Mapping[str, object]):
         cute_async_load_cache: CuteAsyncLoadCacheLiteral | None = None,
         cute_async_store_policy: CuteAsyncStorePolicyLiteral | None = None,
         cute_bf16x2_recurrence: bool | None = None,
+        cute_signed_bitfield_bf16: bool | None = None,
         cute_proven_bounds: bool | None = None,
         cute_affine_scan_schedule: CuteAffineScanScheduleLiteral | None = None,
         num_warps: int | None = None,
@@ -111,6 +112,8 @@ class Config(Mapping[str, object]):
                 16-byte state store ("default" or "l2_evict_last").
             cute_bf16x2_recurrence: Pack a structurally proven BF16 rank-one
                 recurrence into native BF16x2 operations.
+            cute_signed_bitfield_bf16: Convert proved signed byte fields to BF16
+                using the existing vector load/store packets. Disabled by default.
             cute_proven_bounds: Remove CuTe index guards only when exact launch
                 dimensions and cache-specialized tensor sizes prove them true.
             cute_affine_scan_schedule: Physical schedule for a compatible affine
@@ -182,6 +185,7 @@ class Config(Mapping[str, object]):
             "cute_async_load_cache": cute_async_load_cache,
             "cute_async_store_policy": cute_async_store_policy,
             "cute_bf16x2_recurrence": cute_bf16x2_recurrence,
+            "cute_signed_bitfield_bf16": cute_signed_bitfield_bf16,
             "cute_proven_bounds": cute_proven_bounds,
             "cute_affine_scan_schedule": cute_affine_scan_schedule,
             "num_warps": num_warps,

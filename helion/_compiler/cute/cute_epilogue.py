@@ -110,6 +110,7 @@ class Tcgen05GroupedTailEpilogueMatch:
     safe_group_node: torch.fx.Node
     has_m_tail_mask: bool
     has_n_tail_mask: bool
+    store_mask: torch.fx.Node | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1964,22 +1965,35 @@ def analyze_tcgen05_grouped_tail_epilogue(
     target_fx_node: torch.fx.Node,
     inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]],
 ) -> Tcgen05GroupedTailEpilogueMatch | None:
-    """Classify grouped M/N preserve-output tail stores."""
+    """Classify grouped preserve-output tails before or after store folding."""
 
-    if (
-        value_node.op != "call_function"
-        or value_node.target is not torch.ops.aten.where.self
-        or value_node.kwargs
-        or len(value_node.args) != 3
-    ):
-        return None
-    condition, true_branch, false_branch = value_node.args
-    if not (
-        isinstance(condition, torch.fx.Node)
-        and isinstance(true_branch, torch.fx.Node)
-        and isinstance(false_branch, torch.fx.Node)
-    ):
-        return None
+    # fold_noop_stores replaces the old-output where branch with an explicit
+    # store mask. Prove that exact mask here; the store renderer may consume
+    # only the mask attached to this matched store node.
+    store_mask = store_node.args[3] if len(store_node.args) == 4 else None
+    if store_mask is not None:
+        if (
+            store_node.kwargs
+            or not isinstance(store_mask, torch.fx.Node)
+            or store_node.args[2] is not value_node
+        ):
+            return None
+        condition, true_branch, false_branch = store_mask, value_node, None
+    else:
+        if (
+            value_node.op != "call_function"
+            or value_node.target is not torch.ops.aten.where.self
+            or value_node.kwargs
+            or len(value_node.args) != 3
+        ):
+            return None
+        condition, true_branch, false_branch = value_node.args
+        if not (
+            isinstance(condition, torch.fx.Node)
+            and isinstance(true_branch, torch.fx.Node)
+            and isinstance(false_branch, torch.fx.Node)
+        ):
+            return None
 
     true_convert = _convert_input_and_dtype(true_branch)
     if true_convert is None:
@@ -1997,14 +2011,31 @@ def analyze_tcgen05_grouped_tail_epilogue(
     if grouped_tail_info is None:
         return None
     row_info, grouped_n_info, and_nodes = grouped_tail_info
-    if not _matches_output_tile_load(
-        false_branch,
-        store_node=store_node,
-        output_dtype=true_dtype,
-        carrier_tile_shape=carrier_tile_shape,
-        carrier_index_nodes=carrier_index_nodes,
-    ):
-        return None
+    if false_branch is not None:
+        if not _matches_output_tile_load(
+            false_branch,
+            store_node=store_node,
+            output_dtype=true_dtype,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_index_nodes=carrier_index_nodes,
+        ):
+            return None
+    else:
+        target = store_node.args[0]
+        target_val = (
+            target.meta.get("val") if isinstance(target, torch.fx.Node) else None
+        )
+        value_val = value_node.meta.get("val")
+        if (
+            not isinstance(target_val, torch.Tensor)
+            or target_val.ndim != 2
+            or target_val.dtype is not true_dtype
+            or not isinstance(value_val, torch.Tensor)
+            or value_val.dtype is not true_dtype
+            or carrier_tile_shape is None
+            or tuple(value_val.shape) != tuple(carrier_tile_shape)
+        ):
+            return None
     if carrier_index_nodes is None:
         return None
     store_index = store_node.args[1] if len(store_node.args) >= 2 else None
@@ -2021,9 +2052,10 @@ def analyze_tcgen05_grouped_tail_epilogue(
 
     expected_users: list[tuple[torch.fx.Node, set[torch.fx.Node]]] = []
     producer_nodes: list[torch.fx.Node] = []
+    mask_user = store_node if store_mask is not None else value_node
     if row_info is not None:
         row_load, row_mask, row_broadcast = row_info
-        row_mask_user = and_nodes[0] if and_nodes else value_node
+        row_mask_user = and_nodes[0] if and_nodes else mask_user
         expected_users.extend(
             [
                 (row_load, {row_mask}),
@@ -2044,28 +2076,27 @@ def analyze_tcgen05_grouped_tail_epilogue(
                 (col_mask, {col_broadcast}),
                 (
                     col_broadcast,
-                    {and_nodes[0]} if and_nodes else {value_node},
+                    {and_nodes[0]} if and_nodes else {mask_user},
                 ),
             ]
         )
         producer_nodes.extend([tile_index, n_load, col_mask, col_broadcast])
     if and_nodes:
-        expected_users.append((and_nodes[0], {value_node}))
+        expected_users.append((and_nodes[0], {mask_user}))
         producer_nodes.extend(and_nodes)
     else:
-        expected_users.append((condition, {value_node}))
+        expected_users.append((condition, {mask_user}))
         if condition not in producer_nodes:
             producer_nodes.append(condition)
-    expected_users.extend(
-        [
-            (false_branch, {value_node}),
-            (value_node, {store_node}),
-        ]
-    )
+    if false_branch is not None:
+        expected_users.append((false_branch, {value_node}))
+    expected_users.append((value_node, {store_node}))
     for node, users in expected_users:
         if set(node.users) != users:
             return None
-    producer_nodes.extend([false_branch, value_node])
+    if false_branch is not None:
+        producer_nodes.append(false_branch)
+    producer_nodes.append(value_node)
     return Tcgen05GroupedTailEpilogueMatch(
         anchor=anchor,
         store_node=store_node,
@@ -2074,6 +2105,7 @@ def analyze_tcgen05_grouped_tail_epilogue(
         safe_group_node=safe_group_node,
         has_m_tail_mask=row_info is not None,
         has_n_tail_mask=grouped_n_info is not None,
+        store_mask=store_mask,
     )
 
 

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from .aux_tensor import Tcgen05AuxTensorDescriptor
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
+    from .completed_matmul_sum import CompletedMatmulSum
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_flash_bwd import AttentionBwdMatch
     from .cute_mma import _Tcgen05AuxPipelinePlan
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from .direct_affine_plan import DirectAffinePlan
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .signed_bitfield import SignedBytePacket
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
@@ -512,11 +514,16 @@ class CuteDeviceFunctionState:
         # The launcher consults only names that survive final AST lowering;
         # this does not depend on blocked/strided index-expression spelling.
         self.grid_thread_extents: dict[str, tuple[int, int]] = {}
+        self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
         # SIMT reduction-kernel thread-block cluster width (from the
         # ``cute_cluster_n`` config knob, applied by
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        # A reshape can reuse source lanes and leave its synthetic loop dead.
+        # Resolve this recorded alternative only after actual loop pruning.
+        self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
+        self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait
         # after the preamble (covering every site's mbarrier init).

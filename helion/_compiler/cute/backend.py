@@ -33,6 +33,7 @@ from ..backend import _loop_contains_matmul
 from ..backend import _specialized_mma_root_mn_block_ids
 from ..backend import log
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .math_templates import SIGMOID_TEMPLATE
 from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 
@@ -168,7 +169,7 @@ def _detect_mma_loop(
         if graph_info.block_ids != block_ids:
             continue
         for node in graph_info.graph.nodes:
-            candidate = analyze_cute_mma_node(node)
+            candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
             if (
                 candidate is not None
                 and not candidate.requires_scalar_fallback
@@ -362,7 +363,7 @@ def _detect_specialized_mma_loop(
         if getattr(graph_info, "block_ids", None) != block_ids:
             continue
         for node in graph_info.graph.nodes:
-            candidate = analyze_cute_mma_node(node)
+            candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
             if (
                 candidate is not None
                 and not candidate.requires_scalar_fallback
@@ -679,7 +680,7 @@ def _loop_may_use_mma(
         if not isinstance(graph, torch.fx.Graph):
             return False
         for node in graph.nodes:
-            candidate = analyze_cute_mma_node(node)
+            candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
             if (
                 candidate is not None
                 and not candidate.requires_scalar_fallback
@@ -817,6 +818,7 @@ def _graph_used_block_ids(
     from ..compile_environment import CompileEnvironment
     from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
+    from .loop_nesting import _child_graph_ids
 
     env = CompileEnvironment.current()
     device_ir = HostFunction.current().device_ir
@@ -882,13 +884,27 @@ def _graph_used_block_ids(
             and device_ir.grid_block_ids[phase_index] == block_ids
         )
 
-    for graph_info in fn.codegen.codegen_graphs:
-        if not graph_matches_loop(graph_info):
+    graph_by_id = {
+        graph_info.graph_id: graph_info for graph_info in fn.codegen.codegen_graphs
+    }
+    pending = [
+        graph_info
+        for graph_info in fn.codegen.codegen_graphs
+        if graph_matches_loop(graph_info)
+    ]
+    visited: set[int] = set()
+    while pending:
+        graph_info = pending.pop()
+        if graph_info.graph_id in visited:
             continue
+        visited.add(graph_info.graph_id)
         graph = getattr(graph_info, "graph", None)
         if graph is None:
             continue
         for node in graph.nodes:
+            # A root coordinate can first be read inside a captured device
+            # scope. Its thread distribution must remain live there as well.
+            pending.extend(graph_by_id[graph_id] for graph_id in _child_graph_ids(node))
             value = node.meta.get("val")
             if is_tensor_like_value(value):
                 visit_value(value)
@@ -1096,6 +1112,7 @@ class CuteBackend(Backend):
             or key == "cute_reduction_reloads"
             or key == "cute_async_store_policy"
             or key == "cute_bf16x2_recurrence"
+            or key == "cute_signed_bitfield_bf16"
             or key == "cute_proven_bounds"
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
@@ -1198,11 +1215,8 @@ class CuteBackend(Backend):
             compiled_fn = bound_kernel._compile_cache.get(full_config)
         if compiled_fn is None:
             return
-        cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
-            f"_helion_{bound_kernel.kernel.name}"
-        )
-        launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
-        if not launchers:
+        kernels = self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        if not kernels:
             return
         device_index = (
             bound_kernel.env.device.index
@@ -1212,43 +1226,75 @@ class CuteBackend(Backend):
         # The ephemeral context restored CUTE_DSL_CACHE_DIR on exit; this sets
         # the real per-device dir when the user did not provide one.
         self.setup_compile_cache_dir(device_index)
-        for launcher in launchers.values():
-            launcher.persist_compiled()
+        for cute_kernel in kernels:
+            launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", {})
+            for launcher in launchers.values():
+                launcher.persist_compiled()
+
+    @staticmethod
+    def _compiled_kernels(compiled_fn: object, kernel_name: str) -> tuple[object, ...]:
+        bundled = getattr(compiled_fn, "_helion_cute_kernels", None)
+        if isinstance(bundled, tuple):
+            return bundled
+        fn_globals = getattr(compiled_fn, "__globals__", None)
+        if not isinstance(fn_globals, dict):
+            return ()
+        kernel = fn_globals.get(f"_helion_{kernel_name}")
+        return () if kernel is None else (kernel,)
 
     def compiled_cache_key(
         self, bound_kernel: BoundKernel[Any], compiled_fn: object
     ) -> str | None:
-        cute_kernel = compiled_fn.__globals__.get(  # type: ignore[attr-defined]
-            f"_helion_{bound_kernel.kernel.name}"
-        )
-        if cute_kernel is None:
+        keys = []
+        for cute_kernel in self._compiled_kernels(
+            compiled_fn, bound_kernel.kernel.name
+        ):
+            launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", {})
+            key = next(
+                (
+                    key
+                    for launcher in launchers.values()
+                    if (key := getattr(launcher, "_cache_key", None)) is not None
+                ),
+                None,
+            )
+            if key is None:
+                return None
+            keys.append(key)
+        if not keys:
             return None
-        launchers = getattr(cute_kernel, "_helion_cute_compiled_launchers", None)
-        if not launchers:
-            return None
-        for launcher in launchers.values():
-            key = getattr(launcher, "_cache_key", None)
-            if key is not None:
-                return key
-        return None
+        if len(keys) == 1:
+            return keys[0]
+        return hashlib.sha256(repr(tuple(keys)).encode("utf-8")).hexdigest()
 
     def annotate_compiled_module(
         self, module: object, source: str, kernel_name: str
     ) -> None:
-        cute_kernel = getattr(module, f"_helion_{kernel_name}", None)
-        if cute_kernel is None:
-            return
-        with contextlib.suppress(AttributeError, TypeError):
-            cute_kernel._helion_cute_source_hash = hashlib.sha256(
-                source.encode("utf-8")
-            ).hexdigest()
+        compiled_fn = getattr(module, kernel_name, None)
+        kernels = self._compiled_kernels(compiled_fn, kernel_name)
+        source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        # Shared stage modules retain their own source hash. Two bundles may
+        # reuse the same stage while differing in another stage's configuration.
+        targets = (
+            (compiled_fn,)
+            if isinstance(getattr(compiled_fn, "_helion_cute_kernels", None), tuple)
+            else (compiled_fn, *kernels)
+        )
+        for target in targets:
+            with contextlib.suppress(AttributeError, TypeError):
+                target._helion_cute_source_hash = source_hash  # type: ignore[attr-defined]
 
     def generated_source_hash(self, compiled_fn: object) -> str | None:
-        fn_globals = getattr(compiled_fn, "__globals__", None)
+        source_hash = getattr(compiled_fn, "_helion_cute_source_hash", None)
+        if isinstance(source_hash, str):
+            return source_hash
         fn_name = getattr(compiled_fn, "__name__", None)
-        if not isinstance(fn_globals, dict) or not isinstance(fn_name, str):
+        if not isinstance(fn_name, str):
             return None
-        cute_kernel = fn_globals.get(f"_helion_{fn_name}")
+        kernels = self._compiled_kernels(compiled_fn, fn_name)
+        if len(kernels) != 1:
+            return None
+        cute_kernel = kernels[0]
         source_hash = getattr(cute_kernel, "_helion_cute_source_hash", None)
         return source_hash if isinstance(source_hash, str) else None
 
@@ -1362,6 +1408,7 @@ class CuteBackend(Backend):
             "_cute_float4_e2m1fn_x2_to_float32": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x2_to_float32 as _cute_float4_e2m1fn_x2_to_float32",
             "_cute_float4_e2m1fn_x16_to_float16": "from helion._compiler.cute.quantized_helpers import float4_e2m1fn_x16_to_float16 as _cute_float4_e2m1fn_x16_to_float16",
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
+            "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
@@ -1378,6 +1425,10 @@ class CuteBackend(Backend):
             "_cute_rank1_store_u32x4_if_valid": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u32x4_if_valid as _cute_rank1_store_u32x4_if_valid",
             "_cute_rank1_store_u16_or_zero": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_store_u16_or_zero as _cute_rank1_store_u16_or_zero",
             "_cute_load_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l2_evict_last as _cute_load_l2_evict_last",
+            "_cute_load_l1_l2_evict_first": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_first as _cute_load_l1_l2_evict_first",
+            "_cute_load_l1_l2_evict_first_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_first as _cute_load_l1_l2_evict_first_8b",
+            "_cute_load_l1_l2_evict_last": "from helion._compiler.cute.l2_policy import load_v16b_l1_l2_evict_last as _cute_load_l1_l2_evict_last",
+            "_cute_load_l1_l2_evict_last_8b": "from helion._compiler.cute.l2_policy import load_v8b_l1_l2_evict_last as _cute_load_l1_l2_evict_last_8b",
             "_cute_store_u16x8_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u16x8_l2_evict_last as _cute_store_u16x8_l2_evict_last",
             "_cute_store_u32x4_l2_evict_last": "from helion._compiler.cute.l2_policy import store_u32x4_l2_evict_last as _cute_store_u32x4_l2_evict_last",
             "_cute_grid_barrier": "from helion._compiler.cute.grid_barrier import grid_barrier as _cute_grid_barrier",
@@ -1438,6 +1489,29 @@ class CuteBackend(Backend):
                 from ..compile_environment import CompileEnvironment
 
                 return CompileEnvironment.current().settings.fast_math
+
+            @staticmethod
+            def mul(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
+                from torch._inductor.virtualized import V
+
+                from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_EXPR
+                from .scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_META_KEY
+
+                node = V.current_node
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if (
+                    not HelionCuteDSLOpOverrides._fastmath_on()
+                    and isinstance(node, torch.fx.Node)
+                    and node.meta.get(FP32_MULTIPLY_ROUNDING_META_KEY)
+                    and expected is not None
+                    and expected.dtype == torch.float32
+                ):
+                    # Moving a recipe to its own launch must not contract a
+                    # separately rounded multiply/add across a narrowing cast.
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a, b, FP32_MULTIPLY_ROUNDING_EXPR
+                    )
+                return CuteDSLOpOverrides.mul(a, b)
 
             @staticmethod
             def _unary_math(x: CuteDSLArg, name: str) -> CuteDSLArg:
@@ -1535,9 +1609,7 @@ class CuteBackend(Backend):
                     x_fp32 = CuteDSLOpOverrides._cast_expr(str(x), torch.float32)
                 result = CuteDSLOpOverrides._apply_unary_op(
                     x_fp32,
-                    f"cute.math.rcp(1.0 + cute.math.exp2("
-                    f"-{{x}} * {CuteDSLOpOverrides.LOG2_E}, fastmath=True), "
-                    f"approx=True, ftz=True)",
+                    SIGMOID_TEMPLATE,
                 )
                 expected = CuteDSLOpOverrides._expected_tensor_val()
                 expected_dtype = expected.dtype if expected is not None else None
@@ -1858,6 +1930,11 @@ class CuteBackend(Backend):
                     strategy_bs_var = strategy.block_size_var(block_id)
                     if strategy_bs_var != block_size_var:
                         continue
+                    thread_extent = (
+                        strategy.fn.tile_strategy.thread_extent_for_block_id(block_id)
+                    )
+                    if thread_extent is not None and thread_extent > 0:
+                        return min(thread_extent, 32)
                     block_size = strategy.block_size
                     if isinstance(block_size, list) and idx < len(block_size):
                         block_size = block_size[idx]
@@ -1999,6 +2076,7 @@ class CuteBackend(Backend):
         from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
         from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
         from ..compile_environment import CompileEnvironment
+        from ..device_function import ConstExprArg
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
@@ -2136,6 +2214,16 @@ class CuteBackend(Backend):
                 flags=re.MULTILINE,
             )
         }
+        # Block IDs include untuned grid axes and are not positions in the
+        # config's block_sizes list. Use the actual constexpr bindings, which
+        # also preserve names allocated for flattened or renamed tile axes.
+        block_size_values.update(
+            {
+                argument.name: int(argument.host_str())
+                for argument in device_function.arguments
+                if isinstance(argument, ConstExprArg) and argument.host_str().isdigit()
+            }
+        )
         # Accept both the historical ``offset_<n>`` prefix (non-CuTe backends)
         # and the post-rename ``tile_offset_<n>`` prefix (CuTe backend, see the
         # CuTe DSL preprocessor counter-collision note in
@@ -2518,18 +2606,25 @@ class CuteBackend(Backend):
             and not specialized_root_tcgen05
             and not kernel_has_mma
         ):
-            referenced_threads = functools.reduce(
-                operator.mul, codegen.referenced_thread_block_dims, 1
+            # Root indices can live in the grid's outer prefix, outside the
+            # statement-reference recorder. Include those live axes when
+            # validating an inner loop's thread requirements: checking only
+            # the inner axes can hide a launch that dropped part of the tile.
+            required_dims = tuple(
+                max(ref_size, root_live_dims[axis])
+                if axis in final_thread_axes
+                else ref_size
+                for axis, ref_size in enumerate(codegen.referenced_thread_block_dims)
             )
+            referenced_threads = functools.reduce(operator.mul, required_dims, 1)
             if referenced_threads > MAX_THREADS_PER_BLOCK:
-                for axis, ref_size in enumerate(codegen.referenced_thread_block_dims):
+                for axis, ref_size in enumerate(required_dims):
                     if ref_size > 1 and axis < len(dims) and dims[axis] < ref_size:
                         raise exc.BackendUnsupported(
                             self.name,
                             (
                                 f"launch dims {tuple(dims)} under-dimension"
-                                f" referenced_thread_block_dims="
-                                f"{tuple(codegen.referenced_thread_block_dims)}"
+                                f" required_thread_block_dims={required_dims}"
                                 f" (axis {axis}: launched={dims[axis]} <"
                                 f" referenced={ref_size}). Codegen would access"
                                 f" nonexistent threads — joint requested"
@@ -2592,11 +2687,19 @@ class CuteBackend(Backend):
             int(env.config_spec.num_threads.config_get(config.num_threads, block_id, 0))
             for block_id in block_ids
         ]
-        # Compute the total thread count across all block dimensions
-        # (grid + device loops) to check against the hardware limit.
-        # When it would exceed 1024, default device-loop (non-grid)
-        # dimensions to 1 thread to avoid budget overflow.
+        # Budget simultaneously active grid/device-loop axes. Sibling
+        # passes reuse axes; multiplying all their tile sizes would turn
+        # otherwise legal threaded reductions into serial lane loops.
         from .thread_budget import MAX_THREADS_PER_BLOCK
+        from .thread_budget import tile_loop_thread_count
+
+        inactive_grid_block_ids: set[int] = set()
+        if self.name == "cute":
+            from .loop_nesting import boundary_only_grid_blocks
+
+            inactive_grid_block_ids = boundary_only_grid_blocks(
+                env, device_ir, fn.codegen.codegen_graphs
+            )
 
         def _shrink_auto_thread_counts(
             nd_block_size: Sequence[object], thread_limit: int
@@ -2639,20 +2742,30 @@ class CuteBackend(Backend):
                 static_threads = functools.reduce(operator.mul, resolved_threads, 1)
             return static_threads
 
-        active_loop_block_ids = _active_loop_block_ids(fn)
-        all_block_infos = [env.block_sizes[i] for i in sorted(active_loop_block_ids)]
-        total_threads = 1
-        for info in all_block_infos:
-            if info.reduction:
-                continue
-            bs = info.from_config(config)
-            if isinstance(bs, int):
-                nt = int(
-                    env.config_spec.num_threads.config_get(
-                        config.num_threads, info.block_id, 0
+        if self.name == "cute":
+            total_threads = tile_loop_thread_count(
+                env,
+                device_ir,
+                fn.codegen.codegen_graphs,
+                config,
+                inactive_block_ids=inactive_grid_block_ids,
+            )
+        else:
+            # Metal shares this strategy constructor but retains its
+            # existing allocation policy.
+            total_threads = 1
+            for block_id in _active_loop_block_ids(fn):
+                info = env.block_sizes[block_id]
+                if info.reduction:
+                    continue
+                bs = info.from_config(config)
+                if isinstance(bs, int):
+                    nt = int(
+                        env.config_spec.num_threads.config_get(
+                            config.num_threads, block_id, 0
+                        )
                     )
-                )
-                total_threads *= nt if nt > 0 else bs
+                    total_threads *= nt if nt > 0 else bs
         if total_threads > MAX_THREADS_PER_BLOCK:
             for i, block_id in enumerate(block_ids):
                 if num_threads_config[i] == 0 and block_id not in grid_ids:
@@ -2662,6 +2775,7 @@ class CuteBackend(Backend):
             or has_dynamic_shape
             or len(device_ir.grid_block_ids) != 1
             or (len(block_ids) > 1 and not flattened)
+            or bool(inactive_grid_block_ids.intersection(block_ids))
         ):
             known_equal = getattr(env, "known_equal", None)
 
@@ -2683,7 +2797,7 @@ class CuteBackend(Backend):
                 grid_ids=grid_ids,
             )
             should_filter_inactive_block_ids = len(block_ids) > 1
-            inactive_block_ids: set[int] = set()
+            inactive_block_ids = inactive_grid_block_ids.intersection(block_ids)
             if should_filter_inactive_block_ids:
                 used_block_ids = _graph_used_block_ids(fn, block_ids)
                 if not used_block_ids:
@@ -2704,10 +2818,10 @@ class CuteBackend(Backend):
                             continue
                         if sizes_known_equal(block_size, other_size):
                             used_block_ids.add(other_block_id)
-                inactive_block_ids = set(block_ids) - used_block_ids
-                for i, block_id in enumerate(block_ids):
-                    if block_id in inactive_block_ids:
-                        num_threads_config[i] = 1
+                inactive_block_ids.update(set(block_ids) - used_block_ids)
+            for i, block_id in enumerate(block_ids):
+                if block_id in inactive_block_ids:
+                    num_threads_config[i] = 1
             is_device_loop = any(bid not in grid_ids for bid in block_ids)
             reduction_axis_reserve = (
                 1
@@ -2719,7 +2833,10 @@ class CuteBackend(Backend):
             def uses_thread_axis_for(
                 block_id: int, block_size: object, num_threads: int
             ) -> bool:
-                if block_id in inactive_block_ids:
+                if (
+                    block_id in inactive_block_ids
+                    or block_id in inactive_grid_block_ids
+                ):
                     return False
                 if num_threads > 0:
                     return num_threads > 1
@@ -2896,7 +3013,7 @@ class CuteBackend(Backend):
                     )
                     root_n_threads = (
                         min(int(n_block_size), 8)
-                        if num_threads_config[n_axis] == 0
+                        if original_num_threads_config[n_axis] == 0
                         and isinstance(n_block_size, int)
                         else num_threads_config[n_axis]
                     )

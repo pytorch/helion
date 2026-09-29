@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -144,7 +145,11 @@ def test_actual_surplus_and_logical_tails_keep_their_masks(
         assert len(assignments) == 1
         expression = ast.unparse(assignments[0].value)
         assert f"indices_{col_id} < {columns}" in expression
-        assert f"thread_idx()[1]) < _BLOCK_SIZE_{col_id}" in expression
+        # Launch repair spells the physical bound literally; a tail-only mask
+        # keeps the tile strategy's constexpr spelling. Both evaluate to 128.
+        assert re.search(
+            rf"thread_idx\(\)\[1\]\) < (128|_BLOCK_SIZE_{col_id})\b", expression
+        )
         assert f"if {mask}:" in code
         predicate = compile(ast.Expression(assignments[0].value), "<mask>", "eval")
     else:
@@ -186,7 +191,7 @@ def test_default_thread_counts_keep_surplus_mask() -> None:
         config,
     )
     assert _launch_block(code) == (1, 512, 1)
-    assert "thread_idx()[1]) < _BLOCK_SIZE_1" in code
+    assert "thread_idx()[1]) < 128" in code
     assert "if mask_1:" in code
 
 

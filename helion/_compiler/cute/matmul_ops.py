@@ -24,6 +24,7 @@ from ..matmul_utils import _needs_f32_accumulator
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
 from .matmul_fallback import _emit_cute_matmul
+from .matmul_utils import cute_has_synthetic_lane_k
 from .matmul_utils import cute_lower_rhs_for_matmul
 from .matmul_utils import cute_outer_accumulates_result
 from .matmul_utils import cute_outer_accumulator_dtype
@@ -64,6 +65,7 @@ def _cute_mma_matches_dot_semantics(
 
 @_decorators.codegen(dot, "cute")
 def _(state: CodegenState) -> object:
+
     lhs_proxy = state.proxy_args[0]
     assert isinstance(lhs_proxy, FakeTensor)
     rhs_proxy = state.proxy_args[1]
@@ -74,9 +76,12 @@ def _(state: CodegenState) -> object:
     lhs_ast = state.ast_args[0]
     if isinstance(lhs_ast, int | float | bool | None):
         lhs_ast = ast.Constant(value=lhs_ast)
-    rhs_ast = state.ast_arg(1)
+    rhs_ast = state.ast_args[1]
+    if isinstance(rhs_ast, int | float | bool | None):
+        rhs_ast = ast.Constant(value=rhs_ast)
     acc_ast = state.ast_arg(2)
-    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad))
+    assert isinstance(lhs_ast, (ast.AST, CutePackedAffineLoad, CutePackedTerms))
+    assert isinstance(rhs_ast, (ast.AST, CutePackedTerms))
 
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
 
@@ -171,6 +176,16 @@ def _(state: CodegenState) -> object:
             "cute",
             f"{TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY}=True requires "
             "hl.dot to lower through the tcgen05 K-loop path",
+        )
+    if cute_has_synthetic_lane_k(state.codegen, k_block_id):
+        # The wrapping lane loop also repeats accumulator initialization and
+        # users of this dot. A reduction over live threads would therefore
+        # expose a partial dot on every iteration, not the complete K sum.
+        # Native/collective lowering above owns the whole K axis; the scalar
+        # fallback is only valid when that axis is fully mapped to threads.
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe hl.dot scalar fallback cannot reduce a K axis split across synthetic lanes",
         )
     dot_lhs_node = (
         state.fx_node.args[0]

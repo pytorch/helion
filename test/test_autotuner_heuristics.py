@@ -141,6 +141,9 @@ from helion._compiler.cute.grouped_worklist_policy import (
 from helion._compiler.cute.grouped_worklist_policy import (
     grouped_worklist_target_identities,
 )
+from helion._compiler.cute.memory_ops import (
+    _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
+)
 from helion._compiler.cute.strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_D_STORE_BOX_N_KEY
 from helion._compiler.cute.strategies import TCGEN05_LAYOUT_OVERRIDES_EPI_TILE_M_KEY
@@ -3426,7 +3429,12 @@ class TestAutotunerHeuristic(TestCase):
             static_bound = static_viewed_inputs.bind(args)
             dynamic_bound = dynamic_viewed_inputs.bind(args)
 
-        self.assertTrue(static_bound.env.runtime_input_specializations)
+        self.assertTrue(
+            any(
+                key.startswith("cute_tcgen05_grouped_worklist:")
+                for key in static_bound.env.runtime_input_specializations
+            )
+        )
         self.assertTrue(
             any(
                 config.config.get(TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY)
@@ -3434,7 +3442,14 @@ class TestAutotunerHeuristic(TestCase):
                 for config in static_bound.config_spec.compiler_seed_configs
             )
         )
-        self.assertFalse(dynamic_bound.env.runtime_input_specializations)
+        # Generic copy alignment/alias guards are independent of the guarded
+        # worklist dimensions that this viewed input cannot prove.
+        self.assertFalse(
+            any(
+                key.startswith("cute_tcgen05_grouped_worklist:")
+                for key in dynamic_bound.env.runtime_input_specializations
+            )
+        )
         self.assertFalse(
             any(
                 config.config.get(TCGEN05_GROUPED_MODE_CONFIG_KEY)
@@ -3583,13 +3598,29 @@ class TestAutotunerHeuristic(TestCase):
 
         self.assertIsNot(first, zero)
         self.assertIs(rebound, first)
-        self.assertIs(unaligned, first)
-        self.assertEqual(len(plain_matmul._bound_kernels), 2)
-        self.assertEqual(zero._compiler_seed_specialization_extractors, ())
-        self.assertEqual(first._compiler_seed_specialization_extractors, ())
-        self.assertIsNone(
-            first.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
+        # CuTe binds specialize every kernel on its vector-alignment facts, so
+        # an unaligned operand is a distinct bound kernel. Nothing else may
+        # differ: grouped-worklist facts still ignore a plain matmul.
+        self.assertIsNot(unaligned, first)
+        self.assertEqual(len(plain_matmul._bound_kernels), 3)
+        self.assertEqual(
+            set(unaligned.env.runtime_input_specializations),
+            set(first.env.runtime_input_specializations),
         )
+        self.assertEqual(
+            {
+                key
+                for key in first.env.runtime_input_specializations
+                if first.env.bound_runtime_input_specialization_results[key]
+                != unaligned.env.bound_runtime_input_specialization_results[key]
+            },
+            {_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY},
+        )
+        for bound in (zero, first, unaligned):
+            self.assertEqual(bound._compiler_seed_specialization_extractors, ())
+            self.assertIsNone(
+                bound.config_spec._cute_tcgen05_config.grouped_worklist_smem_facts
+            )
 
     @onlyBackends(["cute"])
     def test_grouped_worklist_unannotated_prepacked_seeds_and_rebind(self) -> None:

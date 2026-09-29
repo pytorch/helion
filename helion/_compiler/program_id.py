@@ -633,7 +633,11 @@ class ForEachProgramID(ProgramIDs):
             )
             state.codegen.statements_stack[-1].insert(
                 0,
-                statement_from_string(f"{self.shared_pid_var} -= {block_expr}"),
+                statement_from_string(
+                    f"{self.shared_pid_var} = {self.shared_pid_var} - {block_expr}"
+                    if env.backend_name == "cute"
+                    else f"{self.shared_pid_var} -= {block_expr}"
+                ),
             )
 
     def codegen_grid(self) -> ast.AST:
@@ -3293,7 +3297,7 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
         if (
             emit_pdl_wait
             and self._tcgen05_is_two_cta()
-            and role_block.role_predicate == self._tcgen05_tma_load_role_predicate()
+            and (role_block.role_predicate == self._tcgen05_tma_load_role_predicate())
         ):
             # PDL parity with Quack/CUTLASS: TMA producers wait before
             # touching scheduler state or issuing global-memory TMA work.
@@ -6313,6 +6317,8 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             # free. They may be discarded when none of their results feed
             # post-loop cleanup; stores and pipeline operations remain unsafe.
             "cute.arch.load",
+            # Reading a thread coordinate has no observable side effect.
+            "cute.arch.thread_idx",
         }
     )
 

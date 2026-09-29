@@ -876,6 +876,8 @@ class Settings(_Settings):
         """
         Initialize the Settings object with the provided dictionary of settings.
         """
+        if "backend" not in settings:
+            settings["backend"] = _get_backend()
         # pyrefly: ignore [bad-argument-type]
         super().__init__(**settings)
 
@@ -890,6 +892,10 @@ class Settings(_Settings):
             )
 
         self._check_ref_eager_mode_before_print_output_code()
+
+    def copy(self, **overrides: object) -> Settings:
+        """Copy effective settings, with the same shallow semantics as replace."""
+        return dataclasses.replace(self, **overrides)
 
     def to_dict(self) -> dict[str, object]:
         """
