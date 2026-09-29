@@ -159,6 +159,29 @@ def _concrete_tensor_satisfies_alignment_guard(
     return aligned and (not requires_zero_storage_offset or zero_storage_offset)
 
 
+# Wrapper factories whose result is a fresh allocation (new storage starting
+# at an allocator-aligned base) unless ``out=`` or an aliasing argument says
+# otherwise; ``register_tensor_factory_layout`` records that provenance.  The
+# ``Tensor.new_*`` methods are registered with the receiver as the first
+# argument.
+_FRESH_ALLOCATION_FACTORIES: tuple[object, ...] = (
+    torch.empty,
+    torch.empty_like,
+    torch.empty_strided,
+    torch.zeros,
+    torch.zeros_like,
+    torch.ones,
+    torch.ones_like,
+    torch.full,
+    torch.full_like,
+    torch.Tensor.new_empty,
+    torch.Tensor.new_empty_strided,
+    torch.Tensor.new_zeros,
+    torch.Tensor.new_ones,
+    torch.Tensor.new_full,
+)
+
+
 def _replay_tensor_input_source(
     source: Source,
     root_values: typing.Mapping[str, object],
@@ -380,6 +403,10 @@ class CompileEnvironment:
         # view of a user input cannot acquire it merely because it has no direct
         # replayable input source.
         self._symbolically_exact_layout_storages: set[torch.UntypedStorage] = set()
+        # Storage of every fresh wrapper allocation, whatever its layout proof:
+        # its base is allocator-aligned, so a static storage offset decides the
+        # base alignment of any view of it.
+        self._fresh_allocation_storages: set[torch.UntypedStorage] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -819,6 +846,16 @@ class CompileEnvironment:
             for dim in range(input_tensor.ndim)
         )
 
+    def tensor_storage_is_compiler_allocated(self, fake_tensor: torch.Tensor) -> bool:
+        """Whether ``fake_tensor`` views storage a wrapper factory freshly allocated.
+
+        Such storage starts at an allocator-aligned base, so the base alignment
+        of a view follows from its static storage offset.  Lacking an input
+        source is not enough: input views and dtype-punning aliases lack one
+        too while inheriting an arbitrary runtime base.
+        """
+        return fake_tensor.untyped_storage() in self._fresh_allocation_storages
+
     def register_tensor_factory_layout(
         self,
         factory: object,
@@ -826,15 +863,19 @@ class CompileEnvironment:
         kwargs: typing.Mapping[str, object],
         result: object,
     ) -> None:
-        """Record exact layout provenance for supported wrapper allocations.
+        """Record allocation and layout provenance for wrapper factory calls.
 
+        Every factory in ``_FRESH_ALLOCATION_FACTORIES`` that neither writes
+        ``out=`` nor aliases an argument produces fresh storage, recorded for
+        base-alignment proofs; for ``Tensor.new_*`` the receiver is passed as
+        the first argument.  Exact layout provenance is narrower:
         ``torch.empty`` creates a fresh layout determined entirely by its host
-        arguments.  ``torch.empty_like`` defaults to preserving its input's
+        arguments, and ``torch.empty_like`` defaults to preserving its input's
         layout, so it is exact only when that input already has this proof.
         Other factories conservatively remain runtime-strided until their
         layout contracts are added here.
         """
-        if factory not in (torch.empty, torch.empty_like):
+        if factory not in _FRESH_ALLOCATION_FACTORIES:
             return
         if not isinstance(result, torch.Tensor) or result.layout != torch.strided:
             return
@@ -851,6 +892,7 @@ class CompileEnvironment:
         }
         if result_storage in argument_storages:
             return
+        self._fresh_allocation_storages.add(result_storage)
         is_exact = False
         if factory is torch.empty:
             is_exact = True

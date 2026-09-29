@@ -1656,6 +1656,29 @@ class LoopedReductionStrategy(ReductionStrategy):
             mask_var: str | None = None
         else:
             mask_var = fn.new_var(f"mask_{block_index}", dce=True)
+        # A masked vec lattice keeps its vector transactions when every
+        # V-wide chunk is provably all-in or all-out of the extent: a chunk
+        # base is a multiple of V, so ``extent % V == 0`` makes the bounds
+        # mask uniform across the chunk and it is evaluated once per chunk
+        # (``_cute_reduction_chunk_uniform_mask``).  Without that proof
+        # (a symbolic extent whose cache-key residue is not a multiple of V)
+        # the lane body carries an explicit whole-chunk predicate so full
+        # chunks still use one vector load/store while the straddling tail
+        # chunk falls back to per-element accesses.
+        self._cute_reduction_chunk_uniform_mask = False
+        self._cute_reduction_chunk_full_var: str | None = None
+        if (
+            env.backend.name == "cute"
+            and mask_var is not None
+            and self._cute_reduction_vec_width > 1
+        ):
+            from .cute.memory_ops import cute_known_multiple
+
+            self._cute_reduction_chunk_uniform_mask = cute_known_multiple(
+                env,
+                env.block_sizes[block_index].numel,
+                self._cute_reduction_vec_width,
+            )
         super().__init__(
             fn=fn,
             block_index=block_index,
@@ -1949,6 +1972,66 @@ class LoopedReductionStrategy(ReductionStrategy):
                 statement_from_string(f"{block_size_var} = {self._loop_block_size!r}")
             )
 
+    def _register_cute_dynamic_trip_count(
+        self,
+        state: CodegenState,
+        numel: sympy.Expr,
+        offset_var: str,
+        block_size_var: str,
+    ) -> None:
+        """Expose a symbolic extent's trip count as a constexpr kernel param.
+
+        A symbolic extent has no static trip count, so the host computes
+        ``ceil(extent / block)`` and passes it as ``cutlass.Constexpr``.  The
+        roll then iterates ``range(0, TRIPS * block, block)``: the same trips
+        as ``range(0, extent, block)`` but with a trace-time constant bound
+        the DSL can unroll, and the two-pass load fuser sizes its per-thread
+        cache as ``TRIPS * lanes * V`` (exact for every runtime extent) while
+        making its profitability decision from the bound size hint.  Each
+        distinct trip count is a distinct constexpr value and so traces the
+        kernel again: launch schemas that bake tensor shapes already trace
+        once per shape, while shape-agnostic schemas (matmul wrapper plans)
+        gain one trace per trip count.  The entry is keyed by the roll's
+        offset variable, the loop target the later AST passes match on.
+        """
+        trips = state.device_function.cute_state.dynamic_reduction_trips
+        if offset_var in trips or isinstance(numel, (int, sympy.Integer)):
+            return
+        if self._cute_rolled_cluster_n > 1:
+            return
+        env = CompileEnvironment.current()
+        block_mapping, _ = find_block_size_symbols(numel)
+        if block_mapping:
+            return
+        trips_var = f"_REDUCTION_TRIPS_{self.block_index}"
+        host_numel = HostFunction.current().sympy_expr(numel)
+        state.device_function.constexpr_arg_with_host_def(
+            trips_var,
+            f"({host_numel} + {block_size_var} - 1) // {block_size_var}",
+        )
+        size_hint = shape_env_size_hint(env.shape_env, numel)
+        hint_trips = max(1, -(-size_hint // self._loop_block_size))
+        trips[offset_var] = (hint_trips, trips_var)
+
+    def cute_chunk_in_bounds_expr(self, state: CodegenState) -> str:
+        """Predicate on the chunk base admitting one whole V-wide packet.
+
+        When ``extent % V == 0`` the chunk base decides every lane, so the
+        packet is in bounds exactly when its base is; otherwise its last lane
+        must be in bounds.  The chunk-level mask statements of
+        ``codegen_device_loop`` and the packet guard of the vector hoist are
+        both spelled from this expression, so the load pipeliner rebases them
+        alike.
+        """
+        base_var = self._cute_lane_base_index_var
+        assert base_var is not None
+        numel_expr = state.sympy_expr(
+            CompileEnvironment.current().block_sizes[self.block_index].numel
+        )
+        if self._cute_reduction_chunk_uniform_mask:
+            return f"{base_var} < {numel_expr}"
+        return f"{base_var} + {self._cute_reduction_vec_width - 1} < {numel_expr}"
+
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
         env = CompileEnvironment.current()
         self._maybe_apply_cute_rolled_cluster(state)
@@ -1959,6 +2042,10 @@ class LoopedReductionStrategy(ReductionStrategy):
         block_size_var = self.block_size_var(block_index)
         assert block_size_var is not None
         self._register_block_size_constexpr(state, block_size_var)
+        if env.backend.name == "cute":
+            self._register_cute_dynamic_trip_count(
+                state, numel, offset_var, block_size_var
+            )
         inner_body: list[ast.AST] = [
             statement_from_string(
                 f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)}"
@@ -1986,10 +2073,12 @@ class LoopedReductionStrategy(ReductionStrategy):
         consume_unroll = vec > 1 and (
             not graph_has_reduction or self._cute_reduction_vec_mode == "unroll"
         )
-        # Map from (tensor_name, base_expr) -> (hoist_var, dtype) so the
-        # dispatcher can reuse one hoist per (tensor, base) pair instead of
-        # emitting a fresh vec load on every dispatcher call.
-        self._cute_lane_vec_loads: dict[tuple[str, str], tuple[str, torch.dtype]] = {}
+        # Map from (tensor_name, base_expr, packet guard) -> (hoist_var, dtype)
+        # so the dispatcher can reuse one hoist per (tensor, base) pair
+        # instead of emitting a fresh vec load on every dispatcher call.
+        self._cute_lane_vec_loads: dict[
+            tuple[str, str, str | None], tuple[str, torch.dtype]
+        ] = {}
         # Variable name holding the per-lane-iter base index for vec hoists
         # in ``unroll`` mode — the dispatcher uses this to compute the vec
         # pointer offset once.
@@ -1998,6 +2087,9 @@ class LoopedReductionStrategy(ReductionStrategy):
         # codegen_device_loop); used to position vec hoists and vec-store
         # flushes relative to the V-loop.
         self._cute_lane_vloop: ast.For | None = None
+        # The lane body list of the current sweep, which the dispatcher splices
+        # hoists into; None until the consume-unroll form below builds it.
+        self._cute_lane_body: list[ast.AST] | None = None
         # Vec-store flush sites already spliced into the current lane body
         # (list of list-var names), in source order.
         self._cute_lane_vec_stores: list[str] = []
@@ -2031,12 +2123,35 @@ class LoopedReductionStrategy(ReductionStrategy):
                 inner_body[0] = statement_from_string(
                     f"{index_var} = {offset_var} + {self._index_init_expr(f'({block_size_var})', env.index_type(), block_index)} + cutlass.Int32({reduction_lane_var}) * {self._thread_count}"
                 )
+        chunk_mask_stmts: list[ast.AST] = []
         if (mask_var := self._mask_var) is not None:
-            inner_body.append(
-                statement_from_string(
-                    f"{mask_var} = {index_var} < {state.sympy_expr(numel)}"
+            numel_expr = state.sympy_expr(numel)
+            if consume_unroll and self._cute_lane_base_index_var is not None:
+                chunk_in_bounds = self.cute_chunk_in_bounds_expr(state)
+                if self._cute_reduction_chunk_uniform_mask:
+                    # ``numel % V == 0``: the chunk base decides every lane of
+                    # the chunk, so the mask is defined once above the V-loop
+                    # and vector loads/stores can be predicated on it.
+                    chunk_mask_stmts.append(
+                        statement_from_string(f"{mask_var} = {chunk_in_bounds}")
+                    )
+                else:
+                    # The tail chunk may straddle the extent: keep the
+                    # per-element mask and expose the whole-chunk predicate
+                    # for the vector fast path; its negation selects the
+                    # per-element tail.
+                    self._cute_reduction_chunk_full_var = self.fn.new_var(
+                        f"reduction_chunk_full_{block_index}", dce=True
+                    )
+                    chunk_mask_stmts.append(
+                        statement_from_string(
+                            f"{self._cute_reduction_chunk_full_var} = {chunk_in_bounds}"
+                        )
+                    )
+            if not self._cute_reduction_chunk_uniform_mask or not chunk_mask_stmts:
+                inner_body.append(
+                    statement_from_string(f"{mask_var} = {index_var} < {numel_expr}")
                 )
-            )
         body = inner_body
         if reduction_lane_var is not None:
             from .tile_strategy import _create_lane_loop
@@ -2058,6 +2173,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                 )
                 lane_body: list[ast.AST] = [
                     base_stmt,
+                    *chunk_mask_stmts,
                     vec_for,
                 ]
                 body = [
@@ -2085,6 +2201,16 @@ class LoopedReductionStrategy(ReductionStrategy):
 
         range_begin = "0"
         range_end = state.sympy_expr(numel)
+        dynamic_trips = state.device_function.cute_state.dynamic_reduction_trips.get(
+            offset_var
+        )
+        if env.backend.name == "cute" and dynamic_trips is not None:
+            # Same ``ceil(extent / block)`` trips as ``range(0, extent, block)``
+            # (the bounds mask still covers the tail), but the bound is a
+            # trace-time constant, so the DSL can unroll the short roll and
+            # keep the trip-indexed register cache in registers instead of
+            # dynamically indexed local memory.
+            range_end = f"{dynamic_trips[1]} * {block_size_var}"
         if self._cute_rolled_cluster_n > 1:
             # Cluster split: each of the ``cluster_n`` CTAs rolls over its
             # own contiguous slice (the launch adds a grid dim of

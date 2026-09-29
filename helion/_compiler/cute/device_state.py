@@ -607,6 +607,13 @@ class CuteDeviceFunctionState:
         # are visited in.  A second scan over the same lane loop must agree
         # or it falls back to the serial lowering (see ``cute/scan_ops.py``).
         self.scan_lane_directions: dict[str, bool] = {}
+        # Rolled reductions over a symbolic extent expose their trip count as
+        # a host-computed ``cutlass.Constexpr`` kernel parameter so the
+        # two-pass load fuser can size a per-thread register cache that is
+        # exact for every runtime extent.  Keyed by the roll's offset variable
+        # (``roffset_N``), the loop target the AST passes see: (size-hint trip
+        # count used for profitability decisions, constexpr parameter name).
+        self.dynamic_reduction_trips: dict[str, tuple[int, str]] = {}
         self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.

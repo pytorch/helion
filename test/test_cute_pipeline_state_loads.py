@@ -1438,6 +1438,7 @@ def test_proven_stride_rejects_post_bind_metadata_mutation() -> None:
     current = torch.empty_strided((4, 8), (1, 4))
     source = LocalSource("value", is_input=True)
     env = SimpleNamespace(
+        settings=SimpleNamespace(static_shapes=False),
         compiler_fact_specialization_facts=frozenset(("input_tensor_metadata",)),
         tensor_input_source=lambda _: source,
         runtime_value_for_tensor=lambda _: current,

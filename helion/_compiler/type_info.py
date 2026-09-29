@@ -638,9 +638,17 @@ class TensorAttributeType(TypeInfo):
         proxy_kwargs = {k: v.tree_map(_to_proxy) for k, v in kwargs.items()}
         try:
             fn = getattr(self.tensor.fake_value, attr)
-            output_type = TypeInfo.from_example(
-                _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs), origin
-            )
+            result = _CheckForIndexCalls.retry_call(fn, proxy_args, proxy_kwargs)
+            if origin.is_host():
+                # ``Tensor.new_*`` allocate like the ``torch.*`` factories;
+                # the receiver is the method's first argument.
+                CompileEnvironment.current().register_tensor_factory_layout(
+                    getattr(torch.Tensor, attr, None),
+                    (self.tensor.fake_value, *proxy_args),
+                    proxy_kwargs,
+                    result,
+                )
+            output_type = TypeInfo.from_example(result, origin)
         except exc.Base:
             raise
         except Exception as e:
