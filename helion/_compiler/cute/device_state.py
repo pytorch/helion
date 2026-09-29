@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
+    from .resident_reductions import ResidentReductionLayout
+    from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
@@ -599,9 +601,11 @@ class CuteDeviceFunctionState:
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
         self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
+        self.resident_sequence_regions: dict[int, SequenceRegion] = {}
         self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait

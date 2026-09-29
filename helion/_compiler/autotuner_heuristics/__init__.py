@@ -53,8 +53,13 @@ from .cute import grouped_full_coverage_configs
 from .cute import grouped_row_union_carrier
 from .cute import grouped_row_union_cluster4_carrier
 from .cute import grouped_row_union_paired_clc_carrier
+from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
+from .cute_host_paired_sum import CuteHostPairedSumHeuristic
+from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
+from .cute_resident_reductions import CuteResidentReductionHeuristic
+from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
@@ -98,6 +103,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05ThreadLocalEpilogueHeuristic,
         CuteReductionTileHeuristic,
         CuteReductionWideChunkHeuristic,
+        CuteResidentReductionHeuristic,
+        CuteResidentSequenceHeuristic,
         CutePersistentSubwarpRowsHeuristic,
         CuteAsyncPersistentSubwarpRowsHeuristic,
         CuteRolledRowLadderHeuristic,
@@ -112,6 +119,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteResidentMultiRowHeuristic,
         CutePointwiseVecHeuristic,
         CuteRegisterChainHeuristic,
+        CuteBoundedLoopCacheHeuristic,
+        CuteHostPairedSumHeuristic,
         CuteTcgen05GroupedSource64Heuristic,
     ),
     "triton": (
@@ -262,8 +271,33 @@ def compiler_seed_configs(
             env.config_spec.compiler_default_config = ranked[0]
         env.config_spec.autotuner_heuristics.append(heuristic.name)
     if env.backend_name == "cute":
-        configs = add_signed_bitfield_seeds(env, dedupe_configs(configs))
+        configs = add_host_sum_seeds(env, dedupe_configs(configs))
+        configs = add_signed_bitfield_seeds(env, configs)
     configs = dedupe_configs(configs)
+    if env.backend_name == "cute":
+        serial_rows = CuteResidentReductionHeuristic.serial_row_seed_configs(
+            env, device_ir
+        )
+        if serial_rows:
+            configs.extend(serial_rows)
+            if (
+                CuteResidentReductionHeuristic.name
+                not in env.config_spec.autotuner_heuristics
+            ):
+                env.config_spec.autotuner_heuristics.append(
+                    CuteResidentReductionHeuristic.name
+                )
+        configs.extend(
+            CuteResidentReductionHeuristic.pipeline_depth_seed_configs(env, device_ir)
+        )
+    if env.backend_name == "cute" and env.config_spec.cute_resident_reduction_blocks:
+        # Keep every existing witness in order and expose both summation trees
+        # on the same general resident schedules.
+        for seed in tuple(configs):
+            if seed.config.get("cute_reduction_schedule") in ("resident", "pipelined"):
+                values = deepcopy(seed.config)
+                values["cute_reduction_local_tree"] = True
+                configs.append(Config.from_dict(values))
     if env.backend_name == "cute":
         # Preserve the complete old prefix. A declared coverage witness below
         # admits the static-layout policy without displacing coupled schedules
@@ -280,6 +314,22 @@ def compiler_seed_configs(
         carrier = grouped_row_union_cluster4_carrier(env, device_ir)
         if carrier is not None:
             configs.append(carrier)
+    if env.backend_name == "cute":
+        serial_output = CuteResidentReductionHeuristic.serial_output_carrier(
+            env, device_ir
+        )
+        if serial_output is not None:
+            for row_schedule, packed in (
+                ("serial", False),
+                ("serial_deferred", False),
+                ("serial_deferred", True),
+            ):
+                values = deepcopy(serial_output.config) | {
+                    "cute_reduction_row_schedule": row_schedule
+                }
+                if packed:
+                    values["cute_reduction_pack_output"] = True
+                configs.append(Config.from_dict(values))
     if env.backend_name == "cute":
         paired = grouped_row_union_paired_clc_carrier(env, device_ir)
         if paired is not None:
@@ -415,6 +465,42 @@ def register_compiler_coverage_groups(
             )
         )
     register_matmul_min_blocks_coverage(env, device_ir)
+    serial_output = CuteResidentReductionHeuristic.serial_output_carrier(env, device_ir)
+    if serial_output is not None:
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.resident_row_consumption",
+                version=1,
+                key="cute_reduction_row_schedule",
+                domain=("batched", "serial", "serial_deferred"),
+                legacy="batched",
+                witnesses=tuple(
+                    CoverageWitness(serial_output, mode)
+                    for mode in ("serial", "serial_deferred")
+                ),
+            )
+        )
+        deferred = Config.from_dict(
+            deepcopy(serial_output.config)
+            | {"cute_reduction_row_schedule": "serial_deferred"}
+        )
+        env.config_spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism="cute.resident_terminal_product",
+                version=1,
+                key="cute_reduction_pack_output",
+                domain=(False, True),
+                legacy=False,
+                witnesses=(CoverageWitness(deferred, True),),
+                dependencies=(
+                    CoverageDependency(
+                        "cute.resident_row_consumption",
+                        "cute_reduction_row_schedule",
+                        "serial_deferred",
+                    ),
+                ),
+            )
+        )
     carriers = env.config_spec.compiler_seed_configs
     if not carriers:
         # Declarations remain available when automatic seed use is disabled.

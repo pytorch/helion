@@ -919,6 +919,11 @@ class PersistentReductionStrategy(ReductionStrategy):
         self._cute_lane_base_index_var: str | None = None
         self._cute_lane_body: list[ast.AST] | None = None
         self._cute_lane_vloop: ast.For | None = None
+        self._cute_resident_reduction = False
+        if env.backend.name == "cute":
+            from .cute.resident_reductions import supports_resident_threads
+
+            self._cute_resident_reduction = supports_resident_threads(fn, block_index)
         is_graph_reduction_dim = any(
             isinstance(graph, ReductionLoopGraphInfo) and block_index in graph.block_ids
             for graph in fn.codegen.codegen_graphs
@@ -953,6 +958,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                 if (
                     lane_extent is not None
                     and self._thread_count > _CUTE_WARP_REDUCTION_THREADS
+                    and not self._cute_resident_reduction
                 ):
                     self._thread_count = _CUTE_WARP_REDUCTION_THREADS
                     lane_extent = env.backend.create_synthetic_reduction_lanes(
@@ -964,6 +970,27 @@ class PersistentReductionStrategy(ReductionStrategy):
                         dce=False,
                     )
                     self._synthetic_cute_lane_extent = lane_extent
+                    if self._cute_resident_reduction:
+                        from .cute.resident_reductions import ResidentReductionLayout
+
+                        width = env.config_spec.cute_vector_widths.config_get(
+                            cast(
+                                "list[int]",
+                                fn.config.config.get("cute_vector_widths", []) or [],
+                            ),
+                            block_index,
+                            1,
+                        )
+                        fn.cute_state.resident_reduction_layouts[
+                            self._synthetic_cute_lane_var
+                        ] = ResidentReductionLayout(
+                            block_id=block_index,
+                            feature_extent=size_hint,
+                            threads=self._thread_count,
+                            lane_extent=lane_extent,
+                            vector_width=min(width, lane_extent),
+                            index_name=self.index_var(block_index),
+                        )
                     if mask_var is None:
                         cfg = fn.config.config
                         vec_width = env.config_spec.cute_vector_widths.config_get(
@@ -981,6 +1008,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                             isinstance(vec_width, int)
                             and vec_width > 1
                             and lane_extent == vec_width
+                            and not self._cute_resident_reduction
                         ):
                             self._cute_reduction_vec_width = vec_width
 
@@ -1075,6 +1103,15 @@ class PersistentReductionStrategy(ReductionStrategy):
                     f"({self._index_init_expr(block_size_var, env.index_type(), block_idx)})"
                     f" + cutlass.Int32({synthetic_lane_var}) * {self._thread_count}"
                 )
+                if self._cute_resident_reduction:
+                    from .cute.resident_reductions import feature_index_expression
+
+                    index_expr = feature_index_expression(
+                        self.fn.cute_state.resident_reduction_layouts[
+                            synthetic_lane_var
+                        ],
+                        synthetic_lane_var,
+                    )
             current_grid.thread_axis_sizes[axis] = max(
                 current_grid.thread_axis_sizes.get(axis, 1),
                 self._thread_count,
@@ -1269,7 +1306,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         pre = 1
         for axis in range(reduce_axis):
             pre *= axis_sizes.get(axis, 1)
-        if pre <= 1:
+        if pre <= 1 and not (self._cute_resident_reduction and reduce_extent > 32):
             return None
         group_span = pre * reduce_extent
         if group_span > 32 and group_span % 32 != 0:
@@ -1279,6 +1316,12 @@ class PersistentReductionStrategy(ReductionStrategy):
             num_threads *= size
         if num_threads % group_span != 0:
             return None
+        if self._cute_resident_reduction and (
+            self._planned_thread_dims() != (reduce_extent, 1, 1) or reduce_axis != 0
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "resident reduction must own the whole physical CTA"
+            )
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
         if lane_expr is None:
             return None
@@ -2922,7 +2965,20 @@ class BlockReductionStrategy(ReductionStrategy):
                 f"{reduction_type} reduction over an axis strided by a tile lane "
                 "loop; this backend does not support lane-loop reductions",
             )
+        sequence_expr = None
         if (
+            env.backend.name == "cute"
+            and self.fn.config.config.get("cute_reduction_sequence", "scalar")
+            != "scalar"
+        ):
+            from .cute.resident_sequence import sequence_reduction_expr
+
+            sequence_expr = sequence_reduction_expr(
+                self, state, input_name, reduction_type, fake_output, default
+            )
+        if sequence_expr is not None:
+            expr = sequence_expr
+        elif (
             strided_expr := self._strided_thread_reduction_expr(
                 state,
                 input_name,
