@@ -2131,10 +2131,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return None
 
         timings: list[IsolatedBenchmarkTiming] = []
-        for fn in fns:
+        for index, fn in enumerate(fns):
             if fresh_process and self._benchmark_worker is not None:
-                self._benchmark_worker.shutdown()
-                self._benchmark_worker = None
+                self._shutdown_isolated_worker(index - 1 if index else None)
             try:
                 try:
                     timing = self._run_subprocess_benchmark_job(
@@ -2142,7 +2141,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         warmup=warmup,
                         rep=rep,
                     )
-                except BenchmarkWorkerUnkillable:
+                except BenchmarkWorkerUnkillable as error:
+                    # the worker that could not be reaped ran this candidate
+                    error.fn_index = index
                     raise
                 except BenchmarkTimeout as e:
                     self.log.warning(f"{desc} subprocess failed: {e}")
@@ -2173,9 +2174,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 timings.append(None if timing is None else float(timing))
             finally:
                 if fresh_process and self._benchmark_worker is not None:
-                    self._benchmark_worker.shutdown()
-                    self._benchmark_worker = None
+                    self._shutdown_isolated_worker(index)
         return timings
+
+    def _shutdown_isolated_worker(self, fn_index: int | None) -> None:
+        """Shut the isolated worker down; a worker that cannot be reaped names
+        the batch position of the candidate it last ran."""
+        assert self._benchmark_worker is not None
+        try:
+            self._benchmark_worker.shutdown()
+        except BenchmarkWorkerUnkillable as error:
+            error.fn_index = fn_index
+            raise
+        finally:
+            self._benchmark_worker = None
 
 
 class MultiShapeBenchmarkProvider(BenchmarkProvider):
