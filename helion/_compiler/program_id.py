@@ -739,7 +739,9 @@ class ForEachProgramID(ProgramIDs):
                 )
             )
             if boundary != boundaries[-1] and barrier_stmt is not None:
+                loops.extend(device_function.async_store_drain())
                 loops.append(statement_from_string(barrier_stmt))
+                loops.extend(device_function.async_load_fence())
             start_expr = boundary
         return loops
 

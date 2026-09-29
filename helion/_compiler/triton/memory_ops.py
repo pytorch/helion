@@ -127,7 +127,11 @@ def _(state: CodegenState) -> ast.AST:
     if state.fx_node is not None and state.fx_node.meta.get(
         INTRA_LOOP_RAW_BARRIER_META
     ):
+        for drain in state.device_function.async_store_drain():
+            state.add_statement(drain)
         state.add_statement(statement_from_string("tl.debug_barrier()"))
+        for fence in state.device_function.async_load_fence():
+            state.add_statement(fence)
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)

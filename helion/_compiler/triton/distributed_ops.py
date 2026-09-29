@@ -138,6 +138,7 @@ def _(state: CodegenState) -> ast.AST:
             )
         )
     statements = [
+        *device_fn.async_store_drain(),
         statement_from_string("nvshmem.quiet()"),
         statement_from_string("tl.debug_barrier()"),
     ]
@@ -158,6 +159,7 @@ def _(state: CodegenState) -> ast.AST:
             )
         )
     statements.append(statement_from_string("tl.debug_barrier()"))
+    statements.extend(device_fn.async_load_fence())
     for statement in statements:
         state.codegen.add_statement(statement)
     state.device_function.has_barrier = True
@@ -469,7 +471,7 @@ def _prepare_remote_copy(state: CodegenState) -> ast.AST:
                 device_id=device_id,
                 **src_placeholders,
                 **dst_region.placeholders,
-            )
+            ),
         ]
     else:
         start_statements = [
@@ -480,7 +482,7 @@ def _prepare_remote_copy(state: CodegenState) -> ast.AST:
                 device_id=device_id,
                 **src_placeholders,
                 **dst_region.placeholders,
-            )
+            ),
         ]
     device_fn.remote_copy_descriptors[descriptor_id] = _TritonRemoteCopyInfo(
         start_statements=start_statements,
@@ -523,8 +525,14 @@ def _emit_statements(
 @_decorators.codegen(start_async_remote_copy_descriptor, "triton")
 def _(state: CodegenState) -> ast.AST:
     info = _paired_copy_info(state)
+    # Every thread reads the source (and so may the snapshot), so other
+    # threads' TMA stores to it must be complete first.
+    sync: list[ast.stmt] = []
+    if drain := state.device_function.async_store_drain():
+        sync = [*drain, statement_from_string("tl.debug_barrier()")]
+        state.device_function.has_barrier = True
     return _emit_statements(
-        state, [*info.source_materialization, *info.start_statements]
+        state, [*sync, *info.source_materialization, *info.start_statements]
     )
 
 
@@ -539,7 +547,8 @@ def _receive_wait_statements(state: CodegenState) -> list[ast.stmt]:
         statement_from_string(
             "helion_dist_utils._wait_and_consume_signal("
             f"{signal}, tl.cast(1, tl.int64))"
-        )
+        ),
+        *state.device_function.async_load_fence(),
     ]
 
 

@@ -1223,7 +1223,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
         if needs_barrier_before:
+            for drain in self.device_function.async_store_drain():
+                self.add_statement(drain)
             self.add_statement(statement_from_string("tl.debug_barrier()"))
+            for fence in self.device_function.async_load_fence():
+                self.add_statement(fence)
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
