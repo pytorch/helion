@@ -421,6 +421,9 @@ class _Settings:
     distributed_ll: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_DISTRIBUTED_LL", True)
     )
+    local_ll: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_LOCAL_LL", False)
+    )
     autotune_log_level: int = dataclasses.field(default_factory=_get_autotune_log_level)
     autotune_log: str | None = dataclasses.field(default_factory=_get_autotune_log_path)
     autotune_log_details: bool = dataclasses.field(
@@ -675,6 +678,14 @@ class Settings(_Settings):
             "Carry cross-rank tile readiness in-band (epoch-tagged mailbox words) for "
             "eligible symmetric allocations under cross_loop_pipeline='dynamic' instead of "
             "readiness counters. Set HELION_DISTRIBUTED_LL=0 to always use counters."
+        ),
+        "local_ll": (
+            "Carry rank-local tile readiness in-band for write-once allocations read "
+            "only by later roots under cross_loop_pipeline='dynamic': the producer also "
+            "stores epoch-tagged words to a launcher-owned mailbox that consumers poll. "
+            "Saves a readiness-counter hop per covered edge but reads 8 bytes per "
+            "element and keeps consumer roots out of continuations. "
+            "Set HELION_LOCAL_LL=1 to enable globally."
         ),
         "autotune_log_level": (
             "Log level for autotuning using Python logging levels. Default is logging.INFO. "

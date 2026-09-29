@@ -1,4 +1,4 @@
-"""Triton codegen for in-band (LL) cross-rank readiness.
+"""Triton codegen for in-band (LL) tile readiness.
 
 See ``helion._compiler.distributed_ll`` for the planner and the protocol.
 """
@@ -30,13 +30,17 @@ if TYPE_CHECKING:
     from ..helper_function import CodegenInterface
     from ..inductor_lowering import CodegenState
 
-# Relaxed system-scope stores: each 8-byte word is single-copy atomic and
-# carries its own epoch, so the consumer needs no fence or acquire.
-_PUSH_ASM = "st.relaxed.sys.global.u64 [$1], $2; mov.u32 $0, 0;"
-_MASKED_PUSH_ASM = (
-    "{ .reg .pred p; setp.ne.b32 p, $3, 0; "
-    "@p st.relaxed.sys.global.u64 [$1], $2; } mov.u32 $0, 0;"
-)
+
+def _push_asm(scope: str, masked: bool) -> str:
+    """Relaxed store of one 8-byte word at ``scope`` (``sys`` or ``gpu``).
+
+    Each word is single-copy atomic and carries its own epoch, so the consumer
+    needs no fence or acquire.
+    """
+    store = f"st.relaxed.{scope}.global.u64 [$1], $2;"
+    if masked:
+        store = f"{{ .reg .pred p; setp.ne.b32 p, $3, 0; @p {store} }}"
+    return f"{store} mov.u32 $0, 0;"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,39 +68,51 @@ def register_distributed_ll(
     graph = device_ir.tile_dependency_graph
     if (
         env.backend_name != "triton"
-        or not env.settings.distributed_ll
-        or config.cross_loop_pipeline != "dynamic"
+        or not (env.settings.distributed_ll or env.settings.local_ll)
+        or config.cross_loop_pipeline not in ("dynamic", "dynamic_exact")
         or not str(config.pid_type).startswith("persistent")
         or not device_ir.implicit_dependency_starts
         or graph is None
-        or not graph.has_cross_rank_dependencies()
     ):
         return
-    plan = plan_distributed_ll(graph, device_ir)
+    plan = plan_distributed_ll(
+        graph,
+        device_ir,
+        config,
+        symmetric=env.settings.distributed_ll and graph.has_cross_rank_dependencies(),
+        local=env.settings.local_ll,
+    )
     if plan is None:
         return
     device_function.distributed_ll_plan = plan
-    names = [
-        device_function.new_var(hint, dce=False)
-        for hint in (
-            "tile_dependency_ll_mailbox",
-            "tile_dependency_ll_mailbox_ptrs",
-            "tile_dependency_ll_rank",
+    if plan.mailbox_words:
+        names = [
+            device_function.new_var(hint, dce=False)
+            for hint in (
+                "tile_dependency_ll_mailbox",
+                "tile_dependency_ll_mailbox_ptrs",
+                "tile_dependency_ll_rank",
+            )
+        ]
+        device_function.wrapper_only_params.extend(names)
+        (
+            device_function.triton_distributed_ll_mailbox_arg,
+            device_function.triton_distributed_ll_mailbox_ptrs_arg,
+            device_function.triton_distributed_ll_rank_arg,
+        ) = names
+        device_function.triton_distributed_ll_parity_var = device_function.new_var(
+            "tile_dependency_ll_parity", dce=False
         )
-    ]
-    device_function.wrapper_only_params.extend(names)
-    (
-        device_function.triton_distributed_ll_mailbox_arg,
-        device_function.triton_distributed_ll_mailbox_ptrs_arg,
-        device_function.triton_distributed_ll_rank_arg,
-    ) = names
+        device_function.triton_distributed_ll_mailbox_words = plan.mailbox_words
+    if plan.local_mailbox_words:
+        # Bound as launcher state beside the dispatch ticket once kernel
+        # arguments exist (emit_cross_loop_schedule).
+        device_function.triton_distributed_ll_local_mailbox_arg = (
+            device_function.new_var("tile_dependency_ll_local_mailbox", dce=False)
+        )
     device_function.triton_distributed_ll_tag_var = device_function.new_var(
         "tile_dependency_ll_tag", dce=False
     )
-    device_function.triton_distributed_ll_parity_var = device_function.new_var(
-        "tile_dependency_ll_parity", dce=False
-    )
-    device_function.triton_distributed_ll_mailbox_words = plan.mailbox_words
     _hoist_ll_loads(device_function.codegen.codegen_graphs, plan)
 
 
@@ -149,7 +165,7 @@ def ll_store_allocation(state: CodegenState) -> LLAllocation | None:
     return None if key is None else plan.stores.get(key)
 
 
-def ll_load_source(state: CodegenState) -> tuple[LLAllocation, int] | None:
+def ll_load_source(state: CodegenState) -> tuple[LLAllocation, int | None] | None:
     plan = state.device_function.distributed_ll_plan
     if plan is None or state.fx_node is None:
         return None
@@ -157,21 +173,28 @@ def ll_load_source(state: CodegenState) -> tuple[LLAllocation, int] | None:
     return None if key is None else plan.loads.get(key)
 
 
-def _ll_names(device_function: DeviceFunction) -> tuple[str, str, str, str, str]:
+def _ll_tag(device_function: DeviceFunction) -> str:
+    tag = device_function.triton_distributed_ll_tag_var
+    if tag is None:
+        raise AssertionError("LL state was not registered")
+    return tag
+
+
+def _local_mailbox(device_function: DeviceFunction) -> str:
+    mailbox = device_function.triton_distributed_ll_local_mailbox_arg
+    if mailbox is None:
+        raise AssertionError("local LL mailbox was not registered")
+    return mailbox
+
+
+def _symmetric_names(device_function: DeviceFunction) -> tuple[str, str, str, str]:
     mailbox = device_function.triton_distributed_ll_mailbox_arg
     mailbox_ptrs = device_function.triton_distributed_ll_mailbox_ptrs_arg
     rank = device_function.triton_distributed_ll_rank_arg
-    tag = device_function.triton_distributed_ll_tag_var
     parity = device_function.triton_distributed_ll_parity_var
-    if (
-        mailbox is None
-        or mailbox_ptrs is None
-        or rank is None
-        or tag is None
-        or parity is None
-    ):
+    if mailbox is None or mailbox_ptrs is None or rank is None or parity is None:
         raise AssertionError("distributed LL state was not registered")
-    return mailbox, mailbox_ptrs, rank, tag, parity
+    return mailbox, mailbox_ptrs, rank, parity
 
 
 def _bits_type(dtype: torch.dtype) -> str:
@@ -186,12 +209,12 @@ def codegen_ll_push(
     extra_mask: ast.AST | None,
     allocation: LLAllocation,
 ) -> ast.AST:
-    """Push each stored element, epoch tagged, into every rank's mailbox.
+    """Push each stored element, epoch tagged, into every reader's mailbox.
 
     Returns the (lifted) value so the ordinary store reuses it.
     """
     device_function = state.device_function
-    _mailbox, mailbox_ptrs, rank, tag, parity = _ll_names(device_function)
+    tag = _ll_tag(device_function)
     backend = CompileEnvironment.current().backend
     indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
     output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
@@ -227,33 +250,47 @@ def codegen_ll_push(
             dce=True,
             prefix="ll_mask",
         )
+    if allocation.world_size is None:
+        address = f"{_local_mailbox(device_function)} + {allocation.mailbox_offset}"
+        _emit_push(state, "gpu", f"{address} + {offset.id}", word, mask)
+        return value
+    _mailbox, mailbox_ptrs, rank, parity = _symmetric_names(device_function)
     slot = (
         f"{allocation.mailbox_offset} + {rank} * {allocation.numel} + "
         f"{parity} * {allocation.slot_words()}"
     )
     for peer in range(allocation.world_size):
         base = device_function.new_var("ll_peer_mailbox", dce=True)
-        sink = device_function.new_var("ll_push", dce=False)
         state.add_statement(
             statement_from_string(
                 f"{base} = tl.load(({mailbox_ptrs}).to(tl.pointer_type(tl.uint64)) "
                 f"+ {peer}).to(tl.pointer_type(tl.uint64))"
             )
         )
-        address = f"{base} + ({slot}) + {offset.id}"
-        if mask is None:
-            asm, constraints, args = _PUSH_ASM, "=r,l,l", f"{address}, {word.id}"
-        else:
-            asm, constraints = _MASKED_PUSH_ASM, "=r,l,l,r"
-            args = f"{address}, {word.id}, {mask.id}"
-        state.add_statement(
-            statement_from_string(
-                f"{sink} = tl.inline_asm_elementwise(asm={asm!r}, "
-                f"constraints={constraints!r}, args=[{args}], dtype=tl.int32, "
-                "is_pure=False, pack=1)"
-            )
-        )
+        _emit_push(state, "sys", f"{base} + ({slot}) + {offset.id}", word, mask)
     return value
+
+
+def _emit_push(
+    state: CodegenState,
+    scope: str,
+    address: str,
+    word: ast.Name,
+    mask: ast.Name | None,
+) -> None:
+    sink = state.device_function.new_var("ll_push", dce=False)
+    if mask is None:
+        constraints, args = "=r,l,l", f"{address}, {word.id}"
+    else:
+        constraints, args = "=r,l,l,r", f"{address}, {word.id}, {mask.id}"
+    state.add_statement(
+        statement_from_string(
+            f"{sink} = tl.inline_asm_elementwise("
+            f"asm={_push_asm(scope, mask is not None)!r}, "
+            f"constraints={constraints!r}, args=[{args}], dtype=tl.int32, "
+            "is_pure=False, pack=1)"
+        )
+    )
 
 
 def codegen_ll_poll(
@@ -262,11 +299,11 @@ def codegen_ll_poll(
     subscript: list[object],
     extra_mask: ast.AST | None,
     allocation: LLAllocation,
-    source_rank: int,
+    source_rank: int | None,
 ) -> ast.AST:
-    """Replace a peer-view load with a poll of this rank's own mailbox."""
+    """Replace an LL load with a poll of this rank's own mailbox."""
     device_function = state.device_function
-    mailbox, _mailbox_ptrs, _rank, tag, parity = _ll_names(device_function)
+    tag = _ll_tag(device_function)
     env = CompileEnvironment.current()
     backend = env.backend
     indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
@@ -280,13 +317,17 @@ def codegen_ll_poll(
             offset=offset,
         )
         block_shaped = True
-    address = state.codegen.lift(
-        expr_from_string(
+    if source_rank is None:
+        base = f"{_local_mailbox(device_function)} + {allocation.mailbox_offset}"
+    else:
+        mailbox, _mailbox_ptrs, _rank, parity = _symmetric_names(device_function)
+        base = (
             f"{mailbox} + ({allocation.mailbox_offset} + "
             f"{source_rank * allocation.numel} + "
-            f"{parity} * {allocation.slot_words()}) + {{offset}}",
-            offset=offset,
-        ),
+            f"{parity} * {allocation.slot_words()})"
+        )
+    address = state.codegen.lift(
+        expr_from_string(f"{base} + {{offset}}", offset=offset),
         dce=True,
         prefix="ll_address",
     )

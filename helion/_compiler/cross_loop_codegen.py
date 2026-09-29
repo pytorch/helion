@@ -546,18 +546,20 @@ def _cross_loop_state_device_anchor(device_function: DeviceFunction) -> str | No
     return like.host_str()
 
 
-def _register_cross_loop_state(
+def register_cross_loop_state(
     device_function: DeviceFunction,
     *,
     name_hint: str,
     numel: str,
     dtype: torch.dtype,
+    name: str | None = None,
 ) -> str:
     """Register launch-persistent global state owned by the Triton launcher."""
     like_host = _cross_loop_state_device_anchor(device_function)
     if like_host is None:
         raise AssertionError("cross-loop state requires a host-visible tensor")
-    name = device_function.new_var(name_hint, dce=False)
+    if name is None:
+        name = device_function.new_var(name_hint, dce=False)
     device_function.wrapper_only_params.append(name)
     device_function.triton_persistent_state_args.append(name)
     device_function.triton_persistent_state_specs.append((like_host, numel, str(dtype)))
@@ -681,16 +683,20 @@ def _has_opaque_distributed_protocol(device_ir: object) -> bool:
 def _ll_epoch_statements(
     device_function: DeviceFunction, epoch_var: str
 ) -> list[ast.stmt]:
-    """Define the LL mailbox tag and parity from this launch's epoch."""
+    """Define the LL mailbox tag (and symmetric parity) from this launch's epoch."""
     tag = device_function.triton_distributed_ll_tag_var
     parity = device_function.triton_distributed_ll_parity_var
-    assert tag is not None and parity is not None
-    return [
+    assert tag is not None
+    statements = [
         statement_from_string(
             f"{tag} = tl.cast(tl.cast({epoch_var}, tl.uint32), tl.uint64)"
-        ),
-        statement_from_string(f"{parity} = tl.cast({epoch_var} & 1, tl.int32)"),
+        )
     ]
+    if parity is not None:
+        statements.append(
+            statement_from_string(f"{parity} = tl.cast({epoch_var} & 1, tl.int32)")
+        )
+    return statements
 
 
 def _has_compiler_distributed_dependency(device_ir: DeviceIR) -> bool:
@@ -857,8 +863,8 @@ def emit_cross_loop_schedule(
         site_domains=site_domains,
         worker_count=configured_worker_count,
         publishable_site_ids=publishable_site_ids,
-        # An LL consumer polls peers, so it must hold a dispatch ticket that
-        # follows every producer ticket rather than run inside a producer.
+        # An LL consumer polls its producers, so it must hold a dispatch ticket
+        # that follows every producer ticket rather than run inside a producer.
         continuation_ineligible_roots=(
             kernel_scope_roots
             if ll_plan is None
@@ -907,7 +913,7 @@ def emit_cross_loop_schedule(
         raise exc.InvalidConfig(
             "distributed readiness requires a tensor argument as a device anchor"
         )
-    if ll_plan is not None:
+    if ll_plan is not None and ll_plan.world_size is not None:
         device_function.triton_distributed_readiness_device_anchor = (
             distributed_device_anchor
         )
@@ -1012,7 +1018,7 @@ def emit_cross_loop_schedule(
         * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS
     )
     state_arg = (
-        _register_cross_loop_state(
+        register_cross_loop_state(
             device_function,
             name_hint="tile_dependency_state",
             numel=(f"{counter_state_base} + {state_count}"),
@@ -1022,7 +1028,7 @@ def emit_cross_loop_schedule(
         else None
     )
     dispatch_ticket_arg = (
-        _register_cross_loop_state(
+        register_cross_loop_state(
             device_function,
             name_hint="tile_dependency_dispatch_ticket",
             numel="1",
@@ -1031,8 +1037,20 @@ def emit_cross_loop_schedule(
         if uses_packet_dispatch
         else None
     )
+    local_mailbox_arg = device_function.triton_distributed_ll_local_mailbox_arg
+    if local_mailbox_arg is not None:
+        assert ll_plan is not None
+        # Shares the ticket's stream-local state key, so the epoch and the
+        # zero-initialized mailbox are allocated and reset together.
+        register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_ll_local_mailbox",
+            numel=str(ll_plan.local_mailbox_words),
+            dtype=torch.uint64,
+            name=local_mailbox_arg,
+        )
     distributed_completion_arg = (
-        _register_cross_loop_state(
+        register_cross_loop_state(
             device_function,
             name_hint="tile_dependency_distributed_completion",
             numel="1",

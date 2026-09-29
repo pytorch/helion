@@ -422,6 +422,7 @@ class DeviceFunction:
         self.triton_distributed_ll_mailbox_arg: str | None = None
         self.triton_distributed_ll_mailbox_ptrs_arg: str | None = None
         self.triton_distributed_ll_rank_arg: str | None = None
+        self.triton_distributed_ll_local_mailbox_arg: str | None = None
         self.triton_distributed_ll_tag_var: str | None = None
         self.triton_distributed_ll_parity_var: str | None = None
         self.triton_distributed_ll_mailbox_words = 0
