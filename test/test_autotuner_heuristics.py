@@ -8,7 +8,10 @@ import functools
 import itertools
 import math
 import os
+from pathlib import Path
 import random
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Iterator
@@ -18,6 +21,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
+
+from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._argument_device import _ArgumentDeviceResolver as _DeviceResolver
@@ -11143,3 +11148,63 @@ class TestTritonReductionHeuristic(TestCase):
             self.assertEqual(seed["block_sizes"][apply_idx], expected_apply_block)
             # H100 and B200 share the candidate and warp policy.
             self.assertEqual(seed["num_warps"], 8)
+
+
+def _cute_matmul_for_heuristics(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(a.dtype)
+    return out
+
+
+def _bind_cute_matmul_without_cutlass() -> None:
+    """Child-process body: every cute heuristic registers facts without cutlass."""
+    assert sys.modules.get("cutlass", 0) is None
+    with _grouped_worklist_bind_patches(), _mock_cuda_unavailable():
+        kernel = helion.kernel(
+            _cute_matmul_for_heuristics, backend="cute", static_shapes=True
+        )
+        bound = kernel._bind_isolated(
+            (
+                torch.empty(256, 128, dtype=torch.bfloat16),
+                torch.empty(128, 256, dtype=torch.bfloat16),
+            )
+        )
+    assert bound.host_function is not None
+
+
+def test_cute_heuristics_register_facts_without_cutlass() -> None:
+    # Most CI runners lack the CuTe DSL, yet CPU binds still run every cute
+    # heuristic's register_facts. Their planning imports must stay importable
+    # without cutlass; only device helper modules may import it at module top.
+    root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    environment.pop("HELION_BACKEND", None)
+    environment.pop("HELION_AUTOTUNE_EFFORT", None)
+    # Ref eager binding builds no device IR; the child always binds normally.
+    environment.pop("HELION_INTERPRET", None)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            (
+                "import sys; sys.modules['cutlass'] = None; "
+                "from test.test_autotuner_heuristics import "
+                "_bind_cute_matmul_without_cutlass; "
+                "_bind_cute_matmul_without_cutlass()"
+            ),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

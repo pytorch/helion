@@ -75,6 +75,7 @@ from ..._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_WIDE_SOURCE_M_TILE,
 )
 from ..._compiler.cute.tcgen05_constants import Tcgen05GroupedRuntimeTileField
+from ..._compiler.cute.tcgen05_grouped_descriptors import WrappedGroupedDescriptorPlan
 from ..triton.launcher import get_num_sm
 from .source_dependencies import wrapper_source_dependencies
 
@@ -298,6 +299,62 @@ def _append_cute_wrapper_plan(
     plan: dict[str, object],
     num_sm: int | None = None,
 ) -> None:
+    descriptor_identity = plan.get("wrapped_grouped_descriptors")
+    descriptors = (
+        WrappedGroupedDescriptorPlan.from_identity(descriptor_identity)
+        if descriptor_identity is not None
+        else None
+    )
+    if descriptors is not None:
+        if plan.get("orientation") != "nm":
+            raise exc.BackendUnsupported(
+                "cute", "wrapped descriptors require N,M orientation"
+            )
+        if plan.get("kind") in ("tcgen05_grouped_rna", "tcgen05_grouped_tma_rn"):
+            expected_provider = (
+                "typed_flat_element_bases_v1",
+                descriptors.groups,
+                (
+                    descriptors.rows * descriptors.reduction,
+                    descriptors.reduction,
+                    descriptors.reduction,
+                    16,
+                ),
+                (
+                    descriptors.rows * descriptors.columns,
+                    descriptors.columns,
+                    descriptors.columns,
+                    16,
+                ),
+                128,
+                128,
+                descriptors.offset_bits,
+                (0, 1, 2, 3, "a_element_base", 5, 6, 7, "output_element_base"),
+            )
+            if (
+                plan.get("flat_provider") != expected_provider
+                or not plan.get("fixed_ab_tensormaps")
+                or not plan.get("fixed_grouped_b_rank3")
+                or plan.get("dynamic_ab_tensormaps")
+                or plan.get("m_size") != descriptors.rows
+                or plan.get("n_size") != descriptors.columns
+                or plan.get("k_total_size") != descriptors.reduction
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "wrapped descriptors disagree with typed provider"
+                )
+        elif plan.get("kind") == "tcgen05_d_tma":
+            if (
+                not plan.get("rank3_mnl_tensor")
+                or plan.get("output_dtype") != "cutlass.Float32"
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "wrapped output requires the flat FP32 store"
+                )
+        else:
+            raise exc.BackendUnsupported(
+                "cute", "wrapped descriptors require typed grouped RNA"
+            )
 
     def plan_int(key: str, default: int | None = None) -> int:
         value = plan.get(key, default) if default is not None else plan[key]
@@ -421,7 +478,11 @@ def _append_cute_wrapper_plan(
             if worklist_nm_store
             else f"(arg{tensor_idx}_stride0, arg{tensor_idx}_stride1, 0)"
         )
-        gmem_layout = f"{rank3_gmem_shape}, stride={rank3_gmem_stride}"
+        gmem_layout = (
+            descriptors.layout(f"arg{tensor_idx}", output=True)
+            if descriptors is not None
+            else f"{rank3_gmem_shape}, stride={rank3_gmem_stride}"
+        )
         # Keep these layout arguments in sync with the device-side
         # ``make_smem_layout_epi`` calls; the wrapper's TMA atom and the kernel's
         # SMEM staging must slice the same epilogue tile shape.
@@ -1181,7 +1242,7 @@ def _append_cute_wrapper_plan(
             call_args.append(total_clusters_arg)
         call_args.extend(f"cutlass.Int32({quota})" for quota in quotas)
         return
-    if kind != "tcgen05_ab_tma":
+    if kind not in ("tcgen05_ab_tma", "tcgen05_grouped_rna", "tcgen05_grouped_tma_rn"):
         raise exc.BackendUnsupported("cute", f"wrapper plan kind: {kind}")
 
     lhs_idx = plan_int("lhs_idx")
@@ -1198,9 +1259,39 @@ def _append_cute_wrapper_plan(
     # the plan's TFloat32 via ``internal_type`` (both are 4 bytes wide, so the
     # SMEM layout/byte math is unchanged). Mirrors quack's gemm_sm100 fp32
     # handling.
-    tma_internal_type_arg = (
-        ", internal_type=cutlass.TFloat32" if input_dtype == "cutlass.TFloat32" else ""
-    )
+    if kind == "tcgen05_grouped_rna":
+        # RNA conversion consumes raw FP32 words after TMA completion. Keep
+        # the descriptor in FP32: TMA rounding would change tie/NaN semantics.
+        if (
+            input_dtype != "cutlass.TFloat32"
+            or cluster_m != 1
+            or cluster_n != 1
+            or plan.get("operand_transform") != "tf32_rna"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "raw RNA descriptors require one-CTA TF32 MMA"
+            )
+        tma_internal_type_arg = ", internal_type=cutlass.Float32"
+    elif kind == "tcgen05_grouped_tma_rn":
+        if (
+            input_dtype != "cutlass.TFloat32"
+            or cluster_m != 1
+            or cluster_n != 1
+            or plan.get("operand_transform") != "tf32_tma_rn"
+            or type(plan.get("converter_warps")) is not int
+            or plan["converter_warps"] != 0
+            or plan.get("scheduler_self_consumer") is not False
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "TF32 TMA RN requires its converter-free one-CTA schedule"
+            )
+        tma_internal_type_arg = ", internal_type=cutlass.TFloat32"
+    else:
+        tma_internal_type_arg = (
+            ", internal_type=cutlass.TFloat32"
+            if input_dtype == "cutlass.TFloat32"
+            else ""
+        )
     ab_stage_count = plan_int("ab_stage_count", 2)
     # Optional ``smem_swizzle_*`` overrides recorded by the device-side
     # codegen when the user opts into a non-default A/B SMEM atom
@@ -1386,6 +1477,8 @@ def _append_cute_wrapper_plan(
                 f"(arg{rhs_idx}_shape0, arg{rhs_idx}_shape1, 1), "
                 f"stride=(arg{rhs_idx}_stride0, arg{rhs_idx}_stride1, 0)"
             )
+        if descriptors is not None:
+            rhs_tma_layout = descriptors.layout(f"arg{rhs_idx}")
         lhs_tma_setup = (
             (
                 f"    {lhs_tma} = cute.make_tensor("
@@ -1897,6 +1990,26 @@ def _create_cute_wrapper(
         cast("dict[str, object]", plan)
         for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", [])
     ]
+    wrapped = [plan.get("wrapped_grouped_descriptors") for plan in wrapper_plans]
+    if any(identity is not None for identity in wrapped) and (
+        len(wrapper_plans) != 2
+        or [plan.get("kind") for plan in wrapper_plans]
+        not in (
+            ["tcgen05_grouped_rna", "tcgen05_d_tma"],
+            ["tcgen05_grouped_tma_rn", "tcgen05_d_tma"],
+        )
+        or wrapped[0] is None
+        or wrapped[0] != wrapped[1]
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "wrapped input and output descriptors require one shared proof"
+        )
+    if any(
+        plan.get("kind") == "tcgen05_grouped_tma_rn" for plan in wrapper_plans
+    ) and block != (32, 8, 1):
+        raise exc.BackendUnsupported(
+            "cute", "TF32 TMA RN requires its proved 256-thread block"
+        )
     for plan in wrapper_plans:
         _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
     sm100_recurrence_plans = [
