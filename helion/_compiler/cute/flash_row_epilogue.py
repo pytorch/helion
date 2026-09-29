@@ -644,6 +644,24 @@ def row_epilogue_aux_prefetch() -> int:
     return int(value) if value else ROW_EPILOGUE_AUX_PREFETCH
 
 
+def row_epilogue_packed_enabled() -> bool:
+    """``HELION_CUTE_FLASH_ROW_EPILOGUE_PACKED=0`` uses scalar instructions.
+
+    The chunk loop walks element pairs either way.  By default it lowers
+    ``add``/``sub``/``mul`` and the fused multiply-adds to the packed ``f32x2``
+    FMA-pipe instructions of sm_100 (half the issue slots); with the switch off
+    the same pairs are evaluated in the same order with scalar instructions,
+    ``cute.math.fma`` standing in for ``fma_packed_f32x2`` on the same fused
+    set.  Both forms round identically per lane and produce bitwise-equal
+    outputs, so this is an instruction-selection escape hatch, not a numerics
+    knob.  Which products are fused is decided by ``emit_row_epilogue`` alone.
+    """
+    import os
+
+    value = os.environ.get("HELION_CUTE_FLASH_ROW_EPILOGUE_PACKED", "1").strip().lower()
+    return value not in ("0", "false", "no", "off")
+
+
 def row_epilogue_hoist_enabled() -> bool:
     """``HELION_CUTE_FLASH_ROW_EPILOGUE_HOIST=0`` keeps every pass in the epilogue."""
     import os
@@ -687,6 +705,7 @@ def emit_row_epilogue(
     prefix: str = "_ep",
     aux_prefetch: int | None = None,
     split: bool = False,
+    packed: bool | None = None,
 ) -> tuple[str, str]:
     """Emit the program's passes as kernel-body source.
 
@@ -698,7 +717,12 @@ def emit_row_epilogue(
     index, ``{j}`` the element index and ``{value}`` (``store_elem`` only) the
     fp32 output scalar.  ``o_load[0]`` issues the TMEM load of a chunk and the
     remaining ``o_load`` statements finish it (scaling); loads run ahead of the
-    math by one chunk (O) and ``aux_prefetch`` chunks (aux).
+    math by one chunk (O) and ``aux_prefetch`` chunks (aux).  Even chunk widths
+    walk element pairs: every vec value is a register pair ``x_p0`` / ``x_p1``
+    and the chunk loop steps two elements at a time.  ``packed`` (default) lowers
+    the pair arithmetic to the ``f32x2`` instructions; otherwise the same pairs
+    use scalar instructions with identical per-lane rounding, see
+    ``row_epilogue_packed_enabled``.
     """
     assert len(aux_loads) == len(program.aux_names) == len(aux_elems) == len(aux_allocs)
     assert len(scalar_names) == len(program.scalar_exprs)
@@ -711,6 +735,10 @@ def emit_row_epilogue(
     aux_buffers = aux_prefetch + 1
     o_buffers = 2 if chunks > 1 else 1
     hoisted = hoistable_passes(program) if split and row_epilogue_hoist_enabled() else 0
+    if packed is None:
+        packed = row_epilogue_packed_enabled()
+    pairs = chunk_width % 2 == 0
+    packed = packed and pairs
 
     def var(name: str) -> str:
         return f"{prefix}_{name}"
@@ -745,6 +773,112 @@ def emit_row_epilogue(
         "amax": "cutlass.Float32(-cutlass.Float32.inf)",
         "amin": "cutlass.Float32(cutlass.Float32.inf)",
     }
+    packed_binary = {
+        "add": "add_packed_f32x2",
+        "sub": "sub_packed_f32x2",
+        "mul": "mul_packed_f32x2",
+    }
+    lanes = (elem_var, f"{elem_var} + 1") if pairs else (elem_var,)
+
+    def lane(name: str, index: int) -> str:
+        """Lane ``index`` of a vec value; row values broadcast."""
+        if program.op(name).kind != VEC:
+            return atom(name)
+        return f"{var(name)}_p{index}" if pairs else var(name)
+
+    def lanes_of(name: str, neg: bool = False) -> list[str]:
+        sign = "-" if neg else ""
+        return [f"{sign}{lane(name, index)}" for index in range(len(lanes))]
+
+    def tuple_of(name: str) -> str:
+        return f"({', '.join(lanes_of(name))})"
+
+    def fusable_muls(
+        needed: Sequence[RowEpilogueOp],
+        reductions: Sequence[RowEpilogueOp],
+        is_store: bool,
+    ) -> set[str]:
+        """Vec ``mul`` ops folded into their consumer's fused multiply-add.
+
+        The row epilogue contracts ``a * b + c`` into one rounding wherever the
+        product has no other reader, as the ``fuse_fma`` pass does for the rest
+        of the CuTe backend (that pass skips kernels with matmul facts, i.e.
+        every flash kernel, so this emitter applies the same default itself;
+        it is not a config knob).  A mul read exactly once, by an add/sub or by
+        a sum reduction, is not materialized.  An add/sub folds at most one
+        operand (the right one first) so the other stays a value of its own,
+        and the output is never folded because the store reads it.
+        """
+        uses: dict[str, int] = {}
+        for op in (*needed, *reductions):
+            for name in op.inputs:
+                uses[name] = uses.get(name, 0) + 1
+        if is_store:
+            uses[program.output] = uses.get(program.output, 0) + 1
+        needed_names = {op.name for op in needed}
+
+        def foldable(name: str) -> bool:
+            return (
+                name in needed_names
+                and program.op(name).op == "mul"
+                and uses.get(name) == 1
+            )
+
+        fused: set[str] = set()
+        for op in (*needed, *reductions):
+            if op.op in ("add", "sub"):
+                for name in reversed(op.inputs):
+                    if foldable(name):
+                        fused.add(name)
+                        break
+            elif op.op == "reduce" and str(op.attrs[0]) == "sum":
+                if foldable(op.inputs[0]):
+                    fused.add(op.inputs[0])
+        return fused
+
+    def fma_lanes(
+        outputs: Sequence[str],
+        xs: Sequence[str],
+        ys: Sequence[str],
+        cs: Sequence[str],
+    ) -> str:
+        """``outputs[i] = xs[i] * ys[i] + cs[i]`` in one rounding per lane."""
+        if packed:
+            return (
+                f"{', '.join(outputs)} = cute.arch.fma_packed_f32x2("
+                f"({', '.join(xs)}), ({', '.join(ys)}), ({', '.join(cs)}))"
+            )
+        return "\n".join(
+            f"{out} = cute.math.fma({x}, {y}, {c})"
+            for out, x, y, c in zip(outputs, xs, ys, cs, strict=True)
+        )
+
+    def render_lanes(op: RowEpilogueOp, fused: set[str]) -> str:
+        """Statements computing the lane(s) of ``op`` for one chunk-loop step."""
+        outputs = lanes_of(op.name)
+        if op.op in ("add", "sub"):
+            a, b = op.inputs
+            folded = b if b in fused else a if a in fused else None
+            if folded is not None:
+                x, y = program.op(folded).inputs
+                addend = a if folded == b else b
+                # a - x*y = fma(-x, y, a) and x*y - b = fma(x, y, -b).
+                return fma_lanes(
+                    outputs,
+                    lanes_of(x, neg=op.op == "sub" and folded == b),
+                    lanes_of(y),
+                    lanes_of(addend, neg=op.op == "sub" and folded == a),
+                )
+        if packed and op.op in packed_binary:
+            a, b = op.inputs
+            return (
+                f"{', '.join(outputs)} = cute.arch.{packed_binary[op.op]}("
+                f"{tuple_of(a)}, {tuple_of(b)})"
+            )
+        return "\n".join(
+            f"{out} = {render_op(op, lambda name, index=index: lane(name, index))}"
+            for index, out in enumerate(outputs)
+        )
 
     def emit_passes(pass_range: range, lines: list[str]) -> None:
         def add(text: str, extra: str = "") -> None:
@@ -763,10 +897,18 @@ def emit_row_epilogue(
             aux_needed = sorted({_attr_int(op) for op in needed if op.op == "aux"})
             is_store = pass_index == program.store_pass
             accumulators = 2 if chunks > 1 else 1
+            fused = fusable_muls(needed, reductions, is_store)
+
+            def acc_name(op: RowEpilogueOp, slot: int, index: int) -> str:
+                if pairs:
+                    return f"{var(op.name)}_{slot}_p{index}"
+                return f"{var(op.name)}_{slot}"
+
             for op in reductions:
                 init = reduce_inits[str(op.attrs[0])]
                 for slot in range(accumulators):
-                    add(f"{var(op.name)}_{slot} = {init}")
+                    for index in range(len(lanes)):
+                        add(f"{acc_name(op, slot, index)} = {init}")
             # Prime the load pipelines.
             if uses_o:
                 add(fill(o_load[0], i=0, o_slot=0))
@@ -782,44 +924,63 @@ def emit_row_epilogue(
                 if uses_o:
                     for line in o_load[1:]:
                         add(fill(line, i=i, o_slot=o_slot))
-                add(f"for {elem_var} in cutlass.range_constexpr({chunk_width}):")
+                if pairs:
+                    add(
+                        f"for {elem_var} in cutlass.range_constexpr(0, {chunk_width}, 2):"
+                    )
+                else:
+                    add(f"for {elem_var} in cutlass.range_constexpr({chunk_width}):")
                 inner = "    "
                 for op in needed:
+                    if op.name in fused:
+                        continue
                     if op.op == "o_norm":
-                        add(
-                            f"{var(op.name)} = {fill(o_elem, i=i, j=elem_var, o_slot=o_slot)}",
-                            inner,
-                        )
+                        for out, j in zip(lanes_of(op.name), lanes, strict=True):
+                            add(
+                                f"{out} = {fill(o_elem, i=i, j=j, o_slot=o_slot)}",
+                                inner,
+                            )
                     elif op.op == "aux":
-                        index = _attr_int(op)
+                        aux_index = _attr_int(op)
+                        for out, j in zip(lanes_of(op.name), lanes, strict=True):
+                            add(
+                                f"{out} = "
+                                f"{fill(aux_elems[aux_index], i=i, j=j, a_slot=a_slot, aux=aux_index)}",
+                                inner,
+                            )
+                    else:
+                        add(render_lanes(op, fused), inner)
+                for op in reductions:
+                    source = op.inputs[0]
+                    assert source in needed_names
+                    slot = i % accumulators
+                    reduce_kind = str(op.attrs[0])
+                    accs = [acc_name(op, slot, index) for index in range(len(lanes))]
+                    if reduce_kind == "sum":
+                        if source in fused:
+                            x, y = program.op(source).inputs
+                            add(fma_lanes(accs, lanes_of(x), lanes_of(y), accs), inner)
+                        elif packed:
+                            add(
+                                f"{', '.join(accs)} = cute.arch.add_packed_f32x2("
+                                f"({', '.join(accs)}), {tuple_of(source)})",
+                                inner,
+                            )
+                        else:
+                            for acc, value in zip(accs, lanes_of(source), strict=True):
+                                add(f"{acc} = {acc} + {value}", inner)
+                        continue
+                    fn = "cute.math.max" if reduce_kind == "amax" else "cute.math.min"
+                    for acc, value in zip(accs, lanes_of(source), strict=True):
+                        add(f"{acc} = {fn}({acc}, {value}, propagate_nan=True)", inner)
+                if is_store:
+                    for value, j in zip(lanes_of(program.output), lanes, strict=True):
                         add(
-                            f"{var(op.name)} = "
-                            f"{fill(aux_elems[index], i=i, j=elem_var, a_slot=a_slot, aux=index)}",
+                            fill(store_elem, i=i, j=j, o_slot=o_slot).replace(
+                                "{value}", value
+                            ),
                             inner,
                         )
-                    else:
-                        add(f"{var(op.name)} = {render_op(op, atom)}", inner)
-                for op in reductions:
-                    source = var(op.inputs[0])
-                    assert op.inputs[0] in needed_names
-                    acc = f"{var(op.name)}_{i % accumulators}"
-                    reduce_kind = str(op.attrs[0])
-                    if reduce_kind == "sum":
-                        add(f"{acc} = {acc} + {source}", inner)
-                    else:
-                        fn = (
-                            "cute.math.max"
-                            if reduce_kind == "amax"
-                            else "cute.math.min"
-                        )
-                        add(f"{acc} = {fn}({acc}, {source}, propagate_nan=True)", inner)
-                if is_store:
-                    add(
-                        fill(store_elem, i=i, j=elem_var, o_slot=o_slot).replace(
-                            "{value}", var(program.output)
-                        ),
-                        inner,
-                    )
                 if is_store:
                     for line in store:
                         add(fill(line, i=i, o_slot=o_slot))
@@ -838,24 +999,31 @@ def emit_row_epilogue(
                             )
             for op in reductions:
                 reduce_kind = str(op.attrs[0])
-                parts = [f"{var(op.name)}_{slot}" for slot in range(accumulators)]
-                if len(parts) == 1:
-                    add(f"{var(op.name)} = {parts[0]}")
-                elif reduce_kind == "sum":
-                    add(f"{var(op.name)} = {parts[0]} + {parts[1]}")
-                else:
-                    fn = "cute.math.max" if reduce_kind == "amax" else "cute.math.min"
-                    add(
-                        f"{var(op.name)} = {fn}({parts[0]}, {parts[1]}, propagate_nan=True)"
-                    )
+                parts = [
+                    acc_name(op, slot, index)
+                    for slot in range(accumulators)
+                    for index in range(len(lanes))
+                ]
+                total = parts[0]
+                fn = "cute.math.max" if reduce_kind == "amax" else "cute.math.min"
+                for part in parts[1:]:
+                    if reduce_kind == "sum":
+                        total = f"{total} + {part}"
+                    else:
+                        total = f"{fn}({total}, {part}, propagate_nan=True)"
+                add(f"{var(op.name)} = {total}")
             for op in _row_ops_available_at(program, pass_index + 1):
                 add(f"{var(op.name)} = {render_op(op, atom)}")
 
     prologue: list[str] = []
     epilogue: list[str] = []
 
-    def alloc_lines(lines: list[str], *, include_o: bool) -> None:
+    def alloc_lines(
+        lines: list[str], *, include_o: bool, include_aux: bool = True
+    ) -> None:
         for index, alloc in enumerate(aux_allocs):
+            if not include_aux:
+                break
             if any(_attr_int(op) == index for op in program.ops if op.op == "aux"):
                 for slot in range(aux_buffers):
                     lines.append(f"{indent}{fill(alloc, a_slot=slot, aux=index)}")
@@ -876,6 +1044,9 @@ def emit_row_epilogue(
         first_target.append(f"{indent}{var(op.name)} = {render_op(op, atom)}")
     if hoisted:
         emit_passes(range(hoisted), prologue)
-    alloc_lines(epilogue, include_o=uses_o_anywhere)
+        # The prologue's aux buffers are not visible to the epilogue.
+        alloc_lines(epilogue, include_o=uses_o_anywhere)
+    elif uses_o_anywhere:
+        alloc_lines(epilogue, include_o=True, include_aux=False)
     emit_passes(range(hoisted, program.passes), epilogue)
     return "\n".join(prologue), "\n".join(epilogue)

@@ -5277,8 +5277,11 @@ class CuteFlashAttentionHeuristic(AutotunerHeuristic):
             "requires_ws_overlap": spec._cute_flash_requires_ws_overlap,
             "small_biased_candidate": spec._cute_flash_small_biased_candidate,
             "supports_tensor_4d_tma": spec._cute_flash_supports_tensor_4d_tma,
+            "has_row_epilogue": spec._cute_flash_has_row_epilogue,
             "target_device_capability": spec.target_device_capability,
             "block_size_targets": spec._cute_flash_block_size_target_list(),
+            "plain_row_body": spec._cute_flash_plain_row_body,
+            "device_sm_count": spec._cute_flash_device_sm_count,
         }
         seeds = spec._legalize_cute_flash_compiler_seeds(
             flash_attention_seed_configs(

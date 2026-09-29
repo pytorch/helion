@@ -754,7 +754,10 @@ def _append_cute_wrapper_plan(
         # dense FA4 4D-TMA knob instead treats the same flat storage as
         # (S, D, H, Z), matching FA4's tensor-map rank for contiguous q[z,h,s,d].
         bw = "cutlass.utils.blackwell_helpers"
-        mma_m = 256 if use_2cta_instrs else 128
+        # Query-tile height: the two-warpgroup ws_overlap body can run 64-row
+        # (tcgen05 M=64) tiles; fa4 and the 2-CTA families stay at 128/256.
+        q_tile_m = plan_int("q_tile_m", default=128)
+        mma_m = 256 if use_2cta_instrs else q_tile_m
         qkd = f"({mma_m}, {kv_n}, {hd})"
         pvd = f"({mma_m}, {hd}, {kv_n})"
         if use_tensor_4d_tma:
@@ -862,12 +865,17 @@ def _append_cute_wrapper_plan(
             # Build the O smem layout for epilogue-warp store paths. The TMA
             # variant also builds the O TMA STORE atom; the STG variant reuses
             # the layout but stores with a universal-copy tiled copy in device code.
-            otile = f"(128, {hd})"
+            # One sO stage per resident Q tile: the fa4 topology drains both
+            # Q tiles of a work item, ws_overlap stages its single tile.
+            # Per-CTA output tile: 128 rows for fa4 (also under CtaGroup.TWO,
+            # where each CTA stores its own half) or the ws_overlap tile height.
+            otile = f"({q_tile_m}, {hd})"
             flash_lines.extend(
                 [
                     (
                         f"_flash_osl = {bw}.make_smem_layout_epi("
-                        f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, 2)"
+                        f"{dtype}, cutlass.utils.layout.LayoutEnum.ROW_MAJOR, {otile}, "
+                        f"{q_stage})"
                     ),
                 ]
             )
@@ -888,6 +896,23 @@ def _append_cute_wrapper_plan(
                 )
             else:
                 flash_lines.append("_flash_mOt = _flash_mO")
+            if plan.get("epi_aux_tma"):
+                # The fused row epilogue's aux tile is TMA-loaded into the free
+                # sO stage with the output tile's smem layout.
+                flash_lines.extend(
+                    [
+                        (
+                            "_flash_aux_cta_v = cute.composition("
+                            f"cute.make_identity_layout(_flash_mEpiAux0.shape), {otile})"
+                        ),
+                        (
+                            "_flash_tma_aux0, _flash_mEpiAux0t = "
+                            "cute.nvgpu.cpasync.make_tiled_tma_atom("
+                            "cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(), _flash_mEpiAux0, "
+                            "cute.select(_flash_osl, mode=[0, 1]), _flash_aux_cta_v)"
+                        ),
+                    ]
+                )
         else:
             # mO stays the (S, D, B) view (no TMA atom; the epilogue uses
             # autovec_copy straight to gmem).
@@ -922,6 +947,10 @@ def _append_cute_wrapper_plan(
             # The default root grid would launch batch * seq // 128; override it
             # to the halved fa4 tile count.
             body.append(f"    grid_x = cutlass.Int32({total_tiles * cluster_m})")
+        elif q_tile_m != 128:
+            # 64-row ws_overlap tiles: one CTA per (bh, 64-row tile), twice the
+            # default 128-row root grid.
+            body.append(f"    grid_x = cutlass.Int32({total_tiles})")
         call_args.extend(
             [
                 "_flash_qk_mma",
@@ -956,6 +985,8 @@ def _append_cute_wrapper_plan(
         elif epi_stg:
             call_args.append("_flash_osl")
         call_args.extend(f"_flash_mEpiAux{index}" for index in range(epi_aux_count))
+        if plan.get("epi_aux_tma"):
+            call_args.extend(["_flash_tma_aux0", "_flash_mEpiAux0t"])
         return
     if kind == "helion_flash_bwd" and plan.get("two_cta"):
         # 2-CTA cluster variant (FA4 SM100 backward layout): all M-widened

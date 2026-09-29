@@ -1454,6 +1454,9 @@ class ConfigSpec:
         self._cute_flash_head_dim: int | None = None
         self._cute_flash_num_kv: int | None = None
         self._cute_flash_num_bh: int | None = None
+        # SM count of the bound device (0 when unknown); small grids seed the
+        # 64-row flash tile from it.
+        self._cute_flash_device_sm_count: int = 0
         self._cute_flash_tensor_4d_heads: int | None = None
         self._cute_flash_dtype: torch.dtype = torch.float16
         self._cute_flash_is_causal: bool = False
@@ -1464,6 +1467,8 @@ class ConfigSpec:
         self._cute_flash_standard_causal_output: bool = False
         self._cute_flash_output_requires_tma: bool = False
         self._cute_flash_supports_tensor_4d_tma: bool = True
+        self._cute_flash_has_row_epilogue: bool = False
+        self._cute_flash_plain_row_body: bool = True
         self._cute_flash_block_size_targets: dict[int, int] = {}
         # Memo for ``flash_autotune_fragments``: every other input is fixed
         # ConfigSpec state, so (topology_override, pipeline_family_override) is
@@ -1759,6 +1764,8 @@ class ConfigSpec:
                 target_device_capability=self.target_device_capability,
                 output_requires_tma=self._cute_flash_output_requires_tma,
                 supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
+                has_row_epilogue=self._cute_flash_has_row_epilogue,
+                plain_row_body=self._cute_flash_plain_row_body,
                 topology_override=topology_override,
                 pipeline_family_override=pipeline_family_override,
             )
@@ -1790,6 +1797,8 @@ class ConfigSpec:
                 self._cute_flash_has_kv_tile_pruning
                 or self._cute_flash_requires_ws_overlap
             ),
+            plain_row_body=self._cute_flash_plain_row_body,
+            has_row_epilogue=self._cute_flash_has_row_epilogue,
         )
 
     def _legalize_cute_flash_compiler_seed(
@@ -2218,10 +2227,14 @@ class ConfigSpec:
         standard_causal_output: bool = False,
         output_requires_tma: bool = False,
         supports_tensor_4d_tma: bool = True,
+        has_row_epilogue: bool = False,
+        plain_row_body: bool = True,
+        device_sm_count: int = 0,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
+        self._cute_flash_device_sm_count = device_sm_count
         self._cute_flash_fragments_cache.clear()
         self._cute_flash_fragments_env_fingerprint = None
         self._cute_flash_head_dim = head_dim
@@ -2237,6 +2250,8 @@ class ConfigSpec:
         self._cute_flash_standard_causal_output = standard_causal_output
         self._cute_flash_output_requires_tma = output_requires_tma
         self._cute_flash_supports_tensor_4d_tma = supports_tensor_4d_tma
+        self._cute_flash_has_row_epilogue = has_row_epilogue
+        self._cute_flash_plain_row_body = plain_row_body
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -2684,7 +2699,10 @@ class ConfigSpec:
                     standard_causal_output=self._cute_flash_standard_causal_output,
                     target_device_capability=self.target_device_capability,
                     supports_tensor_4d_tma=(self._cute_flash_supports_tensor_4d_tma),
+                    has_row_epilogue=self._cute_flash_has_row_epilogue,
+                    plain_row_body=self._cute_flash_plain_row_body,
                     block_size_targets=self._cute_flash_block_size_target_list(),
+                    device_sm_count=self._cute_flash_device_sm_count,
                 )
             )
             flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)

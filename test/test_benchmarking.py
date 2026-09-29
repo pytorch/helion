@@ -4366,8 +4366,11 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     )
 
     assert policy["kind"] == "canonical_cute_flash"
-    assert policy["raw_config_count"] == (9 if causal else 26)
-    assert len(policy["effective_config_ids"]) == (9 if causal else 25)
+    # Every surface seeds the flat ws_overlap grid once next to the persistent
+    # family seed (a distinct source variant); the dense hd64 surface still
+    # carries one alias among its raw seeds.
+    assert policy["raw_config_count"] == (10 if causal else 27)
+    assert len(policy["effective_config_ids"]) == (10 if causal else 26)
     assert len(generation_zero_ids) == 100
     assert set(policy["effective_config_ids"]) <= set(generation_zero_ids)
 
@@ -4375,15 +4378,16 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
 @pytest.mark.parametrize(
     ("kernel_name", "shape", "expected_raw_count", "expected_effective_count"),
     (
-        ("attention_output", (2, 32, 262144, 128), 7, 7),
+        # The dense hd128 surface seeds the four plain batched exp2 packets too.
+        ("attention_output", (2, 32, 262144, 128), 12, 12),
         ("causal_attention_output", (2, 32, 524288, 128), 2, 2),
-        ("attention_output", (1, 32, 524288, 64), 15, 14),
-        ("causal_attention_output", (1, 32, 1048576, 64), 7, 7),
+        ("attention_output", (1, 32, 524288, 64), 16, 15),
+        ("causal_attention_output", (1, 32, 1048576, 64), 8, 8),
         ("attention_output", (8, 32, 524288, 64), 1, 1),
         ("causal_attention_output", (8, 32, 786432, 64), 6, 6),
-        ("attention_relu_output", (2, 32, 524288, 64), 15, 14),
+        ("attention_relu_output", (2, 32, 524288, 64), 16, 15),
         ("causal_attention_relu_output", (2, 32, 1048576, 64), 6, 6),
-        ("causal_attention_output", (2, 32, 65536, 64), 7, 7),
+        ("causal_attention_output", (2, 32, 65536, 64), 8, 8),
     ),
 )
 @skipUnlessCuteAvailable("binding a cute-backend kernel requires the CuTe DSL")
