@@ -17,6 +17,7 @@ from ...runtime.cute import topk as runtime_topk
 from ..program_id import XYZProgramIDs
 from ..tile_strategy import DeviceGridState
 from .fx_matcher import _GeneratedCodeTemplate
+from .row_value_facts import RowValueRequirement
 
 if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
@@ -357,13 +358,23 @@ for topk_i in cutlass.range({fragment_size}, unroll_full=True):
             return f"(({key} ^ (({key} >> cutlass.Int32(31)) ^ cutlass.Int32(-1))) & cutlass.Int32({index_mask}))"
         return f"(cutlass.Int32({index_mask}) - ({key} & cutlass.Int32({index_mask})))"
 
-    def value_store(key: str, destination: str, source: str | None = None) -> str:
+    def value_store(
+        key: str,
+        destination: str,
+        source: str | None = None,
+        requirement: RowValueRequirement | None = None,
+    ) -> str:
+        numeric = (
+            requirement is RowValueRequirement.NUMERIC
+            if requirement is not None
+            else plan.softmax
+        )
         if source is None:
             source = f"{x}[topk_row, topk_selected_index]"
         if plan.value_mode == "gather":
             return f"{destination} = {source}\n"
         if native_float:
-            if plan.softmax:
+            if numeric:
                 # Both infinity sentinels round to signed infinity in FP16
                 # and BF16. NaN keys are positive even after undoing a
                 # smallest-k sign flip; softmax permits a canonical payload.
@@ -395,7 +406,7 @@ topk_value_bits = topk_value_magnitude | ((topk_value_rank >> cutlass.Int32(16))
 topk_value_decodable = (topk_value_magnitude != 0) & (topk_value_magnitude <= {infinity_bits})
 """
         )
-        if plan.softmax:
+        if numeric:
             # Rank 32767 decodes to NaN in both dtypes. Signed ranks merge
             # the zero signs, which is also immaterial to softmax, so neither
             # case needs the original input's bit pattern or a reload.

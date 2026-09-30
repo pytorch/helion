@@ -16,8 +16,11 @@ from ..compile_environment import CompileEnvironment
 from .row_fragment import RowFragment
 from .row_fragment import RowFragmentEmitter
 from .row_fragment import RowFragmentLayout
+from .row_fragment import RowFragmentOrder
 from .row_fragment import row_fragment_tensor_inputs
 from .row_fragment_io import RowFragmentIO
+from .row_value_facts import RowValueRequirement
+from .row_value_facts import RowValueUses
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -39,7 +42,7 @@ def codegen_row_topk(
     key_padding: str,
     selected_key: str,
     selected_index: Callable[[str], str],
-    value_store: Callable[[str, str, str | None], str],
+    value_store: Callable[[str, str, str | None, RowValueRequirement | None], str],
     helper_name: str,
     helper_hash: str,
     index_type: str,
@@ -79,12 +82,31 @@ def codegen_row_topk(
         return node
 
     io = RowFragmentIO(cg, row=row, lane=lane, valid_row=valid_row)
+    value_uses = RowValueUses(graph.stores, resolve=resolve)
+    value_nodes = [
+        node
+        for node in graph.selection.users
+        if node.target is operator.getitem and node.args[1] == 0
+    ]
+    requirements = {value_uses.requirement(node) for node in value_nodes}
+    value_requirement = (
+        RowValueRequirement.EXACT
+        if RowValueRequirement.EXACT in requirements
+        else RowValueRequirement.NUMERIC
+        if RowValueRequirement.NUMERIC in requirements
+        else RowValueRequirement.UNUSED
+    )
 
     def load_fragment(node: Node) -> RowFragment:
         return io.load(node, emitter.layout)
 
     emitter = RowFragmentEmitter(
-        cg, load_fragment, layout=input_layout, valid_row=valid_row, resolve=resolve
+        cg,
+        load_fragment,
+        layout=input_layout,
+        valid_row=valid_row,
+        resolve=resolve,
+        numeric_uses_only=value_uses.numeric_only,
     )
 
     def emit(node: Node) -> RowFragment:
@@ -98,6 +120,11 @@ def codegen_row_topk(
 
     def scalar_source(node: Node, column: str) -> ast.AST:
         node = resolve(node)
+        cached = emitter.fragments.get(node)
+        if cached is not None and cached.replicated:
+            # Full-row reductions were evaluated before selection. Their
+            # replicated results can be reused at any selected column.
+            return cached.element(0)
         if node.target is load:
             return expr_from_string(io.expression(node, column))
         inputs = [
@@ -174,7 +201,20 @@ topk_selected = {helper_name}(topk_keys, {padded_k}, {plan.lanes_per_row},
                 )
                 key = key.replace("topk_selected[", "topk_transposed[")
                 output_layout = RowFragmentLayout(
-                    plan.lanes_per_row, output_vector, output_lane
+                    plan.lanes_per_row,
+                    output_vector,
+                    output_lane,
+                    owner_lanes=(
+                        tuple(
+                            logical
+                            % (plan.lanes_per_row // output_vector)
+                            * output_vector
+                            + logical // (plan.lanes_per_row // output_vector)
+                            for logical in range(plan.lanes_per_row)
+                        )
+                        if output_vector <= plan.lanes_per_row
+                        else None
+                    ),
                 )
             key = template.render(key)
             loop = template.render("topk_j")
@@ -189,13 +229,23 @@ for topk_output in cutlass.range_constexpr({plan.k}):
         {selected}[(topk_output // {plan.lanes_per_row * output_vector}) * {output_vector} + topk_output % {output_vector}] = {selected_key}
 """)
 
-        values = RowFragment(
-            fn.new_var("row_selected_values"), plan.x.dtype, plan.k, output_layout
+        values = (
+            RowFragment(
+                fn.new_var("row_selected_values"),
+                plan.x.dtype,
+                plan.k,
+                output_layout,
+                order=RowFragmentOrder(plan.largest),
+            )
+            if value_requirement is not RowValueRequirement.UNUSED
+            else None
         )
         indices = RowFragment(
             fn.new_var("row_selected_indices"), torch.int64, plan.k, output_layout
         )
         for fragment in (values, indices):
+            if fragment is None:
+                continue
             dtype = backend.dtype_str(fragment.dtype)
             add(
                 f"{fragment.name} = cute.make_rmem_tensor({registers}, {dtype})\n"
@@ -205,19 +255,28 @@ for topk_output in cutlass.range_constexpr({plan.k}):
         column = output_layout.column(loop)
         key = f"{selected}[{loop}]"
         recovered_index = template.render("topk_selected_index")
-        recover_statements: list[ast.AST] = []
-        with cg.set_statements(recover_statements):
-            recovery = scalar_source(source, recovered_index)
-        recovery_lines = "\n".join(ast.unparse(s) for s in recover_statements)
-        decode = value_store(key, f"{values.name}[{loop}]", "ROW_RECOVER_VALUE")
         decoded_lines = []
-        for line in template.render(decode).splitlines():
-            if "ROW_RECOVER_VALUE" in line:
-                indent = line[: len(line) - len(line.lstrip())]
-                if recovery_lines:
-                    decoded_lines.append(textwrap.indent(recovery_lines, indent))
-                line = line.replace("ROW_RECOVER_VALUE", ast.unparse(recovery))
-            decoded_lines.append(line)
+        if values is not None:
+            decode = value_store(
+                key, f"{values.name}[{loop}]", "ROW_RECOVER_VALUE", value_requirement
+            )
+            rendered = template.render(decode)
+            if "ROW_RECOVER_VALUE" not in rendered:
+                decoded_lines = rendered.splitlines()
+            else:
+                recover_statements: list[ast.AST] = []
+                with cg.set_statements(recover_statements):
+                    recovery = scalar_source(source, recovered_index)
+                recovery_lines = "\n".join(ast.unparse(s) for s in recover_statements)
+                for line in rendered.splitlines():
+                    if "ROW_RECOVER_VALUE" in line:
+                        indent = line[: len(line) - len(line.lstrip())]
+                        if recovery_lines:
+                            decoded_lines.append(
+                                textwrap.indent(recovery_lines, indent)
+                            )
+                        line = line.replace("ROW_RECOVER_VALUE", ast.unparse(recovery))
+                    decoded_lines.append(line)
         index_expr = template.render(selected_index(key))
         add(f"""
 for {loop} in cutlass.range_constexpr({registers}):
@@ -237,10 +296,13 @@ for {loop} in cutlass.range_constexpr({registers}):
             layout=output_layout,
             valid_row=valid_row,
             resolve=resolve,
+            numeric_uses_only=value_uses.numeric_only,
         )
         for node in graph.selection.users:
             if node.target is operator.getitem:
-                emitter.bind(node, values if node.args[1] == 0 else indices)
+                fragment = values if node.args[1] == 0 else indices
+                if fragment is not None:
+                    emitter.bind(node, fragment)
 
         # Evaluate all values before any effect; the planner proves disjoint
         # output spans so neither recomputation nor another output can be clobbered.

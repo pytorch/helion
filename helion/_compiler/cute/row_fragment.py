@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from dataclasses import replace
 import itertools
+import math
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -21,6 +23,7 @@ from torch.fx.node import map_arg
 
 from ... import exc
 from ...language._tracing_ops import _mask_to
+from ...language._tracing_ops import _new_var
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -39,11 +42,30 @@ if TYPE_CHECKING:
 
 _VIEW_TARGETS = frozenset(
     {
+        _new_var,
         torch.ops.aten.view.default,
         torch.ops.aten.reshape.default,
         torch.ops.aten._unsafe_view.default,
         torch.ops.aten.squeeze.dim,
         torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.expand.default,
+    }
+)
+_REDUCTION_TARGETS: dict[object, str] = {
+    torch.ops.aten.sum.dim_IntList: "sum",
+    torch.ops.aten.amax.default: "max",
+    torch.ops.aten.amin.default: "min",
+    torch.ops.aten.any.dim: "max",
+    torch.ops.aten.any.dims: "max",
+    torch.ops.aten.all.dim: "min",
+    torch.ops.aten.all.dims: "min",
+}
+_BOOLEAN_REDUCTION_TARGETS = frozenset(
+    {
+        torch.ops.aten.any.dim,
+        torch.ops.aten.any.dims,
+        torch.ops.aten.all.dim,
+        torch.ops.aten.all.dims,
     }
 )
 _CAST_TARGETS = frozenset({torch.ops.prims.convert_element_type.default})
@@ -56,10 +78,13 @@ class RowFragmentLayout:
     lanes: int
     vector_width: int
     lane_expr: str
+    owner_lanes: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         assert 0 < self.lanes <= 32 and self.lanes & (self.lanes - 1) == 0
         assert self.vector_width > 0
+        if self.owner_lanes is not None:
+            assert sorted(self.owner_lanes) == list(range(self.lanes))
 
     def column(self, register: str | int) -> str:
         vector = self.vector_width
@@ -71,6 +96,24 @@ class RowFragmentLayout:
     def num_registers(self, extent: int) -> int:
         width = self.lanes * self.vector_width
         return (extent + width - 1) // width * self.vector_width
+
+    def owner(self, column: int) -> tuple[int, int]:
+        """Return the physical subgroup lane and register for a logical column."""
+        vector = self.vector_width
+        lane = column // vector % self.lanes
+        if self.owner_lanes is not None:
+            lane = self.owner_lanes[lane]
+        return lane, column // (self.lanes * vector) * vector + column % vector
+
+
+@dataclass(frozen=True)
+class RowFragmentOrder:
+    """Monotone values with NaNs at the numerically greatest endpoint."""
+
+    descending: bool
+
+    def maximum(self, extent: int) -> int:
+        return 0 if self.descending else extent - 1
 
 
 @dataclass(frozen=True)
@@ -87,6 +130,7 @@ class RowFragment:
     extent: int
     layout: RowFragmentLayout
     replicated: bool = False
+    order: RowFragmentOrder | None = None
 
     def __post_init__(self) -> None:
         assert self.extent > 0
@@ -143,11 +187,42 @@ def _preserves_row_columns(node: Node) -> bool:
     if len(inputs) != 1 or output is None:
         return False
     source = inputs[0].meta["val"]
+    if node.target is torch.ops.aten.expand.default:
+        # Expand can broadcast a row scalar, but cannot change a non-unit
+        # logical dimension or introduce another non-unit row axis.
+        if source.ndim > output.ndim:
+            return False
+        padded = [1] * (output.ndim - source.ndim) + list(source.shape)
+        return all(
+            _same_extent(before, 1) or _same_extent(before, after)
+            for before, after in zip(padded, output.shape, strict=True)
+        )
     source_shape = [size for size in source.shape if not _same_extent(size, 1)]
     output_shape = [size for size in output.shape if not _same_extent(size, 1)]
     return len(source_shape) == len(output_shape) and all(
         itertools.starmap(_same_extent, zip(source_shape, output_shape, strict=True))
     )
+
+
+def _row_reduction(node: Node) -> str | None:
+    reduction = _REDUCTION_TARGETS.get(node.target)
+    inputs = row_fragment_tensor_inputs(node)
+    if reduction is None or len(inputs) != 1:
+        return None
+    source = inputs[0].meta["val"]
+    if node.target in _BOOLEAN_REDUCTION_TARGETS and source.dtype is not torch.bool:
+        return None
+    dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    if isinstance(dim, int):
+        dim = [dim]
+    if (
+        source.ndim < 2
+        or not isinstance(dim, (tuple, list))
+        or len(dim) != 1
+        or dim[0] not in (-1, source.ndim - 1)
+    ):
+        return None
+    return reduction
 
 
 def supports_row_fragment_node(node: Node) -> bool:
@@ -162,6 +237,8 @@ def supports_row_fragment_node(node: Node) -> bool:
         return True
     if node.target in _VIEW_TARGETS:
         return _preserves_row_columns(node)
+    if node.target in _REDUCTION_TARGETS:
+        return _row_reduction(node) is not None
     if node.target in (
         torch.ops.aten.where.self,
         torch.ops.aten.scalar_tensor.default,
@@ -187,12 +264,14 @@ class RowFragmentEmitter:
         layout: RowFragmentLayout,
         valid_row: str = "True",
         resolve: Callable[[Node], Node] | None = None,
+        numeric_uses_only: Callable[[Node], bool] | None = None,
     ) -> None:
         self.cg = cg
         self.load = load
         self.layout = layout
         self.valid_row = valid_row
         self.resolve = resolve
+        self.numeric_uses_only = numeric_uses_only
         self.fragments: dict[Node, RowFragment] = {}
 
     def bind(self, node: Node, fragment: RowFragment) -> None:
@@ -314,6 +393,7 @@ class RowFragmentEmitter:
         else:
             layout, extent = self.layout, 1
         result = self._new_fragment(node, extent, layout, replicated=not owned)
+        result = replace(result, order=self._pointwise_order(node, fragments))
         register = self.cg.device_function.new_var("row_register")
         valid = self.valid_row
         if not result.replicated:
@@ -352,19 +432,173 @@ class RowFragmentEmitter:
         )
         return result
 
+    def _pointwise_order(
+        self, node: Node, fragments: list[RowFragment]
+    ) -> RowFragmentOrder | None:
+        ordered = [fragment for fragment in fragments if fragment.order is not None]
+        output = _tensor(node)
+        if len(ordered) != 1 or output is None or not output.dtype.is_floating_point:
+            return None
+        order = ordered[0].order
+        if node.target in _CAST_TARGETS or node.target is _mask_to:
+            return order
+        if node.target in (
+            torch.ops.aten.exp.default,
+            torch.ops.aten.exp2.default,
+            torch.ops.aten.sigmoid.default,
+            torch.ops.aten.tanh.default,
+        ):
+            return order
+        # A finite scalar offset or positive finite scale preserves both the
+        # numerical ordering and the location of an existing NaN endpoint.
+        if len(node.args) < 2 or len(fragments) != 1:
+            return None
+        scalar = node.args[1]
+        if not isinstance(scalar, (int, float)) or not math.isfinite(scalar):
+            return None
+        limits = torch.finfo(output.dtype)
+        if abs(scalar) > limits.max:
+            return None
+        alpha = node.kwargs.get("alpha", 1)
+        if not isinstance(alpha, (int, float)) or not math.isfinite(alpha):
+            return None
+        if abs(scalar * alpha) > limits.max:
+            return None
+        if node.target in (
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.add.Scalar,
+            torch.ops.aten.sub.Tensor,
+            torch.ops.aten.sub.Scalar,
+        ) or (
+            scalar >= limits.tiny
+            and node.target
+            in (
+                torch.ops.aten.mul.Tensor,
+                torch.ops.aten.mul.Scalar,
+                torch.ops.aten.div.Tensor,
+                torch.ops.aten.div.Scalar,
+            )
+        ):
+            return order
+        return None
+
     def _emit_view(self, node: Node) -> RowFragment:
+        source_node = row_fragment_tensor_inputs(node)[0]
+        source = self.emit(source_node)
+        output = _tensor(node)
+        assert output is not None
+        source_tensor = source_node.meta["val"]
+        if not source.replicated:
+            if output.ndim == 0 or (
+                row_fragment_logical_extent(output.shape[-1]) != source.extent
+            ):
+                raise self._unsupported(node, "view moves the distributed column axis")
+            return source
+        if output.ndim < 2 or _same_extent(output.shape[-1], 1):
+            return source
+        if node.target is not torch.ops.aten.expand.default:
+            raise self._unsupported(node, "view moves the replicated row axis")
+        # A replicated rank-one tensor represents rows, so PyTorch's
+        # right-aligned expansion cannot reinterpret those rows as columns.
+        if source_tensor.ndim == 1 and not _same_extent(source_tensor.shape[0], 1):
+            raise self._unsupported(node, "expand broadcasts rows into columns")
+        extent = row_fragment_logical_extent(output.shape[-1])
+        if extent is None:
+            raise self._unsupported(node, "dynamic broadcast column extent")
+        result = self._new_fragment(node, extent, self.layout)
+        register = self.cg.device_function.new_var("row_expand_register")
+        self._add(
+            f"for {register} in cutlass.range_constexpr({result.num_registers}):\n"
+            f"    {result.name}[{register}] = {source.name}[0]"
+        )
+        return result
+
+    def _emit_reduction(self, node: Node, reduction: str) -> RowFragment:
         source = self.emit(row_fragment_tensor_inputs(node)[0])
         output = _tensor(node)
         assert output is not None
+        result = self._new_fragment(node, 1, source.layout, replicated=True)
+        backend = CompileEnvironment.current().backend
+        accumulation_dtype = output.dtype
+        if accumulation_dtype in (torch.float16, torch.bfloat16):
+            accumulation_dtype = torch.float32
+        dtype = backend.dtype_str(accumulation_dtype)
+        output_dtype = backend.dtype_str(output.dtype)
         if source.replicated:
-            if output.ndim < 2 or _same_extent(output.shape[-1], 1):
-                return source
-            raise self._unsupported(node, "view moves the replicated row axis")
-        if output.ndim == 0 or (
-            row_fragment_logical_extent(output.shape[-1]) != source.extent
-        ):
-            raise self._unsupported(node, "view moves the distributed column axis")
-        return source
+            self._add(f"{result.name}[0] = {output_dtype}({source.name}[0])")
+            return result
+        fallback_guard = None
+        if reduction == "max" and source.order is not None:
+            lane, register = source.layout.owner(source.order.maximum(source.extent))
+            maximum = self.cg.device_function.new_var("row_known_maximum")
+            self._add(f"{maximum} = {dtype}({source.name}[{register}])")
+            if source.layout.lanes > 1:
+                self._add(
+                    f"{maximum} = cute.arch.shuffle_sync({maximum}, offset={lane}, "
+                    f"mask_and_clamp={((32 - source.layout.lanes) << 8) | 31})"
+                )
+            self._add(f"{result.name}[0] = {output_dtype}({maximum})")
+            if self.numeric_uses_only is not None and self.numeric_uses_only(node):
+                return result
+            # Preserve the original choice between zero signs or NaN payloads.
+            # The fallback contains shuffles: every thread named in their warp
+            # mask must take it, even when only one row subgroup needs recovery.
+            fallback_guard = (
+                f"cute.arch.vote_ballot_sync(({self.valid_row}) and "
+                f"(({maximum} == 0) or ({maximum} != {maximum}))) != 0"
+            )
+        full_reduction: list[ast.AST] = []
+        with self.cg.set_statements(full_reduction):
+            if reduction == "sum":
+                identity = "0"
+            elif accumulation_dtype.is_floating_point:
+                identity = "-float('inf')" if reduction == "max" else "float('inf')"
+            elif accumulation_dtype is torch.bool:
+                identity = "False" if reduction == "max" else "True"
+            else:
+                limits = torch.iinfo(accumulation_dtype)
+                identity = str(limits.min if reduction == "max" else limits.max)
+            accumulator = self.cg.device_function.new_var("row_reduce")
+            register = self.cg.device_function.new_var("row_reduce_register")
+            value = self.cg.device_function.new_var("row_reduce_value")
+
+            def combine(left: str, right: str) -> str:
+                if reduction == "sum":
+                    return f"({left} + {right})"
+                comparison = ">" if reduction == "max" else "<"
+                condition = f"({left} {comparison} {right})"
+                if accumulation_dtype.is_floating_point:
+                    # A NaN from either operand must survive local and subgroup
+                    # reductions; hardware fmax/fmin may ignore a NaN operand.
+                    condition += f" or ({left} != {left})"
+                return f"({left} if {condition} else {right})"
+
+            self._add(
+                f"{accumulator} = {dtype}({identity})\n"
+                f"for {register} in cutlass.range_constexpr({source.num_registers}):\n"
+                f"    if ({self.valid_row}) and ({source.layout.column(register)} < {source.extent}):\n"
+                f"        {value} = {dtype}({source.name}[{register}])\n"
+                f"        {accumulator} = {combine(accumulator, value)}"
+            )
+            for stage in range(source.layout.lanes.bit_length() - 1):
+                peer = self.cg.device_function.new_var("row_reduce_peer")
+                self._add(
+                    f"{peer} = cute.arch.shuffle_sync_bfly({accumulator}, offset={1 << stage})\n"
+                    f"{accumulator} = {combine(accumulator, peer)}"
+                )
+            self._add(f"{result.name}[0] = {output_dtype}({accumulator})")
+        if fallback_guard is None:
+            for statement in full_reduction:
+                self.cg.add_statement(statement)
+        else:
+            self.cg.add_statement(
+                ast.If(
+                    test=cast("ast.expr", expr_from_string(fallback_guard)),
+                    body=cast("list[ast.stmt]", full_reduction),
+                    orelse=[],
+                )
+            )
+        return result
 
     def emit(self, node: Node) -> RowFragment:
         if node in self.fragments:
@@ -379,6 +613,8 @@ class RowFragmentEmitter:
             fragment = self.load(node)
         elif node.target in _VIEW_TARGETS:
             fragment = self._emit_view(node)
+        elif (reduction := _row_reduction(node)) is not None:
+            fragment = self._emit_reduction(node, reduction)
         else:
             fragment = self._emit_pointwise(node)
         self.bind(node, fragment)
