@@ -25,6 +25,7 @@ from helion._compiler.autotuner_heuristics.cute import CuteTopKHeuristic
 from helion._compiler.backend import CuteBackend
 from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+from helion._compiler.cute.topk import _match_direct_topk_root
 from helion._compiler.cute.topk import match_topk_root
 from helion._compiler.cute.topk import topk_tensors_are_proven_disjoint
 from helion._testing import DEVICE
@@ -167,13 +168,13 @@ def _topk_and_copy(
 
 @onlyBackends(["cute"])
 def test_direct_topk_preserves_other_stores() -> None:
-    """The whole-region matcher must reject a region with another output store."""
+    """Register selection composes with an independent full-width output."""
     x = torch.arange(48, dtype=torch.bfloat16, device=DEVICE).reshape(3, 16)
     original = x.clone()
     code, (values, indices, copied) = code_and_output(
         _topk_and_copy, (x,), block_sizes=[8]
     )
-    assert "_cute_local_topk" not in code
+    assert "_cute_local_topk" in code
     _check_topk(x, original, (values, indices), 3, True)
     torch.testing.assert_close(copied, original, rtol=0, atol=0)
 
@@ -1191,16 +1192,41 @@ def test_topk_output_dtype_does_not_narrow_addresses(
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int16, torch.float32])
-def test_topk_matcher_rejects_other_index_store_dtypes(
+def test_topk_fragment_supports_other_index_store_dtypes(
     index_dtype: torch.dtype,
 ) -> None:
-    with pytest.raises(exc.InvalidConfig, match="requires a compatible top-k root"):
-        _code(5, 64, 64, 32, index_dtype=index_dtype)
+    code = _code(5, 64, 64, 32, index_dtype=index_dtype)
+    assert "row_selected_indices" in code
+    assert "sort_rank" not in code
 
 
-def test_topk_matcher_rejects_arithmetic_before_index_narrowing() -> None:
-    with pytest.raises(exc.InvalidConfig, match="requires a compatible top-k root"):
-        _code(5, 64, 64, 32, index_dtype=torch.int32, kernel=_transformed_indices_topk)
+def test_topk_fragment_supports_arithmetic_before_index_narrowing() -> None:
+    code = _code(
+        5, 64, 64, 32, index_dtype=torch.int32, kernel=_transformed_indices_topk
+    )
+    assert "row_selected_indices" in code
+    assert "sort_rank" not in code
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "index_dtype,transform",
+    [(torch.int16, False), (torch.float32, False), (torch.int32, True)],
+)
+def test_topk_composition_index_store_casts(
+    index_dtype: torch.dtype, transform: bool
+) -> None:
+    x = torch.arange(64, device="cuda", dtype=torch.bfloat16).repeat(5, 1)
+    kernel = _transformed_indices_topk if transform else _allocating_topk
+    code, (values, indices) = code_and_output(
+        kernel, (x, 32, True, index_dtype), **_composition_config(8, "distributed")
+    )
+    _assert_composed_register_selection(code, "distributed")
+    expected = torch.topk(x, 32, dim=-1)
+    torch.testing.assert_close(values, expected.values, rtol=0, atol=0)
+    torch.testing.assert_close(
+        indices, (expected.indices + int(transform)).to(index_dtype), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize(
@@ -3388,21 +3414,32 @@ def test_topk_new_seeds_cover_growing_and_native_fragments(
 
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize(
-    "dtype,inner_stride", [(torch.float32, 1), (torch.bfloat16, 2)]
+    "dtype,inner_stride,supported",
+    [(torch.float32, 1, False), (torch.bfloat16, 2, True)],
 )
-def test_topk_seeds_reject_unsupported_roots(
-    dtype: torch.dtype, inner_stride: int
+def test_topk_seeds_follow_root_capabilities(
+    dtype: torch.dtype, inner_stride: int, supported: bool
 ) -> None:
     with FakeTensorMode():
         x = torch.empty_strided(
             (17, 64), (64 * inner_stride, inner_stride), dtype=dtype
         )
     bound = _allocating_topk._bind_isolated((x, 32, True))
-    assert "cute_topk" not in bound.config_spec.autotuner_heuristics
-    assert not any(
-        "cute_topk_lanes_per_row" in config
+    assert ("cute_topk" in bound.config_spec.autotuner_heuristics) == supported
+    seeds = [
+        config
         for config in bound.config_spec.compiler_seed_configs
-    )
+        if "cute_topk_lanes_per_row" in config
+    ]
+    assert bool(seeds) == supported
+    if supported:
+        for seed in seeds:
+            bound.config_spec.normalize(copy.deepcopy(seed))
+        config = bound.config_spec.default_config()
+        config.config.update(seeds[0])
+        code = bound.to_code(config)
+        assert "row_selected_indices" in code
+        assert "sort_rank" not in code
 
 
 @pytest.mark.usefixtures("_cpu_compile_environment")
@@ -3920,6 +3957,9 @@ def test_distributed_wide_output_exact_bits_and_tails(
     assert bool((index_storage[offset + rows * k :] == -7).all())
 
 
+# Test autotune final benchmark top-k tests.
+
+
 # Fused softmax of the selected logits.
 
 
@@ -4012,7 +4052,9 @@ def test_topk_softmax_matcher_requires_exact_epilogue(damage: str) -> None:
                 and n.args[1] == torch.float32
             )
             node.args = (node.args[0], torch.float64)
-        result = match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set())
+        result = _match_direct_topk_root(
+            host.device_ir.graphs, noncanonical_block_ids=set()
+        )
         assert (result is not None) == (damage == "none")
 
 
@@ -4157,6 +4199,59 @@ def test_topk_softmax_decode_eliminates_value_gathers(
     assert "x[topk_row, topk_selected_index]" not in code
 
 
+# Register selection composed with ordinary row expressions.
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _pointwise_row_topk(
+    x: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=torch.float32, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    raw = torch.empty((x.size(0), k), dtype=x.dtype, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1)
+        values[row, :] = torch.sigmoid(vals.to(torch.float32) * 0.5 + 0.25)
+        indices[row, :] = idx * 3 + 1
+        raw[row, :] = vals
+    return values, indices, raw
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _preprocessed_row_topk(
+    x: torch.Tensor, k: int, largest: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=x.dtype, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    processed = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        source = (x[row, :].to(torch.float32) * 0.5 + -0.0).to(x.dtype)
+        vals, idx = torch.topk(source, k, dim=-1, largest=largest)
+        values[row, :] = vals
+        indices[row, :] = idx
+        processed[row, :] = source
+    return values, indices, processed
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_row_topk(
+    x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=x.dtype, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        source = (x[row, :].to(torch.float32) * scale[row, :] + bias[None, :]).to(
+            x.dtype
+        )
+        vals, idx = torch.topk(source, k, dim=-1)
+        values[row, :] = vals
+        indices[row, :] = idx
+    return values, indices
+
+
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
     return {
         "block_sizes": [1],
@@ -4169,6 +4264,265 @@ def _composition_config(lanes: int, layout: str) -> dict[str, object]:
         "cute_topk_value_mode": "decode",
         "cute_topk_rank_mode": "ordinal",
     }
+
+
+def _assert_composed_register_selection(code: str, layout: str) -> None:
+    helper = "distributed_topk" if layout == "distributed" else "local_topk"
+    assert f"import {helper} as" in code
+    assert "sort_rank" not in code
+    assert code.count("@cute.kernel") == 1
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize("kind", ["pointwise", "preprocess", "broadcast"])
+def test_topk_composition_codegen(kind: str, layout: str) -> None:
+    x = torch.empty((5, 65), dtype=torch.bfloat16)
+    kernel: helion.Kernel[Any]
+    args: tuple[object, ...]
+    if kind == "pointwise":
+        kernel, args = _pointwise_row_topk, (x, 3)
+    elif kind == "preprocess":
+        kernel, args = _preprocessed_row_topk, (x, 3, True)
+    else:
+        scale = torch.empty((5, 1), dtype=torch.float32)
+        bias = torch.empty((65,), dtype=torch.float32)
+        kernel, args = _broadcast_row_topk, (x, scale, bias, 3)
+    bound = kernel._bind_isolated(args)
+    config = bound.config_spec.default_config()
+    config.config.update(_composition_config(8, layout))
+    _assert_composed_register_selection(bound.to_code(config), layout)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "n,k,lanes,layout",
+    [
+        (65, 3, 8, "distributed"),
+        (64, 8, 16, "replicated"),
+        (64, 32, 2, "distributed"),
+        (64, 32, 8, "distributed"),
+    ],
+)
+def test_topk_composition_pointwise_outputs(
+    n: int, k: int, lanes: int, layout: str
+) -> None:
+    x = torch.randn((9, n), dtype=torch.bfloat16, device="cuda")
+    x[0, 0] = float("nan")
+    x[1] = 0
+    x[1, 1::2] = -0.0
+    original = x.clone()
+    code, (values, encoded_indices, raw) = code_and_output(
+        _pointwise_row_topk, (x, k), **_composition_config(lanes, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    assert values.dtype == torch.float32
+    assert bool((encoded_indices.remainder(3) == 1).all())
+    indices = (encoded_indices - 1) // 3
+    _check_topk(x, original, (raw, indices), k, True)
+    assert torch.equal(
+        raw.view(torch.int16), original.gather(1, indices).view(torch.int16)
+    )
+    torch.testing.assert_close(
+        values,
+        torch.sigmoid(raw.float() * 0.5 + 0.25),
+        rtol=2e-6,
+        atol=1e-7,
+        equal_nan=True,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "largest,layout", [(True, "distributed"), (False, "replicated")]
+)
+def test_topk_composition_preprocess_preserves_selected_bits(
+    dtype: torch.dtype, largest: bool, layout: str
+) -> None:
+    x = torch.randn((9, 65), dtype=dtype, device="cuda")
+    x[0] = 0
+    x[0, 1::2] = -0.0
+    x[1] = float("nan")
+    x[2, 0] = float("inf")
+    x[2, 1] = float("-inf")
+    original = x.clone()
+    code, (values, indices, processed) = code_and_output(
+        _preprocessed_row_topk, (x, 3, largest), **_composition_config(8, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    expected = (original.float() * 0.5 + -0.0).to(dtype)
+    torch.testing.assert_close(processed, expected, rtol=0, atol=0, equal_nan=True)
+    assert torch.equal(torch.signbit(processed[0]), torch.signbit(expected[0]))
+    torch.testing.assert_close(
+        values,
+        torch.topk(expected, 3, dim=-1, largest=largest).values,
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    # Recovery must use the processed fragment, including its exceptional bits.
+    assert torch.equal(
+        values.view(torch.int16), processed.gather(1, indices).view(torch.int16)
+    )
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_composition_row_and_column_broadcast(layout: str) -> None:
+    x = torch.randn((5, 65), dtype=torch.bfloat16, device="cuda")
+    scale = torch.tensor([0.5, -2.0, 0.0, 1.0, 2.0], device="cuda").view(5, 1)
+    bias = torch.arange(65, dtype=torch.float32, device="cuda") / 16
+    original = x.clone()
+    code, (values, indices) = code_and_output(
+        _broadcast_row_topk, (x, scale, bias, 3), **_composition_config(8, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    expected = (original.float() * scale + bias[None, :]).to(x.dtype)
+    torch.testing.assert_close(
+        values, torch.topk(expected, 3, dim=-1).values, rtol=0, atol=0
+    )
+    assert torch.equal(
+        values.view(torch.int16), expected.gather(1, indices).view(torch.int16)
+    )
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "key_dtype,rank_mode,encoder,lanes",
+    [
+        ("float32_native", "ordinal", "dsl", 2),
+        ("int32", "signed", "asm", 2),
+        ("float32_bits", "ordinal", "paired", 8),
+    ],
+)
+def test_topk_composition_encoding_preserves_processed_bits(
+    key_dtype: str, rank_mode: str, encoder: str, lanes: int
+) -> None:
+    x = torch.randn((5, 64), dtype=torch.bfloat16, device="cuda")
+    x[0] = float("nan")
+    x[1] = 0
+    x[1, 1::2] = -0.0
+    x[2, :2] = torch.tensor([float("inf"), float("-inf")], device="cuda")
+    config = _composition_config(lanes, "distributed")
+    config.update(
+        cute_topk_key_dtype=key_dtype,
+        cute_topk_rank_mode=rank_mode,
+        cute_topk_key_encoder=encoder,
+        cute_topk_output_vector_width=8,
+    )
+    code, (values, indices, processed) = code_and_output(
+        _preprocessed_row_topk, (x, 32, False), **config
+    )
+    _assert_composed_register_selection(code, "distributed")
+    torch.testing.assert_close(
+        values,
+        torch.topk(processed, 32, dim=-1, largest=False).values,
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    assert torch.equal(
+        values.view(torch.int16), processed.gather(1, indices).view(torch.int16)
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _composed_out_topk(
+    x: torch.Tensor, values: torch.Tensor, indices: torch.Tensor, k: int
+) -> None:
+    k = hl.specialize(k)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1)
+        values[row, :] = torch.sigmoid(vals.float())
+        indices[row, :] = idx + 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_topk_composition_strided_memory_preserves_guards() -> None:
+    rows, n, k = 9, 65, 3
+    storage = torch.randn((rows, 2 * n + 2), device="cuda", dtype=torch.bfloat16)
+    x = storage[:, 1 : 2 * n + 1 : 2]
+    original = storage.clone()
+    value_storage = torch.full((rows, 2 * k + 2), -17.0, device="cuda")
+    index_storage = torch.full((rows, 3 * k + 2), -42, device="cuda", dtype=torch.int32)
+    values = value_storage[:, 1 : 2 * k + 1 : 2]
+    indices = index_storage[:, 1 : 3 * k + 1 : 3]
+    code, _output = code_and_output(
+        _composed_out_topk,
+        (x, values, indices, k),
+        **_composition_config(8, "distributed"),
+    )
+    _assert_composed_register_selection(code, "distributed")
+    selected_indices = indices.long() - 1
+    selected = x.gather(1, selected_indices)
+    torch.testing.assert_close(
+        selected, torch.topk(x, k, dim=-1).values, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        values, torch.sigmoid(selected.float()), rtol=2e-6, atol=1e-7
+    )
+    for target, stride, sentinel in ((value_storage, 2, -17), (index_storage, 3, -42)):
+        written = torch.zeros_like(target, dtype=torch.bool)
+        written[:, 1 : stride * k + 1 : stride] = True
+        assert bool((target[~written] == sentinel).all())
+    assert torch.equal(storage.view(torch.int16), original.view(torch.int16))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _reused_prologue_row_topk(
+    x: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=torch.float32, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        processed = x[row, :] * 0.5
+        selected, idx = torch.topk(processed, k, dim=-1)
+        values[row, :] = selected.float() + processed.float()
+        indices[row, :] = idx
+    return values, indices
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_composition_reused_prologue_codegen(layout: str) -> None:
+    x = torch.empty((5, 64), dtype=torch.bfloat16)
+    bound = _reused_prologue_row_topk._bind_isolated((x, 64))
+    config = bound.config_spec.default_config()
+    config.config.update(_composition_config(4, layout))
+    code = bound.to_code(config)
+    _assert_composed_register_selection(code, layout)
+    if layout == "distributed":
+        assert "import subgroup_vectorize as" in code
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_composition_reuses_prologue_across_layouts(layout: str) -> None:
+    x = torch.randn((5, 64), dtype=torch.bfloat16, device="cuda")
+    original = x.clone()
+    # Input vectors contain eight values; selected-output vectors contain four.
+    # Distributed selection also permutes physical lanes for contiguous stores.
+    code, (values, indices) = code_and_output(
+        _reused_prologue_row_topk, (x, 64), **_composition_config(4, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    processed = original * 0.5
+    selected = processed.gather(1, indices)
+    torch.testing.assert_close(
+        selected, torch.topk(processed, 64, dim=-1).values, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        indices.sort(dim=-1).values,
+        torch.arange(64, device="cuda").expand_as(indices),
+    )
+    torch.testing.assert_close(
+        values, selected.float() + processed.float(), rtol=0, atol=0
+    )
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

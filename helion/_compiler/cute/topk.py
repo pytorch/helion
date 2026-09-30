@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
     from ..generate_ast import GenerateAST
     from ..tile_dispatch import TileStrategyDispatch
+    from .row_topk import RowTopKGraph
 
 
 @dataclass(frozen=True)
@@ -41,8 +42,9 @@ class CuteTopKPlan:
     k: int
     largest: bool
     x: torch.Tensor
-    values: torch.Tensor
-    indices: torch.Tensor
+    values: torch.Tensor | None
+    indices: torch.Tensor | None
+    fragment_graph: RowTopKGraph | None = None
     softmax: bool = False
     lanes_per_row: int = 16
     rows_per_block: int = 8
@@ -144,7 +146,7 @@ def _match_softmax_epilogue(
     return selected, consumed
 
 
-def match_topk_root(
+def _match_direct_topk_root(
     graphs: Sequence[GraphInfo], *, noncanonical_block_ids: set[int]
 ) -> CuteTopKPlan | None:
     """Prove a full-row top-k and direct or stable-softmax value stores.
@@ -356,6 +358,33 @@ def match_topk_root(
     )
 
 
+def match_topk_root(
+    graphs: Sequence[GraphInfo], *, noncanonical_block_ids: set[int]
+) -> CuteTopKPlan | None:
+    from .row_topk import match_row_topk
+
+    direct = _match_direct_topk_root(
+        graphs, noncanonical_block_ids=noncanonical_block_ids
+    )
+    if direct is not None:
+        return direct
+    graph = match_row_topk(graphs, noncanonical_block_ids=noncanonical_block_ids)
+    if graph is None:
+        return None
+    return CuteTopKPlan(
+        graph.root_graph,
+        graph.row_block_id,
+        graph.n,
+        graph.k,
+        graph.largest,
+        graph.x,
+        None,
+        None,
+        fragment_graph=graph,
+        stable_ties=graph.stable_ties,
+    )
+
+
 def topk_tensors_are_proven_disjoint(
     candidate: CuteTopKPlan,
     env: CompileEnvironment,
@@ -363,22 +392,34 @@ def topk_tensors_are_proven_disjoint(
     allow_unbound: bool = False,
 ) -> bool:
     """Share the final storage proof with compiler-owned seed selection."""
-    tensors = (candidate.x, candidate.values, candidate.indices)
-    for i, left in enumerate(tensors):
-        for right in tensors[:i]:
-            # Fresh wrapper allocations cannot overlap another live storage.
-            # Distinct runtime StorageImpls are insufficient: DLPack can wrap
-            # the same memory twice. Use the cache-specialized span proof,
-            # which becomes available after structural matching and binding.
-            if (
-                left.untyped_storage() not in env._symbolically_exact_layout_storages
-                and right.untyped_storage()
-                not in env._symbolically_exact_layout_storages
-                and not runtime_tensors_are_proven_disjoint(
-                    env, left, right, allow_unbound=allow_unbound
-                )
-            ):
-                return False
+    if candidate.fragment_graph is not None:
+        graph = candidate.fragment_graph
+        pairs = [
+            (output, tensor)
+            for index, output in enumerate(graph.write_tensors)
+            for tensor in (*graph.read_tensors, *graph.write_tensors[:index])
+        ]
+    else:
+        assert candidate.values is not None and candidate.indices is not None
+        tensors = (candidate.x, candidate.values, candidate.indices)
+        pairs = [
+            (left, right) for i, left in enumerate(tensors) for right in tensors[:i]
+        ]
+    for left, right in pairs:
+        if left.untyped_storage()._cdata == right.untyped_storage()._cdata:
+            return False
+        # Fresh wrapper allocations cannot overlap another live storage.
+        # Distinct runtime StorageImpls are insufficient: DLPack can wrap
+        # the same memory twice. Use the cache-specialized span proof,
+        # which becomes available after structural matching and binding.
+        if (
+            left.untyped_storage() not in env._symbolically_exact_layout_storages
+            and right.untyped_storage() not in env._symbolically_exact_layout_storages
+            and not runtime_tensors_are_proven_disjoint(
+                env, left, right, allow_unbound=allow_unbound
+            )
+        ):
+            return False
     return True
 
 

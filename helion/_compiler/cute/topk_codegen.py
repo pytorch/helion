@@ -51,8 +51,8 @@ def codegen_topk_root(cg: GenerateAST, plan: CuteTopKPlan) -> bool:
     )
 
     x_name = fn.tensor_arg(plan.x).name
-    values_name = fn.tensor_arg(plan.values).name
-    indices_name = fn.tensor_arg(plan.indices).name
+    values_name = fn.tensor_arg(plan.values).name if plan.values is not None else ""
+    indices_name = fn.tensor_arg(plan.indices).name if plan.indices is not None else ""
     template = _GeneratedCodeTemplate(
         "topk",
         (*tuple(argument.name for argument in fn.arguments), *cg._extra_params),
@@ -231,11 +231,22 @@ topk_keys[topk_i] = topk_native_key
     )
     row_stride = plan.x.stride(0)
     max_input_offset = (
-        max(row_stride, (plan.x.size(0) - 1) * row_stride + plan.n - 1)
+        max(
+            row_stride,
+            (plan.x.size(0) - 1) * row_stride + (plan.n - 1) * plan.x.stride(-1),
+        )
         if isinstance(row_stride, int)
         else None
     )
     max_output_offset = plan.x.size(0) * plan.k - 1
+    if plan.fragment_graph is not None:
+        max_output_offset = max(
+            sum(
+                (size - 1) * stride
+                for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            )
+            for tensor in plan.fragment_graph.tensors
+        )
     index_type = (
         "cutlass.Int32"
         if max_input_offset is not None
@@ -244,6 +255,7 @@ topk_keys[topk_i] = topk_native_key
     )
     vectorized = (
         plan.vector_width > 1
+        and plan.x.stride(-1) == 1
         and plan.n % plan.vector_width == 0
         and isinstance(row_stride, int)
         and row_stride % plan.vector_width == 0
@@ -334,17 +346,20 @@ for topk_i in cutlass.range({fragment_size}, unroll_full=True):
         "cutlass.BFloat16" if plan.x.dtype == torch.bfloat16 else "cutlass.Float16"
     )
     output_index_dtype = (
-        "cutlass.Int32" if plan.indices.dtype == torch.int32 else "cutlass.Int64"
+        "cutlass.Int32"
+        if plan.indices is not None and plan.indices.dtype == torch.int32
+        else "cutlass.Int64"
     )
-    output_index_bytes = plan.indices.element_size()
+    output_index_bytes = plan.indices.element_size() if plan.indices is not None else 8
 
     def selected_index(key: str) -> str:
         if native_float:
             return f"(({key} ^ (({key} >> cutlass.Int32(31)) ^ cutlass.Int32(-1))) & cutlass.Int32({index_mask}))"
         return f"(cutlass.Int32({index_mask}) - ({key} & cutlass.Int32({index_mask})))"
 
-    def value_store(key: str, destination: str) -> str:
-        source = f"{x}[topk_row, topk_selected_index]"
+    def value_store(key: str, destination: str, source: str | None = None) -> str:
+        if source is None:
+            source = f"{x}[topk_row, topk_selected_index]"
         if plan.value_mode == "gather":
             return f"{destination} = {source}\n"
         if native_float:
@@ -399,6 +414,30 @@ if not topk_value_decodable:
     topk_value = {source}
 {destination} = topk_value
 """
+
+    if plan.fragment_graph is not None:
+        from .row_topk_codegen import codegen_row_topk
+
+        return codegen_row_topk(
+            cg,
+            plan,
+            template=template,
+            loads=loads,
+            encode=encode,
+            fragment_size=fragment_size,
+            key_type=key_type,
+            key_padding=key_padding,
+            selected_key=selected_key,
+            selected_index=selected_index,
+            value_store=value_store,
+            helper_name=helper_name,
+            helper_hash=helper_hash,
+            index_type=index_type,
+            row_guard=row_guard,
+            group_guard=group_guard,
+            input_name=x,
+            use_asm_encoder=use_asm_encoder,
+        )
 
     softmax_name = f"_cute_softmax_topk_values_{helper_hash}"
     if plan.softmax:
