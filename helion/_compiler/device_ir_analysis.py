@@ -1842,6 +1842,7 @@ class DeviceIRAnalysis:
                             root=owner_root,
                             allocation_id=allocation_id,
                             owner_rank=owner_rank,
+                            dtype=fake.dtype if fake is not None else None,
                             kind="load" if is_load else "store",
                             tensor_name=origin.root_rw_name() if origin else None,
                             tensor_shape=tensor_shape,

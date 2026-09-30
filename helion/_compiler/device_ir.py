@@ -3563,6 +3563,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         memory_op_facts = analysis.memory_op_facts(env, func)
         tile_accesses = analysis.tile_accesses(device_ir, env, func)
         config_spec.memory_op_facts = memory_op_facts
+        from .._dist_utils import _resolve_process_group
         from .tile_dependency import build_tile_dependency_graph
 
         if len(device_ir.task_families) > 1 and env.cute_fission_plan is None:
@@ -3570,9 +3571,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 tile_accesses,
                 device_ir=device_ir,
                 root_phases=source_root_phases,
+                world_size=(
+                    torch.distributed.get_world_size(
+                        _resolve_process_group(env.process_group_name)
+                    )
+                    if env.process_group_name is not None
+                    else 1
+                ),
             )
             if any(
-                device_ir.tile_dependency_graph.crosses_ranks(dependency)
+                device_ir.tile_dependency_graph.transport(dependency) != "counter"
                 for edge in device_ir.tile_dependency_graph.edges
                 for dependency in edge.access_dependencies
             ):

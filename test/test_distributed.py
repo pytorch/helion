@@ -186,6 +186,47 @@ def two_root_hidden_access_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def inband_rule_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    broken_rule: hl.constexpr,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(symm)
+    for tile in hl.tile(symm.size(0)):
+        if broken_rule == "R3":
+            out[tile] = peers[1][tile]
+        else:
+            out[tile] = x[tile]
+    for tile in hl.tile(symm.size(0)):
+        symm[tile] = x[tile]
+        if broken_rule == "R1":
+            symm[tile] = x[tile] + 1
+    for tile in hl.tile(symm.size(0)):
+        acc = peers[1][tile] + peers[2][tile]
+        if broken_rule != "R4":
+            acc = acc + peers[0][tile] + peers[3][tile]
+        out[tile] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def diagonal_store_kernel(
+    symm: torch.Tensor, x: torch.Tensor, group_name: hl.ProcessGroupName
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(symm)
+    block = hl.register_block_size(symm.size(0))
+    # Both root axes share one block id, so tasks (i, j) and (i, k) overlap.
+    for tile_i, tile_j in hl.tile(symm.size(), block_size=[block, block]):
+        symm[tile_i, tile_i] = x[tile_i, tile_j]
+    for tile in hl.tile(symm.size()):
+        out[tile] = peers[0][tile] + peers[1][tile] + peers[2][tile] + peers[3][tile]
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -944,6 +985,36 @@ class TestDistributedTileDependencies(TestCase):
             helion.exc.CrossLoopSchedulingError, "allocation identity"
         ):
             two_root_peer_read_kernel.bind((symm, other_group, group))
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_rules(self) -> None:
+        group = dist.group.WORLD.group_name
+        for broken_rule, dtype, expected in (
+            ("", torch.float32, "use inband"),
+            ("R1", torch.float32, "use peer_counter (R1:"),
+            ("", torch.float64, "use peer_counter (R2:"),
+            ("R3", torch.float32, "use peer_counter (R3:"),
+            ("R4", torch.float32, "use peer_counter (R4:"),
+        ):
+            symm, x = torch.zeros(2, 256, device=DEVICE, dtype=dtype)
+            with (
+                self.subTest(broken_rule=broken_rule, dtype=dtype),
+                self.assertLogs(tile_dependency.log, "INFO") as logs,
+                self.assertRaisesRegex(
+                    helion.exc.CrossLoopSchedulingError, "cross-rank"
+                ),
+            ):
+                inband_rule_kernel.bind((symm, x, group, broken_rule))
+            (line,) = logs.output
+            self.assertIn(f"on peers/symm {expected}", line)
+        symm, x = torch.zeros(2, 16, 16, device=DEVICE)
+        with (
+            self.assertLogs(tile_dependency.log, "INFO") as logs,
+            self.assertRaisesRegex(helion.exc.CrossLoopSchedulingError, "cross-rank"),
+        ):
+            diagonal_store_kernel.bind((symm, x, group))
+        (line,) = logs.output
+        self.assertIn("on peers/symm use peer_counter (R1:", line)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:

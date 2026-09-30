@@ -468,17 +468,17 @@ class TestTileDependency(TestCase):
         # disjoint-looking load of another rank's copy still depends on all.
         self.assertEqual(
             {
-                (edge.producer_root, edge.consumer_root, plan.crosses_ranks(dependency))
+                (edge.producer_root, edge.consumer_root, plan.transport(dependency))
                 for edge in plan.edges
                 for dependency in edge.access_dependencies
             },
             {
-                (0, 1, False),
-                (0, 2, True),
-                (1, 2, True),
-                (0, 3, True),
-                (1, 3, True),
-                (2, 3, True),
+                (0, 1, "counter"),
+                (0, 2, "peer_counter"),
+                (1, 2, "peer_counter"),
+                (0, 3, "peer_counter"),
+                (1, 3, "peer_counter"),
+                (2, 3, "peer_counter"),
             },
         )
 
