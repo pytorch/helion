@@ -590,10 +590,21 @@ class TritonBackend(Backend):
             out.append(f"_remote_copy_scratch_specs=({specs},)")
         if device_fn.triton_persistent_state_specs:
             specs = ", ".join(
-                f"({tensor}, {numel}, {dtype})"
-                for tensor, numel, dtype in device_fn.triton_persistent_state_specs
+                f"({tensor}, {numel}, {dtype}, {symmetric})"
+                for tensor, numel, dtype, symmetric in (
+                    device_fn.triton_persistent_state_specs
+                )
             )
             out.append(f"_persistent_state_specs=({specs},)")
+            if any(spec[3] for spec in device_fn.triton_persistent_state_specs):
+                process_group_name = CompileEnvironment.current().process_group_name
+                if process_group_name is None:
+                    raise exc.BackendUnsupported(
+                        "triton", "symmetric launch state requires a process group"
+                    )
+                out.append(
+                    f"_persistent_state_process_group_name={process_group_name!r}"
+                )
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="

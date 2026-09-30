@@ -419,8 +419,9 @@ class DeviceFunction:
         # Compiler-owned state that must persist across launches (for example,
         # epoch-scaled tile-dependency counters). The Triton launcher allocates it
         # once per kernel/device/stream and appends it to the kernel arguments.
+        # A symmetric spec also appends the per-rank base pointer table.
         self.triton_persistent_state_args: list[str] = []
-        self.triton_persistent_state_specs: list[tuple[str, str, str]] = []
+        self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.

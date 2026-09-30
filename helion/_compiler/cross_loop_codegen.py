@@ -488,8 +488,12 @@ def _register_cross_loop_state(
     name_hint: str,
     numel: str,
     dtype: torch.dtype,
+    symmetric: bool = False,
 ) -> str:
-    """Register launch-persistent global state owned by the Triton launcher."""
+    """Register launch-persistent global state owned by the Triton launcher.
+
+    A symmetric state is followed by the table of every rank's state pointer.
+    """
     like = next(
         (
             argument
@@ -512,9 +516,14 @@ def _register_cross_loop_state(
     else:
         like_host = like.host_str()
     name = device_function.new_var(name_hint, dce=False)
-    device_function.wrapper_only_params.append(name)
-    device_function.triton_persistent_state_args.append(name)
-    device_function.triton_persistent_state_specs.append((like_host, numel, str(dtype)))
+    names = [name]
+    if symmetric:
+        names.append(device_function.new_var(f"{name_hint}_ptrs", dce=False))
+    device_function.wrapper_only_params.extend(names)
+    device_function.triton_persistent_state_args.extend(names)
+    device_function.triton_persistent_state_specs.append(
+        (like_host, numel, str(dtype), symmetric)
+    )
     return name
 
 
