@@ -2839,6 +2839,15 @@ class CuteBackend(Backend):
         from ..tile_strategy import PerThreadFlattenedTileStrategy
         from ..tile_strategy import PerThreadNDTileStrategy
 
+        if len(set(block_ids)) != len(block_ids):
+            # ``hl.tile([m, n], block_size=[bs, bs])`` with one registered
+            # block size hands both dimensions the same block: they would
+            # share one index and one mask, walking the diagonal.
+            raise exc.BackendUnsupported(
+                self.name,
+                "a tile whose dimensions share one block size symbol "
+                f"(block ids {block_ids}); register a block size per dimension",
+            )
         env = CompileEnvironment.current()
         device_ir = HostFunction.current().device_ir
         block_size_infos = [env.block_sizes[i] for i in block_ids]

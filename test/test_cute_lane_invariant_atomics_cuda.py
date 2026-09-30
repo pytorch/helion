@@ -251,12 +251,15 @@ def test_column_count_is_once_per_row_tile(
         assert flag.item() == 1.0
 
 
-def test_pinned_row_increment_precedes_every_row_read() -> None:
+@pytest.mark.parametrize("config", [_NESTED_SCALAR, _NESTED], ids=["scalar", "vector"])
+def test_pinned_row_increment_precedes_every_row_read(
+    config: dict[str, object],
+) -> None:
     out = torch.randn((4, 256), device=CUDA_DEVICE)
     expected = out.clone()
     expected[1] += 1.0
     out2 = torch.empty_like(out)
-    result = _run(_row_increment_then_read, (out, out2), **_NESTED_SCALAR)
+    result = _run(_row_increment_then_read, (out, out2), **config)
     torch.testing.assert_close(result, expected)
     torch.testing.assert_close(out, expected)
 

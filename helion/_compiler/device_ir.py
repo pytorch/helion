@@ -555,14 +555,21 @@ class IfGraphInfo(NodeArgsGraphInfo):
         if_ast_node = create(ast.If, test=test, body=body_stmts, orelse=orelse_stmts)
         state.add_statement(if_ast_node)
 
-        with state.codegen.set_statements(body_stmts):
+        # A constant condition is one branch for every thread.  A context
+        # manager instance cannot be entered twice, so build one per branch.
+        def divergent() -> contextlib.AbstractContextManager[None]:
+            if constexpr_test is None:
+                return state.codegen.divergent_control_flow()
+            return contextlib.nullcontext()
+
+        with divergent(), state.codegen.set_statements(body_stmts):
             if_outputs = codegen_call_with_graph(state.codegen, self.graph, if_args)
 
         else_outputs = []
         if self.else_branch is not None:
             else_graph = state.get_graph(self.else_branch)
             assert isinstance(else_graph, ElseGraphInfo)
-            with state.codegen.set_statements(orelse_stmts):
+            with divergent(), state.codegen.set_statements(orelse_stmts):
                 else_outputs = codegen_call_with_graph(
                     state.codegen, else_graph.graph, else_args
                 )
@@ -674,15 +681,18 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
         )
 
         body_statements: list[ast.AST] = []
-        with state.codegen.set_statements(body_statements):
+        with (
+            state.codegen.divergent_control_flow(),
+            state.codegen.set_statements(body_statements),
+        ):
             outputs = codegen_call_with_graph(
                 state.codegen,
                 self.graph,
                 args,
                 copy_named_args=False,
             )
-        loop_condition_update: list[ast.AST] = []
-        cond_expr_loop = emit_condition(loop_condition_update)
+            loop_condition_update: list[ast.AST] = []
+            cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)
         body_statements.append(
             create(

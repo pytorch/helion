@@ -387,6 +387,7 @@ def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
             "scalar",
             "row_ok and lane_ok",
             torch.bfloat16,
+            scalar_stmt=ast.parse("pointer.store(scalar)").body[0],
             packed_values=value,
         )
         # The store site binds the packet under its flush operand's name.
