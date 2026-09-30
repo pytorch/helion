@@ -3571,6 +3571,14 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 device_ir=device_ir,
                 root_phases=source_root_phases,
             )
+            if any(
+                device_ir.tile_dependency_graph.crosses_ranks(dependency)
+                for edge in device_ir.tile_dependency_graph.edges
+                for dependency in edge.access_dependencies
+            ):
+                raise exc.CrossLoopSchedulingError(
+                    "because no transport orders cross-rank tile dependencies yet"
+                )
             _install_dependency_phases(
                 device_ir,
                 visitor.root_nodes,

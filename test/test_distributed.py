@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from datetime import timedelta
 import io
+import itertools
 import os
 import unittest
 from unittest.mock import patch
@@ -20,8 +21,10 @@ from torch.testing._internal.common_utils import TestCase as CommonTestCase
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 from torch.testing._internal.common_utils import run_tests
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
+from helion._compiler import tile_dependency
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import kernel_uses_symm_mem
 from helion._dist_utils import sync_object
@@ -91,6 +94,95 @@ def one_shot_allreduce_kernel(
             acc += a[tile_n]
 
         out[tile_n] = acc
+    return out
+
+
+def _remote_views(
+    t: torch.Tensor, group_name: hl.constexpr
+) -> tuple[torch.Tensor, ...]:
+    return torch.ops.symm_mem.get_remote_tensors(t, group_name)
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def two_root_peer_read_kernel(
+    symm: torch.Tensor,
+    views_group: hl.constexpr,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    n = symm.size(0)
+    peers = _remote_views(symm, views_group)
+    out = torch.empty_like(symm)
+    for tile in hl.tile(n):
+        symm[tile] = symm[tile] + 1
+    # The barrier orders only this rank's roots.
+    hl.barrier()
+    for tile in hl.tile(n):
+        out[tile] = peers[1][tile] + peers[2][tile]
+    return out
+
+
+def _peer_sum(
+    symm: torch.Tensor,
+    start: hl.constexpr,
+    absolute: hl.constexpr,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    n = symm.numel() - start
+    if absolute:
+        local = torch.as_strided(symm, (n,), (1,), storage_offset=start)
+    else:
+        local = symm.view(-1)[start:]
+    peers = _remote_views(local, group_name)
+    out = torch.empty_like(local)
+    for tile in hl.tile(local.size(0)):
+        out[tile] = peers[1][tile] + peers[2][tile]
+    return out
+
+
+peer_sum_kernel = helion.kernel(_peer_sum, autotune_effort="none", static_shapes=True)
+dynamic_peer_sum_kernel = helion.kernel(
+    _peer_sum, autotune_effort="none", static_shapes=False
+)
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def peer_read_through_copy_kernel(
+    symm: torch.Tensor, group_name: hl.ProcessGroupName
+) -> torch.Tensor:
+    m, n = symm.size()
+    peers = _remote_views(symm, group_name)
+    out = symm.new_empty(m)
+    for tile_i, tile_j in hl.tile([m, n]):
+        symm[tile_i, tile_j] = symm[tile_i, tile_j] + 1
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m], dtype=symm.dtype)
+        q = peers[1]
+        for tile_n in hl.tile(n):
+            acc = acc + q[tile_m, tile_n].sum(-1)
+            q = peers[1]
+        out[tile_m] = acc
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def two_root_hidden_access_kernel(
+    symm: torch.Tensor,
+    offsets: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    remote_barrier: hl.constexpr,
+    local_source: hl.constexpr,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    source = symm if local_source else peers[1]
+    out = symm.new_empty([offsets.size(0), 16], dtype=torch.float16)
+    for tile in hl.tile(symm.size(0)):
+        symm[tile] = symm[tile] + 1
+    for tile in hl.tile(offsets.size(0)):
+        if remote_barrier:
+            hl.remote_barrier(1)
+        lanes = hl.load_bfloat16_x16_to_float16(source, offsets[tile])
+        for i in hl.static_range(16):
+            out[tile, i] = lanes[i]
     return out
 
 
@@ -805,6 +897,111 @@ class TestDistributedGating(CommonTestCase):
         self.assertEqual(sync_object("x", process_group_name=None), "x")
         with sync_seed(process_group_name=None):
             pass
+
+
+class TestDistributedTileDependencies(TestCase):
+    """Single-process compile checks of cross-rank tile dependencies."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
+        self.addCleanup(dist.destroy_process_group)
+
+    def _guarded_accesses(
+        self, kernel: helion.Kernel, args: tuple[object, ...]
+    ) -> tuple[tile_dependency.TileAccess, ...]:
+        """Accesses of a kernel the temporary cross-rank guard rejects."""
+        with (
+            patch.object(
+                tile_dependency,
+                "build_tile_dependency_graph",
+                wraps=tile_dependency.build_tile_dependency_graph,
+            ) as build,
+            self.assertRaisesRegex(helion.exc.CrossLoopSchedulingError, "cross-rank"),
+        ):
+            kernel.bind(args)
+        return build.call_args.args[0]
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_peer_views_name_their_owner_rank(self) -> None:
+        group = dist.group.WORLD.group_name
+        symm = torch.zeros(256, device=DEVICE)
+        accesses = self._guarded_accesses(
+            two_root_peer_read_kernel, (symm, group, group)
+        )
+        (store,) = (a for a in accesses if a.kind == "store" and a.root == 0)
+        self.assertEqual(
+            [
+                (a.root, a.allocation_id, a.owner_rank)
+                for a in accesses
+                if a.owner_rank is not None
+            ],
+            [(1, store.allocation_id, 1), (1, store.allocation_id, 2)],
+        )
+        # Views taken in another group have no known owner.
+        other_group = dist.new_group(list(range(4))).group_name
+        with self.assertRaisesRegex(
+            helion.exc.CrossLoopSchedulingError, "allocation identity"
+        ):
+            two_root_peer_read_kernel.bind((symm, other_group, group))
+
+    @skipIfRefEager("peer views are recorded only in compiled mode")
+    def test_peer_views_require_allocation_base(self) -> None:
+        group = dist.group.WORLD.group_name
+        symm = torch.zeros(16, 16, device=DEVICE)
+
+        def guards(kernel: helion.Kernel, *args: object) -> list[object]:
+            env = kernel.bind((symm, *args, group)).env
+            return [
+                guard
+                for key, guard in env.runtime_input_specializations.items()
+                if key.startswith("symmetric_allocation_base")
+            ]
+
+        for kernel, start, absolute in itertools.product(
+            (peer_sum_kernel, dynamic_peer_sum_kernel), (0, 16), (False, True)
+        ):
+            # A view past the owner's start has no known peer counterpart.
+            self.assertEqual(len(guards(kernel, start, absolute)), int(start == 0))
+        # Torch's peer views ignore a view's offset, so they would not line up.
+        shifted = torch.zeros(257, device=DEVICE)[1:].view(16, 16)
+        with self.assertRaisesRegex(helion.exc.InvalidAPIUsage, "symmetric allocation"):
+            peer_sum_kernel.bind((shifted, 0, False, group))
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_peer_view_ssa_copies_keep_their_owner(self) -> None:
+        symm = torch.zeros(64, 64, device=DEVICE)
+        accesses = self._guarded_accesses(
+            peer_read_through_copy_kernel, (symm, dist.group.WORLD.group_name)
+        )
+        (store,) = (a for a in accesses if a.kind == "store" and a.root == 0)
+        self.assertEqual(
+            {(a.allocation_id, a.owner_rank) for a in accesses if a.root == 1},
+            {(store.allocation_id, 1), (accesses[-1].allocation_id, None)},
+        )
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_hidden_accesses_are_rejected(self) -> None:
+        symm = torch.zeros(64, dtype=torch.bfloat16, device=DEVICE)
+        offsets = torch.zeros(4, dtype=torch.int64, device=DEVICE)
+        # Other ranks write this rank's copy too, so its hidden loads count.
+        for remote_barrier, local_source, op in (
+            (True, False, "remote_barrier"),
+            (False, False, "load_bfloat16_x16_to_float16"),
+            (False, True, "load_bfloat16_x16_to_float16"),
+        ):
+            with self.assertRaisesRegex(
+                helion.exc.CrossLoopSchedulingError, f"{op} may access another rank"
+            ):
+                two_root_hidden_access_kernel.bind(
+                    (
+                        symm,
+                        offsets,
+                        dist.group.WORLD.group_name,
+                        remote_barrier,
+                        local_source,
+                    )
+                )
 
 
 if __name__ == "__main__":

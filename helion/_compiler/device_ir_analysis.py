@@ -12,6 +12,7 @@ from typing import cast
 import sympy
 import torch
 
+from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import AccumulatorFact
@@ -30,6 +31,7 @@ from ..autotuner.config_spec import ResolvedMatmulFact
 from ..autotuner.config_spec import RootGridFact
 from ..autotuner.config_spec import SymbolicLoopBound
 from ..language import _tracing_ops
+from ..language._decorators import is_api_func
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
@@ -51,6 +53,7 @@ if TYPE_CHECKING:
     from .compile_environment import CompileEnvironment
     from .device_ir import DeviceIR
     from .device_ir import GraphInfo
+    from .host_function import CompilerState
     from .host_function import HostFunction
     from .tile_dependency import AffineSubscriptRange
     from .tile_dependency import IntegerExpression
@@ -200,6 +203,33 @@ def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
     if eviction_policy_arg is None and len(node.args) >= 4:
         eviction_policy_arg = node.args[3]
     return eviction_policy_arg is None
+
+
+# Ops that only route tensors through SSA values and subgraphs or read metadata.
+_TENSOR_ROUTING_OPS = (
+    _tracing_ops._phi,
+    _tracing_ops._new_var,
+    _tracing_ops._for_loop,
+    _tracing_ops._for_loop_step,
+    _tracing_ops._while_loop,
+    _tracing_ops._if,
+    operator.getitem,
+    torch.ops.aten.sym_size.int,
+    torch.ops.aten.sym_stride.int,
+)
+
+
+def _may_access_memory_unseen(node: torch.fx.Node, state: CompilerState) -> bool:
+    """Whether a side-effecting Helion op or an op on symmetric memory hides accesses."""
+    if node.target in _TENSOR_ROUTING_OPS:
+        return False
+    # Peer views, and the local copies other ranks reach through theirs.
+    symmetric = {*state.peer_views, *(v[0] for v in state.peer_views.values() if v)}
+    return (is_api_func(node.target) and node.is_impure(impure_random=False)) or any(
+        not symmetric.isdisjoint(state.ssa_storages(value))
+        for arg in node.all_input_nodes
+        if isinstance(value := arg.meta.get("val"), torch.Tensor)
+    )
 
 
 def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
@@ -1690,6 +1720,13 @@ class DeviceIRAnalysis:
                 is_store = node.target is memory_ops.store
                 is_atomic = node.target in ATOMIC_OPS
                 if not (is_load or is_store or is_atomic):
+                    if env.process_group_name is not None and (
+                        _may_access_memory_unseen(node, host.compiler_state)
+                    ):
+                        raise exc.CrossLoopSchedulingError(
+                            f"because {node.name} may access another rank's "
+                            "memory outside a load or store"
+                        )
                     continue
 
                 fake = _accessed_tensor_fake(node)
@@ -1698,6 +1735,7 @@ class DeviceIRAnalysis:
                     fake = host.compiler_state.ssa_source(fake)
                 origin = host.tensor_to_origin.get(fake) if fake is not None else None
                 allocation_id = -1
+                owner_rank: int | None = None
                 tensor_shape: tuple[sympy.Expr, ...] = ()
                 tensor_strides: tuple[sympy.Expr, ...] = ()
                 storage_offset: sympy.Expr = sympy.Integer(0)
@@ -1713,9 +1751,16 @@ class DeviceIRAnalysis:
                 layout_is_symbolically_exact = False
 
                 if fake is not None:
-                    allocation_id = allocation_ids.setdefault(
-                        fake.untyped_storage(), len(allocation_ids)
+                    storage = fake.untyped_storage()
+                    # A peer view stands for the local allocation on its owner rank.
+                    allocation = host.compiler_state.peer_views.get(
+                        storage, (storage, None)
                     )
+                    if allocation is not None:
+                        storage, owner_rank = allocation
+                        allocation_id = allocation_ids.setdefault(
+                            storage, len(allocation_ids)
+                        )
 
                     def symbolic_layout_value(
                         value: int | torch.SymInt,
@@ -1772,6 +1817,12 @@ class DeviceIRAnalysis:
                                 index_list[0],
                             )
 
+                if allocation_id < 0 and env.process_group_name is not None:
+                    # A barrier cannot order an unknown access against other ranks.
+                    raise exc.CrossLoopSchedulingError(
+                        "because a memory operation's allocation identity is "
+                        "unavailable"
+                    )
                 has_explicit_mask = (
                     not is_atomic
                     and len(node.args) > (2 if is_load else 3)
@@ -1790,6 +1841,7 @@ class DeviceIRAnalysis:
                             graph_id=graph_analysis.graph_id,
                             root=owner_root,
                             allocation_id=allocation_id,
+                            owner_rank=owner_rank,
                             kind="load" if is_load else "store",
                             tensor_name=origin.root_rw_name() if origin else None,
                             tensor_shape=tensor_shape,

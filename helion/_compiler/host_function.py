@@ -111,6 +111,10 @@ class CompilerState:
     ambiguous_ssa_inputs: set[torch.UntypedStorage] = dataclasses.field(
         default_factory=set
     )
+    # get_remote_tensors views -> (local storage, owner rank), None if unmapped.
+    peer_views: dict[torch.UntypedStorage, tuple[torch.UntypedStorage, int] | None] = (
+        dataclasses.field(default_factory=dict)
+    )
 
     def ssa_source(self, tensor: torch.Tensor) -> torch.Tensor | None:
         """The tensor an SSA fake copies, or None if a join makes it ambiguous."""
@@ -121,6 +125,16 @@ class CompilerState:
             return tensor
         sources = {id(s): s for s in map(self.ssa_source, self.ssa_inputs[storage])}
         return next(iter(sources.values())) if len(sources) == 1 else None
+
+    def ssa_storages(self, tensor: torch.Tensor) -> set[torch.UntypedStorage]:
+        """A fake's storage and those of the tensors it transitively copies."""
+        storages: set[torch.UntypedStorage] = set()
+        pending = [tensor]
+        while pending:
+            if (storage := pending.pop().untyped_storage()) not in storages:
+                storages.add(storage)
+                pending.extend(self.ssa_inputs.get(storage, ()))
+        return storages
 
     def record_ssa_copy(
         self, copy: torch.Tensor, inputs: tuple[torch.Tensor, ...]

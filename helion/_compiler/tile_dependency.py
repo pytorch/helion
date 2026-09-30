@@ -4567,6 +4567,9 @@ class TileAccess:
     # one exact dense span.  Keep that distinct from a genuinely unknown
     # indirect index, which this module must conservatively widen.
     subscript_dense_spans: tuple[tuple[int, int, int] | None, ...] = ()
+    # The rank whose copy of a symmetric allocation a peer view reads or
+    # writes; None is this rank's own copy.
+    owner_rank: int | None = None
 
     def __post_init__(self) -> None:
         """Canonicalize layout values once at the dependency-analysis boundary."""
@@ -4714,6 +4717,13 @@ class TileDependencyGraph:
                     for consumer_site in consumer_sites or (None,)
                 )
         return tuple((pair, frozenset(grouped[pair])) for pair in sorted(grouped))
+
+    def crosses_ranks(self, dependency: AccessDependency) -> bool:
+        """Whether another rank runs one side of the dependency."""
+        return _crosses_ranks(
+            self.accesses[dependency.producer_access_id],
+            self.accesses[dependency.consumer_access_id],
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6067,6 +6077,11 @@ def _subtract_regions(
     return pieces
 
 
+def _crosses_ranks(first: TileAccess, second: TileAccess) -> bool:
+    """Whether another rank can run one of two aliasing accesses."""
+    return first.owner_rank is not None or second.owner_rank is not None
+
+
 def _subtract_reaching_accesses(
     reaching: list[_ReachingAccess],
     writes: tuple[_ReachingAccess, ...],
@@ -6077,6 +6092,22 @@ def _subtract_reaching_accesses(
         for entry in reaching
         for residual in _subtract_regions(entry.region, cover_regions)
     ]
+
+
+def _reject_same_root_cross_rank_hazards(root_accesses: list[TileAccess]) -> None:
+    """No transport orders two ranks' accesses inside one root."""
+    for first, second in itertools.combinations_with_replacement(root_accesses, 2):
+        if (
+            first.allocation_id == second.allocation_id
+            and _crosses_ranks(first, second)
+            and "store" in (first.kind, second.kind)
+            and not (first.is_atomic and second.is_atomic)
+        ):
+            raise exc.CrossLoopSchedulingError(
+                f"because root {first.root} may race with another rank on a "
+                f"symmetric allocation ({first.kind}/{second.kind}); load peer "
+                "data only in a later root than the one that stores it"
+            )
 
 
 def build_tile_dependency_graph(
@@ -6164,11 +6195,20 @@ def build_tile_dependency_graph(
         for root_accesses in accesses_by_root
     ]
 
+    symmetric_allocation_ids = {
+        access.allocation_id for access in accesses if access.owner_rank is not None
+    }
+    # Other ranks may run other programs (e.g. a RANK constexpr), so a
+    # symmetric access may touch any element: it always overlaps, never kills.
     region_by_access_id = {
-        access.access_id: _access_region(access, task_families[access.root])
+        access.access_id: AllocationRegion(None, False)
+        if access.allocation_id in symmetric_allocation_ids
+        else _access_region(access, task_families[access.root])
         for access in accesses
         if 0 <= access.root < root_count and access.allocation_id >= 0
     }
+    for root_accesses in accesses_by_root:
+        _reject_same_root_cross_rank_hazards(root_accesses)
     dependencies_by_edge: dict[tuple[int, int, int], set[AccessDependency]] = {}
     reaching_writes: dict[int, list[_ReachingAccess]] = {}
     reaching_reads: dict[int, list[_ReachingAccess]] = {}
@@ -6178,6 +6218,10 @@ def build_tile_dependency_graph(
         consumer: _ReachingAccess,
         kind: TileDependencyKind,
     ) -> None:
+        if root_phases[producer.root] != root_phases[consumer.root] and not (
+            _crosses_ranks(producer.access, consumer.access)
+        ):
+            return
         dependencies_by_edge.setdefault(
             (producer.root, consumer.root, consumer.access.allocation_id), set()
         ).add(
@@ -6193,8 +6237,10 @@ def build_tile_dependency_graph(
     for consumer_root in range(root_count):
         phase = root_phases[consumer_root]
         if phase != current_phase:
-            reaching_writes.clear()
-            reaching_reads.clear()
+            # A phase barrier orders this rank's roots, not other ranks'.
+            for reaching in (reaching_writes, reaching_reads):
+                for allocation_id in reaching.keys() - symmetric_allocation_ids:
+                    del reaching[allocation_id]
             current_phase = phase
         reads = {
             allocation_id: tuple(

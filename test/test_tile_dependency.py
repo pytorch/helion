@@ -243,6 +243,8 @@ def _access(
     tensor_name: str = "tmp",
     storage_offset: int = 0,
     layout_is_static: bool = True,
+    owner_rank: int | None = None,
+    atomic: bool = False,
 ) -> TileAccess:
     return TileAccess(
         access_id=access_id,
@@ -265,6 +267,8 @@ def _access(
         subscript_static_extents=static_extents or (),
         subscript_dense_spans=dense_spans or (),
         layout_is_symbolically_exact=layout_is_static,
+        owner_rank=owner_rank,
+        is_atomic=atomic,
     )
 
 
@@ -449,6 +453,97 @@ class TestTileDependency(TestCase):
         )
 
         self.assertEqual(plan.edges, ())
+
+    def test_symmetric_accesses_ignore_owners_and_regions(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store"),
+                _access(1, root=1, kind="store"),
+                _access(2, root=2, kind="store", owner_rank=1, atomic=True),
+                _access(3, root=3, kind="load", owner_rank=2, storage_offset=128),
+            ),
+            [[0], [1], [2], [3]],
+        )
+        # Other ranks may run other programs: no write covers another, and a
+        # disjoint-looking load of another rank's copy still depends on all.
+        self.assertEqual(
+            {
+                (edge.producer_root, edge.consumer_root, plan.crosses_ranks(dependency))
+                for edge in plan.edges
+                for dependency in edge.access_dependencies
+            },
+            {
+                (0, 1, False),
+                (0, 2, True),
+                (1, 2, True),
+                (0, 3, True),
+                (1, 3, True),
+                (2, 3, True),
+            },
+        )
+
+    def test_same_root_cross_rank_hazards_are_rejected(self) -> None:
+        for accesses in (
+            (
+                _access(0, root=1, kind="store"),
+                _access(1, root=1, kind="load", owner_rank=1),
+            ),
+            (_access(0, root=1, kind="store", owner_rank=1),),
+            (
+                _access(0, root=1, kind="store", owner_rank=1, atomic=True),
+                _access(1, root=1, kind="load", owner_rank=2),
+            ),
+            (
+                _access(0, root=1, kind="store"),
+                _access(1, root=1, kind="load", owner_rank=1, storage_offset=128),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                exc.CrossLoopSchedulingError, "root 1 may race with another rank"
+            ):
+                build_tile_dependency_graph(accesses, [[0], [1]])
+        # Loads, atomics and local pairs.
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=1, kind="load"),
+                _access(1, root=1, kind="load", owner_rank=1),
+                _access(2, root=1, allocation_id=1, kind="store", atomic=True),
+                _access(
+                    3, root=1, allocation_id=1, kind="store", owner_rank=1, atomic=True
+                ),
+                _access(4, root=1, allocation_id=2, kind="store"),
+                _access(5, root=1, allocation_id=2, kind="load"),
+            ),
+            [[0], [1]],
+        )
+        self.assertEqual(plan.edges, ())
+
+    def test_phase_barrier_does_not_order_other_ranks(self) -> None:
+        plan = build_tile_dependency_graph(
+            (
+                _access(0, root=0, kind="store"),
+                _access(1, root=1, kind="load"),
+                _access(2, root=1, kind="load", owner_rank=1),
+                _access(3, root=0, allocation_id=1, kind="load", owner_rank=1),
+                _access(4, root=1, allocation_id=1, kind="store"),
+                _access(5, root=0, allocation_id=2, kind="store"),
+                _access(6, root=1, allocation_id=2, kind="load"),
+            ),
+            [[0], [1]],
+            root_phases=(0, 1),
+        )
+        # Only symmetric allocations keep reaching accesses across the barrier.
+        self.assertEqual(
+            {
+                (edge.producer_root, dependency.consumer_access_id, dependency.kind)
+                for edge in plan.edges
+                for dependency in edge.access_dependencies
+            },
+            {
+                (0, 2, TileDependencyKind.READ_AFTER_WRITE),
+                (0, 4, TileDependencyKind.WRITE_AFTER_READ),
+            },
+        )
 
     def test_coordinate_domain_separates_geometry_from_linearization_order(
         self,
