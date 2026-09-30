@@ -99,6 +99,42 @@ def shifted_inner_grid(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return x
 
 
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def read_through_alias(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = x.new_empty([2 * m, n])[m:]
+    y = x.new_empty(m)
+    for tile_i, tile_j in hl.tile([m, n]):
+        out[tile_i, tile_j] = x[tile_i, tile_j] + 1
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m], dtype=x.dtype)
+        q = out
+        for tile_n in hl.tile(n):
+            acc = acc + q[tile_m, tile_n].sum(-1)
+            q = out
+        y[tile_m] = acc
+    return y
+
+
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def read_through_loop_carried_alias(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    buf = x.new_empty([2 * m, n])
+    lo = buf[:m]
+    out = buf[m:]
+    y = x.new_empty(m)
+    for tile_i, tile_j in hl.tile([m, n]):
+        out[tile_i, tile_j] = x[tile_i, tile_j] + 1
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m], dtype=x.dtype)
+        q = lo
+        for tile_n in hl.tile(n):
+            acc = acc + q[tile_m, tile_n].sum(-1)
+            q = out
+        y[tile_m] = acc
+    return y
+
+
 def _axis_geometry(
     root_domains: tuple[CoordinateDomain, ...],
 ) -> dict[int, tuple[int, int]]:
@@ -1252,6 +1288,30 @@ class TestTileDependency(TestCase):
         self.assertEqual(
             [r.incidence for r in relations if r.consumer_site_id == inner], [None]
         )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_ssa_copies_keep_allocation_identity(self) -> None:
+        x = torch.empty(64, 32, device=DEVICE)
+        host = read_through_alias.bind((x,)).host_function
+        assert host is not None
+        graph = host.device_ir.tile_dependency_graph
+        assert graph is not None
+        (store,) = (a for a in graph.accesses if a.root == 0 and a.kind == "store")
+        (load,) = (a for a in graph.accesses if a.root == 1 and a.kind == "load")
+        # q = out, lifted into the inner loop, reads root 0's store at its offset.
+        self.assertEqual(
+            (load.allocation_id, load.storage_offset, load.tensor_name),
+            (store.allocation_id, store.storage_offset, "out"),
+        )
+        self.assertEqual(
+            [(e.producer_root, e.consumer_root) for e in graph.edges], [(0, 1)]
+        )
+        # A loop-carried q is lo on the first trip and out after it.
+        with self.assertRaisesRegex(
+            exc.CrossLoopSchedulingError, "allocation identity"
+        ):
+            read_through_loop_carried_alias.bind((x,))
 
     def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
         for layout, left_interval, right_interval, second_dimension in (

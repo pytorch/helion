@@ -103,6 +103,32 @@ class CompilerState:
     )
     global_imports: dict[str, GlobalImport] = dataclasses.field(default_factory=dict)
     rng_seed_slot_count: int = 0
+    # SSA copies (_phi, _new_var) -> the tensors they copy.
+    ssa_inputs: dict[torch.UntypedStorage, tuple[torch.Tensor, ...]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    # Inputs of ambiguous joins: a loop body reads a carried value through them.
+    ambiguous_ssa_inputs: set[torch.UntypedStorage] = dataclasses.field(
+        default_factory=set
+    )
+
+    def ssa_source(self, tensor: torch.Tensor) -> torch.Tensor | None:
+        """The tensor an SSA fake copies, or None if a join makes it ambiguous."""
+        storage = tensor.untyped_storage()
+        if storage in self.ambiguous_ssa_inputs:
+            return None
+        if storage not in self.ssa_inputs:
+            return tensor
+        sources = {id(s): s for s in map(self.ssa_source, self.ssa_inputs[storage])}
+        return next(iter(sources.values())) if len(sources) == 1 else None
+
+    def record_ssa_copy(
+        self, copy: torch.Tensor, inputs: tuple[torch.Tensor, ...]
+    ) -> None:
+        """Record the tensors a fresh SSA fake copies."""
+        self.ssa_inputs[copy.untyped_storage()] = inputs
+        if self.ssa_source(copy) is None:
+            self.ambiguous_ssa_inputs.update(t.untyped_storage() for t in inputs)
 
 
 class HostFunction:

@@ -1678,7 +1678,7 @@ class DeviceIRAnalysis:
             return ()
 
         graph_owners = owner_roots_by_graph_id(device_ir)
-        allocation_ids: dict[int, int] = {}
+        allocation_ids: dict[torch.UntypedStorage, int] = {}
         accesses: list[TileAccess] = []
         memory_op_index = 0
 
@@ -1693,6 +1693,9 @@ class DeviceIRAnalysis:
                     continue
 
                 fake = _accessed_tensor_fake(node)
+                if fake is not None:
+                    # An SSA copy stands for its source; an ambiguous join is unknown.
+                    fake = host.compiler_state.ssa_source(fake)
                 origin = host.tensor_to_origin.get(fake) if fake is not None else None
                 allocation_id = -1
                 tensor_shape: tuple[sympy.Expr, ...] = ()
@@ -1710,10 +1713,8 @@ class DeviceIRAnalysis:
                 layout_is_symbolically_exact = False
 
                 if fake is not None:
-                    storage = fake.untyped_storage()
-                    storage_key = int(getattr(storage, "_cdata", id(storage)))
                     allocation_id = allocation_ids.setdefault(
-                        storage_key, len(allocation_ids)
+                        fake.untyped_storage(), len(allocation_ids)
                     )
 
                     def symbolic_layout_value(
