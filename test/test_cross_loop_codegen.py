@@ -1896,7 +1896,19 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
+        # The early read keeps its own entry wait; the nested wait follows it.
+        self.assertNotIn("tile_dependency_root_barrier", code)
+        scheduled = ast.unparse(
+            _generated_function(code, "tile_dependency_root_1_scheduled_task")
+        )
+        self.assertLess(
+            scheduled.index("tile_dependency_readiness_wait"),
+            scheduled.index("tile_dependency_root_1("),
+        )
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
+        self.assertLess(
+            root.index("first = "), root.index("tile_dependency_nested_loop_wait")
+        )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

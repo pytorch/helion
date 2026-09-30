@@ -1853,8 +1853,10 @@ def _build_readiness_events(
                     )
                 )
 
+    # Consumer keys carry a fallback flag: root-entry projections of nested
+    # consumers stay out of direct root events so a nested counter can drop them.
     exact_relations: dict[
-        tuple[int, int | None, CoordinateDomain],
+        tuple[int, int | None, CoordinateDomain, bool],
         dict[
             tuple[int, int | None, CoordinateDomain],
             list[tuple[Incidence, DependencyObligation]],
@@ -1869,9 +1871,10 @@ def _build_readiness_events(
         consumer_site_id: int | None,
         incidence: Incidence,
         covered_obligations: frozenset[DependencyObligation],
+        fallback: bool = False,
     ) -> None:
         relation = incidence.items_by_key
-        consumer = (consumer_root, consumer_site_id, relation.source_domain)
+        consumer = (consumer_root, consumer_site_id, relation.source_domain, fallback)
         producer = (producer_root, producer_site_id, relation.target_domain)
         exact_relations.setdefault(consumer, {}).setdefault(producer, []).extend(
             (incidence, obligation) for obligation in covered_obligations
@@ -1911,7 +1914,8 @@ def _build_readiness_events(
         consumer_site_is_usable = consumer_is_root or (
             consumer_site is not None and consumer_site.can_split_loop
         )
-        if producer_site_is_usable and consumer_site_is_usable:
+        nested_relation = producer_site_is_usable and consumer_site_is_usable
+        if nested_relation:
             add_exact_relation(
                 producer_root=dependency.producer_root,
                 producer_site_id=(
@@ -1949,6 +1953,7 @@ def _build_readiness_events(
             consumer_site_id=None,
             incidence=root_incidence,
             covered_obligations=exact_obligations,
+            fallback=nested_relation and not consumer_is_root,
         )
 
     pending_events: dict[
@@ -2014,9 +2019,10 @@ def _build_readiness_events(
         key=lambda item: (
             item[0][0],
             -1 if item[0][1] is None else item[0][1],
+            item[0][3],
         ),
     ):
-        consumer_root, consumer_site_id, consumer_domain = consumer
+        consumer_root, consumer_site_id, consumer_domain, _fallback = consumer
         merged_relations: list[
             tuple[
                 tuple[int, int | None, CoordinateDomain],
