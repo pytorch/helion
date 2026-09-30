@@ -14,6 +14,12 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # uv's default 30s per-request timeout is tight for multi-hundred-MB
+  # wheels (torch, cutlass) pulled from PyPI or NVIDIA's index on a slow
+  # link; the install steps below also retry on transport errors.
+  UV_HTTP_TIMEOUT: "300"
+
 jobs:
   load-matrix:
     runs-on: ubuntu-latest
@@ -116,17 +122,20 @@ jobs:
           set -eux
 
           source .venv/bin/activate
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
 
           if [[ "${{ matrix.pytorch-version }}" == pytorch-[0-9]* ]]; then
             VERSION="${{ matrix.pytorch-version }}"
             VERSION="${VERSION#pytorch-}"
-            uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
+            retry uv pip install -U "torch==${VERSION}.*" --index-url https://download.pytorch.org/whl/${{ matrix.runtime-version }}
           else
             # Default to nightly
             # On OSDC, route nightly through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
             PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
             NIGHTLY_INDEX="${PYTORCH_INDEX%/whl/*}/whl/nightly/${{ matrix.runtime-version }}"
-            UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
+            retry env UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U --pre torch --index-url "$NIGHTLY_INDEX"
             if [[ "${{ contains(matrix.alias, 'distributed') }}" == "true" ]]; then
               # Current NVSHMEM wheels no longer contain libnvshmem_device.bc, which
               # PyTorch's Triton API still requires. Keep Torch's ABI-matched host
@@ -228,7 +237,10 @@ jobs:
         if: matrix.backend == 'cute'
         run: |
           source .venv/bin/activate
-          ./scripts/install_cute.sh
+          retry () {
+            "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
+          }
+          retry ./scripts/install_cute.sh
 
       - name: CUDA Compute Check
         if: startsWith(matrix.image, 'nvidia')
@@ -332,7 +344,9 @@ jobs:
           # A10G runners expose one 22 GiB GPU. Four xdist workers can collectively
           # exhaust VRAM with CUDA/Triton/Inductor state even when an individual test
           # only needs a small allocation.
-          if [[ -n "$PARALLEL" && "${{ matrix.alias }}" == *a10g* ]]; then
+          # The MI350X runner also exposes a single GPU. Four workers sharing it
+          # pushed the autotune and benchmark tests past their per-test timeout.
+          if [[ -n "$PARALLEL" && ( "${{ matrix.alias }}" == *a10g* || "${{ matrix.alias }}" == *mi350x* ) ]]; then
             PARALLEL="-n2"
           fi
           # For distributed tests, fail if any test is skipped, failed, or has an error
@@ -352,7 +366,7 @@ jobs:
             # worker gets killed mid-compile. Give it headroom.
             TIMEOUT=180
           elif [[ "${{ matrix.alias }}" == *mi350x* ]]; then
-            # The MI350X runner exposes a single GPU shared by four xdist
+            # The MI350X runner exposes a single GPU shared by its xdist
             # workers. Autotuning and interleaved-benchmark tests (each timed
             # iteration zeroes a 256 MiB cache buffer) legitimately run past
             # 60s under that contention. pytest-timeout's thread method then

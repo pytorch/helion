@@ -420,6 +420,13 @@ class TestLLMGuidedSearch(TestCase):
                 member.perfs.append(rebench_perf_by_key[repr(member.config)])
 
         with (
+            # The suite caps the final verification at two finalists
+            # (test/conftest.py); this mocked run asserts the code default.
+            patch.dict(
+                os.environ,
+                {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"},
+                clear=False,
+            ),
             patch.object(
                 LLMGuidedSearch,
                 "_call_llm_async",
