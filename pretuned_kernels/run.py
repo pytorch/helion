@@ -43,6 +43,7 @@ KERNELS = [
     "rms_norm",
     "layer_norm",
     "softmax",
+    "topk",
     "scaled_mm",
     "scale_mm_cute",
     "nvfp4_gemv",
@@ -73,7 +74,7 @@ KERNELS = [
 
 # Map a compute capability (heuristic file suffix) to a hardware alias. The
 # nightly runs one GPU per alias.
-_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200", "sm103": "gb300"}
 
 
 def _kernel_directory(name: str) -> Path:
@@ -98,13 +99,14 @@ def grouped_reference_requirements(value: str) -> dict[str, bool]:
 def _supported_hardware(name: str) -> set[str]:
     """Hardware a kernel is pretuned for, inferred from its checked-in heuristics.
 
-    Each ``_helion_aot_<name>_cuda_sm<NN>.py`` file declares a compute capability
-    the kernel ships a config for; map those to hardware aliases. This is the
+    Each ``_helion_aot_<name>_cuda_sm<NN>[__policy_<id>].py`` file declares a
+    compute capability the kernel ships a config for; map those to hardware
+    aliases. This is the
     single source of truth -- no per-kernel declaration to keep in sync.
     """
     hardware = set()
     for path in _kernel_directory(name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
-        match = re.search(r"_cuda_(sm\d+)\.py$", path.name)
+        match = re.search(r"_cuda_(sm\d+)(?:__policy_[0-9a-f]{64})?\.py$", path.name)
         if match:
             hardware.add(_HARDWARE_BY_COMPUTE.get(match.group(1), match.group(1)))
     return hardware

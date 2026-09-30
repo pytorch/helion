@@ -15,6 +15,11 @@ from typing import Any
 from unittest.mock import patch
 
 import numpy as np
+from pretuned_kernels import run as pretuned_run
+from pretuned_kernels.topk import (
+    _helion_aot_topk_cuda_sm103__policy_7a1b8d1b32387d9d6564813aef75f57b099f77e8f59f6da7e78a03dae877c635 as topk_heuristic,
+)
+from pretuned_kernels.topk import topk as pretuned_topk
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -33,6 +38,7 @@ from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner.aot_structural_policy import model_configs
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
@@ -4770,6 +4776,122 @@ def test_topk_composition_integer_boolean_reductions(layout: str) -> None:
     torch.testing.assert_close(index_sum, (indices * 2**40).sum(-1, keepdim=True))
     torch.testing.assert_close(positive, (selected > 0).amax(-1, keepdim=True))
     torch.testing.assert_close(all_positive, (selected > 0).amin(-1, keepdim=True))
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+# Pretuned top-k integration tests.
+
+
+def test_pretuned_topk_registration_and_keys() -> None:
+    assert "topk" in pretuned_run.KERNELS
+    assert pretuned_run._supported_hardware("topk") == {"gb300"}
+    keys = set()
+    for rows, width, k, softmax in pretuned_topk.SHAPES:
+        x = torch.empty(
+            (rows, width), dtype=torch.bfloat16, device=torch.device("meta")
+        )
+        key = topk_heuristic.key_topk(x, k, softmax)
+        assert key not in keys
+        keys.add(key)
+        if not softmax:
+            assert topk_heuristic.key_topk(x, k) == key
+    assert len(keys) == 30
+    assert topk_heuristic.STRUCTURAL_POLICY == pretuned_topk.STRUCTURAL_POLICY
+    assert (
+        list(
+            model_configs(topk_heuristic, "topk", pretuned_topk.STRUCTURAL_POLICY) or ()
+        )
+        == topk_heuristic.CONFIGS
+    )
+    assert all(
+        config.policy == pretuned_topk.STRUCTURAL_POLICY
+        for config in topk_heuristic.CONFIGS
+    )
+
+
+@pytest.mark.parametrize("unsupported", ["rows", "k", "dtype", "stride"])
+def test_pretuned_topk_rejects_untuned_inputs(unsupported: str) -> None:
+    rows = 17 if unsupported == "rows" else 65536
+    dtype = torch.float32 if unsupported == "dtype" else torch.bfloat16
+    inner_stride = 2 if unsupported == "stride" else 1
+    x = torch.empty_strided(
+        (rows, 64),
+        (64 * inner_stride, inner_stride),
+        dtype=dtype,
+        device=torch.device("meta"),
+    )
+    k = 3 if unsupported == "k" else 8
+    with pytest.raises(ValueError):
+        topk_heuristic.key_topk(x, k)
+    with pytest.raises(ValueError):
+        topk_heuristic.autotune_topk(x, k)
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("softmax", [False, True])
+def test_pretuned_topk_codegen_is_one_fused_launch(softmax: bool) -> None:
+    with FakeTensorMode():
+        x = torch.empty((65536, 1024), dtype=torch.bfloat16)
+    # Bind the source without loading hardware-dependent AOT caches on the CPU.
+    kernel = helion.kernel(
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_structural_policy=pretuned_topk.STRUCTURAL_POLICY,
+    )(pretuned_topk.topk.fn)
+    bound = kernel._bind_isolated((x, 32, softmax))
+    config = topk_heuristic.autotune_topk(x, 32, softmax)
+    code = bound.to_code(config)
+    assert code.count("@cute.kernel") == 1
+    assert "sort_rank" not in code
+    assert ("topk_softmax_values" in code) == softmax
+    launches = [
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_launcher"
+    ]
+    assert len(launches) == 1
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width,k", [(64, 8), (256, 16), (1024, 32)])
+@pytest.mark.parametrize("softmax", [False, True])
+def test_pretuned_topk_aot_correctness(
+    width: int, k: int, softmax: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("top-k AOT configs are pretuned for GB300 (sm103)")
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    generator = torch.Generator(device=DEVICE).manual_seed(20260929)
+    x = torch.randn(
+        (65536, width), dtype=torch.bfloat16, device=DEVICE, generator=generator
+    )
+    x[0].zero_()
+    x[1] = (torch.arange(width, device=DEVICE) % 5 - 2).to(x.dtype)
+    original = x.clone()
+    values, indices = pretuned_topk.topk(x, k, softmax)
+    assert values.shape == indices.shape == (65536, k)
+    assert values.dtype == torch.bfloat16 and indices.dtype == torch.int32
+    assert bool(((indices >= 0) & (indices < width)).all())
+    ordered_indices = indices.sort(dim=-1).values
+    assert bool((ordered_indices[:, 1:] != ordered_indices[:, :-1]).all())
+    selected = original.gather(1, indices.long())
+    expected = torch.topk(original, k, dim=-1).values
+    torch.testing.assert_close(selected, expected, rtol=0, atol=0)
+    if softmax:
+        expected = torch.softmax(expected.float(), dim=-1)
+        torch.testing.assert_close(values.float(), expected, rtol=0.004, atol=1e-7)
+        torch.testing.assert_close(
+            values.float().sum(-1),
+            torch.ones(65536, device=DEVICE),
+            rtol=0,
+            atol=0.004,
+        )
+    else:
+        assert torch.equal(values.view(torch.int16), selected.view(torch.int16))
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 

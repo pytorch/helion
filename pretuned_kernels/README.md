@@ -7,7 +7,7 @@ who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
 autotuning.  Each entry lists the NVIDIA architecture it supports (currently
-H100, B200, or both), and Helion picks the matching file at runtime.  Treat the
+H100, B200, or GB300), and Helion picks the matching file at runtime.  Treat the
 files as kernel recipes: copy the kernel and its local `_helion_aot_*` heuristic
 into your code, then retune when your target shapes or hardware differ
 materially from the included sweep.
@@ -25,6 +25,7 @@ pretuned_kernels/
 │   ├── _helion_aot_vector_add_cuda_sm100.py   # B200 heuristic
 │   └── _helion_aot_vector_add_cuda_sm90.py    # H100 heuristic
 ├── softmax/
+├── topk/                            # GB300 CuTe top-k + optional selected-value softmax
 ├── layer_norm/
 ├── rms_norm/
 ├── cross_entropy/
@@ -59,6 +60,7 @@ At runtime Helion picks the file matching the current GPU.
 |---|---|---|
 | `vector_add` | `2**i for i in range(19, 29)` | `x + y` |
 | `softmax` | Triton tutorial `M=4096, N=128*i for i in range(2, 100)` + realistic long-context shapes | `F.softmax` |
+| `topk` | BF16 `M=65536, N in {64,128,256,512,1024}, K in {8,16,32}`, plain and fused softmax (30 cases; GB300 CuTe) | `torch.topk`, optionally followed by FP32 softmax of the selected values; int32 indices |
 | `layer_norm` | Triton tutorial `M=4096, N=512*i for i in range(2, 32)` + realistic hidden-size shapes | `F.layer_norm` |
 | `rms_norm` | TritonBench `(M=2048, H)` default + NPOT shapes + realistic LLM hidden-size and production-style shapes | `F.rms_norm` |
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
@@ -89,6 +91,14 @@ PyTorch baseline (a speedup-comparison baseline only -- correctness is checked
 against the eager reference). The grouped-GEMM entries instead use the named
 CUDA references in the table. The headline speedup is Helion vs the *fastest*
 available baseline, and the per-kernel dropdown reports every baseline.
+
+`topk` returns the largest K values in descending order and int32 column
+indices. Its optional softmax normalizes only the selected K values in FP32
+before converting back to BF16. The benchmark checks each case against Torch
+before timing, allowing different indices for tied values. Both implementations
+use the same CUDA-graph timer with cold L2; the Torch baseline includes the cast
+to int32 indices. The checked-in configs were tuned on GB300 (`sm103`) for the
+30 listed cases with contiguous BF16 inputs.
 
 `grouped_gemm` compares Helion with the same pinned CUTLASS kernel. Required
 device pointer tables are initialized before graph capture, and both
@@ -160,6 +170,12 @@ named reference baselines across the included shape set:
 ```bash
 cd pretuned_kernels/softmax
 python softmax.py
+```
+
+To run the top-k sweep and write aggregate metrics on GB300:
+
+```bash
+python pretuned_kernels/run.py --kernels topk --output topk-bench.json
 ```
 
 The external grouped-GEMM references need explicit pinned checkouts:
