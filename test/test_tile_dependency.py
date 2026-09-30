@@ -57,6 +57,34 @@ def cartesian_affine_stage(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def scalar_and_nonaffine_subscripts(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    y = x.new_empty(4 * n)
+    out = torch.empty_like(x)
+    for tile in hl.tile(n, block_size=16):
+        y[tile] = x[tile] + 1
+    hl.barrier()
+    for tile in hl.tile(n, block_size=16):
+        scalars = y[tile.id + 1] + y[tile.begin + 2] + y[tile.end] + y[tile.id * 2]
+        vectors = y[tile.index // 2] + y[tile.index * 2 + 1]
+        wrapped = y[tile.index.to(torch.int8)]
+        out[tile] = scalars + vectors + wrapped + y[hl.arange(16) + 3].sum()
+    hl.barrier()
+    for i in hl.grid(n):
+        out[i] = y[i + 1] + y[2 * i]
+    hl.barrier()
+    for i in hl.grid(0, n, 2):
+        out[i] = y[i + 1]
+    hl.barrier()
+    for tile in hl.tile(n, block_size=1):
+        out[tile] = y[tile.begin + 1]
+    return out
+
+
 def _axis_geometry(
     root_domains: tuple[CoordinateDomain, ...],
 ) -> dict[int, tuple[int, int]]:
@@ -1125,6 +1153,61 @@ class TestTileDependency(TestCase):
             device_ir.root_ids = original_root_ids
             device_ir.task_families = original_task_families
             device_ir.grid_block_ids = original_grid_block_ids
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_subscript_facts_are_exact_or_whole_dimension(self) -> None:
+        x = torch.empty(256, device=DEVICE, dtype=torch.float32)
+        bound = scalar_and_nonaffine_subscripts.bind((x,))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        with bound.env, bound.host_function:
+            analysis = DeviceIRAnalysis.build(device_ir, bound.env)
+            accesses = analysis.tile_accesses(
+                device_ir,
+                bound.env,
+                bound.host_function,
+            )
+        block_ids = {
+            access.root: access.subscript_affine_block_ids[0]
+            for access in accesses
+            if access.kind == "store"
+        }
+        # (root, kind, block, scale, offset, scalar); no block and no offset is
+        # the whole dimension.
+        whole, whole_slice = (None, 1, None, True), (None, 1, None, False)
+        self.assertEqual(
+            [
+                (
+                    access.root,
+                    access.kind,
+                    access.subscript_affine_block_ids[0],
+                    access.subscript_index_scales[0],
+                    access.subscript_offsets[0],
+                    access.subscript_is_scalar[0],
+                )
+                for access in accesses
+                if access.root > 0
+            ],
+            [
+                (1, "load", block_ids[1], 1, 1, True),  # tile.id + 1
+                (1, "load", *whole),  # tile.begin + 2: one point per block
+                (1, "load", *whole),  # tile.end
+                (1, "load", *whole),  # tile.id * 2
+                (1, "load", *whole_slice),  # tile.index // 2
+                (1, "load", block_ids[1], 2, 1, False),  # tile.index * 2 + 1
+                (1, "load", *whole_slice),  # int8 cast may wrap
+                (1, "load", None, 1, 3, False),  # arange(16) + 3
+                (1, "store", block_ids[1], 1, 0, False),
+                (2, "load", block_ids[2], 1, 1, False),  # unit-step grid i + 1
+                (2, "load", *whole),  # 2 * i
+                (2, "store", block_ids[2], 1, 0, False),
+                (3, "load", *whole),  # stepped grid i + 1
+                (3, "store", *whole),
+                (4, "load", block_ids[4], 1, 1, False),  # unit-block tile.begin + 1
+                (4, "store", block_ids[4], 1, 0, False),
+            ],
+        )
 
     def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
         for layout, left_interval, right_interval, second_dimension in (
