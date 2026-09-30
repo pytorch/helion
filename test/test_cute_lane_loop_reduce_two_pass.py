@@ -742,6 +742,9 @@ def test_one_row_tiles_take_the_plain_two_pass_split(
 ) -> None:
     """With one row per CTA the jagged loop's bound is the row's own length (a reduction over a block of one combined the column threads before, an unduplicatable collective that kept the split off); the body now splits into the accumulate and consume passes, including the per-column scaling the restore path declines."""
     x, offsets = _jagged_inputs(512)
+    # Exact quarter-integer sums isolate the split from reduction-order
+    # roundoff, which the per-column scaling can amplify near cancellation.
+    x = (x * 4).round() * 0.25
     bound = _jagged_kernel(fn, static_shapes=static_shapes).bind((x, offsets))
     config = _jagged_lanes_config(2)
     code = bound.to_code(config)

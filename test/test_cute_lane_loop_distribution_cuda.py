@@ -364,6 +364,8 @@ _BYTE_CASES = [
 def test_store_between_a_byte_conversion_and_its_flush_matches_reference(
     columns: int, packet_flush: bool
 ) -> None:
+    if packet_flush and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("signed-byte BF16 packets are restricted to sm_100a")
     # The zeroing store precedes the lane loop (see the GPU-free companion),
     # so the flush overwrites the zero.  Kept in the nest, the second lane
     # iteration zeroed the element again after the first iteration's flush.
@@ -406,6 +408,8 @@ def _copy_zero_copy(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
     packet_flush: bool,
 ) -> None:
+    if packet_flush and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("signed-byte BF16 packets are restricted to sm_100a")
     # The zeroing store follows the loop (see the GPU-free companion): the
     # copy's last element is zero and the second copy is untouched, over two
     # lane iterations per thread.
