@@ -93,6 +93,10 @@ def _warn_dataset_without_log(log: AutotuningLogger) -> None:
 # rebenchmark repeat, which can amplify a single optimistic subprocess timing.
 _SUSPICIOUS_REBENCHMARK_WARMUP = 25
 _SUSPICIOUS_REBENCHMARK_REP = 100
+# A finalist timing is only "suspiciously fast" when it undercuts the search
+# time by more than the batched flushed-graph timer resolves (~0.3 us on B200):
+# confirming costs a fresh worker process per finalist.
+_SUSPICIOUS_REBENCHMARK_MIN_DELTA_MS = 0.001
 _FINAL_REBENCHMARK_TOP_K_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K"
 _FINAL_REBENCHMARK_TOP_K_DEFAULT = 8
 # The cute/flash-attention search surface has a wide config space where verifying
@@ -2507,8 +2511,17 @@ class PopulationBasedSearch(BaseSearch):
                     # and the capped repeat count can take minutes of wall
                     # clock. Keep the whole pass near the sequential-window
                     # budget it replaced (target_ms per candidate).
+                    interleaved_kwargs: dict[str, object] = {
+                        "max_total_ms": target_ms * len(members)
+                    }
+                    if interleaved_benchmark is interleaved_bench:
+                        # the batched graph timer agrees its batch over the
+                        # kernel's process group so every rank launches alike
+                        interleaved_kwargs["process_group_name"] = (
+                            self.kernel.env.process_group_name
+                        )
                     benchmark_function = functools.partial(
-                        interleaved_benchmark, max_total_ms=target_ms * len(members)
+                        interleaved_benchmark, **interleaved_kwargs
                     )
                 if self.settings.autotune_progress_bar:
                     new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
@@ -2796,6 +2809,7 @@ class PopulationBasedSearch(BaseSearch):
             if math.isfinite(timing)
             and math.isfinite(member.perf)
             and timing < ratio * member.perf
+            and member.perf - timing > _SUSPICIOUS_REBENCHMARK_MIN_DELTA_MS
         ]
         if not suspicious:
             return updated
