@@ -280,6 +280,36 @@ def default_launcher(
     )
 
 
+def compile_only_launch_args(
+    *args: object,
+    _remote_copy_signal_slots_per_program: int = 0,
+    _remote_barrier_signal_slots_per_program: int = 0,
+    _remote_copy_scratch_specs: tuple[tuple[torch.Tensor, int], ...] = (),
+    _persistent_state_specs: tuple[
+        tuple[torch.Tensor, int, torch.dtype, bool], ...
+    ] = (),
+    **kwargs: object,
+) -> tuple[tuple[object, ...], dict[str, object]]:
+    """Return ``triton_kernel.run`` arguments for compiling without launching.
+
+    The arguments ``default_launcher`` appends become empty tensors of the same
+    dtypes, which is all compilation reads, and launcher-only options drop.
+    """
+    dtypes = [torch.int64] * (
+        bool(_remote_copy_signal_slots_per_program)
+        + bool(_remote_barrier_signal_slots_per_program)
+    )
+    dtypes += [like.dtype for like, _ in _remote_copy_scratch_specs]
+    for _, _, dtype, symmetric in _persistent_state_specs:
+        dtypes += [dtype, torch.int64] if symmetric else [dtype]
+    kwargs = {name: value for name, value in kwargs.items() if not name.startswith("_")}
+    if not dtypes:
+        return args, kwargs
+    device = next(arg.device for arg in args if isinstance(arg, torch.Tensor))
+    placeholders = [torch.empty(0, dtype=dtype, device=device) for dtype in dtypes]
+    return (*args, *placeholders), kwargs
+
+
 def _get_remote_copy_signal(
     triton_kernel: object,
     dst: torch.Tensor,

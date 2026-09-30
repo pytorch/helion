@@ -36,7 +36,9 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
+from helion.autotuner.benchmark_provider import _triton_compile
 import helion.language as hl
+from helion.runtime.triton.launcher import compile_only_launch_args
 
 
 def _generated_function(code: str, name: str) -> ast.FunctionDef:
@@ -839,6 +841,45 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("_minimum_resident_programs=", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_pipeline_precompiles_without_launcher_state(self) -> None:
+        x = torch.zeros(1, 4096, device=DEVICE)
+        bound = nested_load_store_chain.bind((x,))
+        config = helion.Config(
+            block_sizes=[1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        compiled = bound.compile_config(config)
+        # The precompiler gets placeholders for the launcher-owned state.
+        self.assertTrue(_triton_compile(compiled, (x,), config, bound))
+
+    def test_compile_only_launch_args_mirror_launcher_state(self) -> None:
+        x = torch.zeros(4)
+        self.assertEqual(
+            compile_only_launch_args(3, num_warps=4, _minimum_resident_programs=2),
+            ((3,), {"num_warps": 4}),
+        )
+        args, kwargs = compile_only_launch_args(
+            x,
+            num_warps=4,
+            _remote_barrier_signal_slots_per_program=1,
+            _remote_copy_scratch_specs=((x.half(), 8),),
+            _persistent_state_specs=(
+                (x, 2, torch.uint32, False),
+                (x, 3, torch.uint64, True),
+            ),
+            _persistent_state_process_group_name="group",
+        )
+        self.assertEqual(
+            [arg.dtype for arg in args[1:]],
+            [torch.int64, torch.float16, torch.uint32, torch.uint64, torch.int64],
+        )
+        self.assertEqual(kwargs, {"num_warps": 4})
 
     @skipIfNotCUDA()
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")

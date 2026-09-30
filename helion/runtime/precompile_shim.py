@@ -10,6 +10,7 @@ from .._compat import get_triton_iterable_path
 from .._compat import get_triton_version
 from ..autotuner.logger import classify_triton_exception
 from ..autotuner.logger import format_triton_compile_failure
+from .triton.launcher import compile_only_launch_args
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -46,6 +47,8 @@ def make_precompiler(
         parts so we can wrap it in a subprocess to handle configs that hang in
         Triton compile and never return.
         """
+        # pyrefly: ignore [bad-argument-type]
+        args, kwargs = compile_only_launch_args(*args, **kwargs)
         # pyrefly: ignore [bad-argument-type]
         device = _find_device([*args, *kwargs.values()])
         kwargs["debug"] = (
