@@ -1211,9 +1211,19 @@ class DeviceFunction:
                 statement_from_string("cute.arch.cluster_arrive_relaxed()"),
                 statement_from_string("cute.arch.cluster_wait()"),
             ]
+        dependent_launch: list[ast.stmt] = []
+        if self._cute_pdl_applies():
+            # Programmatic dependent launch (``cute_pdl``): the launch and
+            # this prologue overlap the previous kernel in the stream; wait
+            # for it before the first global memory access.
+            with SyntheticLocation():
+                dependent_launch = [
+                    statement_from_string("cute.arch.griddepcontrol_wait()")
+                ]
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
+                *dependent_launch,
                 *scalar_preamble,
                 *self.preamble,
                 *cluster_sync,
@@ -1864,6 +1874,13 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_cluster_shape = (1, {simt_cluster_n}, 1)"
                 )
             )
+        if self._cute_pdl_applies():
+            # The CuTe launcher reads this attribute to launch the kernel
+            # with programmatic dependent launch (``use_pdl``).
+            with SyntheticLocation():
+                result.append(
+                    statement_from_string(f"{self.name}._helion_cute_use_pdl = True")
+                )
         min_blocks = self.config.config.get("cute_min_blocks_per_mp", 0)
         if (
             CompileEnvironment.current().backend.name == "cute"
@@ -2033,6 +2050,42 @@ class DeviceFunction:
                     property_hint,
                 )
         return result
+
+    def _cute_pdl_applies(self) -> bool:
+        """Whether ``cute_pdl`` shapes this kernel.
+
+        The knob launches the kernel as a programmatic dependent of the
+        previous kernel in the stream and splices ``griddepcontrol_wait()``
+        in ahead of the scalar preamble, the preamble, the cluster sync and
+        the body, so every global read, write, atomic and bulk copy, on
+        every path, follows the wait; the passes that run afterwards may
+        hoist register or shared allocations above it, never a memory
+        access.  It stays out of kernels that already take part in
+        dependent launch, which generate exactly the knob-off code: native
+        plans launched with ``use_pdl``, and bodies that wait on or release
+        their dependents themselves.  A release ahead of the knob's wait
+        would let the dependents start before this kernel's predecessors
+        finish; the materialized-fission producer gets its release inserted
+        after this function runs, so ``_stage_config`` keeps the knob away
+        from it.  ``griddepcontrol`` needs sm_90, so older targets are left
+        alone as well.
+        """
+        env = CompileEnvironment.current()
+        if env.backend.name != "cute" or self.config.config.get("cute_pdl") is not True:
+            return False
+        capability = env.config_spec.target_device_capability
+        if capability is None or capability < (9, 0):
+            return False
+        if any(plan.get("use_pdl") for plan in self.codegen.cute_wrapper_plans):
+            return False
+        return not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            in ("griddepcontrol_wait", "griddepcontrol_launch_dependents")
+            for stmt in [*self.preamble, *self.body]
+            for node in ast.walk(stmt)
+        )
 
     def codegen_function_call(self) -> ast.AST:
         env = CompileEnvironment.current()

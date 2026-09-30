@@ -131,6 +131,8 @@ def _stage_config(
     plan: MaterializedFissionPlan,
     stage_index: int,
     stage: HostFunction | None = None,
+    *,
+    releases_dependents_at_entry: bool = False,
 ) -> Config:
     pointwise = stage_index in plan.pointwise_region_indices
     project_ffi = pointwise and config.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True
@@ -139,14 +141,23 @@ def _stage_config(
         for key in ("tcgen05_region_ab_stages", "tcgen05_region_c_stages")
     )
     fanout = config.get("tcgen05_epilogue_fanout") == "shared"
+    # The stage that releases its dependents at entry (the materialized-PDL
+    # producer) has to stay an ordinary launch.  Launched as a programmatic
+    # dependent itself it would start, and release the consumer, while the
+    # kernels ahead of it still run, and the consumer's TMA role loads the
+    # ordinary operand ahead of its own wait.  ``cute_pdl`` never reaches it.
+    drop_pdl = releases_dependents_at_entry and config.get("cute_pdl") is True
     if (
         "cute_pointwise_pid_type" not in config.config
         and not project_ffi
         and not has_region_stages
         and not fanout
+        and not drop_pdl
     ):
         return config
     result = copy.deepcopy(config)
+    if drop_pdl:
+        result.config.pop("cute_pdl")
     for kind in ("ab", "c"):
         key = f"tcgen05_region_{kind}_stages"
         region_stages = result.config.pop(key, None)
@@ -324,12 +335,26 @@ def generate_materialized_fission(
     used_names.update(arg.arg for arg in func.args.args)
     used_names.update(extra_params or ())
 
+    pdl_roots = env.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
+    if not config.get("tcgen05_materialized_pdl", False):
+        pdl_roots = None
+
     def generate_stage(
-        stage: HostFunction, stage_config: Config, stage_index: int
+        stage: HostFunction,
+        stage_config: Config,
+        stage_index: int,
+        *,
+        releases_dependents_at_entry: bool,
     ) -> ast.Module:
         return generate_ast(
             stage,
-            _stage_config(stage_config, plan, stage_index, stage),
+            _stage_config(
+                stage_config,
+                plan,
+                stage_index,
+                stage,
+                releases_dependents_at_entry=releases_dependents_at_entry,
+            ),
             False,
             store_transform=store_transform,
             load_transform=load_transform,
@@ -345,8 +370,15 @@ def generate_materialized_fission(
         assert not claimed_graphs.intersection(graph_ids)
         claimed_graphs.update(graph_ids)
         stage = _stage_host(func, root, stage_index, graphs, graph_ids, plan)
+        root_id = func.device_ir.root_ids[stage_index]
+        releases_at_entry = pdl_roots is not None and root_id == pdl_roots[0]
         try:
-            module = generate_stage(stage, config, stage_index)
+            module = generate_stage(
+                stage,
+                config,
+                stage_index,
+                releases_dependents_at_entry=releases_at_entry,
+            )
         except VloopSinkNotApplied:
             # ``cute_vloop_sink`` shaped this stage's thread layout but sank
             # nothing.  The knob must not change the code by itself, so
@@ -361,13 +393,13 @@ def generate_materialized_fission(
                 graph_ids,
                 plan,
             )
-            module = generate_stage(stage, off_config, stage_index)
-        pdl_roots = env.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
-        if (
-            config.get("tcgen05_materialized_pdl", False)
-            and pdl_roots is not None
-            and func.device_ir.root_ids[stage_index] == pdl_roots[0]
-        ):
+            module = generate_stage(
+                stage,
+                off_config,
+                stage_index,
+                releases_dependents_at_entry=releases_at_entry,
+            )
+        if releases_at_entry:
             # Every launched CTA must release the dependent grid, including
             # persistent CTAs with no work. Keep this ahead of all entry guards.
             device = next(
@@ -379,11 +411,17 @@ def generate_materialized_fission(
             device.body.insert(
                 0, statement_from_string("cute.arch.griddepcontrol_launch_dependents()")
             )
-        if (
-            config.get("tcgen05_materialized_pdl", False)
-            and pdl_roots is not None
-            and func.device_ir.root_ids[stage_index] == pdl_roots[1]
-        ):
+            # Releasing ahead of everything else is only sound for an
+            # ordinary launch, one that started after its predecessors
+            # completed; ``_stage_config`` keeps ``cute_pdl`` away from this
+            # stage and no native plan of a pointwise stage launches with it.
+            assert not any(
+                isinstance(stmt, ast.Assign)
+                and ast.unparse(stmt.targets[0])
+                == f"{device.name}._helion_cute_use_pdl"
+                for stmt in module.body
+            )
+        if pdl_roots is not None and root_id == pdl_roots[1]:
             ab_plans = [
                 item
                 for item in env.cute_resolved_wrapper_plans
