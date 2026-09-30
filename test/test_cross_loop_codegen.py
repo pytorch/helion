@@ -285,6 +285,22 @@ def prewait_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def fixed_block_dense_span_chain(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    y = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(n, block_size=16):
+        y[tile] = x[tile] + 1
+    for row in hl.tile(n // 16, block_size=1):
+        columns = row.begin * 16 + hl.arange(16)
+        out[columns] = y[columns] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def streamed_sibling_reductions(x: torch.Tensor) -> torch.Tensor:
     """Exercise two independently ready nested sites in one consumer root task."""
     batch, width = x.size()
@@ -1880,6 +1896,24 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 "tile_dependency_root_1_scheduled_task",
             ],
         )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_fixed_block_size_dense_span_is_task_ready(self) -> None:
+        x = torch.arange(256, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            fixed_block_dense_span_chain,
+            (x,),
+            block_sizes=[],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        # arange(16) traces as a constant; block_size=1 keeps a symbolic var.
+        self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
