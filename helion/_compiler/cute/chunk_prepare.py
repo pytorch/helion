@@ -584,7 +584,7 @@ def _body_target_counts(
             torch.ops.aten.full.default: 1,
             torch.ops.aten.reciprocal.default: 1,
             torch.ops.aten.sigmoid.default: 1,
-            torch.ops.aten.permute.default: 9,
+            torch.ops.aten.permute.default: 3,
             dot: 10,
             torch.ops.aten.ge.Tensor: 1,
             torch.ops.aten.gt.Tensor: 1,
@@ -1237,18 +1237,6 @@ def _validate_block_inverse_semantics(
     def f16(node: object, source: object) -> bool:
         return _is_convert(node, source, torch.float16)
 
-    def f16_transpose(node: object, source: torch.fx.Node) -> bool:
-        if not isinstance(node, torch.fx.Node) or not _is_convert(
-            node, node.args[0] if node.args else None, torch.float16
-        ):
-            return False
-        transpose = node.args[0]
-        return bool(
-            isinstance(transpose, torch.fx.Node)
-            and _is_call(transpose, torch.ops.aten.permute.default)
-            and transpose.args == (source, [1, 0])
-        )
-
     diagonal = (
         diagonal2.args[0].args[0]
         if isinstance(diagonal2.args[0], torch.fx.Node) and diagonal2.args[0].args
@@ -1257,10 +1245,10 @@ def _validate_block_inverse_semantics(
     if (
         not isinstance(diagonal, torch.fx.Node)
         or not f16(diagonal2.args[0], diagonal)
-        or not f16_transpose(diagonal2.args[1], diagonal)
+        or not f16(diagonal2.args[1], diagonal)
         or diagonal2.args[2] is not None
         or not f16(diagonal4.args[0], diagonal2)
-        or not f16_transpose(diagonal4.args[1], diagonal2)
+        or not f16(diagonal4.args[1], diagonal2)
         or diagonal4.args[2] is not None
     ):
         return False
@@ -1333,11 +1321,8 @@ def _validate_block_inverse_semantics(
     assert inverse_iota is not None
 
     coupling = (
-        first.args[1].args[0].args[0]
-        if isinstance(first.args[1], torch.fx.Node)
-        and first.args[1].args
-        and isinstance(first.args[1].args[0], torch.fx.Node)
-        and first.args[1].args[0].args
+        first.args[1].args[0]
+        if isinstance(first.args[1], torch.fx.Node) and first.args[1].args
         else None
     )
     if (
@@ -1346,7 +1331,7 @@ def _validate_block_inverse_semantics(
         or coupling.args[0] is not lower_half
         or coupling.args[1] is not lower
         or not _zero_scalar(coupling.args[2])
-        or not f16_transpose(first.args[1], coupling)
+        or not f16(first.args[1], coupling)
     ):
         return False
 
@@ -1388,15 +1373,15 @@ def _validate_block_inverse_semantics(
 
     if not (
         f16(correction2.args[0], inverse0)
-        and f16_transpose(correction2.args[1], diagonal2)
+        and f16(correction2.args[1], diagonal2)
         and correction2.args[2] is None
         and f16(correction4.args[0], inverse1)
-        and f16_transpose(correction4.args[1], diagonal4)
+        and f16(correction4.args[1], diagonal4)
         and correction4.args[2] is None
         and f16(first.args[0], inverse2)
         and first.args[2] is None
         and f16(lower_left.args[0], first)
-        and f16_transpose(lower_left.args[1], inverse2)
+        and f16(lower_left.args[1], inverse2)
         and lower_left.args[2] is None
     ):
         return False

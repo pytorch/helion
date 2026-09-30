@@ -11,6 +11,7 @@ from unittest.mock import patch
 from benchmarks.cute.kda_prefill_kernels import BT
 from benchmarks.cute.kda_prefill_kernels import DK
 from benchmarks.cute.kda_prefill_kernels import KDA_PREPARE_CONFIG as _CONFIG
+from benchmarks.cute.kda_prefill_kernels import _block_inverse
 from benchmarks.cute.kda_prefill_kernels import (
     kda_chunk_prepare as _five_factor_prepare,
 )
@@ -28,6 +29,7 @@ from helion._compiler.cute.chunk_prepare import _preferred_split_alias_chunks_pe
 from helion._compiler.cute.chunk_prepare import _TensorRef
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+import helion.language as hl
 from helion.runtime.cute.launcher import _chunk_prepare_expected_tensor_map_specs
 from helion.runtime.cute.launcher import _chunk_prepare_tensor_map_specs
 
@@ -424,6 +426,69 @@ def _captured_plan(
 
 def _captured_plan_after_mutation(mutate: Callable[[DeviceIR], None]) -> object:
     return _captured_plan(mutate=mutate)
+
+
+@pytest.mark.parametrize("contraction", range(6))
+def test_prepare_rejects_transposed_inverse_contraction(contraction: int) -> None:
+    from helion.language.matmul_ops import dot
+
+    def mutate(device_ir: DeviceIR) -> None:
+        dots = [
+            node
+            for node in _prepare_body_nodes(device_ir)
+            if node.op == "call_function"
+            and node.target is dot
+            and node.args[0].meta["val"].dtype == torch.float16
+        ]
+        selected_dot = dots[contraction]
+        rhs = selected_dot.args[1]
+        source = rhs.args[0]
+        with rhs.graph.inserting_before(selected_dot):
+            transpose = rhs.graph.call_function(
+                torch.ops.aten.permute.default, (source, [1, 0])
+            )
+            converted = rhs.graph.call_function(
+                torch.ops.prims.convert_element_type.default,
+                (transpose, torch.float16),
+            )
+        transpose.meta = {**source.meta, "val": source.meta["val"].T}
+        converted.meta = {**rhs.meta, "val": rhs.meta["val"].T}
+        selected_dot.args = (selected_dot.args[0], converted, *selected_dot.args[2:])
+
+    assert _captured_plan_after_mutation(mutate) is None
+
+
+@pytest.mark.parametrize("ref_mode", (helion.RefMode.OFF, helion.RefMode.EAGER))
+def test_block_inverse_matches_triangular_solve(ref_mode: helion.RefMode) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("FP16 inverse oracle requires CUDA")
+
+    @helion.kernel(
+        backend="triton",
+        ref_mode=ref_mode,
+        static_shapes=True,
+        config=helion.Config(block_sizes=[], num_warps=4),
+    )
+    def inverse_only(lower: torch.Tensor, result: torch.Tensor) -> None:
+        for rows, cols in hl.tile([BT, BT], block_size=[BT, BT]):
+            result[rows, cols] = _block_inverse(lower[rows, cols])
+
+    # Dense, asymmetric diagonal blocks and a nonzero lower-left coupling make
+    # all six contractions observable. A zero/diagonal fixture cannot detect
+    # accidental D @ D.T in place of the nilpotent power D @ D.
+    rows = torch.arange(BT, device="cuda")
+    lower = torch.where(
+        rows[:, None] > rows[None, :],
+        ((rows[:, None] * 7 + rows[None, :] * 5) % 13 - 6).float() / 32,
+        0.0,
+    )
+    diagonal = torch.where((rows[:, None] < 8) == (rows[None, :] < 8), lower, 0.0)
+    assert (diagonal @ diagonal - diagonal @ diagonal.T).abs().max() > 0.01
+    eye = torch.eye(BT, dtype=torch.float64, device="cuda")
+    expected = torch.linalg.solve_triangular(eye + lower.double(), eye, upper=False)
+    actual = torch.empty_like(lower, dtype=torch.bfloat16)
+    inverse_only(lower, actual)
+    torch.testing.assert_close(actual.double(), expected, atol=2e-4, rtol=0.005)
 
 
 def test_prepare_rejects_changed_scan_axis() -> None:
@@ -847,6 +912,78 @@ def test_prepare_aliases_qd_ki_after_split_release() -> None:
     assert "allocate_array(cutlass.Int64, 10)" in source
     assert source.count("mbar_q_released") >= 4
     assert source.count("mbar_k_released") >= 4
+
+
+def test_prepare_recycled_ki_preserves_qk_factors() -> None:
+    """QK must finish reading Ki before the next chunk overwrites raw K."""
+
+    from benchmarks.cute.kda_prefill_staged import allocate_kda_factor_workspace
+    from benchmarks.cute.kda_prefill_staged import kda_group_host_metadata
+    from benchmarks.cute.kda_prefill_staged import materialize_kda_group_metadata
+
+    if not torch.cuda.is_available() or not _compat.requires_cuda_version("13"):
+        pytest.skip("Prepare runtime test requires CUDA >= 13")
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_capability(device)[0] != 10:
+        pytest.skip("Prepare runtime test requires SM100")
+
+    heads = 16
+    offsets = (0, 8192, 16385, 24576, 32768)
+    metadata = materialize_kda_group_metadata(
+        kda_group_host_metadata(offsets, (0, len(offsets) - 1)), device
+    )
+    workspace = allocate_kda_factor_workspace(heads, metadata.host.total_chunks, device)
+    generator = torch.Generator(device=device).manual_seed(20260923)
+    q = torch.randn(
+        (1, offsets[-1], heads, DK),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    k = torch.randn(q.shape, dtype=q.dtype, device=device, generator=generator)
+    gate = torch.randn(q.shape, dtype=torch.float32, device=device, generator=generator)
+    beta = torch.randn(q.shape[:-1], dtype=q.dtype, device=device, generator=generator)
+    factors = (
+        workspace.kd,
+        workspace.qd,
+        workspace.ak,
+        workspace.aq,
+        workspace.g_total,
+    )
+    args = (
+        q,
+        k,
+        gate,
+        beta,
+        torch.zeros(heads, dtype=torch.float32, device=device),
+        torch.zeros((heads, DK), dtype=torch.float32, device=device),
+        metadata.cu_seqlens,
+        metadata.cu_chunks,
+        metadata.chunk_to_seq,
+        *factors,
+        None,
+        -5.0 * 1.4426950408889634,
+    )
+    # CPC1 never reuses a Ki image for another chunk and is the control. Use
+    # independent bound objects so setting one config cannot replace the other.
+    control = _five_factor_prepare._bind_isolated(args).compile_config(
+        helion.Config.from_dict(
+            {**_CONFIG.config, "cute_chunk_prepare_schedule": "split_alias_cpc1"}
+        )
+    )
+    recycled = _five_factor_prepare._bind_isolated(args).compile_config(
+        helion.Config.from_dict(
+            {**_CONFIG.config, "cute_chunk_prepare_schedule": "split_alias_cpc2"}
+        )
+    )
+    control(*args)
+    expected = tuple(value.clone() for value in factors)
+    flush = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    for _ in range(50):
+        flush.zero_()
+        recycled(*args)
+        for actual, reference in zip(factors, expected, strict=True):
+            assert torch.equal(actual, reference)
 
 
 @pytest.mark.parametrize(
