@@ -4681,6 +4681,8 @@ class TileDependencyGraph:
     edges: tuple[TileDependency, ...]
     execution_sites: tuple[ExecutionSite, ...] = ()
     site_ids_by_access: tuple[tuple[int, ...], ...] = ()
+    # Loop axes whose coordinates are shifted by a begin or a step.
+    noncanonical_axes: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if tuple(site.site_id for site in self.execution_sites) != tuple(
@@ -5752,6 +5754,12 @@ def instantiate_symbolic_dependencies(
                                     prove_nonnegative=prove_nonnegative,
                                 )
                                 if axes_have_canonical_origins
+                                and dependency_graph.noncanonical_axes.isdisjoint(
+                                    (
+                                        *producer_domain.axis_order,
+                                        *consumer_domain.axis_order,
+                                    )
+                                )
                                 else None
                             ),
                         )
@@ -6318,6 +6326,7 @@ def build_tile_dependency_graph(
         edges=tuple(edges),
         execution_sites=execution_sites,
         site_ids_by_access=tuple(site_ids_by_access),
+        noncanonical_axes=noncanonical_task_origin_block_ids,
     )
 
 

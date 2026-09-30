@@ -85,6 +85,20 @@ def scalar_and_nonaffine_subscripts(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True, autotune_effort="none")
+def shifted_inner_grid(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    for i in hl.grid(n):
+        y[i] = x[i]
+    hl.barrier()
+    for tile in hl.tile(n, block_size=16):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for j in hl.grid(2, 6):
+            acc = acc + y[j + 1]
+        x[tile] = acc
+    return x
+
+
 def _axis_geometry(
     root_domains: tuple[CoordinateDomain, ...],
 ) -> dict[int, tuple[int, int]]:
@@ -1207,6 +1221,36 @@ class TestTileDependency(TestCase):
                 (4, "load", block_ids[4], 1, 1, False),  # unit-block tile.begin + 1
                 (4, "store", block_ids[4], 1, 0, False),
             ],
+        )
+
+    @skipIfRefEager("compiled DeviceIR is unavailable in ref eager mode")
+    def test_shifted_inner_loop_has_no_incidence(self) -> None:
+        x = torch.empty(64, device=DEVICE)
+        bound = shifted_inner_grid.bind((x, torch.empty_like(x)))
+        host = bound.host_function
+        assert host is not None
+        with bound.env, host:
+            accesses = DeviceIRAnalysis.build(host.device_ir, bound.env).tile_accesses(
+                host.device_ir, bound.env, host
+            )
+            graph = build_tile_dependency_graph(
+                accesses, device_ir=host.device_ir, root_phases=(0, 0)
+            )
+        (inner,) = (
+            site.site_id
+            for site in graph.execution_sites
+            if len(site.logical_axis_order) == 2
+        )
+        # Blocks: outer grid, root tile, inner grid.
+        root_domains, site_domains = _configured_domains(
+            graph, {0: (64, 1), 1: (4, 16), 2: (4, 1)}
+        )
+        relations = instantiate_symbolic_dependencies(
+            graph, root_domains=root_domains, site_domains=site_domains
+        )
+        # y[j + 1] reads y[c + 3]; a zero-based incidence would claim y[c + 1].
+        self.assertEqual(
+            [r.incidence for r in relations if r.consumer_site_id == inner], [None]
         )
 
     def test_noninjective_regions_are_not_coordinate_disjoint(self) -> None:
