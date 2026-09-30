@@ -125,6 +125,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
         expected = ((x + 1) + (y + 5)) * 2 + 7
         torch.testing.assert_close(out, expected)
 
+    @onlyBackends(["triton"])
     @skipIfRefEager("pid_type validation is only enforced in compiled mode")
     def test_non_persistent_pid_type_errors(self) -> None:
         x = torch.arange(4, device=DEVICE, dtype=torch.float32)

@@ -312,11 +312,14 @@ class ReductionStrategy(TileStrategy):
         return 0
 
     def thread_axes_used(self) -> int:
-        return 1 if self._reduction_thread_count() > 0 else 0
+        count = self._reduction_thread_count()
+        if CompileEnvironment.current().backend_name == "cute" and count == 1:
+            return 0
+        return 1 if count > 0 else 0
 
     def thread_block_sizes(self) -> list[int]:
         count = self._reduction_thread_count()
-        return [count] if count > 0 else []
+        return [count] if self.thread_axes_used() else []
 
     def _reduction_block_has_lane_loops(self) -> bool:
         """Return True when this reduction block is being traversed via a
