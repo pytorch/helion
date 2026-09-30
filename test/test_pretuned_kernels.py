@@ -623,6 +623,7 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     },
     "fused_qk_norm_rope": {
         "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=7.2, wins_slack=2),
+        "sm100": ExpectedPerf(helion_wins=21, total=21, geomean=1.27, wins_slack=1),
     },
     # These are fixed-capacity B200 gates.  Allowing every individual win to
     # cross parity avoids a flaky binary pass/fail; the aggregate geomean is the
