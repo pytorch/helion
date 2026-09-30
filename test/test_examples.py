@@ -1170,7 +1170,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("Pallas rejects int64 inputs (jagged offsets)")
-    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
     def test_jagged_dense_bmm(self):
         mod = import_path(EXAMPLES_DIR / "jagged_dense_bmm.py")
@@ -1578,7 +1577,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @xfailIfPallas("tensor-derived if-predicates not supported")
-    @skipIfXPU("Jagged tensor operations not fully supported on XPU")
     def test_jagged_hstu_attn(self):
         batch_size = 4
         max_seq_len = 64
@@ -2296,7 +2294,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfSharedMemoryLessThan(
         131072, reason="block sizes exceed device shared memory limit"
     )
-    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     def test_squeeze_and_excitation_net_fwd(self):
         self._check_squeeze_and_excitation_net_fwd(automatic=False)
 
@@ -2345,7 +2342,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @xfailIfPallas("conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
-    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
     @skipIfTileIR("accuracy failure")
     def test_squeeze_and_excitation_net_bwd_dx(self):
         m, n, k = 256, 256, 256
@@ -2390,7 +2386,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @xfailIfPallas("tensor accessed with conflicting tiling patterns")
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
-    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_da(self):
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -2433,7 +2428,6 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
-    @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_db(self):
         torch.manual_seed(0)
         m, n, k = 256, 256, 256
