@@ -17,6 +17,7 @@ The workflow is:
 
 from __future__ import annotations
 
+import ast
 import copy
 import csv
 from dataclasses import dataclass
@@ -54,6 +55,7 @@ from ..runtime.cute_structural_config import require_same_structural_policy
 from .aot_kernel import _flatten_key_value
 from .aot_kernel import extract_key_features
 from .aot_kernel import extract_shape_features
+from .aot_structural_policy import MODEL_MANIFEST
 from .aot_structural_policy import load_policy_module
 from .aot_structural_policy import measurement_config_hash
 from .aot_structural_policy import measurement_metadata
@@ -140,6 +142,10 @@ def find_heuristic_file(
     3. Fallback to older compute capabilities within the same device family
     4. AOT data directory: heuristic_<kernel_name>.py (fallback)
 
+    Policy-specific names take precedence at each location. Architecture-named
+    files may omit the policy suffix if their structural manifest matches.
+    Generated data-directory models retain their policy-specific names.
+
     Args:
         kernel_source_file: Path to the kernel's source file
         kernel_name: Optional kernel name for fallback lookup
@@ -191,12 +197,35 @@ def find_heuristic_file(
     # Find first existing file
     result: Path | None = None
     for candidate in candidates:
-        candidate = policy_path(candidate, policy)
-        if candidate.exists():
-            log.debug(f"Found heuristic file: {candidate}")
-            result = candidate
+        partitioned = policy_path(candidate, policy)
+        if partitioned.exists():
+            result = partitioned
             break
+        if (
+            policy is None
+            or kernel_name is None
+            or not candidate.name.startswith("_helion_aot_")
+            or not candidate.is_file()
+        ):
+            continue
+        # Do not import legacy modules while probing for an explicit policy.
+        if not any(
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == MODEL_MANIFEST
+                for target in node.targets
+            )
+            for node in ast.parse(candidate.read_bytes(), filename=str(candidate)).body
+        ):
+            continue
+        module = AOTAutotuneCache._load_heuristic_module(candidate, policy)
+        assert module is not None
+        model_configs(module, kernel_name, policy)
+        result = candidate
+        break
 
+    if result is not None:
+        log.debug(f"Found heuristic file: {result}")
     _heuristic_file_cache[cache_key] = result
     return result
 

@@ -412,15 +412,23 @@ def test_public_prebinding_key_uses_resolved_policy_and_policy_scoped_cache(
     assert keys[0] is keys[1] and keys[0] is not keys[2]
 
 
+@pytest.mark.parametrize("policy_named", [False, True])
 @pytest.mark.parametrize(
     "change", ["policy", "version", "id", "config_policy", "missing"]
 )
 def test_bad_model_rejected_before_key_or_config_callback(
-    change: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    change: str,
+    policy_named: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     function = _function(tmp_path)
     policy = CuteStructuralPolicy()
-    path = policy_path(tmp_path / "heuristic__pointwise.py", policy)
+    path = (
+        policy_path(tmp_path / "heuristic__pointwise.py", policy)
+        if policy_named
+        else tmp_path / "_helion_aot_original_cuda_sm100.py"
+    )
     _write_model(path, function.__name__, policy)
     module = _module(path)
     payload = copy.deepcopy(vars(module)[MODEL_MANIFEST])
@@ -452,6 +460,41 @@ def test_bad_model_rejected_before_key_or_config_callback(
         kernel.bind((torch.empty(37),))
 
 
+@pytest.mark.parametrize("location", ["source", "override"])
+@pytest.mark.parametrize("policy_named", [False, True])
+def test_unsuffixed_architecture_model_loads_validated_key_and_config(
+    location: str,
+    policy_named: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    function = _function(tmp_path)
+    policy = CuteStructuralPolicy()
+    directory = tmp_path
+    if location == "override":
+        directory = tmp_path / "override"
+        directory.mkdir()
+        monkeypatch.setenv("HELION_HEURISTIC_DIR", str(directory))
+    else:
+        monkeypatch.delenv("HELION_HEURISTIC_DIR", raising=False)
+    path = directory / "_helion_aot_original_cuda_sm100.py"
+    _write_model(path, function.__name__, policy, selected=1)
+    expected_index = 1
+    if policy_named:
+        # The explicit partition wins when both forms exist.
+        _write_model(policy_path(path, policy), function.__name__, policy, selected=0)
+        path.write_text("raise AssertionError('unsuffixed model imported')")
+        expected_index = 0
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    kernel = helion.aot_kernel(function, backend="cute", cute_structural_policy=policy)
+    args = (torch.empty(37),)
+    assert kernel._key_fn(*args) == expected_index
+    cache = AOTAutotuneCache(BaseSearch(kernel._bind_isolated(args), args))
+    config = cache._get_heuristic_config()
+    assert config is not None
+    assert config.block_sizes == [[32], [64]][expected_index]
+
+
 def test_policy_lookup_never_falls_back_to_unversioned_model(tmp_path: Path) -> None:
     source = tmp_path / "original.py"
     source.touch()
@@ -461,6 +504,21 @@ def test_policy_lookup_never_falls_back_to_unversioned_model(tmp_path: Path) -> 
     assert (
         find_heuristic_file(
             source, "_pointwise", tmp_path, policy=CuteStructuralPolicy()
+        )
+        is None
+    )
+
+
+def test_policy_lookup_keeps_generated_models_partitioned(tmp_path: Path) -> None:
+    function = _function(tmp_path)
+    policy = CuteStructuralPolicy()
+    _write_model(tmp_path / "heuristic__pointwise.py", function.__name__, policy)
+    assert (
+        find_heuristic_file(
+            function.__code__.co_filename,
+            function.__name__,
+            tmp_path,
+            policy=policy,
         )
         is None
     )

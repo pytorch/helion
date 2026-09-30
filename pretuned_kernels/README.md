@@ -7,7 +7,7 @@ who want to quickly try Helion.
 
 The checked-in heuristics let these kernels run immediately without online
 autotuning.  Each entry lists the NVIDIA architecture it supports (currently
-H100, B200, or both), and Helion picks the matching file at runtime.  Treat the
+H100, B200, or GB300), and Helion picks the matching file at runtime.  Treat the
 files as kernel recipes: copy the kernel and its local `_helion_aot_*` heuristic
 into your code, then retune when your target shapes or hardware differ
 materially from the included sweep.
