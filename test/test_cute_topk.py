@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import gc
 import itertools
+import operator
 import random
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -4219,6 +4220,23 @@ def _pointwise_row_topk(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _temperature_row_topk(
+    x: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=torch.float32, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    summary = torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1)
+        logits = vals.to(torch.float32) / 0.75
+        values[row, :] = torch.softmax(logits, dim=-1)
+        indices[row, :] = idx
+        summary[row, :] = torch.sum(logits, dim=-1, keepdim=True)
+    return values, indices, summary
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _preprocessed_row_topk(
     x: torch.Tensor, k: int, largest: hl.constexpr
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -4252,6 +4270,20 @@ def _broadcast_row_topk(
     return values, indices
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_reduction_row_topk(
+    x: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=torch.float32, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1)
+        values[row, :] = vals.to(torch.float32).sum(dim=-1, keepdim=True)
+        indices[row, :] = idx
+    return values, indices
+
+
 def _composition_config(lanes: int, layout: str) -> dict[str, object]:
     return {
         "block_sizes": [1],
@@ -4275,15 +4307,21 @@ def _assert_composed_register_selection(code: str, layout: str) -> None:
 
 @pytest.mark.usefixtures("cpu_codegen")
 @pytest.mark.parametrize("layout", ["replicated", "distributed"])
-@pytest.mark.parametrize("kind", ["pointwise", "preprocess", "broadcast"])
+@pytest.mark.parametrize(
+    "kind", ["pointwise", "temperature", "preprocess", "broadcast", "broadcast_store"]
+)
 def test_topk_composition_codegen(kind: str, layout: str) -> None:
     x = torch.empty((5, 65), dtype=torch.bfloat16)
     kernel: helion.Kernel[Any]
     args: tuple[object, ...]
     if kind == "pointwise":
         kernel, args = _pointwise_row_topk, (x, 3)
+    elif kind == "temperature":
+        kernel, args = _temperature_row_topk, (x, 3)
     elif kind == "preprocess":
         kernel, args = _preprocessed_row_topk, (x, 3, True)
+    elif kind == "broadcast_store":
+        kernel, args = _broadcast_reduction_row_topk, (x, 3)
     else:
         scale = torch.empty((5, 1), dtype=torch.float32)
         bias = torch.empty((65,), dtype=torch.float32)
@@ -4292,6 +4330,40 @@ def test_topk_composition_codegen(kind: str, layout: str) -> None:
     config = bound.config_spec.default_config()
     config.config.update(_composition_config(8, layout))
     _assert_composed_register_selection(bound.to_code(config), layout)
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("destination_columns", [1, 3])
+def test_topk_composition_rejects_mismatched_store_extent(
+    destination_columns: int,
+) -> None:
+    x = torch.empty((5, 65), dtype=torch.bfloat16)
+    bound = _temperature_row_topk._bind_isolated((x, 3))
+    host = bound.host_function
+    assert host is not None
+    with bound.env, host:
+        plan = match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set())
+        assert plan is not None and plan.fragment_graph is not None
+        graph = plan.fragment_graph
+        target = next(
+            effect
+            for effect in graph.stores
+            if effect.args[0].meta["val"].dtype == torch.float32
+            and effect.args[0].meta["val"].size(1) == destination_columns
+        )
+        replacement = (
+            graph.source
+            if destination_columns == 3
+            else next(
+                node
+                for node in graph.root_graph.nodes
+                if node.target is torch.ops.aten.div.Tensor and node.args[1] == 0.75
+            )
+        )
+        target.args = (*target.args[:2], replacement, target.args[3])
+        assert (
+            match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set()) is None
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -4330,6 +4402,64 @@ def test_topk_composition_pointwise_outputs(
         atol=1e-7,
         equal_nan=True,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "n,k,lanes,layout",
+    [
+        (65, 3, 8, "replicated"),
+        (64, 8, 16, "distributed"),
+        (64, 32, 2, "distributed"),
+        (64, 32, 8, "distributed"),
+    ],
+)
+def test_topk_composition_temperature_and_row_reduction(
+    n: int, k: int, lanes: int, layout: str
+) -> None:
+    x = torch.randn((5, n), dtype=torch.float16, device=DEVICE)
+    x[0] = float("inf")
+    x[1] = float("-inf")
+    x[2, 0] = float("nan")
+    original = x.clone()
+    code, (values, indices, summary) = code_and_output(
+        _temperature_row_topk, (x, k), **_composition_config(lanes, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    assert values.dtype == summary.dtype == torch.float32
+    selected = original.gather(1, indices)
+    _check_topk(x, original, (selected, indices), k, True)
+    logits = selected.float() / 0.75
+    torch.testing.assert_close(
+        values, torch.softmax(logits, dim=-1), rtol=2e-6, atol=1e-7, equal_nan=True
+    )
+    torch.testing.assert_close(
+        summary, logits.sum(dim=-1, keepdim=True), equal_nan=True
+    )
+    # Inactive lanes must not contribute duplicate selected values or padding.
+    finite_rows = torch.isfinite(logits).all(dim=-1)
+    torch.testing.assert_close(
+        values[finite_rows].sum(dim=-1), torch.ones_like(summary[finite_rows, 0])
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "k,lanes,layout", [(3, 8, "distributed"), (8, 16, "replicated")]
+)
+def test_topk_composition_broadcasts_row_reduction_store(
+    k: int, lanes: int, layout: str
+) -> None:
+    x = torch.randn((5, 65), dtype=torch.float16, device=DEVICE)
+    original = x.clone()
+    code, (values, indices) = code_and_output(
+        _broadcast_reduction_row_topk, (x, k), **_composition_config(lanes, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    selected = original.gather(1, indices)
+    _check_topk(x, original, (selected, indices), k, True)
+    expected = selected.float().sum(dim=-1, keepdim=True).expand_as(values)
+    torch.testing.assert_close(values, expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -4526,6 +4656,127 @@ def test_topk_composition_reuses_prologue_across_layouts(layout: str) -> None:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _expanded_row_topk(
+    x: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    expanded_output = torch.empty_like(x, dtype=torch.float32)
+    sums = torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        source = x[row, :]
+        values, idx = torch.topk(source, k, dim=-1)
+        total = values.float().sum(-1, keepdim=True)
+        expanded = total.expand_as(source)
+        expanded_output[row, :] = expanded
+        sums[row, :] = expanded.sum(-1, keepdim=True)
+        indices[row, :] = idx
+    return expanded_output, sums, indices
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _integer_boolean_reduction_row_topk(
+    x: torch.Tensor, k: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    index_sum = torch.empty((x.size(0), 1), dtype=torch.int64, device=x.device)
+    positive = torch.empty((x.size(0), 1), dtype=torch.bool, device=x.device)
+    all_positive = torch.empty((x.size(0), 1), dtype=torch.bool, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        values, idx = torch.topk(x[row, :], k, dim=-1)
+        index_sum[row, :] = (idx * 2**40).sum(-1, keepdim=True)
+        positive[row, :] = (values > 0).amax(-1, keepdim=True)
+        all_positive[row, :] = (values > 0).amin(-1, keepdim=True)
+        indices[row, :] = idx
+    return index_sum, positive, all_positive, indices
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize("kind", ["expand", "integer_boolean"])
+def test_topk_composition_reduction_shapes_codegen(kind: str, layout: str) -> None:
+    kernel = (
+        _expanded_row_topk if kind == "expand" else _integer_boolean_reduction_row_topk
+    )
+    bound = kernel._bind_isolated((torch.empty((5, 65), dtype=torch.bfloat16), 3))
+    config = bound.config_spec.default_config()
+    config.config.update(_composition_config(8, layout))
+    _assert_composed_register_selection(bound.to_code(config), layout)
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+def test_topk_composition_rejects_shape_query_arithmetic() -> None:
+    bound = _expanded_row_topk._bind_isolated(
+        (torch.empty((5, 65), dtype=torch.bfloat16), 3)
+    )
+    host = bound.host_function
+    assert host is not None
+    with bound.env, host:
+        plan = match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set())
+        assert plan is not None and plan.fragment_graph is not None
+        graph = plan.fragment_graph.root_graph
+        query = next(
+            node for node in graph.nodes if node.target is torch.ops.aten.sym_size.int
+        )
+        view = next(iter(query.users))
+        with graph.inserting_before(view):
+            arithmetic = graph.call_function(operator.add, (query, 1))
+            arithmetic.meta["val"] = query.meta["val"] + 1
+        view.update_arg(
+            1, [arithmetic if value is query else value for value in view.args[1]]
+        )
+        assert (
+            match_topk_root(host.device_ir.graphs, noncanonical_block_ids=set()) is None
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_composition_expand_as_uses_logical_extent(layout: str) -> None:
+    x = torch.randn((5, 65), dtype=torch.bfloat16, device=DEVICE)
+    original = x.clone()
+    code, (expanded, sums, indices) = code_and_output(
+        _expanded_row_topk, (x, 3), **_composition_config(8, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    selected = original.gather(1, indices)
+    torch.testing.assert_close(selected, torch.topk(original, 3, dim=-1).values)
+    expected = selected.float().sum(-1, keepdim=True).expand_as(original)
+    torch.testing.assert_close(expanded, expected, rtol=0, atol=0)
+    # The reduction must visit 65 columns, excluding the padded tile entries.
+    torch.testing.assert_close(sums, expected.sum(-1, keepdim=True))
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_composition_integer_boolean_reductions(layout: str) -> None:
+    x = torch.randn((5, 65), dtype=torch.bfloat16, device=DEVICE)
+    x[0] = -x[0].abs() - 1
+    x[1] = x[1].abs() + 1
+    x[2] = 0
+    x[4] = -x[4].abs() - 1
+    x[4, 0] = 1
+    original = x.clone()
+    code, (index_sum, positive, all_positive, indices) = code_and_output(
+        _integer_boolean_reduction_row_topk,
+        (x, 3),
+        **_composition_config(8, layout),
+    )
+    _assert_composed_register_selection(code, layout)
+    selected = original.gather(1, indices)
+    torch.testing.assert_close(selected, torch.topk(original, 3, dim=-1).values)
+    torch.testing.assert_close(index_sum, (indices * 2**40).sum(-1, keepdim=True))
+    torch.testing.assert_close(positive, (selected > 0).amax(-1, keepdim=True))
+    torch.testing.assert_close(all_positive, (selected > 0).amin(-1, keepdim=True))
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+# Full sorting reuses the same ordered-key networks and subgroup layouts.
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _row_network_sort(
     x: torch.Tensor, descending: hl.constexpr
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -4575,6 +4826,250 @@ def test_sort_network_preserves_values_indices_and_ties(
     )
     torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
     assert torch.equal(values.view(torch.int16), expected_values.view(torch.int16))
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _normalized_input_row_topk(
+    x: torch.Tensor, k: int, mode: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=x.dtype, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    normalized = torch.empty_like(x)
+    for row in hl.tile(x.size(0)):
+        source = x[row, :].to(torch.float32)
+        if mode == "rms":
+            variance = torch.sum(source * source, dim=-1, keepdim=True) / x.size(1)
+            source = source * torch.rsqrt(variance + 1e-5)
+        else:
+            source = torch.softmax(source, dim=-1)
+        source = source.to(x.dtype)
+        vals, idx = torch.topk(source, k, dim=-1)
+        values[row, :] = vals
+        indices[row, :] = idx
+        normalized[row, :] = source
+    return values, indices, normalized
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("mode", ["rms", "softmax"])
+@pytest.mark.parametrize("width", [64, 65])
+def test_topk_composition_reduces_input_and_vectorizes(mode: str, width: int) -> None:
+    x = torch.empty((5, width), dtype=torch.bfloat16)
+    bound = _normalized_input_row_topk._bind_isolated((x, 8, mode))
+    code = bound.to_code(_composition_config(4, "distributed"))
+    _assert_composed_register_selection(code, "distributed")
+    assert "row_reduce" in code
+    assert ("cute.autovec_copy(row_transfer_memory" in code) == (width == 64)
+    assert "subgroup_vectorize" in code
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("mode", ["rms", "softmax"])
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+@pytest.mark.parametrize("width", [64, 65])
+def test_topk_composition_normalizes_before_selection(
+    mode: str, layout: str, width: int
+) -> None:
+    x = torch.randn((5, width), dtype=torch.bfloat16, device=DEVICE)
+    x[0].zero_()
+    x[0, 1::2] = -0.0
+    x[1, 1] = float("nan")
+    x[2, 2] = float("inf")
+    original = x.clone()
+    code, (values, indices, normalized) = code_and_output(
+        _normalized_input_row_topk, (x, 8, mode), **_composition_config(4, layout)
+    )
+    _assert_composed_register_selection(code, layout)
+    selected = normalized.gather(1, indices)
+    assert torch.equal(values.view(torch.int16), selected.view(torch.int16))
+    torch.testing.assert_close(
+        values, torch.topk(normalized, 8, dim=-1).values, rtol=0, atol=0, equal_nan=True
+    )
+    source = original.float()
+    expected = (
+        source * torch.rsqrt((source * source).sum(-1, keepdim=True) / width + 1e-5)
+        if mode == "rms"
+        else torch.softmax(source, dim=-1)
+    ).to(x.dtype)
+    torch.testing.assert_close(
+        normalized, expected, rtol=0.004, atol=1e-7, equal_nan=True
+    )
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _ordered_extremum_row_topk(
+    x: torch.Tensor, k: int, largest: hl.constexpr, scale: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=torch.float32, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1, largest=largest)
+        logits = vals.to(torch.float32) * scale
+        exponents = torch.exp(logits - torch.amax(logits, dim=-1, keepdim=True))
+        values[row, :] = exponents / torch.sum(exponents, dim=-1, keepdim=True)
+        indices[row, :] = idx
+    return values, indices
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize("k,lanes,scale", [(6, 4, 1.0), (32, 2, 1.0), (6, 4, -1.0)])
+def test_topk_composition_order_fact_is_monotone(
+    k: int, lanes: int, scale: float
+) -> None:
+    x = torch.empty((5, 64), dtype=torch.bfloat16)
+    bound = _ordered_extremum_row_topk._bind_isolated((x, k, False, scale))
+    code = bound.to_code(_composition_config(lanes, "distributed"))
+    _assert_composed_register_selection(code, "distributed")
+    assert ("row_known_maximum" in code) == (scale > 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("k,lanes,scale", [(6, 4, 1.0), (32, 2, 1.0), (6, 4, -1.0)])
+@pytest.mark.parametrize("largest", [False, True])
+def test_topk_composition_ordered_maximum_owner(
+    k: int, lanes: int, scale: float, largest: bool
+) -> None:
+    x = torch.randn((5, 64), dtype=torch.bfloat16, device=DEVICE)
+    x[0].zero_()
+    x[0, 1::2] = -0.0
+    x[1].fill_(float("nan"))
+    x[2, 0] = float("inf")
+    x[2, 1] = -float("inf")
+    original = x.clone()
+    code, (values, indices) = code_and_output(
+        _ordered_extremum_row_topk,
+        (x, k, largest, scale),
+        **_composition_config(lanes, "distributed"),
+    )
+    _assert_composed_register_selection(code, "distributed")
+    assert ("row_known_maximum" in code) == (scale > 0)
+    selected = original.gather(1, indices)
+    torch.testing.assert_close(
+        selected,
+        torch.topk(original, k, dim=-1, largest=largest).values,
+        rtol=0,
+        atol=0,
+        equal_nan=True,
+    )
+    expected = torch.softmax(selected.float() * scale, dim=-1)
+    torch.testing.assert_close(values, expected, rtol=2e-6, atol=1e-7, equal_nan=True)
+    assert torch.equal(x.view(torch.int16), original.view(torch.int16))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _semantic_row_topk(
+    x: torch.Tensor, k: int, mode: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor]:
+    k = hl.specialize(k)
+    values = torch.empty((x.size(0), k), dtype=torch.float32, device=x.device)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1)
+        logits = vals.to(torch.float32) / 0.75
+        if mode == "softmax":
+            shifted = logits - torch.amax(logits, dim=-1, keepdim=True)
+            exponents = torch.exp(shifted)
+            output = exponents / torch.sum(exponents, dim=-1, keepdim=True)
+        elif mode == "logsumexp":
+            maximum = torch.amax(logits, dim=-1, keepdim=True)
+            output = maximum + torch.log(
+                torch.sum(torch.exp(logits - maximum), dim=-1, keepdim=True)
+            )
+        elif mode == "reciprocal":
+            output = torch.reciprocal(logits)
+        elif mode == "zero_sign":
+            output = (torch.reciprocal(logits) < 0).to(torch.float32)
+        elif mode == "predicate":
+            output = (logits == 0).to(torch.float32)
+        else:
+            output = logits
+        values[row, :] = output
+        indices[row, :] = idx
+    return values, indices
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _indices_only_composed_row_topk(x: torch.Tensor, k: int) -> torch.Tensor:
+    k = hl.specialize(k)
+    indices = torch.empty((x.size(0), k), dtype=torch.int64, device=x.device)
+    for row in hl.tile(x.size(0)):
+        vals, idx = torch.topk(x[row, :], k, dim=-1)
+        indices[row, :] = idx * 2 + 1
+    return indices
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+@pytest.mark.parametrize(
+    "mode", ["softmax", "logsumexp", "reciprocal", "zero_sign", "predicate", "raw"]
+)
+def test_topk_composition_value_observability_codegen(mode: str) -> None:
+    x = torch.empty((5, 64), dtype=torch.bfloat16)
+    bound = _semantic_row_topk._bind_isolated((x, 8, mode))
+    config = _composition_config(4, "distributed")
+    config["cute_topk_rank_mode"] = "signed"
+    code = bound.to_code(config)
+    _assert_composed_register_selection(code, "distributed")
+    assert ("row_known_maximum" in code) == (mode in ("softmax", "logsumexp"))
+    assert ("if not topk_value_decodable" in code) == (
+        mode not in ("softmax", "predicate")
+    )
+
+
+@pytest.mark.usefixtures("cpu_codegen")
+def test_topk_composition_indices_only_avoids_value_recovery() -> None:
+    x = torch.empty((5, 64), dtype=torch.bfloat16)
+    bound = _indices_only_composed_row_topk._bind_isolated((x, 8))
+    code = bound.to_code(_composition_config(4, "distributed"))
+    _assert_composed_register_selection(code, "distributed")
+    assert "row_selected_values" not in code
+    assert "topk_value_decodable" not in code
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "mode", ["softmax", "logsumexp", "reciprocal", "zero_sign", "predicate", "raw"]
+)
+@pytest.mark.parametrize("layout", ["replicated", "distributed"])
+def test_topk_composition_value_observability(mode: str, layout: str) -> None:
+    x = torch.randn((5, 64), dtype=torch.bfloat16, device=DEVICE)
+    x[0].zero_()
+    x[0, 1::2] = -0.0
+    x[1, :8] = float("nan")
+    x[2, :8] = float("inf")
+    original = x.clone()
+    config = _composition_config(4, layout)
+    config["cute_topk_rank_mode"] = "signed"
+    code, (values, indices) = code_and_output(
+        _semantic_row_topk, (x, 8, mode), **config
+    )
+    _assert_composed_register_selection(code, layout)
+    selected = original.gather(1, indices)
+    torch.testing.assert_close(
+        selected, torch.topk(original, 8, dim=-1).values, rtol=0, atol=0, equal_nan=True
+    )
+    logits = selected.float() / 0.75
+    if mode == "softmax":
+        expected = torch.softmax(logits, dim=-1)
+    elif mode == "logsumexp":
+        maximum = logits.amax(dim=-1, keepdim=True)
+        expected = (
+            maximum + torch.log(torch.exp(logits - maximum).sum(-1, keepdim=True))
+        ).expand_as(logits)
+    elif mode == "reciprocal":
+        expected = logits.reciprocal()
+    elif mode == "zero_sign":
+        expected = (logits.reciprocal() < 0).float()
+    elif mode == "predicate":
+        expected = (logits == 0).float()
+    else:
+        expected = logits
+    torch.testing.assert_close(values, expected, rtol=2e-6, atol=1e-7, equal_nan=True)
+    if mode in ("raw", "reciprocal"):
+        assert torch.equal(values[0].signbit(), expected[0].signbit())
     assert torch.equal(x.view(torch.int16), original.view(torch.int16))
 
 

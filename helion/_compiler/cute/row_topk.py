@@ -82,6 +82,46 @@ def _extent(value: object) -> int | None:
     return row_fragment_logical_extent(value)
 
 
+def _static_view_shape_query(node: Node) -> bool:
+    """Admit static tensor sizes only as direct view-shape operands."""
+    if (
+        node.target is not torch.ops.aten.sym_size.int
+        or len(node.args) != 2
+        or node.kwargs
+    ):
+        return False
+    source, dim = node.args
+    tensor = _tensor(source)
+    size = node.meta.get("val")
+    if (
+        tensor is None
+        or type(dim) is not int
+        or not -tensor.ndim <= dim < tensor.ndim
+        or not isinstance(size, (int, torch.SymInt))
+        or _extent(size) is None
+        or not CompileEnvironment.current().known_equal(size, tensor.size(dim))
+        or not node.users
+    ):
+        return False
+    for user in node.users:
+        if (
+            user.target
+            not in (
+                torch.ops.aten.expand.default,
+                torch.ops.aten.view.default,
+                torch.ops.aten.reshape.default,
+                torch.ops.aten._unsafe_view.default,
+            )
+            or len(user.args) != 2
+            or not isinstance(user.args[1], (tuple, list))
+            or node not in user.args[1]
+            or user.args[0] is node
+            or any(isinstance(value, Node) for value in user.kwargs.values())
+        ):
+            return False
+    return True
+
+
 def _unique_tensors(nodes: Sequence[Node]) -> tuple[torch.Tensor, ...]:
     tensors: dict[int, torch.Tensor] = {}
     for node in nodes:
@@ -97,8 +137,9 @@ def match_row_topk(
     """Accept one complete-row selection and a pure DAG with row-local stores.
 
     Full-extent reduction carriers are aliases for their child graph outputs;
-    they do not introduce another execution domain. Input expressions must be
-    pointwise so exceptional selected values can be recomputed at their index.
+    they do not introduce another execution domain. Input reductions remain
+    replicated row statistics and can be reused when selected values need
+    exact recovery at their original index.
     Runtime storage disjointness remains a separate cache-specialized proof.
     """
     roots = {id(info.graph): info for info in graphs if isinstance(info, RootGraphInfo)}
@@ -354,6 +395,7 @@ def match_row_topk(
         if (
             node.target in (load, store, _host_tensor, _get_symnode)
             or node is selection
+            or _static_view_shape_query(node)
         ):
             continue
         if node.target is operator.getitem:
@@ -397,7 +439,7 @@ def match_row_topk(
 
     prologue: set[Node] = set()
 
-    def pointwise_source(node: Node) -> bool:
+    def recoverable_source(node: Node) -> bool:
         node = resolve(node)
         if node in prologue:
             return True
@@ -405,12 +447,12 @@ def match_row_topk(
         if node.target is load:
             return True
         return supports_row_fragment_node(node) and all(
-            pointwise_source(argument)
+            recoverable_source(argument)
             for argument in node.all_input_nodes
             if _tensor(resolve(argument)) is not None
         )
 
-    if not pointwise_source(source):
+    if not recoverable_source(source):
         return None
     # No output may alias an input or another output even through distinct
     # views. Separate StorageImpls still need the final runtime span proof.

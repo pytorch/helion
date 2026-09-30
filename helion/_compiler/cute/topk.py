@@ -58,7 +58,6 @@ class CuteTopKPlan:
     key_encoder: str = "dsl"
     defer_value_gathers: bool = False
     merge_schedule: str = "sequential"
-
     stable_ties: bool = False
 
     @property
