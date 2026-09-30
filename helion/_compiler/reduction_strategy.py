@@ -388,6 +388,28 @@ class ReductionStrategy(TileStrategy):
                         return cluster_by_block.get(self.block_index, 1)
         return 1
 
+    def _launch_thread_axis_extent(self, axis: int, extent: int) -> int:
+        """``extent`` widened to the launch's thread count along ``axis``.
+
+        Sibling loop paths reuse a CUDA axis and the launch takes the widest
+        of them, so a narrower sibling (a 16-row ``hl.tile`` beside a
+        32-thread K loop) runs with surplus threads: their tile mask fails,
+        so they hold the reduction's identity, but they execute every
+        collective of the body.  A cross-thread combine over the axis has to
+        span them.  A group sized to the strategy's own extent leaves the
+        surplus threads reducing among themselves, so a value every thread of
+        the row is meant to hold -- a per-column sum multiplied back into the
+        row and stored by all of them -- differs between the real and the
+        surplus writers of one address, and the shared-memory combines index
+        slots past their allocation.  ``_normalize_shared_tile_thread_extents``
+        widens SIMT tile strategies to the launch ahead of codegen, but not in
+        a kernel with a matmul, whose layouts keep their own thread contracts.
+        """
+        codegen = getattr(self, "_codegen", None)
+        if codegen is None:
+            return extent
+        return max(extent, codegen.launch_thread_axis_sizes().get(axis, 1))
+
     def _lane_reduce_threads_in_group(self) -> int | None:
         """Return ``threads_in_group`` for a two-pass lane reduction over this
         block, or ``None`` when this reduction is not over a lane-distributed
@@ -3034,6 +3056,18 @@ class BlockReductionStrategy(ReductionStrategy):
                 self._codegen.max_thread_block_dims[reduce_axis],
             )
 
+        # Every axis the tile is distributed over spans the launch's threads
+        # along it: the surplus threads of a sibling narrower than the launch
+        # execute this combine holding the identity, and the lane expression
+        # has to follow the physical layout (``_launch_thread_axis_extent``).
+        # An axis of extent 1 is not distributed: every thread holds the same
+        # element there, so the launch's threads along it are not combined.
+        strategy_axis_sizes = dict(logical_axis_sizes)
+        for axis, size in strategy_axis_sizes.items():
+            if size > 1:
+                logical_axis_sizes[axis] = self._launch_thread_axis_extent(axis, size)
+        surplus_threads = logical_axis_sizes != strategy_axis_sizes
+
         pre = 1
         for axis in range(reduce_axis):
             pre *= logical_axis_sizes.get(axis, 1)
@@ -3108,7 +3142,14 @@ class BlockReductionStrategy(ReductionStrategy):
         # the reduction block is no longer in ``active_device_loops``
         # (e.g. ``cute_dynamic_row_sum``'s ``acc.sum(-1)`` after the
         # inner ``hl.tile`` exits) and would silently drop the reduce.
-        if pre <= 1 and group_span <= 32 and num_threads == group_span:
+        # Under surplus threads the direct path would size its group by the
+        # block's own extent, so the strided form is kept.
+        if (
+            pre <= 1
+            and group_span <= 32
+            and num_threads == group_span
+            and not surplus_threads
+        ):
             debug(
                 "skip small direct",
                 tuple(fake_input.size()),
@@ -3263,6 +3304,23 @@ class BlockReductionStrategy(ReductionStrategy):
         identity_expr = env.backend.cast_expr(
             constant_repr(default), _dtype_str(acc_dtype)
         )
+        reduce_axis = self.fn.tile_strategy.thread_axis_for_block_id(self.block_index)
+        if (
+            threads > 1
+            and reduce_axis is not None
+            and self._launch_thread_axis_extent(reduce_axis, threads) != threads
+        ):
+            # The surplus threads of the launch walk this lane loop too; with
+            # a strided lane layout their elements alias the real threads'
+            # and a group spanning them would count those twice, while a
+            # group of the block's own threads leaves them a partial every
+            # owner-guarded consume store would race with.
+            raise exc.BackendUnsupported(
+                "cute",
+                "lane-looped reduction over a tile axis narrower than the "
+                f"launch (threads={threads}, launch="
+                f"{self._launch_thread_axis_extent(reduce_axis, threads)})",
+            )
         group_params = self._lane_loop_group_params()
         owner_lane = self._lane_reduce_owner(state)
         cluster_n = self._lane_reduce_cluster_n()

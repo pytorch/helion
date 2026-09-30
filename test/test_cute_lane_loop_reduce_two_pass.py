@@ -12,6 +12,7 @@ across its lanes and the cross-thread combine runs once per row tile.
 
 from __future__ import annotations
 
+import re
 from typing import Callable
 
 import pytest
@@ -207,3 +208,456 @@ def test_owned_marker_restore_when_two_pass_split_is_unsafe() -> None:
         rtol=1e-4,
         atol=1e-4,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_two_lane_nested_row_seeds_match_their_static_twin_under_dynamic_shapes() -> (
+    None
+):
+    """jagged_layer_norm's 512-column nested-row seeds with two column lanes.
+
+    Under dynamic shapes the column mask turns ``row_sums.sum()`` into a
+    masked two-pass lane reduction, whose accumulate pass must run the
+    jagged loop that accumulates ``row_sums``; it used to fold the fresh
+    zero in a pass ahead of that loop and return mean = variance = 0 (``x *
+    rsqrt(eps)``).  The dynamic render now takes the static twin's per-lane
+    schedule, so the two agree bitwise.
+    """
+    from examples.jagged_layer_norm import jagged_layer_norm_kernel
+    from examples.jagged_layer_norm import reference_jagged_layer_norm_pytorch
+
+    from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
+
+    torch.manual_seed(0)
+    lengths = torch.randint(0, 40, (17,))
+    lengths[3] = 0
+    x_offsets = torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)])
+    x_offsets = x_offsets.to(DEVICE)
+    x = torch.randn((int(lengths.sum()), 512), device=DEVICE)
+    expected = reference_jagged_layer_norm_pytorch(x, x_offsets, 1e-6)
+    outputs: dict[bool, list[torch.Tensor]] = {}
+    for static_shapes in (True, False):
+        kernel = helion.kernel(
+            jagged_layer_norm_kernel.fn,
+            backend="cute",
+            static_shapes=static_shapes,
+            autotune_effort="none",
+        )
+        bound = kernel.bind((x, x_offsets, 1e-6))
+        host = bound.host_function
+        assert host is not None
+        seeds = [
+            seed
+            for seed in CuteNestedRowHeuristic.get_seed_configs(
+                bound.env, host.device_ir
+            )
+            if max(seed.num_threads) == 256
+        ]
+        assert len(seeds) == 3
+        for seed in seeds:
+            code = bound.to_code(seed)
+            assert "for lane_1 in range(2):" in code
+            out = bound.compile_config(seed)(x, x_offsets, 1e-6)
+            torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+            outputs.setdefault(static_shapes, []).append(out)
+    for static, dynamic in zip(outputs[True], outputs[False], strict=True):
+        assert torch.equal(static, dynamic)
+
+
+def _accumulated_columns_reduced_and_stored(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-column K accumulation, reduced across the columns into a carried row sum, and stored per column."""
+    b, k, n = x.shape
+    out = torch.empty([b, n], dtype=x.dtype, device=x.device)
+    tot = torch.empty([b], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        row_acc = hl.zeros([tile_b], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([tile_b, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = acc + x[tile_b, tile_k, tile_n].sum(dim=1)
+            row_acc = row_acc + acc.sum(dim=1)
+            out[tile_b, tile_n] = acc
+        tot[tile_b] = row_acc
+    return out, tot
+
+
+def _reduced_columns_then_accumulated(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A row's column reduction, after which a K loop keeps accumulating the row that is then stored."""
+    b, n = x.shape
+    k = y.shape[1]
+    out = torch.empty([b, n], dtype=x.dtype, device=x.device)
+    tot = torch.empty([b], dtype=x.dtype, device=x.device)
+    for tile_b in hl.tile(b):
+        for tile_n in hl.tile(n):
+            acc = x[tile_b, tile_n]
+            total = acc.sum(dim=1)
+            for tile_k in hl.tile(k):
+                acc = acc + y[tile_b, tile_k, tile_n].sum(dim=1)
+            out[tile_b, tile_n] = acc
+            tot[tile_b] = total
+    return out, tot
+
+
+def _column_lanes_config(lanes: int) -> helion.Config:
+    """512 columns over ``512 // lanes`` threads: ``lanes`` strided column lanes."""
+    return helion.Config.from_dict(
+        {
+            "block_sizes": [1, 512, 32],
+            "num_threads": [1, 512 // lanes, 1],
+            "cute_vector_widths": [1, 1, 1],
+            "cute_lane_layouts": ["strided"] * 3,
+        }
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [2, 4])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+def test_a_stored_accumulator_restarts_in_every_lane_of_the_consume_pass(
+    lanes: int, static_shapes: bool
+) -> None:
+    """The consume pass re-runs ``acc = 0`` per lane before the K loop.
+
+    The K loop rewrites ``acc`` under its loop-output name; classified as
+    spelled, the initializer was taken for lane-invariant and hoisted between
+    the passes, so every lane after the first continued from the previous
+    lane's final ``acc``: the stored columns of those lanes were wrong while
+    the reduced row sum was right.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(3, 64, 512, device=DEVICE)
+    kernel = helion.kernel(
+        _accumulated_columns_reduced_and_stored,
+        backend="cute",
+        static_shapes=static_shapes,
+        autotune_effort="none",
+    )
+    bound = kernel.bind((x,))
+    config = _column_lanes_config(lanes)
+    code = bound.to_code(config)
+    assert f"for lane_1 in range({lanes}):" in code
+    assert "_lane_acc = " in code
+    out, tot = bound.compile_config(config)(x)
+    torch.testing.assert_close(out, x.sum(dim=1), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(tot, x.sum(dim=(1, 2)), rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [2, 4])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+def test_a_reduction_folds_its_input_before_a_later_loop_accumulates_it(
+    lanes: int, static_shapes: bool
+) -> None:
+    """``total = acc.sum()`` reads ``acc`` as loaded, not as the K loop left it.
+
+    The K loop after the reduction rewrites ``acc`` under its loop-output
+    name; a producer slice over the whole body took that loop into the
+    accumulate pass, and the reduced row sum included the K accumulation.
+    """
+    torch.manual_seed(0)
+    x = torch.randn(3, 512, device=DEVICE)
+    y = torch.randn(3, 48, 512, device=DEVICE)
+    kernel = helion.kernel(
+        _reduced_columns_then_accumulated,
+        backend="cute",
+        static_shapes=static_shapes,
+        autotune_effort="none",
+    )
+    bound = kernel.bind((x, y))
+    config = _column_lanes_config(lanes)
+    code = bound.to_code(config)
+    assert f"for lane_1 in range({lanes}):" in code
+    assert "_lane_acc = " in code
+    out, tot = bound.compile_config(config)(x, y)
+    torch.testing.assert_close(out, x + y.sum(dim=1), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(tot, x.sum(dim=1), rtol=1e-4, atol=1e-3)
+
+
+def _jagged_inputs(columns: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """17 sequences of 731 rows in all, one of them empty (jagged_layer_norm's test shape)."""
+    generator = torch.Generator().manual_seed(0)
+    lengths = torch.randint(1, 40, (17,), generator=generator)
+    lengths[3] = 0
+    lengths[-1] = 731 - int(lengths[:-1].sum())
+    offsets = torch.zeros(18, dtype=torch.int64)
+    offsets[1:] = lengths.cumsum(0)
+    values = torch.randn((731, columns), generator=generator)
+    return values.to(DEVICE), offsets.to(DEVICE)
+
+
+def _jagged_row_sums_stored(
+    x_values: torch.Tensor, x_offsets: torch.Tensor
+) -> torch.Tensor:
+    """Each sequence's row sums over a jagged device loop, their total stored."""
+    total_rows, columns = x_values.shape
+    batch = x_offsets.size(0) - 1
+    tot = torch.empty([batch], dtype=x_values.dtype, device=x_values.device)
+    x_flat = x_values.view(-1)
+    for tile_b in hl.tile(batch):
+        starts = x_offsets[tile_b]
+        ends = x_offsets[tile_b.index + 1]
+        seq_lengths = ends - starts
+        for tile_m in hl.tile(columns):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
+            for tile_k in hl.jagged_tile(seq_lengths):
+                flat = (starts[:, None] + tile_k.index[None, :])[:, :, None] * columns
+                flat = flat + tile_m.index[None, None, :]
+                row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+            tot[tile_b] = row_sums.sum(dim=1)
+    return tot
+
+
+def _jagged_row_sums_scaled(
+    x_values: torch.Tensor, x_offsets: torch.Tensor
+) -> torch.Tensor:
+    """The row sums scaled by their total: the total is consumed per column."""
+    total_rows, columns = x_values.shape
+    batch = x_offsets.size(0) - 1
+    out = torch.empty([batch, columns], dtype=x_values.dtype, device=x_values.device)
+    x_flat = x_values.view(-1)
+    for tile_b in hl.tile(batch):
+        starts = x_offsets[tile_b]
+        ends = x_offsets[tile_b.index + 1]
+        seq_lengths = ends - starts
+        for tile_m in hl.tile(columns):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
+            for tile_k in hl.jagged_tile(seq_lengths):
+                flat = (starts[:, None] + tile_k.index[None, :])[:, :, None] * columns
+                flat = flat + tile_m.index[None, None, :]
+                row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+            total = row_sums.sum(dim=1)
+            out[tile_b, tile_m] = row_sums * total[:, None]
+    return out
+
+
+def _jagged_lanes_config(lanes: int) -> helion.Config:
+    return helion.Config.from_dict(
+        {
+            "block_sizes": [1, 512, 32],
+            "num_threads": [1, 512 // lanes, 1],
+            "cute_vector_widths": [1, 1, 1],
+            "cute_lane_layouts": ["strided"] * 3,
+        }
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [2, 4])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+def test_a_stored_strided_reduction_totals_the_lanes_shares(
+    lanes: int, static_shapes: bool
+) -> None:
+    """The jagged loop's collective trip count keeps the two-pass split off this body; the restored per-lane shares used to be stored as they were (the last lane's half-row won), and are now totalled across the lanes before the store."""
+    x, offsets = _jagged_inputs(512)
+    kernel = helion.kernel(
+        _jagged_row_sums_stored,
+        backend="cute",
+        static_shapes=static_shapes,
+        autotune_effort="none",
+    )
+    bound = kernel.bind((x, offsets))
+    config = _jagged_lanes_config(lanes)
+    code = bound.to_code(config)
+    assert code.count(f"for lane_1 in range({lanes}):") == 1
+    assert "_lane_share = " in code and "_lane_total = " in code
+    out = bound.compile_config(config)(x, offsets)
+    expected = torch.stack(
+        [x[int(offsets[b]) : int(offsets[b + 1])].sum() for b in range(17)]
+    )
+    torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [2, 4])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+def test_a_strided_reduction_scaled_back_per_lane_is_declined(
+    lanes: int, static_shapes: bool
+) -> None:
+    """Every lane's row sums are needed after the total, which neither the restore nor a lane-invariant tail provides; the config is declined instead of scaling by one lane's share."""
+    x, offsets = _jagged_inputs(512)
+    kernel = helion.kernel(
+        _jagged_row_sums_scaled,
+        backend="cute",
+        static_shapes=static_shapes,
+        autotune_effort="none",
+    )
+    bound = kernel.bind((x, offsets))
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
+    ):
+        bound.to_code(_jagged_lanes_config(lanes))
+
+
+def _jagged_row_sums_running_max(
+    x_values: torch.Tensor, x_offsets: torch.Tensor
+) -> torch.Tensor:
+    """The row sums' max over each column tile feeds a running max across the tiles."""
+    total_rows, columns = x_values.shape
+    batch = x_offsets.size(0) - 1
+    tot = torch.empty([batch], dtype=x_values.dtype, device=x_values.device)
+    x_flat = x_values.view(-1)
+    for tile_b in hl.tile(batch):
+        starts = x_offsets[tile_b]
+        ends = x_offsets[tile_b.index + 1]
+        seq_lengths = ends - starts
+        m_acc = hl.full([tile_b], float("-inf"), dtype=x_values.dtype)
+        for tile_m in hl.tile(columns):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
+            for tile_k in hl.jagged_tile(seq_lengths):
+                flat = (starts[:, None] + tile_k.index[None, :])[:, :, None] * columns
+                flat = flat + tile_m.index[None, None, :]
+                row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+            m_acc = torch.maximum(m_acc, row_sums.amax(dim=1))
+        tot[tile_b] = m_acc
+    return tot
+
+
+def _jagged_row_sums_atomically_added(
+    x_values: torch.Tensor, x_offsets: torch.Tensor
+) -> torch.Tensor:
+    """Each column tile's total is added atomically into the sequence's slot."""
+    total_rows, columns = x_values.shape
+    batch = x_offsets.size(0) - 1
+    tot = torch.zeros([batch], dtype=x_values.dtype, device=x_values.device)
+    x_flat = x_values.view(-1)
+    for tile_b in hl.tile(batch):
+        starts = x_offsets[tile_b]
+        ends = x_offsets[tile_b.index + 1]
+        seq_lengths = ends - starts
+        for tile_m in hl.tile(columns):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
+            for tile_k in hl.jagged_tile(seq_lengths):
+                flat = (starts[:, None] + tile_k.index[None, :])[:, :, None] * columns
+                flat = flat + tile_m.index[None, None, :]
+                row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+            hl.atomic_add(tot, [tile_b], row_sums.sum(dim=1))
+    return tot
+
+
+def _jagged_row_sums_sum_and_max_stored(
+    x_values: torch.Tensor, x_offsets: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two reductions of the row sums, both stored."""
+    total_rows, columns = x_values.shape
+    batch = x_offsets.size(0) - 1
+    tot = torch.empty([batch], dtype=x_values.dtype, device=x_values.device)
+    tot2 = torch.empty([batch], dtype=x_values.dtype, device=x_values.device)
+    x_flat = x_values.view(-1)
+    for tile_b in hl.tile(batch):
+        starts = x_offsets[tile_b]
+        ends = x_offsets[tile_b.index + 1]
+        seq_lengths = ends - starts
+        for tile_m in hl.tile(columns):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
+            for tile_k in hl.jagged_tile(seq_lengths):
+                flat = (starts[:, None] + tile_k.index[None, :])[:, :, None] * columns
+                flat = flat + tile_m.index[None, None, :]
+                row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+            tot[tile_b] = row_sums.sum(dim=1)
+            tot2[tile_b] = row_sums.amax(dim=1)
+    return tot, tot2
+
+
+def _jagged_row_sums(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Each sequence's column sums, zeros for the empty one."""
+    return torch.stack(
+        [x[int(offsets[b]) : int(offsets[b + 1])].sum(dim=0) for b in range(17)]
+    )
+
+
+def _jagged_column_block_config(lanes: int, block: int) -> helion.Config:
+    return helion.Config.from_dict(
+        {
+            "block_sizes": [1, block, 32],
+            "num_threads": [1, block // lanes, 1],
+            "cute_vector_widths": [1, 1, 1],
+            "cute_lane_layouts": ["strided"] * 3,
+        }
+    )
+
+
+def _jagged_kernel(fn: Callable[..., object], *, static_shapes: bool) -> helion.Kernel:
+    return helion.kernel(
+        fn, backend="cute", static_shapes=static_shapes, autotune_effort="none"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [2, 4])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+def test_a_running_max_carry_keeps_the_per_lane_restore(
+    lanes: int, static_shapes: bool
+) -> None:
+    """``m_acc = torch.maximum(m_acc, row_sums.amax(dim=1))`` renders as ``cute.math.max`` under casts: the max over the lanes of the lanes' maxes is exact, so the marker stays restored per lane."""
+    x, offsets = _jagged_inputs(512)
+    bound = _jagged_kernel(
+        _jagged_row_sums_running_max, static_shapes=static_shapes
+    ).bind((x, offsets))
+    config = _jagged_lanes_config(lanes)
+    code = bound.to_code(config)
+    assert code.count(f"for lane_1 in range({lanes}):") == 1
+    assert "_lane_total" not in code
+    assert "_reduced = _cute_grouped_reduce" in code
+    out = bound.compile_config(config)(x, offsets)
+    torch.testing.assert_close(
+        out, _jagged_row_sums(x, offsets).amax(dim=1), rtol=1e-4, atol=1e-3
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [2, 4])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+def test_an_atomic_add_of_the_row_total_runs_once_on_the_lanes_total(
+    lanes: int, static_shapes: bool
+) -> None:
+    """The emitted ``cute.arch.atomic_add(ptr, val=..., sem=...)`` is a lane-invariant consumer: the shares are totalled over the lanes and one guarded atomic adds the total."""
+    x, offsets = _jagged_inputs(512)
+    bound = _jagged_kernel(
+        _jagged_row_sums_atomically_added, static_shapes=static_shapes
+    ).bind((x, offsets))
+    config = _jagged_lanes_config(lanes)
+    code = bound.to_code(config)
+    assert "_lane_total" in code
+    assert code.count("cute.arch.atomic_add(") == 1
+    out = bound.compile_config(config)(x, offsets)
+    torch.testing.assert_close(
+        out, _jagged_row_sums(x, offsets).sum(dim=1), rtol=1e-4, atol=1e-3
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [2, 4])
+def test_two_stored_reductions_of_one_accumulator_take_one_schedule_in_both_shape_modes(
+    lanes: int,
+) -> None:
+    """Under dynamic shapes the second reduction's masked input sits between the two markers; it joins the prefix, so the static and dynamic twins both total the shares and agree bitwise."""
+    x, offsets = _jagged_inputs(512)
+    config = _jagged_lanes_config(lanes)
+    outputs = []
+    for static_shapes in (True, False):
+        bound = _jagged_kernel(
+            _jagged_row_sums_sum_and_max_stored, static_shapes=static_shapes
+        ).bind((x, offsets))
+        code = bound.to_code(config)
+        assert code.count(f"for lane_1 in range({lanes}):") == 1
+        assert (
+            len(
+                re.findall(
+                    r"^\s*\w+_lane_total = cutlass\.Float32\((?:0|float\('-inf'\))\)$",
+                    code,
+                    re.MULTILINE,
+                )
+            )
+            == 2
+        )
+        outputs.append(bound.compile_config(config)(x, offsets))
+    (static_tot, static_max), (dynamic_tot, dynamic_max) = outputs
+    row_sums = _jagged_row_sums(x, offsets)
+    torch.testing.assert_close(static_tot, row_sums.sum(dim=1), rtol=1e-4, atol=1e-3)
+    torch.testing.assert_close(static_max, row_sums.amax(dim=1), rtol=1e-4, atol=1e-3)
+    assert torch.equal(static_tot, dynamic_tot)
+    assert torch.equal(static_max, dynamic_max)

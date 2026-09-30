@@ -13,7 +13,7 @@ from ._cute_aux import _cpu_codegen
 from .test_cute_tile_loop_vec_hoist import _reduction_kernel
 import helion
 from helion._compiler.tile_strategy import DeviceGridState
-from helion._compiler.tile_strategy import TileStrategy
+from helion._compiler.tile_strategy import PerThreadNDTileStrategy
 from helion._compiler.tile_strategy import VecLaneWrapper
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
@@ -227,6 +227,7 @@ def test_store_emitter_uses_captured_axis(lane_axis: int) -> None:
             "value",
             None,
             torch.bfloat16,
+            scalar_stmt=ast.parse("pointer.store(value)").body[0],
             lane_axis_pos=lane_axis,
         )
     expected = ["row", "col"]
@@ -249,8 +250,12 @@ def test_deferred_scope_uses_the_complete_body(inner_live: bool) -> None:
     assert isinstance(outer, ast.For)
     vloop = outer.body[1]
     assert isinstance(vloop, ast.For)
+    # Only the per-thread lane strategies defer vector ops; the wrap consults
+    # the strategy's collected-store registry once the body is complete.
+    strategy = Mock(spec=PerThreadNDTileStrategy)
+    strategy._cute_lane_vec_stores_by_block = {}
     grid = DeviceGridState(
-        strategy=Mock(spec=TileStrategy),
+        strategy=strategy,
         block_id_to_info={},
         lane_loops=[("lane", 8), ("inner", 64)],
         lane_setup_statements=[*ast.parse("index = base + vi\nother = inner").body],
