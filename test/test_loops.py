@@ -11,6 +11,10 @@ import torch
 import helion
 from helion import _compat
 from helion._compat import use_tileir_tunables
+from helion._compiler.device_ir import ForLoopGraphInfo
+from helion._compiler.device_ir import LiftTensorArgs
+from helion._compiler.device_ir import LoopCarry
+from helion._compiler.device_ir import LoopInterface
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -39,6 +43,34 @@ datadir = Path(__file__).parent / "data"
 basic_kernels = import_path(datadir / "basic_kernels.py")
 FIXED_BLOCK_SIZE = 16
 BLOCK_SIZE_CHOICES = (32, 256)
+
+
+def test_explicit_loop_interface_preserves_slots_and_graph_copies():
+    initial = torch.empty(4)
+    inputs = LiftTensorArgs(
+        {
+            "left": initial,
+            "right": initial,
+            "captured": (torch.empty(4), {"bias": torch.empty(4)}),
+        }
+    )
+    outputs = LiftTensorArgs({"right": torch.empty(4), "left": torch.empty(4)})
+    interface = LoopInterface.from_args(inputs, outputs)
+    assert interface.input_count == 4
+    assert interface.carries == (LoopCarry(1, 0), LoopCarry(0, 1))
+    assert interface.captures == (2, 3)
+
+    graph = torch.fx.Graph()
+    args = [graph.placeholder(f"arg{i}") for i in range(4)]
+    graph.output((args[1], args[0]))
+    info = ForLoopGraphInfo(
+        graph_id=0, graph=graph, node_args=args, block_ids=[0], loop_interface=interface
+    )
+    copied = info.copy()
+    assert isinstance(copied, ForLoopGraphInfo)
+    assert copied.loop_interface == interface
+    assert copied.graph is not graph
+    assert all(a is not b for a, b in zip(graph.nodes, copied.graph.nodes, strict=True))
 
 
 @helion.kernel
