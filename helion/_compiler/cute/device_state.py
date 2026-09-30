@@ -709,6 +709,7 @@ class CuteDeviceFunctionState:
         self.single_token_rank1_plan: CuteSingleTokenRank1Plan | None = None
         self.collective_register_chain_lowered = False
         self.collective_register_chain_block_dims: tuple[int, int, int] | None = None
+        self.owned_root_block_dims: tuple[int, int, int] | None = None
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None

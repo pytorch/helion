@@ -37,6 +37,7 @@ from ..cute.grouped_row_union import TRANSPOSED
 from ..cute.grouped_row_union import TRANSPOSED_SCHEDULE
 from ..cute.grouped_row_union import index_domain as row_union_index_domain
 from ..cute.grouped_row_union import resident_ctas_supported
+from ..cute.grouped_row_union import target_supported as row_union_target_supported
 from ..cute.grouped_worklist_policy import GroupedBMajor
 from ..cute.grouped_worklist_policy import GroupedWorklistHardwareIdentity
 from ..cute.grouped_worklist_policy import get_grouped_worklist_target_policy
@@ -3761,7 +3762,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         )
         spec._cute_tcgen05_config.grouped_row_union_supported = (
             analysis.dense_row_union_supported
-            and spec.target_device_capability == (10, 0)
+            and row_union_target_supported(spec.target_device_capability, None)
         )
         spec._cute_tcgen05_config.grouped_row_union_cluster4_supported = (
             analysis.dense_row_union_cluster4_supported
@@ -3771,7 +3772,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         )
         spec._cute_tcgen05_config.grouped_row_union_paired_clc_supported = (
             analysis.dense_row_union_paired_clc_supported
-            and spec.target_device_capability == (10, 0)
+            and row_union_target_supported(spec.target_device_capability, PAIRED_CLC)
             and CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
             >= PAIRED_CLC.shared_upper_bound
         )

@@ -88,6 +88,7 @@ from .grouped_row_union import index_domain as row_union_index_domain
 from .grouped_row_union import physical_schedule
 from .grouped_row_union import resident_ctas_supported
 from .grouped_row_union import schedule_supported as row_union_schedule_supported
+from .grouped_row_union import target_supported as row_union_target_supported
 from .layout import MatmulExecutionKind
 from .layout import MatmulExecutionPlan
 from .matmul_utils import analyze_direct_grouped_n_loads
@@ -7491,20 +7492,23 @@ def _emit_mma_pipeline(
         if rhs_rank3_grouped_proof is None:
             return _unsupported_schedule("rank3 grouped semantic proof failed")
         if row_union_requested is True:
+            selected_row_profile = physical_schedule(df.config)
             metadata = _grouped_row_union_metadata(
                 cg,
                 fx_node,
                 rhs_rank3_grouped_proof,
-                schedule=physical_schedule(df.config),
+                schedule=selected_row_profile,
             )
             if (
                 metadata is None
                 or segment_block_id is None
                 or not row_union_schedule_supported(df.config.config, (bm, bn, bk))
-                or env.config_spec.target_device_capability != (10, 0)
+                or not row_union_target_supported(
+                    env.config_spec.target_device_capability, selected_row_profile
+                )
                 or not tcgen05_use_tma_pipeline
                 or (
-                    (selected_row_profile := physical_schedule(df.config)) is not None
+                    selected_row_profile is not None
                     and selected_row_profile.shared_upper_bound
                     > CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
                 )
@@ -7532,7 +7536,7 @@ def _emit_mma_pipeline(
                 offsets=df.tensor_arg(rhs_rank3_grouped_proof.layout_tensor).name,
                 prefix=df.new_var("row_union"),
                 resident_ctas=cast("int", df.config.get(GROUPED_RESIDENT_CTAS_KEY, 1)),
-                schedule=physical_schedule(df.config),
+                schedule=selected_row_profile,
             )
         elif not _rank3_rhs_grouped_schedule_is_legal(
             rhs_rank3_grouped_proof, grouped_mode=grouped_mode
