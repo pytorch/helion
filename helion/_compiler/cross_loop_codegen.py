@@ -12,6 +12,7 @@ from torch.utils._sympy.functions import Max as SymbolicMax
 from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
+from .._dist_utils import _resolve_process_group
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -41,6 +42,7 @@ from .tile_strategy import L2GroupingProgramIDs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Mapping
 
     from .device_function import DeviceFunction
@@ -60,6 +62,10 @@ _CROSS_LOOP_COUNTER_DTYPE = torch.uint32
 _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS = (
     _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // _CROSS_LOOP_COUNTER_DTYPE.itemsize
 )
+
+
+# One 128-byte line per uint64 peer_counter slot.
+_PEER_SLOT_WORDS = _CROSS_LOOP_COUNTER_ALIGNMENT_BYTES // torch.uint64.itemsize
 
 
 def _ast_fingerprint(nodes: list[ast.stmt]) -> tuple[str, ...]:
@@ -608,6 +614,13 @@ def emit_cross_loop_schedule(
     Graph arguments need neither a reset kernel nor a host-side epoch update.
     """
     pipeline = device_function.config.cross_loop_pipeline
+    dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
+    assert dependency_graph is not None
+    # Only the dynamic pipeline emits peer transports; R5 offers no other choice.
+    if pipeline != "dynamic" and dependency_graph.crosses_ranks():
+        raise AssertionError(
+            "cross-rank tile dependencies require cross_loop_pipeline='dynamic'"
+        )
     if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
@@ -646,8 +659,6 @@ def emit_cross_loop_schedule(
         for root, body in enumerate(case_bodies)
         if _triton_root_requires_kernel_scope(body, target_device_capability)
     )
-    dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
-    assert dependency_graph is not None
     indexing = device_function.config.get("indexing", ())
 
     def uses_tensor_descriptor(memory_op_index: int) -> bool:
@@ -841,6 +852,69 @@ def emit_cross_loop_schedule(
     readiness_counter_arg = state_section(readiness_counter_state_offset)
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
 
+    # peer_counter: one uint64 slot per publishing root plus a done slot, on
+    # every rank. Targets use a uint64 epoch so they never wrap.
+    peer_edges = static_pipeline_plan.peer_edges
+    done_roots = static_pipeline_plan.done_roots
+    peer_slots = {
+        root: index * _PEER_SLOT_WORDS
+        for index, root in enumerate(sorted({producer for producer, _ in peer_edges}))
+    }
+    done_slot = len(peer_slots) * _PEER_SLOT_WORDS
+    peer_state = peer_ptrs = peer_epoch = None
+    world_size = 1
+    if peer_edges:
+        peer_state = _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_peer_state",
+            numel=str(done_slot + 1),
+            dtype=torch.uint64,
+            symmetric=True,
+        )
+        peer_ptrs = device_function.triton_persistent_state_args[-1]
+        peer_epoch = device_function.new_var("tile_dependency_peer_epoch", dce=False)
+        process_group_name = CompileEnvironment.current().process_group_name
+        assert process_group_name is not None
+        world_size = torch.distributed.get_world_size(
+            _resolve_process_group(process_group_name)
+        )
+
+    def peer_target(roots: Iterable[int]) -> str:
+        tasks = sum(
+            static_pipeline_plan.execution_orders[root].task_count for root in roots
+        )
+        return f"{peer_epoch} * {int(tasks) * world_size}"
+
+    def peer_waits(root: int) -> list[ast.stmt]:
+        waits = [
+            statement_from_string(
+                f"helion_dist_utils._wait_at_least({peer_state} + "
+                f"{peer_slots[producer]}, {peer_target((producer,))})"
+            )
+            for producer, consumer in sorted(peer_edges)
+            if consumer == root
+        ]
+        if not waits:
+            return []
+        return [
+            *waits,
+            _publication_sync(device_function),
+            *device_function.async_load_fence(),
+        ]
+
+    def peer_publications(root: int) -> list[ast.stmt]:
+        slots = [peer_slots[root]] if root in peer_slots else []
+        if root in done_roots:
+            slots.append(done_slot)
+        lanes = 1 << (world_size - 1).bit_length()
+        return [
+            statement_from_string(
+                f"helion_dist_utils._add_on_every_rank({peer_ptrs}, {slot}, "
+                f"{world_size}, {lanes})"
+            )
+            for slot in slots
+        ]
+
     dispatch_ticket: str | None = None
     if not uses_packet_dispatch:
         assert state_arg is not None
@@ -871,6 +945,13 @@ def emit_cross_loop_schedule(
                 f"{packet_count}, tl.uint64) + 1, tl.uint32)"
             ),
         ]
+        if peer_epoch is not None:
+            result.append(
+                statement_from_string(
+                    f"{peer_epoch} = {raw_dispatch_ticket} // "
+                    f"tl.cast({packet_count}, tl.uint64) + 1"
+                )
+            )
     root_barrier_incoming: dict[int, tuple[int, ...]] = {
         consumer: tuple(
             sorted(
@@ -1947,6 +2028,7 @@ def emit_cross_loop_schedule(
                 dependencies=root_barrier_input_dependencies(root),
                 prefix="tile_dependency_root_barrier_wait",
             )
+            task_body.extend(peer_waits(root))
             task_body.extend(
                 scheduled_root_task_body(
                     root,
@@ -1955,7 +2037,11 @@ def emit_cross_loop_schedule(
                     (dispatch_ticket,),
                 )
             )
-            task_body.extend(root_barrier_publication(root))
+            publications = peer_publications(root)
+            if publications:
+                task_body.extend(_release_sync(device_function))
+            task_body.extend(root_barrier_publication(root, synced=bool(publications)))
+            task_body.extend(publications)
             packet_branches.append(
                 (
                     packet_begin,
@@ -1998,7 +2084,11 @@ def emit_cross_loop_schedule(
                 device_function,
                 name_hint="tile_dependency_packet_dispatch",
                 body=[branch for _begin, _requires_kernel_scope, branch in suffix],
-                extra_argument_names=(dispatch_ticket, epoch_var),
+                extra_argument_names=(
+                    dispatch_ticket,
+                    epoch_var,
+                    *([peer_epoch] if peer_epoch is not None else []),
+                ),
                 noinline=True,
             )
             result.append(
@@ -2012,6 +2102,22 @@ def emit_cross_loop_schedule(
         else:
             result.extend(
                 branch for _begin, _requires_kernel_scope, branch in packet_branches
+            )
+        if done_roots:
+            # The last ticket exits only after every rank's done roots finish,
+            # so the next launch cannot overwrite data a peer still reads.
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"{dispatch_ticket} == {packet_count - 1}"),
+                    body=[
+                        statement_from_string(
+                            f"helion_dist_utils._wait_at_least({peer_state} + "
+                            f"{done_slot}, {peer_target(done_roots)})"
+                        )
+                    ],
+                    orelse=[],
+                )
             )
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)

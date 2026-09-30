@@ -196,6 +196,54 @@ def _wait_and_consume_signal(signal, count):  # noqa: ANN001, ANN202
 
 
 @triton.jit
+def _add_on_every_rank(  # noqa: ANN202
+    buffer_ptrs,  # noqa: ANN001
+    offset,  # noqa: ANN001
+    world_size: tl.constexpr,
+    lanes: tl.constexpr,
+):
+    """Add 1 with system-scope release to one uint64 word on every rank.
+
+    The caller syncs the CTA first, so the release covers all of its stores.
+    """
+    ranks = tl.arange(0, lanes)
+    bases = tl.load(
+        buffer_ptrs.to(tl.pointer_type(tl.uint64)) + ranks,
+        mask=ranks < world_size,
+        other=0,
+    )
+    tl.atomic_add(
+        bases.to(tl.pointer_type(tl.uint64)) + offset,
+        tl.cast(1, tl.uint64),
+        mask=ranks < world_size,
+        sem="release",
+        scope="sys",
+    )
+
+
+@triton.jit
+def _wait_at_least(counter, target):  # noqa: ANN001, ANN202
+    """Spin in every thread with system-scope acquire loads until counter >= target."""
+    value = tl.inline_asm_elementwise(
+        "ld.acquire.sys.global.u64 $0, [$1];",
+        "=l,l",
+        [counter],
+        dtype=tl.uint64,
+        is_pure=False,
+        pack=1,
+    )
+    while value < target:
+        value = tl.inline_asm_elementwise(
+            "ld.acquire.sys.global.u64 $0, [$1];",
+            "=l,l",
+            [counter],
+            dtype=tl.uint64,
+            is_pure=False,
+            pack=1,
+        )
+
+
+@triton.jit
 def _get_tid():  # noqa: ANN202
     return tl.inline_asm_elementwise(
         """

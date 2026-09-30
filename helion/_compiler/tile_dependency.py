@@ -4735,6 +4735,35 @@ class TileDependencyGraph:
             return "inband"
         return "peer_counter"
 
+    def crosses_ranks(self) -> bool:
+        """Whether any dependency needs a cross-rank transport."""
+        return any(
+            self.transport(dependency) != "counter"
+            for edge in self.edges
+            for dependency in edge.access_dependencies
+        )
+
+    def rank_digest(self) -> tuple[object, ...]:
+        """Facts every rank must agree on; owners and regions may differ."""
+        return (
+            tuple(
+                (a.root, a.allocation_id, a.kind, a.is_atomic, a.owner_rank is None)
+                for a in self.accesses
+            ),
+            repr(self.task_families),
+            tuple(sorted(self.inband_allocation_ids)),
+            tuple(
+                sorted(
+                    {
+                        (edge.producer_root, edge.consumer_root, transport)
+                        for edge in self.edges
+                        for dependency in edge.access_dependencies
+                        if (transport := self.transport(dependency)) != "counter"
+                    }
+                )
+            ),
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class _ReachingAccess:

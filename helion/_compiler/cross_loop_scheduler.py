@@ -988,6 +988,10 @@ class StaticPipelinePlan:
     readiness_counters: tuple[ReadinessCounterPlan, ...]
     root_barrier_edges: frozenset[tuple[int, int]]
     dispatch_mode: CrossLoopDispatchMode = "static"
+    # Cross-rank per-root counters: producer->consumer root pairs, and the
+    # roots whose tasks every rank waits for before a launch exits.
+    peer_edges: frozenset[tuple[int, int]] = frozenset()
+    done_roots: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if self.dispatch_mode not in ("static", "dynamic"):
@@ -2946,6 +2950,43 @@ def build_static_pipeline_plan(
     root_domains = tuple(
         order.tasks_by_ordinal.target_domain for order in root_task_orders
     )
+    # Local counters order same-rank dependencies only, and each cross-rank
+    # dependency gets a direct peer edge.
+    transports = {
+        (edge.producer_root, edge.consumer_root, dependency_graph.transport(dependency))
+        for edge in dependency_graph.edges
+        for dependency in edge.access_dependencies
+    }
+    peer_edges = frozenset(
+        (producer, consumer)
+        for producer, consumer, transport in transports
+        if transport != "counter"
+    )
+    cross_rank_roots = frozenset(
+        root
+        for producer, consumer, transport in transports
+        if transport != "counter"
+        for root in (producer, consumer)
+    ) | {
+        access.root
+        for access in dependency_graph.accesses
+        if access.owner_rank is not None
+    }
+    continuation_ineligible_roots |= cross_rank_roots
+    dependency_graph = dataclasses.replace(
+        dependency_graph,
+        edges=tuple(
+            dataclasses.replace(edge, access_dependencies=local)
+            for edge in dependency_graph.edges
+            if (
+                local := tuple(
+                    dependency
+                    for dependency in edge.access_dependencies
+                    if dependency_graph.transport(dependency) == "counter"
+                )
+            )
+        ),
+    )
     readiness_graph = ReadinessGraph(
         root_domains,
         _build_readiness_events(
@@ -3111,7 +3152,11 @@ def build_static_pipeline_plan(
                 "the requested dynamic cross-loop pipeline does not admit a "
                 "progress-safe cross-loop schedule"
             )
-    return proposal
+    return dataclasses.replace(
+        proposal,
+        peer_edges=peer_edges,
+        done_roots=cross_rank_roots if peer_edges else frozenset(),
+    )
 
 
 def _select_root_barrier_edges(

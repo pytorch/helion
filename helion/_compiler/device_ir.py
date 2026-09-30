@@ -23,6 +23,7 @@ from unittest.mock import patch
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.traceback import preserve_node_meta
@@ -33,6 +34,7 @@ from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
+from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
 from ..autotuner.config_spec import CuteLaneLayoutSpec
 from ..autotuner.config_spec import CuteReductionReloadSpec
 from ..autotuner.config_spec import CuteVectorWidthSpec
@@ -3561,32 +3563,53 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # Collect per-load/store metadata so heuristics can map each Config.indexing
         # slot to its graph op.
         memory_op_facts = analysis.memory_op_facts(env, func)
-        tile_accesses = analysis.tile_accesses(device_ir, env, func)
         config_spec.memory_op_facts = memory_op_facts
-        from .._dist_utils import _resolve_process_group
+        from .. import _dist_utils
         from .tile_dependency import build_tile_dependency_graph
 
-        if len(device_ir.task_families) > 1 and env.cute_fission_plan is None:
-            device_ir.tile_dependency_graph = build_tile_dependency_graph(
-                tile_accesses,
-                device_ir=device_ir,
-                root_phases=source_root_phases,
-                world_size=(
-                    torch.distributed.get_world_size(
-                        _resolve_process_group(env.process_group_name)
-                    )
-                    if env.process_group_name is not None
-                    else 1
-                ),
-            )
-            if any(
-                device_ir.tile_dependency_graph.transport(dependency) != "counter"
-                for edge in device_ir.tile_dependency_graph.edges
-                for dependency in edge.access_dependencies
-            ):
-                raise exc.CrossLoopSchedulingError(
-                    "because no transport orders cross-rank tile dependencies yet"
+        multi_root = len(device_ir.task_families) > 1 and env.cute_fission_plan is None
+        group_name = env.process_group_name if multi_root else None
+
+        def all_gather(obj: tuple[object, ...]) -> list[tuple[object, ...]]:
+            # The collective needs real tensors, not the compile-time fake mode.
+            with unset_fake_temporarily():
+                return _dist_utils.all_gather_object(obj, group_name)
+
+        graph = None
+        try:
+            tile_accesses = analysis.tile_accesses(device_ir, env, func)
+            if multi_root:
+                graph = build_tile_dependency_graph(
+                    tile_accesses,
+                    device_ir=device_ir,
+                    root_phases=source_root_phases,
+                    world_size=(
+                        torch.distributed.get_world_size(
+                            _dist_utils._resolve_process_group(group_name)
+                        )
+                        if group_name is not None
+                        else 1
+                    ),
                 )
+        except exc.CrossLoopSchedulingError as error:
+            # Every rank joins the exchange before raising, so none hangs in it.
+            if group_name is not None:
+                all_gather(("error", str(error)))
+            raise
+        if graph is not None:
+            if group_name is not None:
+                digests = all_gather(graph.rank_digest())
+                for rank, digest in enumerate(digests):
+                    if digest[0] == "error":
+                        raise exc.CrossLoopSchedulingError(
+                            f"because rank {rank} failed: {digest[1]}"
+                        )
+                if any(digest != digests[0] for digest in digests):
+                    raise exc.CrossLoopSchedulingError(
+                        "because ranks disagree on tile dependencies"
+                    )
+            device_ir.tile_dependency_graph = graph
+            cross_rank = graph.crosses_ranks()
             _install_dependency_phases(
                 device_ir,
                 visitor.root_nodes,
@@ -3611,7 +3634,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 env.require_persistent_blocked(reason)
-                config_spec.enable_cross_loop_pipeline()
+                # R5: only the dynamic pipeline has cross-rank transports.
+                config_spec.enable_cross_loop_pipeline(
+                    choices=("dynamic",) if cross_rank else VALID_CROSS_LOOP_PIPELINES
+                )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()

@@ -227,6 +227,28 @@ def diagonal_store_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def pipelined_allreduce_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+    variant: hl.constexpr,
+    world: hl.constexpr,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        symm[tile] = x[tile]
+        if variant == "R1":
+            symm[tile] = x[tile] + 0
+    for tile in hl.tile(x.size(0)):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(world):
+            acc = acc + peers[r][tile]
+        out[tile] = acc
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -426,6 +448,44 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         dist.all_reduce(expected, op=dist.ReduceOp.SUM)
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
+
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @parametrize("variant", ("inband", "R1"))
+    def test_pipelined_allreduce_replays(self, variant: str) -> None:
+        self._init_process()
+        group = dist.group.WORLD
+        world, n = self.world_size, 4096
+        symm = symm_mem.empty(n, device=self.device)
+        symm_mem.rendezvous(symm, group=group)
+        x = torch.empty(n, device=self.device)
+        args = (symm, x, group.group_name, variant, world)
+        outs = []
+
+        def launch(step: int, replay: bool = False) -> None:
+            # Skewed ranks overwrite symm while peers may still read the last
+            # launch's values, which the done barrier orders.
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            x.fill_(n * step + self.rank)
+            if replay:
+                graph.replay()
+                outs.append(graph_out.clone())
+            else:
+                outs.append(pipelined_allreduce_kernel(*args).clone())
+
+        for step in range(4):
+            launch(step)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = pipelined_allreduce_kernel(*args)
+        # Alternate graph replays with eager launches.
+        for step in range(4, 12):
+            launch(step, replay=step % 2 == 0)
+        torch.cuda.synchronize()
+        for step, out in enumerate(outs):
+            expected = n * step * world + world * (world - 1) // 2
+            torch.testing.assert_close(out, torch.full_like(out, expected))
+        self._cleanup_process()
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
@@ -948,17 +1008,21 @@ class TestDistributedTileDependencies(TestCase):
         dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
         self.addCleanup(dist.destroy_process_group)
 
-    def _guarded_accesses(
-        self, kernel: helion.Kernel, args: tuple[object, ...]
+    def _accesses(
+        self, kernel: helion.Kernel, args: tuple[object, ...], error: str | None = None
     ) -> tuple[tile_dependency.TileAccess, ...]:
-        """Accesses of a kernel the temporary cross-rank guard rejects."""
+        """Accesses the tile dependency graph of a bind is built from."""
         with (
             patch.object(
                 tile_dependency,
                 "build_tile_dependency_graph",
                 wraps=tile_dependency.build_tile_dependency_graph,
             ) as build,
-            self.assertRaisesRegex(helion.exc.CrossLoopSchedulingError, "cross-rank"),
+            (
+                self.assertRaisesRegex(helion.exc.CrossLoopSchedulingError, error)
+                if error is not None
+                else contextlib.nullcontext()
+            ),
         ):
             kernel.bind(args)
         return build.call_args.args[0]
@@ -967,8 +1031,9 @@ class TestDistributedTileDependencies(TestCase):
     def test_peer_views_name_their_owner_rank(self) -> None:
         group = dist.group.WORLD.group_name
         symm = torch.zeros(256, device=DEVICE)
-        accesses = self._guarded_accesses(
-            two_root_peer_read_kernel, (symm, group, group)
+        # The barrier orders only this rank's roots, so the peer edge remains.
+        accesses = self._accesses(
+            two_root_peer_read_kernel, (symm, group, group), "hl.barrier"
         )
         (store,) = (a for a in accesses if a.kind == "store" and a.root == 0)
         self.assertEqual(
@@ -987,6 +1052,38 @@ class TestDistributedTileDependencies(TestCase):
             two_root_peer_read_kernel.bind((symm, other_group, group))
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_ranks_agree_on_tile_dependencies(self) -> None:
+        group = dist.group.WORLD.group_name
+        symm = torch.zeros(256, device=DEVICE)
+        two_root_peer_read_kernel.reset()
+        for other, expected in (
+            (("other",), "ranks disagree"),
+            (("error", "boom"), "rank 1 failed: boom"),
+        ):
+            with (
+                self.subTest(expected=expected),
+                patch(
+                    "helion._dist_utils.all_gather_object",
+                    side_effect=lambda obj, name, other=other: [obj, other],
+                ),
+                self.assertRaisesRegex(helion.exc.CrossLoopSchedulingError, expected),
+            ):
+                two_root_peer_read_kernel.bind((symm, group, group))
+        # A rank-local failure still joins the exchange, so peers do not hang.
+        other_group = dist.new_group(list(range(4))).group_name
+        with (
+            patch(
+                "helion._dist_utils.all_gather_object",
+                side_effect=lambda obj, name: [obj] * 4,
+            ) as gather,
+            self.assertRaisesRegex(
+                helion.exc.CrossLoopSchedulingError, "allocation identity"
+            ),
+        ):
+            two_root_peer_read_kernel.bind((symm, other_group, group))
+        self.assertEqual(gather.call_args.args[0][0], "error")
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
     def test_inband_rules(self) -> None:
         group = dist.group.WORLD.group_name
         for broken_rule, dtype, expected in (
@@ -1000,21 +1097,37 @@ class TestDistributedTileDependencies(TestCase):
             with (
                 self.subTest(broken_rule=broken_rule, dtype=dtype),
                 self.assertLogs(tile_dependency.log, "INFO") as logs,
-                self.assertRaisesRegex(
-                    helion.exc.CrossLoopSchedulingError, "cross-rank"
-                ),
             ):
                 inband_rule_kernel.bind((symm, x, group, broken_rule))
             (line,) = logs.output
             self.assertIn(f"on peers/symm {expected}", line)
         symm, x = torch.zeros(2, 16, 16, device=DEVICE)
-        with (
-            self.assertLogs(tile_dependency.log, "INFO") as logs,
-            self.assertRaisesRegex(helion.exc.CrossLoopSchedulingError, "cross-rank"),
-        ):
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
             diagonal_store_kernel.bind((symm, x, group))
         (line,) = logs.output
         self.assertIn("on peers/symm use peer_counter (R1:", line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_peer_counters_order_cross_rank_edges(self) -> None:
+        symm, x = torch.zeros(2, 256, device=DEVICE)
+        bound = inband_rule_kernel.bind((symm, x, dist.group.WORLD.group_name, "R1"))
+        # Only the dynamic pipeline carries cross-rank transports.
+        self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("dynamic",))
+        config = bound.config_spec.default_config()
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "cross_loop_pipeline"):
+            bound.config_spec.normalize(
+                {**config.config, "cross_loop_pipeline": "static"}
+            )
+        code = bound.to_triton_code(config)
+        # Root 1 publishes to its slot and the done slot on all 4 ranks. Root 2
+        # waits for 4 tasks per rank, and the last ticket for roots 1 and 2.
+        for expected in (
+            "_add_on_every_rank(tile_dependency_peer_state_ptrs, 0, 4, 4)",
+            "_add_on_every_rank(tile_dependency_peer_state_ptrs, 16, 4, 4)",
+            "tile_dependency_peer_state + 0, tile_dependency_peer_epoch * 16)",
+            "tile_dependency_peer_state + 16, tile_dependency_peer_epoch * 32)",
+        ):
+            self.assertIn(expected, code)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:
@@ -1042,7 +1155,7 @@ class TestDistributedTileDependencies(TestCase):
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     def test_peer_view_ssa_copies_keep_their_owner(self) -> None:
         symm = torch.zeros(64, 64, device=DEVICE)
-        accesses = self._guarded_accesses(
+        accesses = self._accesses(
             peer_read_through_copy_kernel, (symm, dist.group.WORLD.group_name)
         )
         (store,) = (a for a in accesses if a.kind == "store" and a.root == 0)
