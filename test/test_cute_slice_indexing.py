@@ -65,18 +65,43 @@ def test_atomic_slice_ownership_and_reduction(
         torch.testing.assert_close(storage[..., 1::2], untouched, atol=0, rtol=0)
 
 
+def _concatenate_parallel_config(proven_bounds: bool) -> helion.Config:
+    return helion.Config(
+        block_sizes=[128],
+        num_threads=[0, 1, 8],
+        reduction_loops=[8],
+        cute_vector_widths=[8, 1, 1],
+        cute_proven_bounds=proven_bounds,
+    )
+
+
 @pytest.mark.parametrize(
-    "shape", [(256, 128, 256), (33, 37, 64), (65, 1, 128), (65, 128, 1)]
+    ("shape", "proven_bounds"),
+    [
+        ((256, 128, 256), None),
+        ((33, 37, 64), None),
+        ((65, 1, 128), None),
+        ((65, 128, 1), None),
+        ((256, 128, 256), False),
+        ((256, 128, 256), True),
+    ],
 )
 @skipUnlessBackends(["cute"])
 @skipIfNotCUDA()
-def test_concatenate_serial_slice_coordinates(shape: tuple[int, int, int]) -> None:
+def test_concatenate_serial_slice_coordinates(
+    shape: tuple[int, int, int], proven_bounds: bool | None
+) -> None:
     m, n1, n2 = shape
     x = torch.randn((m, n1), device=DEVICE)
     y = torch.randn((m, n2), device=DEVICE)
     kernel = helion.kernel(concat2d_dim1_simple.fn, backend="cute", static_shapes=True)
     bound = kernel.bind((x, y))
-    compiled = bound.compile_config(helion.Config(block_sizes=[32]))
+    config = (
+        helion.Config(block_sizes=[32])
+        if proven_bounds is None
+        else _concatenate_parallel_config(proven_bounds)
+    )
+    compiled = bound.compile_config(config)
     for _ in range(3):
         x.normal_()
         y.normal_()
@@ -87,25 +112,21 @@ def test_concatenate_serial_slice_coordinates(shape: tuple[int, int, int]) -> No
 
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("proven_bounds", [False, True])
-def test_concatenate_rejects_grid_and_full_slice_thread_axis_collision(
+def test_concatenate_separates_grid_and_full_slice_thread_axes(
     proven_bounds: bool,
 ) -> None:
     from test._cute_binding import _cpu_bind
 
     kernel = helion.kernel(concat2d_dim1_simple.fn, backend="cute", static_shapes=True)
     bound = _cpu_bind(kernel, (torch.empty(256, 128), torch.empty(256, 256)))
-    # This FULL-search candidate assigned both the row and the second input's
-    # full slice to thread_idx[1], producing diagonal writes and leaving most
-    # of the output uninitialized. The slice is not an executable reduction.
-    config = helion.Config(
-        block_sizes=[128],
-        num_threads=[0, 1, 8],
-        reduction_loops=[8],
-        cute_vector_widths=[8, 1, 1],
-        cute_proven_bounds=proven_bounds,
+    # This candidate used to put the row and the second input's full slice
+    # on the same axis. The serial first slice must not reserve a thread axis.
+    code = bound.to_code(_concatenate_parallel_config(proven_bounds))
+    assert (
+        "offsets_0 = pid_flat * _BLOCK_SIZE_0 + cutlass.Int32(cute.arch.thread_idx()[1])"
+        in code
     )
-    with pytest.raises(BackendUnsupported, match="thread-axis collision"):
-        bound.to_code(config)
+    assert "indices_2 = cutlass.Int32(cute.arch.thread_idx()[0])" in code
 
 
 @skipUnlessBackends(["cute"])

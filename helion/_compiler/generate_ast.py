@@ -534,6 +534,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             "cute", "warp_mma GEMM family failed late validation"
         )
 
+    def _try_codegen_computed_fragment_root(self) -> bool:
+        from .cute.computed_fragment import codegen_computed_fragment_root
+
+        return codegen_computed_fragment_root(self)
+
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
         if plan is None:
@@ -1636,6 +1641,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and not self._try_codegen_fixed_token_rank1_root()
                         and not self._try_codegen_warp_mma_gemm_root()
                         and not self._try_codegen_attention_flash_root()
+                        and not self._try_codegen_computed_fragment_root()
                     ):
                         grid_state = self.current_grid_state
                         if isinstance(grid_state, DeviceGridState):
@@ -2495,6 +2501,7 @@ def _generate_ast(
                 )
             block_dims = (
                 codegen.device_function.cute_state.collective_register_chain_block_dims
+                or codegen.device_function.cute_state.owned_root_block_dims
             )
             if block_dims is not None:
                 from .cute.thread_block_projection import update_launch_block

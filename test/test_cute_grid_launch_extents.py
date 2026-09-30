@@ -177,6 +177,13 @@ def _launch_block(code: str) -> tuple[int, int, int]:
     return values[0]
 
 
+def _single_thread_axis(code: str, width: int) -> int:
+    """Check the complete physical extent without reserving a dead axis."""
+    block = _launch_block(code)
+    assert sorted(block) == [1, 1, width]
+    return block.index(width)
+
+
 @pytest.mark.parametrize("layout", ["blocked", "strided"])
 @pytest.mark.parametrize("vector", [1, 8])
 @pytest.mark.parametrize("length", [4096, 4112])
@@ -250,12 +257,12 @@ def test_mixed_rank_grid_keeps_surplus_thread_mask(
         (torch.empty((2, 4096)), torch.empty((1024,)), torch.empty((1024,))),
         config,
     )
-    assert sorted(_launch_block(code)) == [1, 1, max(first_threads, second_threads)]
+    axis = _single_thread_axis(code, max(first_threads, second_threads))
     if first_threads > second_threads:
         # A 128-element root cannot spread over 256 threads, so its surplus
         # threads stay masked by the physical thread bound.
         assert "_BLOCK_SIZE_2 = 128" in code
-        assert "cute.arch.thread_idx()[1]) < 128" in code
+        assert f"cute.arch.thread_idx()[{axis}]) < 128" in code
         assert "if mask_2:" in code
     elif second_threads > first_threads:
         # The vectorized 2048-element root is re-planned over all 256 launched

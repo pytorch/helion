@@ -231,6 +231,7 @@ def _captured_plan(
     shape: dict[str, int] | None = None,
     capability: tuple[int, int] = _CAPABILITY,
     mutate: Callable[[object], None] | None = None,
+    overrides: dict[str, object] | None = None,
     kernel: object | None = None,
     inputs: tuple[torch.Tensor, ...] | None = None,
 ) -> object:
@@ -254,6 +255,7 @@ def _captured_plan(
             shape=shape,
             capability=capability,
             mutate=mutate,
+            overrides=overrides,
             kernel=kernel,
             inputs=inputs,
         )
@@ -399,8 +401,25 @@ def test_gdn_recurrence_admits_the_study_siblings(
 def test_gdn_recurrence_unadmitted_shapes_fall_back(
     chunk: int, block_v: int, shape: dict[str, int]
 ) -> None:
-    assert _captured_plan(chunk=chunk, block_v=block_v, shape=shape) is None
-    assert _PLAN_KIND not in _code(chunk=chunk, block_v=block_v, shape=shape)
+    # Select the ordinary SIMT fallback explicitly. The default computed
+    # fragment schedule can exceed shared memory for these unadmitted shapes.
+    with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"):
+        assert (
+            _captured_plan(
+                chunk=chunk,
+                block_v=block_v,
+                shape=shape,
+                overrides={"cute_collective_mma": True},
+            )
+            is None
+        )
+        code = _code(
+            chunk=chunk,
+            block_v=block_v,
+            shape=shape,
+            overrides={"cute_collective_mma": True},
+        )
+    assert _PLAN_KIND not in code
 
 
 def test_gdn_recurrence_rejects_sm80() -> None:
@@ -1035,14 +1054,32 @@ def test_gdn_recurrence_declines_tiles_outside_the_schedule() -> None:
         tile for tile, _mma_m in spec.cute_gdn_recurrence_stage_choices_by_tile
     } == {128, 64, 32, 16}
     for stages in spec.cute_gdn_recurrence_stages.choices:
-        config = _config(bound, 256, **{CUTE_GDN_RECURRENCE_STAGES_KEY: stages})
+        config = _config(
+            bound,
+            256,
+            cute_collective_mma=True,
+            **{CUTE_GDN_RECURRENCE_STAGES_KEY: stages},
+        )
         normalized = spec.normalized_config(config).config
         assert normalized["block_sizes"] == [256]
         assert normalized[CUTE_GDN_RECURRENCE_STAGES_KEY] == stages
-        with _sm100_environment():
+        with (
+            _sm100_environment(),
+            patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"),
+        ):
             code = bound.to_triton_code(config)  # type: ignore[attr-defined]
         assert _PLAN_KIND not in code
-    assert _captured_plan(chunk=128, block_v=256, shape=shape) is None
+        assert _SIMT_FALLBACK in code
+    with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"):
+        assert (
+            _captured_plan(
+                chunk=128,
+                block_v=256,
+                shape=shape,
+                overrides={"cute_collective_mma": True},
+            )
+            is None
+        )
 
 
 def test_gdn_recurrence_unmatched_kernel_has_no_knobs() -> None:
@@ -1957,12 +1994,15 @@ def test_gdn_recurrence_ragged_seqlen_matches_simt_cuda() -> None:
     assert _PLAN_KIND in code
     # A 256-row dstate tile is not admitted, so this is the independent SIMT
     # lowering of the same kernel (the block-size spec clamps tiles below 16).
-    simt_code, simt = code_and_output(
-        module.helion_gdn_fwd_h,  # type: ignore[attr-defined]
-        args,
-        block_sizes=[256],
-    )
+    with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"):
+        simt_code, simt = code_and_output(
+            module.helion_gdn_fwd_h,  # type: ignore[attr-defined]
+            args,
+            block_sizes=[256],
+            cute_collective_mma=True,
+        )
     assert _PLAN_KIND not in simt_code
+    assert _SIMT_FALLBACK in simt_code
     expected = _torch_reference(*args)
     torch.testing.assert_close(simt.float(), expected.float(), atol=1e-1, rtol=1e-2)
     torch.testing.assert_close(result.float(), simt.float(), atol=1e-1, rtol=1e-2)

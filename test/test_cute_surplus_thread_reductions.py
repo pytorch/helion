@@ -135,19 +135,31 @@ def test_a_lane_looped_reduction_narrower_than_the_launch_is_declined() -> None:
 
 
 def test_a_thread_shape_beyond_the_launch_limits_is_declined_at_codegen() -> None:
-    """``num_threads=[2, 128]`` lands the K loop's 128 threads on the z axis, whose CUDA limit is 64: the shape passed the total-thread check and failed at launch with ``cudaErrorInvalidValue``; it is declined when the launch shape is emitted instead."""
+    """Serial reductions leave the z axis free; an actual z extent above 64 rejects."""
+
+    @helion.kernel(backend="cute", static_shapes=True)
+    def add(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for i, j, k in hl.tile(x.size()):
+            out[i, j, k] = x[i, j, k] + 1
+        return out
+
     with _cpu_codegen():
         bound = _cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu", k=256))
-        with pytest.raises(
-            helion.exc.BackendUnsupported, match="exceeds the launch limit of 64"
-        ):
+        code = bound.to_code(
+            _config(bound, block_sizes=[16, 128, 16], num_threads=[2, 128])
+        )
+        assert "block=(2, 128, 1)" in code
+
+        bound = _cpu_bind(add, (torch.empty(2, 2, 128),))
+        with pytest.raises(helion.exc.BackendUnsupported, match="per-axis limits"):
             bound.to_code(
-                _config(bound, block_sizes=[16, 128, 16], num_threads=[2, 128])
+                helion.Config(block_sizes=[2, 2, 128], num_threads=[2, 2, 128])
             )
         code = bound.to_code(
-            _config(bound, block_sizes=[16, 128, 16], num_threads=[2, 64])
+            helion.Config(block_sizes=[2, 2, 128], num_threads=[2, 2, 64])
         )
-    assert "block=(1, 2, 64)" in code
+    assert "block=(2, 2, 64)" in code
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -451,7 +451,12 @@ class TypePropagation(ast.NodeVisitor):
                 jagged_tile_info = env.jagged_tile_parent_ids
                 for jagged_tile_id, parent_block_ids in jagged_tile_info.items():
                     include_jagged = jagged_tile_id in shape_id
-                    include_parents = all(p in shape_id for p in parent_block_ids)
+                    # A parent tile fixed to one element loses its block-id
+                    # symbol when tensor broadcasting simplifies the shape.
+                    include_parents = all(
+                        p in shape_id or env.known_equal(env.block_sizes[p].var, 1)
+                        for p in parent_block_ids
+                    )
                     if include_jagged and not include_parents:
                         raise exc.InvalidJaggedTileUsage(
                             f"jagged_tile alone cannot be used without its parent in assignment {lhs.id}"

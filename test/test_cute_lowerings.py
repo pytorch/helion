@@ -24333,9 +24333,9 @@ class TestReductionBlockClassifiers(unittest.TestCase):
 class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
     """The SIMT lowering gives each block id one lane coordinate, so a tensor
     that binds one block id to two of its axes collapses onto its diagonal.
-    Such kernels must fail loudly instead of returning wrong numbers; once the
-    lowering supports a repeated block id, the rejection tests below turn into
-    numerics tests against the torch references in their bodies.
+    The ordinary path must reject those kernels. Complete fragment ownership
+    can represent their distinct coordinates; supported cases also check that
+    path numerically against the full tensor, including off-diagonal values.
     """
 
     def test_two_full_slice_dot_cc_tile_is_rejected(self) -> None:
@@ -24385,9 +24385,18 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
             return out
 
         x = torch.randn(4, 64, 32, device=DEVICE)
-        # Reference once supported: tril(ones(C, C)) broadcast over B.
-        with self.assertRaisesRegex(exc.BackendUnsupported, "two axes"):
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "two axes"),
+        ):
             causal_mask(x)
+        code, out = code_and_output(causal_mask, (x,), block_sizes=[1])
+        self.assertIn("fragment_thread", code)
+        expected = torch.ones(64, 64, device=DEVICE).tril().expand(4, -1, -1)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     def test_dot_with_k_equal_m_block_is_rejected(self) -> None:
         """``T = t[tile_bhn, :, :]`` with M == K dedups both full slices onto
@@ -24421,9 +24430,19 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
             dot_t_k(t_rect, k), torch.bmm(t_rect, k.float()), rtol=1e-4, atol=1e-4
         )
         t_square = torch.randn(4, 16, 16, device=DEVICE)
-        # Reference once supported: torch.bmm(t_square, k.float())
-        with self.assertRaisesRegex(exc.BackendUnsupported, "two axes"):
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "two axes"),
+        ):
             dot_t_k(t_square, k)
+        code, out = code_and_output(dot_t_k, (t_square, k), block_sizes=[1, 8])
+        self.assertIn("fragment_buffer", code)
+        torch.testing.assert_close(
+            out, torch.bmm(t_square, k.float()), rtol=1e-4, atol=1e-4
+        )
 
     def test_dot_with_k_equal_m_block_inner_load_is_rejected(self) -> None:
         """Loading ``T`` next to the ``hl.dot`` exempts it from the load check
@@ -24458,11 +24477,19 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
             atol=1e-4,
         )
         t_square = torch.randn(4, 16, 16, device=DEVICE)
-        # Reference once supported: torch.bmm(t_square, k.float())
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "requires an active K tile"
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "requires an active K tile"),
         ):
             dot_t_k_inner(t_square, k)
+        code, out = code_and_output(dot_t_k_inner, (t_square, k), block_sizes=[1, 8])
+        self.assertIn("fragment_buffer", code)
+        torch.testing.assert_close(
+            out, torch.bmm(t_square, k.float()), rtol=1e-4, atol=1e-4
+        )
 
     def test_equal_free_aranges_on_two_dims_of_one_store_are_rejected(
         self,
@@ -24493,9 +24520,21 @@ class TestCuteRepeatedBlockIdGuard(unittest.TestCase):
 
         q = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
         k = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
-        # Reference once supported: bmm(q[:, :16], k[:, :16].T) in out[:, :16, :16]
-        with self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"):
+        with (
+            patch(
+                "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+                return_value=False,
+            ),
+            self.assertRaisesRegex(exc.BackendUnsupported, "share a free hl.arange"),
+        ):
             dot_rows_cols(q, k)
+        code, out = code_and_output(dot_rows_cols, (q, k), block_sizes=[])
+        self.assertIn("fragment_buffer", code)
+        expected = torch.zeros(4, 64, 64, device=DEVICE)
+        expected[:, :16, :16] = torch.bmm(
+            q[:, :16].float(), k[:, :16].float().transpose(-2, -1)
+        )
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
 
     def test_one_free_arange_on_two_dims_of_one_access_is_rejected(self) -> None:
         """Helion indexes two tensor entries as a cartesian tile, so one
@@ -25777,15 +25816,26 @@ class TestCuteMultiAxisKContraction(unittest.TestCase):
 
         q = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
         k = torch.randn(4, 64, 64, device=DEVICE, dtype=torch.bfloat16)
-        code = dot_m8_n16.bind((q, k)).to_code(helion.Config(block_sizes=[]))
+        with patch(
+            "helion._compiler.cute.computed_fragment.codegen_computed_fragment_root",
+            return_value=False,
+        ):
+            ordinary = dot_m8_n16._bind_isolated((q, k))
+            config = helion.Config(block_sizes=[])
+            code = ordinary.to_code(config)
+            out = ordinary.compile_config(config)(q, k)
         self.assertIn("block=(64, 8, 2)", code)
         self.assertIn("_cute_grouped_reduce_shared_two_stage", code)
-        out = dot_m8_n16(q, k)
         ref = torch.zeros(4, 64, 64, device=DEVICE)
         ref[:, :8, :16] = torch.bmm(
             q[:, :8].float() * 2.0, (k[:, :16].float() * 0.5).transpose(-2, -1)
         )
         torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
+        fragment_code, fragment_out = code_and_output(
+            dot_m8_n16, (q, k), block_sizes=[]
+        )
+        self.assertIn("fragment_buffer", fragment_code)
+        torch.testing.assert_close(fragment_out, ref, rtol=1e-3, atol=1e-3)
 
 
 if __name__ == "__main__":

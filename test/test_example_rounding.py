@@ -16,6 +16,7 @@ from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion.runtime import default_cute_launcher
 from helion.runtime import default_launcher
 
 pytestmark = skipUnlessBackends(["triton", "cute"])
@@ -45,11 +46,15 @@ def test_rope_forward_backward_rounding_and_slices(
     backward = helion.kernel(rope_bwd.fn, static_shapes=True).bind(args)
     fwd = forward.compile_config(forward.config_spec.autotune_reference_config())
     bwd = backward.compile_config(backward.config_spec.autotune_reference_config())
+    # Fusion can replace the rounded product and addition with a half FMA.
+    # Disable contraction when checking the explicit rounding exactly.
     launch_options = {}
     if forward.env.backend_name == "triton":
-        # Fusion can replace the rounded product and addition with a half FMA.
-        # Disable contraction when checking the explicit rounding exactly.
         launch_options["_launcher"] = partial(default_launcher, enable_fp_fusion=False)
+    elif forward.env.backend_name == "cute":
+        launch_options["_launcher"] = partial(
+            default_cute_launcher, cute_compile_options="--ptxas-options=--fmad=false"
+        )
     for _ in range(3):
         with torch.no_grad():
             q.normal_()

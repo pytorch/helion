@@ -161,6 +161,8 @@ def test_per_element_atomics_match_reference() -> None:
 
 @pytest.mark.parametrize("packet_flush", [False, True], ids=["values", "packet"])
 def test_byte_conversion_and_count_match_reference(packet_flush: bool) -> None:
+    if packet_flush and torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("signed-byte BF16 packets are restricted to sm_100a")
     packed = torch.randint(-128, 128, (8, 256), dtype=torch.int8, device=CUDA_DEVICE)
     counter = torch.zeros((1,), dtype=torch.int32, device=CUDA_DEVICE)
     out = _run(
