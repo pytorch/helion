@@ -17,7 +17,6 @@ from ...language import _decorators
 from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import store
-from ..ast_extension import statement_from_string
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -113,7 +112,8 @@ def _(state: CodegenState) -> ast.AST:
     if state.fx_node is not None and state.fx_node.meta.get(
         INTRA_LOOP_RAW_BARRIER_META
     ):
-        state.add_statement(statement_from_string("tl.debug_barrier()"))
+        for statement in state.device_function.cta_barrier():
+            state.add_statement(statement)
 
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)

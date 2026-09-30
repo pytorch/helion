@@ -138,6 +138,7 @@ def _(state: CodegenState) -> ast.AST:
             )
         )
     statements = [
+        *device_fn.async_store_drain(),
         statement_from_string("nvshmem.quiet()"),
         statement_from_string("tl.debug_barrier()"),
     ]
@@ -158,6 +159,7 @@ def _(state: CodegenState) -> ast.AST:
             )
         )
     statements.append(statement_from_string("tl.debug_barrier()"))
+    statements.extend(device_fn.async_load_fence())
     for statement in statements:
         state.codegen.add_statement(statement)
     state.device_function.has_barrier = True
@@ -523,8 +525,13 @@ def _emit_statements(
 @_decorators.codegen(start_async_remote_copy_descriptor, "triton")
 def _(state: CodegenState) -> ast.AST:
     info = _paired_copy_info(state)
+    # Every thread reads the source, so other threads' TMA stores to it must be
+    # complete first. A CTA barrier only, so has_barrier stays unset.
+    sync: list[ast.stmt] = []
+    if drain := state.device_function.async_store_drain():
+        sync = [*drain, statement_from_string("tl.debug_barrier()")]
     return _emit_statements(
-        state, [*info.source_materialization, *info.start_statements]
+        state, [*sync, *info.source_materialization, *info.start_statements]
     )
 
 
@@ -539,7 +546,8 @@ def _receive_wait_statements(state: CodegenState) -> list[ast.stmt]:
         statement_from_string(
             "helion_dist_utils._wait_and_consume_signal("
             f"{signal}, tl.cast(1, tl.int64))"
-        )
+        ),
+        *state.device_function.async_load_fence(),
     ]
 
 
@@ -553,7 +561,14 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(wait_send_async_remote_copy, "triton")
 def _(state: CodegenState) -> ast.AST:
-    return _emit_statements(state, [statement_from_string("nvshmem.quiet()")])
+    # Order the completed source reads before later TMA writes to the source.
+    return _emit_statements(
+        state,
+        [
+            statement_from_string("nvshmem.quiet()"),
+            *state.device_function.async_load_fence(),
+        ],
+    )
 
 
 @_decorators.codegen(wait_recv_async_remote_copy, "triton")

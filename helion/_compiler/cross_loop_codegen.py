@@ -392,6 +392,7 @@ def _wait_for_counter(
     counter: str,
     target: str,
     prefix: str,
+    load_fence: bool = True,
 ) -> list[ast.stmt]:
     value = device_function.new_var(prefix, dce=False)
     sync = device_function.new_var(f"{prefix}_sync", dce=False)
@@ -415,6 +416,7 @@ def _wait_for_counter(
             "constraints='=r,r', args=[tl.arange(0, 32)], "
             "dtype=tl.uint32, is_pure=False, pack=1)"
         ),
+        *(device_function.async_load_fence() if load_fence else []),
     ]
 
 
@@ -425,7 +427,7 @@ def _wait_for_dependencies(
     prefix: str,
 ) -> list[ast.stmt]:
     """Emit every acquire wait in one graph-derived dependency set."""
-    return [
+    waits = [
         statement
         for counter, target in dependencies
         for statement in _wait_for_counter(
@@ -433,8 +435,10 @@ def _wait_for_dependencies(
             counter=counter,
             target=target,
             prefix=prefix,
+            load_fence=False,
         )
     ]
+    return [*waits, *device_function.async_load_fence()] if waits else []
 
 
 def _emit_final_arrival_continuation(
@@ -468,6 +472,14 @@ def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
         "constraints='=r,r', args=[tl.arange(0, 32)], "
         "dtype=tl.uint32, is_pure=False, pack=1)"
     )
+
+
+def _release_sync(device_function: DeviceFunction) -> list[ast.stmt]:
+    """CTA sync before a release publication, completing TMA stores first."""
+    return [
+        *device_function.async_store_drain(),
+        _publication_sync(device_function),
+    ]
 
 
 def _register_cross_loop_state(
@@ -881,12 +893,12 @@ def emit_cross_loop_schedule(
         producers = root_barrier_incoming.get(root, ())
         return tuple(root_barrier_dependency(producer) for producer in producers)
 
-    def root_barrier_publication(root: int) -> list[ast.stmt]:
+    def root_barrier_publication(root: int, *, synced: bool = False) -> list[ast.stmt]:
         if root not in root_barrier_indices:
             return []
         barrier_counter = root_barrier_counter(root)
         arrivals = static_pipeline_plan.root_barrier_arrival_count(root)
-        result = [_publication_sync(device_function)]
+        result = [] if synced else _release_sync(device_function)
         if arrivals == 1:
             result.append(
                 statement_from_string(
@@ -1541,11 +1553,15 @@ def emit_cross_loop_schedule(
                 )
             )
 
-        last_arrival_body = [consumer_call]
+        last_arrival_body = [*device_function.async_load_fence(), consumer_call]
         if consumer_publications:
-            last_arrival_body.append(_publication_sync(device_function))
+            last_arrival_body.extend(_release_sync(device_function))
             last_arrival_body.extend(consumer_publications)
-        last_arrival_body.extend(root_barrier_publication(continuation_root))
+        last_arrival_body.extend(
+            root_barrier_publication(
+                continuation_root, synced=bool(consumer_publications)
+            )
+        )
         expected_arrivals = plan.uniform_arrival_count()
         if expected_arrivals is None:
             raise AssertionError(
@@ -1672,12 +1688,7 @@ def emit_cross_loop_schedule(
                     )
 
             cloned = cast("ast.For", _clone_ast_value(loop))
-            cloned.body.extend(
-                [
-                    _publication_sync(device_function),
-                    *publications,
-                ]
-            )
+            cloned.body.extend([*_release_sync(device_function), *publications])
             emitted_site_ids.add(site_id)
             return [cloned]
 
@@ -1817,7 +1828,7 @@ def emit_cross_loop_schedule(
             )
         if producer_counters:
             has_task_scheduling = True
-            body.append(_publication_sync(device_function))
+            body.extend(_release_sync(device_function))
         for producer_counter_plan, readiness_producer in producer_counters:
             body.extend(
                 emit_readiness_arrivals_from_producer(

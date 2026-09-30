@@ -867,6 +867,87 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 self.assertIn("tile_dependency_raw_dispatch_ticket", code)
                 self.assertIn("tile_dependency_root_0_scheduled_task", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
+                # The TMA store of tmp must complete before its release, and the
+                # consumer's TMA load of tmp must follow a proxy fence.
+                self.assertIn(
+                    "cp.async.bulk.wait_group 0; fence.proxy.async.global", code
+                )
+                self.assertIn("async_load_fence", code)
+
+    @skipIfNotCUDA()
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_middle_root_tma_store_drains_every_release(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def three_stage(x: torch.Tensor) -> torch.Tensor:
+            a = torch.empty_like(x)
+            b = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                a[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                b[tile_m, tile_n] = a[tile_m, tile_n] * 2
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                out[tile_m, tile_n] = b[tile_m, tile_n] + 3
+            return out
+
+        x = torch.arange(64 * 128, device=DEVICE, dtype=torch.float32).reshape(64, 128)
+        # Continuations with fan-in 1 publish without atomics; keep every edge
+        # on the release path this test inspects.
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "choose_final_arrival_continuations",
+            return_value=(),
+        ):
+            code, out = code_and_output(
+                three_stage,
+                (x,),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=4,
+                # Only the store of b is a TMA store; every load uses pointers.
+                indexing=[
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "pointer",
+                    "pointer",
+                ],
+            )
+
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertIn(".store(", code)
+        lines = code.splitlines()
+        releases = [
+            i
+            for i, line in enumerate(lines)
+            if "sem='release'" in line or "sem='acq_rel'" in line
+        ]
+        self.assertTrue(releases)
+        # Walking back from each release must reach a drain before any store.
+        for i in releases:
+            for line in reversed(lines[:i]):
+                if "cp.async.bulk.wait_group 0;" in line:
+                    break
+                self.assertFalse(
+                    ".store(" in line or line.lstrip().startswith("def "),
+                    msg=f"release without a TMA drain: {lines[i].strip()}",
+                )
+
+        # Without a TMA access there is nothing to drain or fence.
+        code, out = code_and_output(
+            three_stage,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=4,
+            indexing="pointer",
+        )
+        torch.testing.assert_close(out, (x + 1) * 2 + 3)
+        self.assertNotIn("fence.proxy.async", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
