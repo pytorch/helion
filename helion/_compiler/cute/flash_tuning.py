@@ -24,6 +24,7 @@ _FLASH_POLICY_PIPELINE_FAMILIES = frozenset(
     {
         "ws_overlap",
         "fa4",
+        "row_mma",
         "fa4_deep_1cta",
         "fa4_2cta_causal",
         "fa4_tma_4d",

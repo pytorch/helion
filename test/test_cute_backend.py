@@ -5952,9 +5952,12 @@ class TestCuteBackend(TestCase):
         fragments = _cute_flash.flash_autotune_fragments(64, 512)
         family = fragments[_cute_flash.FLASH_PIPELINE_FAMILY_KEY]
         epi_tma = fragments[_cute_flash.FLASH_EPI_TMA_KEY]
+        # The row programs are searched only on small grids of a known
+        # batch; this 512-tile surface of an unknown batch leaves them out.
         self.assertEqual(
             set(family.search_choices or ()),
-            set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES) - {"fa4_2cta_causal"},
+            set(_cute_flash.FLASH_AUTOTUNE_PIPELINE_FAMILIES)
+            - {"fa4_2cta_causal", "row_mma"},
         )
         self.assertEqual(epi_tma.search_choices, (False, True))
 
@@ -6045,6 +6048,7 @@ class TestCuteBackend(TestCase):
                 False,
             ),
             "fa4": ("fa4", False, False, False, False, False, False, False),
+            "row_mma": ("row_mma", False, False, False, False, False, False, False),
             "fa4_deep_1cta": ("fa4", True, False, False, False, False, False, False),
             "fa4_2cta_causal": ("fa4", False, True, True, False, False, False, False),
             "fa4_tma_4d": ("fa4", False, False, False, False, False, False, True),

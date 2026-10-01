@@ -4368,7 +4368,8 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
     assert policy["kind"] == "canonical_cute_flash"
     # Every surface seeds the flat ws_overlap grid once next to the persistent
     # family seed (a distinct source variant); the dense hd64 surface still
-    # carries one alias among its raw seeds.
+    # carries one alias among its raw seeds. These grids are far beyond the
+    # row_mma search bound, so the row programs seed nothing here.
     assert policy["raw_config_count"] == (10 if causal else 27)
     assert len(policy["effective_config_ids"]) == (10 if causal else 26)
     assert len(generation_zero_ids) == 100
@@ -7732,10 +7733,17 @@ def _full_autotune_trial_with_failed_clc_combination():
     leaf = cast("dict[str, Any]", phase["leaf_results"][0])
     clc = cast("dict[str, Any]", phase["clc_families"][0])
     depth_ids = set(cast("list[str]", clc["combination_depth_config_ids"]))
+    # The failed cell must be a config first measured in the combination pass:
+    # a generation-zero member keeps its (successful) initial snapshot, so
+    # failing its later cell would make the timeline inconsistent.
+    initial_ids = {
+        cast("str", record["config_id"])
+        for record in cast("list[dict[str, Any]]", phase["initial_results"])
+    }
     failed_cell = next(
         cell
         for cell in cast("list[dict[str, Any]]", clc["combination_cells"])
-        if cell["config_id"] not in depth_ids
+        if cell["config_id"] not in depth_ids and cell["config_id"] not in initial_ids
     )
     failed_id = cast("str", failed_cell["config_id"])
     failed_cell.update(

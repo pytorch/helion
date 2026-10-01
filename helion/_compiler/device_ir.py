@@ -3416,6 +3416,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
                     has_row_epilogue=flash_shape.has_row_epilogue,
                     plain_row_body=flash_shape.plain_row_body,
+                    has_score_modifiers=flash_shape.has_score_modifiers,
                     device_sm_count=_cuda_num_sms_or_zero(
                         CompileEnvironment.current().device
                     ),

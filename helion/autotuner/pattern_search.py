@@ -112,7 +112,12 @@ class PatternSearch(PopulationBasedSearch):
         self.copies = copies
         self.max_generations = max_generations
         self.min_improvement_delta = min_improvement_delta
-        self.initial_population = initial_population
+        # A CuTe flash surface measures one parent row per structural leaf;
+        # a profile population below that count (``quick`` on the widest
+        # small-grid surface) is raised here rather than for every kernel.
+        self.initial_population = self.config_gen.flash_population_floor(
+            initial_population
+        )
         self.num_neighbors_cap = num_neighbors_cap
         self.compile_timeout_lower_bound = compile_timeout_lower_bound
         self.compile_timeout_quantile = compile_timeout_quantile

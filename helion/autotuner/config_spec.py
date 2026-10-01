@@ -1491,6 +1491,7 @@ class ConfigSpec:
         self._cute_flash_supports_tensor_4d_tma: bool = True
         self._cute_flash_has_row_epilogue: bool = False
         self._cute_flash_plain_row_body: bool = True
+        self._cute_flash_has_score_modifiers: bool = False
         self._cute_flash_block_size_targets: dict[int, int] = {}
         # Memo for ``flash_autotune_fragments``: every other input is fixed
         # ConfigSpec state, so (topology_override, pipeline_family_override) is
@@ -1798,6 +1799,7 @@ class ConfigSpec:
                 supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
                 has_row_epilogue=self._cute_flash_has_row_epilogue,
                 plain_row_body=self._cute_flash_plain_row_body,
+                has_score_modifiers=self._cute_flash_has_score_modifiers,
                 topology_override=topology_override,
                 pipeline_family_override=pipeline_family_override,
             )
@@ -1831,6 +1833,7 @@ class ConfigSpec:
             ),
             plain_row_body=self._cute_flash_plain_row_body,
             has_row_epilogue=self._cute_flash_has_row_epilogue,
+            has_score_modifiers=self._cute_flash_has_score_modifiers,
         )
 
     def _legalize_cute_flash_compiler_seed(
@@ -2261,6 +2264,7 @@ class ConfigSpec:
         supports_tensor_4d_tma: bool = True,
         has_row_epilogue: bool = False,
         plain_row_body: bool = True,
+        has_score_modifiers: bool = False,
         device_sm_count: int = 0,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
@@ -2284,6 +2288,7 @@ class ConfigSpec:
         self._cute_flash_supports_tensor_4d_tma = supports_tensor_4d_tma
         self._cute_flash_has_row_epilogue = has_row_epilogue
         self._cute_flash_plain_row_body = plain_row_body
+        self._cute_flash_has_score_modifiers = has_score_modifiers
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -2949,6 +2954,7 @@ class ConfigSpec:
                     supports_tensor_4d_tma=(self._cute_flash_supports_tensor_4d_tma),
                     has_row_epilogue=self._cute_flash_has_row_epilogue,
                     plain_row_body=self._cute_flash_plain_row_body,
+                    has_score_modifiers=self._cute_flash_has_score_modifiers,
                     block_size_targets=self._cute_flash_block_size_target_list(),
                     device_sm_count=self._cute_flash_device_sm_count,
                 )
