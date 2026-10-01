@@ -381,7 +381,9 @@ class _NameReplacer(ast.NodeTransformer):
         return node
 
 
-def _inline_invariant_aliases_in_body(body: list[ast.stmt]) -> None:
+def _inline_invariant_aliases_in_body(
+    body: list[ast.stmt], snapshot_names: set[str]
+) -> None:
     """Inline pure SSA-style alias chains of the form ``NAME = ROOT_NAME``
     in ``body`` (single straight-line scope only).
 
@@ -422,18 +424,34 @@ def _inline_invariant_aliases_in_body(body: list[ast.stmt]) -> None:
         # have the chain root (or an earlier link of the same chain) as
         # the RHS Name.  User-level reassignments (``mi = mi_next``)
         # don't contain ``_copy`` in the target and stay intact.
-        return "_copy" in target and target.startswith(rhs)
+        # Parallel phi inputs use two snapshots whose names need not share
+        # a prefix. The emitter records these explicitly; they obey the same
+        # read-before-write and nested-scope checks as the older copy chains.
+        return target in snapshot_names or (
+            "_copy" in target and target.startswith(rhs)
+        )
 
     alias_def_idx: dict[str, int] = {}
     alias_rhs: dict[str, str] = {}
     multi_assigned: set[str] = set()
     non_alias_assign_idx: dict[str, list[int]] = {}
     for idx, stmt in enumerate(body):
-        if not isinstance(stmt, ast.Assign) or len(stmt.targets) != 1:
+        if (
+            not isinstance(stmt, ast.Assign)
+            or len(stmt.targets) != 1
+            or not isinstance(stmt.targets[0], ast.Name)
+        ):
+            # A nested branch/loop or augmented assignment can also overwrite
+            # a snapshot's root before a later straight-line use.
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                    non_alias_assign_idx.setdefault(node.id, []).append(idx)
+                    canon = _RENAME_GROUPS.get(node.id, node.id)
+                    if canon != node.id:
+                        non_alias_assign_idx.setdefault(canon, []).append(idx)
             continue
         target = stmt.targets[0]
-        if not isinstance(target, ast.Name):
-            continue
+        assert isinstance(target, ast.Name)
         name = target.id
         # A snapshot-shaped name (``X_copy_..._N``) is load-bearing
         # when it participates in an ``ast_rename`` group — either as
@@ -506,16 +524,8 @@ def _inline_invariant_aliases_in_body(body: list[ast.stmt]) -> None:
                 into.add(sub.id)
 
     for idx, stmt in enumerate(body):
-        # Skip the alias's own RHS (a single Name that's about to be dropped).
-        is_alias_def = (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-            and stmt.targets[0].id in alias_to_root
-            and isinstance(stmt.value, ast.Name)
-        )
-        if is_alias_def:
-            continue
+        # Alias definitions are reads too: an unsafe descendant can survive
+        # this pass and still require an earlier snapshot after a root write.
         # Top-level loads (RHS / target subscripts of straight-line stmts).
         if isinstance(stmt, ast.Assign):
             loads_here: set[str] = set()
@@ -609,7 +619,14 @@ def _inline_invariant_aliases_in_body(body: list[ast.stmt]) -> None:
             safe_aliases[alias] = root
             continue
         last_use = max(uses)
-        offending = [i for i in root_assign_idxs if snapshot_idx <= i <= last_use]
+        # An assignment evaluates its RHS before writing its target, so a
+        # final read in the root's own update still sees the snapshot value.
+        offending = [
+            i
+            for i in root_assign_idxs
+            if snapshot_idx <= i
+            and (i < last_use or (i == last_use and isinstance(body[i], ast.While)))
+        ]
         if not offending:
             safe_aliases[alias] = root
 
@@ -635,7 +652,9 @@ def _inline_invariant_aliases_in_body(body: list[ast.stmt]) -> None:
     body[:] = new_stmts
 
 
-def _inline_invariant_aliases(body: list[ast.stmt]) -> list[ast.stmt]:
+def _inline_invariant_aliases(
+    body: list[ast.stmt], snapshot_names: set[str]
+) -> list[ast.stmt]:
     """Walk down into every nested loop body and inline alias chains
     whose chain root is loop-external for THAT body.
 
@@ -644,13 +663,13 @@ def _inline_invariant_aliases(body: list[ast.stmt]) -> list[ast.stmt]:
     if _is_placeholder_body(body):
         return body
     # Process this body first.
-    _inline_invariant_aliases_in_body(body)
+    _inline_invariant_aliases_in_body(body, snapshot_names)
     # Recurse into for/if/with bodies that remain after rewrite.
     for stmt in body:
         if isinstance(stmt, (ast.For, ast.If, ast.With, ast.FunctionDef)):
-            _inline_invariant_aliases(stmt.body)
+            _inline_invariant_aliases(stmt.body, snapshot_names)
         if isinstance(stmt, (ast.For, ast.If)):
-            _inline_invariant_aliases(stmt.orelse)
+            _inline_invariant_aliases(stmt.orelse, snapshot_names)
     return body
 
 
@@ -1065,6 +1084,8 @@ def _dce_pure_assigns(body: list[ast.stmt]) -> list[ast.stmt]:
 def hoist_loop_invariant_recips(
     body: list[ast.stmt],
     rename_groups: dict[str, str] | None = None,
+    *,
+    snapshot_names: set[str] | None = None,
 ) -> list[ast.stmt]:
     """Apply the hoist passes to a list of kernel-body statements.
 
@@ -1118,7 +1139,7 @@ def hoist_loop_invariant_recips(
         #    whose use crosses a root reassignment or escapes into a
         #    nested scope, preserving load-bearing loop-carry updates.
         _USE_CANONICAL_INVARIANCE[0] = False
-        _inline_invariant_aliases(body)
+        _inline_invariant_aliases(body, snapshot_names or set())
         # 2. Hoist reciprocals — runs WITH canonical-aware mode so that
         #    ``di`` is not classified as invariant when ``v_8`` (renamed
         #    to ``di``) is reassigned inside the loop.

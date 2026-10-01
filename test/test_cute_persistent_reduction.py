@@ -1605,7 +1605,11 @@ sink = reduced_0 + reduced_1
         split_lane_loop_reductions([loop])
 
 
-def test_dependent_lane_split_preserves_invariant_carried_update() -> None:
+@pytest.mark.parametrize(
+    "snapshot",
+    ["carry_copy = carry", "carry_entry = carry\ncarry_copy = carry_entry"],
+)
+def test_dependent_lane_split_preserves_invariant_carried_update(snapshot: str) -> None:
     from helion._compiler.tile_strategy import _create_lane_loop
     from helion._compiler.tile_strategy import split_lane_loop_reductions
 
@@ -1613,8 +1617,8 @@ def test_dependent_lane_split_preserves_invariant_carried_update() -> None:
         "lane",
         8,
         ast.parse(
-            """
-carry_copy = carry
+            f"""
+{snapshot}
 first = lane + 1
 reduced_0 = _helion_lane_reduce(first, 'sum', cutlass.Float32(0), 16, 1, 0, '', 1, 1)
 second = first + reduced_0

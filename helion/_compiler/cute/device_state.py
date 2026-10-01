@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
     from .block_scaled_mma import BlockScaledMmaPlan
+    from .chained_matmul import ChainedMatmulPlan
+    from .chunk_prefill import CuteChunkPrefillRegion
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
     from .collective_matmul import CollectiveMmaSite
@@ -42,6 +44,7 @@ if TYPE_CHECKING:
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+    from .work_order import WorkOrderPlan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -597,6 +600,10 @@ class CuteDeviceFunctionState:
         self.explicit_rng_seed_names: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
+        self.work_order_plan: WorkOrderPlan | None = None
+        # Structured tile-loop emission owns its memory scheduling; ordinary
+        # scalar memory lowering must not splice transfers into old wrappers.
+        self.emitting_tile_loop: bool = False
         # SIMT reduction-kernel thread-block cluster width (from the
         # ``cute_cluster_n`` config knob, applied by
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
@@ -713,10 +720,13 @@ class CuteDeviceFunctionState:
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None
         self.block_scaled_plan: BlockScaledMmaPlan | None = None
+        self.chunk_prefill_plan: CuteChunkPrefillRegion | None = None
         # Whole-root BT16 KDA recurrence/output schedule. Like the
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
         self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
+        self.chained_matmul_plan: ChainedMatmulPlan | None = None
+        self.phi_snapshot_names: set[str] = set()
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the

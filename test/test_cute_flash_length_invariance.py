@@ -26,6 +26,7 @@ from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion.autotuner import config_spec
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -224,6 +225,26 @@ def _shared_flash_generation(
     with _memoized_flash_fragments():
         generation.flash_deterministic_population_configs()
     return generation
+
+
+@contextlib.contextmanager
+def _isolated_flash_target(capability: tuple[int, int] | None) -> Iterator[None]:
+    # The shared generation cache predates target-specific policies and does not
+    # include the target in its key. Do not reuse it across an explicit target.
+    _shared_flash_generation.cache_clear()
+    try:
+        with patch.object(
+            config_spec, "get_target_device_capability", return_value=capability
+        ):
+            yield
+    finally:
+        _shared_flash_generation.cache_clear()
+
+
+@pytest.fixture
+def _generic_flash_target() -> Iterator[None]:
+    with _isolated_flash_target(None):
+        yield
 
 
 def _structural_coverage_configs(
@@ -508,6 +529,7 @@ def test_flash_search_surfaces_are_length_invariant(
 # warmed generations: deterministic-coverage fingerprints and leaf catalogs,
 # low-confound schedule anchors, starting-path and family-probe limits, the
 # terminal coordinate-surface catalog, and coordinate-neighbor projections.
+@pytest.mark.usefixtures("_generic_flash_target")
 @pytest.mark.parametrize("is_causal", (False, True), ids=("dense", "causal"))
 def test_flash_structural_design_is_length_invariant(is_causal: bool) -> None:
     random_state = random.getstate()
@@ -998,6 +1020,7 @@ def test_flash_path_limits_follow_live_compound_catalog() -> None:
 
 # The two semantic cases span both dtypes, both head dims, and dense+causal;
 # each length class is checked at its two extremes for both cases.
+@pytest.mark.usefixtures("_generic_flash_target")
 @pytest.mark.parametrize(("dtype", "head_dim", "is_causal"), _POPULATION_CASES)
 @pytest.mark.parametrize(
     "compiler_seeded", (False, True), ids=("cold", "compiler-seeded")
@@ -3434,3 +3457,103 @@ def test_persistent_loop_canonicalizes_for_clc() -> None:
     )
     assert resolved.use_clc_scheduler
     assert resolved.persistent_loop == "while"
+
+
+def test_sm103_causal_catalog_adds_only_target_legal_rows() -> None:
+    with _isolated_flash_target((10, 3)):
+        catalogs = {
+            length: _shared_flash_generation(
+                64, length, torch.float16, True
+            ).flash_terminal_coordinate_surface_catalog(radius=2)
+            for length in _ALIGNED_LENGTHS
+        }
+    expected = copy.deepcopy(catalogs[4])
+    additions = {
+        cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY: ("16/6", "inherit"),
+        cute_flash.FLASH_EXP2_PACKET_KEY: ("deg2_16x6", "1x1"),
+        cute_flash.FLASH_WAIT_HINT_KEY: (0, 10_000_000),
+    }
+    found: set[str] = set()
+    for leaf in cast("list[dict[str, Any]]", expected["leaves"]):
+        if leaf["leaf"] != {
+            "family": "ws_overlap",
+            "compound_packet": None,
+            "softmax_disc": True,
+        }:
+            continue
+        for coordinate in leaf["coordinates"]:
+            key = coordinate["key"]
+            if key not in additions:
+                continue
+            assert key not in found
+            found.add(key)
+            value, active = additions[key]
+            assert coordinate["active_values"] == [active]
+            rows = coordinate["neighbors_by_value"]
+            assert all(row["from_value"] != value for row in rows)
+            rows.append({"from_value": value, "to_values": [active]})
+    assert found == set(additions)
+    # Compare the complete catalog: no other rows, fields or active choices vary.
+    assert catalogs[4096] == expected
+
+
+def test_sm103_causal_compiler_seeds_preserve_generic_prefix() -> None:
+    with _isolated_flash_target((10, 3)):
+        specs = {
+            length: _flash_config_spec(
+                head_dim=64, num_kv=length, dtype=torch.float16, is_causal=True
+            )
+            for length in _ALIGNED_LENGTHS
+        }
+        seeds = {length: spec.autotune_seed_configs() for length, spec in specs.items()}
+        assert all(spec.target_device_capability == (10, 3) for spec in specs.values())
+        assert len(seeds[4]) == 9 and len(seeds[4096]) == 10
+        assert seeds[4096][1:] == seeds[4]
+        keys = (
+            cute_flash.FLASH_KV_STAGE_KEY,
+            cute_flash.FLASH_E2E_OFFSET_KEY,
+            cute_flash.FLASH_E2E_OFFSET0_KEY,
+            cute_flash.FLASH_SOFTMAX_REGS_KEY,
+            cute_flash.FLASH_EXP2_PACKET_KEY,
+        )
+        assert tuple(seeds[4][0][key] for key in keys) == (2, 2, 0, 200, "1x1")
+        assert tuple(seeds[4096][0][key] for key in keys) == (
+            6,
+            14,
+            12,
+            184,
+            "deg2_16x6",
+        )
+        for length, spec in specs.items():
+            generation = spec.create_config_generation()
+            for seed in seeds[length]:
+                normalized = spec.normalized_config(seed)
+                assert generation.unflatten(generation.flatten(seed)) == normalized
+
+
+@pytest.mark.parametrize("first,second", ((None, (10, 3)), ((10, 3), None)))
+def test_explicit_flash_targets_do_not_share_cached_generations(
+    first: tuple[int, int] | None, second: tuple[int, int] | None
+) -> None:
+    with _isolated_flash_target(first):
+        previous = _shared_flash_generation(64, 4, torch.float16, True)
+        assert previous.config_spec.target_device_capability == first
+        with _isolated_flash_target(second):
+            assert _shared_flash_generation.cache_info().currsize == 0
+            current = _shared_flash_generation(64, 4, torch.float16, True)
+            assert current is not previous
+            assert current.config_spec.target_device_capability == second
+        assert _shared_flash_generation.cache_info().currsize == 0
+        assert config_spec.get_target_device_capability() == first
+
+
+def test_explicit_flash_target_clears_cache_after_failure() -> None:
+    original = config_spec.get_target_device_capability
+    with (
+        pytest.raises(RuntimeError, match="target isolation sentinel"),
+        _isolated_flash_target((10, 3)),
+    ):
+        _shared_flash_generation(64, 4, torch.float16, True)
+        raise RuntimeError("target isolation sentinel")
+    assert _shared_flash_generation.cache_info().currsize == 0
+    assert config_spec.get_target_device_capability is original

@@ -81,10 +81,14 @@ def _build_scan(
     extra_effect: bool = False,
     live_out: bool = False,
     producer_live_out: bool = False,
+    feedback: tuple[bool, ...] | None = None,
 ) -> _BuiltScan:
     if observation_forms is None:
         observation_forms = ("direct",) * steps
     assert len(observation_forms) == steps
+    if feedback is None:
+        feedback = (True,) * steps
+    assert len(feedback) == steps
 
     graph = torch.fx.Graph()
     state_base = _placeholder(graph, "state_buffer", (ROWS, features), storage_dtype)
@@ -220,6 +224,21 @@ def _build_scan(
             (0.5, residual) if index % 2 else (residual, 0.5),
             (ROWS,),
         )
+        if not feedback[index]:
+            for unused in (
+                row_update,
+                residual,
+                prediction,
+                prediction_product,
+                prediction_view,
+            ):
+                graph.erase_node(unused)
+            row_update = _call(
+                graph,
+                torch.ops.aten.sin.default,
+                (row_input,),
+                (ROWS,),
+            )
         row_view = _call(
             graph,
             view_ops.subscript,
@@ -368,6 +387,7 @@ def _build_scan(
                 "diagonal": diagonal,
                 "prediction_vector": prediction_vector,
                 "row_input": row_input,
+                "row_update": row_update,
                 "update_vector": update_vector,
                 "observation_vector": observation_vector,
                 "decayed": decayed,
@@ -450,6 +470,41 @@ def test_discovers_t2_through_t8_without_mutating_graph(step_count: int) -> None
     assert region.row_extent == ROWS
     assert region.feature_extent == FEATURES
     assert region.storage_dtype is torch.bfloat16
+
+
+@pytest.mark.parametrize("feedback", ((False, False, False), (True, False, True)))
+@pytest.mark.parametrize("form", ("direct", "factored"))
+def test_additive_and_feedback_steps_share_discovery(
+    feedback: tuple[bool, ...], form: str
+) -> None:
+    built = _build_scan(3, feedback=feedback, observation_forms=(form,) * 3)
+    before = _graph_snapshot(built.info.graph)
+    (candidate,) = discover_direct_affine_candidates((built.info,))
+    assert _graph_snapshot(built.info.graph) == before
+    for enabled, original, step in zip(
+        feedback, built.steps, candidate.region.steps, strict=True
+    ):
+        assert (step.prediction_vector is not None) is enabled
+        if not enabled:
+            assert step.row_input is original["row_update"]
+            assert step.update_scale == 1.0
+            assert original["row_update"] in candidate.region.producer_nodes
+            assert original["row_update"] not in candidate.region.owned_nodes
+
+
+def test_state_dependent_update_cannot_masquerade_as_additive() -> None:
+    built = _build_scan(2, feedback=(False, False))
+    row_update = built.steps[0]["row_update"]
+    with built.info.graph.inserting_before(row_update):
+        state_sum = _call(
+            built.info.graph,
+            torch.ops.aten.sum.dim_IntList,
+            (built.entry_state, [-1]),
+            (ROWS,),
+        )
+    row_update.args = (state_sum,)
+    built.info.graph.lint()
+    assert discover_direct_affine_candidates((built.info,)) == ()
 
 
 @pytest.mark.parametrize("step_count", (1, 9))

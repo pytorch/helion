@@ -15,10 +15,15 @@ from benchmarks.cute.kda_prefill_kernels import KDA_RECURRENCE_CONFIG as _CONFIG
 from benchmarks.cute.kda_prefill_kernels import (
     kda_chunk_recurrence as _bt16_resident_chain,
 )
+from benchmarks.cute.kda_prefill_kernels import (
+    kda_chunk_recurrence_fp32 as _bt16_fp32_chain,
+)
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx import Node
 
+from ._cute_aux import _cpu_codegen
 import helion
 from helion import exc
 from helion._compiler.cute.chunk_recurrence import _select_sm100_dv_partitions
@@ -31,6 +36,7 @@ pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
 
 
 def _fake_inputs(
@@ -40,6 +46,7 @@ def _fake_inputs(
     sequences: int = 2,
     chunks: int = 8,
     packed_workspace: bool = True,
+    fp32_state: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     rows = chunks * BT
     with FakeTensorMode():
@@ -90,11 +97,26 @@ def _fake_inputs(
         )
         output = torch.empty_like(values)
         state = torch.empty(
-            (sequences, heads, DV, DK), device=DEVICE, dtype=torch.bfloat16
+            (sequences, heads, DV, DK),
+            device=DEVICE,
+            dtype=torch.float32 if fp32_state else torch.bfloat16,
         )
+        final_state = (torch.empty_like(state),) if fp32_state else ()
         cu_seqlens = torch.empty((sequences + 1,), device=DEVICE, dtype=torch.int32)
         cu_chunks = torch.empty_like(cu_seqlens)
-    return kd, qd, ak, aq, g_total, values, output, state, cu_seqlens, cu_chunks
+    return (
+        kd,
+        qd,
+        ak,
+        aq,
+        g_total,
+        values,
+        output,
+        state,
+        *final_state,
+        cu_seqlens,
+        cu_chunks,
+    )
 
 
 def _code(
@@ -108,7 +130,9 @@ def _code(
     num_sm: int = 152,
     dv_partitions: int | None = None,
     register_cap: int | None = None,
+    pipeline: str | None = None,
     packed_workspace: bool = True,
+    fp32_state: bool = False,
 ) -> str:
     with (
         patch(
@@ -131,8 +155,15 @@ def _code(
         patch("helion._compat._min_dot_size", return_value=(16, 16, 16)),
         patch("helion._compat._is_hip", return_value=False),
         patch("helion.runtime.get_num_sm", return_value=num_sm),
+        # This file exercises the interim external schedule in isolation. The
+        # general contraction-loop path may otherwise claim the FP32 recurrence.
+        patch(
+            "helion._compiler.cute.chained_matmul.plan_chained_matmul",
+            return_value=None,
+        ),
     ):
-        bound = _bt16_resident_chain._bind_isolated(
+        kernel = _bt16_fp32_chain if fp32_state else _bt16_resident_chain
+        bound = kernel._bind_isolated(
             (
                 *_fake_inputs(
                     tokens=tokens,
@@ -140,6 +171,7 @@ def _code(
                     sequences=sequences,
                     chunks=chunks,
                     packed_workspace=packed_workspace,
+                    fp32_state=fp32_state,
                 ),
                 128**-0.5,
             )
@@ -153,6 +185,8 @@ def _code(
             config_overrides["cute_chunk_recurrence_dv_partitions"] = dv_partitions
         if register_cap is not None:
             config_overrides["cute_chunk_recurrence_register_cap"] = register_cap
+        if pipeline is not None:
+            config_overrides["cute_chunk_recurrence_pipeline"] = pipeline
         config = helion.Config.from_dict({**_CONFIG.config, **config_overrides})
         return bound.to_triton_code(config)
 
@@ -162,6 +196,7 @@ def _captured_plan(
     mutate: Callable[[object], None] | None = None,
     capability: tuple[int, int] = (10, 3),
     packed_workspace: bool = True,
+    fp32_state: bool = False,
 ) -> object:
     from helion._compiler.cute import chunk_recurrence
 
@@ -181,6 +216,7 @@ def _captured_plan(
             mutate=mutate,
             capability=capability,
             packed_workspace=packed_workspace,
+            fp32_state=fp32_state,
         )
     assert len(captured) == 1
     return captured[0]
@@ -242,6 +278,67 @@ def test_bt16_resident_chain_codegen() -> None:
     assert "cute.gemm(" not in code
 
 
+@pytest.mark.parametrize(
+    ("pipeline", "input_stages", "tma_stages", "acc_stages", "tmem", "smem"),
+    (("wide", 8, 6, 2, 512, 138240), ("compact", 6, 4, 1, 256, 107520)),
+)
+def test_bt16_recurrence_pipeline_resource_contract(
+    pipeline: str,
+    input_stages: int,
+    tma_stages: int,
+    acc_stages: int,
+    tmem: int,
+    smem: int,
+) -> None:
+    code = _code(dv_partitions=2, pipeline=pipeline)
+    assert f"'pipeline': '{pipeline}'" in code
+    assert f"'input_stages': {input_stages}" in code
+    assert f"'tma_stages': {tma_stages}" in code
+    assert f"'output_acc_stages': {acc_stages}" in code
+    assert f"'tmem_cols': {tmem}" in code
+    assert f"'smem_bytes': {smem}" in code
+
+
+def test_bt16_recurrence_pipeline_autotune_and_validation() -> None:
+    spec = _config_spec(tokens=8192, heads=12, sequences=6, chunks=515)
+    assert spec.cute_chunk_recurrence_pipeline.choices == ("wide", "compact")
+    assert {
+        seed.config["cute_chunk_recurrence_pipeline"]
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_chunk_recurrence_dv_partitions") == 2
+    } == {"wide", "compact"}
+    assert all(
+        seed.config["cute_chunk_recurrence_pipeline"] == "wide"
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_chunk_recurrence_dv_partitions") == 4
+    )
+    config = spec.normalized_config(
+        helion.Config.from_dict(
+            {
+                **_CONFIG.config,
+                "cute_chunk_recurrence_dv_partitions": 2,
+                "cute_chunk_recurrence_pipeline": "compact",
+            }
+        )
+    )
+    generation = ConfigGeneration(spec)
+    round_trip = generation.unflatten(generation.flatten(config))
+    assert round_trip["cute_chunk_recurrence_pipeline"] == "compact"
+    with pytest.raises(exc.InvalidConfig, match="must be 'wide'"):
+        spec.normalized_config(
+            helion.Config.from_dict(
+                {
+                    **_CONFIG.config,
+                    "cute_chunk_recurrence_dv_partitions": 4,
+                    "cute_chunk_recurrence_pipeline": "compact",
+                }
+            )
+        )
+    spec.cute_chunk_recurrence_pipeline = None
+    with pytest.raises(exc.InvalidConfig, match="available only for matched"):
+        spec.normalized_config(config)
+
+
 def test_tmem_dv2_exposes_only_the_matched_state_contract() -> None:
     from helion._compiler.cute import chunk_recurrence_sm100 as device
 
@@ -250,7 +347,6 @@ def test_tmem_dv2_exposes_only_the_matched_state_contract() -> None:
     host_parameters = inspect.signature(device.host_chain_dv2).parameters
     for removed_parameter in (
         "state_indices",
-        "initial_state",
         "final_state",
         "state_ckpt",
         "cu_ckpts",
@@ -258,7 +354,201 @@ def test_tmem_dv2_exposes_only_the_matched_state_contract() -> None:
     ):
         assert removed_parameter not in kernel_parameters
         assert removed_parameter not in host_parameters
+    assert "initial_state" in kernel_parameters
+    assert host_parameters["initial_state"].default is None
     assert "checkpoint_read_done" not in source
+
+
+def test_fp32_recurrence_codegen_preserves_authoritative_state_precision() -> None:
+    code = _code(fp32_state=True, sequences=1, dv_partitions=2)
+    assert "'kind': 'chunk_recurrence_sm100'" in code
+    assert "'state_dtype': 'float32'" in code
+    assert "'initial_state_idx':" in code
+    assert "chunk_recurrence_warp_dv4" not in code
+
+
+def test_fp32_recurrence_dv4_codegen_uses_direct_state_and_is_tunable() -> None:
+    code = _code(fp32_state=True, dv_partitions=4)
+    assert "'kind': 'chunk_recurrence_warp_dv4'" in code
+    assert "'state_dtype': 'float32'" in code
+    assert "'initial_state_idx':" in code
+    args = (*_fake_inputs(fp32_state=True), 128**-0.5)
+    bound = _bt16_fp32_chain._bind_isolated(args)
+    assert {
+        seed.config["cute_chunk_recurrence_dv_partitions"]
+        for seed in bound.config_spec.compiler_seed_configs
+        if "cute_chunk_recurrence_dv_partitions" in seed.config
+    } == {2, 4}
+    fragment = bound.config_spec.cute_chunk_recurrence_dv_partitions
+    assert fragment is not None
+    assert set(fragment.choices) == {2, 4}
+
+
+@contextlib.contextmanager
+def _real_dispatch_cpu() -> Iterator[None]:
+    with (
+        _cpu_codegen(),
+        # An indexless fake CUDA device queries current_device() once an earlier
+        # test initialized CUDA. Pin the same fake device used by a fresh CPU
+        # process without weakening _cpu_codegen's CUDA-forbidden protection.
+        patch(f"{__name__}.DEVICE", torch.device("cuda", 0)),
+        patch("helion.runtime.kernel.target_device_capability", return_value=(10, 3)),
+        patch("helion.language.loops.use_tileir_tunables", return_value=False),
+        patch("helion.language.loops._supports_warp_specialize", return_value=True),
+        patch("helion._compat._supports_tensor_descriptor", return_value=True),
+        patch("helion._compat._min_dot_size", return_value=(16, 16, 16)),
+        patch("helion._compat._is_hip", return_value=False),
+    ):
+        yield
+
+
+@pytest.mark.parametrize(
+    ("overrides", "shared"),
+    [
+        ({}, True),
+        ({"cute_chunk_recurrence_dv_partitions": 2}, False),
+        ({"cute_chunk_recurrence_dv_partitions": 4}, False),
+        (
+            {
+                "cute_chunk_recurrence_dv_partitions": 4,
+                "cute_chunk_recurrence_register_cap": 72,
+            },
+            False,
+        ),
+        ({"cute_chunk_recurrence_register_cap": None}, False),
+        ({"cute_chunk_recurrence_pipeline": "wide"}, False),
+        (
+            {
+                "cute_chunk_recurrence_dv_partitions": 4,
+                "cute_chained_mma_schedule": "coalesced",
+            },
+            True,
+        ),
+        (
+            {
+                "cute_chunk_recurrence_dv_partitions": 4,
+                "cute_chained_mma_schedule": "tcgen05_tmem",
+                "cute_chained_group_contractions": True,
+            },
+            True,
+        ),
+        (
+            {
+                "cute_chunk_recurrence_dv_partitions": 4,
+                "cute_chained_pointwise_cache_bytes": 4096,
+            },
+            True,
+        ),
+        (
+            {
+                "cute_chunk_recurrence_dv_partitions": 4,
+                "cute_chained_group_contractions": False,
+                "cute_chained_scratch_layout": "row_major",
+                "cute_chained_scan_schedule": "serial",
+                "cute_chained_pointwise_cache_bytes": 0,
+                "cute_chained_pointwise_vectorize": False,
+                "cute_chained_pointwise_unroll": 1,
+            },
+            False,
+        ),
+    ],
+    ids=(
+        "implicit-common-default",
+        "legacy-dv2",
+        "legacy-dv4",
+        "legacy-cap72",
+        "legacy-explicit-uncapped",
+        "legacy-pipeline",
+        "explicit-common-warp",
+        "explicit-common-group",
+        "active-common-knob",
+        "inactive-common-defaults",
+    ),
+)
+def test_fp32_recurrence_real_dispatch_preserves_requested_family(
+    overrides: dict[str, object], shared: bool
+) -> None:
+    # Do not use _code(): its isolated legacy-planner mock would hide a
+    # normalized common schedule preempting the requested recurrence family.
+    with _real_dispatch_cpu():
+        bound = _bt16_fp32_chain._bind_isolated(
+            (*_fake_inputs(fp32_state=True), 128**-0.5)
+        )
+        assert bound.config_spec.cute_chained_loop_search_enabled
+        config = helion.Config.from_dict({**_CONFIG.config, **overrides})
+        normalized = bound.config_spec.normalized_config(config)
+        assert ("cute_chained_mma_schedule" in normalized.config) is shared
+        assert bound.config_spec.normalized_config(normalized) == normalized
+        code = bound.to_code(normalized)
+    assert ("chain_loop_index" in code) is shared
+    assert ("'state_dtype': 'float32'" in code) is not shared
+    if overrides.get("cute_chunk_recurrence_register_cap") == 72:
+        assert "--maxrregcount=72" in code
+
+
+def test_fp32_recurrence_compiler_seeds_keep_legacy_family() -> None:
+    with _real_dispatch_cpu():
+        bound = _bt16_fp32_chain._bind_isolated(
+            (*_fake_inputs(fp32_state=True), 128**-0.5)
+        )
+        seeds = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if "cute_chunk_recurrence_dv_partitions" in seed.config
+        ]
+        assert seeds
+        for seed in seeds:
+            config = helion.Config.from_dict({**_CONFIG.config, **seed.config})
+            normalized = bound.config_spec.normalized_config(config)
+            assert "cute_chained_mma_schedule" not in normalized.config
+            assert bound.config_spec.normalized_config(normalized) == normalized
+            assert "'state_dtype': 'float32'" in bound.to_code(normalized)
+
+
+def test_fp32_recurrence_rejects_changed_residual_semantics() -> None:
+    assert _captured_plan(fp32_state=True, mutate=_reverse_residual_subtraction) is None
+
+
+@pytest.mark.parametrize("mutation", ("remove", "nonzero", "invert"))
+def test_fp32_recurrence_requires_zero_invalid_residual(mutation: str) -> None:
+    def mutate(device_ir: object) -> None:
+        masked = next(
+            node
+            for node in _recurrence_loop_nodes(device_ir)
+            if node.op == "call_function" and node.target is torch.ops.aten.where.self
+        )
+        mask, residual, zero = masked.args
+        if mutation == "remove":
+            masked.replace_all_uses_with(residual)
+            masked.graph.erase_node(masked)
+            masked.graph.erase_node(zero)
+        elif mutation == "nonzero":
+            zero.args = (1.0,)
+        else:
+            masked.args = (mask, zero, residual)
+
+    assert _captured_plan(fp32_state=True, mutate=mutate) is None
+
+
+def test_fp32_recurrence_requires_projection_rounding_before_subtraction() -> None:
+    def remove_rounding(device_ir: object) -> None:
+        subtraction = next(
+            node
+            for node in _recurrence_loop_nodes(device_ir)
+            if node.op == "call_function"
+            and node.target is torch.ops.aten.sub.Tensor
+            and node.meta["val"].dtype is torch.float32
+        )
+        rounded = subtraction.args[1]
+        assert isinstance(rounded, torch.fx.Node)
+        packed = rounded.args[0]
+        assert isinstance(packed, torch.fx.Node)
+        projection = packed.args[0]
+        subtraction.args = (subtraction.args[0], projection)
+        subtraction.graph.erase_node(rounded)
+        subtraction.graph.erase_node(packed)
+
+    assert _captured_plan(fp32_state=True, mutate=remove_rounding) is None
 
 
 @pytest.mark.parametrize("guard", ("_linear_offsets_fit_i32", "_xyz_grid_fits"))
@@ -318,7 +608,9 @@ def _reverse_residual_subtraction(device_ir: object) -> None:
     subtraction = next(
         node
         for node in nodes
-        if node.op == "call_function" and node.target is torch.ops.aten.sub.Tensor
+        if node.op == "call_function"
+        and node.target is torch.ops.aten.sub.Tensor
+        and node.meta["val"].dtype is torch.float32
     )
     subtraction.args = (subtraction.args[1], subtraction.args[0])
 
@@ -345,7 +637,7 @@ def _change_ak_row_xor(device_ir: object) -> None:
         if node.op == "call_function"
         and node.target is torch.ops.aten.bitwise_xor.Scalar
         and isinstance(node.args[0], torch.fx.Node)
-        and node.args[0].target.__name__ == "tile_index"
+        and node.args[0].target is torch.ops.aten.sub.Tensor
     ]
     assert len(xors) == 1
     xors[0].args = (xors[0].args[0], 4)
@@ -379,7 +671,9 @@ def _change_residual_rounding(device_ir: object) -> None:
     subtraction = next(
         node
         for node in nodes
-        if node.op == "call_function" and node.target is torch.ops.aten.sub.Tensor
+        if node.op == "call_function"
+        and node.target is torch.ops.aten.sub.Tensor
+        and node.meta["val"].dtype is torch.float32
     )
     rounding = next(
         node
@@ -483,7 +777,7 @@ def _disconnect_token_tile_id_from_lane(device_ir: object) -> None:
     tile_ids = [node for node in nodes if node.target is tile_id]
     tile_indices = [node for node in nodes if node.target is tile_index]
     assert len(tile_ids) == 2
-    assert len(tile_indices) == 4
+    assert len(tile_indices) == 2
     head_block_size = tile_ids[1].args[0]
     assert isinstance(head_block_size, torch.fx.Node)
     tile_ids[0].prepend(head_block_size)
@@ -543,6 +837,67 @@ def test_bt16_recurrence_rejects_semantic_mutations(
     mutate: Callable[[object], None],
 ) -> None:
     assert _captured_plan(mutate=mutate) is None
+
+
+@pytest.mark.parametrize("fp32_state", (False, True))
+@pytest.mark.parametrize("consumer", ("factor", "ak", "aq", "all"))
+def test_recurrence_rejects_absolute_index_in_local_factor_access(
+    fp32_state: bool, consumer: str
+) -> None:
+    from helion.language import view_ops
+
+    def mutate(device_ir: object) -> None:
+        lane = next(
+            node
+            for node in _recurrence_loop_nodes(device_ir)
+            if node.target is torch.ops.aten.sub.Tensor
+            and node.meta["val"].dtype is torch.int32
+        )
+        target = {
+            "factor": torch.ops.aten.add.Tensor,
+            "ak": torch.ops.aten.bitwise_xor.Scalar,
+            "aq": view_ops.subscript,
+        }.get(consumer)
+        users = tuple(lane.users)
+        assert len(users) == 3
+        absolute_lane = lane.args[0]
+        assert isinstance(absolute_lane, Node)
+        for user in users:
+            if consumer == "all" or user.target is target:
+                user.replace_input_with(lane, absolute_lane)
+        # Retain the now-unused local subtraction, so the operation multiset
+        # still matches. Admission must prove each access uses the local lane.
+
+    assert _captured_plan(fp32_state=fp32_state, mutate=mutate) is None
+
+
+@pytest.mark.parametrize("fp32_state", (False, True))
+@pytest.mark.parametrize("wrong_begin", ("index", "head"))
+def test_recurrence_requires_begin_of_the_same_token_tile(
+    fp32_state: bool, wrong_begin: str
+) -> None:
+    from helion.language.tile_ops import tile_begin
+    from helion.language.tile_ops import tile_id
+    from helion.language.tile_ops import tile_index
+
+    def mutate(device_ir: object) -> None:
+        nodes = _recurrence_loop_nodes(device_ir)
+        begin = next(node for node in nodes if node.target is tile_begin)
+        if wrong_begin == "index":
+            lane = next(iter(begin.users))
+            # The duplicate absolute index has the same value as lane.args[0],
+            # so this produces zero rather than a chunk-local lane.
+            index = next(node for node in nodes if node.target is tile_index)
+            assert index is not lane.args[0]
+            lane.replace_input_with(begin, index)
+        else:
+            head = [node for node in nodes if node.target is tile_id][1]
+            head_block_size = head.args[0]
+            assert isinstance(head_block_size, torch.fx.Node)
+            begin.prepend(head_block_size)
+            begin.args = head.args
+
+    assert _captured_plan(fp32_state=fp32_state, mutate=mutate) is None
 
 
 def test_bt16_recurrence_rejects_sm80() -> None:
@@ -648,14 +1003,17 @@ def test_bt16_recurrence_autotune_seeds_both_dv_schedules() -> None:
     assert fixed.compiler_default_config.config == {
         "cute_chunk_recurrence_dv_partitions": 4,
         "cute_chunk_recurrence_register_cap": 72,
+        "cute_chunk_recurrence_pipeline": "wide",
     }
     assert packed.compiler_default_config.config == {
         "cute_chunk_recurrence_dv_partitions": 2,
         "cute_chunk_recurrence_register_cap": None,
+        "cute_chunk_recurrence_pipeline": "wide",
     }
     recurrence_keys = {
         "cute_chunk_recurrence_dv_partitions",
         "cute_chunk_recurrence_register_cap",
+        "cute_chunk_recurrence_pipeline",
     }
     fixed_recurrence_seeds = [
         seed
@@ -999,6 +1357,32 @@ def test_chunk_recurrence_runtime_builds_dv4_tensor_map_geometry() -> None:
     assert specs["state_in"] == specs["state_out"]
 
 
+def test_fp32_dv4_runtime_omits_state_tensor_maps() -> None:
+    source = _fake_inputs(fp32_state=True)
+    args = (
+        source[0].view(-1, DK),
+        source[1].view(-1, DK),
+        source[2].view(-1, DK),
+        source[3].view(-1, BT * BT),
+        source[4].view(-1, DK),
+        source[5].view(-1, DV),
+        source[6].view(-1, DV),
+        *source[7:],
+    )
+    plan = _runtime_plan()
+    plan.update(
+        state_dtype="float32",
+        initial_state_idx=7,
+        state_idx=8,
+        cu_seqlens_idx=9,
+        cu_chunks_idx=10,
+    )
+    storage_patch, tensor_patch = _fake_pointer_patches(args)
+    with storage_patch, tensor_patch:
+        specs = _chunk_recurrence_tensor_map_specs(plan, args)
+    assert set(specs) == {"factor", "aq", "gt", "v", "out"}
+
+
 def test_chunk_recurrence_runtime_validates_sm100_dv2_without_raw_descriptors() -> None:
     args = _runtime_view_args()
     plan = _runtime_plan()
@@ -1011,6 +1395,43 @@ def test_chunk_recurrence_runtime_validates_sm100_dv2_without_raw_descriptors() 
             match="raw chunk-recurrence TensorMaps require the warp-DV4 schedule",
         ):
             _chunk_recurrence_tensor_map_specs(plan, args)
+
+
+@pytest.mark.parametrize("bad_field", ("tmem_cols", "min_blocks_per_mp", "smem_bytes"))
+def test_chunk_recurrence_runtime_rejects_mixed_pipeline_resources(
+    bad_field: str,
+) -> None:
+    from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+    plan = _runtime_plan()
+    plan.update(
+        {
+            "kind": "chunk_recurrence_sm100",
+            "dv_partitions": 2,
+            "threads": 512,
+            "device_abi": 2,
+            "pipeline": "compact",
+            "input_stages": 6,
+            "tma_stages": 4,
+            "output_acc_stages": 1,
+            "factor_tma_value_splits": 2,
+            "output_smem_stages": 7,
+            "output_store_wait_groups": 6,
+            "tmem_cols": 256,
+            "smem_bytes": 107520,
+            "compute_registers": 72,
+            "service_registers": 40,
+            "min_blocks_per_mp": 2,
+        }
+    )
+    _append_cute_wrapper_plan([], [], plan)
+    plan[bad_field] = {
+        "tmem_cols": 512,
+        "min_blocks_per_mp": 1,
+        "smem_bytes": 138240,
+    }[bad_field]
+    with pytest.raises(exc.BackendUnsupported, match="schedule ABI"):
+        _append_cute_wrapper_plan([], [], plan)
 
 
 def test_chunk_recurrence_runtime_allows_exact_value_output_alias() -> None:
@@ -1159,6 +1580,80 @@ def test_chunk_recurrence_runtime_rejects_split_factor_storage() -> None:
         _chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
 
 
+@pytest.mark.parametrize("pipeline", ("wide", "compact"))
+def test_dv2_pipeline_recycles_buffers_and_preserves_tail(pipeline: str) -> None:
+    from benchmarks.cute.kda_prefill_staged import allocate_kda_factor_workspace
+    from benchmarks.cute.kda_prefill_staged import kda_group_host_metadata
+    from benchmarks.cute.kda_prefill_staged import materialize_kda_group_metadata
+
+    device = _require_dv4_runtime()
+    heads = 32
+    offsets = (0, 273, 532, 787, 1043)
+    metadata = materialize_kda_group_metadata(
+        kda_group_host_metadata(offsets, (0, len(offsets) - 1)), device
+    )
+    workspace = allocate_kda_factor_workspace(heads, metadata.host.total_chunks, device)
+    workspace.kd.zero_()
+    workspace.qd.zero_()
+    workspace.ak.zero_()
+    workspace.aq.zero_()
+    workspace.g_total.fill_(1)
+    lane = torch.arange(BT, dtype=torch.int64, device=device)
+    byte_offset = 2 * (lane[:, None] * BT + (lane[None, :] ^ 8))
+    pair_index = (byte_offset ^ (((byte_offset >> 7) & 1) << 4)) // 2
+    workspace.aq.view(-1, BT * BT)[:, pair_index] = torch.eye(
+        BT, dtype=torch.bfloat16, device=device
+    )
+    generator = torch.Generator(device=device).manual_seed(17)
+    values = torch.randn(
+        (1, offsets[-1], heads, DV),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    output = torch.empty_like(values)
+    initial = torch.randn(
+        (len(offsets) - 1, heads, DV, DK),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    state = initial.clone()
+    args = (
+        workspace.kd,
+        workspace.qd,
+        workspace.ak,
+        workspace.aq,
+        workspace.g_total,
+        values,
+        output,
+        state,
+        metadata.cu_seqlens,
+        metadata.cu_chunks,
+        1.0,
+    )
+    compiled = _bt16_resident_chain._bind_isolated(args).compile_config(
+        helion.Config.from_dict(
+            {
+                **_CONFIG.config,
+                "cute_chunk_recurrence_dv_partitions": 2,
+                "cute_chunk_recurrence_pipeline": pipeline,
+            }
+        )
+    )
+    compiled(*args)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        state.copy_(initial)
+        compiled(*args)
+    flush = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+    for _ in range(16):
+        flush.zero_()
+        graph.replay()
+        assert torch.equal(output, values)
+        assert torch.equal(state, initial)
+
+
 def _require_dv4_runtime() -> torch.device:
     from helion._compat import requires_cuda_version
 
@@ -1177,12 +1672,13 @@ def _dv4_runtime_args(
     value: float,
     decay: float,
     identity_aq: bool,
+    heads: int = 1,
+    sequences: int = 1,
 ) -> tuple[object, ...]:
     from benchmarks.cute.kda_prefill_staged import allocate_kda_factor_workspace
 
-    heads = 1
-    tokens = 2 * BT
-    chunks = 2
+    tokens = sequences * 2 * BT
+    chunks = sequences * 2
     workspace = allocate_kda_factor_workspace(heads, chunks, device)
     workspace.kd.zero_()
     workspace.qd.zero_()
@@ -1199,9 +1695,13 @@ def _dv4_runtime_args(
     value_output = torch.full(
         (1, tokens, heads, DV), value, dtype=torch.bfloat16, device=device
     )
-    state = torch.full((1, heads, DV, DK), 0.25, dtype=torch.bfloat16, device=device)
-    cu_seqlens = torch.tensor((0, tokens), dtype=torch.int32, device=device)
-    cu_chunks = torch.tensor((0, chunks), dtype=torch.int32, device=device)
+    state = torch.full(
+        (sequences, heads, DV, DK), 0.25, dtype=torch.bfloat16, device=device
+    )
+    cu_seqlens = torch.arange(sequences + 1, dtype=torch.int32, device=device) * (
+        2 * BT
+    )
+    cu_chunks = torch.arange(sequences + 1, dtype=torch.int32, device=device) * 2
     return (
         workspace.kd,
         workspace.qd,
@@ -1215,6 +1715,166 @@ def _dv4_runtime_args(
         cu_chunks,
         2.0,
     )
+
+
+@pytest.mark.parametrize("dv_partitions", (2, 4))
+def test_fp32_recurrence_preserves_state_bits_and_replays_immutable_inputs(
+    dv_partitions: int,
+) -> None:
+    device = _require_dv4_runtime()
+    args = _dv4_runtime_args(
+        device, value=0.125, decay=0.997, identity_aq=True, heads=3, sequences=2
+    )
+    values = args[5]
+    assert isinstance(values, torch.Tensor)
+    old_state = args[7]
+    assert isinstance(old_state, torch.Tensor)
+    initial = (
+        torch.arange(old_state.numel(), dtype=torch.float32, device=device)
+        .reshape(old_state.shape)
+        .mul_(1e-6)
+        .add_(0.25012345)
+    )
+    final = torch.empty_like(initial)
+    output = torch.empty_like(values)
+    pristine = initial.clone()
+    fp32_args = (*args[:6], output, initial, final, *args[8:])
+    bound = _bt16_fp32_chain.bind(fp32_args)
+    config = helion.Config.from_dict(
+        {**_CONFIG.config, "cute_chunk_recurrence_dv_partitions": dv_partitions}
+    )
+    compiled = bound.compile_config(config)
+    assert "'state_dtype': 'float32'" in bound.to_code(config)
+    expected_state = initial * 0.997 * 0.997
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        compiled(*fp32_args)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        compiled(*fp32_args)
+    for _ in range(5):
+        graph.replay()
+        torch.testing.assert_close(final, expected_state, rtol=0, atol=1e-7)
+        torch.testing.assert_close(
+            output, torch.full_like(output, 0.25), rtol=0, atol=0
+        )
+        assert torch.equal(initial, pristine)
+        assert torch.equal(values, torch.full_like(values, 0.125))
+    assert not torch.equal(final, final.bfloat16().float())
+    with pytest.raises(exc.BackendUnsupported, match="states must be disjoint"):
+        compiled(*fp32_args[:8], initial, *fp32_args[9:])
+
+
+@pytest.mark.parametrize("dv_partitions,register_cap", ((2, None), (4, None), (4, 72)))
+def test_fp32_recurrence_four_contractions_match_device_rounding(
+    dv_partitions: int,
+    register_cap: int | None,
+) -> None:
+    from benchmarks.cute.kda_prefill_staged import allocate_kda_factor_workspace
+
+    device = _require_dv4_runtime()
+    generator = torch.Generator(device=device).manual_seed(801)
+    # The third chunk exposes state-rounding differences in output too: both
+    # policies use the same BF16 matrix copy immediately after the first update.
+    chunks = 9
+    tokens = chunks * BT - 3
+    workspace = allocate_kda_factor_workspace(1, chunks, device)
+    kd, qd, ak = (
+        (
+            torch.randn((chunks, BT, DK), generator=generator, device=device) * scale
+        ).bfloat16()
+        for scale in (0.125, 0.125, 0.0625)
+    )
+    aq = (
+        torch.randn((chunks, BT, BT), generator=generator, device=device) * 0.0625
+    ).bfloat16()
+    decay = torch.rand((chunks, DK), generator=generator, device=device) * 0.06 + 0.91
+    initial = torch.randn((1, 1, DV, DK), generator=generator, device=device) * 0.1
+    values = (
+        torch.randn((1, tokens, 1, DV), generator=generator, device=device) * 0.25
+    ).bfloat16()
+    output = torch.empty_like(values)
+    final = torch.empty_like(initial)
+    pristine = initial.clone()
+
+    lane = torch.arange(BT, device=device)
+    feature = torch.arange(DK, device=device)
+    workspace.kd[0, 0, :, feature ^ 8] = kd.reshape(-1, DK)
+    workspace.qd[0, 0, :, feature ^ 8] = qd.reshape(-1, DK)
+    workspace.ak.view(chunks, BT, DK)[:, lane ^ 8, :] = ak
+    byte_offset = 2 * (lane[:, None] * BT + (lane[None, :] ^ 8))
+    pair_index = (byte_offset ^ (((byte_offset >> 7) & 1) << 4)) // 2
+    workspace.aq.view(chunks, BT * BT)[:, pair_index] = aq
+    workspace.g_total.copy_(decay.view(1, 1, chunks, DK))
+    cu = torch.tensor((0, tokens), dtype=torch.int32, device=device)
+    cu_chunks = torch.tensor((0, chunks), dtype=torch.int32, device=device)
+    scale = 0.75
+    args = (
+        workspace.kd,
+        workspace.qd,
+        workspace.ak,
+        workspace.aq,
+        workspace.g_total,
+        values,
+        output,
+        initial,
+        final,
+        cu,
+        cu_chunks,
+        scale,
+    )
+
+    def reference(
+        *, round_projection: bool = True, round_state: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        state = pristine[0, 0].clone()
+        outputs = []
+        for chunk in range(chunks):
+            state_operand = state.bfloat16().double()
+            projection = (kd[chunk].double() @ state_operand.T).float()
+            if round_projection:
+                projection = projection.bfloat16().float()
+            valid = min(BT, tokens - chunk * BT)
+            value = values[0, chunk * BT : chunk * BT + valid, 0].float()
+            residual = torch.zeros((BT, DV), dtype=torch.bfloat16, device=device)
+            residual[:valid] = (value - projection[:valid]).bfloat16()
+            state_output = (qd[chunk].double() @ state_operand.T).float()
+            result = (
+                state_output.double() + aq[chunk].double() @ residual.double()
+            ).float()
+            outputs.append((result[:valid] * scale).bfloat16())
+            update = (residual.double().T @ ak[chunk].double()).float()
+            state = state * decay[chunk][None, :] + update
+            if round_state:
+                state = state.bfloat16().float()
+        return torch.cat(outputs).view_as(output), state.view_as(final)
+
+    expected_output, expected_state = reference()
+    wrong_output, wrong_state = reference(round_projection=False)
+    rounded_output, rounded_state = reference(round_state=True)
+    # This fixture must discriminate the two incorrect intermediate contracts.
+    assert not torch.equal(expected_output, wrong_output)
+    assert not torch.equal(expected_output, rounded_output)
+    assert (expected_state - wrong_state).abs().max() > 1e-4
+    assert (expected_state - rounded_state).abs().max() > 1e-4
+
+    bound = _bt16_fp32_chain.bind(args)
+    config = helion.Config.from_dict(
+        {
+            **_CONFIG.config,
+            "cute_chunk_recurrence_dv_partitions": dv_partitions,
+            "cute_chunk_recurrence_register_cap": register_cap,
+        }
+    )
+    compiled = bound.compile_config(config)
+    assert "'state_dtype': 'float32'" in bound.to_code(config)
+    for _ in range(3):
+        compiled(*args)
+        torch.testing.assert_close(output, expected_output, rtol=0.01, atol=1e-5)
+        torch.testing.assert_close(final, expected_state, rtol=2e-5, atol=2e-6)
+        assert torch.equal(initial, pristine)
 
 
 def test_dv4_cuda_graph_descriptor_lifetime_after_launch_cache_eviction() -> None:

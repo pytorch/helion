@@ -10,6 +10,7 @@ from unittest.mock import patch
 import torch
 
 import helion
+from helion import _compat
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import patch_cute_mma_support
 import helion.language as hl
@@ -93,23 +94,39 @@ def _rank_two_inputs() -> tuple[torch.Tensor, ...]:
 
 @contextmanager
 def _cpu_codegen() -> Iterator[None]:
-    with (
-        patch_cute_mma_support(),
-        # These tests inspect generated source without compiling or launching
-        # CuTe. They do not require the installed runtime DSL or TVM FFI.
-        patch("helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"),
-        patch("torch.cuda.is_available", return_value=False),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
-        patch(
-            "helion._compiler.compile_environment.target_device_capability",
-            return_value=(10, 3),
-        ),
-        patch("helion.runtime.get_num_sm", return_value=148),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
-    ):
-        yield
+    # Do not reuse real-target answers inside the fake target, or retain fake
+    # answers for later GPU tests. Clear after mock teardown even on failure.
+    feature_caches = (
+        _compat._supports_maxnreg,
+        _compat._supports_tensor_descriptor,
+    )
+    for cache in feature_caches:
+        cache.cache_clear()
+    try:
+        with (
+            patch_cute_mma_support(),
+            # These tests inspect generated source without compiling or launching
+            # CuTe. They do not require the installed runtime DSL or TVM FFI.
+            patch(
+                "helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"
+            ),
+            patch("torch.cuda.is_available", return_value=False),
+            patch(
+                "torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")
+            ),
+            patch(
+                "helion._compiler.compile_environment.target_device_capability",
+                return_value=(10, 3),
+            ),
+            patch("helion.runtime.get_num_sm", return_value=148),
+            patch.object(
+                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+        ):
+            yield
+    finally:
+        for cache in feature_caches:
+            cache.cache_clear()
 
 
 def _rank_two_code(args: tuple[torch.Tensor, ...], config: helion.Config) -> str:

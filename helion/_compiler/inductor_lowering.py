@@ -1624,7 +1624,28 @@ def codegen_call_with_graph(
         prepare_cute_collective_lane_loop_suppression(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
-        for arg, placeholder in zip(args, placeholders, strict=True):
+        original_args = args
+        if copy_named_args and len(args) > 1:
+            # Phi nodes may merge a placeholder copy with a different incoming
+            # name (e.g. ``a, b = b, a + x``). Snapshot all inputs before any
+            # such merged assignment can overwrite another incoming value.
+            # These names are not exposed to phi merging themselves.
+            snapshots = []
+            for arg, placeholder in zip(args, placeholders, strict=True):
+                if isinstance(arg, ast.Name):
+                    snapshot = cg.device_function.new_var(arg.id + "_incoming")
+                    cg.device_function.cute_state.phi_snapshot_names.add(snapshot)
+                    with cg.statement_owner_node(placeholder):
+                        cg.add_statement(
+                            statement_from_string(f"{snapshot} = {{arg}}", arg=arg)
+                        )
+                    snapshots.append(expr_from_string(snapshot))
+                else:
+                    snapshots.append(arg)
+            args = snapshots
+        for original_arg, arg, placeholder in zip(
+            original_args, args, placeholders, strict=True
+        ):
             if all(
                 user.target == torch.ops.aten.sym_size.int for user in placeholder.users
             ):
@@ -1634,7 +1655,9 @@ def codegen_call_with_graph(
                 # We need to copy the inputs to a loop so that phi nodes are handled properly.
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.
-                copy_name = cg.device_function.new_var(arg.id + "_copy")
+                assert isinstance(original_arg, ast.Name)
+                copy_name = cg.device_function.new_var(original_arg.id + "_copy")
+                cg.device_function.cute_state.phi_snapshot_names.add(copy_name)
                 with cg.statement_owner_node(placeholder):
                     cg.add_statement(
                         statement_from_string(f"{copy_name} = {{arg}}", arg=arg)

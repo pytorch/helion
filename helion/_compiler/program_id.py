@@ -6759,11 +6759,17 @@ class Tcgen05PersistentProgramIDs(PersistentProgramIDs):
             or not cls._tcgen05_expr_safe_to_omit(stmt.iter)
         ):
             return False
-        allowed_names = {"acc_copy", "safe_group_id_copy"}
-        allowed_bases = {"indices", "mask", *allowed_names}
+        carried_names = {"acc", "safe_group_id"}
         if worklist_metadata:
-            allowed_names.update({"group_id_copy", "v_0_copy", "v_1_copy"})
-            allowed_bases.update(allowed_names)
+            carried_names.update({"group_id", "v_0", "v_1"})
+        # Loop-call lowering snapshots carried inputs before seeding their
+        # phi copies. Both assignments belong to the replaced K-loop setup.
+        allowed_names = {
+            f"{name}_{suffix}"
+            for name in carried_names
+            for suffix in ("incoming", "copy")
+        }
+        allowed_bases = {"indices", "mask", *allowed_names}
         for child in stmt.body:
             if isinstance(child, ast.Pass):
                 continue

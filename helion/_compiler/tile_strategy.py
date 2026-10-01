@@ -2264,7 +2264,10 @@ def _markers_feed_cross_lane_carry(
                 live_in.add(name)
         written_so_far |= set(rw.writes)
 
-    # Detect top-level phi copies ``X_copy = X`` of a live-in accumulator.
+    # Follow staging aliases as well as direct phi copies. Parallel loop
+    # inputs snapshot every source before emitting the copies that phi merging
+    # can rename; a carried value must still prevent the register-stash path.
+    alias_roots: dict[str, str] = {}
     for stmt in body:
         if (
             isinstance(stmt, ast.Assign)
@@ -2272,8 +2275,9 @@ def _markers_feed_cross_lane_carry(
             and isinstance(stmt.targets[0], ast.Name)
             and isinstance(stmt.value, ast.Name)
         ):
-            src = stmt.value.id
+            src = alias_roots.get(stmt.value.id, stmt.value.id)
             dst = stmt.targets[0].id
+            alias_roots[dst] = src
             if src in live_in and _strip_ssa_suffix(dst) == _strip_ssa_suffix(src):
                 return True
     return False
@@ -4801,6 +4805,35 @@ def _cute_epilogue_subtile_active(config: object) -> bool:
 
 
 @dataclasses.dataclass
+class ThreadTileLayout:
+    """A thread's contiguous element group, recorded by layout assignment.
+
+    The bindings/setup belong to the layout emitter, not to a scalarized user
+    body. A structured lowering can open this element scope directly instead
+    of finding and rewriting a previously emitted vector loop.
+    """
+
+    block_id: int
+    group_var: str
+    group_extent: int
+    element_var: str
+    elements: int
+    base_index_var: str
+    index_var: str
+    group_setup: list[ast.AST]
+    element_setup: list[ast.AST]
+
+    @property
+    def fragment_elements(self) -> int:
+        """Value extent is independent of the width of one memory transfer."""
+        return self.group_extent * self.elements
+
+    @property
+    def fragment_index(self) -> str:
+        return f"({self.group_var} * {self.elements} + {self.element_var})"
+
+
+@dataclasses.dataclass
 class VecLaneWrapper:
     """Pre-built outer x constexpr-V lane structure for a GRID lane loop.
 
@@ -4845,6 +4878,9 @@ class DeviceGridState(DeviceLoopOrGridState):
     # lane loops whose block has ``cute_vector_widths[block] > 1`` (and a
     # divisible elements-per-thread) get an entry.
     vec_lane_wrappers: dict[str, VecLaneWrapper] = dataclasses.field(
+        default_factory=dict
+    )
+    thread_tile_layouts: dict[str, ThreadTileLayout] = dataclasses.field(
         default_factory=dict
     )
     deferred_vector_ops: list[tuple[ast.For, ast.AST, Callable[[], ast.AST | None]]] = (
@@ -7258,6 +7294,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         lane_setup_statements: list[ast.AST] = []
         outer_setup_statements: list[ast.AST] = []
         vec_wrappers: dict[str, VecLaneWrapper] = {}
+        thread_tiles: dict[str, ThreadTileLayout] = {}
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
@@ -7396,10 +7433,10 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                             f"{env.backend.lane_offset_expr(lane_var)} "
                             f"* {vec_width}"
                         )
-                    lane_body.insert(
-                        0,
-                        statement_from_string(f"{base_index_var} = {base_expr}"),
+                    base_setup = statement_from_string(
+                        f"{base_index_var} = {base_expr}"
                     )
+                    lane_body.insert(0, base_setup)
                     outer_for = _create_lane_loop(
                         lane_var, elements_per_thread // vec_width, lane_body
                     )
@@ -7408,6 +7445,17 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                         vloop=inner_for,
                         vec_lane_var=vec_lane_var,
                         base_index_var=base_index_var,
+                    )
+                    thread_tiles[lane_var] = ThreadTileLayout(
+                        block_id=block_idx,
+                        group_var=lane_var,
+                        group_extent=elements_per_thread // vec_width,
+                        element_var=vec_lane_var,
+                        elements=vec_width,
+                        base_index_var=base_index_var,
+                        index_var=index_var,
+                        group_setup=[base_setup],
+                        element_setup=[],
                     )
                     idx_expr = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
                 else:
@@ -7426,6 +7474,28 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                         idx_expr = (
                             f"{idx_expr} + {env.backend.lane_offset_expr(lane_var)}"
                         )
+                    if (
+                        env.backend_name == "cute"
+                        and env.config_spec.cute_loop_schedule_enabled
+                        and not env.config_spec.matmul_facts
+                        and not _cute_epilogue_subtile_active(self.fn.config)
+                    ):
+                        # Scalar transport still has a multi-element value
+                        # representation when a thread owns multiple elements.
+                        base = self.fn.new_var(f"lane_base_{block_idx}", dce=False)
+                        thread_tiles[lane_var] = ThreadTileLayout(
+                            block_id=block_idx,
+                            group_var=lane_var,
+                            group_extent=elements_per_thread,
+                            element_var=self.fn.new_var(
+                                f"vec_lane_{block_idx}", dce=False
+                            ),
+                            elements=1,
+                            base_index_var=base,
+                            index_var=index_var,
+                            group_setup=[statement_from_string(f"{base} = {idx_expr}")],
+                            element_setup=[],
+                        )
                 target = lane_setup_statements
             else:
                 # Setup that does not depend on a lane variable can be hoisted
@@ -7434,7 +7504,11 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 # its internal negative-step machinery emits identifiers like
                 # ``offset_<n>`` that collide with helion's tile offsets.
                 target = outer_setup_statements
-            target.append(statement_from_string(f"{index_var} = {idx_expr}"))
+            index_setup = statement_from_string(f"{index_var} = {idx_expr}")
+            target.append(index_setup)
+            thread_tile = thread_tiles.get(self._lane_var_by_block.get(block_idx, ""))
+            if thread_tile is not None:
+                thread_tile.element_setup.append(index_setup)
 
             if (
                 isinstance(static_extent, int)
@@ -7465,6 +7539,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             )
             if mask_statement is not None:
                 target.append(mask_statement)
+                if thread_tile is not None:
+                    thread_tile.element_setup.append(mask_statement)
             pid = PIDInfo(pid_var, block_size_var, numel, block_idx)
             pids.append(pid)
         pids.codegen(state)
@@ -7508,6 +7584,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
             vec_lane_wrappers=vec_wrappers,
+            thread_tile_layouts=thread_tiles,
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:

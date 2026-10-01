@@ -1407,7 +1407,9 @@ class DeviceFunction:
             # loop and capture its stale initial value.
             rename_groups = {k: v[0] for k, v in self._variable_renames.items()}
             kernel_body = hoist_loop_invariant_recips(
-                kernel_body, rename_groups=rename_groups
+                kernel_body,
+                rename_groups=rename_groups,
+                snapshot_names=self.cute_state.phi_snapshot_names,
             )
             # Contract single-use fp32 ``t = a*b; w = t + c`` chains into
             # ``cute.math.fma`` (the DSL's arith ops carry no contract
@@ -1761,6 +1763,12 @@ class DeviceFunction:
                 statement_from_string(
                     f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
                 )
+            )
+        if self.cute_state.chained_matmul_plan is not None:
+            # Guarded vector copies promote individual tiles to 16-byte
+            # alignment. Their scalar fallback only needs element alignment.
+            result.append(
+                statement_from_string(f"{self.name}._helion_cute_pointer_alignment = 1")
             )
         simt_cluster_n = getattr(self.cute_state, "simt_cluster_n", 1)
         if simt_cluster_n > 1:

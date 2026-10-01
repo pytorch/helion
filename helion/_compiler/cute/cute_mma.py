@@ -7246,7 +7246,7 @@ def _emit_mma_pipeline(
     # silently miscompiles those paths.  Mirror the flag set in
     # ``_emit_cute_matmul`` so the host-side launcher disables the bake.
     if analysis is None:
-        cg.cute_uses_matmul = True
+        cg.record_cute_matmul_layout()
     lhs_operand = lhs_info
     rhs_operand = rhs_info
     lhs_m_size = lhs_operand.matrix_rows
@@ -7838,7 +7838,7 @@ def _emit_mma_pipeline(
     # Non-tcgen05 paths inspect runtime layouts. tcgen05 wrapper schemas are
     # specialized by shape and stride, so they can keep tensor layouts baked.
     if analysis is not None and mma_impl != "tcgen05":
-        cg.cute_uses_matmul = True
+        cg.record_cute_matmul_layout()
     tcgen05_requested_flat_role_coordinates = bool(
         df.config.get(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, False)
     )

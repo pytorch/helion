@@ -31,6 +31,8 @@ from .._compat import warps_to_threads
 from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
 from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
 from .._compiler.cute.block_scaled_config import normalize_block_scaled_config
+from .._compiler.cute.chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINE_KEY
+from .._compiler.cute.chunk_recurrence_config import CUTE_CHUNK_RECURRENCE_PIPELINES
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
@@ -67,6 +69,7 @@ from .._compiler.cute.cute_flash import flash_effective_config_values
 from .._compiler.cute.cute_flash import flash_env_fingerprint
 from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
+from .._compiler.cute.cutedsl_compat import cp_async_supported
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
 from .._compiler.cute.split_k_cluster import validate_cluster_config
@@ -827,6 +830,103 @@ CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
+CUTE_CHUNK_PREFILL_TASK_ORDER_KEY = "cute_chunk_prefill_task_order"
+CUTE_CHUNK_PREFILL_SCHEDULE_KEY = "cute_chunk_prefill_schedule"
+CUTE_CHAINED_MMA_SCHEDULE_KEY = "cute_chained_mma_schedule"
+CUTE_CHAINED_WARP_MMA_ROWS_KEY = "cute_chained_warp_mma_rows"
+CUTE_CHAINED_PREPARATION_PIPELINE_KEY = "cute_chained_preparation_pipeline"
+CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY = "cute_chained_pipeline_consumer_warps"
+VALID_CUTE_CHAINED_PIPELINE_CONSUMER_WARPS = (4, 8, 16)
+CUTE_CHAINED_PREPARATION_COHORTS_KEY = "cute_chained_preparation_cohorts"
+VALID_CUTE_CHAINED_PREPARATION_COHORTS = (1, 2, 3, 4, 5, 6, 7)
+CUTE_CHAINED_PREPARATION_UNROLL_KEY = "cute_chained_preparation_unroll"
+CUTE_CHAINED_REGISTER_ISLANDS_KEY = "cute_chained_register_islands"
+CUTE_CHAINED_LEAF_COUNT_KEY = "cute_chained_leaf_count"
+VALID_CUTE_CHAINED_LEAF_COUNTS = (1, 2, 4)
+CUTE_CHAINED_COLLECTIVE_RETENTION_KEY = "cute_chained_collective_retention"
+CUTE_CHAINED_OPERAND_RETENTION_KEY = "cute_chained_operand_retention"
+CUTE_CHAINED_FRONTIER_TILE_COLUMNS_KEY = "cute_chained_frontier_tile_columns"
+CUTE_CHAINED_NATIVE_VECTOR_READS_KEY = "cute_chained_native_vector_reads"
+CUTE_CHAINED_OUTPUT_LEASE_SNAPSHOT_KEY = "cute_chained_output_lease_snapshot"
+CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY = "cute_chained_scan_producer_retention"
+CUTE_CHAINED_FRONTIER_STMATRIX_KEY = "cute_chained_frontier_stmatrix"
+CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY = "cute_chained_snapshot_tile_columns"
+CUTE_CHAINED_COMPACT_PREPARATION_KEY = "cute_chained_compact_preparation"
+CUTE_CHAINED_LEAF_ISSUE_BATCHING_KEY = "cute_chained_leaf_issue_batching"
+CUTE_CHAINED_BROADCAST_RETENTION_KEY = "cute_chained_broadcast_retention"
+CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY = "cute_chained_completed_member_store"
+CUTE_NATIVE_MATMUL_METADATA_KEY = "cute_native_matmul_metadata"
+CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY = "cute_chained_drain_tile_columns"
+CUTE_CHAINED_ISLAND_CONSUMERS_KEY = "cute_chained_island_consumers"
+CUTE_CHAINED_FRAGMENT_EPILOGUES_KEY = "cute_chained_fragment_epilogues"
+VALID_CUTE_CHAINED_DRAIN_TILE_COLUMNS = (0, 32)
+VALID_CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS = (0, 32)
+VALID_CUTE_CHAINED_FRONTIER_TILE_COLUMNS = (0, 8, 16, 32, 64, 128, 256)
+# Zero inherits the original shared producer factor without changing its code.
+VALID_CUTE_CHAINED_PREPARATION_UNROLLS = (0, 1, 2, 4, 8)
+VALID_CUTE_CHAINED_WARP_MMA_ROWS = (0, 16, 32, 64, 128)
+CUTE_CHAINED_GROUP_CONTRACTIONS_KEY = "cute_chained_group_contractions"
+CUTE_CHAINED_SCRATCH_LAYOUT_KEY = "cute_chained_scratch_layout"
+VALID_CUTE_CHAINED_SCRATCH_LAYOUTS = ("row_major", "xor")
+CUTE_CHAINED_SCAN_SCHEDULE_KEY = "cute_chained_scan_schedule"
+VALID_CUTE_CHAINED_SCAN_SCHEDULES = ("serial", "warp")
+CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY = "cute_chained_pointwise_cache_bytes"
+VALID_CUTE_CHAINED_POINTWISE_CACHE_BYTES = (0, 4096, 16384)
+CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY = "cute_chained_pointwise_cache_entries"
+CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY = "cute_chained_pointwise_cache_nested"
+VALID_CUTE_CHAINED_POINTWISE_CACHE_ENTRIES = (1, 2, 4)
+CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY = "cute_chained_pointwise_cache_layout"
+VALID_CUTE_CHAINED_POINTWISE_CACHE_LAYOUTS = ("auto", "xor")
+CUTE_CHAINED_SEED_TILE_COLUMNS_KEY = "cute_chained_seed_tile_columns"
+VALID_CUTE_CHAINED_SEED_TILE_COLUMNS = (0, 32, 64)
+CUTE_CHAINED_POINTWISE_VECTORIZE_KEY = "cute_chained_pointwise_vectorize"
+CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY = "cute_chained_async_vector_store"
+CUTE_CHAINED_VECTOR_GROUP_KEY = "cute_chained_vector_group"
+CUTE_CHAINED_STARTUP_TRANSFER_KEY = "cute_chained_startup_transfer"
+CUTE_CHAINED_TMEM_FREE_KEY = "cute_chained_tmem_free"
+VALID_CUTE_CHAINED_TMEM_FREE_SCHEDULES = ("legacy", "last_read")
+CUTE_CHAINED_POINTWISE_UNROLL_KEY = "cute_chained_pointwise_unroll"
+CUTE_CHAINED_POINTWISE_READ_CACHE_KEY = "cute_chained_pointwise_read_cache"
+CUTE_CHAINED_POINTWISE_INPLACE_KEY = "cute_chained_pointwise_inplace_async"
+CUTE_LOOP_VECTORIZATION_KEY = "cute_loop_vectorize"
+CUTE_GRID_WORK_ORDER_KEY = "cute_grid_work_order"
+CUTE_LOOP_LOAD_SCHEDULE_KEY = "cute_loop_load_schedule"
+VALID_CUTE_LOOP_LOAD_SCHEDULES = (
+    "current",
+    "group2",
+    "prefetch2",
+    "group4",
+    "prefetch4",
+)
+CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY = "cute_chained_initialized_accumulator"
+CUTE_CHAINED_LATE_RHS_REUSE_KEY = "cute_chained_late_rhs_reuse"
+CUTE_CHAINED_K_SCHEDULE_KEY = "cute_chained_k_schedule"
+VALID_CUTE_CHAINED_K_SCHEDULES = ("full", "serial64", "overlap64")
+CUTE_CHAINED_LEAF_PIPELINE_KEY = "cute_chained_leaf_pipeline"
+VALID_CUTE_CHAINED_LEAF_PIPELINES = ("legacy", "paired_tma", "rectangular_tma")
+CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY = "cute_chained_tmem_early_release"
+CUTE_CHAINED_DIRECT_OUTPUT_KEY = "cute_chained_direct_output"
+VALID_CUTE_CHAINED_POINTWISE_UNROLLS = (1, 2, 4, 8)
+CUTE_CHAINED_AUXILIARY_CACHE_KEY = "cute_chained_auxiliary_cache"
+VALID_CUTE_CHAINED_MMA_SCHEDULES = (
+    "coalesced",
+    "cp_async",
+    "cp_async_register",
+    "cp_async_register_reuse",
+    "cp_async_register_reuse_scan",
+    "coalesced_unrolled",
+    "k_major",
+    "k_major_padded",
+    "tcgen05_tmem",
+)
+VALID_CUTE_CHAINED_LOOP_MMA_SCHEDULES = (
+    "coalesced",
+    "cp_async",
+    "coalesced_unrolled",
+    "k_major",
+    "k_major_padded",
+    "tcgen05_tmem",
+)
 VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc1",
     "split_alias_cpc2",
@@ -901,8 +1001,61 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_CHUNK_RECURRENCE_PIPELINE_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
+        CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        CUTE_CHAINED_MMA_SCHEDULE_KEY,
+        CUTE_CHAINED_WARP_MMA_ROWS_KEY,
+        CUTE_CHAINED_PREPARATION_PIPELINE_KEY,
+        CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY,
+        CUTE_CHAINED_PREPARATION_COHORTS_KEY,
+        CUTE_CHAINED_PREPARATION_UNROLL_KEY,
+        CUTE_CHAINED_REGISTER_ISLANDS_KEY,
+        CUTE_CHAINED_LEAF_COUNT_KEY,
+        CUTE_CHAINED_COLLECTIVE_RETENTION_KEY,
+        CUTE_CHAINED_OPERAND_RETENTION_KEY,
+        CUTE_CHAINED_FRONTIER_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_NATIVE_VECTOR_READS_KEY,
+        CUTE_CHAINED_OUTPUT_LEASE_SNAPSHOT_KEY,
+        CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY,
+        CUTE_CHAINED_FRONTIER_STMATRIX_KEY,
+        CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_COMPACT_PREPARATION_KEY,
+        CUTE_CHAINED_LEAF_ISSUE_BATCHING_KEY,
+        CUTE_CHAINED_BROADCAST_RETENTION_KEY,
+        CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY,
+        CUTE_NATIVE_MATMUL_METADATA_KEY,
+        CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_ISLAND_CONSUMERS_KEY,
+        CUTE_CHAINED_FRAGMENT_EPILOGUES_KEY,
+        CUTE_CHAINED_GROUP_CONTRACTIONS_KEY,
+        CUTE_CHAINED_SCRATCH_LAYOUT_KEY,
+        CUTE_CHAINED_SCAN_SCHEDULE_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY,
+        CUTE_CHAINED_SEED_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY,
+        CUTE_CHAINED_VECTOR_GROUP_KEY,
+        CUTE_CHAINED_STARTUP_TRANSFER_KEY,
+        CUTE_CHAINED_TMEM_FREE_KEY,
+        CUTE_CHAINED_POINTWISE_UNROLL_KEY,
+        CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
+        CUTE_CHAINED_POINTWISE_INPLACE_KEY,
+        CUTE_LOOP_VECTORIZATION_KEY,
+        CUTE_GRID_WORK_ORDER_KEY,
+        CUTE_LOOP_LOAD_SCHEDULE_KEY,
+        CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
+        CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_K_SCHEDULE_KEY,
+        CUTE_CHAINED_LEAF_PIPELINE_KEY,
+        CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
+        CUTE_CHAINED_DIRECT_OUTPUT_KEY,
+        CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_threads",
         "cute_vector_widths",
         "cute_lane_layouts",
@@ -977,8 +1130,61 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_CHUNK_RECURRENCE_PIPELINE_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
+        CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
+        CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
+        CUTE_CHAINED_MMA_SCHEDULE_KEY,
+        CUTE_CHAINED_WARP_MMA_ROWS_KEY,
+        CUTE_CHAINED_PREPARATION_PIPELINE_KEY,
+        CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY,
+        CUTE_CHAINED_PREPARATION_COHORTS_KEY,
+        CUTE_CHAINED_PREPARATION_UNROLL_KEY,
+        CUTE_CHAINED_REGISTER_ISLANDS_KEY,
+        CUTE_CHAINED_LEAF_COUNT_KEY,
+        CUTE_CHAINED_COLLECTIVE_RETENTION_KEY,
+        CUTE_CHAINED_OPERAND_RETENTION_KEY,
+        CUTE_CHAINED_FRONTIER_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_NATIVE_VECTOR_READS_KEY,
+        CUTE_CHAINED_OUTPUT_LEASE_SNAPSHOT_KEY,
+        CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY,
+        CUTE_CHAINED_FRONTIER_STMATRIX_KEY,
+        CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_COMPACT_PREPARATION_KEY,
+        CUTE_CHAINED_LEAF_ISSUE_BATCHING_KEY,
+        CUTE_CHAINED_BROADCAST_RETENTION_KEY,
+        CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY,
+        CUTE_NATIVE_MATMUL_METADATA_KEY,
+        CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_ISLAND_CONSUMERS_KEY,
+        CUTE_CHAINED_FRAGMENT_EPILOGUES_KEY,
+        CUTE_CHAINED_GROUP_CONTRACTIONS_KEY,
+        CUTE_CHAINED_SCRATCH_LAYOUT_KEY,
+        CUTE_CHAINED_SCAN_SCHEDULE_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY,
+        CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY,
+        CUTE_CHAINED_SEED_TILE_COLUMNS_KEY,
+        CUTE_CHAINED_POINTWISE_VECTORIZE_KEY,
+        CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY,
+        CUTE_CHAINED_VECTOR_GROUP_KEY,
+        CUTE_CHAINED_STARTUP_TRANSFER_KEY,
+        CUTE_CHAINED_TMEM_FREE_KEY,
+        CUTE_CHAINED_POINTWISE_UNROLL_KEY,
+        CUTE_CHAINED_POINTWISE_READ_CACHE_KEY,
+        CUTE_CHAINED_POINTWISE_INPLACE_KEY,
+        CUTE_LOOP_VECTORIZATION_KEY,
+        CUTE_GRID_WORK_ORDER_KEY,
+        CUTE_LOOP_LOAD_SCHEDULE_KEY,
+        CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
+        CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+        CUTE_CHAINED_K_SCHEDULE_KEY,
+        CUTE_CHAINED_LEAF_PIPELINE_KEY,
+        CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
+        CUTE_CHAINED_DIRECT_OUTPUT_KEY,
+        CUTE_CHAINED_AUXILIARY_CACHE_KEY,
         "num_warps",
         "num_stages",
         "pid_type",
@@ -1296,6 +1502,9 @@ class ConfigSpec:
         self.cute_proven_bounds_enabled = False
         self.cute_rng_packet_enabled = False
         self.cute_packet_prefetch_enabled = False
+        self.cute_loop_schedule_enabled = False
+        self.cute_work_order_axes: tuple[int, ...] = ()
+        self.cute_work_order_candidates: tuple[int, ...] = ()
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -1367,9 +1576,13 @@ class ConfigSpec:
         # selected value into a ptxas max-register constraint; unrelated CuTe
         # kernels never see this search dimension.
         self.cute_chunk_recurrence_register_cap: EnumFragment | None = None
+        # TMEM resource/occupancy alternatives; DV4 has only canonical "wide".
+        self.cute_chunk_recurrence_pipeline: EnumFragment | None = None
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
+        self.cute_chunk_prefill_task_order: EnumFragment | None = None
+        self.cute_chunk_prefill_schedule: EnumFragment | None = None
         # Enabled only after a generic matcher proves a compatible affine scan.
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
@@ -1440,6 +1653,23 @@ class ConfigSpec:
         self._cute_flash_bwd_block_size_targets: dict[int, int] = {}
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self.compiler_default_config: helion.Config | None = None
+        self.cute_chained_matmul_search_enabled: bool = False
+        self.cute_chained_loop_search_enabled: bool = False
+        self.cute_chained_scratch_layout_search_enabled: bool = False
+        self.cute_chained_scan_search_enabled: bool = False
+        self.cute_chained_pointwise_residency_search_enabled: bool = False
+        self.cute_chained_tcgen05_search_enabled: bool = False
+        self.cute_chained_warp_mma_search_enabled: bool = False
+        self.cute_chained_preparation_pipeline_search_enabled: bool = False
+        self.cute_chained_group_search_enabled: bool = False
+        self.cute_chained_pointwise_unroll_search_enabled: bool = False
+        self.cute_chained_pointwise_read_cache_search_enabled: bool = False
+        self.cute_chained_pointwise_inplace_search_enabled: bool = False
+        self.cute_chained_initialized_accumulator_search_enabled: bool = False
+        self.cute_chained_late_rhs_reuse_search_enabled: bool = False
+        self.cute_chained_k_schedule_search_enabled: bool = False
+        self.cute_chained_leaf_pipeline_search_enabled: bool = False
+        self.cute_chained_direct_output_search_enabled: bool = False
         self.compiler_seed_configs: list[helion.Config] = []
         self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
         self._compiler_coverage_fields: tuple[tuple[str | int, ...], ...] = ()
@@ -2194,7 +2424,9 @@ class ConfigSpec:
             spec.autotuner_min = target
             spec.max_size = target
 
-    def enable_cute_chunk_recurrence_search(self, *, preferred_partitions: int) -> None:
+    def enable_cute_chunk_recurrence_search(
+        self, *, preferred_partitions: int, fp32_state: bool = False
+    ) -> None:
         """Expose the exact BT16 recurrence schedule as CuTe search knobs."""
 
         if preferred_partitions not in (2, 4):
@@ -2208,6 +2440,9 @@ class ConfigSpec:
         )
         self.cute_chunk_recurrence_register_cap = EnumFragment(
             choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
+        )
+        self.cute_chunk_recurrence_pipeline = EnumFragment(
+            choices=CUTE_CHUNK_RECURRENCE_PIPELINES
         )
 
     def enable_cute_flash_bwd_search(
@@ -2248,6 +2483,26 @@ class ConfigSpec:
         ) in self._cute_attention_generic_fallback_block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
             spec.autotuner_min = max(spec.autotuner_min, target)
+
+    def enable_cute_chunk_prefill_task_order_search(
+        self,
+        *,
+        schedules: tuple[str, ...] = ("single", "prefix_tail_2", "prefix_tail_4"),
+        task_orders: tuple[str, ...] = (
+            "identity",
+            "longest_first",
+            "longest_first_precompute",
+        ),
+    ) -> None:
+        """Expose effective schedules only for a proved fused recurrence."""
+        self.cute_chunk_prefill_schedule = EnumFragment(choices=schedules)
+        self.cute_chunk_prefill_task_order = EnumFragment(choices=task_orders)
+        # Tensor-numel constraints index the frontend block coordinates. Keep
+        # these coordinates in flat configs, fixed to one representative tile,
+        # even though the complete-root emitter owns device geometry.
+        for spec in self.block_sizes:
+            spec.autotuner_min = 64
+            spec.max_size = 64
 
     def enable_cute_chunk_prepare_schedule_search(
         self, *, preferred_schedule: str
@@ -3140,6 +3395,1100 @@ class ConfigSpec:
                 )
             config.pop(key, None)
 
+    def _normalize_cute_loop_vectorize(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = CUTE_LOOP_VECTORIZATION_KEY
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if value is not True or not self.cute_loop_schedule_enabled:
+            if fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    f"{key} requires an independent tile-valued serial loop"
+                )
+
+    def _normalize_cute_loop_load_schedule(self, config: dict[str, object]) -> None:
+        key = CUTE_LOOP_LOAD_SCHEDULE_KEY
+        value = config.get(key, "current")
+        if type(value) is not str or value not in VALID_CUTE_LOOP_LOAD_SCHEDULES:
+            raise InvalidConfig(f"{key} requires a supported serial load schedule")
+        if value == "current":
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_loop_schedule_enabled
+            or config.get(CUTE_LOOP_VECTORIZATION_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{key} requires cute_loop_vectorize on an independent tile-valued loop"
+            )
+
+    def _normalize_cute_grid_work_order(self, config: dict[str, object]) -> None:
+        key = CUTE_GRID_WORK_ORDER_KEY
+        if key not in config:
+            return
+        value = config[key]
+        if (
+            self.backend_name != "cute"
+            or not isinstance(value, (tuple, list))
+            or len(value) != len(self.cute_work_order_axes)
+            or any(
+                type(item) is not str or item not in ("identity", "longest_first")
+                for item in value
+            )
+        ):
+            raise InvalidConfig(
+                f"{key} requires one identity/longest_first policy per CuTe grid axis"
+            )
+        selected = [
+            axis
+            for axis, item in zip(self.cute_work_order_axes, value, strict=True)
+            if item == "longest_first"
+        ]
+        if not selected:
+            config.pop(key)
+            return
+        if (
+            len(selected) != 1
+            or selected[0] not in self.cute_work_order_candidates
+            or key not in self._flat_fields()
+        ):
+            raise InvalidConfig(f"{key} requires one eligible scalar work axis")
+        if config.get("pid_type", "flat") != "flat":
+            raise InvalidConfig(f"{key} requires the original flat task grid")
+        # One vector-valued enum: keep its canonical value equal to the immutable
+        # choices used by encoding, neighborhoods and differential mutation.
+        config[key] = tuple(value)
+
+    def _normalize_cute_chained_scratch_layout(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_SCRATCH_LAYOUT_KEY
+        value = config.get(key, "row_major")
+        if type(value) is not str or value not in VALID_CUTE_CHAINED_SCRATCH_LAYOUTS:
+            raise InvalidConfig(f"{key} must be row_major or xor")
+        if value == "row_major":
+            config.pop(key, None)
+        elif config.get(CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary") != "ordinary":
+            raise InvalidConfig(f"{key} requires the common contraction lowering")
+        elif not self.cute_chained_scratch_layout_search_enabled:
+            raise InvalidConfig(
+                f"{key} requires an eligible FP32 contraction scratch tile"
+            )
+        elif self.cute_chunk_prefill_task_order is not None and not config.get(
+            CUTE_CHAINED_GROUP_CONTRACTIONS_KEY
+        ):
+            raise InvalidConfig(
+                f"{key} requires the explicit shared prefill family, not legacy prefill"
+            )
+
+    def _normalize_cute_chained_scan_schedule(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_SCAN_SCHEDULE_KEY
+        value = config.get(key, "serial")
+        if type(value) is not str or value not in VALID_CUTE_CHAINED_SCAN_SCHEDULES:
+            raise InvalidConfig(f"{key} must be serial or warp")
+        if value == "serial":
+            config.pop(key, None)
+        elif self.backend_name != "cute" or not self.cute_chained_scan_search_enabled:
+            raise InvalidConfig(f"{key} requires an eligible general contraction scan")
+        elif config.get(CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary") != "ordinary":
+            raise InvalidConfig(f"{key} requires the common contraction lowering")
+        elif self.cute_chunk_prefill_task_order is not None and not config.get(
+            CUTE_CHAINED_GROUP_CONTRACTIONS_KEY
+        ):
+            raise InvalidConfig(
+                f"{key} requires the explicit shared prefill family, not legacy prefill"
+            )
+
+    def _normalize_cute_chained_pointwise_cache(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY
+        value = config.get(key, 0)
+        if (
+            type(value) is not int
+            or value not in VALID_CUTE_CHAINED_POINTWISE_CACHE_BYTES
+        ):
+            raise InvalidConfig(f"{key} must be 0, 4096 or 16384")
+        if value == 0:
+            config.pop(key, None)
+        elif (
+            self.backend_name != "cute"
+            or not self.cute_chained_pointwise_residency_search_enabled
+        ):
+            raise InvalidConfig(
+                f"{key} requires reused common-region pointwise arithmetic"
+            )
+        elif config.get(
+            CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary"
+        ) != "ordinary" or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY):
+            raise InvalidConfig(f"{key} requires the common contraction lowering")
+        elif self.cute_chunk_prefill_task_order is not None and not config.get(
+            CUTE_CHAINED_GROUP_CONTRACTIONS_KEY
+        ):
+            raise InvalidConfig(
+                f"{key} requires the explicit shared prefill family, not legacy prefill"
+            )
+
+    def _normalize_cute_chained_pointwise_cache_entries(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY
+        value = config.get(key, 1)
+        if (
+            type(value) is not int
+            or value not in VALID_CUTE_CHAINED_POINTWISE_CACHE_ENTRIES
+        ):
+            raise InvalidConfig(f"{key} must be 1, 2 or 4")
+        if value == 1:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_matmul_search_enabled
+            or not self.cute_chained_pointwise_residency_search_enabled
+        ):
+            raise InvalidConfig(
+                f"{key} requires reused common-region pointwise arithmetic"
+            )
+        # The budget has already been strictly normalized. Increasing the
+        # entry limit must never enable caching or repair an inactive family.
+        if not config.get(CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY):
+            raise InvalidConfig(f"{key} requires positive pointwise cache bytes")
+        schedule = config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY, "coalesced")
+        if (
+            type(schedule) is not str
+            or schedule not in self._cute_chained_mma_schedules()
+        ):
+            raise InvalidConfig(f"{key} requires an admitted common MMA schedule")
+
+    def _normalize_cute_chained_pointwise_cache_nested(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        # Budget and entry count were already normalized by the original path.
+        if not config.get(CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY) or config.get(
+            CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY, 1
+        ) not in (2, 4):
+            raise InvalidConfig(f"{key} requires positive cache bytes and entries >= 2")
+
+    def _normalize_cute_chained_pointwise_cache_layout(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY
+        value = config.get(key, "auto")
+        if (
+            type(value) is not str
+            or value not in VALID_CUTE_CHAINED_POINTWISE_CACHE_LAYOUTS
+        ):
+            raise InvalidConfig(f"{key} must be 'auto' or 'xor'")
+        if value == "auto":
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_matmul_search_enabled
+            or not self.cute_chained_pointwise_residency_search_enabled
+        ):
+            raise InvalidConfig(
+                f"{key} requires reused common-region pointwise arithmetic"
+            )
+        # Like the entry limit, a layout request cannot activate a missing
+        # cache budget or repair an unsupported schedule into the common path.
+        if not config.get(CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY):
+            raise InvalidConfig(f"{key} requires positive pointwise cache bytes")
+        schedule = config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY, "coalesced")
+        if (
+            type(schedule) is not str
+            or schedule not in self._cute_chained_mma_schedules()
+        ):
+            raise InvalidConfig(f"{key} requires an admitted common MMA schedule")
+        if (
+            config.get(CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary") != "ordinary"
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+            or config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY) is not None
+            or config.get(CUTE_CHUNK_RECURRENCE_PIPELINE_KEY, "wide") != "wide"
+        ):
+            raise InvalidConfig(f"{key} requires the common contraction lowering")
+        # Concrete rank, layout, and effective-use validation belongs to the
+        # emitter; discovery only proves a reused pointwise cache candidate.
+
+    def _cute_chained_legacy_loop_fragments(self) -> dict[str, EnumFragment]:
+        """Legacy seed coordinates, only where both loop families are admitted."""
+        if not (
+            self.backend_name == "cute"
+            and self.cute_chained_matmul_search_enabled
+            and self.cute_chained_loop_search_enabled
+            and self.cute_chunk_recurrence_dv_partitions is not None
+            and self.cute_chunk_recurrence_register_cap is not None
+            and self.cute_chunk_recurrence_pipeline is not None
+        ):
+            return {}
+        return {
+            CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY: self.cute_chunk_recurrence_dv_partitions,
+            CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY: self.cute_chunk_recurrence_register_cap,
+            CUTE_CHUNK_RECURRENCE_PIPELINE_KEY: self.cute_chunk_recurrence_pipeline,
+        }
+
+    @staticmethod
+    def _requests_cute_chained_loop(config: Mapping[str, object]) -> bool:
+        # Overrides can select a common mechanism on an inherited MMA parent.
+        return config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) is not None or any(
+            config.get(key, default) != default
+            for key, default in (
+                (CUTE_CHAINED_SCRATCH_LAYOUT_KEY, "row_major"),
+                (CUTE_CHAINED_SCAN_SCHEDULE_KEY, "serial"),
+                (CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY, 0),
+                (CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY, 1),
+                (CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY, False),
+                (CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY, "auto"),
+                (CUTE_CHAINED_SEED_TILE_COLUMNS_KEY, 0),
+                (CUTE_CHAINED_GROUP_CONTRACTIONS_KEY, False),
+                (CUTE_CHAINED_POINTWISE_VECTORIZE_KEY, False),
+                (CUTE_CHAINED_VECTOR_GROUP_KEY, False),
+                (CUTE_CHAINED_POINTWISE_UNROLL_KEY, 1),
+                (CUTE_CHAINED_WARP_MMA_ROWS_KEY, 0),
+                (CUTE_CHAINED_PREPARATION_PIPELINE_KEY, False),
+                (CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY, 4),
+                (CUTE_CHAINED_PREPARATION_COHORTS_KEY, 1),
+                (CUTE_CHAINED_PREPARATION_UNROLL_KEY, 0),
+                (CUTE_CHAINED_REGISTER_ISLANDS_KEY, False),
+                (CUTE_CHAINED_LEAF_COUNT_KEY, 1),
+                (CUTE_CHAINED_COLLECTIVE_RETENTION_KEY, False),
+                (CUTE_CHAINED_OPERAND_RETENTION_KEY, False),
+                (CUTE_CHAINED_FRONTIER_TILE_COLUMNS_KEY, 0),
+                (CUTE_CHAINED_NATIVE_VECTOR_READS_KEY, False),
+                (CUTE_CHAINED_OUTPUT_LEASE_SNAPSHOT_KEY, False),
+                (CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY, False),
+                (CUTE_CHAINED_FRONTIER_STMATRIX_KEY, False),
+                (CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY, 0),
+                (CUTE_CHAINED_COMPACT_PREPARATION_KEY, False),
+                (CUTE_CHAINED_LEAF_ISSUE_BATCHING_KEY, False),
+                (CUTE_CHAINED_BROADCAST_RETENTION_KEY, False),
+                (CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY, False),
+                (CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY, 0),
+                (CUTE_CHAINED_ISLAND_CONSUMERS_KEY, False),
+                (CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY, False),
+            )
+        )
+
+    def _normalize_cute_chained_loop_family(self, config: dict[str, object]) -> None:
+        fragments = self._cute_chained_legacy_loop_fragments()
+        key = CUTE_CHAINED_MMA_SCHEDULE_KEY
+        if key in config and config[key] is None:
+            if not fragments:
+                raise InvalidConfig(
+                    "an absent chained MMA schedule requires overlapping loop families"
+                )
+            if self._requests_cute_chained_loop(config):
+                raise InvalidConfig(
+                    "legacy loop selection conflicts with active common loop options"
+                )
+            # None is the flat representation of the inactive common family.
+            # Keep the normalized config's existing absence-based dispatch ABI.
+            config.pop(key)
+            for legacy_key, fragment in fragments.items():
+                config.setdefault(legacy_key, fragment.default())
+        elif fragments and self._requests_cute_chained_loop(config):
+            if config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY) is not None:
+                raise InvalidConfig(
+                    "legacy recurrence register caps conflict with common loop options"
+                )
+            if config.get(CUTE_CHUNK_RECURRENCE_PIPELINE_KEY, "wide") != "wide":
+                raise InvalidConfig(
+                    "legacy recurrence pipelines conflict with common loop options"
+                )
+
+    def _normalize_cute_chained_vector_group(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_VECTOR_GROUP_KEY
+        enabled = config.get(key, False)
+        if type(enabled) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not enabled:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_matmul_search_enabled
+            or not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{key} requires explicit tcgen05_tmem and "
+                "cute_chained_pointwise_vectorize=True on a discovered common region"
+            )
+        if (
+            config.get(CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary") != "ordinary"
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+            or config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY) is not None
+            or config.get(CUTE_CHUNK_RECURRENCE_PIPELINE_KEY, "wide") != "wide"
+            or (
+                self.cute_chunk_prefill_task_order is not None
+                and config.get(CUTE_CHAINED_GROUP_CONTRACTIONS_KEY) is not True
+                and config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            )
+        ):
+            raise InvalidConfig(f"{key} requires the common contraction lowering")
+        # Concrete shared expressions, ownership and effective use are proven
+        # by the emitter; discovery does not promise every stage has a group.
+
+    def _normalize_cute_chained_seed_tile_columns(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_SEED_TILE_COLUMNS_KEY
+        columns = config.get(key, 0)
+        if (
+            type(columns) is not int
+            or columns not in VALID_CUTE_CHAINED_SEED_TILE_COLUMNS
+        ):
+            raise InvalidConfig(f"{key} must be 0, 32 or 64")
+        if columns == 0:
+            config.pop(key, None)
+            return
+        # Discovery admits the TCgen mechanism, not every concrete seed shape.
+        # The emitter must prove an initialized seed is actually split.
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_matmul_search_enabled
+            or not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary") != "ordinary"
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+            or config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY) is not None
+            or config.get(CUTE_CHUNK_RECURRENCE_PIPELINE_KEY, "wide") != "wide"
+            or (
+                self.cute_chunk_prefill_task_order is not None
+                and not config.get(CUTE_CHAINED_GROUP_CONTRACTIONS_KEY)
+            )
+        ):
+            raise InvalidConfig(
+                f"{key} requires explicit tcgen05_tmem on a discovered common contraction region"
+            )
+
+    def _normalize_cute_chained_snapshot_tile_columns(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY
+        columns = config.get(key, 0)
+        if (
+            type(columns) is not int
+            or columns not in VALID_CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS
+        ):
+            raise InvalidConfig(f"{key} must be 0 or 32")
+        if columns == 0:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_matmul_search_enabled
+            or not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common TCgen05 contraction region"
+            )
+        if self.cute_chained_loop_search_enabled:
+            if (
+                not self.cute_chained_preparation_pipeline_search_enabled
+                or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            ):
+                raise InvalidConfig(
+                    f"{key} requires an explicit common TCgen05 preparation pipeline for a loop"
+                )
+        elif config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY):
+            raise InvalidConfig(f"{key} root selection cannot request a loop pipeline")
+        # Discovery does not prove a concrete snapshot or its panel ownership.
+        # Positive selection must produce a validated streamed carry or root action.
+
+    def _normalize_cute_chained_drain_tile_columns(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY
+        columns = config.get(key, 0)
+        if (
+            type(columns) is not int
+            or columns not in VALID_CUTE_CHAINED_DRAIN_TILE_COLUMNS
+        ):
+            raise InvalidConfig(f"{key} must be 0 or 32")
+        if columns == 0:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_matmul_search_enabled
+            or not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common TCgen05 contraction region"
+            )
+        if self.cute_chained_loop_search_enabled and (
+            not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common preparation pipeline for a loop"
+            )
+        if not self.cute_chained_loop_search_enabled and config.get(
+            CUTE_CHAINED_PREPARATION_PIPELINE_KEY
+        ):
+            raise InvalidConfig(f"{key} cannot select a root preparation pipeline")
+
+    def _normalize_cute_chained_pipeline_consumer_warps(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY
+        value = config.get(key, 4)
+        if (
+            type(value) is not int
+            or value not in VALID_CUTE_CHAINED_PIPELINE_CONSUMER_WARPS
+        ):
+            raise InvalidConfig(f"{key} must be 4, 8 or 16")
+        if value == 4:
+            config.pop(key, None)
+            return
+        warps = config.get("num_warps", DEFAULT_NUM_WARPS)
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or type(warps) is not int
+            or warps < value + 4
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common TCgen05 preparation pipeline "
+                "and num_warps >= consumer_warps + 4"
+            )
+
+    def _normalize_cute_chained_preparation_schedule(
+        self, config: dict[str, object]
+    ) -> None:
+        from .._compiler.cute.chained_preparation_cohorts import (
+            plan_preparation_cohorts,
+        )
+
+        for key, default, choices in (
+            (
+                CUTE_CHAINED_PREPARATION_COHORTS_KEY,
+                1,
+                VALID_CUTE_CHAINED_PREPARATION_COHORTS,
+            ),
+            (
+                CUTE_CHAINED_PREPARATION_UNROLL_KEY,
+                0,
+                VALID_CUTE_CHAINED_PREPARATION_UNROLLS,
+            ),
+        ):
+            value = config.get(key, default)
+            if type(value) is not int or value not in choices:
+                raise InvalidConfig(f"{key} must be one of {choices}")
+            if value == default:
+                config.pop(key, None)
+                continue
+            if (
+                self.backend_name != "cute"
+                or not self.cute_chained_loop_search_enabled
+                or not self.cute_chained_preparation_pipeline_search_enabled
+                or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    f"{key} requires an explicit common TCgen05 preparation pipeline"
+                )
+            if key == CUTE_CHAINED_PREPARATION_COHORTS_KEY:
+                warps = config.get("num_warps", DEFAULT_NUM_WARPS)
+                consumer = config.get(CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY, 4)
+                if (
+                    type(warps) is not int
+                    or type(consumer) is not int
+                    or plan_preparation_cohorts(32 * warps, 32 * consumer, value)
+                    is None
+                ):
+                    raise InvalidConfig(
+                        f"{key} requires equal whole-128-thread preparation teams "
+                        "and a disjoint ordered recurrence team within one CTA"
+                    )
+
+    def _normalize_cute_chained_register_islands(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_REGISTER_ISLANDS_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common TCgen05 preparation pipeline"
+            )
+        # The late emitter proves graph support, exact typed domains, physical
+        # fragment transport and final frame lifetimes. Strict fast_math=False
+        # deliberately preserves the ordinary source without discovery.
+
+    def _normalize_cute_chained_compact_preparation(
+        self, config: dict[str, object]
+    ) -> None:
+        if (
+            self.backend_name == "cute"
+            and self.cute_chained_loop_search_enabled
+            and self.cute_chained_preparation_pipeline_search_enabled
+            and type(config.get("cute_min_blocks_per_mp")) is int
+            and config["cute_min_blocks_per_mp"] == 0
+        ):
+            # The new flat coordinate's zero is the existing absent launch
+            # policy. Preserve every old default and seed configuration.
+            config.pop("cute_min_blocks_per_mp")
+        key = CUTE_CHAINED_COMPACT_PREPARATION_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        count = config.get(CUTE_CHAINED_PREPARATION_COHORTS_KEY, 1)
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or type(count) is not int
+            or count <= 1
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common TCgen05 multi-cohort preparation pipeline"
+            )
+        # Cohort geometry was checked above. Actual accepted actions, typed
+        # views and complete resource charging remain late compiler proofs.
+
+    def _normalize_cute_chained_leaf_issue_batching(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_LEAF_ISSUE_BATCHING_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        count = config.get(CUTE_CHAINED_LEAF_COUNT_KEY, 1)
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_COMPACT_PREPARATION_KEY) is not True
+            or config.get(CUTE_CHAINED_LEAF_PIPELINE_KEY) != "rectangular_tma"
+            or type(count) is not int
+            or count <= 1
+        ):
+            raise InvalidConfig(
+                f"{key} requires explicit compact multi-leaf rectangular preparation"
+            )
+
+    def _normalize_cute_native_matmul_metadata(self, config: dict[str, object]) -> None:
+        key = CUTE_NATIVE_MATMUL_METADATA_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        if self.backend_name != "cute" or not self.cute_chained_matmul_search_enabled:
+            raise InvalidConfig(f"{key} requires a discovered common contraction")
+        if (
+            self.cute_chunk_prefill_task_order is not None
+            and config.get(CUTE_CHAINED_GROUP_CONTRACTIONS_KEY) is not True
+            and config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{key} requires common contraction lowering, not whole-root prefill"
+            )
+
+    def _normalize_cute_chained_island_consumers(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_ISLAND_CONSUMERS_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_COMPACT_PREPARATION_KEY) is not True
+            or config.get(CUTE_CHAINED_REGISTER_ISLANDS_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{key} requires explicit compact register-island preparation"
+            )
+        # A graph seed or config is not publication authority: the original
+        # emitter must accept a real multi-reader image and every read receipt.
+
+    def _normalize_cute_chained_fragment_epilogues(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_FRAGMENT_EPILOGUES_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_matmul_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY)
+            not in (
+                "cp_async_register",
+                "cp_async_register_reuse",
+                "cp_async_register_reuse_scan",
+                "tcgen05_tmem",
+            )
+            or self.cute_chained_loop_search_enabled
+            and (
+                config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+                or config.get(CUTE_CHAINED_COMPACT_PREPARATION_KEY) is not True
+            )
+        ):
+            raise InvalidConfig(f"{key} requires explicit common fragment lowering")
+
+    def _normalize_cute_chained_broadcast_retention(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_BROADCAST_RETENTION_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_COMPACT_PREPARATION_KEY) is not True
+        ):
+            raise InvalidConfig(f"{key} requires explicit compact common preparation")
+
+    def _normalize_cute_chained_async_vector_store(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        if (
+            key not in self._flat_fields()
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{key} requires explicit vectorized common TCgen05 preparation"
+            )
+        # Discovery proposes the transport, not a layout or source proof.
+        # Original emission must activate an exact identity shared sink.
+
+    def _normalize_cute_chained_retention(self, config: dict[str, object]) -> None:
+        for key in (
+            CUTE_CHAINED_COLLECTIVE_RETENTION_KEY,
+            CUTE_CHAINED_OPERAND_RETENTION_KEY,
+            CUTE_CHAINED_NATIVE_VECTOR_READS_KEY,
+            CUTE_CHAINED_OUTPUT_LEASE_SNAPSHOT_KEY,
+            CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY,
+            CUTE_CHAINED_FRONTIER_STMATRIX_KEY,
+            CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY,
+        ):
+            value = config.get(key, False)
+            if type(value) is not bool:
+                raise InvalidConfig(f"{key} must be bool")
+            if not value:
+                config.pop(key, None)
+                continue
+            if (
+                self.backend_name != "cute"
+                or not self.cute_chained_loop_search_enabled
+                or not self.cute_chained_preparation_pipeline_search_enabled
+                or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+                or key == CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY
+                and not self.cute_chained_tcgen05_search_enabled
+            ):
+                raise InvalidConfig(
+                    f"{key} requires an explicit common TCgen05 preparation pipeline"
+                )
+        # Each late lowering separately proves original typed values, their
+        # coordinate ownership and all publication/storage lifetimes. Neither
+        # request changes the caller's existing floating-point policy.
+        if config.get(CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY) is True and (
+            config.get(CUTE_CHAINED_SCAN_SCHEDULE_KEY) != "warp"
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY} requires explicit warp scan and vector producers"
+            )
+        if config.get(CUTE_CHAINED_NATIVE_VECTOR_READS_KEY) is True and (
+            config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+            or not (
+                config.get(CUTE_CHAINED_OPERAND_RETENTION_KEY) is True
+                or (
+                    config.get(CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY) is True
+                    and config.get(CUTE_CHAINED_LEAF_PIPELINE_KEY) == "rectangular_tma"
+                )
+            )
+        ):
+            raise InvalidConfig(
+                f"{CUTE_CHAINED_NATIVE_VECTOR_READS_KEY} requires vector producers "
+                "and either typed operand retention or a retained scan with "
+                "rectangular TMA leaves"
+            )
+        if config.get(CUTE_CHAINED_FRONTIER_STMATRIX_KEY) is True and (
+            config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+            or config.get(CUTE_CHAINED_VECTOR_GROUP_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{CUTE_CHAINED_FRONTIER_STMATRIX_KEY} requires explicit vector producers and grouping"
+            )
+
+    def _normalize_cute_chained_frontier_tile_columns(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_FRONTIER_TILE_COLUMNS_KEY
+        value = config.get(key, 0)
+        if (
+            type(value) is not int
+            or value not in VALID_CUTE_CHAINED_FRONTIER_TILE_COLUMNS
+        ):
+            raise InvalidConfig(
+                f"{key} must be one of {VALID_CUTE_CHAINED_FRONTIER_TILE_COLUMNS}"
+            )
+        if value == 0:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+            or config.get(CUTE_CHAINED_VECTOR_GROUP_KEY) is not True
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common preparation pipeline with vector grouping"
+            )
+        # Late admission requires mixed native-axis frontier outputs. It must
+        # not infer that capability from unrelated scalar/XOR destinations.
+
+    def _normalize_cute_chained_leaf_count(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_LEAF_COUNT_KEY
+        value = config.get(key, 1)
+        if type(value) is not int or value not in VALID_CUTE_CHAINED_LEAF_COUNTS:
+            raise InvalidConfig(
+                f"{key} must be one of {VALID_CUTE_CHAINED_LEAF_COUNTS}"
+            )
+        if value == 1:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_LEAF_PIPELINE_KEY) != "rectangular_tma"
+        ):
+            raise InvalidConfig(
+                f"{key} requires an explicit common TCgen05 preparation pipeline "
+                "with rectangular_tma leaves"
+            )
+        # This bounds the admitted set, not its exact size. Discovery does not
+        # grant expression, descriptor, lifetime or final allocation authority.
+
+    def _normalize_cute_chained_preparation_pipeline(
+        self, config: dict[str, object]
+    ) -> None:
+        key = CUTE_CHAINED_PREPARATION_PIPELINE_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        rows = config.get(CUTE_CHAINED_WARP_MMA_ROWS_KEY, 0)
+        warps = config.get("num_warps", DEFAULT_NUM_WARPS)
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_preparation_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or type(rows) is not int
+            or rows not in VALID_CUTE_CHAINED_WARP_MMA_ROWS[1:]
+            or type(warps) is not int
+            or warps < 8
+            or config.get(CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary") != "ordinary"
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+            or config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY) is not None
+            or config.get(CUTE_CHUNK_RECURRENCE_PIPELINE_KEY, "wide") != "wide"
+        ):
+            raise InvalidConfig(
+                f"{key} requires explicit tcgen05_tmem, positive warp MMA rows "
+                "and num_warps >= 8 on an eligible common preparation loop"
+            )
+
+    def _normalize_cute_chained_warp_mma_rows(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_WARP_MMA_ROWS_KEY
+        rows = config.get(key, 0)
+        if type(rows) is not int or rows not in VALID_CUTE_CHAINED_WARP_MMA_ROWS:
+            raise InvalidConfig(f"{key} must be 0, 16, 32, 64 or 128")
+        if rows == 0:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_loop_search_enabled
+            or not self.cute_chained_warp_mma_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_AFFINE_SCAN_SCHEDULE_KEY, "ordinary") != "ordinary"
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+        ):
+            raise InvalidConfig(
+                f"{key} requires explicit tcgen05_tmem on a common loop with an "
+                "eligible uninitialized contraction"
+            )
+
+    def _normalize_cute_chained_loop_options(self, config: dict[str, object]) -> None:
+        if not self.cute_chained_loop_search_enabled:
+            return
+        # These mechanisms belong to the root-only emitter. Reject explicit
+        # requests before normalization can repair them into inactive defaults.
+        defaults = {
+            CUTE_CHAINED_POINTWISE_READ_CACHE_KEY: False,
+            CUTE_CHAINED_POINTWISE_INPLACE_KEY: False,
+            CUTE_CHAINED_AUXILIARY_CACHE_KEY: False,
+            CUTE_CHAINED_TMEM_FREE_KEY: "legacy",
+            CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY: False,
+            CUTE_CHAINED_STARTUP_TRANSFER_KEY: "legacy",
+            CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY: False,
+            CUTE_CHAINED_LATE_RHS_REUSE_KEY: False,
+            CUTE_CHAINED_K_SCHEDULE_KEY: "full",
+            CUTE_CHAINED_LEAF_PIPELINE_KEY: "legacy",
+            CUTE_CHAINED_DIRECT_OUTPUT_KEY: False,
+            CUTE_LOOP_VECTORIZATION_KEY: False,
+            CUTE_LOOP_LOAD_SCHEDULE_KEY: "current",
+        }
+        for key, default in defaults.items():
+            if key not in config:
+                continue
+            value = config[key]
+            if key == CUTE_CHAINED_LEAF_PIPELINE_KEY and value == "rectangular_tma":
+                # This mode belongs to the loop preparation DAG; its geometry
+                # and pipeline prerequisites are validated separately below.
+                continue
+            if type(value) is not type(default) or value != default:
+                raise InvalidConfig(f"{key} is not implemented for contraction loops")
+            config.pop(key)
+        schedule = config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY)
+        if CUTE_CHAINED_POINTWISE_UNROLL_KEY in config:
+            unroll = config[CUTE_CHAINED_POINTWISE_UNROLL_KEY]
+            if (
+                type(unroll) is not int
+                or unroll not in VALID_CUTE_CHAINED_POINTWISE_UNROLLS
+            ):
+                raise InvalidConfig(
+                    "cute_chained_pointwise_unroll must be 1, 2, 4 or 8"
+                )
+            if unroll == 1:
+                config.pop(CUTE_CHAINED_POINTWISE_UNROLL_KEY)
+            elif (
+                schedule != "tcgen05_tmem"
+                or not self.cute_chained_pointwise_unroll_search_enabled
+            ):
+                raise InvalidConfig(
+                    "loop pointwise unroll requires tcgen05_tmem producers"
+                )
+        if CUTE_CHAINED_POINTWISE_VECTORIZE_KEY in config:
+            vectorize = config[CUTE_CHAINED_POINTWISE_VECTORIZE_KEY]
+            if type(vectorize) is not bool:
+                raise InvalidConfig("cute_chained_pointwise_vectorize must be bool")
+            if vectorize and schedule != "tcgen05_tmem":
+                raise InvalidConfig("loop vector staging requires tcgen05_tmem")
+        if (
+            schedule in VALID_CUTE_CHAINED_MMA_SCHEDULES
+            and schedule not in VALID_CUTE_CHAINED_LOOP_MMA_SCHEDULES
+        ):
+            raise InvalidConfig(
+                f"chained MMA schedule {schedule!r} is not implemented for contraction loops"
+            )
+
+    def _normalize_cute_chained_loop_num_warps(self, config: dict[str, object]) -> None:
+        value = config.get("num_warps", DEFAULT_NUM_WARPS)
+        if self.backend_name == "cute" and value == 20:
+            from .._compiler.cute.chained_preparation_cohorts import (
+                supports_twenty_warp_preparation,
+            )
+
+            if (
+                not self.cute_chained_loop_search_enabled
+                or not self.cute_chained_preparation_pipeline_search_enabled
+                or not supports_twenty_warp_preparation(config)
+            ):
+                raise InvalidConfig(
+                    "num_warps=20 requires compact TCgen05 preparation with "
+                    "128-thread cohorts and explicit cute_min_blocks_per_mp=1"
+                )
+            return
+        if not self.cute_chained_loop_search_enabled:
+            return
+        schedule = config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY, "coalesced")
+        choices = (4, 8, 16, 32) if schedule == "tcgen05_tmem" else (1, 2, 4, 8, 16, 32)
+        if type(value) is not int or value not in choices:
+            raise InvalidConfig(f"{schedule} requires num_warps in {choices}")
+
+    def _normalize_cute_chained_tmem_free(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_TMEM_FREE_KEY
+        value = config.get(key, "legacy")
+        if (
+            type(value) is not str
+            or value not in VALID_CUTE_CHAINED_TMEM_FREE_SCHEDULES
+        ):
+            raise InvalidConfig(f"{key} must be legacy or last_read")
+        if value == "legacy":
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get("num_warps", DEFAULT_NUM_WARPS) != 4
+            or config.get("pid_type", "flat") != "flat"
+            or config.get("cute_cluster_n", 1) != 1
+        ):
+            raise InvalidConfig(
+                f"{key} requires a resident one-CTA chained TCgen05 schedule"
+            )
+
+    def _normalize_cute_chained_groups(self, config: dict[str, object]) -> None:
+        from .._compiler.cute.chained_preparation_cohorts import (
+            supports_twenty_warp_preparation,
+        )
+
+        key = CUTE_CHAINED_GROUP_CONTRACTIONS_KEY
+        value = config.get(key, False)
+        if type(value) is not bool:
+            raise InvalidConfig(f"{key} must be bool")
+        if not value:
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_group_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or (
+                config.get("num_warps", DEFAULT_NUM_WARPS)
+                not in (
+                    (4, 8, 16, 32) if self.cute_chained_loop_search_enabled else (4,)
+                )
+                and not (
+                    self.cute_chained_loop_search_enabled
+                    and supports_twenty_warp_preparation(config)
+                )
+            )
+        ):
+            raise InvalidConfig(f"{key} requires a resident TCgen05 contraction loop")
+
+    def _normalize_cute_chained_k_schedule(self, config: dict[str, object]) -> None:
+        # Run before repair: an explicit unsupported request cannot be erased
+        # or have its prerequisites silently enabled by generic normalization.
+        key = CUTE_CHAINED_K_SCHEDULE_KEY
+        value = config.get(key, "full")
+        if type(value) is not str or value not in VALID_CUTE_CHAINED_K_SCHEDULES:
+            raise InvalidConfig(f"{key} must be full, serial64 or overlap64")
+        if value == "full":
+            config.pop(key, None)
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_k_schedule_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY) is not True
+            or config.get(CUTE_CHAINED_LATE_RHS_REUSE_KEY) is not True
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+            or config.get("num_warps", DEFAULT_NUM_WARPS) != 4
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+        ):
+            raise InvalidConfig(
+                f"{key} requires an initialized late-RHS vector K128 TCgen05 pair"
+            )
+
+    def _normalize_cute_chained_leaf_pipeline(self, config: dict[str, object]) -> None:
+        key = CUTE_CHAINED_LEAF_PIPELINE_KEY
+        value = config.get(key, "legacy")
+        if type(value) is not str or value not in VALID_CUTE_CHAINED_LEAF_PIPELINES:
+            raise InvalidConfig(
+                f"{key} must be one of {VALID_CUTE_CHAINED_LEAF_PIPELINES}"
+            )
+        if value == "legacy":
+            config.pop(key, None)
+            return
+        if value == "rectangular_tma":
+            if (
+                self.backend_name != "cute"
+                or not self.cute_chained_preparation_pipeline_search_enabled
+                or config.get(CUTE_CHAINED_PREPARATION_PIPELINE_KEY) is not True
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(f"{key} requires a TCgen05 preparation pipeline")
+            return
+        if (
+            self.backend_name != "cute"
+            or not self.cute_chained_leaf_pipeline_search_enabled
+            or config.get(CUTE_CHAINED_K_SCHEDULE_KEY) not in ("serial64", "overlap64")
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            or config.get(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY) is not True
+            or config.get(CUTE_CHAINED_LATE_RHS_REUSE_KEY) is not True
+            or config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY) is not True
+            or config.get("num_warps", DEFAULT_NUM_WARPS) != 4
+            or config.get(CUTE_CHAINED_POINTWISE_INPLACE_KEY)
+            or config.get(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+        ):
+            raise InvalidConfig(
+                f"{key} requires an initialized, late-RHS FP32-leaf K128 pair"
+            )
+
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
 
@@ -3275,6 +4624,17 @@ class ConfigSpec:
             self.normalize(config.config, _fix_invalid=_fix_invalid)
             return
 
+        if (
+            self.cute_chunk_prefill_task_order is not None
+            and "block_sizes" not in config
+        ):
+            # The fused schedule owns the complete value dimension. A nominal
+            # frontend tile is still needed to normalize the bound DSL graph,
+            # but does not affect this emitter's launch or device code.
+            config["block_sizes"] = self.block_sizes._flat_config(
+                self, lambda fragment: fragment.default()
+            )
+
         # ``cross_loop_schedule`` was the former public name. Accept old configs
         # only at this boundary, then keep ``cross_loop_pipeline`` as the sole
         # internal key.
@@ -3301,6 +4661,41 @@ class ConfigSpec:
                     "cross_loop_schedule and cross_loop_pipeline select "
                     "conflicting execution policies"
                 )
+
+        self._normalize_cute_chained_vector_group(config)
+        self._normalize_cute_chained_seed_tile_columns(config)
+        self._normalize_cute_chained_pipeline_consumer_warps(config)
+        self._normalize_cute_chained_preparation_pipeline(config)
+        self._normalize_cute_chained_preparation_schedule(config)
+        self._normalize_cute_chained_compact_preparation(config)
+        self._normalize_cute_chained_leaf_issue_batching(config)
+        self._normalize_cute_chained_broadcast_retention(config)
+        self._normalize_cute_native_matmul_metadata(config)
+        self._normalize_cute_chained_register_islands(config)
+        self._normalize_cute_chained_island_consumers(config)
+        self._normalize_cute_chained_fragment_epilogues(config)
+        self._normalize_cute_chained_retention(config)
+        self._normalize_cute_chained_frontier_tile_columns(config)
+        self._normalize_cute_chained_snapshot_tile_columns(config)
+        self._normalize_cute_chained_drain_tile_columns(config)
+        self._normalize_cute_chained_warp_mma_rows(config)
+        self._normalize_cute_chained_loop_options(config)
+        self._normalize_cute_chained_async_vector_store(config)
+        self._normalize_cute_chained_loop_num_warps(config)
+        self._normalize_cute_chained_scratch_layout(config)
+        self._normalize_cute_chained_scan_schedule(config)
+        self._normalize_cute_chained_pointwise_cache(config)
+        self._normalize_cute_chained_pointwise_cache_entries(config)
+        self._normalize_cute_chained_pointwise_cache_nested(config)
+        self._normalize_cute_chained_pointwise_cache_layout(config)
+        self._normalize_cute_loop_load_schedule(config)
+        self._normalize_cute_grid_work_order(config)
+        self._normalize_cute_chained_tmem_free(config)
+        self._normalize_cute_chained_groups(config)
+        self._normalize_cute_chained_k_schedule(config)
+        self._normalize_cute_chained_leaf_pipeline(config)
+        self._normalize_cute_chained_leaf_count(config)
+        self._normalize_cute_chained_loop_family(config)
 
         for name in (
             "block_size",
@@ -3368,6 +4763,19 @@ class ConfigSpec:
                 )
 
         if (
+            CUTE_CHUNK_RECURRENCE_PIPELINE_KEY in config
+            and self.cute_chunk_recurrence_pipeline is None
+            and self.supports_config_key(CUTE_CHUNK_RECURRENCE_PIPELINE_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_CHUNK_RECURRENCE_PIPELINE_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_CHUNK_RECURRENCE_PIPELINE_KEY} is available only "
+                    "for matched BT16 chunk-recurrence kernels"
+                )
+
+        if (
             CUTE_CHUNK_PREPARE_SCHEDULE_KEY in config
             and self.cute_chunk_prepare_schedule is None
             and self.supports_config_key(CUTE_CHUNK_PREPARE_SCHEDULE_KEY)
@@ -3379,6 +4787,16 @@ class ConfigSpec:
                     f"{CUTE_CHUNK_PREPARE_SCHEDULE_KEY} is available only for "
                     "matched BT16 chunk-prepare kernels"
                 )
+
+        for key, fragment in (
+            (CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, self.cute_chunk_prefill_task_order),
+            (CUTE_CHUNK_PREFILL_SCHEDULE_KEY, self.cute_chunk_prefill_schedule),
+        ):
+            if key in config and fragment is None and self.supports_config_key(key):
+                if _fix_invalid:
+                    config.pop(key)
+                else:
+                    raise InvalidConfig(f"{key} requires a matched fused recurrence")
 
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
@@ -3441,6 +4859,7 @@ class ConfigSpec:
             self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_loop_vectorize(config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
@@ -3878,6 +5297,192 @@ class ConfigSpec:
 
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
+        if self.cute_chained_matmul_search_enabled:
+            legacy_loop_requested = self.cute_chained_loop_search_enabled and bool(
+                provided_keys
+                & {
+                    CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
+                    CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+                    CUTE_CHUNK_RECURRENCE_PIPELINE_KEY,
+                }
+            )
+            # Preserve the absent common schedule for explicit legacy loop
+            # configs. The loop planner uses its presence as family selection.
+            # Inactive common defaults were removed before provided_keys;
+            # grouping/vector staging/unroll already require an explicit MMA
+            # schedule, while these knobs may select the default common one.
+            common_loop_requested = self._requests_cute_chained_loop(config)
+            if not legacy_loop_requested or common_loop_requested:
+                schedule = config.setdefault(CUTE_CHAINED_MMA_SCHEDULE_KEY, "coalesced")
+                if schedule not in self._cute_chained_mma_schedules():
+                    if _fix_invalid:
+                        config[CUTE_CHAINED_MMA_SCHEDULE_KEY] = "coalesced"
+                    else:
+                        raise InvalidConfig(
+                            f"invalid chained MMA schedule: {schedule!r}"
+                        )
+                elif (
+                    schedule == "tcgen05_tmem"
+                    and not self.cute_chained_loop_search_enabled
+                    and config.get("num_warps") != 4
+                ):
+                    # Preserve root schedules' original repair policy. Loop
+                    # geometry is checked strictly before generic repair above.
+                    if _fix_invalid:
+                        config["num_warps"] = 4
+                    else:
+                        raise InvalidConfig("tcgen05_tmem requires num_warps=4")
+        elif CUTE_CHAINED_MMA_SCHEDULE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_MMA_SCHEDULE_KEY)
+            else:
+                raise InvalidConfig("chained MMA schedules require a contraction DAG")
+        if CUTE_CHAINED_DIRECT_OUTPUT_KEY in config:
+            direct_output = config[CUTE_CHAINED_DIRECT_OUTPUT_KEY]
+            if type(direct_output) is not bool:
+                raise InvalidConfig("cute_chained_direct_output must be bool")
+            if not direct_output:
+                config.pop(CUTE_CHAINED_DIRECT_OUTPUT_KEY)
+            elif (
+                not self.cute_chained_direct_output_search_enabled
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "direct output requires a resident one-dot M64 schedule"
+                )
+        if CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY in config:
+            early_release = config[CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY]
+            if type(early_release) is not bool:
+                raise InvalidConfig("cute_chained_tmem_early_release must be bool")
+            if not early_release:
+                config.pop(CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY)
+            elif (
+                not self.cute_chained_tcgen05_search_enabled
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "early TMEM release requires a resident chained TCgen05 schedule"
+                )
+        if CUTE_CHAINED_LATE_RHS_REUSE_KEY in config:
+            late_rhs = config[CUTE_CHAINED_LATE_RHS_REUSE_KEY]
+            if type(late_rhs) is not bool:
+                raise InvalidConfig("cute_chained_late_rhs_reuse must be bool")
+            if not late_rhs:
+                config.pop(CUTE_CHAINED_LATE_RHS_REUSE_KEY)
+            elif (
+                not self.cute_chained_late_rhs_reuse_search_enabled
+                or not config.get(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY)
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "late RHS reuse requires an initialized direct-RHS TCgen05 pair"
+                )
+        if self.cute_chained_tcgen05_search_enabled:
+            vectorize = config.setdefault(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY, False)
+            if not isinstance(vectorize, bool):
+                raise InvalidConfig("cute_chained_pointwise_vectorize must be bool")
+            if config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem":
+                config[CUTE_CHAINED_POINTWISE_VECTORIZE_KEY] = False
+        elif CUTE_CHAINED_POINTWISE_VECTORIZE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY)
+            else:
+                raise InvalidConfig(
+                    "vector pointwise staging requires a TCgen05 contraction DAG"
+                )
+        if self.cute_chained_loop_search_enabled:
+            # Loop producers were checked before repair; scalar staging also
+            # consumes this knob, and the inactive default stays canonical.
+            pass
+        elif self.cute_chained_pointwise_unroll_search_enabled:
+            unroll = config.setdefault(CUTE_CHAINED_POINTWISE_UNROLL_KEY, 1)
+            if (
+                type(unroll) is not int
+                or unroll not in VALID_CUTE_CHAINED_POINTWISE_UNROLLS
+            ):
+                raise InvalidConfig(
+                    "cute_chained_pointwise_unroll must be 1, 2, 4 or 8"
+                )
+            if config.get(
+                CUTE_CHAINED_MMA_SCHEDULE_KEY
+            ) != "tcgen05_tmem" or not config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY):
+                config[CUTE_CHAINED_POINTWISE_UNROLL_KEY] = 1
+        elif CUTE_CHAINED_POINTWISE_UNROLL_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_UNROLL_KEY)
+            else:
+                raise InvalidConfig(
+                    "pointwise unroll requires computed TCgen05 vector operands"
+                )
+        if self.cute_chained_pointwise_read_cache_search_enabled:
+            read_cache = config.setdefault(CUTE_CHAINED_POINTWISE_READ_CACHE_KEY, False)
+            if not isinstance(read_cache, bool):
+                raise InvalidConfig("cute_chained_pointwise_read_cache must be bool")
+            if config.get(
+                CUTE_CHAINED_MMA_SCHEDULE_KEY
+            ) != "tcgen05_tmem" or not config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY):
+                config[CUTE_CHAINED_POINTWISE_READ_CACHE_KEY] = False
+        elif CUTE_CHAINED_POINTWISE_READ_CACHE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_READ_CACHE_KEY)
+            else:
+                raise InvalidConfig(
+                    "pointwise read cache requires computed TCgen05 vector operands"
+                )
+        if self.cute_chained_pointwise_inplace_search_enabled:
+            inplace = config.setdefault(CUTE_CHAINED_POINTWISE_INPLACE_KEY, False)
+            if not isinstance(inplace, bool):
+                raise InvalidConfig("cute_chained_pointwise_inplace_async must be bool")
+            if config.get(
+                CUTE_CHAINED_MMA_SCHEDULE_KEY
+            ) != "tcgen05_tmem" or not config.get(CUTE_CHAINED_POINTWISE_VECTORIZE_KEY):
+                config[CUTE_CHAINED_POINTWISE_INPLACE_KEY] = False
+        elif CUTE_CHAINED_POINTWISE_INPLACE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_POINTWISE_INPLACE_KEY)
+            else:
+                raise InvalidConfig(
+                    "inplace async requires computed same-dtype TCgen05 operands"
+                )
+        if CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY in config:
+            initialized = config[CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY]
+            if type(initialized) is not bool:
+                raise InvalidConfig("cute_chained_initialized_accumulator must be bool")
+            if not initialized:
+                config.pop(CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY)
+            elif (
+                not self.cute_chained_initialized_accumulator_search_enabled
+                or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+            ):
+                raise InvalidConfig(
+                    "initialized accumulator requires an independent FP32 TCgen05 pair"
+                )
+        startup = config.get(CUTE_CHAINED_STARTUP_TRANSFER_KEY, "legacy")
+        if type(startup) is not str or startup not in ("legacy", "tma"):
+            raise InvalidConfig("cute_chained_startup_transfer must be legacy or tma")
+        if startup == "legacy":
+            config.pop(CUTE_CHAINED_STARTUP_TRANSFER_KEY, None)
+        elif (
+            not self.cute_chained_tcgen05_search_enabled
+            or config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem"
+        ):
+            raise InvalidConfig("startup TMA requires a TCgen05 contraction DAG")
+        if (
+            self.cute_chained_tcgen05_search_enabled
+            and not self.cute_chained_loop_search_enabled
+        ):
+            cache = config.setdefault(CUTE_CHAINED_AUXILIARY_CACHE_KEY, False)
+            if not isinstance(cache, bool):
+                raise InvalidConfig("cute_chained_auxiliary_cache must be bool")
+            if config.get(CUTE_CHAINED_MMA_SCHEDULE_KEY) != "tcgen05_tmem":
+                config[CUTE_CHAINED_AUXILIARY_CACHE_KEY] = False
+        elif CUTE_CHAINED_AUXILIARY_CACHE_KEY in config:
+            if _fix_invalid:
+                config.pop(CUTE_CHAINED_AUXILIARY_CACHE_KEY)
+            else:
+                raise InvalidConfig(
+                    "auxiliary caches require a TCgen05 contraction DAG"
+                )
         if self.supports_config_key("num_stages"):
             config.setdefault("num_stages", self._default_num_stages())
         if self.supports_config_key("host_tensor_descriptors"):
@@ -4002,6 +5607,62 @@ class ConfigSpec:
                         f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} must be None for "
                         f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY}=2 because the "
                         "TMEM schedule dynamically reallocates registers"
+                    )
+        recurrence_pipeline_fragment = self.cute_chunk_recurrence_pipeline
+        if recurrence_pipeline_fragment is not None:
+            pipeline = config.setdefault(
+                CUTE_CHUNK_RECURRENCE_PIPELINE_KEY,
+                recurrence_pipeline_fragment.default(),
+            )
+            if pipeline not in recurrence_pipeline_fragment.choices:
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_PIPELINE_KEY] = "wide"
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_PIPELINE_KEY} must be one of "
+                        f"{recurrence_pipeline_fragment.choices!r}, got {pipeline!r}"
+                    )
+            if (
+                config.get(CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY) == 4
+                and config[CUTE_CHUNK_RECURRENCE_PIPELINE_KEY] != "wide"
+            ):
+                if _fix_invalid:
+                    config[CUTE_CHUNK_RECURRENCE_PIPELINE_KEY] = "wide"
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_RECURRENCE_PIPELINE_KEY} must be 'wide' for "
+                        f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY}=4"
+                    )
+        if CUTE_CHAINED_MMA_SCHEDULE_KEY in config:
+            # The common family does not consume legacy coordinates. Keep one
+            # canonical inactive value after validating explicit contracts.
+            for key, fragment in self._cute_chained_legacy_loop_fragments().items():
+                config[key] = fragment.default()
+        prefill_task_order = self.cute_chunk_prefill_task_order
+        if prefill_task_order is not None:
+            task_order = config.setdefault(
+                CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, prefill_task_order.default()
+            )
+            if task_order not in prefill_task_order.choices:
+                if _fix_invalid:
+                    config[CUTE_CHUNK_PREFILL_TASK_ORDER_KEY] = (
+                        prefill_task_order.default()
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_PREFILL_TASK_ORDER_KEY} must be one of {prefill_task_order.choices!r}"
+                    )
+        prefill_schedule = self.cute_chunk_prefill_schedule
+        if prefill_schedule is not None:
+            schedule = config.setdefault(
+                CUTE_CHUNK_PREFILL_SCHEDULE_KEY, prefill_schedule.default()
+            )
+            if schedule not in prefill_schedule.choices:
+                if _fix_invalid:
+                    config[CUTE_CHUNK_PREFILL_SCHEDULE_KEY] = prefill_schedule.default()
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_CHUNK_PREFILL_SCHEDULE_KEY} must be one of {prefill_schedule.choices!r}"
                     )
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
@@ -4521,6 +6182,90 @@ class ConfigSpec:
                 return True, "off"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
+            if (
+                key == CUTE_CHAINED_MMA_SCHEDULE_KEY
+                and self._cute_chained_legacy_loop_fragments().keys() & config.keys()
+                and not self._requests_cute_chained_loop(config)
+            ):
+                return True, None
+            if key == CUTE_CHAINED_SCRATCH_LAYOUT_KEY:
+                return True, "row_major"
+            if key == CUTE_CHAINED_SCAN_SCHEDULE_KEY:
+                return True, "serial"
+            if key == CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY:
+                return True, 0
+            if key == CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY:
+                return True, 1
+            if key == CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY:
+                return True, False
+            if key == CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY:
+                return True, "auto"
+            if key == CUTE_CHAINED_SEED_TILE_COLUMNS_KEY:
+                return True, 0
+            if key == CUTE_CHAINED_VECTOR_GROUP_KEY:
+                return True, False
+            if key == CUTE_CHAINED_WARP_MMA_ROWS_KEY:
+                return True, 0
+            if key == CUTE_CHAINED_PREPARATION_PIPELINE_KEY:
+                return True, False
+            if key == CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY:
+                return True, 4
+            if key == CUTE_CHAINED_PREPARATION_COHORTS_KEY:
+                return True, 1
+            if key == CUTE_CHAINED_PREPARATION_UNROLL_KEY:
+                return True, 0
+            if key == CUTE_CHAINED_REGISTER_ISLANDS_KEY:
+                return True, False
+            if key == CUTE_CHAINED_LEAF_COUNT_KEY:
+                return True, 1
+            if key in (
+                CUTE_CHAINED_COLLECTIVE_RETENTION_KEY,
+                CUTE_CHAINED_OPERAND_RETENTION_KEY,
+                CUTE_CHAINED_NATIVE_VECTOR_READS_KEY,
+                CUTE_CHAINED_OUTPUT_LEASE_SNAPSHOT_KEY,
+                CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY,
+                CUTE_CHAINED_FRONTIER_STMATRIX_KEY,
+                CUTE_CHAINED_COMPACT_PREPARATION_KEY,
+                CUTE_CHAINED_LEAF_ISSUE_BATCHING_KEY,
+                CUTE_CHAINED_BROADCAST_RETENTION_KEY,
+                CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY,
+                CUTE_NATIVE_MATMUL_METADATA_KEY,
+                CUTE_CHAINED_ISLAND_CONSUMERS_KEY,
+                CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY,
+            ):
+                return True, False
+            if key == CUTE_CHAINED_FRONTIER_TILE_COLUMNS_KEY:
+                return True, 0
+            if key == CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY:
+                return True, 0
+            if key == CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY:
+                return True, 0
+            if (
+                key == "cute_min_blocks_per_mp"
+                and self.cute_chained_loop_search_enabled
+                and self.cute_chained_preparation_pipeline_search_enabled
+            ):
+                return True, 0
+            if (
+                key == CUTE_CHAINED_POINTWISE_UNROLL_KEY
+                and self.cute_chained_loop_search_enabled
+            ):
+                return True, 1
+            if key == CUTE_CHAINED_STARTUP_TRANSFER_KEY:
+                return True, "legacy"
+            if key == CUTE_CHAINED_TMEM_FREE_KEY:
+                return True, "legacy"
+            if key == CUTE_CHAINED_K_SCHEDULE_KEY:
+                return True, "full"
+            if key == CUTE_CHAINED_LEAF_PIPELINE_KEY:
+                return True, "legacy"
+            if key in (
+                CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY,
+                CUTE_CHAINED_LATE_RHS_REUSE_KEY,
+                CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY,
+                CUTE_CHAINED_DIRECT_OUTPUT_KEY,
+            ):
+                return True, False
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
@@ -4532,6 +6277,20 @@ class ConfigSpec:
         overrides: Mapping[str, object],
     ) -> None:
         if self.backend_name == "cute":
+            if (
+                self._cute_chained_legacy_loop_fragments().keys() & overrides.keys()
+                and not self._requests_cute_chained_loop(overrides)
+            ):
+                # Legacy-only overrides select their family, not the common
+                # parent used to populate the flat candidate. Never erase a
+                # caller's explicit key: conflicting options must still fail.
+                for key in tuple(config):
+                    if (
+                        key.startswith("cute_chained_")
+                        and key not in overrides
+                        and key not in self.user_defined_tunables
+                    ):
+                        config.pop(key)
             family = overrides.get(FLASH_PIPELINE_FAMILY_KEY)
             family_flags = _flash_pipeline_family_flags(family)
             if self.cute_flash_search_enabled and family_flags is not None:
@@ -4623,6 +6382,16 @@ class ConfigSpec:
         # preserved rather than dropped.
         merged = dict(self.autotune_reference_config().config)
         merged.update(self.compiler_default_config.config)
+        if (
+            self._cute_chained_legacy_loop_fragments().keys()
+            & self.compiler_default_config.config.keys()
+            and not self._requests_cute_chained_loop(
+                self.compiler_default_config.config
+            )
+        ):
+            # A promoted legacy seed must not inherit the common reference's
+            # family selector. Generic block and user-tunable defaults remain.
+            merged.pop(CUTE_CHAINED_MMA_SCHEDULE_KEY, None)
         config = helion.Config.from_dict(merged)
         # Then normalize, so a promoted compiler default has the same canonical field set as the
         # ``_base_default_config`` path: without this its ``repr``/equality differs from its own
@@ -4708,6 +6477,17 @@ class ConfigSpec:
                     num_items=0,
                 )
 
+    def _cute_chained_mma_schedules(self) -> tuple[str, ...]:
+        return tuple(
+            schedule
+            for schedule in (
+                VALID_CUTE_CHAINED_LOOP_MMA_SCHEDULES
+                if self.cute_chained_loop_search_enabled
+                else VALID_CUTE_CHAINED_MMA_SCHEDULES
+            )
+            if schedule != "tcgen05_tmem" or self.cute_chained_tcgen05_search_enabled
+        )
+
     def _flat_fields(
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
@@ -4717,14 +6497,313 @@ class ConfigSpec:
         self,
         _flash_pipeline_family_override: str | None = None,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
+        fields = self._flat_fields_without_native_metadata(
+            _flash_pipeline_family_override
+        )
+        if self.backend_name == "cute" and self.cute_chained_matmul_search_enabled:
+            if CUTE_CHAINED_MMA_SCHEDULE_KEY in fields:
+                fields[CUTE_NATIVE_MATMUL_METADATA_KEY] = EnumFragment(
+                    choices=(False, True)
+                )
+            if (
+                CUTE_CHAINED_MMA_SCHEDULE_KEY in fields
+                and self.cute_chained_tcgen05_search_enabled
+                and (
+                    not self.cute_chained_loop_search_enabled
+                    or self.cute_chained_preparation_pipeline_search_enabled
+                )
+            ):
+                fields[CUTE_CHAINED_DRAIN_TILE_COLUMNS_KEY] = EnumFragment(
+                    choices=VALID_CUTE_CHAINED_DRAIN_TILE_COLUMNS
+                )
+            if (
+                CUTE_CHAINED_PREPARATION_PIPELINE_KEY in fields
+                and self.cute_chained_tcgen05_search_enabled
+            ):
+                fields[CUTE_CHAINED_ISLAND_CONSUMERS_KEY] = EnumFragment(
+                    choices=(False, True)
+                )
+            if (
+                self.cute_chained_pointwise_residency_search_enabled
+                and CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY in fields
+                and CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY in fields
+            ):
+                fields[CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY] = EnumFragment(
+                    choices=(False, True)
+                )
+            if (
+                self.cute_chained_loop_search_enabled
+                and self.cute_chained_tcgen05_search_enabled
+                and self.cute_chained_preparation_pipeline_search_enabled
+                and cp_async_supported(self.target_device_capability)
+                and CUTE_CHAINED_MMA_SCHEDULE_KEY in fields
+                and CUTE_CHAINED_PREPARATION_PIPELINE_KEY in fields
+                and CUTE_CHAINED_POINTWISE_VECTORIZE_KEY in fields
+            ):
+                # Append after every existing coordinate, including user fields.
+                fields[CUTE_CHAINED_ASYNC_VECTOR_STORE_KEY] = EnumFragment(
+                    choices=(False, True)
+                )
+        if (
+            self.backend_name == "cute"
+            and self.cute_work_order_candidates
+            and self.cute_chunk_prefill_task_order is None
+        ):
+            identity = tuple("identity" for axis in self.cute_work_order_axes)
+            fields[CUTE_GRID_WORK_ORDER_KEY] = EnumFragment(
+                choices=(
+                    identity,
+                    *(
+                        tuple(
+                            "longest_first" if axis == selected else "identity"
+                            for axis in self.cute_work_order_axes
+                        )
+                        for selected in self.cute_work_order_candidates
+                    ),
+                )
+            )
+        if (
+            self.backend_name == "cute"
+            and self.cute_chained_matmul_search_enabled
+            and CUTE_CHAINED_MMA_SCHEDULE_KEY in fields
+        ):
+            fields[CUTE_CHAINED_FRAGMENT_EPILOGUES_KEY] = EnumFragment(
+                choices=(False, True)
+            )
+        return fields
+
+    def _flat_fields_without_native_metadata(
+        self,
+        _flash_pipeline_family_override: str | None = None,
+    ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
         """Return {key: field} for all tunable fields in flat_config() order.
 
         This is the single source of truth for field ordering.
         """
+        # A whole-root asynchronous emitter does not consume generic SIMT
+        # geometry/layout knobs. Keep its flat search restricted to choices
+        # that change the emitted schedule rather than timing duplicate code.
+        if (
+            self.backend_name == "cute"
+            and self.cute_chunk_prefill_task_order is not None
+        ):
+            assert self.cute_chunk_prefill_schedule is not None
+            return {
+                "block_sizes": self.block_sizes,
+                CUTE_CHUNK_PREFILL_TASK_ORDER_KEY: self.cute_chunk_prefill_task_order,
+                CUTE_CHUNK_PREFILL_SCHEDULE_KEY: self.cute_chunk_prefill_schedule,
+                **self.user_defined_tunables,
+            }
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
         }
         if self.backend_name == "cute":
+            if self.cute_chained_matmul_search_enabled:
+                legacy_loop_fragments = self._cute_chained_legacy_loop_fragments()
+                fields["num_warps"] = EnumFragment(
+                    choices=(4, 8, 2, 1, 16, 32)
+                    + (
+                        (20,)
+                        if self.cute_chained_preparation_pipeline_search_enabled
+                        else ()
+                    )
+                    if self.cute_chained_loop_search_enabled
+                    else (4, 8, 2, 1)
+                )
+                schedules = self._cute_chained_mma_schedules()
+                fields[CUTE_CHAINED_MMA_SCHEDULE_KEY] = EnumFragment(
+                    choices=(*schedules, None) if legacy_loop_fragments else schedules,
+                    search_choices=schedules if legacy_loop_fragments else None,
+                )
+                if self.cute_chained_scratch_layout_search_enabled:
+                    fields[CUTE_CHAINED_SCRATCH_LAYOUT_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_SCRATCH_LAYOUTS
+                    )
+                if self.cute_chained_scan_search_enabled:
+                    fields[CUTE_CHAINED_SCAN_SCHEDULE_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_SCAN_SCHEDULES
+                    )
+                if self.cute_chained_pointwise_residency_search_enabled:
+                    fields[CUTE_CHAINED_POINTWISE_CACHE_BYTES_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_POINTWISE_CACHE_BYTES
+                    )
+                if self.cute_chained_loop_search_enabled:
+                    if self.cute_chained_warp_mma_search_enabled:
+                        fields[CUTE_CHAINED_WARP_MMA_ROWS_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_WARP_MMA_ROWS
+                        )
+                    if self.cute_chained_group_search_enabled:
+                        fields[CUTE_CHAINED_GROUP_CONTRACTIONS_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_tcgen05_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_VECTORIZE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_pointwise_unroll_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_UNROLL_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_POINTWISE_UNROLLS
+                        )
+                    fields.update(self.user_defined_tunables)
+                    # Preserve legacy compiler/user seeds without expanding
+                    # ordinary common search or changing its existing prefix.
+                    for key, fragment in legacy_loop_fragments.items():
+                        fields[key] = EnumFragment(
+                            choices=fragment.choices,
+                            search_choices=(fragment.default(),),
+                        )
+                    if self.cute_chained_preparation_pipeline_search_enabled:
+                        fields[CUTE_CHAINED_PREPARATION_PIPELINE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_PIPELINE_CONSUMER_WARPS_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_PIPELINE_CONSUMER_WARPS
+                        )
+                        fields[CUTE_CHAINED_LEAF_PIPELINE_KEY] = EnumFragment(
+                            choices=("legacy", "rectangular_tma")
+                        )
+                    if self.cute_chained_pointwise_residency_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_POINTWISE_CACHE_ENTRIES
+                        )
+                    if self.cute_chained_tcgen05_search_enabled:
+                        # Append after every existing loop/user/legacy field.
+                        fields[CUTE_CHAINED_SEED_TILE_COLUMNS_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_SEED_TILE_COLUMNS
+                        )
+                    if self.cute_chained_pointwise_residency_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_POINTWISE_CACHE_LAYOUTS
+                        )
+                    if self.cute_chained_tcgen05_search_enabled:
+                        fields[CUTE_CHAINED_VECTOR_GROUP_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_preparation_pipeline_search_enabled:
+                        # Append after every existing loop/user/legacy field.
+                        fields[CUTE_CHAINED_PREPARATION_COHORTS_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_PREPARATION_COHORTS
+                        )
+                        fields[CUTE_CHAINED_PREPARATION_UNROLL_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_PREPARATION_UNROLLS
+                        )
+                        fields[CUTE_CHAINED_REGISTER_ISLANDS_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_LEAF_COUNT_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_LEAF_COUNTS
+                        )
+                        fields[CUTE_CHAINED_COLLECTIVE_RETENTION_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_OPERAND_RETENTION_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_FRONTIER_TILE_COLUMNS_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_FRONTIER_TILE_COLUMNS
+                        )
+                        fields[CUTE_CHAINED_NATIVE_VECTOR_READS_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_OUTPUT_LEASE_SNAPSHOT_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_SCAN_PRODUCER_RETENTION_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_FRONTIER_STMATRIX_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS
+                        )
+                        fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))
+                        fields[CUTE_CHAINED_COMPACT_PREPARATION_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_LEAF_ISSUE_BATCHING_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        fields[CUTE_CHAINED_BROADCAST_RETENTION_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                        if self.cute_chained_tcgen05_search_enabled:
+                            fields[CUTE_CHAINED_COMPLETED_MEMBER_STORE_KEY] = (
+                                EnumFragment(choices=(False, True))
+                            )
+                    return fields
+                if self.cute_chained_tcgen05_search_enabled:
+                    if self.cute_chained_group_search_enabled:
+                        fields[CUTE_CHAINED_GROUP_CONTRACTIONS_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    fields[CUTE_CHAINED_POINTWISE_VECTORIZE_KEY] = EnumFragment(
+                        choices=(False, True)
+                    )
+                    if self.cute_chained_pointwise_unroll_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_UNROLL_KEY] = EnumFragment(
+                            choices=VALID_CUTE_CHAINED_POINTWISE_UNROLLS
+                        )
+                    fields[CUTE_CHAINED_AUXILIARY_CACHE_KEY] = EnumFragment(
+                        choices=(False, True)
+                    )
+                    fields[CUTE_CHAINED_TMEM_FREE_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_TMEM_FREE_SCHEDULES
+                    )
+                    if self.cute_chained_pointwise_read_cache_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_READ_CACHE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_pointwise_inplace_search_enabled:
+                        fields[CUTE_CHAINED_POINTWISE_INPLACE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_initialized_accumulator_search_enabled:
+                        fields[CUTE_CHAINED_INITIALIZED_ACCUMULATOR_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    if self.cute_chained_late_rhs_reuse_search_enabled:
+                        fields[CUTE_CHAINED_LATE_RHS_REUSE_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                    fields[CUTE_CHAINED_TMEM_EARLY_RELEASE_KEY] = EnumFragment(
+                        choices=(False, True)
+                    )
+                    if self.cute_chained_direct_output_search_enabled:
+                        fields[CUTE_CHAINED_DIRECT_OUTPUT_KEY] = EnumFragment(
+                            choices=(False, True)
+                        )
+                fields.update(self.user_defined_tunables)
+                if self.cute_chained_k_schedule_search_enabled:
+                    fields[CUTE_CHAINED_K_SCHEDULE_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_K_SCHEDULES
+                    )
+                if self.cute_chained_tcgen05_search_enabled:
+                    fields[CUTE_CHAINED_STARTUP_TRANSFER_KEY] = EnumFragment(
+                        choices=("legacy", "tma")
+                    )
+                if self.cute_chained_leaf_pipeline_search_enabled:
+                    fields[CUTE_CHAINED_LEAF_PIPELINE_KEY] = EnumFragment(
+                        choices=("legacy", "paired_tma")
+                    )
+                if self.cute_chained_pointwise_residency_search_enabled:
+                    fields[CUTE_CHAINED_POINTWISE_CACHE_ENTRIES_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_POINTWISE_CACHE_ENTRIES
+                    )
+                    fields[CUTE_CHAINED_POINTWISE_CACHE_LAYOUT_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_POINTWISE_CACHE_LAYOUTS
+                    )
+                if self.cute_chained_tcgen05_search_enabled:
+                    fields[CUTE_CHAINED_SEED_TILE_COLUMNS_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_SEED_TILE_COLUMNS
+                    )
+                    fields[CUTE_CHAINED_VECTOR_GROUP_KEY] = EnumFragment(
+                        choices=(False, True)
+                    )
+                    fields[CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS_KEY] = EnumFragment(
+                        choices=VALID_CUTE_CHAINED_SNAPSHOT_TILE_COLUMNS
+                    )
+                return fields
             if self.cute_signed_bitfield_bf16_available:
                 fields["cute_signed_bitfield_bf16"] = BooleanFragment()
             if self.cute_host_paired_sum_available:
@@ -4761,6 +6840,13 @@ class ConfigSpec:
                     choices=(0, 1) if self._cute_flash_bwd_two_cta_allowed else (0,)
                 )
                 fields["cute_flash_bwd_exp2_f32"] = EnumFragment(choices=(0, 1))
+            elif self.cute_chunk_prepare_schedule is not None:
+                # This schedule replaces the complete root, including its
+                # layouts, loads and thread assignment. Generic SIMT knobs
+                # produce byte-identical code and only multiply timing noise.
+                # The schedule fragment is added below; explicit configs keep
+                # their normal validation and fallback behavior.
+                pass
             elif self.supports_config_key("num_threads"):
                 fields["num_threads"] = self.num_threads
                 # Loop flattening is a real codegen choice on the SIMT path
@@ -5019,6 +7105,14 @@ class ConfigSpec:
                         (False, True),
                         search_choices=(False, True) if chain_seeded else (False,),
                     )
+                if self.cute_loop_schedule_enabled:
+                    fields[CUTE_LOOP_VECTORIZATION_KEY] = BooleanFragment()
+                    fields[CUTE_LOOP_LOAD_SCHEDULE_KEY] = EnumFragment(
+                        choices=VALID_CUTE_LOOP_LOAD_SCHEDULES,
+                        # Nondefault values require a vector parent. The typed
+                        # compiler siblings supply those coupled configurations.
+                        search_choices=("current",),
+                    )
                 # CuTe's SIMT search normally has no pid_type coordinate.  A
                 # metadata-specialized compiler seed may nevertheless prove one
                 # exact 3-D ``xyz`` launch safe after the earlier, deliberately
@@ -5080,6 +7174,18 @@ class ConfigSpec:
             if self.cute_chunk_recurrence_register_cap is not None:
                 fields[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = (
                     self.cute_chunk_recurrence_register_cap
+                )
+            if self.cute_chunk_recurrence_pipeline is not None:
+                fields[CUTE_CHUNK_RECURRENCE_PIPELINE_KEY] = (
+                    self.cute_chunk_recurrence_pipeline
+                )
+            if self.cute_chunk_prefill_task_order is not None:
+                fields[CUTE_CHUNK_PREFILL_TASK_ORDER_KEY] = (
+                    self.cute_chunk_prefill_task_order
+                )
+            if self.cute_chunk_prefill_schedule is not None:
+                fields[CUTE_CHUNK_PREFILL_SCHEDULE_KEY] = (
+                    self.cute_chunk_prefill_schedule
                 )
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
