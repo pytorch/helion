@@ -127,6 +127,7 @@ _CACHE_POLICY_BASELINE_SCALE = 1
 _CACHE_POLICY_DYNAMIC_HELPER: object = None
 _TEST_CUTE_FLASH_BACKEND = SimpleNamespace(
     generated_source_hash=lambda _fn: None,
+    autotune_config_is_viable=lambda _config_spec, _config: True,
 )
 
 
@@ -410,6 +411,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             cute_flash_search_enabled=False,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                autotune_config_is_viable=lambda _config_spec, _config: True,
                 should_deduplicate_generated_sources=lambda config_spec: False,
                 get_do_bench=lambda: None,
                 classify_autotune_exception=lambda error: None,
@@ -2506,6 +2508,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         raw_flat = gen.default_flat()
         original_flat = copy.deepcopy(raw_flat)
         search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = spec
         search.config_gen = gen
 
         member = search.make_unbenchmarked(raw_flat)
@@ -2524,6 +2527,31 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(seed_config.num_warps, 8)
         self.assertEqual(seed_flat, gen.flatten(seed_config))
+
+    def test_initial_population_refills_backend_rejections(self):
+        configs = {value: helion.Config(block_sizes=[value]) for value in range(1, 7)}
+        backend = SimpleNamespace(
+            autotune_config_is_viable=lambda _spec, config: (
+                config.config["block_sizes"][0] % 2 == 0
+            )
+        )
+        config_gen = SimpleNamespace(
+            config_spec=SimpleNamespace(backend=backend),
+            invalid_config_count=0,
+            canonicalize_flat=lambda flat: (flat, configs[flat[0]]),
+            random_flat=Mock(side_effect=([3], [4], [5], [6])),
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = config_gen.config_spec
+        search.config_gen = config_gen
+        search.log = Mock()
+
+        population = search._pad_initial_population_with_unique_random(
+            [[1], [2]], target=3
+        )
+
+        self.assertEqual(population, [[2], [4], [6]])
+        self.assertEqual(config_gen.random_flat.call_count, 4)
 
     def test_scalar_list_override_has_encodable_flat_values(self):
         args = (
@@ -8358,6 +8386,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             random_flat=Mock(side_effect=([-1], [4])),
         )
         search = PatternSearch.__new__(PatternSearch)
+        search.config_spec = config_gen.config_spec
         search.config_gen = config_gen
         search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE

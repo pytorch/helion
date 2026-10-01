@@ -3909,6 +3909,37 @@ class TestPallas(TestCase):
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
 
+    def test_pallas_autotune_filters_excessive_static_unroll(self) -> None:
+        """Autotuning avoids large generated programs but keeps explicit configs."""
+        args = (
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+        )
+        bound = pallas_inner_loop_add.bind(args)
+        backend = bound.config_spec.backend
+        excessive = helion.Config(
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+        )
+        bounded = helion.Config(
+            block_sizes=[8, 1024],
+            pallas_loop_type="unroll",
+        )
+
+        self.assertFalse(
+            backend.autotune_config_is_viable(bound.config_spec, excessive)
+        )
+        self.assertTrue(backend.autotune_config_is_viable(bound.config_spec, bounded))
+
+        # The autotune-only guard does not alter explicit configurations.
+        result = bound.compile_config(
+            helion.Config(
+                block_sizes=[8, 16384],
+                pallas_loop_type="unroll",
+            )
+        )(*args)
+        torch.testing.assert_close(result, (args[0] + args[1]).to(result.device))
+
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
         """BMM with K reduction starting at non-zero offset, across all loop types."""
