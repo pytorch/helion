@@ -3155,7 +3155,8 @@ def build_static_pipeline_plan(
     return dataclasses.replace(
         proposal,
         peer_edges=peer_edges,
-        done_roots=cross_rank_roots if peer_edges else frozenset(),
+        # Parity and credit already keep in-band roots from reusing live buffers.
+        done_roots=frozenset(root for edge in peer_edges for root in edge),
     )
 
 

@@ -289,7 +289,7 @@ def chained_exchange_kernel(
     for tile in hl.tile(x.size(0)):
         acc = total[tile]
         for moment_peer in moment_peers:
-            acc = acc + moment_peer[:]
+            acc = acc + moment_peer[:].to(x.dtype)
         out[tile] = acc
     return out
 
@@ -550,13 +550,15 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    def test_chained_exchanges_replay(self) -> None:
+    @parametrize("moment_dtype", (torch.float32, torch.float64))
+    def test_chained_exchanges_replay(self, moment_dtype: torch.dtype) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
+        # A float64 moment mixes in-band and peer-counter transports.
         symm, moment = (
             symm_mem.empty(n, device=self.device),
-            symm_mem.empty(1, device=self.device),
+            symm_mem.empty(1, device=self.device, dtype=moment_dtype),
         )
         symm_mem.rendezvous(symm, group=group)
         symm_mem.rendezvous(moment, group=group)
@@ -1313,6 +1315,23 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("@p bra SPIN"), 2)
         self.assertNotIn("_wait_at_least", code)
         self.assertNotIn("_add_on_every_rank", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
+    def test_done_barrier_waits_on_fallback_roots(self, world: int) -> None:
+        symm, x = torch.zeros(2, 4096, device=DEVICE)
+        # R2 rejects the 8-byte moment, so it falls back to peer counters.
+        moment = torch.zeros(1, device=DEVICE, dtype=torch.float64)
+        group = self._world(world, chained_exchange_kernel)
+        bound = chained_exchange_kernel.bind((symm, moment, x, group))
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code({**config, "block_sizes": [1024, 1024, 1, 512]})
+        # Only roots 2 and 3 publish to the done slot, and the last ticket waits
+        # for their 1 + 4096 / 512 tasks, not also the in-band roots' 4 + 4.
+        done = f"tile_dependency_peer_state + {2 * world * 4096 + 16}"
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
+        self.assertEqual(code.count("_add_on_every_rank"), 3)
+        self.assertIn(f"{done}, tile_dependency_peer_epoch * {9 * world})", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
