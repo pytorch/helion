@@ -192,10 +192,12 @@ def inband_rule_kernel(
     x: torch.Tensor,
     group_name: hl.ProcessGroupName,
     broken_rule: hl.constexpr,
+    world: hl.constexpr,
 ) -> torch.Tensor:
     peers = _remote_views(symm, group_name)
     out = torch.empty_like(symm)
-    # R6: the consumer reads only half of each peer's buffer.
+    # R4: no task polls rank 0. R6: the consumer reads half of each peer's buffer.
+    first = 1 if broken_rule == "R4" else 0
     read = symm.size(0) // 2 if broken_rule == "R6" else symm.size(0)
     for tile in hl.tile(symm.size(0)):
         if broken_rule == "R3":
@@ -207,9 +209,9 @@ def inband_rule_kernel(
         if broken_rule == "R1":
             symm[tile] = x[tile] + 1
     for tile in hl.tile(read):
-        acc = peers[1][tile] + peers[2][tile]
-        if broken_rule != "R4":
-            acc = acc + peers[0][tile] + peers[3][tile]
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for r in hl.static_range(first, world):
+            acc = acc + peers[r][tile]
         out[tile] = acc
     return out
 
@@ -225,7 +227,7 @@ def diagonal_store_kernel(
     for tile_i, tile_j in hl.tile(symm.size(), block_size=[block, block]):
         symm[tile_i, tile_i] = x[tile_i, tile_j]
     for tile in hl.tile(symm.size()):
-        out[tile] = peers[0][tile] + peers[1][tile] + peers[2][tile] + peers[3][tile]
+        out[tile] = peers[0][tile] + peers[1][tile]
     return out
 
 
@@ -1089,6 +1091,7 @@ class TestDistributedGating(CommonTestCase):
             pass
 
 
+@instantiate_parametrized_tests
 class TestDistributedTileDependencies(TestCase):
     """Single-process compile checks of cross-rank tile dependencies."""
 
@@ -1096,6 +1099,17 @@ class TestDistributedTileDependencies(TestCase):
         super().setUp()
         dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
         self.addCleanup(dist.destroy_process_group)
+
+    def _world(self, world: int, *kernels: helion.Kernel) -> str:
+        """Recreate the fake group with ``world`` ranks and reset ``kernels``."""
+        dist.destroy_process_group()
+        dist.init_process_group(
+            backend="fake", store=FakeStore(), rank=0, world_size=world
+        )
+        # The new group reuses the old name, so a cached bind would be stale.
+        for kernel in kernels:
+            kernel.reset()
+        return dist.group.WORLD.group_name
 
     def _accesses(
         self, kernel: helion.Kernel, args: tuple[object, ...], error: str | None = None
@@ -1173,25 +1187,28 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(gather.call_args.args[0][0], "error")
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
-    def test_inband_rules(self) -> None:
-        group = dist.group.WORLD.group_name
+    @parametrize("world", (2, 4, 8))
+    def test_inband_rules(self, world: int) -> None:
+        group = self._world(world, inband_rule_kernel, diagonal_store_kernel)
         for broken_rule, dtype, expected in (
             ("", torch.float32, "use inband"),
+            ("", torch.float16, "use inband"),
             ("R1", torch.float32, "use peer_counter (R1:"),
             ("", torch.float64, "use peer_counter (R2:"),
             ("R3", torch.float32, "use peer_counter (R3:"),
             ("R4", torch.float32, "use peer_counter (R4:"),
             ("R6", torch.float32, "use peer_counter (R6:"),
-            # 4 ranks * 2**17 words * 8 bytes is past the 1 MiB push cap.
+            # Exactly 1 MiB per rank stays inband; 2 ranks * 2**17 words does not.
+            ("cap", torch.float32, "use inband"),
             ("R7", torch.float32, "use peer_counter (R7:"),
         ):
-            n = 1 << 17 if broken_rule == "R7" else 256
+            n = {"cap": (1 << 20) // (8 * world), "R7": 1 << 17}.get(broken_rule, 256)
             symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
             with (
                 self.subTest(broken_rule=broken_rule, dtype=dtype),
                 self.assertLogs(tile_dependency.log, "INFO") as logs,
             ):
-                inband_rule_kernel.bind((symm, x, group, broken_rule))
+                inband_rule_kernel.bind((symm, x, group, broken_rule, world))
             (line,) = logs.output
             self.assertIn(f"on peers/symm {expected}", line)
         symm, x = torch.zeros(2, 16, 16, device=DEVICE)
@@ -1201,9 +1218,11 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("on peers/symm use peer_counter (R1:", line)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
-    def test_peer_counters_order_cross_rank_edges(self) -> None:
+    @parametrize("world", (2, 4, 8))
+    def test_peer_counters_order_cross_rank_edges(self, world: int) -> None:
         symm, x = torch.zeros(2, 256, device=DEVICE)
-        bound = inband_rule_kernel.bind((symm, x, dist.group.WORLD.group_name, "R1"))
+        group = self._world(world, inband_rule_kernel)
+        bound = inband_rule_kernel.bind((symm, x, group, "R1", world))
         # Only the dynamic pipeline carries cross-rank transports.
         self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("dynamic",))
         config = bound.config_spec.default_config()
@@ -1211,23 +1230,26 @@ class TestDistributedTileDependencies(TestCase):
             bound.config_spec.normalize(
                 {**config.config, "cross_loop_pipeline": "static"}
             )
-        code = bound.to_triton_code(config)
-        # Root 1 publishes to its slot and the done slot on all 4 ranks. Root 2
-        # waits for 4 tasks per rank, and the last ticket for roots 1 and 2.
+        code = bound.to_triton_code(
+            helion.Config(**{**config.config, "block_sizes": [64, 64, 64]})
+        )
+        # Root 1 publishes to its slot and the done slot on every rank. Root 2
+        # waits for 256 / 64 tasks per rank, and the last ticket for roots 1 and 2.
+        state = "tile_dependency_peer_state"
         for expected in (
-            "_add_on_every_rank(tile_dependency_peer_state_ptrs, 0, 4, 4)",
-            "_add_on_every_rank(tile_dependency_peer_state_ptrs, 16, 4, 4)",
-            "tile_dependency_peer_state + 0, tile_dependency_peer_epoch * 16)",
-            "tile_dependency_peer_state + 16, tile_dependency_peer_epoch * 32)",
+            f"_add_on_every_rank({state}_ptrs, 0, {world}, {world})",
+            f"_add_on_every_rank({state}_ptrs, 16, {world}, {world})",
+            f"{state} + 0, tile_dependency_peer_epoch * {4 * world})",
+            f"{state} + 16, tile_dependency_peer_epoch * {8 * world})",
         ):
             self.assertIn(expected, code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
-    def test_inband_pushes_and_polls_data(self) -> None:
+    @parametrize("world", (2, 4, 8))
+    def test_inband_pushes_and_polls_data(self, world: int) -> None:
         symm, x = torch.zeros(2, 4000, device=DEVICE, dtype=torch.bfloat16)
-        bound = pipelined_allreduce_kernel.bind(
-            (symm, x, dist.group.WORLD.group_name, "inband", 4)
-        )
+        group = self._world(world)
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "inband", world))
         config = bound.config_spec.default_config().config
         # A thread holds 2 words of a 1024 block at 16 warps, and 1 of a 64 block.
         for block_size, num_warps, pack in ((1024, 16, 2), (64, 4, 1)):
@@ -1240,62 +1262,58 @@ class TestDistributedTileDependencies(TestCase):
                     }
                 )
             )
-            # Root 0 pushes each word to 4 ranks, root 1 polls all 4 mailboxes
+            # Root 0 pushes each word to every rank, root 1 polls all mailboxes
             # in one asm, and the data needs no peer counters or done barrier.
-            self.assertEqual(code.count("st.relaxed.sys.global.u64"), 4)
+            self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
             self.assertIn("tl.store(symm + ", code)
             self.assertEqual(code.count("@p bra SPIN"), 1)
-            words = ", ".join(["tl.uint64"] * 4)
+            words = ", ".join(["tl.uint64"] * world)
             self.assertIn(f"dtype=({words}), is_pure=False, pack={pack})", code)
-            self.assertIn("(x, 32001, torch.uint64, True)", code)
+            # Two parities of a word per rank and element, then the done slot.
+            self.assertIn(f"(x, {2 * world * 4000 + 1}, torch.uint64, True)", code)
             self.assertNotIn("_wait_at_least", code)
             self.assertNotIn("_add_on_every_rank", code)
         # A push may be the kernel's first tensor access.
-        bound = pipelined_allreduce_kernel.bind(
-            (symm, x, dist.group.WORLD.group_name, "constant", 4)
-        )
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "constant", world))
         code = bound.to_triton_code()
         self.assertIn("st.relaxed.sys.global.u64", code)
         self.assertIn("tl.store(symm + ", code)
         # Debug output touches no memory, so it does not block the analysis.
-        bound = pipelined_allreduce_kernel.bind(
-            (symm, x, dist.group.WORLD.group_name, "print", 4)
-        )
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "print", world))
         self.assertIn("tl.device_print", bound.to_triton_code())
         # A poll's loop runs one stage: Triton would pipeline the first read
         # into an early, weak cp.async.
-        bound = pipelined_allreduce_kernel.bind(
-            (symm, x, dist.group.WORLD.group_name, "loop", 4)
-        )
+        bound = pipelined_allreduce_kernel.bind((symm, x, group, "loop", world))
         config = bound.config_spec.default_config().config
         code = bound.to_triton_code({**config, "range_num_stages": [0, 0, 3]})
         self.assertIn("_BLOCK_SIZE_2, num_stages=1)", code)
         self.assertNotIn("num_stages=3", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
-    def test_inband_chains_exchanges(self) -> None:
+    @parametrize("world", (2, 4, 8))
+    def test_inband_chains_exchanges(self, world: int) -> None:
         symm, x = torch.zeros(2, 4096, device=DEVICE)
         moment = torch.zeros(1, device=DEVICE)
-        bound = chained_exchange_kernel.bind(
-            (symm, moment, x, dist.group.WORLD.group_name)
-        )
-        code = bound.to_triton_code()
+        group = self._world(world, chained_exchange_kernel)
+        code = chained_exchange_kernel.bind((symm, moment, x, group)).to_triton_code()
         # Both buffers go in band, each with its own push and poll.
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), 8)
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), 2 * world)
         self.assertEqual(code.count("@p bra SPIN"), 2)
         self.assertNotIn("_wait_at_least", code)
         self.assertNotIn("_add_on_every_rank", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
-    def test_inband_static_index_store(self) -> None:
+    @parametrize("world", (2, 4, 8))
+    def test_inband_static_index_store(self, world: int) -> None:
         # A static index is no tile axis: symm[0, tile] fills a [1, N] buffer.
         symm, x = torch.zeros(1, 256, device=DEVICE), torch.zeros(256, device=DEVICE)
+        group = self._world(world, row_exchange_kernel)
         with self.assertLogs(tile_dependency.log, "INFO") as logs:
-            bound = row_exchange_kernel.bind((symm, x, dist.group.WORLD.group_name))
+            bound = row_exchange_kernel.bind((symm, x, group))
         (line,) = logs.output
         self.assertIn("on peers/symm use inband", line)
         code = bound.to_triton_code()
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), 4)
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
         self.assertNotIn("_wait_at_least", code)
         # In a [2, N] buffer the same store fills only row 0, which R2 rejects.
         symm = torch.zeros(2, 256, device=DEVICE)
