@@ -206,7 +206,8 @@ def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
     return eviction_policy_arg is None
 
 
-# Ops that only route tensors through SSA values and subgraphs or read metadata.
+# Ops that touch no memory: they route tensors through SSA values and subgraphs,
+# read metadata or only debug.
 _TENSOR_ROUTING_OPS = (
     _tracing_ops._phi,
     _tracing_ops._new_var,
@@ -217,6 +218,8 @@ _TENSOR_ROUTING_OPS = (
     operator.getitem,
     torch.ops.aten.sym_size.int,
     torch.ops.aten.sym_stride.int,
+    hl.device_print,
+    hl.breakpoint,
 )
 
 

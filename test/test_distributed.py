@@ -249,6 +249,8 @@ def pipelined_allreduce_kernel(
         for r in hl.static_range(world):
             acc = acc + peers[r][tile]
         out[tile] = acc
+        if variant == "print":
+            print("acc", acc)
         if variant == "loop":
             for inner in hl.tile(tile.begin, tile.end, block_size=64):
                 part = hl.zeros([inner], dtype=x.dtype)
@@ -1249,6 +1251,11 @@ class TestDistributedTileDependencies(TestCase):
         code = bound.to_triton_code()
         self.assertIn("st.relaxed.sys.global.u64", code)
         self.assertIn("tl.store(symm + ", code)
+        # Debug output touches no memory, so it does not block the analysis.
+        bound = pipelined_allreduce_kernel.bind(
+            (symm, x, dist.group.WORLD.group_name, "print", 4)
+        )
+        self.assertIn("tl.device_print", bound.to_triton_code())
         # A poll's loop runs one stage: Triton would pipeline the first read
         # into an early, weak cp.async.
         bound = pipelined_allreduce_kernel.bind(
