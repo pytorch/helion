@@ -705,3 +705,63 @@ def test_every_pointer_constructor_uses_metadata() -> None:
         "_cute_tensor_pointer_alignment",
         "_cute_schema_pointer_alignment",
     }
+
+
+def _decay_last_view(batch: int = 4, rows: int = 3, chunk: int = 64) -> torch.Tensor:
+    """``g_cs[:, :, -1]`` of a contiguous FP32 ``g_cs``: only 4-byte aligned."""
+    return torch.empty(batch, rows, chunk)[:, :, -1]
+
+
+def test_scalar_view_alignment_splits_schema_and_keys_but_not_aligned_schema(
+    fake_runtime: list[_Pointer],
+) -> None:
+    kernel = SimpleNamespace(_helion_cute_source_hash="scalar-view")
+    view = _decay_last_view()
+    aligned = view.contiguous()
+    other = torch.empty(4, 3)
+    assert view.data_ptr() % 16 == 12
+    relaxed = launcher._build_cute_schema_and_args(kernel, (other, view), (1, 1, 1))
+    ordinary = launcher._build_cute_schema_and_args(kernel, (other, aligned), (1, 1, 1))
+    baseline = launcher._build_cute_schema_and_args(
+        SimpleNamespace(), (other, aligned), (1, 1, 1)
+    )
+    # Each tensor entry carries its own alignment; no trailing key-only entry.
+    assert [launcher._cute_schema_pointer_alignment(e) for e in relaxed.schema] == [
+        16,
+        4,
+    ]
+    assert all(entry[0] == "tensor" for entry in relaxed.schema)
+    assert ordinary.schema == baseline.schema
+    block = (128, 1, 1)
+    assert (
+        launcher._cute_compiled_launcher_discriminator(
+            relaxed.schema, block, None, None
+        )[0]
+        != launcher._cute_compiled_launcher_discriminator(
+            ordinary.schema, block, None, None
+        )[0]
+    )
+    assert launcher._cute_disk_cache_key(
+        kernel, relaxed.schema, block, (), None, None
+    ) != launcher._cute_disk_cache_key(kernel, ordinary.schema, block, (), None, None)
+
+
+def test_low_alignment_launch_still_builds_fast_relaunch() -> None:
+    # The fast path guards each tensor against its compiled schema alignment,
+    # so a low-alignment first launch may own it; later stronger pointers hit.
+    kernel = SimpleNamespace()
+    launch = launcher._CuteLaunchArgCacheEntry(
+        schema=(("tensor", "torch.float32", 1, 4),),
+        launch_args=(),
+        grouped_static_metadata=(),
+        owned_tensors=(),
+    )
+    sentinel = object()
+    with patch.object(
+        launcher, "_cute_build_fast_relaunch", return_value=sentinel
+    ) as build:
+        launcher._cute_maybe_build_fastpath(
+            kernel, (), (1, 1, 1), (128, 1, 1), None, launch, None
+        )
+    assert build.call_count == 1
+    assert kernel._helion_cute_fastpath is sentinel
