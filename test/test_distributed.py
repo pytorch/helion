@@ -249,6 +249,12 @@ def pipelined_allreduce_kernel(
         for r in hl.static_range(world):
             acc = acc + peers[r][tile]
         out[tile] = acc
+        if variant == "loop":
+            for inner in hl.tile(tile.begin, tile.end, block_size=64):
+                part = hl.zeros([inner], dtype=x.dtype)
+                for r in hl.static_range(world):
+                    part = part + peers[r][inner]
+                out[inner] = part
     return out
 
 
@@ -1167,6 +1173,15 @@ class TestDistributedTileDependencies(TestCase):
         code = bound.to_triton_code()
         self.assertIn("st.relaxed.sys.global.u64", code)
         self.assertIn("tl.store(symm + ", code)
+        # A poll's loop runs one stage: Triton would pipeline the first read
+        # into an early, weak cp.async.
+        bound = pipelined_allreduce_kernel.bind(
+            (symm, x, dist.group.WORLD.group_name, "loop", 4)
+        )
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code({**config, "range_num_stages": [0, 0, 3]})
+        self.assertIn("_BLOCK_SIZE_2, num_stages=1)", code)
+        self.assertNotIn("num_stages=3", code)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:

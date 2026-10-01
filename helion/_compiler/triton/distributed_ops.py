@@ -27,6 +27,7 @@ from ..cross_loop_codegen import peer_state
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..tile_dependency import TILE_ACCESS_META
+from ..tile_strategy import DeviceLoopState
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -701,35 +702,33 @@ def inband_store_codegen(
             dce=True,
             prefix="inband_word",
         )
-        world_size = len(peer.bases)
         slot = peer.mailbox(access.allocation_id, peer.rank)
-        args = [f"{base} + ({slot}) + {offset.id}" for base in peer.bases]
-        args.append(word.id)
-        constraints = ["=r", *["l"] * (world_size + 1)]
-        store = f"st.relaxed.sys.global.u64 [${{}}], ${world_size + 1};"
-        prefix = ""
+        store = "st.relaxed.sys.global.u64 [$1], $2;"
+        mask = []
         if indexing.has_mask():
-            mask = state.codegen.lift(
-                expr_from_string("tl.cast({mask}, tl.int32)", mask=indexing.mask_expr),
-                dce=True,
-                prefix="inband_mask",
-            )
-            args.append(mask.id)
-            constraints.append("r")
-            prefix = f".reg .pred p; setp.ne.b32 p, ${world_size + 2}, 0; "
-            store = f"@p {store}"
+            mask = [
+                state.codegen.lift(
+                    expr_from_string(
+                        "tl.cast({mask}, tl.int32)", mask=indexing.mask_expr
+                    ),
+                    dce=True,
+                    prefix="inband_mask",
+                ).id
+            ]
+            store = f"{{ .reg .pred p; setp.ne.b32 p, $3, 0; @p {store} }}"
         # Each word is single-copy atomic and carries its epoch: no fence needed.
-        stores = " ".join(store.format(1 + rank) for rank in range(world_size))
-        state.add_statement(
-            _inline_asm(
-                device_function.new_var("inband_push", dce=False),
-                f"{{ {prefix}{stores} }} mov.u32 $0, 0;",
-                ",".join(constraints),
-                args,
-                "tl.int32",
-                1,
+        # One asm per peer keeps that peer's stores adjacent, which is faster.
+        for base in peer.bases:
+            state.add_statement(
+                _inline_asm(
+                    device_function.new_var("inband_push", dce=False),
+                    f"{store} mov.u32 $0, 0;",
+                    "=r,l,l" + ",r" * len(mask),
+                    [f"{base} + ({slot}) + {offset.id}", word.id, *mask],
+                    "tl.int32",
+                    1,
+                )
             )
-        )
         device_function.inband_access_ids.update(ids)
         return local_store
 
@@ -792,9 +791,7 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         mask = None
         if indexing.has_mask():
             mask = state.codegen.lift(
-                expr_from_string("tl.cast({mask}, tl.int32)", mask=indexing.mask_expr),
-                dce=True,
-                prefix="inband_mask",
+                indexing.mask_expr, dce=True, prefix="inband_mask"
             ).id
         dtype = fake_tensor.dtype
         word = device_function.new_var("inband_word", dce=False)
@@ -802,6 +799,15 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             f"tl.cast(tl.cast({word}, {_bits(dtype)}), "
             f"{backend.dtype_str(dtype)}, bitcast=True)"
         )
+        # Triton's pipeliner would make the first read an early, weak cp.async.
+        for loops in state.codegen.active_device_loops.values():
+            for loop in loops:
+                call = loop.for_node.iter if isinstance(loop, DeviceLoopState) else None
+                if isinstance(call, ast.Call) and ast.unparse(call.func) == "tl.range":
+                    call.keywords = [
+                        *(kw for kw in call.keywords if kw.arg != "num_stages"),
+                        create(ast.keyword, arg="num_stages", value=ast.Constant(1)),
+                    ]
         group, pack = None, 1
         if indexing.needs_broadcast():
             result = expr_from_string(
@@ -829,44 +835,28 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
     return poll
 
 
-def _poll_asm(masked: list[bool], pack: int) -> tuple[str, str]:
-    """Issue every word, then reload only stale words until all are current.
+def _poll_asm(polls: int, pack: int) -> tuple[str, str]:
+    """Reload only the stale words of a first load until all are current.
 
-    Operands: words, addresses, the tag, then one mask per masked poll.
+    Operands: words, first-load words, addresses, then the tag.
     """
-    count = len(masked) * pack
-    tag = 2 * count
-    masks = iter(range(tag + pack, tag + pack + sum(masked) * pack, pack))
-    issue: list[str] = []
-    check: list[str] = []
-    for poll, is_masked in enumerate(masked):
-        mask = next(masks) if is_masked else None
-        for lane in range(pack):
-            word = poll * pack + lane
-            load = f"ld.volatile.global.b64 ${word}, [${count + word}];"
-            if mask is not None:
-                # Masked lanes start current and never load.
-                load = (
-                    f"setp.ne.b32 p, ${mask + lane}, 0; "
-                    f"mov.b64 ${word}, {{zero, ${tag + lane}}}; @p {load}"
-                )
-            issue.append(load)
-            check.append(
-                f"mov.b64 {{lo, hi}}, ${word}; setp.ne.b32 p, hi, ${tag + lane}; "
-                f"@p ld.volatile.global.b64 ${word}, [${count + word}]; "
-                "@p mov.u32 stale, 1;"
-            )
+    count = polls * pack
+    check = [
+        f"mov.b64 {{lo, hi}}, ${word}; setp.ne.b32 p, hi, ${3 * count + word % pack}; "
+        f"@p ld.volatile.global.b64 ${word}, [${2 * count + word}]; "
+        "@p mov.u32 stale, 1;"
+        for word in range(count)
+    ]
     asm = " ".join(
         [
-            "{ .reg .pred p; .reg .b32 lo, hi, zero, stale; mov.u32 zero, 0;",
-            *issue,
+            "{ .reg .pred p; .reg .b32 lo, hi, stale;",
+            *(f"mov.b64 ${word}, ${count + word};" for word in range(count)),
             "SPIN${:uid}: mov.u32 stale, 0;",
             *check,
             "setp.ne.u32 p, stale, 0; @p bra SPIN${:uid}; }",
         ]
     )
-    operands = ["=l"] * count + ["l"] * count + ["r"] * (1 + sum(masked)) * pack
-    return asm, ",".join(operands)
+    return asm, ",".join(["=l"] * count + ["l"] * 2 * count + ["r"] * pack)
 
 
 def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
@@ -892,18 +882,25 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     for poll in polls:
         groups.setdefault(poll.group or poll.word, []).append(poll)
     for group in groups.values():
-        asm, constraints = _poll_asm(
-            [poll.mask is not None for poll in group], group[0].pack
-        )
+        # A plain volatile load vectorizes; masked lanes read as current.
+        for poll in group:
+            mask = "" if poll.mask is None else f", {poll.mask}, {peer.epoch} << 32"
+            cg.add_statement(
+                statement_from_string(
+                    f"{poll.word} = tl.load({poll.address}{mask}, volatile=True)"
+                )
+            )
+        words = [poll.word for poll in group]
+        asm, constraints = _poll_asm(len(words), group[0].pack)
         cg.add_statement(
             _inline_asm(
-                ", ".join(poll.word for poll in group),
+                ", ".join(words),
                 asm,
                 constraints,
                 [
+                    *words,
                     *(poll.address for poll in group),
                     f"tl.cast({peer.epoch}, tl.uint32)",
-                    *(poll.mask for poll in group if poll.mask is not None),
                 ],
                 "tl.uint64" if len(group) == 1 else f"({'tl.uint64, ' * len(group)})",
                 group[0].pack,
