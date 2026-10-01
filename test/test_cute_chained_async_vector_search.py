@@ -35,7 +35,7 @@ def _selected(**overrides):
 def test_public_field_roundtrip_default_and_exact_existing_prefix(bound):
     spec = bound.config_spec
     fields = spec._flat_fields()
-    assert tuple(fields)[-1] == KEY
+    assert tuple(fields)[-2:] == (KEY, "cute_chained_fragment_epilogues")
     field = fields[KEY]
     assert isinstance(field, EnumFragment)
     assert field.search_values() == [False, True] and field.default() is False
@@ -48,6 +48,7 @@ def test_public_field_roundtrip_default_and_exact_existing_prefix(bound):
         "cute_chained_drain_tile_columns",
         "cute_chained_island_consumers",
         KEY,
+        "cute_chained_fragment_epilogues",
     )
     default = spec.default_config()
     assert KEY not in default.config

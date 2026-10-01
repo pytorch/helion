@@ -136,6 +136,9 @@ def test_common_seed_prefix_reference_and_search_choices_are_unchanged(
         CUTE_NATIVE_MATMUL_METADATA_KEY,
         CUTE_CHAINED_POINTWISE_CACHE_NESTED_KEY,
     )
+    if "cute_grid_work_order" in old_fields:
+        suffix += ("cute_grid_work_order",)
+    suffix += ("cute_chained_fragment_epilogues",)
     # These promoted legacy graphs do not discover common preparation, so the
     # asynchronous shared sink is not an effective search coordinate here.
     assert not spec.cute_chained_preparation_pipeline_search_enabled

@@ -707,7 +707,7 @@ def _expression(rhs: str, dtype: torch.dtype = torch.bfloat16) -> _Expression:
     # This unit fixture supplies the real typed expression catalog consumed by
     # prepare; it does not evaluate FX nodes or require a GenerateAST instance.
     expression = _Expression.__new__(_Expression)
-    expression.plan = ChainedMatmulPlan(
+    expression.context = ChainedMatmulPlan(
         root_graph_id=0,
         dots=(),
         store=graph.output(load),

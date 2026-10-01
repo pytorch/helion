@@ -12,6 +12,7 @@ import cutlass.experimental.primitives as prims
 
 from ..prepared_tcgen_edge import execute_prepared_linear_state
 from ..prepared_tcgen_edge import execute_prepared_state_abi
+from ..prepared_tcgen_edge import execute_prepared_state_copy
 from ..prepared_tcgen_edge import execute_prepared_state_product
 from . import common as cm
 
@@ -275,6 +276,7 @@ def export_state(
 def state_loop(
     smem_base,
     tmem_base,
+    desc_initial,
     initial_state,
     final_state,
     sequence,
@@ -286,9 +288,22 @@ def state_loop(
     gate_scale_log2,
     STATE_PROGRAM: cutlass.Constexpr = None,
     STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    STATE_COPY_PROGRAM: cutlass.Constexpr = None,
     STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
-    initialize(tmem_base, initial_state, sequence, head, warp, lane, STATE_ABI_PROGRAM)
+    if cutlass.const_expr(desc_initial is not None):
+        execute_prepared_state_copy(
+            STATE_COPY_PROGRAM,
+            desc_initial,
+            smem_base,
+            tmem_base,
+            (head, sequence),
+            warp,
+        )
+    else:
+        initialize(
+            tmem_base, initial_state, sequence, head, warp, lane, STATE_ABI_PROGRAM
+        )
     if cutlass.const_expr(STATE_PUBLICATIONS is None):
         center_scale = cute.math.exp2(
             gate_scale_log2 * cutlass.Float32(16.0), fastmath=True

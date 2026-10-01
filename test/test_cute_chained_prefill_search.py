@@ -62,7 +62,8 @@ def test_explicit_grouped_family_exposes_real_value_tiles_and_search_knobs(
             "block_sizes",
             "cute_chunk_prefill_task_order",
             "cute_chunk_prefill_schedule",
-        }
+            "cute_state_transfer_max_bits",
+        } | ({"cute_state_transfer_transport"} if chunk_size == 32 else set())
         legacy_source = legacy.to_code(helion.Config(block_sizes=[64], num_warps=4))
         assert "chain_0_mma" not in legacy_source
 

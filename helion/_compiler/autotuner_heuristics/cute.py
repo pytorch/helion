@@ -27,6 +27,8 @@ from ...autotuner.config_spec import CUTE_CHUNK_PREFILL_TASK_ORDER_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from ...autotuner.config_spec import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from ...autotuner.config_spec import CUTE_STATE_TRANSFER_MAX_BITS_KEY
+from ...autotuner.config_spec import CUTE_STATE_TRANSFER_TRANSPORT_KEY
 from ...autotuner.config_spec import VALID_CUTE_CHAINED_LEAF_COUNTS
 from ...autotuner.config_spec import VALID_CUTE_CHAINED_POINTWISE_UNROLLS
 from ...autotuner.config_spec import _cute_chunk_recurrence_config_is_safe
@@ -5902,7 +5904,7 @@ class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
             num_sm=env.config_spec.num_sm,
         )
         env.config_spec.enable_cute_chunk_recurrence_search(
-            preferred_partitions=preferred, fp32_state=geometry.fp32_state
+            preferred_partitions=preferred
         )
         return cls.CACHE_SPECIALIZATION_FACTS
 
@@ -5996,7 +5998,7 @@ class CuteChunkPrefillHeuristic(AutotunerHeuristic):
             return None
         schedule = env.config_spec.cute_chunk_prefill_schedule
         assert schedule is not None
-        return [
+        seeds = [
             Config.from_dict(
                 {
                     CUTE_CHUNK_PREFILL_TASK_ORDER_KEY: order,
@@ -6006,6 +6008,25 @@ class CuteChunkPrefillHeuristic(AutotunerHeuristic):
             for value in schedule.choices
             for order in fragment.choices
         ]
+        state_transfer = env.config_spec.cute_state_transfer_max_bits
+        if state_transfer is not None:
+            # Retain the complete old schedule/order seed block first, then its
+            # full width partners. Neither geometry nor measured winners select it.
+            seeds = [
+                Config.from_dict({**seed, CUTE_STATE_TRANSFER_MAX_BITS_KEY: max_bits})
+                for max_bits in state_transfer.choices
+                for seed in seeds
+            ]
+        state_transport = env.config_spec.cute_state_transfer_transport
+        if state_transport is not None:
+            # Preserve the old prefix and append one sibling per new transport.
+            seeds += [
+                Config.from_dict({**seed, CUTE_STATE_TRANSFER_TRANSPORT_KEY: transport})
+                for transport in state_transport.choices
+                if transport != state_transport.default()
+                for seed in seeds
+            ]
+        return seeds
 
     @classmethod
     def get_seed_config(

@@ -478,4 +478,5 @@ def test_explicit_ungrouped_pipeline_owns_true_prefill_tile_and_flat_schema(
             "block_sizes",
             "cute_chunk_prefill_task_order",
             "cute_chunk_prefill_schedule",
-        }
+            "cute_state_transfer_max_bits",
+        } | ({"cute_state_transfer_transport"} if chunk_size == 32 else set())

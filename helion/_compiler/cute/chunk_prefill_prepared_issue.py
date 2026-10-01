@@ -106,6 +106,83 @@ class FastRecurrence:
         return tuple(port.payload() for port in self.ports)
 
 
+def fast_issue_layouts() -> tuple[
+    tuple[tuple[object, ...], ...],
+    tuple[tuple[int, ...], ...],
+    tuple[tuple[int, ...], ...],
+]:
+    """Canonical physical descriptors and events shared by admission and issue."""
+    from .chunk_prefill_bt32 import common as cm
+
+    # These are the existing engine's descriptor layouts, not graph extents.
+    # Each result shape comes from the accepted full-value-width CTA owner.
+    native = (
+        (
+            cm.TMEM_PACKED_STATE,
+            cm.KD,
+            cm.TMEM_PROJECTION,
+            cm.DV,
+            cm.BT,
+            16,
+            1024,
+            128,
+            0,
+            (2, 4, 32, 128),
+        ),
+        (
+            cm.TMEM_PACKED_STATE,
+            cm.QD,
+            cm.TMEM_OUT,
+            cm.DV,
+            cm.BT,
+            16,
+            1024,
+            128,
+            0,
+            (2, 4, 32, 128),
+        ),
+        (
+            cm.TMEM_RHS_U,
+            cm.INV,
+            cm.TMEM_UPDATE,
+            cm.DV,
+            cm.BT,
+            16,
+            256,
+            32,
+            0,
+            (2, 1, 32, 32),
+        ),
+        (
+            cm.TMEM_RHS_U,
+            cm.FINAL_TRANS,
+            cm.TMEM_STATE,
+            cm.DV,
+            cm.DK + cm.BT,
+            4096,
+            1024,
+            128,
+            1,
+            (2, 1, 16, 128),
+        ),
+    )
+    return (
+        native,
+        (
+            (cm.QK_FULL, cm.OUT_EMPTY, cm.STATE_INP_READY),
+            (),
+            (cm.U_INP_READY,),
+            (cm.U2_INP_READY,),
+        ),
+        (
+            (cm.OLD_OUT_READY,),
+            (cm.RAW_INPUTS_FREE,),
+            (cm.U2_ACC_READY,),
+            (cm.FINAL_READY, cm.SMEM_FREE),
+        ),
+    )
+
+
 def bind_fast_recurrence(
     region: CuteChunkPrefillRegion, semantic_loop: GraphInfo
 ) -> FastRecurrence:
@@ -193,58 +270,7 @@ def bind_fast_recurrence(
         )
         for spec, geo in zip(selected, geometries, strict=True)
     )
-    # These are the existing engine's descriptor layouts, not graph extents.
-    # Each result shape comes from the accepted full-value-width CTA owner.
-    native = (
-        (
-            cm.TMEM_PACKED_STATE,
-            cm.KD,
-            cm.TMEM_PROJECTION,
-            cm.DV,
-            cm.BT,
-            16,
-            1024,
-            128,
-            0,
-            (2, 4, 32, 128),
-        ),
-        (
-            cm.TMEM_PACKED_STATE,
-            cm.QD,
-            cm.TMEM_OUT,
-            cm.DV,
-            cm.BT,
-            16,
-            1024,
-            128,
-            0,
-            (2, 4, 32, 128),
-        ),
-        (
-            cm.TMEM_RHS_U,
-            cm.INV,
-            cm.TMEM_UPDATE,
-            cm.DV,
-            cm.BT,
-            16,
-            256,
-            32,
-            0,
-            (2, 1, 32, 32),
-        ),
-        (
-            cm.TMEM_RHS_U,
-            cm.FINAL_TRANS,
-            cm.TMEM_STATE,
-            cm.DV,
-            cm.DK + cm.BT,
-            4096,
-            1024,
-            128,
-            1,
-            (2, 1, 16, 128),
-        ),
-    )
+    native, ready, complete = fast_issue_layouts()
     ports = tuple(
         starmap(
             FastIssuePort,
@@ -252,18 +278,8 @@ def bind_fast_recurrence(
                 ((placements[0],), (placements[1],), (placements[2],), placements[3:]),
                 (left[0], left[1], left[2], left[3]),
                 native,
-                (
-                    (cm.QK_FULL, cm.OUT_EMPTY, cm.STATE_INP_READY),
-                    (),
-                    (cm.U_INP_READY,),
-                    (cm.U2_INP_READY,),
-                ),
-                (
-                    (cm.OLD_OUT_READY,),
-                    (cm.RAW_INPUTS_FREE,),
-                    (cm.U2_ACC_READY,),
-                    (cm.FINAL_READY, cm.SMEM_FREE),
-                ),
+                ready,
+                complete,
                 strict=True,
             ),
         )

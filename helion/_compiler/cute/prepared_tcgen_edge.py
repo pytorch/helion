@@ -42,6 +42,7 @@ from .warp_specialized_primitives import fence_async_shared
 from .warp_specialized_primitives import matrix_16x16_transposed_lane_coordinates
 from .warp_specialized_primitives import named_barrier_sync
 from .warp_specialized_primitives import segmented_swizzle_b16_element_index
+from .warp_specialized_primitives import shared_pointer
 from .warp_specialized_primitives import swizzle_b16_index
 
 
@@ -611,7 +612,7 @@ def execute_prepared_store_completion(
 
 
 @cute.jit
-def read_linear_state_abi(
+def _read_linear_state_abi_128(
     source,
     coordinates,
     BEGIN: cutlass.Constexpr,
@@ -631,8 +632,75 @@ def read_linear_state_abi(
     return values
 
 
+# Aligned FP32 rows use raw-word loads to preserve every state bit.
 @cute.jit
-def store_linear_state_abi(
+def read_linear_state_abi(
+    source,
+    coordinates,
+    BEGIN: cutlass.Constexpr,
+    COUNT: cutlass.Constexpr,
+    valid=True,
+    MAX_BITS: cutlass.Constexpr = 256,
+):
+    if cutlass.const_expr(MAX_BITS == 128 or source is None):
+        return _read_linear_state_abi_128(source, coordinates, BEGIN, COUNT, valid)
+    else:  # noqa: RET505 - CuTe constexpr return types stay separate.
+        assert MAX_BITS == 256
+        if cutlass.const_expr(
+            source.element_type != cutlass.Float32
+            or source.stride[3] != 1
+            or COUNT % 8 != 0
+            or source.iterator.alignment < 16
+            or BEGIN % 4 != 0
+            or source.stride[0] % 4 != 0
+            or source.stride[1] % 4 != 0
+            or source.stride[2] % 4 != 0
+        ):
+            return _read_linear_state_abi_128(source, coordinates, BEGIN, COUNT, valid)
+        else:  # noqa: RET505 - CuTe constexpr return types stay separate.
+            values = cutlass.Array(cutlass.Float32, COUNT, alignment=32)
+            for column in cutlass.range_constexpr(COUNT):
+                values[column] = cutlass.Float32(0.0)
+            if valid:
+                offset = cute.crd2idx(
+                    (coordinates[0], coordinates[1], coordinates[2], BEGIN),
+                    source.layout,
+                )
+                pointer = source.iterator + offset
+                address = pointer.toint()
+                wide = True
+                if cutlass.const_expr(pointer.alignment < 32):
+                    alignment_address = address
+                    if cutlass.const_expr(
+                        BEGIN % 8 == 0
+                        and source.stride[0] % 8 == 0
+                        and source.stride[1] % 8 == 0
+                        and source.stride[2] % 8 == 0
+                    ):
+                        alignment_address = source.iterator.toint()
+                    wide = (alignment_address & 31) == 0
+                native_pointer = cutlass.inttoptr(address, 1, cutlass.Int64)
+                for group in cutlass.range_constexpr(COUNT // 8):
+                    group_pointer = native_pointer + group * 4
+                    words = cutlass.Vector.from_elements(
+                        (cutlass.Int64(0),) * 4, cutlass.Int64
+                    )
+                    if wide:
+                        words = group_pointer.load(alignment=32, count=4)
+                    else:
+                        low = group_pointer.load(alignment=16, count=2)
+                        high = (group_pointer + 2).load(alignment=16, count=2)
+                        words = cutlass.Vector.from_elements(
+                            (low[0], low[1], high[0], high[1]), cutlass.Int64
+                        )
+                    loaded = words.bitcast(cutlass.Float32)
+                    for lane in cutlass.range_constexpr(8):
+                        values[group * 8 + lane] = loaded[lane]
+            return values
+
+
+@cute.jit
+def _store_linear_state_abi_128(
     values,
     destination,
     coordinates,
@@ -645,6 +713,295 @@ def store_linear_state_abi(
             destination[
                 coordinates[0], coordinates[1], coordinates[2], BEGIN + column
             ] = values[column]
+
+
+# Check the effective row address before issuing a 256-bit store.
+@cute.jit
+def store_linear_state_abi(
+    values,
+    destination,
+    coordinates,
+    BEGIN: cutlass.Constexpr,
+    COUNT: cutlass.Constexpr,
+    valid=True,
+    MAX_BITS: cutlass.Constexpr = 256,
+):
+    if cutlass.const_expr(MAX_BITS == 128):
+        _store_linear_state_abi_128(
+            values, destination, coordinates, BEGIN, COUNT, valid
+        )
+    else:
+        assert MAX_BITS == 256
+        if cutlass.const_expr(
+            destination.element_type != cutlass.Float32
+            or destination.stride[3] != 1
+            or COUNT % 8 != 0
+        ):
+            _store_linear_state_abi_128(
+                values, destination, coordinates, BEGIN, COUNT, valid
+            )
+        else:
+            if valid:
+                offset = cute.crd2idx(
+                    (coordinates[0], coordinates[1], coordinates[2], BEGIN),
+                    destination.layout,
+                )
+                pointer = destination.iterator + offset
+                address = pointer.toint()
+                wide = True
+                if cutlass.const_expr(pointer.alignment < 32):
+                    alignment_address = address
+                    if cutlass.const_expr(
+                        BEGIN % 8 == 0
+                        and destination.stride[0] % 8 == 0
+                        and destination.stride[1] % 8 == 0
+                        and destination.stride[2] % 8 == 0
+                    ):
+                        alignment_address = destination.iterator.toint()
+                    wide = (alignment_address & 31) == 0
+                if wide:
+                    aligned = cute.make_ptr(
+                        cutlass.Float32,
+                        address,
+                        cute.AddressSpace.gmem,
+                        assumed_align=32,
+                    )
+                    panel = cute.make_tensor(aligned, cute.make_layout(COUNT))
+                    registers = cute.make_rmem_tensor(COUNT, cutlass.Float32)
+                    for column in cutlass.range_constexpr(COUNT):
+                        registers[column] = values[column]
+                    cute.autovec_copy(registers, panel)
+                else:
+                    _store_linear_state_abi_128(
+                        values, destination, coordinates, BEGIN, COUNT, valid
+                    )
+
+
+@cute.jit
+def initialize_prepared_state_copy(PROGRAM: cutlass.Constexpr, smem_base):
+    """Implementation barriers only; the original state publication is later."""
+    for index in cutlass.range_constexpr(4 if PROGRAM[0] == 2 else 3):
+        prims.mbarrier_init(
+            shared_pointer(smem_base, PROGRAM[6] + index * 8, cutlass.Int64), 1
+        )
+
+
+@cute.jit
+def execute_prepared_serial_state_copy(
+    PROGRAM: cutlass.Constexpr, descriptor, smem_base, tmem_base, coordinates, warp
+):
+    """Raw32 TMA/CP panels in a graph-bound shared scratch lease.
+
+    One warp copies all 128 rows. Each panel releases scratch only after its
+    asynchronous TMEM copy completes. The final event publishes that completion
+    to all state warps; their original consumer publication remains unchanged.
+    """
+    assert PROGRAM[0] == 1 and PROGRAM[1] == 128 and PROGRAM[3] == 32
+    tma_ready = shared_pointer(smem_base, PROGRAM[6], cutlass.Int64)
+    copy_ready = shared_pointer(smem_base, PROGRAM[6] + 8, cutlass.Int64)
+    final_ready = shared_pointer(smem_base, PROGRAM[6] + 16, cutlass.Int64)
+    scratch = shared_pointer(smem_base, PROGRAM[4], cutlass.Int32)
+    head, sequence = coordinates
+    if warp == 0:
+        for panel in cutlass.range(PROGRAM[2] // PROGRAM[3], unroll=1):
+            if prims.elect_sync():
+                prims.mbarrier_arrive_expect_tx(tma_ready, PROGRAM[1] * PROGRAM[3] * 4)
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    scratch,
+                    descriptor.get_ptr(),
+                    (panel * PROGRAM[3], cutlass.Int32(0), head, sequence),
+                    tma_ready,
+                )
+            execute_prepared_wait(tma_ready, panel % 2, True)
+            desc = prims.Tcgen05SmemDesc.build(
+                scratch,
+                leading_byte_offset=16,
+                stride_byte_offset=1024,
+                layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+            )
+            if prims.elect_sync():
+                for part in cutlass.range_constexpr(4):
+                    prims.tcgen05_cp(
+                        prims.Tcgen05CpShape.SHAPE_128X256B,
+                        cutlass.inttoptr(
+                            tmem_base + PROGRAM[5] + panel * PROGRAM[3] + part * 8,
+                            6,
+                            cutlass.Int32,
+                        ),
+                        desc.advance_start_address(part * 32),
+                        group=prims.CTAGroup.CTA_1,
+                    )
+                prims.tcgen05_commit(copy_ready, group=prims.CTAGroup.CTA_1)
+            execute_prepared_wait(copy_ready, panel % 2, True)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        arrive_mbarrier(final_ready)
+    execute_prepared_wait(final_ready, cutlass.Int32(0), True)
+    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+
+
+@cute.jit
+def execute_prepared_planar_state_copy(
+    PROGRAM: cutlass.Constexpr, descriptor, smem_base, tmem_base, coordinates, warp
+):
+    """Pack adjacent raw32 planes into one checked startup scratch transfer."""
+    assert PROGRAM[0] == 3 and PROGRAM[1] == 128 and PROGRAM[3] == 32
+    tma_ready = shared_pointer(smem_base, PROGRAM[6], cutlass.Int64)
+    copy_ready = shared_pointer(smem_base, PROGRAM[6] + 8, cutlass.Int64)
+    final_ready = shared_pointer(smem_base, PROGRAM[6] + 16, cutlass.Int64)
+    scratch = shared_pointer(smem_base, PROGRAM[4], cutlass.Int32)
+    head, sequence = coordinates
+    if warp == 0:
+        for panel in cutlass.range(PROGRAM[2] // (PROGRAM[7] * PROGRAM[3]), unroll=1):
+            if prims.elect_sync():
+                prims.mbarrier_arrive_expect_tx(
+                    tma_ready, PROGRAM[1] * PROGRAM[3] * PROGRAM[7] * 4
+                )
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    scratch,
+                    descriptor.get_ptr(),
+                    (
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                        panel * PROGRAM[7],
+                        head,
+                        sequence,
+                    ),
+                    tma_ready,
+                )
+            execute_prepared_wait(tma_ready, panel % 2, True)
+            desc = prims.Tcgen05SmemDesc.build(
+                scratch,
+                leading_byte_offset=16,
+                stride_byte_offset=1024,
+                layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+            )
+            if prims.elect_sync():
+                for part in cutlass.range_constexpr(PROGRAM[7] * 4):
+                    prims.tcgen05_cp(
+                        prims.Tcgen05CpShape.SHAPE_128X256B,
+                        cutlass.inttoptr(
+                            tmem_base
+                            + PROGRAM[5]
+                            + panel * (PROGRAM[7] * PROGRAM[3])
+                            + part * 8,
+                            6,
+                            cutlass.Int32,
+                        ),
+                        desc.advance_start_address(
+                            (part // 4) * 16384 + (part % 4) * 32
+                        ),
+                        group=prims.CTAGroup.CTA_1,
+                    )
+                prims.tcgen05_commit(copy_ready, group=prims.CTAGroup.CTA_1)
+            execute_prepared_wait(copy_ready, panel % 2, True)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+        arrive_mbarrier(final_ready)
+    execute_prepared_wait(final_ready, cutlass.Int32(0), True)
+    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+
+
+@cute.jit
+def execute_prepared_pipelined_state_copy(
+    PROGRAM: cutlass.Constexpr,
+    descriptor,
+    smem_base,
+    tmem_base,
+    coordinates,
+    warp,
+    SECOND_SCRATCH: cutlass.Constexpr,
+):
+    """Two raw32 slots; their owners are gated by the checked startup lease."""
+    assert PROGRAM[0] == 2 and PROGRAM[1] == 128 and PROGRAM[3] == 32
+    copy_ready = shared_pointer(smem_base, PROGRAM[6] + 16, cutlass.Int64)
+    final_ready = shared_pointer(smem_base, PROGRAM[6] + 24, cutlass.Int64)
+    head, sequence = coordinates
+    if warp == 0:
+        if prims.elect_sync():
+            for slot in cutlass.range_constexpr(2):
+                ready = shared_pointer(smem_base, PROGRAM[6] + slot * 8, cutlass.Int64)
+                scratch = shared_pointer(
+                    smem_base,
+                    PROGRAM[4] + slot * (SECOND_SCRATCH - PROGRAM[4]),
+                    cutlass.Int32,
+                )
+                prims.mbarrier_arrive_expect_tx(ready, PROGRAM[1] * PROGRAM[3] * 4)
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    scratch,
+                    descriptor.get_ptr(),
+                    (
+                        cutlass.Int32(slot * PROGRAM[3]),
+                        cutlass.Int32(0),
+                        head,
+                        sequence,
+                    ),
+                    ready,
+                )
+        for panel in cutlass.range(PROGRAM[2] // PROGRAM[3], unroll=1):
+            slot = panel % 2
+            ready = shared_pointer(smem_base, PROGRAM[6] + slot * 8, cutlass.Int64)
+            scratch = shared_pointer(
+                smem_base,
+                PROGRAM[4] + slot * (SECOND_SCRATCH - PROGRAM[4]),
+                cutlass.Int32,
+            )
+            execute_prepared_wait(ready, (panel // 2) % 2, True)
+            desc = prims.Tcgen05SmemDesc.build(
+                scratch,
+                leading_byte_offset=16,
+                stride_byte_offset=1024,
+                layout=prims.Tcgen05SmemSwizzle.SWIZZLE_128B,
+            )
+            if prims.elect_sync():
+                for part in cutlass.range_constexpr(4):
+                    prims.tcgen05_cp(
+                        prims.Tcgen05CpShape.SHAPE_128X256B,
+                        cutlass.inttoptr(
+                            tmem_base + PROGRAM[5] + panel * PROGRAM[3] + part * 8,
+                            6,
+                            cutlass.Int32,
+                        ),
+                        desc.advance_start_address(part * 32),
+                        group=prims.CTAGroup.CTA_1,
+                    )
+                prims.tcgen05_commit(copy_ready, group=prims.CTAGroup.CTA_1)
+            execute_prepared_wait(copy_ready, panel % 2, True)
+            prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+            if panel < PROGRAM[2] // PROGRAM[3] - 2:
+                if prims.elect_sync():
+                    prims.mbarrier_arrive_expect_tx(ready, PROGRAM[1] * PROGRAM[3] * 4)
+                    prims.cp_async_bulk_tensor_shared_cta_global(
+                        scratch,
+                        descriptor.get_ptr(),
+                        ((panel + 2) * PROGRAM[3], cutlass.Int32(0), head, sequence),
+                        ready,
+                    )
+        arrive_mbarrier(final_ready)
+    execute_prepared_wait(final_ready, cutlass.Int32(0), True)
+    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
+
+
+@cute.jit
+def execute_prepared_state_copy(
+    PROGRAM: cutlass.Constexpr, descriptor, smem_base, tmem_base, coordinates, warp
+):
+    if cutlass.const_expr(PROGRAM[0] == 2):
+        execute_prepared_pipelined_state_copy(
+            PROGRAM,
+            descriptor,
+            smem_base,
+            tmem_base,
+            coordinates,
+            warp,
+            SECOND_SCRATCH=PROGRAM[7],
+        )
+    elif cutlass.const_expr(PROGRAM[0] == 3):
+        execute_prepared_planar_state_copy(
+            PROGRAM, descriptor, smem_base, tmem_base, coordinates, warp
+        )
+    else:
+        execute_prepared_serial_state_copy(
+            PROGRAM, descriptor, smem_base, tmem_base, coordinates, warp
+        )
 
 
 @cute.jit
@@ -675,6 +1032,7 @@ def execute_prepared_state_abi(
                     instruction[2] * instruction[5],
                     instruction[5],
                     valid,
+                    MAX_BITS=instruction[7] if len(instruction) == 8 else 256,
                 )
         elif cutlass.const_expr(instruction[0] == 1):
             if cutlass.const_expr(instruction[1] == 0):
@@ -693,6 +1051,7 @@ def execute_prepared_state_abi(
                     instruction[2] * instruction[5],
                     instruction[5],
                     valid,
+                    MAX_BITS=instruction[7] if len(instruction) == 8 else 256,
                 )
         else:
             assert instruction[0] == 2 and instruction[1] == 0

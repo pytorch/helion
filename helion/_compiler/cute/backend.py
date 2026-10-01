@@ -1408,7 +1408,13 @@ class CuteBackend(Backend):
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_recurrence_pipeline"
             or key == "cute_chunk_prepare_schedule"
-            or key in ("cute_chunk_prefill_task_order", "cute_chunk_prefill_schedule")
+            or key
+            in (
+                "cute_chunk_prefill_task_order",
+                "cute_chunk_prefill_schedule",
+                "cute_state_transfer_max_bits",
+                "cute_state_transfer_transport",
+            )
             or key == "cute_affine_scan_schedule"
             or key == "cute_chained_mma_schedule"
             or key == "cute_chained_warp_mma_rows"

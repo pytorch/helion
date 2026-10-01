@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from .chunk_prefill import CuteChunkPrefillRegion
     from .prepared_state_planner import StateCut
     from .prepared_state_planner import StatePublication
+    from .prepared_state_planner import StateTransferPlan
     from .prepared_state_planner import StateView
 
 
@@ -149,18 +150,21 @@ class FastStateABIBinding:
 class FastStateABICycle:
     owner: FastStateABI
     mode: int
+    max_bits: int = 256
     cut: StateCut = field(init=False)
 
     @property
     def scope(self) -> tuple[object, ...]:
         return id(self.owner), "external-state", self.mode
 
-    def program(self) -> tuple[tuple[object, ...], ...]:
+    def schedule(self) -> StateTransferPlan:
         from .prepared_state_planner import StateCut
         from .prepared_state_planner import StatePublication
         from .prepared_state_planner import plan_state_transfers
 
         self.owner.check()
+        if type(self.max_bits) is not int or self.max_bits not in (256, 128):
+            raise chain._UnsupportedChain("unsupported external state transfer cap")
         self.cut = StateCut(
             self.owner,
             self.owner.loop if self.mode == 0 else self.owner.final_store,
@@ -183,6 +187,10 @@ class FastStateABICycle:
             (self.cut,),
         )
         schedule.check()
+        return schedule
+
+    def program(self) -> tuple[tuple[object, ...], ...]:
+        schedule = self.schedule()
         result: list[tuple[object, ...]] = []
         for effect in schedule.actions:
             binding = effect.binding
@@ -192,27 +200,49 @@ class FastStateABICycle:
                 opcode, *geometry = state_transfer_instruction(
                     effect.kind, binding.transfer()
                 )
-                result.append((opcode, self.mode, binding.panel, *geometry))
+                instruction = (opcode, self.mode, binding.panel, *geometry)
+                # Keep the original seven-field default program, including
+                # TMEM effects and completion. Only external memory consumes
+                # this cap; older serialized programs retain default256.
+                if self.max_bits != 256 and (
+                    (opcode == 0 and self.mode != 1) or (opcode == 1 and self.mode != 0)
+                ):
+                    instruction += (self.max_bits,)
+                result.append(instruction)
         return tuple(result)
 
 
 def bind_fast_state_abi(
     region: CuteChunkPrefillRegion,
     semantic_root: GraphInfo,
+    *,
+    max_bits: int = 256,
 ) -> tuple[tuple[tuple[object, ...], ...], ...]:
     if region.numerical_policy != "centered_bt32_fp32_rhs_v2" or (
         region.key_width,
         region.value_width,
     ) != (128, 128):
         raise chain._UnsupportedChain("foreign external state geometry")
-    return bind_external_state_abi(region, semantic_root)
+    return bind_external_state_abi(region, semantic_root, max_bits=max_bits)
 
 
 def bind_external_state_abi(
     region: CuteChunkPrefillRegion,
     semantic_root: GraphInfo,
+    *,
+    max_bits: int = 256,
 ) -> tuple[tuple[tuple[object, ...], ...], ...]:
     """Original root FP32 state ports after the physical adapter's admission."""
+    owner = bind_external_state_owner(region, semantic_root)
+    return tuple(
+        FastStateABICycle(owner, mode, max_bits).program() for mode in range(3)
+    )
+
+
+def bind_external_state_owner(
+    region: CuteChunkPrefillRegion, semantic_root: GraphInfo
+) -> FastStateABI:
+    """Retain the graph owner for transports of the same original state ports."""
     from torch.fx import Node
 
     if (region.key_width, region.value_width) != (128, 128):
@@ -252,7 +282,7 @@ def bind_external_state_abi(
         or region.final_state.fake.dtype is not torch.float32
     ):
         raise chain._UnsupportedChain("changed original initial-state precision/owner")
-    owner = FastStateABI(
+    return FastStateABI(
         region,
         semantic_root,
         initial,
@@ -266,4 +296,3 @@ def bind_external_state_abi(
             )
         ),
     )
-    return tuple(FastStateABICycle(owner, mode).program() for mode in range(3))

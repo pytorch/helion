@@ -21,6 +21,7 @@ from test.test_cute_chained_tcgen05 import _tcgen_inputs
 from test.test_cute_chained_tcgen05 import _tcgen_single
 
 from ._cute_aux import _cpu_codegen
+from ._cute_prepared_source import expand_prepared_root_source
 import helion
 from helion import exc
 from helion._compiler.autotuner_heuristics import cute as heuristics
@@ -168,7 +169,9 @@ def test_typed_emitted_seed_and_join(dtype, n):
         with pytest.raises(exc.BackendUnsupported):
             _initialized_code(args, "missing")
     new = _initialized_code(args)
+    new = expand_prepared_root_source(new)
     if old is not None:
+        old = expand_prepared_root_source(old)
         assert "chain_0_c =" in old
     assert not any(
         isinstance(node, ast.Name) and node.id == "chain_0_c"
@@ -482,6 +485,7 @@ def _major_code(args: tuple[Any, ...], **extra: Any) -> str:
 
 
 def _assert_majors(code: str, first: tuple[str, str], second: tuple[str, str]) -> None:
+    code = expand_prepared_root_source(code)
     calls = [
         n
         for n in ast.walk(ast.parse(code))
@@ -710,6 +714,8 @@ def _late_rhs_code(args, value: object = True, capacity=232448, **extra):
 
 
 def _without_schedule_delta(old: str, new: str) -> None:
+    old = expand_prepared_root_source(old)
+    new = expand_prepared_root_source(new)
     start = old.index("    chain_1_b_ptr = cute.arch.alloc_smem(")
     # Only the RHS pointer/layout/copy statements, not following early caches.
     parsed = ast.parse(old)
@@ -764,6 +770,7 @@ def test_generic_exact_delta_and_typed_boundaries(dtype, n):
     assert old == _late_rhs_code(args, False, capacity=500000)
     new = _late_rhs_code(args)
     _without_schedule_delta(old, new)
+    new = expand_prepared_root_source(new)
     assert "chain_0_c =" not in new
     assert "chain_1_mma.set(tcgen05.Field.ACCUMULATE, True)" in new
     assert new.count("cute.gemm(") == 2

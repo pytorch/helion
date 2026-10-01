@@ -402,12 +402,21 @@ def test_computed_operand_scalar_offset_and_search(warps: int) -> None:
         "cute_chained_mma_schedule",
         "cute_chained_scratch_layout",
         "cute_native_matmul_metadata",
+        "cute_chained_fragment_epilogues",
     }
     assert (
         spec.default_config().config.get("cute_native_matmul_metadata", False) is False
     )
     assert all(
         seed.config.get("cute_native_matmul_metadata", False) is False
+        for seed in spec.compiler_seed_configs
+    )
+    assert (
+        spec.default_config().config.get("cute_chained_fragment_epilogues", False)
+        is False
+    )
+    assert all(
+        seed.config.get("cute_chained_fragment_epilogues", False) is False
         for seed in spec.compiler_seed_configs
     )
     config = helion.Config(block_sizes=[16, 32], num_warps=warps)

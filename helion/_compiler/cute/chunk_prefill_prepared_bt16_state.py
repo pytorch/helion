@@ -332,12 +332,12 @@ def bind_bt16_state(owner: BT16Bindings) -> tuple[tuple[tuple[object, ...], ...]
 
 
 def bind_bt16_state_abi(
-    owner: BT16Bindings, semantic_root: GraphInfo
+    owner: BT16Bindings, semantic_root: GraphInfo, *, max_bits: int = 256
 ) -> tuple[tuple[tuple[object, ...], ...], ...]:
     from .chunk_prefill_prepared_state_abi import bind_external_state_abi
 
     owner.check()
-    return bind_external_state_abi(owner.region, semantic_root)
+    return bind_external_state_abi(owner.region, semantic_root, max_bits=max_bits)
 
 
 def bind_bt16_output(owner: BT16Bindings) -> tuple[int, int, int, int]:

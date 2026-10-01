@@ -134,6 +134,9 @@ def _assert_old_prefix(spec: ConfigSpec) -> None:
         suffix += ("cute_chained_pointwise_cache_nested",)
     if "cute_chained_async_vector_store" in fields:
         suffix += ("cute_chained_async_vector_store",)
+    if "cute_grid_work_order" in fields:
+        suffix += ("cute_grid_work_order",)
+    suffix += ("cute_chained_fragment_epilogues",)
     assert keys[field_index + 1 :] == suffix
     previous_key = (
         CUTE_CHAINED_SEED_TILE_COLUMNS_KEY

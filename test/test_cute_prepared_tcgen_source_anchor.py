@@ -82,8 +82,8 @@ def test_actual_preprocessor_keeps_original_decorated_source(host, module, name)
     context = host._context
     before_cuda = torch.cuda.is_initialized()
     with _original_function(function) as inner:
-        original_code = inner.__code__
-        source = inspect.getsource(function)
+        original_code = vars(inner).get("_original_code", inner.__code__)
+        source = inspect.getsource(original_code)
         host.check()
         _preprocess(inner)
         assert vars(inner)["_original_code"] is original_code
@@ -218,3 +218,34 @@ def test_precompile_active_original_code_identity_change_rejects(host):
         with pytest.raises(_UnsupportedChain):
             host.check()
     host.check()
+
+
+@pytest.mark.parametrize("preprocessed", [False, True])
+@pytest.mark.parametrize(("module", "name"), _FUNCTIONS)
+def test_original_source_check_preserves_existing_preprocess_state(
+    host, module, name, preprocessed
+):
+    function = vars(module)[name]
+    inner = vars(function)["__wrapped__"]
+    prior_code, prior_fields = inner.__code__, dict(vars(inner))
+    before_cuda = torch.cuda.is_initialized()
+    with _original_function(function) as inner:
+        original_code = vars(inner).get("_original_code", inner.__code__)
+        inner.__code__ = original_code
+        for field in ("_original_code", "_preprocessed", "_preprocessed_signature"):
+            vars(inner).pop(field, None)
+        assert "_original_code" not in vars(inner)
+        if preprocessed:
+            _preprocess(inner)
+            assert vars(inner)["_original_code"] is original_code
+            assert inner.__code__ is not original_code
+        state_code, state_fields = inner.__code__, dict(vars(inner))
+        test_actual_preprocessor_keeps_original_decorated_source(host, module, name)
+        assert inner.__code__ is state_code
+        assert vars(inner).keys() == state_fields.keys()
+        assert all(vars(inner)[key] is value for key, value in state_fields.items())
+    assert inner.__code__ is prior_code
+    assert vars(inner).keys() == prior_fields.keys()
+    assert all(vars(inner)[key] is value for key, value in prior_fields.items())
+    host.check()
+    assert torch.cuda.is_initialized() == before_cuda

@@ -35,6 +35,7 @@ from .affine_recurrence_primitives import pack_output_b16x2_to_i32
 from .affine_recurrence_primitives import pack_typed_b16x2_to_i32
 from .affine_recurrence_primitives import packed_f32x2_binary as packed_f32x2_binary
 from .affine_recurrence_primitives import sub_b16x2_input_dtype
+from .sequence_order import select_sequence_by_length_cta
 from .warp_specialized_plan import chained_recurrence_tmem_layout
 from .warp_specialized_primitives import advance_ring_stage
 from .warp_specialized_primitives import matrix_16x16_transposed_lane_coordinates
@@ -2596,6 +2597,7 @@ def tcgen05_store_initial_state_tmem(
                 read[2] * read[5],
                 read[5],
                 valid_lane,
+                MAX_BITS=read[7] if len(read) == 8 else 256,
             )
             prepared_tcgen.execute_prepared_store(
                 state_block[0 : store[5]],
@@ -4582,27 +4584,7 @@ def length_ordered_sequence(cu_seqlens, sequence_slot, tidx):
     global workspace is required. Equal lengths retain source order. Threads
     stride over candidates when the sequence count exceeds the CTA width.
     """
-    selected = cutlass.Array(
-        cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4
-    )
-    sequences = cutlass.Int32(cu_seqlens.shape[0] - 1)
-    for candidate in cutlass.range(tidx, sequences, 512):
-        length = cutlass.Int32(cu_seqlens[candidate + 1]) - cutlass.Int32(
-            cu_seqlens[candidate]
-        )
-        rank = cutlass.Int32(0)
-        for other in cutlass.range(sequences):
-            other_length = cutlass.Int32(cu_seqlens[other + 1]) - cutlass.Int32(
-                cu_seqlens[other]
-            )
-            if (other_length > length) | (
-                (other_length == length) & (other < candidate)
-            ):
-                rank += cutlass.Int32(1)
-        if rank == sequence_slot:
-            selected[0] = candidate
-    cute.arch.barrier()
-    return selected[0]
+    return select_sequence_by_length_cta(cu_seqlens, sequence_slot, tidx, 512)
 
 
 @cute.kernel

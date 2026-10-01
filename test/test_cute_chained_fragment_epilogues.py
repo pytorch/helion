@@ -275,8 +275,22 @@ def test_experimental_switch_is_an_exact_boolean(value):
 
 def test_explicit_accumulator_is_not_repaired_into_an_additive_reader():
     assert _root(enabled=None, seed=True) == _root(enabled=False, seed=True)
-    with pytest.raises(exc.BackendUnsupported, match="fragment"):
+    original = chain._register_bridges
+    accepted = []
+
+    def observe(*args, **kwargs):
+        result = original(*args, **kwargs)
+        accepted.append(result)
+        return result
+
+    with (
+        patch.object(chain, "_register_bridges", side_effect=observe),
+        pytest.raises(
+            exc.BackendUnsupported, match="chained matmul failed late validation"
+        ),
+    ):
         _root(seed=True)
+    assert accepted == [{}]
 
 
 def test_experimental_coordinate_appends_without_seed_or_default_adoption():

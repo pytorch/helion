@@ -832,6 +832,8 @@ VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
 CUTE_CHUNK_PREFILL_TASK_ORDER_KEY = "cute_chunk_prefill_task_order"
 CUTE_CHUNK_PREFILL_SCHEDULE_KEY = "cute_chunk_prefill_schedule"
+CUTE_STATE_TRANSFER_MAX_BITS_KEY = "cute_state_transfer_max_bits"
+CUTE_STATE_TRANSFER_TRANSPORT_KEY = "cute_state_transfer_transport"
 CUTE_CHAINED_MMA_SCHEDULE_KEY = "cute_chained_mma_schedule"
 CUTE_CHAINED_WARP_MMA_ROWS_KEY = "cute_chained_warp_mma_rows"
 CUTE_CHAINED_PREPARATION_PIPELINE_KEY = "cute_chained_preparation_pipeline"
@@ -1005,6 +1007,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
         CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
+        CUTE_STATE_TRANSFER_MAX_BITS_KEY,
+        CUTE_STATE_TRANSFER_TRANSPORT_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_WARP_MMA_ROWS_KEY,
@@ -1134,6 +1138,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
         CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
+        CUTE_STATE_TRANSFER_MAX_BITS_KEY,
+        CUTE_STATE_TRANSFER_TRANSPORT_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         CUTE_CHAINED_MMA_SCHEDULE_KEY,
         CUTE_CHAINED_WARP_MMA_ROWS_KEY,
@@ -1583,6 +1589,8 @@ class ConfigSpec:
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
         self.cute_chunk_prefill_task_order: EnumFragment | None = None
         self.cute_chunk_prefill_schedule: EnumFragment | None = None
+        self.cute_state_transfer_max_bits: EnumFragment | None = None
+        self.cute_state_transfer_transport: EnumFragment | None = None
         # Enabled only after a generic matcher proves a compatible affine scan.
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
@@ -2424,9 +2432,7 @@ class ConfigSpec:
             spec.autotuner_min = target
             spec.max_size = target
 
-    def enable_cute_chunk_recurrence_search(
-        self, *, preferred_partitions: int, fp32_state: bool = False
-    ) -> None:
+    def enable_cute_chunk_recurrence_search(self, *, preferred_partitions: int) -> None:
         """Expose the exact BT16 recurrence schedule as CuTe search knobs."""
 
         if preferred_partitions not in (2, 4):
@@ -2503,6 +2509,26 @@ class ConfigSpec:
         for spec in self.block_sizes:
             spec.autotuner_min = 64
             spec.max_size = 64
+
+    def enable_cute_state_transfer_search(self) -> None:
+        """Register caps after a physical adapter binds an external-state ABI."""
+        if not self.supports_config_key(CUTE_STATE_TRANSFER_MAX_BITS_KEY):
+            raise InvalidConfig(
+                f"{CUTE_STATE_TRANSFER_MAX_BITS_KEY} is not supported by backend "
+                f"{self.backend_name!r}"
+            )
+        self.cute_state_transfer_max_bits = EnumFragment(choices=(256, 128))
+
+    def enable_cute_state_transport_search(self) -> None:
+        """Register transports after state graph and shared-memory binding."""
+        if not self.supports_config_key(CUTE_STATE_TRANSFER_TRANSPORT_KEY):
+            raise InvalidConfig(
+                f"{CUTE_STATE_TRANSFER_TRANSPORT_KEY} is not supported by backend "
+                f"{self.backend_name!r}"
+            )
+        self.cute_state_transfer_transport = EnumFragment(
+            choices=("register", "tma", "tma_pipelined", "tma_planar")
+        )
 
     def enable_cute_chunk_prepare_schedule_search(
         self, *, preferred_schedule: str
@@ -4798,6 +4824,31 @@ class ConfigSpec:
                 else:
                     raise InvalidConfig(f"{key} requires a matched fused recurrence")
 
+        if (
+            CUTE_STATE_TRANSFER_MAX_BITS_KEY in config
+            and self.cute_state_transfer_max_bits is None
+            and self.supports_config_key(CUTE_STATE_TRANSFER_MAX_BITS_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_STATE_TRANSFER_MAX_BITS_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_STATE_TRANSFER_MAX_BITS_KEY} requires a bound external-state ABI"
+                )
+
+        if (
+            CUTE_STATE_TRANSFER_TRANSPORT_KEY in config
+            and self.cute_state_transfer_transport is None
+            and self.supports_config_key(CUTE_STATE_TRANSFER_TRANSPORT_KEY)
+        ):
+            if _fix_invalid:
+                config.pop(CUTE_STATE_TRANSFER_TRANSPORT_KEY)
+            else:
+                raise InvalidConfig(
+                    f"{CUTE_STATE_TRANSFER_TRANSPORT_KEY} requires a bound "
+                    "state graph and shared-memory transport"
+                )
+
         if unsupported := self.unsupported_config_keys(config):
             # Separate backend-specific keys (e.g. AMD tunables, TileIR tunables)
             # from common keys (e.g. num_warps, num_stages, indexing).
@@ -5664,6 +5715,36 @@ class ConfigSpec:
                     raise InvalidConfig(
                         f"{CUTE_CHUNK_PREFILL_SCHEDULE_KEY} must be one of {prefill_schedule.choices!r}"
                     )
+        state_transfer = self.cute_state_transfer_max_bits
+        if state_transfer is not None:
+            max_bits = config.setdefault(
+                CUTE_STATE_TRANSFER_MAX_BITS_KEY, state_transfer.default()
+            )
+            if type(max_bits) is not int or max_bits not in state_transfer.choices:
+                if _fix_invalid:
+                    config[CUTE_STATE_TRANSFER_MAX_BITS_KEY] = state_transfer.default()
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_STATE_TRANSFER_MAX_BITS_KEY} must be one of "
+                        f"{state_transfer.choices!r}, got {max_bits!r}"
+                    )
+        state_transport = self.cute_state_transfer_transport
+        if state_transport is not None:
+            transport = config.get(
+                CUTE_STATE_TRANSFER_TRANSPORT_KEY, state_transport.default()
+            )
+            if type(transport) is not str or transport not in state_transport.choices:
+                if _fix_invalid:
+                    transport = state_transport.default()
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_STATE_TRANSFER_TRANSPORT_KEY} must be one of "
+                        f"{state_transport.choices!r}, got {transport!r}"
+                    )
+            if transport == state_transport.default():
+                config.pop(CUTE_STATE_TRANSFER_TRANSPORT_KEY, None)
+            else:
+                config[CUTE_STATE_TRANSFER_TRANSPORT_KEY] = transport
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
             prepare_schedule = config.setdefault(
@@ -6182,6 +6263,8 @@ class ConfigSpec:
                 return True, "off"
             if key == "cute_signed_bitfield_bf16":
                 return True, False
+            if key == CUTE_STATE_TRANSFER_TRANSPORT_KEY:
+                return True, "register"
             if (
                 key == CUTE_CHAINED_MMA_SCHEDULE_KEY
                 and self._cute_chained_legacy_loop_fragments().keys() & config.keys()
@@ -6593,6 +6676,20 @@ class ConfigSpec:
                 CUTE_CHUNK_PREFILL_TASK_ORDER_KEY: self.cute_chunk_prefill_task_order,
                 CUTE_CHUNK_PREFILL_SCHEDULE_KEY: self.cute_chunk_prefill_schedule,
                 **self.user_defined_tunables,
+                **(
+                    {
+                        CUTE_STATE_TRANSFER_MAX_BITS_KEY: self.cute_state_transfer_max_bits
+                    }
+                    if self.cute_state_transfer_max_bits is not None
+                    else {}
+                ),
+                **(
+                    {
+                        CUTE_STATE_TRANSFER_TRANSPORT_KEY: self.cute_state_transfer_transport
+                    }
+                    if self.cute_state_transfer_transport is not None
+                    else {}
+                ),
             }
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
@@ -7205,6 +7302,14 @@ class ConfigSpec:
             if self.cute_matmul_min_blocks_search_enabled:
                 fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))
             fields.update(self.user_defined_tunables)
+            if self.cute_state_transfer_max_bits is not None:
+                fields[CUTE_STATE_TRANSFER_MAX_BITS_KEY] = (
+                    self.cute_state_transfer_max_bits
+                )
+            if self.cute_state_transfer_transport is not None:
+                fields[CUTE_STATE_TRANSFER_TRANSPORT_KEY] = (
+                    self.cute_state_transfer_transport
+                )
             return fields
 
         # Only add sequence keys that the backend supports

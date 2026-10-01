@@ -86,7 +86,12 @@ def _bind(call: ast.Call) -> Mapping[str, ast.expr]:
         if keyword.arg is not None
     }
     signature = inspect.signature(prepared_tcgen_edge.execute_prepared_issue)
-    return signature.bind(*call.args, **keywords).arguments
+    bound = signature.bind(*call.args, **keywords)
+    bound.apply_defaults()
+    return {
+        name: value if isinstance(value, ast.expr) else ast.Constant(value)
+        for name, value in bound.arguments.items()
+    }
 
 
 def _assert_controls(values: Mapping[str, ast.expr], action: DescriptorIssue) -> None:
@@ -104,6 +109,7 @@ def _assert_controls(values: Mapping[str, ast.expr], action: DescriptorIssue) ->
         "INITIALIZED": issue.initialized,
         "COMMIT": issue.commit,
         "WAIT_AFTER": issue.wait_after,
+        "ISSUER_ELECTED": False,
     }
     for name, value in expected.items():
         actual = ast.literal_eval(values[name])
@@ -123,7 +129,14 @@ def test_normal_public_six_issues_bind_actual_helper_abi(public_epoch_calls) -> 
     )
     for call, action in public_epoch_calls:
         assert len(call.args) == 4
-        assert tuple(keyword.arg for keyword in call.keywords) == parameters[4:]
+        assert parameters[-1] == "ISSUER_ELECTED"
+        assert (
+            inspect.signature(prepared_tcgen_edge.execute_prepared_issue)
+            .parameters["ISSUER_ELECTED"]
+            .default
+            is False
+        )
+        assert tuple(keyword.arg for keyword in call.keywords) == parameters[4:-1]
         _assert_controls(_bind(call), action)
 
 
@@ -148,7 +161,7 @@ def test_previous_positional_controls_are_rejected(
             ast.Constant(True),
             ast.Constant(True),
             ast.Constant(True),
-            *(values[name] for name in parameters[11:]),
+            *(values[name] for name in parameters[11:-1]),
         ],
         keywords=[],
     )

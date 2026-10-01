@@ -139,7 +139,9 @@ def test_prefill_segmented_abi_rejects_state_rounding_and_aliases() -> None:
             validate_args(_plan(), invalid)
 
 
-@pytest.mark.parametrize("task_order", ["identity", "longest_first_precompute"])
+@pytest.mark.parametrize(
+    "task_order", ["identity", "longest_first_precompute", "longest_first"]
+)
 def test_bt32_plan_and_host_resolution(task_order: str) -> None:
     pytest.importorskip("cutlass.cute")
     plan = _bt32_plan(task_order)
@@ -160,7 +162,7 @@ def test_bt32_plan_and_host_resolution(task_order: str) -> None:
         ("min_blocks_per_mp", 2),
         ("chunk_size", 16),
         ("numerical_policy", "native_bt16_bf16_rhs_v1"),
-        ("task_order", "longest_first"),
+        ("task_order", "invalid"),
         ("schedule", "prefix_tail_2"),
     ],
 )
@@ -195,7 +197,9 @@ def test_bt32_argument_guards(invalid: str) -> None:
         validate_args(plan, args)
 
 
-@pytest.mark.parametrize("task_order", ["identity", "longest_first_precompute"])
+@pytest.mark.parametrize(
+    "task_order", ["identity", "longest_first_precompute", "longest_first"]
+)
 def test_bt32_host_call_arguments(task_order: str) -> None:
     body: list[str] = []
     append_host_call(body, _bt32_plan(task_order))
@@ -220,7 +224,9 @@ def test_bt32_host_call_arguments(task_order: str) -> None:
     assert ast.literal_eval(call.args[19]) is True
     assert ast.literal_eval(call.args[21]) == 1024
     assert ast.unparse(call.args[22]) == "cutlass.BFloat16"
-    assert ast.literal_eval(call.args[23]) == "identity"
+    assert ast.literal_eval(call.args[23]) == (
+        "longest_first" if task_order == "longest_first" else "identity"
+    )
     code = "\n".join(body)
     assert "cute.make_layout((1, 16, 8, 128), stride=(128, 1024, 128, 1))" in code
     assert "cute.make_layout((1, 16, 8), stride=(8, 8, 1))" in code

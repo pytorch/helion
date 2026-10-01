@@ -193,6 +193,7 @@ def test_cohort_config_roundtrip_keeps_existing_flat_prefix(
             "cute_chained_drain_tile_columns",
             "cute_chained_island_consumers",
             "cute_chained_async_vector_store",
+            "cute_chained_fragment_epilogues",
         )
         assert tuple(fields)[-len(keys) :] == keys
         config = spec.normalized_config(

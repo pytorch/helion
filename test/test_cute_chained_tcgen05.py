@@ -1869,6 +1869,7 @@ def test_scalar_float_floor_keeps_existing_lowering() -> None:
     node = graph.call_function(operator.floordiv, (1.5, -3.0))
     node.meta["val"] = -1.0
     expression = _Expression.__new__(_Expression)
+    expression.fragments = {}
     assert expression.scalar(node) == "(1.5 // -3.0)"
 
 

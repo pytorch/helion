@@ -181,6 +181,9 @@ def _assert_old_prefix_and_seeds(spec: ConfigSpec) -> None:
     )
     if "cute_chained_async_vector_store" in fields:
         suffix += ("cute_chained_async_vector_store",)
+    if "cute_grid_work_order" in fields:
+        suffix += ("cute_grid_work_order",)
+    suffix += ("cute_chained_fragment_epilogues",)
     assert tuple(fields)[-len(suffix) :] == suffix
     index = _flat_scalar_index(spec, KEY)
     generation = spec.create_config_generation()

@@ -45,7 +45,8 @@ def test_legacy_prefill_has_no_nested_coordinate(chunk_size: int) -> None:
             "block_sizes",
             "cute_chunk_prefill_task_order",
             "cute_chunk_prefill_schedule",
-        )
+            "cute_state_transfer_max_bits",
+        ) + (("cute_state_transfer_transport",) if chunk_size == 32 else ())
         default = spec.default_config()
         assert spec.normalized_config(default.config | {KEY: False}) == default
         generation = spec.create_config_generation()

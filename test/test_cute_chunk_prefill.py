@@ -36,6 +36,7 @@ from helion._compiler.cute.chunk_prefill_prepared_output import bind_fast_output
 from helion._compiler.cute.chunk_prefill_prepared_pairwise import bind_fast_pairwise
 from helion._compiler.cute.chunk_prefill_prepared_state import bind_fast_state
 from helion._compiler.cute.chunk_prefill_prepared_state_abi import bind_fast_state_abi
+from helion._compiler.cute.chunk_prefill_prepared_warp_tiles import bind_fast_warp_tiles
 from helion._compiler.cute.prepared_graph_schedule import ContractionPartition
 from helion._compiler.cute.prepared_graph_schedule import order_issue_placements
 from helion._compiler.device_function import DeviceFunction
@@ -46,6 +47,7 @@ from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
 from helion.autotuner.config_spec import CUTE_CHUNK_PREFILL_SCHEDULE_KEY
 from helion.autotuner.config_spec import CUTE_CHUNK_PREFILL_TASK_ORDER_KEY
+from helion.autotuner.config_spec import CUTE_STATE_TRANSFER_MAX_BITS_KEY
 from helion.exc import InvalidConfig
 from helion.language.matmul_ops import dot
 from helion.language.memory_ops import store
@@ -341,10 +343,11 @@ def test_prefill_search_only_varies_effective_choices(bound: BoundKernel) -> Non
         "block_sizes",
         CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
         CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
+        CUTE_STATE_TRANSFER_MAX_BITS_KEY,
     }
     generation = bound.env.config_spec.create_config_generation()
     assert generation.block_size_indices == [0]
-    assert [fragment.cardinality() for fragment in generation.flat_spec] == [1, 3, 3]
+    assert [fragment.cardinality() for fragment in generation.flat_spec] == [1, 3, 3, 2]
     config = bound.env.config_spec.default_config()
     assert "chunk_prefill_sm100" in bound.to_triton_code(config)
 
@@ -393,6 +396,7 @@ def test_prefill_full_search_population_obeys_tensor_constraints(
             assert neighbor.key in (
                 CUTE_CHUNK_PREFILL_TASK_ORDER_KEY,
                 CUTE_CHUNK_PREFILL_SCHEDULE_KEY,
+                CUTE_STATE_TRANSFER_MAX_BITS_KEY,
             )
     assert generation.unflatten(
         generation.differential_mutation(*population[:4], crossover_rate=0.5)
@@ -495,12 +499,16 @@ def _assert_prefill_generic_search(
     spec = bound.config_spec
     assert spec.cute_chunk_prefill_task_order is None
     assert spec.cute_chunk_prefill_schedule is None
+    assert spec.cute_state_transfer_max_bits is None
     fields = spec._flat_fields()
     if spec.cute_chained_matmul_search_enabled:
         assert {"num_warps", "cute_chained_mma_schedule"} <= fields.keys()
     else:
         assert {"num_threads", "cute_vector_widths"} <= fields.keys()
     assert CUTE_CHUNK_PREFILL_TASK_ORDER_KEY not in fields
+    assert CUTE_STATE_TRANSFER_MAX_BITS_KEY not in fields
+    with pytest.raises(InvalidConfig, match="bound external-state ABI"):
+        spec.normalized_config(helion.Config(cute_state_transfer_max_bits=128))
     assert spec.block_sizes[0].min_size == 64
     assert spec.block_sizes[0].autotuner_min < spec.block_sizes[0].max_size
     assert spec.block_sizes[0].max_size >= 128
@@ -1154,6 +1162,9 @@ def test_bt32_shared_public_payloads_reach_host(
         "OUTPUT_PROGRAM": bind_fast_output(owner),
         "PAIRWISE_PROGRAM": bt32_shared.pairwise.payload(),
         "INVERSE_PROGRAM": bt32_shared.payload(),
+        "WARP_TILE_PROGRAM": bind_fast_warp_tiles(
+            bt32_shared.pairwise, bt32_shared
+        ).payload(),
     }
     plan = bt32_shared_plan
     for name, payload in expected.items():

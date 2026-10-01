@@ -21,6 +21,16 @@ if TYPE_CHECKING:
 
 
 def validate_plan(plan: dict[str, object]) -> None:
+    if "prepared_state_copy_program" in plan:
+        from ..._compiler.cute.chunk_prefill_prepared_state_copy import (
+            validate_fast_state_copy_payload,
+        )
+
+        if plan.get("device_abi") != 2 or "prepared_state_abi_program" not in plan:
+            raise exc.BackendUnsupported(
+                "cute", "raw state copy requires bound state ABI"
+            )
+        validate_fast_state_copy_payload(plan["prepared_state_copy_program"])
     if plan.get("device_abi") == 2:
         from ..._compiler.cute.chunk_prefill_bt32.config import PIPELINE_PLAN
 
@@ -359,9 +369,11 @@ def _append_bt32_host_call(body: list[str], plan: dict[str, object]) -> None:
             ("prepared_issue_program", "ISSUE_PROGRAM"),
             ("prepared_state_program", "STATE_PROGRAM"),
             ("prepared_state_abi_program", "STATE_ABI_PROGRAM"),
+            ("prepared_state_copy_program", "STATE_COPY_PROGRAM"),
             ("prepared_output_program", "OUTPUT_PROGRAM"),
             ("prepared_pairwise_program", "PAIRWISE_PROGRAM"),
             ("prepared_inverse_program", "INVERSE_PROGRAM"),
+            ("prepared_warp_tile_program", "WARP_TILE_PROGRAM"),
         )
         if key in plan
     )

@@ -4,8 +4,13 @@ import ast
 from dataclasses import replace
 import hashlib
 from textwrap import dedent
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
+from cuda.bindings.driver import CUstream
+import cutlass
+from cutlass import cute
+from cutlass.cute.runtime import make_ptr
 import pytest
 import torch
 
@@ -18,8 +23,13 @@ from helion import exc
 from helion._compiler.cute import chained_matmul as chain
 from helion._compiler.cute import chained_tcgen_stage as stage_module
 from helion._compiler.cute import chunk_recurrence
+from helion._compiler.cute import prepared_tcgen_edge
 from helion._compiler.cute.prepared_tcgen_binding import PreparedProjectionHost
 from helion._compiler.cute.prepared_tcgen_binding import PreparedTmemEdge
+from helion.runtime.cute.launcher import cute_cuda_graph
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class _Restore(ast.NodeTransformer):
@@ -468,3 +478,227 @@ def test_original_matched_host_default_source_and_mutation():
     finally:
         node.args = old
     host.check()
+
+
+@cute.kernel
+def _state_abi_transfer_kernel(
+    source: cute.Tensor,
+    destination: cute.Tensor,
+    valid_rows: cutlass.Int32,
+    BEGIN: cutlass.Constexpr,
+    COUNT: cutlass.Constexpr,
+    READ: cutlass.Constexpr,
+    NARROW: cutlass.Constexpr,
+) -> None:
+    row = cute.arch.thread_idx()[0]
+    valid = row < valid_rows
+    state_row = row
+    if not valid:
+        state_row = row + 1024
+    if cutlass.const_expr(READ):
+        if cutlass.const_expr(NARROW):
+            values = prepared_tcgen_edge.read_linear_state_abi(
+                source, (0, 0, state_row), BEGIN, COUNT, valid, MAX_BITS=128
+            )
+        else:
+            values = prepared_tcgen_edge.read_linear_state_abi(
+                source, (0, 0, state_row), BEGIN, COUNT, valid
+            )
+        for column in cutlass.range_constexpr(COUNT):
+            destination[0, 0, row, column] = values[column]
+    else:
+        values = cutlass.Array(cutlass.Float32, COUNT, alignment=16)
+        for column in cutlass.range_constexpr(COUNT):
+            values[column] = source[0, 0, row, column]
+        if cutlass.const_expr(NARROW):
+            prepared_tcgen_edge.store_linear_state_abi(
+                values,
+                destination,
+                (0, 0, state_row),
+                BEGIN,
+                COUNT,
+                valid,
+                MAX_BITS=128,
+            )
+        else:
+            prepared_tcgen_edge.store_linear_state_abi(
+                values, destination, (0, 0, state_row), BEGIN, COUNT, valid
+            )
+
+
+@cute.jit
+def _state_abi_transfer_host(
+    source_pointer: cute.Pointer,
+    destination_pointer: cute.Pointer,
+    valid_rows: cutlass.Int32,
+    ROW_STRIDE: cutlass.Constexpr,
+    INNER_STRIDE: cutlass.Constexpr,
+    BEGIN: cutlass.Constexpr,
+    COUNT: cutlass.Constexpr,
+    READ: cutlass.Constexpr,
+    NARROW: cutlass.Constexpr,
+    stream: CUstream,
+) -> None:
+    source_stride = ROW_STRIDE if READ else 64
+    source_inner = INNER_STRIDE if READ else 1
+    destination_stride = 64 if READ else ROW_STRIDE
+    destination_inner = 1 if READ else INNER_STRIDE
+    source = cute.make_tensor(
+        source_pointer,
+        cute.make_layout(
+            (1, 1, 32, 64),
+            stride=(
+                32 * source_stride,
+                32 * source_stride,
+                source_stride,
+                source_inner,
+            ),
+        ),
+    )
+    destination = cute.make_tensor(
+        destination_pointer,
+        cute.make_layout(
+            (1, 1, 32, 64),
+            stride=(
+                32 * destination_stride,
+                32 * destination_stride,
+                destination_stride,
+                destination_inner,
+            ),
+        ),
+    )
+    _state_abi_transfer_kernel(
+        source, destination, valid_rows, BEGIN, COUNT, READ, NARROW
+    ).launch(grid=(1, 1, 1), block=(32, 1, 1), stream=stream)
+
+
+@pytest.mark.parametrize("read", [True, False], ids=["read", "store"])
+@pytest.mark.parametrize(
+    "row_stride,inner_stride,begin,count",
+    [(132, 1, 0, 32), (132, 1, 4, 32), (132, 1, 1, 12), (260, 2, 0, 32)],
+    ids=["divergent_alignment", "begin4", "partial_unaligned", "strided"],
+)
+def test_linear_state_abi_exact_bits_and_masked_addresses(
+    read: bool,
+    row_stride: int,
+    inner_stride: int,
+    begin: int,
+    count: int,
+    tmp_path: Path,
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("requires Blackwell or newer CUDA device")
+    # No conversion through Python floats: preserve NaN payloads, signed zeros
+    # and subnormals. Read and store have independent physical-index oracles.
+    words = [
+        0x00000000,
+        0x80000000,
+        0x7F800000,
+        0xFF800000,
+        0x7FC00001,
+        0x7FC12345,
+        0xFFC54321,
+        0x00000001,
+        0x80000001,
+        0x007FFFFF,
+        0x807FFFFF,
+        0x3F800000,
+        0xBF012345,
+    ]
+    words = [word if word < 0x80000000 else word - 0x100000000 for word in words]
+    source_stride, source_inner = (row_stride, inner_stride) if read else (64, 1)
+    output_stride, output_inner = (64, 1) if read else (row_stride, inner_stride)
+    source_begin, output_begin = (begin, 0) if read else (0, begin)
+    stream = CUstream(torch.cuda.current_stream().cuda_stream)
+    for narrow in (False, True):
+        # Both orientations put 32-byte and 16-byte-only rows in the same warp.
+        for offset in (0, 4):
+            source_start = 8 + (offset if read else 0)
+            output_start = 8 + (0 if read else offset)
+            source_cpu = torch.tensor(
+                [words[index % len(words)] for index in range(32 * source_stride + 32)],
+                dtype=torch.int32,
+            )
+            poison_cpu = torch.full(
+                (32 * output_stride + 32,), 0x6BADCAFE, dtype=torch.int32
+            )
+            for row in range(32):
+                for column in range(64):
+                    poison_cpu[
+                        output_start + row * output_stride + column * output_inner
+                    ] = 0x5A17DEAD
+            source = source_cpu.cuda()
+            poison = poison_cpu.cuda()
+            output = poison.clone()
+            source_pointer = make_ptr(
+                cutlass.Float32,
+                source.data_ptr() + 4 * source_start,
+                cute.AddressSpace.gmem,
+                assumed_align=32 if read and offset == 0 else 16,
+            )
+            destination_pointer = make_ptr(
+                cutlass.Float32,
+                output.data_ptr() + 4 * output_start,
+                cute.AddressSpace.gmem,
+                assumed_align=32 if not read and offset == 0 else 16,
+            )
+            if row_stride == 132 and begin % 4 == 0:
+                state_address = (
+                    source.data_ptr() + 4 * source_start
+                    if read
+                    else output.data_ptr() + 4 * output_start
+                )
+                assert {
+                    (state_address + row * row_stride * 4) % 32 for row in range(32)
+                } == {0, 16}
+            native_dir = tmp_path / f"{narrow}-{offset}"
+            native_dir.mkdir()
+            compiled = cute.compile(
+                _state_abi_transfer_host,
+                source_pointer,
+                destination_pointer,
+                cutlass.Int32(32),
+                row_stride,
+                inner_stride,
+                begin,
+                count,
+                read,
+                narrow,
+                stream,
+                options=f"--enable-tvm-ffi --keep-ptx --dump-dir {native_dir}",
+            )
+            instruction = "ld.global.v4.b64" if read else "st.global.v4.b64"
+            assert (instruction in compiled.__ptx__) == (
+                not narrow and inner_stride == 1 and count % 8 == 0
+            )
+            for valid_rows in (32, 17, 0):
+                expected = poison_cpu.clone()
+                for row in range(32):
+                    for column in range(count):
+                        destination_index = (
+                            output_start
+                            + row * output_stride
+                            + (output_begin + column) * output_inner
+                        )
+                        if row < valid_rows:
+                            source_index = (
+                                source_start
+                                + row * source_stride
+                                + (source_begin + column) * source_inner
+                            )
+                            expected[destination_index] = source_cpu[source_index]
+                        elif read:
+                            expected[destination_index] = 0
+                call = (source_pointer, destination_pointer, cutlass.Int32(valid_rows))
+                output.copy_(poison)
+                compiled(*call, stream)
+                assert torch.equal(output.cpu(), expected)
+                assert torch.equal(source.cpu(), source_cpu)
+                with cute_cuda_graph() as graph:
+                    compiled(*call, CUstream(torch.cuda.current_stream().cuda_stream))
+                for _replay in range(2):
+                    output.copy_(poison)
+                    graph.replay()
+                    assert torch.equal(output.cpu(), expected)
+                    assert torch.equal(source.cpu(), source_cpu)
+                graph.reset()

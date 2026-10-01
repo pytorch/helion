@@ -37,7 +37,7 @@ class FastPairwise:
         ):
             raise chain._UnsupportedChain("foreign pairwise partition")
 
-    def payload(self) -> tuple[tuple[int, ...], ...]:
+    def payload(self) -> tuple[tuple[int, int, int, int, int], ...]:
         from .chunk_prefill_bt32 import common as cm
 
         self.check()

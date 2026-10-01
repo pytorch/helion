@@ -35,6 +35,37 @@ def warp_sequence_order(cu_seqlens: cute.Tensor) -> cutlass.Int32:
 
 
 @cute.jit
+def select_sequence_by_length_cta(
+    cu_seqlens: cute.Tensor,
+    sequence_slot: cutlass.Int32,
+    thread: cutlass.Int32,
+    THREADS: cutlass.Constexpr,
+) -> cutlass.Int32:
+    """Select the stable length rank using the existing CTA-wide algorithm."""
+    selected = cutlass.Array(
+        cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4
+    )
+    sequences = cutlass.Int32(cute.size(cu_seqlens) - 1)
+    for candidate in cutlass.range(thread, sequences, THREADS):
+        length = cutlass.Int32(cu_seqlens[candidate + 1]) - cutlass.Int32(
+            cu_seqlens[candidate]
+        )
+        rank = cutlass.Int32(0)
+        for other in cutlass.range(sequences):
+            other_length = cutlass.Int32(cu_seqlens[other + 1]) - cutlass.Int32(
+                cu_seqlens[other]
+            )
+            if (other_length > length) | (
+                (other_length == length) & (other < candidate)
+            ):
+                rank += cutlass.Int32(1)
+        if rank == sequence_slot:
+            selected[0] = candidate
+    cute.arch.barrier()
+    return selected[0]
+
+
+@cute.jit
 def select_sequence_by_length(
     cu_seqlens: cute.Tensor,
     sequence_slot: cutlass.Int32,
@@ -51,27 +82,9 @@ def select_sequence_by_length(
         index = warp_sequence_order(cu_seqlens)
         result = cute.arch.shuffle_sync(index, sequence_slot)
     else:
-        selected = cutlass.Array(
-            cutlass.Int32, 1, space=cutlass.AddressSpace.smem, alignment=4
+        result = select_sequence_by_length_cta(
+            cu_seqlens, sequence_slot, thread, THREADS
         )
-        sequences = cutlass.Int32(cute.size(cu_seqlens) - 1)
-        for candidate in cutlass.range(thread, sequences, THREADS):
-            length = cutlass.Int32(cu_seqlens[candidate + 1]) - cutlass.Int32(
-                cu_seqlens[candidate]
-            )
-            rank = cutlass.Int32(0)
-            for other in cutlass.range(sequences):
-                other_length = cutlass.Int32(cu_seqlens[other + 1]) - cutlass.Int32(
-                    cu_seqlens[other]
-                )
-                if (other_length > length) | (
-                    (other_length == length) & (other < candidate)
-                ):
-                    rank += cutlass.Int32(1)
-            if rank == sequence_slot:
-                selected[0] = candidate
-        cute.arch.barrier()
-        result = selected[0]
     return result
 
 

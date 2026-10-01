@@ -16,6 +16,9 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from ..chunk_prefill_prepared_state_copy import validate_fast_state_copy_payload
+from ..prepared_state_copy import raw_state_copy_eligible
+from ..prepared_tcgen_edge import initialize_prepared_state_copy
 from ..sequence_order import select_sequence_by_length
 from ..warp_specialized_primitives import initialize_mbarrier_region
 from . import common as cm
@@ -32,7 +35,7 @@ NUMERICAL_POLICY = "centered_bt32_fp32_rhs_v2"
 
 
 @cute.jit
-def init_barriers(smem_base, lane):
+def init_barriers(smem_base, lane, STATE_COPY_PROGRAM: cutlass.Constexpr = None):
     """Initialize the packed barrier regions cooperatively in one warp."""
     initialize_mbarrier_region(
         smem_base,
@@ -51,6 +54,8 @@ def init_barriers(smem_base, lane):
     if lane == 0:
         prims.mbarrier_init(cm.sptr(smem_base, cm.OUT_EMPTY, cutlass.Int64), 1)
         prims.mbarrier_init(cm.sptr(smem_base, cm.DONE, cutlass.Int64), 8)
+        if cutlass.const_expr(STATE_COPY_PROGRAM is not None):
+            initialize_prepared_state_copy(STATE_COPY_PROGRAM, smem_base)
     prims.fence_mbarrier_init()
 
 
@@ -62,6 +67,7 @@ def kernel(
     desc_beta: cutlass.GridConstant[cuda.TensorMap],
     desc_v: cutlass.GridConstant[cuda.TensorMap],
     desc_out: cutlass.GridConstant[cuda.TensorMap],
+    desc_initial: cutlass.GridConstant[cuda.TensorMap] | None,
     q: cute.Tensor,
     k: cute.Tensor,
     v: cute.Tensor,
@@ -80,8 +86,10 @@ def kernel(
     ISSUE_PROGRAM: cutlass.Constexpr = None,
     STATE_PROGRAM: cutlass.Constexpr = None,
     STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    STATE_COPY_PROGRAM: cutlass.Constexpr = None,
     OUTPUT_PROGRAM: cutlass.Constexpr = None,
     PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    WARP_TILE_PROGRAM: cutlass.Constexpr = None,
     INVERSE_PROGRAM: cutlass.Constexpr = None,
     FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
     FACTOR_INPUTS: cutlass.Constexpr = None,
@@ -111,7 +119,11 @@ def kernel(
     )
     smem_base = cutlass.Int32(storage.data_ptr().toint())
     if warp == 10:
-        init_barriers(smem_base, lane)
+        init_barriers(
+            smem_base,
+            lane,
+            STATE_COPY_PROGRAM if desc_initial is not None else None,
+        )
     if warp == 0:
         prims.tcgen05_alloc(
             cm.sptr(smem_base, cm.TMEM_ADDR, cutlass.Int32),
@@ -128,6 +140,7 @@ def kernel(
         state_loop(
             smem_base,
             tmem_base,
+            desc_initial,
             initial_state,
             final_state,
             sequence,
@@ -139,6 +152,7 @@ def kernel(
             gate_scale_log2,
             STATE_PROGRAM=STATE_PROGRAM,
             STATE_ABI_PROGRAM=STATE_ABI_PROGRAM,
+            STATE_COPY_PROGRAM=STATE_COPY_PROGRAM,
             STATE_PUBLICATIONS=STATE_PUBLICATIONS,
         )
     elif warp < cm.OUTPUT_LAST_WARP:
@@ -163,6 +177,21 @@ def kernel(
             issuer_loop(smem_base, tmem_base, num_chunks, ISSUE_PROGRAM=ISSUE_PROGRAM)
     else:
         prims.setmaxregister(cm.FACTOR_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
+        if cutlass.const_expr(desc_initial is not None):
+            if cutlass.const_expr(STATE_COPY_PROGRAM[0] in (2, 3)):
+                # The checked lease ends at the last producer warp. Release
+                # registers before waiting, and wait before any stage access.
+                if warp >= STATE_COPY_PROGRAM[8]:
+                    cm.wait(
+                        cm.sptr(
+                            smem_base,
+                            STATE_COPY_PROGRAM[6]
+                            + (24 if STATE_COPY_PROGRAM[0] == 2 else 16),
+                            cutlass.Int64,
+                        ),
+                        cutlass.Int32(0),
+                    )
+                    prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         factor_loop(
             smem_base,
             q,
@@ -188,6 +217,7 @@ def kernel(
             scale,
             gate_scale_log2,
             PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+            WARP_TILE_PROGRAM=WARP_TILE_PROGRAM,
             INVERSE_PROGRAM=INVERSE_PROGRAM,
             FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
             FACTOR_INPUTS=FACTOR_INPUTS,
@@ -333,14 +363,20 @@ def host(
     ISSUE_PROGRAM: cutlass.Constexpr = None,
     STATE_PROGRAM: cutlass.Constexpr = None,
     STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    STATE_COPY_PROGRAM: cutlass.Constexpr = None,
     OUTPUT_PROGRAM: cutlass.Constexpr = None,
     PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    WARP_TILE_PROGRAM: cutlass.Constexpr = None,
     INVERSE_PROGRAM: cutlass.Constexpr = None,
     FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
     FACTOR_INPUTS: cutlass.Constexpr = None,
     GATE_PUBLICATIONS: cutlass.Constexpr = None,
     STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
+    if cutlass.const_expr(STATE_COPY_PROGRAM is not None):
+        validate_fast_state_copy_payload(STATE_COPY_PROGRAM)
+        if cutlass.const_expr(STATE_ABI_PROGRAM is None):
+            raise ValueError("raw state copy requires a bound state ABI")
     _validate_metadata(
         q,
         k,
@@ -421,6 +457,68 @@ def host(
             stride_order=(0, 1, 2, 3),
             swizzle=cuda.TensorMapSwizzle.s128b,
         )
+        desc_initial = None
+        if cutlass.const_expr(
+            STATE_COPY_PROGRAM is not None and initial_state is not None
+        ):
+            if cutlass.const_expr(
+                initial_state.element_type is cutlass.Float32
+                and raw_state_copy_eligible(
+                    initial_state.shape,
+                    initial_state.stride,
+                    initial_state.iterator.alignment,
+                )
+            ):
+                if cutlass.const_expr(STATE_COPY_PROGRAM[0] == 3):
+                    initial_layout = cute.make_layout(
+                        (
+                            32,
+                            initial_state.shape[2],
+                            initial_state.shape[3] // 32,
+                            initial_state.shape[1],
+                            initial_state.shape[0],
+                        ),
+                        stride=(
+                            initial_state.stride[3],
+                            initial_state.stride[2],
+                            32 * initial_state.stride[3],
+                            initial_state.stride[1],
+                            initial_state.stride[0],
+                        ),
+                    )
+                    desc_initial = cuda.create_tensor_map_tiled_from_view(
+                        cute.make_tensor(initial_state.iterator, initial_layout),
+                        box_dims=(
+                            32,
+                            STATE_COPY_PROGRAM[1],
+                            STATE_COPY_PROGRAM[7],
+                            1,
+                            1,
+                        ),
+                        stride_order=(0, 1, 2, 3, 4),
+                        swizzle=cuda.TensorMapSwizzle.s128b,
+                    )
+                else:
+                    initial_layout = cute.make_layout(
+                        (
+                            initial_state.shape[3],
+                            initial_state.shape[2],
+                            initial_state.shape[1],
+                            initial_state.shape[0],
+                        ),
+                        stride=(
+                            initial_state.stride[3],
+                            initial_state.stride[2],
+                            initial_state.stride[1],
+                            initial_state.stride[0],
+                        ),
+                    )
+                    desc_initial = cuda.create_tensor_map_tiled_from_view(
+                        cute.make_tensor(initial_state.iterator, initial_layout),
+                        box_dims=(STATE_COPY_PROGRAM[3], STATE_COPY_PROGRAM[1], 1, 1),
+                        stride_order=(0, 1, 2, 3),
+                        swizzle=cuda.TensorMapSwizzle.s128b,
+                    )
         kernel(
             desc_q,
             desc_k,
@@ -428,6 +526,7 @@ def host(
             desc_beta,
             desc_v,
             desc_out,
+            desc_initial,
             q,
             k,
             v,
@@ -446,8 +545,10 @@ def host(
             ISSUE_PROGRAM=ISSUE_PROGRAM,
             STATE_PROGRAM=STATE_PROGRAM,
             STATE_ABI_PROGRAM=STATE_ABI_PROGRAM,
+            STATE_COPY_PROGRAM=STATE_COPY_PROGRAM,
             OUTPUT_PROGRAM=OUTPUT_PROGRAM,
             PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+            WARP_TILE_PROGRAM=WARP_TILE_PROGRAM,
             INVERSE_PROGRAM=INVERSE_PROGRAM,
             FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
             FACTOR_INPUTS=FACTOR_INPUTS,

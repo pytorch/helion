@@ -193,7 +193,22 @@ def register_chunk_prefill_search(env: CompileEnvironment, device_ir: DeviceIR) 
     )
     if specialization.classifier(values) is True:
         assert region is not None
+        from .chunk_prefill_prepared_state_abi import bind_external_state_abi
+
+        semantic_root = next(
+            graph
+            for graph in device_ir.cute_semantic_graphs
+            if graph.graph_id == region.root_graph_id
+        )
+        # Register only after the actual external-state nodes, precision,
+        # lifetime cuts and zero-trip copy have passed their shared binder.
+        bind_external_state_abi(region, semantic_root)
+        env.config_spec.enable_cute_state_transfer_search()
         if region.chunk_size == 32:
+            # The original root state ABI admits the search coordinate. The
+            # scratch lease additionally binds native recurrence/output cuts
+            # during codegen, when concrete tile extents are available.
+            env.config_spec.enable_cute_state_transport_search()
             env.config_spec.enable_cute_chunk_prefill_task_order_search(
                 schedules=("single",),
                 task_orders=("identity", "longest_first", "longest_first_precompute"),
@@ -310,7 +325,9 @@ def _bt16_prepared_bindings(
         "prepared_issue_program": bind_bt16_issues(owner),
         "prepared_state_program": bind_bt16_state(owner),
         "prepared_output_program": bind_bt16_output(owner),
-        "prepared_state_abi_program": bind_bt16_state_abi(owner, root),
+        "prepared_state_abi_program": bind_bt16_state_abi(
+            owner, root, max_bits=cg.device_function.config.cute_state_transfer_max_bits
+        ),
         "prepared_factor_publications": bind_bt16_factor_publications(cg, owner),
         "prepared_state_publications": bind_bt16_state_publications(cg, owner),
         "prepared_factor_inputs": bind_bt16_inputs(cg, owner),
@@ -330,6 +347,7 @@ def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
     from .chunk_prefill_prepared_publication import bind_fast_factor_publications
     from .chunk_prefill_prepared_state import bind_fast_state
     from .chunk_prefill_prepared_state_abi import bind_fast_state_abi
+    from .chunk_prefill_prepared_state_copy import bind_fast_state_copy
     from .chunk_prefill_prepared_state_publication import bind_fast_state_publications
 
     df = cg.device_function
@@ -369,6 +387,9 @@ def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
     recurrence = bind_fast_recurrence(region, semantic_loop)
     pairwise = bind_fast_pairwise(recurrence)
     inverse = bind_fast_inverse(recurrence, pairwise)
+    from .chunk_prefill_prepared_warp_tiles import bind_fast_warp_tiles
+
+    warp_tiles = bind_fast_warp_tiles(pairwise, inverse)
     semantic_root = next(
         graph
         for graph in cg.host_function.device_ir.cute_semantic_graphs
@@ -400,9 +421,31 @@ def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
             "smem_bytes": PIPELINE_PLAN.shared_bytes,
             "prepared_issue_program": recurrence.payload(),
             "prepared_state_program": bind_fast_state(recurrence),
-            "prepared_state_abi_program": bind_fast_state_abi(region, semantic_root),
+            "prepared_state_abi_program": bind_fast_state_abi(
+                region,
+                semantic_root,
+                max_bits=df.config.cute_state_transfer_max_bits,
+            ),
+            **(
+                {
+                    "prepared_state_copy_program": bind_fast_state_copy(
+                        recurrence,
+                        semantic_root,
+                        pipelined=df.config.cute_state_transfer_transport
+                        == "tma_pipelined",
+                        planes_per_transfer=(
+                            2
+                            if df.config.cute_state_transfer_transport == "tma_planar"
+                            else 1
+                        ),
+                    ).payload()
+                }
+                if df.config.cute_state_transfer_transport != "register"
+                else {}
+            ),
             "prepared_output_program": bind_fast_output(recurrence),
             "prepared_pairwise_program": pairwise.payload(),
+            "prepared_warp_tile_program": warp_tiles.payload(),
             "prepared_inverse_program": inverse.payload(),
             "prepared_factor_publications": bind_fast_factor_publications(
                 cg, pairwise, inverse

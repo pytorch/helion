@@ -18,6 +18,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from test._cute_prepared_source import expand_prepared_root_source
 from test.test_cute_chained_accumulator import _cpu
 from test.test_cute_chained_accumulator import _late_rhs_args
 from test.test_cute_chained_accumulator import _late_rhs_code
@@ -539,6 +540,8 @@ def test_source_halves_seed_and_phases(dtype, n, mode):
     control = k_schedule_source("full", args)
     new = k_schedule_source(mode, args)
     assert control == _late_rhs_code(args, **FLAGS)
+    control = expand_prepared_root_source(control)
+    new = expand_prepared_root_source(new)
     assert "cute.local_tile(chain_1_a, (128, 64), (0, chain_k_half))" in new
     assert "chain_k_half * 64 + chain_thread % 8 * 8" in new
     assert "chain_1_local_kk in cutlass.range_constexpr(4)" in new
@@ -862,7 +865,9 @@ def leaf_source(mode="paired_tma", values=None, **kw):
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize("schedule", ("serial64", "overlap64"))
 def test_source(dtype, schedule):
-    code = leaf_source(values=args(dtype), schedule=schedule)
+    code = expand_prepared_root_source(
+        leaf_source(values=args(dtype), schedule=schedule)
+    )
     ast.parse(code)
     assert "chained_paired_leaf_tma" in code
     assert "16384" in code
@@ -1059,7 +1064,7 @@ def test_exact_scalar_fallback_and_uniform_phase_drain():
 
 
 def test_phase_order_and_typed_arithmetic():
-    code = leaf_source()
+    code = expand_prepared_root_source(leaf_source())
     # First A retires before descriptor issue; this issue overlaps seed work.
     assert (
         code.index("mbarrier_wait(chain_bars + 0, 0)")

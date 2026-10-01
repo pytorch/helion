@@ -104,6 +104,7 @@ def test_actual_complete_epoch_walk_and_original_host_link(tmp_path):
 
 @pytest.mark.parametrize("mutation", (None, "missing", "both"))
 def test_actual_emitted_callable_reaches_original_default_wrapper(tmp_path, mutation):
+    before_cuda = torch.cuda.is_initialized()
     source = _code()
     path = tmp_path / "epoch_source.py"
     path.write_text(source)
@@ -148,7 +149,7 @@ def test_actual_emitted_callable_reaches_original_default_wrapper(tmp_path, muta
             text = inspect.getsource(wrapper)
             assert "EPOCH_KERNEL=_helion_epoch_kernel" in text
             assert "_helion_sm100_chain_host(" in text
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == before_cuda
 
 
 @pytest.mark.parametrize(
@@ -231,3 +232,21 @@ def test_actual_epoch_mutations_reject(mutation):
         _code()
     assert seen == [True]
     assert isinstance(caught.value.__cause__, chain._UnsupportedChain)
+
+
+@pytest.mark.parametrize("cuda_initialized", [False, True])
+@pytest.mark.parametrize("mutation", (None, "missing", "both"))
+def test_default_wrapper_preserves_prior_cuda_state(
+    tmp_path, mutation, cuda_initialized
+):
+    with (
+        patch("torch.cuda.is_initialized", return_value=cuda_initialized),
+        # FakeTensor normalizes an initialized CUDA device through this metadata.
+        patch("torch.cuda.current_device", return_value=0),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
+        patch("cutlass.cute.compile", side_effect=AssertionError("native forbidden")),
+    ):
+        test_actual_emitted_callable_reaches_original_default_wrapper(
+            tmp_path, mutation
+        )
+        assert torch.cuda.is_initialized() == cuda_initialized

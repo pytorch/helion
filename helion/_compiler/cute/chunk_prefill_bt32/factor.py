@@ -20,6 +20,8 @@ import cutlass.experimental.primitives as prims
 from ..prepared_warp_contraction import execute_prepared_blockdiag_fragment
 from ..prepared_warp_contraction import execute_prepared_warp_fragment
 from ..prepared_warp_contraction import execute_prepared_warp_k
+from ..prepared_warp_tile_executor import execute_prepared_warp_tiles
+from ..prepared_warp_tile_executor import prepared_warp_tile_join
 from . import common as cm
 from helion._compiler.cute.affine_recurrence_primitives import mma_blockdiag_8x8_f16
 from helion._compiler.cute.affine_recurrence_primitives import mma_m16n8k16_bf16
@@ -941,6 +943,7 @@ def factor_loop(
     scale: cutlass.Float32,
     gate_scale_log2: cutlass.Float32,
     PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    WARP_TILE_PROGRAM: cutlass.Constexpr = None,
     INVERSE_PROGRAM: cutlass.Constexpr = None,
     FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
     FACTOR_INPUTS: cutlass.Constexpr = None,
@@ -1132,7 +1135,10 @@ def factor_loop(
                 FACTOR_INPUTS,
             )
         # The CTA barrier orders ordinary shared writes before pairwise reads.
-        cm.team_sync(team)
+        if cutlass.const_expr(WARP_TILE_PROGRAM is None):
+            cm.team_sync(team)
+        else:
+            prepared_warp_tile_join(team, WARP_TILE_PROGRAM)
         total = cm.sptr(
             smem_base, cm.PREFIX_LAST + stage_bytes + phase_tid * 4, cutlass.Float32
         ).load()
@@ -1210,39 +1216,52 @@ def factor_loop(
             store_inverse_work(
                 smem_base, cm.INV_WORK + stage_bytes, zero8(), row_base, col_base, lane
             )
-        qk = zero8()
-        if row_base >= col_base:
-            if cutlass.const_expr(PAIRWISE_PROGRAM is None):
-                qk = pairwise16(
-                    smem_base,
-                    cm.QD + stage_bytes,
-                    cm.KI + stage_bytes,
-                    row_base,
-                    col_base,
-                    lane,
-                )
-            else:
-                qk = prepared_pairwise16(
-                    smem_base,
-                    stage_bytes,
-                    row_base,
-                    col_base,
-                    lane,
-                    PAIRWISE_PROGRAM[1],
-                )
-        store_qk_transpose(
-            smem_base,
-            cm.FINAL_TRANS + stage_bytes,
-            qk,
-            row_base,
-            col_base,
-            lane,
-            PUBLICATION=None
-            if cutlass.const_expr(FACTOR_PUBLICATIONS is None)
-            else FACTOR_PUBLICATIONS[1],
-        )
+        if cutlass.const_expr(WARP_TILE_PROGRAM is None):
+            qk = zero8()
+            if row_base >= col_base:
+                if cutlass.const_expr(PAIRWISE_PROGRAM is None):
+                    qk = pairwise16(
+                        smem_base,
+                        cm.QD + stage_bytes,
+                        cm.KI + stage_bytes,
+                        row_base,
+                        col_base,
+                        lane,
+                    )
+                else:
+                    qk = prepared_pairwise16(
+                        smem_base,
+                        stage_bytes,
+                        row_base,
+                        col_base,
+                        lane,
+                        PAIRWISE_PROGRAM[1],
+                    )
+            store_qk_transpose(
+                smem_base,
+                cm.FINAL_TRANS + stage_bytes,
+                qk,
+                row_base,
+                col_base,
+                lane,
+                PUBLICATION=None
+                if cutlass.const_expr(FACTOR_PUBLICATIONS is None)
+                else FACTOR_PUBLICATIONS[1],
+            )
+        else:
+            execute_prepared_warp_tiles(
+                smem_base,
+                stage_bytes,
+                local_warp,
+                lane,
+                WARP_TILE_PROGRAM,
+                FACTOR_PUBLICATIONS[1],
+            )
         # The CTA barrier orders ordinary shared writes before restore reads.
-        cm.team_sync(team)
+        if cutlass.const_expr(WARP_TILE_PROGRAM is None):
+            cm.team_sync(team)
+        else:
+            prepared_warp_tile_join(team, WARP_TILE_PROGRAM)
         if local_warp == 0:
             finish_inverse32(
                 smem_base,

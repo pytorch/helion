@@ -28,11 +28,13 @@ def prefill_bound(request: pytest.FixtureRequest):
 
 def test_whole_root_has_only_effective_fields_and_exact_opt_out(prefill_bound):
     spec = prefill_bound.config_spec
+    region = prefill_bound.host_function.device_ir.cute_chunk_prefill_region
     assert tuple(spec._flat_fields()) == (
         "block_sizes",
         "cute_chunk_prefill_task_order",
         "cute_chunk_prefill_schedule",
-    )
+        "cute_state_transfer_max_bits",
+    ) + (("cute_state_transfer_transport",) if region.chunk_size == 32 else ())
     absent = helion.Config(block_sizes=[64])
     disabled = helion.Config(block_sizes=[64], cute_native_matmul_metadata=False)
     assert spec.normalized_config(absent) == spec.normalized_config(disabled)

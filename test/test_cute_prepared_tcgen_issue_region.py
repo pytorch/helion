@@ -142,8 +142,19 @@ def test_installed_region_analysis(original):
     assert full_writes == (4 if original else 0)
 
 
-def test_actual_preprocess_does_not_capture_incoming_operands():
-    inner = vars(shared.execute_prepared_issue)["__wrapped__"]
+def test_actual_preprocess_does_not_capture_incoming_operands(tmp_path):
+    # Other tests can populate CuTe's in-place preprocessing cache. Load the
+    # actual source afresh so this test always observes its first transition.
+    assert shared.__file__ is not None
+    path = tmp_path / "prepared_issue.py"
+    path.write_text(Path(shared.__file__).read_text())
+    spec = importlib.util.spec_from_file_location(
+        "helion._compiler.cute._isolated_issue", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    inner = vars(module.execute_prepared_issue)["__wrapped__"]
     code, fields = inner.__code__, dict(vars(inner))
     analyzer = DSLPreprocessor.analyze_region_variables
     observed = []

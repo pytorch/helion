@@ -7,6 +7,7 @@ from helion.runtime.cute.launcher import default_cute_launcher
 
 cute = pytest.importorskip("cutlass.cute")
 sequence_order = pytest.importorskip("helion._compiler.cute.sequence_order")
+chunk_prefill_tmem = pytest.importorskip("helion._compiler.cute.chunk_prefill_tmem")
 
 
 @pytest.mark.parametrize("sequences", [1, 7, 32, 33, 513])
@@ -63,16 +64,24 @@ def _inline_order(cu: cute.Tensor, order: cute.Tensor) -> None:
         order[slot, thread // 32] = index
 
 
-@pytest.mark.parametrize("sequences", [1, 7, 32, 33, 513])
-def test_inline_sequence_order_captures_live_offsets(sequences: int) -> None:
+@cute.kernel
+def _cta_order(cu: cute.Tensor, order: cute.Tensor) -> None:
+    thread, _, _ = cute.arch.thread_idx()
+    slot, _, _ = cute.arch.block_idx()
+    index = chunk_prefill_tmem.length_ordered_sequence(cu, slot, thread)
+    if thread % 32 == 0:
+        order[slot, thread // 32] = index
+
+
+def _check_inline_order(cute_kernel: object, sequences: int, threads: int) -> None:
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     cu = torch.empty(sequences + 1, device="cuda", dtype=torch.int64)
-    order = torch.empty((sequences, 32), device="cuda", dtype=torch.int32)
+    order = torch.empty((sequences, threads // 32), device="cuda", dtype=torch.int32)
 
     def launch() -> None:
         default_cute_launcher(
-            _inline_order, (sequences,), cu, order, block=(1024, 1, 1)
+            cute_kernel, (sequences,), cu, order, block=(threads, 1, 1)
         )
 
     cu.zero_()
@@ -95,8 +104,18 @@ def test_inline_sequence_order_captures_live_offsets(sequences: int) -> None:
         graph.replay()
         torch.cuda.synchronize()
         expected = [
-            [index] * 32
+            [index] * (threads // 32)
             for index in sorted(range(sequences), key=lambda i: -lengths[i])
         ]
         assert order.tolist() == expected
         assert torch.equal(cu, snapshot)
+
+
+@pytest.mark.parametrize("sequences", [1, 7, 32, 33, 513])
+def test_inline_sequence_order_captures_live_offsets(sequences: int) -> None:
+    _check_inline_order(_inline_order, sequences, 1024)
+
+
+@pytest.mark.parametrize("sequences", [1, 7, 32, 33, 513])
+def test_cta_sequence_order_captures_live_offsets(sequences: int) -> None:
+    _check_inline_order(_cta_order, sequences, 512)
