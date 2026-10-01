@@ -1515,6 +1515,10 @@ class GraphInterpreter(LoweringContext, Interpreter):
             self.cg.record_codegen_result(node, result)
 
     def run_node(self, n: Node) -> object:
+        if self.cg.device_function.inband_polls:
+            from .triton.distributed_ops import flush_inband_polls
+
+            flush_inband_polls(self.cg, n)
         if n.op == "call_function":
             with (
                 self.cg.statement_owner_node(n),

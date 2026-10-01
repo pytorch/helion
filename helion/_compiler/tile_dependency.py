@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 
 TILE_DEPENDENCY_SITE_IDS_META = "_tile_dependency_site_ids"
 TILE_DEPENDENCY_SITE_ID_ATTR = "_tile_dependency_site_id"
+# FX node meta key: the TileAccess ids a memory op contributes.
+TILE_ACCESS_META = "tile_access_ids"
 _ALLOCATION_ADDRESS_AXIS = -1
 _MAX_RELATION_PIECES = 4_096
 _MAX_RELATION_PRODUCT_STATES = 65_536
@@ -4735,6 +4737,24 @@ class TileDependencyGraph:
             return "inband"
         return "peer_counter"
 
+    def is_inband(self, access: TileAccess) -> bool:
+        """Whether codegen emits an access as an inband push or poll."""
+        return access.allocation_id in self.inband_allocation_ids and (
+            access.kind == "store" or access.owner_rank is not None
+        )
+
+    def inband_numel(self, allocation_id: int) -> int:
+        """Elements per mailbox slot: R2 makes the store fill the buffer."""
+        store = next(
+            access
+            for access in self.accesses
+            if access.allocation_id == allocation_id and access.kind == "store"
+        )
+        return math.prod(
+            _concrete_integer(extent, description="inband shape")
+            for extent in store.tensor_shape
+        )
+
     def crosses_ranks(self) -> bool:
         """Whether any dependency needs a cross-rank transport."""
         return any(
@@ -4751,7 +4771,10 @@ class TileDependencyGraph:
                 for a in self.accesses
             ),
             repr(self.task_families),
-            tuple(sorted(self.inband_allocation_ids)),
+            tuple(
+                (allocation_id, self.inband_numel(allocation_id))
+                for allocation_id in sorted(self.inband_allocation_ids)
+            ),
             tuple(
                 sorted(
                     {

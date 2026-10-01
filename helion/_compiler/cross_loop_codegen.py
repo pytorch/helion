@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -533,6 +534,100 @@ def _register_cross_loop_state(
     return name
 
 
+@dataclasses.dataclass(frozen=True)
+class PeerState:
+    """Symmetric uint64 state: inband mailboxes, peer counters, a done slot.
+
+    Laid out from the dependency graph alone, so body codegen and the
+    schedule agree on it whichever registers it first.
+    """
+
+    state: str
+    epoch: str
+    ptrs: str
+    rank: str
+    bases: tuple[str, ...]
+    # allocation id -> (first word, elements per slot)
+    mailboxes: dict[int, tuple[int, int]]
+    slots: dict[int, int]
+    done: int
+
+    def mailbox(self, allocation_id: int, source: object) -> str:
+        """Word offset of ``source``'s slot for this launch's parity."""
+        offset, numel = self.mailboxes[allocation_id]
+        return (
+            f"{offset} + tl.cast({self.epoch} & 1, tl.int64) * "
+            f"{len(self.bases) * numel} + {source} * {numel}"
+        )
+
+
+def peer_state(device_function: DeviceFunction) -> PeerState | None:
+    """Register the peer state once per kernel if any dependency crosses ranks."""
+    if device_function.peer_state is not None:
+        return device_function.peer_state
+    graph = HostFunction.current().device_ir.tile_dependency_graph
+    if graph is None or not graph.crosses_ranks():
+        return None
+    process_group_name = CompileEnvironment.current().process_group_name
+    assert process_group_name is not None
+    world_size = torch.distributed.get_world_size(
+        _resolve_process_group(process_group_name)
+    )
+    mailboxes: dict[int, tuple[int, int]] = {}
+    words = 0
+    for allocation_id in sorted(graph.inband_allocation_ids):
+        numel = graph.inband_numel(allocation_id)
+        mailboxes[allocation_id] = (words, numel)
+        words += 2 * world_size * numel
+    words = -(-words // _PEER_SLOT_WORDS) * _PEER_SLOT_WORDS
+    producers = sorted(
+        {
+            edge.producer_root
+            for edge in graph.edges
+            for dependency in edge.access_dependencies
+            if graph.transport(dependency) == "peer_counter"
+        }
+    )
+    slots = {root: words + i * _PEER_SLOT_WORDS for i, root in enumerate(producers)}
+    done = words + len(producers) * _PEER_SLOT_WORDS
+    state = _register_cross_loop_state(
+        device_function,
+        name_hint="tile_dependency_peer_state",
+        numel=str(done + 1),
+        dtype=torch.uint64,
+        symmetric=True,
+    )
+    ptrs = device_function.triton_persistent_state_args[-1]
+    rank = device_function.new_var("tile_dependency_peer_rank", dce=True)
+    bases = tuple(
+        device_function.new_var(f"tile_dependency_peer_base_{peer}", dce=True)
+        for peer in range(world_size)
+    )
+    # The launcher appends this rank to the table of per-rank state pointers.
+    device_function.preamble.extend(
+        [
+            statement_from_string(f"{rank} = tl.load({ptrs} + {world_size})"),
+            *(
+                statement_from_string(
+                    f"{base} = tl.load({ptrs} + {peer}).to(tl.pointer_type(tl.uint64))"
+                )
+                for peer, base in enumerate(bases)
+            ),
+        ]
+    )
+    device_function.peer_state = PeerState(
+        state=state,
+        epoch=device_function.new_var("tile_dependency_peer_epoch", dce=False),
+        ptrs=ptrs,
+        rank=rank,
+        bases=bases,
+        mailboxes=mailboxes,
+        slots=slots,
+        done=done,
+    )
+    return device_function.peer_state
+
+
 def _outline_cross_loop_region(
     device_function: DeviceFunction,
     *,
@@ -856,60 +951,52 @@ def emit_cross_loop_schedule(
     # every rank. Targets use a uint64 epoch so they never wrap.
     peer_edges = static_pipeline_plan.peer_edges
     done_roots = static_pipeline_plan.done_roots
-    peer_slots = {
-        root: index * _PEER_SLOT_WORDS
-        for index, root in enumerate(sorted({producer for producer, _ in peer_edges}))
-    }
-    done_slot = len(peer_slots) * _PEER_SLOT_WORDS
-    peer_state = peer_ptrs = peer_epoch = None
-    world_size = 1
-    if peer_edges:
-        peer_state = _register_cross_loop_state(
-            device_function,
-            name_hint="tile_dependency_peer_state",
-            numel=str(done_slot + 1),
-            dtype=torch.uint64,
-            symmetric=True,
-        )
-        peer_ptrs = device_function.triton_persistent_state_args[-1]
-        peer_epoch = device_function.new_var("tile_dependency_peer_epoch", dce=False)
-        process_group_name = CompileEnvironment.current().process_group_name
-        assert process_group_name is not None
-        world_size = torch.distributed.get_world_size(
-            _resolve_process_group(process_group_name)
-        )
+    peer = peer_state(device_function)
+    world_size = len(peer.bases) if peer is not None else 1
+    # A lost node key would turn a poll into a plain load of racing peer data.
+    if any(
+        dependency_graph.is_inband(access)
+        and access.access_id not in device_function.inband_access_ids
+        for access in dependency_graph.accesses
+    ):
+        raise AssertionError("an inband access was not emitted as a push or poll")
 
     def peer_target(roots: Iterable[int]) -> str:
+        assert peer is not None
         tasks = sum(
             static_pipeline_plan.execution_orders[root].task_count for root in roots
         )
-        return f"{peer_epoch} * {int(tasks) * world_size}"
+        return f"{peer.epoch} * {int(tasks) * world_size}"
 
     def peer_waits(root: int) -> list[ast.stmt]:
-        waits = [
-            statement_from_string(
-                f"helion_dist_utils._wait_at_least({peer_state} + "
-                f"{peer_slots[producer]}, {peer_target((producer,))})"
-            )
-            for producer, consumer in sorted(peer_edges)
-            if consumer == root
-        ]
-        if not waits:
+        producers = sorted(
+            producer for producer, consumer in peer_edges if consumer == root
+        )
+        if not producers:
             return []
+        assert peer is not None
         return [
-            *waits,
+            *(
+                statement_from_string(
+                    f"helion_dist_utils._wait_at_least({peer.state} + "
+                    f"{peer.slots[producer]}, {peer_target((producer,))})"
+                )
+                for producer in producers
+            ),
             _publication_sync(device_function),
             *device_function.async_load_fence(),
         ]
 
     def peer_publications(root: int) -> list[ast.stmt]:
-        slots = [peer_slots[root]] if root in peer_slots else []
+        if peer is None:
+            return []
+        slots = [peer.slots[root]] if root in peer.slots else []
         if root in done_roots:
-            slots.append(done_slot)
+            slots.append(peer.done)
         lanes = 1 << (world_size - 1).bit_length()
         return [
             statement_from_string(
-                f"helion_dist_utils._add_on_every_rank({peer_ptrs}, {slot}, "
+                f"helion_dist_utils._add_on_every_rank({peer.ptrs}, {slot}, "
                 f"{world_size}, {lanes})"
             )
             for slot in slots
@@ -945,10 +1032,10 @@ def emit_cross_loop_schedule(
                 f"{packet_count}, tl.uint64) + 1, tl.uint32)"
             ),
         ]
-        if peer_epoch is not None:
+        if peer is not None:
             result.append(
                 statement_from_string(
-                    f"{peer_epoch} = {raw_dispatch_ticket} // "
+                    f"{peer.epoch} = {raw_dispatch_ticket} // "
                     f"tl.cast({packet_count}, tl.uint64) + 1"
                 )
             )
@@ -2087,7 +2174,7 @@ def emit_cross_loop_schedule(
                 extra_argument_names=(
                     dispatch_ticket,
                     epoch_var,
-                    *([peer_epoch] if peer_epoch is not None else []),
+                    *([peer.epoch] if peer is not None else []),
                 ),
                 noinline=True,
             )
@@ -2106,14 +2193,15 @@ def emit_cross_loop_schedule(
         if done_roots:
             # The last ticket exits only after every rank's done roots finish,
             # so the next launch cannot overwrite data a peer still reads.
+            assert peer is not None
             result.append(
                 create(
                     ast.If,
                     test=expr_from_string(f"{dispatch_ticket} == {packet_count - 1}"),
                     body=[
                         statement_from_string(
-                            f"helion_dist_utils._wait_at_least({peer_state} + "
-                            f"{done_slot}, {peer_target(done_roots)})"
+                            f"helion_dist_utils._wait_at_least({peer.state} + "
+                            f"{peer.done}, {peer_target(done_roots)})"
                         )
                     ],
                     orelse=[],

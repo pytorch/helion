@@ -238,7 +238,10 @@ def pipelined_allreduce_kernel(
     peers = _remote_views(symm, group_name)
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
-        symm[tile] = x[tile]
+        if variant == "constant":
+            symm[tile] = hl.full([tile], 1.0, dtype=x.dtype)
+        else:
+            symm[tile] = x[tile]
         if variant == "R1":
             symm[tile] = x[tile] + 0
     for tile in hl.tile(x.size(0)):
@@ -1128,6 +1131,42 @@ class TestDistributedTileDependencies(TestCase):
             "tile_dependency_peer_state + 16, tile_dependency_peer_epoch * 32)",
         ):
             self.assertIn(expected, code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_pushes_and_polls_data(self) -> None:
+        symm, x = torch.zeros(2, 4000, device=DEVICE, dtype=torch.bfloat16)
+        bound = pipelined_allreduce_kernel.bind(
+            (symm, x, dist.group.WORLD.group_name, "inband", 4)
+        )
+        config = bound.config_spec.default_config().config
+        # A thread holds 2 words of a 1024 block at 16 warps, and 1 of a 64 block.
+        for block_size, num_warps, pack in ((1024, 16, 2), (64, 4, 1)):
+            code = bound.to_triton_code(
+                helion.Config(
+                    **{
+                        **config,
+                        "block_sizes": [block_size, block_size],
+                        "num_warps": num_warps,
+                    }
+                )
+            )
+            # Root 0 pushes each word to 4 ranks, root 1 polls all 4 mailboxes
+            # in one asm, and the data needs no peer counters or done barrier.
+            self.assertEqual(code.count("st.relaxed.sys.global.u64"), 4)
+            self.assertIn("tl.store(symm + ", code)
+            self.assertEqual(code.count("@p bra SPIN"), 1)
+            words = ", ".join(["tl.uint64"] * 4)
+            self.assertIn(f"dtype=({words}), is_pure=False, pack={pack})", code)
+            self.assertIn("(x, 32001, torch.uint64, True)", code)
+            self.assertNotIn("_wait_at_least", code)
+            self.assertNotIn("_add_on_every_rank", code)
+        # A push may be the kernel's first tensor access.
+        bound = pipelined_allreduce_kernel.bind(
+            (symm, x, dist.group.WORLD.group_name, "constant", 4)
+        )
+        code = bound.to_triton_code()
+        self.assertIn("st.relaxed.sys.global.u64", code)
+        self.assertIn("tl.store(symm + ", code)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:

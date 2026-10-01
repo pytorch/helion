@@ -485,7 +485,8 @@ def _new_symmetric_state(
 ) -> tuple[torch.Tensor, torch.Tensor, object]:
     """Allocate zeroed symmetric state once every rank agrees on the launch.
 
-    Returns the state, its per-rank base pointer table, and the owning handle.
+    Returns the state, its per-rank base pointer table followed by this rank,
+    and the owning handle.
     """
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
@@ -511,7 +512,9 @@ def _new_symmetric_state(
             state,
             group=process_group_name,  # pyrefly: ignore[bad-argument-type]
         )
-    ptrs = torch.tensor(handle.buffer_ptrs, dtype=torch.int64, device=device)
+    ptrs = torch.tensor(
+        [*handle.buffer_ptrs, handle.rank], dtype=torch.int64, device=device
+    )
     return state, ptrs, handle
 
 

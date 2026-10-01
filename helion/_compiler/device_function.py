@@ -53,12 +53,14 @@ from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .cross_loop_codegen import PeerState
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
     from .tile_dispatch import TileStrategyDispatch
+    from .triton.distributed_ops import InbandPoll
     from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
@@ -422,6 +424,11 @@ class DeviceFunction:
         # A symmetric spec also appends the per-rank base pointer table.
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
+        # Cross-rank transport state (cross_loop_codegen.peer_state), the polls
+        # awaiting their first use, and the inband accesses emitted so far.
+        self.peer_state: PeerState | None = None
+        self.inband_polls: list[InbandPoll] = []
+        self.inband_access_ids: set[int] = set()
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.

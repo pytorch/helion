@@ -39,6 +39,7 @@ from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
+from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
 from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
@@ -1833,6 +1834,10 @@ class DeviceIRAnalysis:
                     if graph_analysis.graph_id < len(graph_owners)
                     else ()
                 )
+                if owner_roots:
+                    node.meta[TILE_ACCESS_META] = tuple(
+                        range(len(accesses), len(accesses) + len(owner_roots))
+                    )
                 for owner_root in owner_roots:
                     accesses.append(
                         TileAccess(

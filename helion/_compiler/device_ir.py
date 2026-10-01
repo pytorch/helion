@@ -1545,11 +1545,59 @@ class DeviceIR:
         temp.graphs = [g.copy() for g in self.graphs]
         temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
+        temp._hoist_inband_polls()
         if CompileEnvironment.current().backend_name == "metal":
             from .metal.mpp_graph_transform import rewrite_mpp_graphs
 
             rewrite_mpp_graphs(temp)
         return temp.graphs
+
+    def _hoist_inband_polls(self) -> None:
+        """Move each inband peer load, with its pure inputs, up to the previous
+        impure node or load, so consecutive polls share one wait.
+
+        Memory ops keep their order, and with it their config slots.
+        """
+        from ..language import memory_ops
+        from ..language.inline_asm_ops import inline_asm_elementwise
+        from .tile_dependency import TILE_ACCESS_META
+
+        dependency_graph = self.tile_dependency_graph
+        if dependency_graph is None or not dependency_graph.inband_allocation_ids:
+            return
+
+        def is_poll(node: torch.fx.Node) -> bool:
+            ids = node.meta.get(TILE_ACCESS_META)
+            return (
+                node.target is memory_ops.load
+                and bool(ids)
+                and dependency_graph.is_inband(dependency_graph.accesses[ids[0]])
+            )
+
+        def reorderable(node: torch.fx.Node) -> bool:
+            # Impure asm (e.g. clock reads) is not marked side effecting.
+            return (
+                node.op == "call_function"
+                and node.target not in (memory_ops.load, inline_asm_elementwise)
+                and not node.is_impure()
+            )
+
+        for graph_info in self.graphs:
+            for node in [node for node in graph_info.graph.nodes if is_poll(node)]:
+                segment: list[torch.fx.Node] = []
+                floor = node.prev
+                while floor.op != "root" and reorderable(floor):
+                    segment.append(floor)
+                    floor = floor.prev
+                needed = {node}
+                for candidate in segment:
+                    if any(user in needed for user in candidate.users):
+                        needed.add(candidate)
+                anchor = floor
+                for moved in [*reversed(segment), node]:
+                    if moved in needed:
+                        anchor.append(moved)
+                        anchor = moved
 
     def _apply_rolling(self, config: Config) -> None:
         """Apply reduction rolling on the graph copies."""
