@@ -13,6 +13,7 @@ from .accuracy import assert_close
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .kernel_args import _clone_args
 from .kernel_args import load_trusted_kernel_args
 from .logger import capture_output
 from .precompile_future import _load_compiled_fn
@@ -54,7 +55,7 @@ class BenchmarkJob:
         with capture_output():
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
-                args = load_trusted_kernel_args(self.args_path)
+                args = _clone_args(load_trusted_kernel_args(self.args_path), None)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # return_mode="median" guarantees a float return.
                 benchmark_fn = functools.partial(fn, *args)
@@ -99,7 +100,7 @@ class AccuracyCheckJob:
         with capture_output():
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
-                args = load_trusted_kernel_args(self.args_path)
+                args = _clone_args(load_trusted_kernel_args(self.args_path), None)
                 baseline_output = _load_trusted_baseline_output(self.baseline_path)
                 output = fn(*args)
                 synchronize_device()
