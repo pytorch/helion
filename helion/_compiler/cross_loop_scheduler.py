@@ -2359,9 +2359,10 @@ def _consumer_major_producer_order(
             if not root_candidates or any(item is None for item in root_candidates):
                 continue
             order = pipeline_plan.execution_orders[root]
+            # A root of at most one wave gains nothing from reordering; keep its order.
             if (
                 root in pipeline_plan.continuation_roots
-                or order.task_count < pipeline_plan.worker_count
+                or order.task_count <= pipeline_plan.worker_count
                 or order.task_count != readiness_graph.root_domains[root].size
             ):
                 continue

@@ -677,6 +677,21 @@ def runtime_bound_loop_chain(
     static_shapes=True,
     autotune_effort="none",
 )
+def split_merge_chain(x: torch.Tensor) -> torch.Tensor:
+    keys, splits = x.size()
+    partial = torch.empty_like(x)
+    out = torch.empty([keys], dtype=x.dtype, device=x.device)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        partial[key_tile, split_tile] = x[key_tile, split_tile] * 2
+    for key_tile in hl.tile(keys, block_size=1):
+        out[key_tile] = torch.sum(partial[key_tile, :], dim=-1)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def specialized_quotient_chain(
     x: torch.Tensor,
     numerator: int,
@@ -1641,6 +1656,29 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(out, torch.sum(x * mask, dim=1) * 2)
         self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_one_wave_producer_keeps_configured_order(self) -> None:
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        if workers % 2:
+            self.skipTest("needs an even SM count")
+        for splits, reordered in ((workers // 2, False), (workers, True)):
+            with self.subTest(splits=splits):
+                x = torch.randn((2, splits), device=DEVICE, dtype=torch.float32)
+                code, out = code_and_output(
+                    split_merge_chain,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                torch.testing.assert_close(out, torch.sum(x * 2, dim=1))
+                self.assertIn("tile_dependency_continuation_previous", code)
+                self.assertEqual(
+                    "tile_dependency_scheduled_pid_task" in code, reordered
+                )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
