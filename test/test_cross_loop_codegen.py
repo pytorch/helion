@@ -692,6 +692,39 @@ def split_merge_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def conditional_split_merge_chain(
+    x: torch.Tensor, active: torch.Tensor, early: hl.constexpr
+) -> torch.Tensor:
+    keys, rows, splits = x.size()
+    partial = torch.empty_like(x)
+    lse = torch.empty_like(x)
+    out = torch.empty([keys, rows], dtype=x.dtype, device=x.device)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        key = key_tile.begin
+        split = split_tile.begin
+        partial[key, :, split] = x[key, :, split] * 2
+        lse[key, :, split] = x[key, :, split] + 1
+    for merge_tile in hl.tile(keys, block_size=1):
+        merge_key = merge_tile.begin
+        top = lse[merge_key, :, 0]
+        for index in hl.static_range(1, splits):
+            top = torch.maximum(top, lse[merge_key, :, index])
+        acc = hl.zeros([rows], dtype=torch.float32)
+        for rank in hl.static_range(early):
+            acc = acc + partial[merge_key, :, rank] * (lse[merge_key, :, rank] - top)
+        # Every split is read twice; the late ones only under a runtime branch.
+        if active[0] > early:
+            for late in hl.static_range(early, splits):
+                weight = lse[merge_key, :, late] - top
+                acc = acc + partial[merge_key, :, late] * weight
+        out[merge_key, :] = acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def specialized_quotient_chain(
     x: torch.Tensor,
     numerator: int,
@@ -1679,6 +1712,27 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 self.assertEqual(
                     "tile_dependency_scheduled_pid_task" in code, reordered
                 )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_conditional_rereads_keep_final_arrival_continuation(self) -> None:
+        x = torch.randn((4, 8, 8), device=DEVICE, dtype=torch.float32)
+        lse = x + 1
+        terms = x * 2 * (lse - lse.amax(dim=-1, keepdim=True))
+        for active in (8, 5):
+            with self.subTest(active=active):
+                code, out = code_and_output(
+                    conditional_split_merge_chain,
+                    (x, torch.tensor([active], device=DEVICE), 5),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+                live = terms if active > 5 else terms[..., :5]
+                torch.testing.assert_close(out, live.sum(dim=-1))
+                self.assertIn("tile_dependency_continuation_previous", code)
+                self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

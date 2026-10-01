@@ -2686,6 +2686,26 @@ class Incidence:
         return Incidence._from_constructed(items_by_key, keys_by_item=keys_by_item)
 
 
+def _interval_hull(
+    first: tuple[sympy.Expr, sympy.Expr],
+    second: tuple[sympy.Expr, sympy.Expr],
+    prove_nonnegative: Callable[[sympy.Expr], bool] | None,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """Return the hull of two overlapping half-open intervals if it is provable."""
+
+    def at_most(a: sympy.Expr, b: sympy.Expr) -> bool:
+        # pyrefly: ignore [unsupported-operation]
+        return _is_provably_nonnegative(b - a, prove_nonnegative)
+
+    if not (at_most(first[0], second[1]) and at_most(second[0], first[1])):
+        return None
+    lows = ((first[0], second[0]), (second[0], first[0]))
+    highs = ((first[1], second[1]), (second[1], first[1]))
+    low = next((a for a, b in lows if at_most(a, b)), None)
+    high = next((b for a, b in highs if at_most(a, b)), None)
+    return None if low is None or high is None else (low, high)
+
+
 def _rectangular_fiber_spec(
     relation: CoordinateRelation,
     *,
@@ -2720,28 +2740,24 @@ def _rectangular_fiber_spec(
             (index,) = differing
             axis, begin, end, step = left.target_ranges[index]
             other_axis, other_begin, other_end, other_step = right.target_ranges[index]
+            if axis != other_axis or step != 1 or other_step != 1:
+                continue
             # pyrefly: ignore [unsupported-operation]
             left_first = sympy.simplify(end - other_begin) == 0
             # pyrefly: ignore [unsupported-operation]
             right_first = sympy.simplify(other_end - begin) == 0
-            if (
-                axis != other_axis
-                or step != 1
-                or other_step != 1
-                or not (left_first or right_first)
-                or not all(
-                    _is_provably_nonnegative(width, prove_nonnegative)
-                    for width in (end - begin, other_end - other_begin)  # pyrefly: ignore [unsupported-operation]
+            hull = (begin, other_end) if left_first else (other_begin, end)
+            if not (left_first or right_first):
+                hull = _interval_hull(
+                    (begin, end), (other_begin, other_end), prove_nonnegative
                 )
+            if hull is None or not all(
+                _is_provably_nonnegative(width, prove_nonnegative)
+                for width in (end - begin, other_end - other_begin)  # pyrefly: ignore [unsupported-operation]
             ):
                 continue
             ranges = list(left.target_ranges)
-            ranges[index] = (
-                axis,
-                begin if left_first else other_begin,
-                other_end if left_first else end,
-                1,
-            )
+            ranges[index] = (axis, *hull, 1)
             replacement = (
                 left_index,
                 right_index,

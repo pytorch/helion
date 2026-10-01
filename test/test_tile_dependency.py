@@ -29,6 +29,7 @@ from helion._compiler.tile_dependency import TileDependency
 from helion._compiler.tile_dependency import TileDependencyKind
 from helion._compiler.tile_dependency import _access_layout
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
+from helion._compiler.tile_dependency import _interval_hull
 from helion._compiler.tile_dependency import _simplify_logical_expression
 from helion._compiler.tile_dependency import _symbolic_access_map
 from helion._compiler.tile_dependency import allocation_regions_may_overlap
@@ -2653,6 +2654,51 @@ class TestTileDependency(TestCase):
         self.assertIsNotNone(
             partition.rekey_fine(Incidence.from_fibers(identity, keys_by_item=identity))
         )
+
+    def test_interval_hull_needs_provable_overlap(self) -> None:
+        n = sympy.Symbol("n", integer=True, positive=True)
+        m = sympy.Symbol("m", integer=True, positive=True)
+        self.assertEqual(_interval_hull((0, n), (1, n + 1), None), (0, n + 1))
+        self.assertEqual(_interval_hull((1, n + 1), (0, n), None), (0, n + 1))
+        self.assertIsNone(_interval_hull((0, n), (1, m), None))
+        self.assertIsNone(_interval_hull((0, 5), (7, 9), None))
+
+    def test_union_coalesces_only_provably_overlapping_fibers(self) -> None:
+        keys = CoordinateDomain.scalar(1, kind="event")
+        items = CoordinateDomain.scalar(37, axis=1)
+        offset = sympy.Symbol("offset", integer=True, nonnegative=True)
+
+        def fibers(*ranges: tuple[sympy.Expr | int, sympy.Expr | int]) -> Incidence:
+            pieces = tuple(
+                _CoordinateRelationPiece(((0, 0, 1, 1),), ((1, begin, end, 1),))
+                for begin, end in ranges
+            )
+            return Incidence.from_fibers(CoordinateRelation(keys, items, pieces))
+
+        # Re-reading items in a different order must not change the union.
+        for name, incidence, expected_count in (
+            ("nested", Incidence.union_all((fibers((0, 37)), fibers((1, 37)))), 37),
+            ("overlap", Incidence.union_all((fibers((0, 20)), fibers((10, 37)))), 37),
+            ("identical", fibers((0, 18), (18, 37), (0, 37)), 37),
+            ("disjoint", Incidence.union_all((fibers((0, 5)), fibers((7, 9)))), None),
+            (
+                "unproved",
+                Incidence.union_all((fibers((0, 5)), fibers((offset, offset + 3)))),
+                None,
+            ),
+        ):
+            with self.subTest(name):
+                assert incidence is not None
+                if expected_count is None:
+                    self.assertEqual(len(incidence.items_by_key.pieces), 2)
+                    self.assertIsNone(incidence.count_by_key)
+                else:
+                    self.assertEqual(len(incidence.items_by_key.pieces), 1)
+                    assert incidence.count_by_key is not None
+                    self.assertEqual(
+                        incidence.count_by_key.value_bounds(),
+                        (expected_count, expected_count),
+                    )
 
     def test_symbolic_uniform_fibers_keep_count_without_dense_order(self) -> None:
         batch = sympy.Symbol("batch", integer=True, positive=True)
