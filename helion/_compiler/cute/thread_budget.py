@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
 
 MAX_THREADS_PER_BLOCK = 1024
+# CUDA's per-axis limits on a thread block: 1024 along x and y, 64 along z.
+MAX_THREAD_BLOCK_DIMS = (1024, 1024, 64)
 # Largest per-thread register tile (reduction lanes x vector elements) that a
 # scalar synthetic reduction lane unrolls at trace time outside the one-vector
 # tile wrappers (``DeviceGridState.nest_reduction_lane_outside_vector_tiles``).
@@ -83,6 +85,57 @@ def tile_loop_thread_count(
             else:
                 launch_extents[axis] = max(launch_extents[axis], extent)
     return math.prod(launch_extents)
+
+
+def check_thread_block_dims(dims: Sequence[int], *, context: str = "") -> None:
+    """Raise ``BackendUnsupported`` for a launch shape CUDA cannot start.
+
+    A thread block is limited along each axis (1024, 1024, 64) as well as in
+    total (:func:`check_thread_limit`); a config whose thread counts land a
+    wide tile axis on z (``num_threads=[2, 128]`` launching ``block=(1, 2,
+    128)``) passed the total and failed at launch with
+    ``cudaErrorInvalidValue``.  Every ``block=(x, y, z)`` the backend emits
+    goes through here, except the symbolic shape a kernel argument sizes,
+    which the host wrapper checks at launch through
+    :func:`checked_thread_block_dims`.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    for axis, (size, limit) in enumerate(zip(dims, MAX_THREAD_BLOCK_DIMS, strict=True)):
+        if size > limit:
+            backend_name = CompileEnvironment.current().backend.name
+            raise exc.BackendUnsupported(
+                backend_name,
+                f"thread block axis {axis} of {context or tuple(dims)} exceeds "
+                f"the launch limit of {limit}",
+            )
+    check_thread_limit(math.prod(dims), context=context or str(tuple(dims)))
+
+
+def checked_thread_block_dims(dims: Sequence[int]) -> tuple[int, int, int]:
+    """Validate a launch shape only known at launch time and hand it back.
+
+    A thread extent that is a kernel argument (``hl.tile(n, block_size=bsz)``
+    with ``bsz`` an int argument) renders the launch shape symbolically, so
+    :func:`check_thread_block_dims` cannot see it at codegen; the host wrapper
+    wraps that ``block=`` tuple in this call instead.  It runs outside any
+    compile environment, so the backend is spelled out.
+    """
+    x, y, z = (int(dim) for dim in dims)
+    for axis, (size, limit) in enumerate(
+        zip((x, y, z), MAX_THREAD_BLOCK_DIMS, strict=True)
+    ):
+        if size > limit:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"thread block axis {axis} of {(x, y, z)} exceeds the launch "
+                f"limit of {limit}",
+            )
+    if x * y * z > MAX_THREADS_PER_BLOCK:
+        raise exc.BackendUnsupported(
+            "cute", f"thread block too large for cute kernel: {(x, y, z)}"
+        )
+    return x, y, z
 
 
 def check_thread_limit(

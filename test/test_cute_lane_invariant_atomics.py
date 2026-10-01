@@ -9,10 +9,10 @@ against the other accesses of its tensor, and a body it cannot place that
 way is rejected instead of repeating the atomic.  Per-lane atomics keep their
 loops unchanged.
 
-A tile-uniform atomic (a constant or tile-attribute index and a scalar
-value) is issued by the leader thread of every thread axis of the tile and
-carries no tile mask (``cute/atomic_ops.py``), so with the placement above it
-runs exactly once per tile.
+A tile-uniform atomic (a constant, tile-attribute or ``hl.grid`` index and a
+scalar value) is issued by the leader thread of every thread axis of the tile
+and carries no tile mask (``cute/atomic_ops.py``), so with the placement above
+it runs exactly once per tile.
 
 An atomic that has to stay inside the lane loop of a tile axis it is uniform
 along (the loop structure nests its own loop inside that one; the loop belongs
@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import textwrap
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1112,3 +1113,66 @@ def test_grid_atomic_leaves_the_unindexed_block_without_an_index() -> None:
             and ast.unparse(statement.targets[0]) == "indices_2"
         ):
             assert "thread_idx" not in ast.unparse(statement), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _grid_count_then_copy(x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    """A grid index addresses one element for the whole program, like ``tile.begin``."""
+    out = torch.empty_like(x)
+    for i in hl.grid(x.size(0)):
+        for tile1 in hl.tile(x.size(1)):
+            hl.atomic_add(counts, [i], 1)
+            out[i, tile1] = x[i, tile1]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _segment_sums(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+    """Each segment's total, every tile's sum added under the segment's grid index."""
+    out = torch.zeros([offsets.size(0) - 1], dtype=torch.float32, device=x.device)
+    for i in hl.grid(offsets.size(0) - 1):
+        start = offsets[i]
+        end = offsets[i + 1]
+        for tile_k in hl.tile(start, end):
+            hl.atomic_add(out, [i], x[tile_k].sum())
+    return out
+
+
+_GRID_ROW = {"block_sizes": [32], "num_threads": [32], "cute_vector_widths": [1]}
+_GRID_ROW_WIDE = {"block_sizes": [128], "num_threads": [128], "cute_vector_widths": [1]}
+
+
+@pytest.mark.parametrize("config", [_GRID_ROW, _GRID_ROW_WIDE], ids=["warp", "cta"])
+@pytest.mark.parametrize(
+    ("kernel", "args"),
+    [
+        pytest.param(
+            _grid_count_then_copy,
+            (torch.empty((6, 100)), torch.zeros((6,))),
+            id="count",
+        ),
+        pytest.param(
+            _segment_sums,
+            (torch.empty((192,)), torch.tensor([0, 50, 50, 57, 89, 189, 192])),
+            id="segment_sums",
+        ),
+    ],
+)
+def test_a_grid_indexed_atomic_is_tile_uniform(
+    kernel: object, args: tuple[torch.Tensor, ...], config: dict[str, object]
+) -> None:
+    """``out[i]`` under ``for i in hl.grid(n)`` is one address for every thread of
+    the program: the leader thread issues the atomic without the column tile's
+    mask instead of every active thread adding the (reduced or constant) value."""
+    with patch(
+        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        return_value=232448,
+    ):
+        code = _generate(kernel, args, **config)
+    function = _kernel_function(code)
+    atomic = _the_atomic(function)
+    guard = _guard(function, atomic)
+    assert _leader_axes(guard) == {0}, code
+    assert "mask" not in (guard or ""), code
+    # Inside the column tile loop only: no lane loop pins it.
+    assert _lane_loops_around(function, atomic) == ["tile_offset_1"], code

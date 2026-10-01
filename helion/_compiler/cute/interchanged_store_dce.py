@@ -1,4 +1,4 @@
-"""Remove unobservable stores duplicated by CuTe reduction interchange."""
+"""Remove the first-pass stores and atomics duplicated by CuTe reduction interchange."""
 
 from __future__ import annotations
 
@@ -335,16 +335,33 @@ def eliminate_interchanged_stores(
     # The final pass executes the same nonempty Cartesian iteration set whenever
     # the first pass executes. These unconditional definitions therefore kill
     # the corresponding first-pass bindings, including after either loop exits.
-    redefined = {
+    _prune_redefined_bindings(
+        lane_loop, serial_loop, _redefined_names(final_flat, protected_names)
+    )
+    if not serial_loop.body:
+        serial_loop.body = [ast.Pass()]
+    return len(removed)
+
+
+def _redefined_names(final_flat: list[ast.stmt], protected_names: set[str]) -> set[str]:
+    """Names the final pass binds unconditionally before any read of its own."""
+    return {
         name
         for statement in final_flat
         if (name := tile_strategy._plain_assignment_name(statement)) is not None
     } - (_live_in(final_flat) | protected_names)
+
+
+def _prune_redefined_bindings(
+    lane_loop: ast.For, owner: ast.For, redefined: set[str]
+) -> None:
+    """Drop ``owner``'s plain bindings that the final pass redefines and no
+    statement of the first pass (``lane_loop``) still reads."""
     while True:
         reads = ReadWrites.from_ast(lane_loop).reads
         dead = [
             statement
-            for statement in serial_loop.body
+            for statement in owner.body
             if (name := tile_strategy._plain_assignment_name(statement)) is not None
             and name in redefined
             and reads.get(name, 0) == ReadWrites.from_ast(statement).reads.get(name, 0)
@@ -354,9 +371,108 @@ def eliminate_interchanged_stores(
         ]
         if not dead:
             break
-        serial_loop.body = [
-            statement for statement in serial_loop.body if statement not in dead
-        ]
+        owner.body = [statement for statement in owner.body if statement not in dead]
+
+
+def _is_atomic_write(call: ast.Call) -> bool:
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.attr.startswith("atomic_")
+    return isinstance(func, ast.Name) and (
+        func.id.startswith(("atomic_", "_cute_atomic_"))
+        or func.id == "_cute_red_add_f32_vec"
+    )
+
+
+def atomic_write_calls(statement: ast.AST) -> list[ast.Call]:
+    """The atomic read-modify-writes among ``statement``'s memory writes."""
+    return [
+        call
+        for call in tile_strategy._memory_write_calls(statement)
+        if _is_atomic_write(call)
+    ]
+
+
+def eliminate_interchanged_atomics(
+    lane_loop: ast.For,
+    serial_loop: ast.For,
+    final_nest: list[ast.AST],
+    candidates: list[ast.AST],
+    protected_names: set[str],
+) -> int:
+    """Drop the first pass's atomic consumers that the final pass applies in full.
+
+    The first pass keeps each reduction consumer over the marker's raw
+    per-lane input.  A store there writes a partial value the final pass
+    overwrites; an atomic read-modify-write would instead add every lane's
+    partial on top of the full reduction the final pass applies once per
+    serial iteration (a column sum over a lane-looped row tile added into
+    ``out[column]`` came out exactly doubled).  A candidate is dropped when
+    its one memory write is an atomic the statement does nothing else around
+    and the final pass holds exactly one clone of it; the number dropped is
+    returned so the caller can decline a nest it could not make exact.  The
+    first-pass bindings the final pass redefines and nothing left in the
+    first pass reads are pruned afterwards, the serial loop goes when its
+    body is empty and the lane loop's body may end up empty too, which the
+    caller takes as the whole first pass being dead.
+    """
+    if not candidates or lane_loop.orelse or serial_loop.orelse:
+        return 0
+    if not final_nest or not isinstance(final_nest[-1], ast.For):
+        return 0
+    final_serial = final_nest[-1]
+    if (
+        final_serial.orelse
+        or not final_serial.body
+        or not isinstance(final_serial.body[-1], ast.For)
+        or ast.unparse(final_serial.target) != ast.unparse(serial_loop.target)
+        or ast.unparse(final_serial.iter) != ast.unparse(serial_loop.iter)
+    ):
+        return 0
+    final_lane = final_serial.body[-1]
+    if (
+        final_lane.orelse
+        or ast.unparse(final_lane.target) != ast.unparse(lane_loop.target)
+        or ast.unparse(final_lane.iter) != ast.unparse(lane_loop.iter)
+    ):
+        return 0
+    final_prefix = cast("list[ast.stmt]", final_nest[:-1])
+    final_flat = [*final_prefix, *final_serial.body[:-1], *final_lane.body]
+    final_texts = [ast.unparse(statement) for statement in final_flat]
+    removed: list[ast.AST] = []
+    for statement in candidates:
+        if statement not in serial_loop.body:
+            continue
+        writes = tile_strategy._memory_write_calls(statement)
+        if (
+            len(writes) != 1
+            or not _is_atomic_write(writes[0])
+            or not tile_strategy._is_isolated_store_statement(statement, writes[0])
+            or final_texts.count(ast.unparse(statement)) != 1
+        ):
+            continue
+        removed.append(statement)
+    if not removed:
+        return 0
+    serial_loop.body = [
+        statement for statement in serial_loop.body if statement not in removed
+    ]
+
+    # Both nests run the lane loop's static extent times the same serial
+    # bounds, which nothing in the first pass rebinds, so the final pass's
+    # unconditional definitions kill the first pass's bindings
+    # (``eliminate_interchanged_stores``).
+    if tile_strategy._static_lane_loop_extent(lane_loop) is None or (
+        _reads(serial_loop.iter) & set(ReadWrites.from_ast(lane_loop).writes)
+    ):
+        if not serial_loop.body:
+            serial_loop.body = [ast.Pass()]
+        return len(removed)
+    redefined = _redefined_names(final_flat, protected_names)
+    _prune_redefined_bindings(lane_loop, serial_loop, redefined)
     if not serial_loop.body:
-        serial_loop.body = [ast.Pass()]
+        lane_loop.body = [
+            statement for statement in lane_loop.body if statement is not serial_loop
+        ]
+        _prune_redefined_bindings(lane_loop, lane_loop, redefined)
     return len(removed)

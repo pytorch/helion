@@ -13,6 +13,7 @@ across its lanes and the cross-thread combine runs once per row tile.
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 from typing import Callable
 
 import pytest
@@ -24,6 +25,9 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -435,10 +439,27 @@ def _jagged_row_sums_scaled(
 
 
 def _jagged_lanes_config(lanes: int) -> helion.Config:
+    """One row per CTA, the 512 columns on ``512 // lanes`` threads."""
     return helion.Config.from_dict(
         {
             "block_sizes": [1, 512, 32],
             "num_threads": [1, 512 // lanes, 1],
+            "cute_vector_widths": [1, 1, 1],
+            "cute_lane_layouts": ["strided"] * 3,
+        }
+    )
+
+
+def _jagged_rows_config(lanes: int) -> helion.Config:
+    """Two rows per CTA on the y axis: the max over the rows' lengths that
+    bounds the jagged loop is a cross-thread collective in the lane body, so
+    the two-pass split stays off it and the strided markers are restored or
+    re-reduced.  (With one row per CTA that max is the row's own length and the
+    body splits like any other.)"""
+    return helion.Config.from_dict(
+        {
+            "block_sizes": [2, 512, 32],
+            "num_threads": [2, 512 // lanes, 1],
             "cute_vector_widths": [1, 1, 1],
             "cute_lane_layouts": ["strided"] * 3,
         }
@@ -451,7 +472,7 @@ def _jagged_lanes_config(lanes: int) -> helion.Config:
 def test_a_stored_strided_reduction_totals_the_lanes_shares(
     lanes: int, static_shapes: bool
 ) -> None:
-    """The jagged loop's collective trip count keeps the two-pass split off this body; the restored per-lane shares used to be stored as they were (the last lane's half-row won), and are now totalled across the lanes before the store."""
+    """The jagged loop's collective trip count (the max over the two rows' lengths) keeps the two-pass split off this body; the restored per-lane shares used to be stored as they were (the last lane's half-row won), and are now totalled across the lanes before the store."""
     x, offsets = _jagged_inputs(512)
     kernel = helion.kernel(
         _jagged_row_sums_stored,
@@ -460,7 +481,7 @@ def test_a_stored_strided_reduction_totals_the_lanes_shares(
         autotune_effort="none",
     )
     bound = kernel.bind((x, offsets))
-    config = _jagged_lanes_config(lanes)
+    config = _jagged_rows_config(lanes)
     code = bound.to_code(config)
     assert code.count(f"for lane_1 in range({lanes}):") == 1
     assert "_lane_share = " in code and "_lane_total = " in code
@@ -477,7 +498,7 @@ def test_a_stored_strided_reduction_totals_the_lanes_shares(
 def test_a_strided_reduction_scaled_back_per_lane_is_declined(
     lanes: int, static_shapes: bool
 ) -> None:
-    """Every lane's row sums are needed after the total, which neither the restore nor a lane-invariant tail provides; the config is declined instead of scaling by one lane's share."""
+    """Every lane's row sums are needed after the total, which neither the restore nor a lane-invariant tail provides; the two-row config, whose body cannot split, is declined instead of scaling by one lane's share."""
     x, offsets = _jagged_inputs(512)
     kernel = helion.kernel(
         _jagged_row_sums_scaled,
@@ -489,7 +510,7 @@ def test_a_strided_reduction_scaled_back_per_lane_is_declined(
     with pytest.raises(
         helion.exc.BackendUnsupported, match="no proved complete per-lane restore"
     ):
-        bound.to_code(_jagged_lanes_config(lanes))
+        bound.to_code(_jagged_rows_config(lanes))
 
 
 def _jagged_row_sums_running_max(
@@ -619,7 +640,7 @@ def test_a_running_max_carry_keeps_the_per_lane_restore(
     bound = _jagged_kernel(
         _jagged_row_sums_running_max, static_shapes=static_shapes
     ).bind((x, offsets))
-    config = _jagged_lanes_config(lanes)
+    config = _jagged_rows_config(lanes)
     code = bound.to_code(config)
     assert code.count(f"for lane_1 in range({lanes}):") == 1
     assert "_lane_total" not in code
@@ -641,7 +662,7 @@ def test_an_atomic_add_of_the_row_total_runs_once_on_the_lanes_total(
     bound = _jagged_kernel(
         _jagged_row_sums_atomically_added, static_shapes=static_shapes
     ).bind((x, offsets))
-    config = _jagged_lanes_config(lanes)
+    config = _jagged_rows_config(lanes)
     code = bound.to_code(config)
     assert "_lane_total" in code
     assert code.count("cute.arch.atomic_add(") == 1
@@ -658,7 +679,7 @@ def test_two_stored_reductions_of_one_accumulator_take_one_schedule_in_both_shap
 ) -> None:
     """Under dynamic shapes the second reduction's masked input sits between the two markers; it joins the prefix, so the static and dynamic twins both total the shares and agree bitwise."""
     x, offsets = _jagged_inputs(512)
-    config = _jagged_lanes_config(lanes)
+    config = _jagged_rows_config(lanes)
     outputs = []
     for static_shapes in (True, False):
         bound = _jagged_kernel(
@@ -685,6 +706,56 @@ def test_two_stored_reductions_of_one_accumulator_take_one_schedule_in_both_shap
     assert torch.equal(static_max, dynamic_max)
 
 
+def _jagged_expectations(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> dict[Callable[..., object], tuple[torch.Tensor, ...]]:
+    row_sums = _jagged_row_sums(x, offsets)
+    return {
+        _jagged_row_sums_stored: (row_sums.sum(dim=1),),
+        _jagged_row_sums_scaled: (row_sums * row_sums.sum(dim=1, keepdim=True),),
+        _jagged_row_sums_running_max: (row_sums.amax(dim=1),),
+        _jagged_row_sums_atomically_added: (row_sums.sum(dim=1),),
+        _jagged_row_sums_sum_and_max_stored: (
+            row_sums.sum(dim=1),
+            row_sums.amax(dim=1),
+        ),
+        _jagged_row_means_stored: (row_sums.mean(dim=1),),
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+@pytest.mark.parametrize(
+    "fn",
+    [
+        _jagged_row_sums_stored,
+        _jagged_row_sums_scaled,
+        _jagged_row_sums_running_max,
+        _jagged_row_sums_atomically_added,
+        _jagged_row_sums_sum_and_max_stored,
+        _jagged_row_means_stored,
+    ],
+    ids=lambda fn: fn.__name__.removeprefix("_jagged_row_"),
+)
+def test_one_row_tiles_take_the_plain_two_pass_split(
+    fn: Callable[..., object], static_shapes: bool
+) -> None:
+    """With one row per CTA the jagged loop's bound is the row's own length (a reduction over a block of one combined the column threads before, an unduplicatable collective that kept the split off); the body now splits into the accumulate and consume passes, including the per-column scaling the restore path declines."""
+    x, offsets = _jagged_inputs(512)
+    bound = _jagged_kernel(fn, static_shapes=static_shapes).bind((x, offsets))
+    config = _jagged_lanes_config(2)
+    code = bound.to_code(config)
+    assert code.count("for lane_1 in range(2):") == 2
+    assert "_lane_total" not in code and "_lane_share" not in code
+    outputs = bound.compile_config(config)(x, offsets)
+    if not isinstance(outputs, tuple):
+        outputs = (outputs,)
+    for out, expected in zip(
+        outputs, _jagged_expectations(x, offsets)[fn], strict=True
+    ):
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [1, 2])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -704,3 +775,57 @@ def test_a_mean_over_a_padded_column_block_divides_by_the_columns(
     torch.testing.assert_close(
         out, _jagged_row_sums(x, offsets).mean(dim=1), rtol=1e-4, atol=1e-4
     )
+
+
+def _column_sums_added(x: torch.Tensor) -> torch.Tensor:
+    """Every row tile's column sums added into ``out``: the full column sums."""
+    b, m = x.size()
+    out = torch.zeros([m], dtype=torch.float32, device=x.device)
+    for tile_b in hl.tile(b):
+        for tile_m in hl.tile(m):
+            hl.atomic_add(out, [tile_m], x[tile_b, tile_m].sum(dim=0))
+    return out
+
+
+def _column_means_added(x: torch.Tensor) -> torch.Tensor:
+    b, m = x.size()
+    out = torch.zeros([m], dtype=torch.float32, device=x.device)
+    for tile_b in hl.tile(b):
+        for tile_m in hl.tile(m):
+            hl.atomic_add(out, [tile_m], x[tile_b, tile_m].mean(dim=0))
+    return out
+
+
+def _grid_lane_config(bound: BoundKernel, lanes: int) -> helion.Config:
+    """Eight rows per tile on ``8 // lanes`` row threads, 32 column threads."""
+    config = dict(bound.config_spec.default_config().config)
+    config.update(
+        block_sizes=[8, 32],
+        num_threads=[8 // lanes, 32],
+        cute_vector_widths=[1, 1],
+        cute_lane_layouts=["strided", "strided"],
+    )
+    return helion.Config.from_dict(config)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [8, 4])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+@pytest.mark.parametrize("reduction", ["sum", "mean"], ids=["sum", "mean"])
+def test_an_atomic_consumer_of_an_interchanged_lane_reduction_runs_once(
+    lanes: int, static_shapes: bool, reduction: str
+) -> None:
+    """The row lane loop around the column loop is interchanged for the column reduction; the first pass used to keep the atomic over its per-lane partials, so the total came out doubled."""
+    x = torch.randn(37, 100, device=DEVICE)
+    fn = _column_sums_added if reduction == "sum" else _column_means_added
+    bound = _jagged_kernel(fn, static_shapes=static_shapes).bind((x,))
+    config = _grid_lane_config(bound, lanes)
+    code = bound.to_code(config)
+    assert code.count("cute.arch.atomic_add(") == 1
+    assert code.count(f"for lane_0 in range({lanes}):") == 1
+    out = bound.compile_config(config)(x)
+    if reduction == "sum":
+        expected = x.sum(dim=0)
+    else:
+        expected = sum(x[r : r + 8].mean(dim=0) for r in range(0, 37, 8))
+    torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)

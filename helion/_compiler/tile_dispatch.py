@@ -580,8 +580,16 @@ class TileStrategyDispatch:
                 next_axis = total_axes
             if local_axis >= next_axis:
                 continue
-            size = next(size_iter, None)
             expr = next(expr_iter, None)
+            # ``thread_block_sizes`` lists the static extents only, while
+            # ``thread_block_size_exprs`` has an entry for every thread axis
+            # (an argument-sized block's is its ``_BLOCK_SIZE_n`` constant),
+            # so a static size pairs with the next digit expression and a
+            # symbolic expression ahead of it takes none.
+            if expr is not None and not expr.isdigit():
+                size = None
+            else:
+                size = next(size_iter, None)
             result.append((block_id, local_axis, size, expr))
         return result
 
@@ -701,6 +709,46 @@ class TileStrategyDispatch:
                 if block_id == target_block_id:
                     return expr
         return None
+
+    def symbolic_thread_extent_expr(self, target_block_id: int) -> str | None:
+        """The thread extent of a block that is only known at launch.
+
+        ``hl.tile(n, block_size=bsz)`` with ``bsz`` an int argument of a kernel
+        bound with ``static_shapes=False`` holds one element per thread on the
+        host constant ``_BLOCK_SIZE_n``, which is the expression returned here;
+        the static shape (:meth:`thread_block_dims`) has a one for its axis.
+        ``None`` for a static extent and for a block without a thread axis.
+        """
+        if self.thread_extent_for_block_id(target_block_id) is not None:
+            return None
+        expr = self._thread_extent_expr_for_block_id(target_block_id)
+        if expr is None or expr.isdigit():
+            return None
+        return expr
+
+    def symbolic_thread_axes(self) -> dict[int, str]:
+        """The launch axes whose thread extent is only known at launch, by axis.
+
+        Each value is the extent's expression (see
+        :meth:`symbolic_thread_extent_expr`); the first block claiming an axis
+        names it.
+        """
+        axes: dict[int, str] = {}
+        for strategy in self.strategies:
+            base_axis = self.thread_axis_for_strategy(strategy)
+            if base_axis is None:
+                continue
+            for block_id, local_axis, _size, expr in self._iter_strategy_thread_axes(
+                strategy
+            ):
+                if (
+                    expr is None
+                    or expr.isdigit()
+                    or self.thread_extent_for_block_id(block_id) is not None
+                ):
+                    continue
+                axes.setdefault(base_axis + local_axis, expr)
+        return axes
 
     def thread_block_dims(self) -> tuple[int, int, int]:
         """Compute the CUDA thread block dims from all strategies.

@@ -10,10 +10,15 @@ import numpy as np
 import pytest
 import torch
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _mock_cuda_unavailable
+
 import helion
+from helion import exc
 from helion._compiler import tile_strategy
 from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_stores
 from helion._testing import skipUnlessBackends
+import helion.language as hl
 
 _PAIRS = {
     frozenset(pair)
@@ -354,3 +359,200 @@ def test_norm_backward_emits_one_dx_store(name: str) -> None:
             for node in ast.walk(first)
         )
     assert "grad_weight" in ast.unparse(first)
+
+
+def _atomic_program(*, row_total: bool = True, extra: str = "") -> ast.For:
+    """``_program`` with the reduction added into ``output[row]`` by an atomic
+    instead of stored per element; ``row_total=False`` drops the per-lane
+    ``column`` accumulator so the reduction is the loop's only effect."""
+    init = (
+        """
+    grad_w = 0.0"""
+        if row_total
+        else ""
+    )
+    total = (
+        """
+        grad_w = grad_w + value"""
+        if row_total
+        else ""
+    )
+    suffix = (
+        """
+    (column.iterator + col).store(grad_w)"""
+        if row_total
+        else ""
+    )
+    loop = ast.parse(
+        f"""
+for lane in range(4):
+    col = lane{init}
+    for row in range(rows):
+        row_mask = row < valid_rows
+        mask = row_mask and col < valid_cols
+        value = (source.iterator + row * 4 + col).load() if mask else 0.0{total}
+        reduced = _helion_lane_reduce(value, 'sum', 0.0, 1, 1, 0, '', 1)
+        if row_mask:
+            cute.arch.atomic_add((output.iterator + row).llvm_ptr, val=reduced, sem='relaxed'){extra}{suffix}
+"""
+    ).body[0]
+    assert isinstance(loop, ast.For)
+    setattr(loop, tile_strategy.HELION_LANE_LOOP_VAR_ATTR, "lane")
+    return loop
+
+
+def _atomics(body: list[ast.AST]) -> list[ast.Call]:
+    return [
+        node
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "atomic_add"
+    ]
+
+
+class _AtomicBuffer(_Buffer):
+    @property
+    def iterator(self) -> _AtomicPointer:
+        return _AtomicPointer(self, 0)
+
+
+class _AtomicPointer(_Pointer):
+    def __add__(self, offset: int) -> _AtomicPointer:
+        return _AtomicPointer(self.buffer, self.offset + offset)
+
+    @property
+    def llvm_ptr(self) -> _AtomicPointer:
+        return self
+
+    def atomic_add(self, value: float) -> None:
+        self.buffer.stores += 1
+        self.buffer.values[self.offset] += value
+
+
+def _execute_atomics(
+    body: list[ast.AST], rows: int, valid_rows: int, valid_cols: int
+) -> dict[str, _AtomicBuffer]:
+    body = tile_strategy.split_lane_loop_reductions(
+        body,
+        uniform_names={
+            "source",
+            "output",
+            "column",
+            "rows",
+            "valid_rows",
+            "valid_cols",
+        },
+        proven_disjoint_tensor_pairs=_PAIRS,
+    )
+    body = tile_strategy.restore_unprocessed_lane_reduce_markers(body)
+    buffers = {
+        "source": _AtomicBuffer(np.arange(rows * 4, dtype=np.float64) + 0.5),
+        "output": _AtomicBuffer(np.zeros(rows)),
+        "column": _AtomicBuffer(np.full(4, -99.0)),
+    }
+    namespace = {
+        **buffers,
+        "rows": rows,
+        "valid_rows": valid_rows,
+        "valid_cols": valid_cols,
+        "cutlass": SimpleNamespace(Float32=float, Int32=int),
+        "cute": SimpleNamespace(
+            arch=SimpleNamespace(
+                atomic_add=lambda pointer, val, sem: pointer.atomic_add(val)
+            )
+        ),
+    }
+    module = ast.Module(body=cast("list[ast.stmt]", body), type_ignores=[])
+    exec(compile(ast.unparse(module), "<interchanged>", "exec"), namespace)
+    return buffers
+
+
+@pytest.mark.parametrize(
+    ("rows", "valid_rows", "valid_cols"), [(3, 3, 4), (3, 2, 3), (0, 0, 4)]
+)
+def test_an_atomic_consumer_of_the_reduction_is_applied_by_the_final_pass_only(
+    rows: int, valid_rows: int, valid_cols: int
+) -> None:
+    """The first pass keeps its per-lane ``column`` totals; its atomic of the
+    reduction's per-lane partial is dropped (a store there is overwritten by
+    the final pass, an add would double the total) and the final pass adds
+    each row's full reduction once."""
+    body = tile_strategy.interchange_lane_outside_serial_reductions([_atomic_program()])
+    first, *final = body
+    assert isinstance(first, ast.For) and first.target.id == "lane"  # pyrefly: ignore [missing-attribute]
+    assert not _atomics([first])
+    assert len(_atomics(final)) == 1
+    assert "reduced" not in ast.unparse(first)
+    assert "grad_w = grad_w + value" in ast.unparse(first)
+    buffers = _execute_atomics(body, rows, valid_rows, valid_cols)
+    values = buffers["source"].values.reshape(rows, 4)
+    mask = (np.arange(rows)[:, None] < valid_rows) & (
+        np.arange(4)[None, :] < valid_cols
+    )
+    masked = np.where(mask, values, 0.0)
+    np.testing.assert_array_equal(buffers["output"].values, masked.sum(1))
+    assert buffers["output"].stores == valid_rows
+    np.testing.assert_array_equal(buffers["column"].values, masked.sum(0))
+
+
+def test_a_first_pass_whose_only_effect_was_the_atomic_is_dropped() -> None:
+    body = tile_strategy.interchange_lane_outside_serial_reductions(
+        [_atomic_program(row_total=False)]
+    )
+    assert len(body) == 1 and isinstance(body[0], ast.For)
+    assert body[0].target.id == "row"  # pyrefly: ignore [missing-attribute]
+    assert len(_atomics(body)) == 1
+    buffers = _execute_atomics(body, 3, 2, 3)
+    values = buffers["source"].values.reshape(3, 4)
+    expected = np.where(np.arange(4)[None, :] < 3, values, 0.0).sum(1)
+    expected[2:] = 0.0
+    np.testing.assert_array_equal(buffers["output"].values, expected)
+
+
+def test_an_atomic_statement_with_other_work_declines_the_interchange() -> None:
+    """Dropping the statement from the first pass would drop its other
+    effect too, and keeping it would double the total: decline the nest."""
+    with pytest.raises(exc.BackendUnsupported, match="atomic consumer"):
+        tile_strategy.interchange_lane_outside_serial_reductions(
+            [_atomic_program(extra="\n            seen = reduced")]
+        )
+
+
+def _column_sums_added(x: torch.Tensor) -> torch.Tensor:
+    b, m = x.size()
+    out = torch.zeros([m], dtype=torch.float32, device=x.device)
+    for tile_b in hl.tile(b):
+        for tile_m in hl.tile(m):
+            hl.atomic_add(out, [tile_m], x[tile_b, tile_m].sum(dim=0))
+    return out
+
+
+@skipUnlessBackends(["cute"])
+def test_column_sums_over_a_lane_looped_row_tile_are_added_once() -> None:
+    """Eight rows of a tile on one thread walk a lane loop around the column
+    loop; the interchange puts the column loop outside and the kernel holds
+    one atomic of the full column sum, with no first pass left."""
+    with _mock_cuda_unavailable():
+        bound = _cpu_bind(
+            helion.kernel(_column_sums_added, backend="cute", autotune_effort="none"),
+            (torch.randn(37, 100),),
+        )
+        config = dict(bound.config_spec.default_config().config)
+        config.update(
+            block_sizes=[8, 32],
+            num_threads=[1, 32],
+            cute_vector_widths=[1, 1],
+            cute_lane_layouts=["strided", "strided"],
+        )
+        code = bound.to_code(helion.Config(**config))
+    kernel = next(
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    assert len(_atomics(list(kernel.body))) == 1, code
+    assert ast.unparse(kernel).count("for lane_0 in range(8):") == 1, code
+    (column_loop,) = [node for node in kernel.body if isinstance(node, ast.For)]
+    assert column_loop.target.id == "tile_offset_1"  # pyrefly: ignore [missing-attribute]

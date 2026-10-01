@@ -80,9 +80,19 @@ tls: _TLS = cast("_TLS", threading.local())
 def _exact_thread_block_dims(
     tile_strategy: TileStrategyDispatch,
 ) -> tuple[int, int, int] | None:
-    """Return a proven-static launch shape, or ``None`` when inference fails."""
+    """Return a proven-static launch shape, or ``None`` when inference fails.
+
+    ``None`` as well when a launch axis is sized by a kernel argument
+    (``TileStrategyDispatch.symbolic_thread_axes``): the static shape holds a
+    one for it, and a pass proving bounds from that one (the lane-tile bounds
+    simplifier erased the leader guard ``cute.arch.thread_idx()[axis] == 0``
+    of an atomic beside the axis, which then ran once per thread of it) would
+    prove the wrong thing.
+    """
 
     try:
+        if tile_strategy.symbolic_thread_axes():
+            return None
         thread_dims = tile_strategy.thread_block_dims()
         if len(thread_dims) != 3 or any(
             not isinstance(dim, (int, sympy.Integer)) for dim in thread_dims
@@ -794,6 +804,13 @@ class DeviceFunction:
         fewer elements than the block, and the masked ones must not count
         in a mean.  Spelled as a parenthesized compound expression in that
         case, as the other derived tile edges are.
+
+        A masked loop that carries no end variable has no per-dim extent to
+        divide by: a flattened loop's dims share one flat bound, and some
+        strategies keep a data-dependent end as a tensor.  No shipped
+        strategy hosts a reduction in such a loop (a loop with a reduction
+        is never flattened); should one, the mean is declined rather than
+        divided by the block.
         """
         env = CompileEnvironment.current()
         block_size = self.block_size_var(env.canonical_block_id(block_id))
@@ -801,13 +818,18 @@ class DeviceFunction:
             block_size = "1"
         if self.codegen.mask_var(block_id) is None:
             return block_size
-        begin = self.codegen.tile_begin_var(block_id)
         end = (
             self.codegen.active_device_loops[block_id][-1]
             .block_id_to_info[block_id]
             .end_var_name
         )
-        assert end is not None
+        if end is None:
+            raise exc.BackendUnsupported(
+                env.backend.name,
+                f"a mean over tile dim {block_id} in a masked loop without an end "
+                "variable: the tile's extent is unknown there",
+            )
+        begin = self.codegen.tile_begin_var(block_id)
         clamped = env.backend.minimum_expr(f"{begin} + {block_size}", end)
         return f"(({clamped}) - {begin})"
 
