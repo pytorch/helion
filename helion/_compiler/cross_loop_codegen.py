@@ -2040,16 +2040,21 @@ def emit_cross_loop_schedule(
         ]
 
     def static_root_body(root: int) -> list[ast.stmt]:
-        """Lower one resident root from its scalar W-padded ownership fold."""
+        """Lower one resident root from its scalar ownership fold."""
         task_count_value = static_pipeline_plan.execution_orders[root].task_count
         active_worker_count = min(launch_worker_count, task_count_value)
-        segment_membership = (
-            f"({worker}) == 0"
-            if active_worker_count == 1
-            else f"(({worker}) >= 0 and ({worker}) < {active_worker_count})"
-        )
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = segment_begin + task_count_value
+        # A trailing root may begin mid-wave: rotate workers onto its lanes.
+        rotation = -segment_begin % launch_worker_count
+        lane = (
+            f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
+        )
+        segment_membership = (
+            f"({lane}) == 0"
+            if active_worker_count == 1
+            else f"(({lane}) >= 0 and ({lane}) < {active_worker_count})"
+        )
         task_dispatch: list[ast.stmt] = [
             create(
                 ast.For,
@@ -2059,7 +2064,7 @@ def emit_cross_loop_schedule(
                     ctx=ast.Store(),
                 ),
                 iter=expr_from_string(
-                    f"tl.range((({worker}) - 0) + ({segment_begin}), "
+                    f"tl.range((({lane}) - 0) + ({segment_begin}), "
                     f"({segment_end}), "
                     f"{launch_worker_count})"
                 ),

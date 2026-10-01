@@ -725,6 +725,49 @@ def conditional_split_merge_chain(
     static_shapes=True,
     autotune_effort="none",
 )
+def split_merge_then_independent(
+    x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    keys, splits = x.size()
+    partial = torch.empty_like(x)
+    out = torch.empty([keys], dtype=x.dtype, device=x.device)
+    side = torch.empty_like(y)
+    other = torch.empty_like(z)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        partial[key_tile, split_tile] = x[key_tile, split_tile] * 2
+    for key_tile in hl.tile(keys, block_size=1):
+        out[key_tile] = torch.sum(partial[key_tile, :], dim=-1)
+    for side_tile in hl.tile(y.size(0), block_size=1):
+        side[side_tile] = y[side_tile] + 1
+    for other_tile in hl.tile(z.size(0), block_size=1):
+        other[other_tile] = z[other_tile] - 1
+    return out, side, other
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def split_independent_merge(
+    x: torch.Tensor, z: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    keys, splits = x.size()
+    partial = torch.empty_like(x)
+    out = torch.empty([keys], dtype=x.dtype, device=x.device)
+    other = torch.empty_like(z)
+    for key_tile, split_tile in hl.tile([keys, splits], block_size=[1, 1]):
+        partial[key_tile, split_tile] = x[key_tile, split_tile] * 2
+    for other_tile in hl.tile(z.size(0), block_size=1):
+        other[other_tile] = z[other_tile] - 1
+    for key_tile in hl.tile(keys, block_size=1):
+        out[key_tile] = torch.sum(partial[key_tile, :], dim=-1)
+    return out, other
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def specialized_quotient_chain(
     x: torch.Tensor,
     numerator: int,
@@ -1733,6 +1776,36 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(out, live.sum(dim=-1))
                 self.assertIn("tile_dependency_continuation_previous", code)
                 self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_trailing_independent_roots_pack_behind_previous_root(self) -> None:
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        x = torch.randn((2, 3), device=DEVICE, dtype=torch.float32)
+        y = torch.randn((workers - 1,), device=DEVICE, dtype=torch.float32)
+        z = torch.randn((5,), device=DEVICE, dtype=torch.float32)
+        config = {
+            "pid_type": "persistent_blocked",
+            "cross_loop_pipeline": "static",
+            "num_sm_multiplier": 1,
+            "num_warps": 1,
+        }
+        code, (out, side, other) = code_and_output(
+            split_merge_then_independent, (x, y, z), **config
+        )
+        torch.testing.assert_close(out, torch.sum(x * 2, dim=1))
+        torch.testing.assert_close(side, y + 1)
+        torch.testing.assert_close(other, z - 1)
+        self.assertIn("tile_dependency_continuation_previous", code)
+        # y starts after the six producer tasks and wraps; z packs behind y.
+        self.assertIn(f"% {workers} - 0 + 6, {workers + 5}, {workers})", code)
+        end = workers + 10
+        self.assertIn(f"% {workers} - 0 + {workers + 5}, {end}, {workers})", code)
+        # An edge-free root before a synchronized one keeps its own wave.
+        code, (out, other) = code_and_output(split_independent_merge, (x, z), **config)
+        torch.testing.assert_close(out, torch.sum(x * 2, dim=1))
+        torch.testing.assert_close(other, z - 1)
+        self.assertIn(f"tl.program_id(0) - 0 + {workers}, {workers + 5},", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

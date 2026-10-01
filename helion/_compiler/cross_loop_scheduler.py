@@ -992,6 +992,8 @@ class StaticPipelinePlan:
     # roots whose tasks every rank waits for before a launch exits.
     peer_edges: frozenset[tuple[int, int]] = frozenset()
     done_roots: frozenset[int] = frozenset()
+    # Roots after every synchronized root: they neither wait nor publish.
+    trailing_roots: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if self.dispatch_mode not in ("static", "dynamic"):
@@ -1052,7 +1054,14 @@ class StaticPipelinePlan:
         )
 
     def static_base(self, root: int) -> int:
-        """Return one root's immutable W-aligned ownership base."""
+        """Return one root's immutable ownership base, W-aligned unless trailing."""
+        previous = [index for index in self.resident_roots if index < root]
+        if root in self.trailing_roots and previous:
+            # A trailing root needs no wave of its own; pack it behind.
+            return (
+                self.static_base(previous[-1])
+                + self.execution_orders[previous[-1]].task_count
+            )
         return sum(self._padded_task_count(index) for index in range(root))
 
     def _padded_task_count(self, root: int) -> int:
@@ -1134,7 +1143,7 @@ def _root_task_wave_relation(
     root: int,
     charge: Callable[[int], bool],
 ) -> CoordinateRelation | None:
-    if root in plan.continuation_roots:
+    if root in plan.continuation_roots or root in plan.trailing_roots:
         return None
     order = plan.execution_orders[root]
     ordinal_to_wave = CoordinateRelation.scalar_floor_div(
@@ -1409,7 +1418,7 @@ def _continuation_dominance_owner(
     virtual_execution = None if placement is None else placement.keys_by_item
     if virtual_execution is None or not virtual_execution.is_single_valued():
         return None
-    ignored = removed_roots | frozenset((consumer.consumer_root,))
+    ignored = removed_roots | plan.trailing_roots | {consumer.consumer_root}
     if any(
         root not in ignored
         and (
@@ -2301,7 +2310,7 @@ def _task_step_relations(
         for root in range(len(pipeline_plan.execution_orders))
     )
     if sum(relation is None for relation in result) != len(
-        pipeline_plan.continuation_roots
+        pipeline_plan.continuation_roots | pipeline_plan.trailing_roots
     ):
         return None
     return result
@@ -2797,6 +2806,7 @@ def _try_finalize_pipeline_proposal(
     readiness_counters: tuple[ReadinessCounterPlan, ...],
     root_barrier_edges: frozenset[tuple[int, int]],
     dispatch_mode: CrossLoopDispatchMode,
+    trailing_roots: frozenset[int],
     charge: Callable[[int], bool],
 ) -> StaticPipelinePlan | None:
     """Freeze one canonical placement, then lower its final counters."""
@@ -2848,6 +2858,7 @@ def _try_finalize_pipeline_proposal(
             readiness_counters=readiness_counters,
             root_barrier_edges=root_barrier_edges,
             dispatch_mode=dispatch_mode,
+            trailing_roots=trailing_roots,
         )
     except (ValueError, exc.CrossLoopSchedulingError):
         return None
@@ -2974,6 +2985,14 @@ def build_static_pipeline_plan(
         if access.owner_rank is not None
     }
     continuation_ineligible_roots |= cross_rank_roots
+    synchronized_roots = cross_rank_roots | {
+        root
+        for edge in dependency_graph.edges
+        for root in (edge.producer_root, edge.consumer_root)
+    }
+    trailing_roots = frozenset(
+        range(max(synchronized_roots, default=-1) + 1, len(root_task_orders))
+    )
     dependency_graph = dataclasses.replace(
         dependency_graph,
         edges=tuple(
@@ -3014,6 +3033,7 @@ def build_static_pipeline_plan(
             readiness_counters=counters,
             root_barrier_edges=barriers,
             dispatch_mode=dispatch_mode,
+            trailing_roots=trailing_roots,
             charge=charge,
         )
 
