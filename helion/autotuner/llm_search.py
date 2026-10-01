@@ -306,6 +306,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
     def _call_llm(self, messages: list[dict[str, str]]) -> str:
         """Send one synchronous request to the configured provider and time it."""
         t0 = time.perf_counter()
+        trace_request = None
         try:
             provider = self.provider or _infer_provider(self.model)
             if provider == "unsupported":
@@ -315,18 +316,44 @@ class LLMGuidedSearch(PopulationBasedSearch):
                     "Responses. Set HELION_LLM_PROVIDER to override the provider "
                     "when using a proxy."
                 )
-            return _call_provider(
+            max_output_tokens = self._max_output_tokens_for_request()
+            trace_request = self.log.record_llm_request(
+                provider=provider,
+                model=self.model,
+                round=len(self._llm_call_times),
+                messages=messages,
+                max_output_tokens=max_output_tokens,
+                request_timeout_s=self.request_timeout_s,
+                effort_level=self.effort_level,
+                fast_mode=self.fast_mode,
+            )
+            response = _call_provider(
                 provider,
                 model=self.model,
                 api_base=self.api_base,
                 api_key=self.api_key,
                 messages=messages,
-                max_output_tokens=self._max_output_tokens_for_request(),
+                max_output_tokens=max_output_tokens,
                 request_timeout_s=self.request_timeout_s,
                 effort_level=self.effort_level,
                 fast_mode=self.fast_mode,
             )
+            self.log.record_llm_response(
+                trace_request,
+                status="ok",
+                response=response,
+                duration_s=time.perf_counter() - t0,
+            )
+            return response
         except Exception as e:
+            # Provider errors may contain credentials or headers. Record the
+            # exception class, while keeping the existing diagnostic log intact.
+            self.log.record_llm_response(
+                trace_request,
+                status="error",
+                error_type=type(e).__name__,
+                duration_s=time.perf_counter() - t0,
+            )
             self.log.warning(f"LLM call failed: {type(e).__name__}: {e}")
             raise
         finally:
