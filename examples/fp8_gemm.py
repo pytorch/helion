@@ -26,7 +26,11 @@ import helion.language as hl
 # `AssertionError: Input shapes should have M >= 16, N >= 16 and K >= 32`
 config = None
 if os.environ.get("HELION_AUTOTUNE_EFFORT") == "none":
-    config = helion.Config(block_sizes=[32, 32, 32])
+    if DEVICE.type == "xpu":
+        # 64x64 tiles are 1.3-1.9x faster than 32x32 on Intel GPUs
+        config = helion.Config(block_sizes=[64, 64, 32])
+    else:
+        config = helion.Config(block_sizes=[32, 32, 32])
 
 
 # %%
