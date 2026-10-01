@@ -11,6 +11,7 @@ from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
 from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_signature
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 import helion.language as hl
@@ -47,8 +48,15 @@ def test_unrelated_grid_has_no_alias_specialization(static_shapes: bool) -> None
     x = torch.empty(64, device=CPU_DEVICE)
     y = torch.empty_like(x)
     bound = kernel.bind((x, y))
-    assert not bound.env.runtime_input_specializations
-    assert not kernel._has_specialization_extras
+    # Every CuTe kernel specializes on vector-alignment facts; those depend on
+    # pointer residues only, never on storage overlap.
+    assert set(bound.env.runtime_input_specializations) == {
+        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
+    }
+    assert [
+        extractor.specialization_key
+        for extractor in kernel._specialize_extra[bound._base_spec_key]
+    ] == [_PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY]
     # This pointwise kernel does not reorder stores to an existing input, so
     # input aliasing should not create a redundant compiled variant.
     assert kernel.bind((x, x.view_as(x))) is bound
@@ -65,11 +73,17 @@ def test_explicit_specialization_schema_is_not_extended_by_unused_alias_facts() 
 
     args = (torch.empty(32, device=CPU_DEVICE), torch.empty(64, device=CPU_DEVICE))
     bound = specialized.bind(args)
+    assert _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY not in (
+        bound.env.runtime_input_specializations
+    )
     extractors = specialized._specialize_extra[bound._base_spec_key]
-    assert tuple(fn(args) for fn in extractors) == (64,)
+    assert tuple(fn(args) for fn in extractors) == (
+        64,
+        _persistent_vec_alignment_matrix_signature(args),
+    )
 
 
-def test_container_grid_dispatch_does_not_rebind_without_alias_consumer() -> None:
+def test_container_grid_dispatch_does_not_recompile_without_alias_consumer() -> None:
     @helion.kernel(
         backend="cute", static_shapes=True, config=helion.Config(block_sizes=[64])
     )
@@ -80,15 +94,46 @@ def test_container_grid_dispatch_does_not_rebind_without_alias_consumer() -> Non
         return out
 
     x, y = torch.randn(64, device=CPU_DEVICE), torch.randn(64, device=CPU_DEVICE)
-    with (
-        patch.object(
-            BoundKernel, "compile_config", return_value=lambda xs: xs[0] + xs[1]
-        ),
-        patch.object(add_list, "_bind", wraps=add_list._bind) as bind,
-    ):
+    with patch.object(
+        BoundKernel, "compile_config", return_value=lambda xs: xs[0] + xs[1]
+    ) as compile_config:
         out = add_list([x, y])
-    assert bind.call_count == 1
+    # Alignment facts re-resolve the bound kernel during dispatch, but without
+    # an alias consumer every lookup lands on the single compiled variant.
+    assert compile_config.call_count == 1
+    assert len(add_list._bound_kernels) == 1
+    assert _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY not in (
+        add_list.bind(([x, y],)).env.runtime_input_specializations
+    )
+    assert len(add_list._bound_kernels) == 1
     torch.testing.assert_close(out, x + y)
+
+
+def _matmul_into(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for row, column in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([row, column], dtype=torch.float32)
+        for reduction in hl.tile(a.size(1)):
+            acc = torch.addmm(acc, a[row, reduction], b[reduction, column])
+        out[row, column] = acc.to(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
+def test_grid_contraction_registers_alias_facts(static_shapes: bool) -> None:
+    kernel = helion.kernel(_matmul_into, backend="cute", static_shapes=static_shapes)
+    a = torch.empty((64, 32), dtype=torch.float16, device=CPU_DEVICE)
+    b = torch.empty((32, 48), dtype=torch.float16, device=CPU_DEVICE)
+    out = torch.empty((64, 48), dtype=torch.float16, device=CPU_DEVICE)
+    bound = kernel.bind((a, b, out))
+    # Collective MMA schedules prove the epilogue store disjoint from operand
+    # loads only through these facts, so an aliasing launch cannot reuse the
+    # bound kernel compiled for disjoint storage.
+    assert _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY in (
+        bound.env.runtime_input_specializations
+    )
+    shared = torch.empty(out.numel(), dtype=torch.float16, device=CPU_DEVICE)
+    overlapping = (shared[: a.numel()].view_as(a), b, shared.view_as(out))
+    assert kernel.bind(overlapping) is not bound
 
 
 def _scan_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:

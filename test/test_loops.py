@@ -42,8 +42,11 @@ BLOCK_SIZE_CHOICES = (32, 256)
 
 
 @helion.kernel
-def device_loop_3d(x: torch.Tensor) -> torch.Tensor:
-    out = torch.empty_like(x)
+def device_loop_3d(x: torch.Tensor, output: torch.Tensor | None = None) -> torch.Tensor:
+    if output is None:
+        out = torch.empty_like(x)
+    else:
+        out = output
     a, b, c, d = x.shape
     for tile_a in hl.tile(a):
         for tile_b, tile_c, tile_d in hl.tile([b, c, d]):
@@ -241,7 +244,10 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop1(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+        x = torch.randn([128, 128, 128, 128], device=DEVICE)
+        # An output argument retains the serial loop axes under CuTe's
+        # fresh-output partition promotion, so these controls remain exercised.
+        args = (x, torch.empty_like(x))
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -254,7 +260,8 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfLowVRAM("Test requires high VRAM for [128, 128, 128, 128] tensors")
     @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop2(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+        x = torch.randn([128, 128, 128, 128], device=DEVICE)
+        args = (x, torch.empty_like(x))
         code, result = code_and_output(
             device_loop_3d,
             args,
@@ -269,7 +276,8 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfTileIR("TileIR does not support block_ptr indexing")
     @skipIfXPU("worker crash on XPU")
     def test_3d_device_loop3(self):
-        args = (torch.randn([128, 128, 128, 128], device=DEVICE),)
+        x = torch.randn([128, 128, 128, 128], device=DEVICE)
+        args = (x, torch.empty_like(x))
         code, result = code_and_output(
             device_loop_3d,
             args,

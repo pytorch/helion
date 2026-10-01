@@ -1486,16 +1486,129 @@ def test_attention_helion_source_provenance_matches_benchmark_checkout():
         capture_output=True,
         text=True,
     )
-    if git_head.returncode != 0:
+    git_root = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=compare_attention_backends.REPO_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if (
+        git_root.returncode != 0
+        or Path(git_root.stdout.strip()).resolve()
+        != compare_attention_backends.REPO_ROOT.resolve()
+    ):
         # CI containers cannot always read the mounted checkout's git metadata
-        # (e.g. dubious-ownership); the script degrades provenance to None then.
+        # (e.g. dubious-ownership). A source archive may also be nested inside
+        # a different checkout; neither case supplies this source's provenance.
         assert provenance["helion_checkout_git_commit"] is None
         assert provenance["helion_source_tree_sha256"] is None
         assert provenance["helion_source_tree_file_count"] is None
     else:
-        assert provenance["helion_checkout_git_commit"] == git_head.stdout.strip()
+        expected_head = git_head.stdout.strip() if git_head.returncode == 0 else None
+        assert provenance["helion_checkout_git_commit"] == expected_head
         assert len(provenance["helion_source_tree_sha256"]) == 64
         assert provenance["helion_source_tree_file_count"] > 0
+
+
+def test_attention_source_snapshot_hashes_a_real_worktree_and_symlink(tmp_path):
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        ["git", "init", "--quiet", str(checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    source = checkout / "helion" / "__init__.py"
+    source.parent.mkdir()
+    source.write_text("value = 1\n")
+    subprocess.run(
+        ["git", "add", "--", "helion/__init__.py"],
+        cwd=checkout,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    alias = tmp_path / "checkout-alias"
+    alias.symlink_to(checkout, target_is_directory=True)
+    expected = hashlib.sha256(
+        b"helion/__init__.py\0" + hashlib.sha256(source.read_bytes()).digest()
+    ).hexdigest()
+    for root in (checkout, alias):
+        assert compare_attention_backends._git_worktree_root_matches(root)
+        snapshot = compare_attention_backends._git_source_snapshot(root, ("helion",))
+        assert snapshot == {
+            "helion_source_tree_sha256": expected,
+            "helion_source_tree_file_count": 1,
+            "helion_source_tree_dirty": True,
+        }
+    source.write_text("value = 2\n")
+    changed = compare_attention_backends._git_source_snapshot(checkout, ("helion",))
+    assert changed["helion_source_tree_sha256"] != expected
+    assert changed["helion_source_tree_file_count"] == 1
+    untracked = source.parent / "untracked.py"
+    untracked.write_text("untracked_value = 3\n")
+    expected_with_untracked = hashlib.sha256()
+    for path in (source, untracked):
+        expected_with_untracked.update(str(path.relative_to(checkout)).encode())
+        expected_with_untracked.update(b"\0")
+        expected_with_untracked.update(hashlib.sha256(path.read_bytes()).digest())
+    snapshot = compare_attention_backends._git_source_snapshot(checkout, ("helion",))
+    assert snapshot["helion_source_tree_sha256"] == expected_with_untracked.hexdigest()
+    assert snapshot["helion_source_tree_file_count"] == 2
+
+
+@pytest.mark.parametrize("ignored", [False, True])
+def test_attention_source_copy_cannot_inherit_parent_git_provenance(
+    tmp_path, monkeypatch, ignored
+):
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        ["git", "init", "--quiet", str(checkout)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    copied = checkout / "copied-source"
+    package = copied / "helion"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("copied_value = 7\n")
+    example = copied / "examples" / "attention.py"
+    example.parent.mkdir()
+    example.write_text("copied_example = 9\n")
+    if ignored:
+        (checkout / ".gitignore").write_text("copied-source/\n")
+    assert not compare_attention_backends._git_worktree_root_matches(copied)
+    snapshot = compare_attention_backends._git_source_snapshot(copied, ("helion",))
+    assert all(value is None for value in snapshot.values())
+    monkeypatch.setattr(compare_attention_backends, "REPO_ROOT", copied)
+    module_paths = {
+        "helion": package / "__init__.py",
+        "examples.attention": example,
+    }
+    monkeypatch.setattr(
+        compare_attention_backends, "_module_source_path", module_paths.__getitem__
+    )
+
+    def parent_metadata_must_not_be_queried(*args):
+        raise AssertionError("A copied source has no matching Git checkout")
+
+    monkeypatch.setattr(
+        compare_attention_backends, "_git_commit", parent_metadata_must_not_be_queried
+    )
+    monkeypatch.setattr(
+        compare_attention_backends, "_git_describe", parent_metadata_must_not_be_queried
+    )
+    provenance = compare_attention_backends._helion_source_provenance()
+    assert provenance["helion_import_root_matches_repo"] is True
+    assert provenance["attention_example_import_matches_repo"] is True
+    assert provenance["helion_checkout_git_commit"] is None
+    assert provenance["helion_checkout_git_describe"] is None
+    assert provenance["helion_source_tree_sha256"] is None
+    assert provenance["helion_source_tree_file_count"] is None
+    assert provenance["helion_source_tree_dirty"] is None
+    with pytest.raises(SystemExit, match="source checkout"):
+        compare_attention_backends._validate_helion_source_checkout(provenance)
 
 
 def test_attention_direct_script_pins_helion_to_benchmark_checkout(tmp_path):

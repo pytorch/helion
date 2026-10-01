@@ -4,7 +4,9 @@ import contextlib
 import functools
 import math
 import operator
+import os
 import re
+import tempfile
 from typing import Any
 import unittest
 from unittest.mock import patch
@@ -5581,11 +5583,21 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
                 "torch.compile fusion requires ExternalTritonTemplateKernel support"
             )
 
+        # This test needs a fused cache miss after its own unfused warmup.
+        # An ambient cache may already contain the same valid fused key.
+        helion_cache_dir = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(patch.dict(os.environ, HELION_CACHE_DIR=helion_cache_dir))
+        self.enterContext(fresh_cache())
+
         @helion.kernel(
             torch_compile_fusion=True,
             autotune_with_torch_compile_fusion=True,
             autotune_max_generations=1,
             autotune_effort="quick",
+            # The search only has to reach the fused benchmark path; cap its
+            # wall clock so a shared-GPU runner cannot stretch it past the
+            # per-test timeout.
+            autotune_budget_seconds=30,
         )
         def k_add_no_configs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)

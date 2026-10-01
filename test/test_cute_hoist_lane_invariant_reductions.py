@@ -13,6 +13,7 @@ from helion._compiler.ast_read_writes import ast_rename
 from helion._compiler.cute.hoist_lane_invariant_reductions import (
     hoist_lane_invariant_reductions,
 )
+from helion._compiler.cute.vector_reduction_packets import optimize_vector_reductions
 
 _TENSORS = {"bias", "gate", "head", "indices", "key", "out", "state"}
 _TENSOR_DTYPES = {
@@ -1251,3 +1252,47 @@ for row_lane in range(16):
     assert code.count("cute.math.exp2(") == 2
     assert "_fuse_cache_20[element] = raw" in code
     assert "_lane_invariant_" not in code
+
+
+def test_packet_pass_preserves_annotations_for_later_lane_hoisting() -> None:
+    for extended in (False, True):
+        for flags in (
+            (True, False, False),
+            (False, True, False),
+            (False, False, True),
+            (True, True, True),
+        ):
+            parsed = ast.parse(_POSITIVE)
+            module = cast("ast.Module", convert(parsed)) if extended else parsed
+            body = module.body
+            setattr(body[0], HELION_LANE_LOOP_VAR_ATTR, "row_lane")
+            annotations = object()
+            body[0].__dict__["_helion_composition_annotations"] = annotations
+            transformed = optimize_vector_reductions(
+                body,
+                {},
+                thread_block_dims=(256, 1, 1),
+                independent_accumulators=flags[0],
+                replicated_single_use=flags[1],
+                unroll_packets=flags[2],
+            )
+            assert transformed[0] is not body[0]
+            assert (
+                transformed[0].__dict__["_helion_composition_annotations"]
+                is annotations
+            )
+            assert ast.dump(ast.Module(body=transformed, type_ignores=[])) == ast.dump(
+                module
+            )
+            result = hoist_lane_invariant_reductions(
+                transformed,
+                tensor_names=_TENSORS,
+                tensor_dtypes=_TENSOR_DTYPES,
+                proven_disjoint_tensor_pairs=_DISJOINT,
+                uniform_names={"base", "batch", "row_base", "vector_type"},
+            )
+            expected = _rewrite(_POSITIVE)
+            assert len(expected) == 4
+            assert ast.dump(ast.Module(body=result, type_ignores=[])) == ast.dump(
+                ast.Module(body=expected, type_ignores=[])
+            )

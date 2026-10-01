@@ -32,6 +32,10 @@ from torch.utils._pytree import tree_flatten
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
+from ..runtime.cute_structural_config import CuteStructuralConfig
+from ..runtime.cute_structural_config import StructuralPolicyError
+from ..runtime.cute_structural_config import bound_structural_policy
+from ..runtime.cute_structural_config import require_same_structural_policy
 from ..runtime.settings import _env_get_int
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
@@ -62,6 +66,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
     from ..runtime.settings import Settings
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
@@ -188,21 +193,50 @@ class _AutotunableKernel(Protocol):
 _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 
 
-def normalize_autotune_seed_configs(settings: Settings) -> tuple[Config, ...]:
+def normalize_autotune_seed_configs(
+    settings: Settings,
+    *,
+    structural_policy: CuteStructuralPolicy
+    | Callable[[], CuteStructuralPolicy | None]
+    | None = None,
+) -> tuple[Config, ...]:
     """Return user-provided autotune seed configs from settings as concrete Configs."""
     from ..runtime.config import Config
 
     seed_configs = settings.autotune_seed_configs
     if seed_configs is None:
         return ()
+    if isinstance(seed_configs, CuteStructuralConfig):
+        seed_configs = (seed_configs,)
     if isinstance(seed_configs, Config):
         return (seed_configs,)
     if isinstance(seed_configs, dict):
         return (Config.from_dict(seed_configs),)
-    return tuple(
-        Config.from_dict(seed_config) if isinstance(seed_config, dict) else seed_config
-        for seed_config in seed_configs
-    )
+    result = []
+    for seed_config in seed_configs:
+        if isinstance(seed_config, CuteStructuralConfig):
+            # Legacy search-policy inspection can run before binding. Only a
+            # new envelope needs the captured bound's policy, so resolve lazily.
+            policy = (
+                structural_policy()
+                if callable(structural_policy)
+                else structural_policy
+            )
+            require_same_structural_policy(
+                seed_config.policy,
+                policy or settings.get_cute_structural_policy()
+                if settings.backend == "cute"
+                else None,
+                context="Late autotune seed envelope",
+            )
+            result.append(seed_config.config)
+        else:
+            result.append(
+                Config.from_dict(seed_config)
+                if isinstance(seed_config, dict)
+                else seed_config
+            )
+    return tuple(result)
 
 
 def _file_sha256(filename: str | None) -> str | None:
@@ -348,6 +382,12 @@ class BaseSearch(BaseAutotuner):
         super().__init__()
         self.kernel = kernel
         self.settings: Settings = kernel.settings
+        if isinstance(self.settings.autotune_config_overrides, CuteStructuralConfig):
+            raise StructuralPolicyError(
+                "Policy-bearing autotune overrides must be supplied before "
+                "creating a new Kernel; late overrides must be an ordinary "
+                "dictionary for the already selected config schema."
+            )
         self.config_spec: ConfigSpec = kernel.config_spec
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
@@ -420,7 +460,12 @@ class BaseSearch(BaseAutotuner):
                 "autotune_effort": settings.autotune_effort,
                 "autotune_budget_seconds": settings.autotune_budget_seconds,
                 "autotune_config_overrides": settings.autotune_config_overrides,
-                "autotune_seed_configs": normalize_autotune_seed_configs(settings),
+                "autotune_seed_configs": normalize_autotune_seed_configs(
+                    settings,
+                    structural_policy=lambda: bound_structural_policy(
+                        self.kernel, captured=True
+                    ),
+                ),
                 "compiler_seed_configs": tuple(self.config_spec.compiler_seed_configs),
                 "compiler_seed_timeout_retry_repetitions": (
                     self.config_spec.compiler_seed_timeout_retry_repetitions
@@ -581,6 +626,7 @@ class BaseSearch(BaseAutotuner):
             hardware=hardware,
             settings=metadata_settings,
             _device_ir=getattr(host_function, "_device_ir", None),
+            cute_structural_policy=bound_structural_policy(self.kernel),
         )
         provider_cls = (
             MultiShapeBenchmarkProvider
@@ -726,17 +772,26 @@ class BaseSearch(BaseAutotuner):
     def _apply_config_filter(
         self, configs: list[Config]
     ) -> tuple[list[Config], list[int]]:
-        """Apply the user-provided config filter, returning passing configs and their indices."""
+        """Apply backend and user filters, returning configs and source indices."""
         config_filter = self.settings.autotune_config_filter
-        if config_filter is None:
-            return configs, list(range(len(configs)))
-        filtered: list[Config | None] = [config_filter(c) for c in configs]
+        filtered: list[Config | None] = []
+        for config in configs:
+            candidate = config_filter(config) if config_filter is not None else config
+            if candidate is not None and not self._backend_config_is_viable(candidate):
+                candidate = None
+            filtered.append(candidate)
         passing_indices = [i for i, fc in enumerate(filtered) if fc is not None]
         passing_configs = cast(
             "list[Config]",
             [filtered[i] for i in passing_indices],
         )
         return passing_configs, passing_indices
+
+    def _backend_config_is_viable(self, config: Config) -> bool:
+        """Return whether the backend can cheaply rule out an autotune config."""
+        return self.config_spec.backend.autotune_config_is_viable(
+            self.config_spec, config
+        )
 
     def benchmark_batch(
         self, configs: list[Config], *, desc: str = "Benchmarking"
@@ -778,7 +833,7 @@ class BaseSearch(BaseAutotuner):
                     results.append(next(inner_iter))
                 else:
                     self.log.debug(
-                        f"Config filtered out by autotune_config_filter: {config!r}"
+                        f"Config filtered out before benchmarking: {config!r}"
                     )
                     results.append(
                         BenchmarkResult(
@@ -983,7 +1038,9 @@ class BaseSearch(BaseAutotuner):
 
         return hardware, specialization_key
 
-    def _find_similar_cached_configs(self, max_configs: int) -> list[SavedBestConfig]:
+    def _find_similar_cached_configs(
+        self, max_configs: int, *, config_spec_hash: str | None = None
+    ) -> list[SavedBestConfig]:
         """Return cached configs matching hardware and specialization.
 
         Scans the local cache first; if more configs are needed and a remote
@@ -1013,8 +1070,12 @@ class BaseSearch(BaseAutotuner):
         if current_hardware is None or current_spec_key is None:
             return []
 
-        current_fingerprint_hash = self.config_spec.cache_fingerprint_hash(
-            advanced_controls_files=self.settings.autotune_search_acf or None
+        current_fingerprint_hash = (
+            config_spec_hash
+            if config_spec_hash is not None
+            else self.config_spec.cache_fingerprint_hash(
+                advanced_controls_files=self.settings.autotune_search_acf or None
+            )
         )
 
         def is_compatible(entry: SavedBestConfig) -> bool:
@@ -1024,6 +1085,7 @@ class BaseSearch(BaseAutotuner):
                 and _normalize_spec_key_str(entry.specialization_key)
                 == current_spec_key
                 and entry.config_spec_hash == current_fingerprint_hash
+                and entry.cute_structural_policy == bound_structural_policy(self.kernel)
             )
 
         matching: list[SavedBestConfig] = []
@@ -1087,7 +1149,12 @@ class BaseSearch(BaseAutotuner):
 
     def _autotune_seed_configs(self) -> Sequence[Config]:
         """Return user-provided autotune seed configs normalized from settings."""
-        return normalize_autotune_seed_configs(self.settings)
+        return normalize_autotune_seed_configs(
+            self.settings,
+            structural_policy=lambda: bound_structural_policy(
+                self.kernel, captured=True
+            ),
+        )
 
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
@@ -1251,6 +1318,7 @@ class PopulationBasedSearch(BaseSearch):
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
+            compiler_coverage_enabled=not self.settings.disable_autotuner_heuristics,
         )
 
     def _generation_invalid_config_count(self) -> int:
@@ -1264,7 +1332,9 @@ class PopulationBasedSearch(BaseSearch):
             # 3: an in-process fallback for a mutated-argument kernel gives
             # every finalist private storage, preventing cross-config L2
             # eviction-priority leakage.
-            "timing_version": 3,
+            # Fresh finalist processes cannot inherit cached argument storage
+            # or live allocations from candidates measured earlier in search.
+            "timing_version": 4,
             "top_k": self._final_rebenchmark_top_k(),
             "target_ms": self._final_rebenchmark_target_ms(),
             "isolated": self._final_rebenchmark_use_isolated(),
@@ -1398,14 +1468,20 @@ class PopulationBasedSearch(BaseSearch):
         except exc.InvalidConfig:
             self.config_gen.invalid_config_count += 1
             return None
+        if not self._backend_config_is_viable(config):
+            self.config_gen.invalid_config_count += 1
+            return None
         return PopulationMember(_unset_fn, [], canonical_flat, config)
 
     def _pad_initial_population_with_unique_random(
         self,
         population: Sequence[FlatConfig],
         target: int,
+        *,
+        generation: ConfigGeneration | None = None,
     ) -> list[FlatConfig]:
         """Pad an initial population with normalized, unique random configs."""
+        generation = self.config_gen if generation is None else generation
         result: list[FlatConfig] = []
         seen: set[Config] = set()
         invalid = 0
@@ -1414,8 +1490,11 @@ class PopulationBasedSearch(BaseSearch):
         def append_if_valid(flat: FlatConfig) -> None:
             nonlocal invalid, duplicate
             try:
-                canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+                canonical_flat, config = generation.canonicalize_flat(flat)
             except exc.InvalidConfig:
+                invalid += 1
+                return
+            if not self._backend_config_is_viable(config):
                 invalid += 1
                 return
             if config in seen:
@@ -1431,7 +1510,7 @@ class PopulationBasedSearch(BaseSearch):
         max_attempts = max(64, max(0, target - len(result)) * 64)
         while len(result) < target and attempts < max_attempts:
             attempts += 1
-            append_if_valid(self.config_gen.random_flat())
+            append_if_valid(generation.random_flat())
 
         if len(result) < target:
             self.log(
@@ -1440,10 +1519,32 @@ class PopulationBasedSearch(BaseSearch):
                 f"after {attempts} random attempts "
                 f"({invalid} invalid, {duplicate} duplicate)."
             )
-        self.log(f"Initial population after unique random padding: {len(result)} total")
+        if attempts or invalid or duplicate:
+            self.log(
+                f"Initial population after unique random padding: {len(result)} total"
+            )
         return result
 
-    def _generate_best_available_population_flat(self) -> list[FlatConfig]:
+    def _replace_backend_rejected_initial_configs(
+        self,
+        population: Sequence[FlatConfig],
+        target: int,
+    ) -> list[FlatConfig]:
+        """Refill only when backend screening rejects an initial candidate."""
+        for flat in population:
+            try:
+                _canonical_flat, config = self.config_gen.canonicalize_flat(flat)
+            except exc.InvalidConfig:
+                continue
+            if not self._backend_config_is_viable(config):
+                return self._pad_initial_population_with_unique_random(
+                    population, target
+                )
+        return list(population)
+
+    def _generate_best_available_population_flat(
+        self, *, generation: ConfigGeneration | None = None
+    ) -> list[FlatConfig]:
         """
         Generate initial population using default config, explicit seed configs,
         and cached configs.
@@ -1463,6 +1564,8 @@ class PopulationBasedSearch(BaseSearch):
             seed configs and up to autotune_best_available_max_configs cached
             configs.
         """
+        projected = generation is not None and generation._initial_sampling
+        generation = self.config_gen if generation is None else generation
         max_configs = self.settings.autotune_best_available_max_configs
 
         seen: set[Config] = set()
@@ -1472,7 +1575,7 @@ class PopulationBasedSearch(BaseSearch):
         # User seed configs are explicit requests, so try them before compiler-owned
         # seeds, the raw default, and cached configs while still deduplicating
         # normalized configs.
-        for flat, transferred_config in self.config_gen.user_seed_flat_config_pairs(
+        for flat, transferred_config in generation.user_seed_flat_config_pairs(
             self._autotune_seed_configs(), self.log
         ):
             if transferred_config not in seen:
@@ -1484,9 +1587,7 @@ class PopulationBasedSearch(BaseSearch):
         # they encode backend/compiler heuristics and complement user seed configs.
         # Keep them before the raw fragment default so expensive fallback defaults
         # cannot starve a known fast compiler seed in FROM_BEST_AVAILABLE mode.
-        for flat, transferred_config in self.config_gen.seed_flat_config_pairs(
-            self.log
-        ):
+        for flat, transferred_config in generation.seed_flat_config_pairs(self.log):
             if transferred_config not in seen:
                 seen.add(transferred_config)
                 pinned_configs.add(transferred_config)
@@ -1494,8 +1595,8 @@ class PopulationBasedSearch(BaseSearch):
 
         for config in self._best_available_seed_configs:
             try:
-                flat = self.config_gen.flatten(config)
-                transferred_config = self.config_gen.unflatten(flat)
+                flat = generation.flatten(config)
+                transferred_config = generation.unflatten(flat)
                 if transferred_config not in seen:
                     seen.add(transferred_config)
                     pinned_configs.add(transferred_config)
@@ -1503,8 +1604,8 @@ class PopulationBasedSearch(BaseSearch):
             except (ValueError, TypeError, KeyError, AssertionError) as e:
                 self.log(f"Failed to transfer explicit seed config: {e}")
 
-        default_flat = self.config_gen.default_flat()
-        default_config = self.config_gen.unflatten(default_flat)
+        default_flat = generation.default_flat()
+        default_config = generation.unflatten(default_flat)
         if default_config not in seen:
             seen.add(default_config)
             pinned_configs.add(default_config)
@@ -1514,7 +1615,16 @@ class PopulationBasedSearch(BaseSearch):
         )
         self.log("Starting with seed/default configs")
 
-        cached_entries = self._find_similar_cached_configs(max_configs)
+        cached_entries = (
+            self._find_similar_cached_configs(
+                max_configs,
+                config_spec_hash=self.config_spec.projected_cache_fingerprint_hash(
+                    advanced_controls_files=self.settings.autotune_search_acf or None
+                ),
+            )
+            if projected
+            else self._find_similar_cached_configs(max_configs)
+        )
 
         if cached_entries:
             self.log.debug(
@@ -1526,7 +1636,12 @@ class PopulationBasedSearch(BaseSearch):
             try:
                 self.log.debug(f"Cached config {i + 1}: {entry.config}")
                 flat = entry.to_mutable_flat_config()
-                transferred_config = self.config_gen.unflatten(flat)
+                if projected:
+                    flat, transferred_config = generation.projected_cache_flat_pair(
+                        flat
+                    )
+                else:
+                    transferred_config = generation.unflatten(flat)
                 if transferred_config in seen:
                     duplicates += 1
                     self.log.debug(
@@ -1553,6 +1668,48 @@ class PopulationBasedSearch(BaseSearch):
 
         self.log(f"Seed/default/cache population: {len(result)} total")
 
+        return result
+
+    def _append_compiler_coverage(
+        self, population: list[FlatConfig], *, use_cache: bool
+    ) -> list[FlatConfig]:
+        from .compiler_coverage import append_compiler_coverage
+
+        def cached_configs() -> list[Config]:
+            if not use_cache:
+                return []
+            result: list[Config] = []
+            for entry in self._find_similar_cached_configs(
+                self.settings.autotune_best_available_max_configs
+            ):
+                try:
+                    result.append(
+                        self.config_gen.strict_unflatten(entry.to_mutable_flat_config())
+                    )
+                except (
+                    exc.InvalidConfig,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    AssertionError,
+                ) as error:
+                    self.log(
+                        f"Failed to transfer expanded coverage cache config: {error}"
+                    )
+            return result
+
+        result, outcomes = append_compiler_coverage(
+            population,
+            self.config_gen,
+            cached_configs=cached_configs,
+            pin=self.pin_finalist_config,
+        )
+        self.compiler_coverage_outcomes = outcomes
+        for outcome in outcomes:
+            self.log.debug(
+                f"Compiler coverage {outcome.mechanism} ({outcome.origin}): "
+                f"{outcome.outcome}; requested={outcome.requested}, effective={outcome.effective}"
+            )
         return result
 
     def set_best_available_seed_configs(
@@ -2094,8 +2251,8 @@ class PopulationBasedSearch(BaseSearch):
         Args:
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
-            candidate_private_args: When an isolated worker is unavailable,
-                keep mutated argument storage private to each candidate.
+            candidate_private_args: Use a fresh worker process per candidate;
+                when unavailable, keep argument storage private in-process.
         """
         if len(members) < 2:
             return
@@ -2126,6 +2283,7 @@ class PopulationBasedSearch(BaseSearch):
                     target_ms, self.settings.autotune_benchmark_timeout
                 ),
                 desc=desc,
+                fresh_process=candidate_private_args,
             )
             if isolated_results is not None:
                 new_timings, failure_statuses = (
@@ -2862,6 +3020,13 @@ class PopulationBasedSearch(BaseSearch):
         if not math.isfinite(delta_by_slot[best_slot]):
             return best
         best_member = candidates[best_slot]
+
+        # Every delta is measured against a fresh run of ``best``. Sampling
+        # noise can make the incumbent's own pair nonzero, so the smallest
+        # positive delta may belong to another candidate. Keep the incumbent
+        # unless at least one paired measurement is actually faster.
+        if best_member is not best and delta_by_slot[best_slot] >= 0:
+            return best
 
         if best_member is not best:
             self.log(

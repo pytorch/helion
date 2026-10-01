@@ -14,7 +14,6 @@ from .test_cute_grid_launch_extents import _merged_copy
 from .test_cute_grid_launch_extents import _mixed_rank_copy
 from .test_cute_grid_launch_extents import _opposed_grids
 import helion
-from helion import exc
 from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
@@ -116,6 +115,10 @@ def test_simultaneous_axes_still_repair_thread_budget(flatten: bool) -> None:
 
 def test_missing_grid_topology_retains_conservative_repair() -> None:
     with _bound(_merged_copy, (torch.empty(2048), torch.empty(2048))) as bound:
+        # Tile-loop paths normally budget separate roots by physical axis.
+        # Without them, the grid facts are the only topology; without those
+        # too, the conservative product repair must still apply.
+        bound.config_spec.cute_tile_loop_paths = ()
         bound.config_spec.kernel_grid_fact = None
         result = _roundtrip(
             bound, helion.Config(block_sizes=[1024, 1024], num_threads=[128, 128])
@@ -125,7 +128,10 @@ def test_missing_grid_topology_retains_conservative_repair() -> None:
 
 def test_nonroot_thread_axis_remains_in_every_group() -> None:
     with _bound(_opposed_grids, (torch.empty((256, 256)),) * 2) as bound:
-        # Axis1 has no root-owner proof; it must coexist with either root.
+        # Exercise the grid-fact group repair that backs kernels without
+        # tile-loop paths. Axis1 has no root-owner proof there; it must
+        # coexist with either root.
+        bound.config_spec.cute_tile_loop_paths = ()
         bound.config_spec.kernel_grid_fact = KernelGridFact(
             roots=(RootGridFact(0, (0,)), RootGridFact(1, (2, 3))),
             graph_to_root=(),
@@ -168,18 +174,18 @@ def test_flattened_root_auto_threads_are_repaired_per_root(opposed: bool) -> Non
                 flatten_loops=[True, True],
             ),
         )
-        assert result.num_threads == ([128, 8, 8, 128] if opposed else [128, 8, 128, 8])
-        assert math.prod(result.num_threads[:2]) == 1024
-        assert math.prod(result.num_threads[2:]) == 1024
         if opposed:
-            # Root-wise repair cannot prove combined physical axis placement.
-            with pytest.raises(exc.BackendUnsupported, match="thread"):
-                bound.to_code(result)
+            # The launch takes each physical axis's maximum across roots, so
+            # both roots shrink until max(32, 8) * max(8, 32) fits the budget.
+            assert result.num_threads == [32, 8, 8, 32]
         else:
-            assert math.prod(_launch_block(bound.to_code(result))) <= 1024
+            assert result.num_threads == [128, 8, 128, 8]
+            assert math.prod(result.num_threads[:2]) == 1024
+            assert math.prod(result.num_threads[2:]) == 1024
+        assert math.prod(_launch_block(bound.to_code(result))) <= 1024
 
 
-def test_distinct_physical_root_axes_still_fail_closed() -> None:
+def test_distinct_physical_root_axes_are_repaired_to_fit() -> None:
     config = helion.Config(
         block_sizes=[16, 2048, 2048, 16],
         num_threads=[16, 64, 64, 16],
@@ -188,10 +194,12 @@ def test_distinct_physical_root_axes_still_fail_closed() -> None:
     )
     args = (torch.empty((32, 4096)), torch.empty((4096, 32)))
     with _bound(_opposed_grids, args) as bound:
+        # Explicit counts on opposed roots would launch max(16, 64) * max(64,
+        # 16) threads. The tile-loop path repair shrinks the wide axes instead
+        # of leaving a config that codegen must reject.
         result = _roundtrip(bound, config)
-        assert result.num_threads == config.num_threads
-        with pytest.raises(exc.BackendUnsupported, match="thread"):
-            bound.to_code(result)
+        assert result.num_threads == [16, 32, 32, 16]
+        assert math.prod(_launch_block(bound.to_code(result))) <= 1024
 
 
 @pytest.mark.parametrize("dtype,width", [(torch.bfloat16, 8), (torch.float32, 4)])

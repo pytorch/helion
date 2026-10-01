@@ -293,7 +293,9 @@ def test_seed_uses_block_ids_with_permuted_specs() -> None:
         torch.randn(256, dtype=torch.bfloat16),
         torch.randn(16, dtype=torch.bfloat16),
     )
-    bound = _persistent_state_update.bind(args)
+    # This test permutes the bound config spec in place; an isolated bind
+    # keeps that (and any earlier test's bound) out of the shared cache.
+    bound = _persistent_state_update._bind_isolated(args)
     env = bound.env
     reduction_block = next(
         block_id for block_id, block in enumerate(env.block_sizes) if block.reduction

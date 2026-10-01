@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import pickle
+import re
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
@@ -50,6 +51,9 @@ from helion._compiler.cute.tcgen05_constants import (
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
+)
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
@@ -168,6 +172,7 @@ def _known_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
             "cute_affine_scan_schedule": st.sampled_from(
                 ["ordinary", "direct_m16n8_v1", "direct_m16n16_v1"]
             ),
+            "cute_packet_prefetch": st.sampled_from([0, 2, 4, 8]),
             "num_warps": st.integers(min_value=1, max_value=64),
             "num_stages": st.integers(min_value=1, max_value=16),
             "pid_type": st.sampled_from(
@@ -224,6 +229,7 @@ def _unknown_keys_strategy() -> st.SearchStrategy[dict[str, Any]]:
                     "cute_bf16x2_recurrence",
                     "cute_proven_bounds",
                     "cute_affine_scan_schedule",
+                    "cute_packet_prefetch",
                     "num_warps",
                     "num_stages",
                     "pid_type",
@@ -509,6 +515,7 @@ class TestConfigAPI(TestCase):
             "cute_bf16x2_recurrence",
             "cute_proven_bounds",
             "cute_affine_scan_schedule",
+            "cute_packet_prefetch",
             "num_warps",
             "num_stages",
             "pid_type",
@@ -1795,7 +1802,8 @@ class TestCuteTcgen05ConfigSpecSplit(TestCase):
             ] = invalid_value
             with self.assertRaisesRegex(
                 exc.InvalidConfig,
-                r"source_m_tile.*\(32, 224, 256\)",
+                r"source_m_tile.*"
+                + re.escape(str(TCGEN05_GROUPED_WORKLIST_DEVICE_SOURCE_M_TILE_CHOICES)),
             ):
                 spec.normalize(wrong_type_config)
 

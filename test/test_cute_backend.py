@@ -203,9 +203,10 @@ def cute_device_loop_add_one(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="cute")
-def cute_flattened_device_loop_add_one(x: torch.Tensor) -> torch.Tensor:
+def cute_flattened_device_loop_add_one(
+    x: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
     b, m, n = x.size()
-    out = torch.empty_like(x)
     for tile_b in hl.tile(b):
         for tile_m, tile_n in hl.tile([m, n]):
             out[tile_b, tile_m, tile_n] = x[tile_b, tile_m, tile_n] + 1
@@ -6812,7 +6813,9 @@ class TestCuteBackend(TestCase):
         self.assertIn("for lane_", code)
 
     def test_flattened_device_loop_num_threads(self) -> None:
-        args = (torch.randn(8, 65, 23, device=DEVICE, dtype=torch.float32),)
+        x = torch.randn(8, 65, 23, device=DEVICE, dtype=torch.float32)
+        # An output argument keeps the device loop available for flattening.
+        args = (x, torch.empty_like(x))
         code, out = code_and_output(
             cute_flattened_device_loop_add_one,
             args,
@@ -6820,7 +6823,6 @@ class TestCuteBackend(TestCase):
             flatten_loops=[True],
             num_threads=[1, 32, 16],
         )
-        (x,) = args
         torch.testing.assert_close(out, x + 1)
         self.assertIn("for lane_", code)
 
@@ -10863,6 +10865,7 @@ class TestCuteBackend(TestCase):
         identity = _runtime_identity_kernel()
         args = (torch.empty(1), torch.zeros(128, dtype=torch.int64))
         bound = identity.bind(args)
+        original_schema = tuple(identity._specialize_extra[bound._base_spec_key])
         descriptor = ("cute_grouped_static_tail", 1, 1, 128, None, None)
         extractor_entered = threading.Event()
         release_extractor = threading.Event()
@@ -10940,7 +10943,10 @@ class TestCuteBackend(TestCase):
             second.result(timeout=5)
 
         signature = bound._base_spec_key
-        self.assertEqual(len(identity._specialize_extra[signature]), 1)
+        self.assertEqual(
+            tuple(identity._specialize_extra[signature]),
+            (*original_schema, blocking_extractor),
+        )
         self.assertEqual(
             identity._cute_grouped_static_tail_extra_descriptors[signature],
             {descriptor},
@@ -10953,6 +10959,9 @@ class TestCuteBackend(TestCase):
         args_a = (x, layout_a)
         signature = identity._base_specialization_key(args_a)
         bound_a = identity.bind(args_a)
+        original_results = tuple(
+            extractor(args_a) for extractor in identity._specialize_extra[signature]
+        )
 
         def first(values: Sequence[object]) -> Hashable:
             return int(cast("torch.Tensor", values[1])[0].item())
@@ -10978,7 +10987,9 @@ class TestCuteBackend(TestCase):
             if key.specialization_key == signature
         ]
         self.assertEqual(len(signature_entries), 1)
-        self.assertEqual(signature_entries[0][0].extra_results, (0, 0))
+        self.assertEqual(
+            signature_entries[0][0].extra_results, (*original_results, 0, 0)
+        )
         self.assertIs(signature_entries[0][1], bound_a)
         self.assertEqual(identity._dispatch_cache, {})
 

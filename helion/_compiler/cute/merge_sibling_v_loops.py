@@ -412,50 +412,23 @@ def _cast_dtype_name(call: ast.Call) -> str | None:
     return None
 
 
-class _NameUseCountVisitor(ast.NodeVisitor):
-    """Count uses of each Name (Load context) within a list of stmts."""
-
-    def __init__(self) -> None:
-        self.counts: dict[str, int] = {}
-
-    def visit_Name(self, node: ast.Name) -> None:
-        if isinstance(node.ctx, ast.Load):
-            self.counts[node.id] = self.counts.get(node.id, 0) + 1
-
-
 def _elide_double_casts_in_stmts(stmts: list[ast.stmt]) -> list[ast.stmt]:
-    """Walk ``stmts`` and merge a redundant cast round-trip on
-    warp_reduction results.
+    """Remove only repeated casts to the same dtype after a warp reduction.
 
-    Pattern (over CONSECUTIVE stmts):
+        A = cutlass.Float<N>(cute.arch.warp_reduction_*(...))
+        B = cutlass.Float<N>(A)
 
-        A = cutlass.Float<N>(cute.arch.warp_reduction_*(...))   # outer cast 1
-        B = cutlass.Float<M>(A)                                   # outer cast 2
+    becomes::
 
-    When N != M and ``A`` has exactly ONE total use in the body (the
-    ``Float<M>(A)`` line), the pair is replaced with:
-
-        A = cutlass.Float<N>(cute.arch.warp_reduction_*(...))   # untouched
-        B = cutlass.Float<M>(cute.arch.warp_reduction_*(...))   # skip A
-
-    Strictly speaking, we want to ELIDE the Float<N> entirely when M
-    matches the underlying type — but the underlying warp_reduction
-    return dtype is determined by the hoist pass's acc dtype, which is
-    ALWAYS cutlass.Float32 for fp16/bf16 inputs.  So when M == Float32
-    we drop the Float<N> wrapper, yielding:
-
-        A = cute.arch.warp_reduction_*(...)
+        A = cutlass.Float < N > (cute.arch.warp_reduction_ * (...))
         B = A
+
+    The first cast establishes A's dtype and must remain. In particular,
+    Float16/BFloat16 followed by Float32 rounds the reduction result, even
+    when the underlying reduction already accumulates in Float32.
     """
     if not stmts:
         return stmts
-
-    # Count uses across all stmts at this level (we only inline when A is
-    # used exactly once — by the next stmt).
-    counter = _NameUseCountVisitor()
-    for s in stmts:
-        counter.visit(s)
-    total_use_counts = counter.counts
 
     new_stmts: list[ast.stmt] = []
     i = 0
@@ -477,6 +450,7 @@ def _elide_double_casts_in_stmts(stmts: list[ast.stmt]) -> list[ast.stmt]:
             if (
                 inner_cast_dtype is not None
                 and len(inner_cast.args) == 1
+                and not inner_cast.keywords
                 and _looks_like_warp_reduce_call(inner_cast.args[0])
             ):
                 next_stmt = stmts[i + 1]
@@ -486,34 +460,21 @@ def _elide_double_casts_in_stmts(stmts: list[ast.stmt]) -> list[ast.stmt]:
                     and isinstance(next_stmt.targets[0], ast.Name)
                     and isinstance(next_stmt.value, ast.Call)
                     and len(next_stmt.value.args) == 1
+                    and not next_stmt.value.keywords
                     and isinstance(next_stmt.value.args[0], ast.Name)
                     and next_stmt.value.args[0].id == a_name
                 ):
                     outer_cast_dtype = _cast_dtype_name(next_stmt.value)
-                    if (
-                        outer_cast_dtype is not None
-                        and outer_cast_dtype == "cutlass.Float32"
-                    ):
-                        # ``A`` must be used exactly ONCE (the Float<M>(A))
-                        # so dropping the inner cast doesn't break anything.
-                        if total_use_counts.get(a_name, 0) == 1:
-                            # Replace stmt: ``A = warp_reduction(...)``
-                            new_a = ast.Assign(
-                                targets=[ast.Name(id=a_name, ctx=ast.Store())],
-                                value=inner_cast.args[0],
-                            )
-                            ast.copy_location(new_a, stmt)
-                            new_stmts.append(new_a)
-                            # Replace next_stmt: ``B = A`` (i.e. drop
-                            # the outer cast since A is now fp32)
-                            new_b = ast.Assign(
-                                targets=next_stmt.targets,
-                                value=ast.Name(id=a_name, ctx=ast.Load()),
-                            )
-                            ast.copy_location(new_b, next_stmt)
-                            new_stmts.append(new_b)
-                            i += 2
-                            consumed = True
+                    if outer_cast_dtype == inner_cast_dtype:
+                        new_stmts.append(stmt)
+                        new_b = ast.Assign(
+                            targets=next_stmt.targets,
+                            value=ast.Name(id=a_name, ctx=ast.Load()),
+                        )
+                        ast.copy_location(new_b, next_stmt)
+                        new_stmts.append(new_b)
+                        i += 2
+                        consumed = True
         if not consumed:
             new_stmts.append(stmt)
             i += 1

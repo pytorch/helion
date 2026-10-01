@@ -11,7 +11,6 @@ from typing import cast
 from ... import exc
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Sequence
 
     import torch
@@ -20,20 +19,49 @@ if TYPE_CHECKING:
     from ..tile_strategy import DeviceLoopState
     from .attention_plan import AttentionScorePlan
     from .aux_tensor import Tcgen05AuxTensorDescriptor
+    from .block_scaled_mma import BlockScaledMmaPlan
     from .chunk_prepare import CuteChunkPreparePlan
     from .chunk_recurrence import CuteChunkRecurrencePlan
+    from .collective_matmul import CollectiveMmaSite
+    from .completed_matmul_sum import CompletedMatmulSum
     from .cute_epilogue import Tcgen05GroupedTailEpilogueMatch
     from .cute_flash_bwd import AttentionBwdMatch
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
+    from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
+    from .grouped_row_union import GroupedRowUnionPlan
+    from .resident_reductions import ResidentReductionLayout
+    from .resident_sequence import SequenceRegion
+    from .signed_bitfield import SignedBytePacket
     from .single_token_rank1_recurrence import CuteSingleTokenRank1Plan
     from .split_single_token_rank1_recurrence import CuteSplitSingleTokenRank1Plan
     from .tcgen05_lifecycle import Tcgen05LifecycleContext
     from .tcgen05_pure_matmul import Tcgen05PureMatmulObjectModel
+
+
+@dataclasses.dataclass(frozen=True)
+class Tcgen05AbStartupPrefill:
+    """Exactly S initial packets, carried into the normal producer state.
+
+    The startup guard uses a private clone. Only the later producer role
+    advances the original state, before consuming its first scheduler record.
+    """
+
+    stages: int
+    producer_state: str
+    first_record: str
+
+    def role_prelude(self) -> str:
+        return (
+            f"{self.first_record} = cutlass.Boolean(True)\n"
+            f"for _tcgen05_prefill_resume in cutlass.range({self.stages}, unroll_full=True):\n"
+            f"    {self.producer_state}.advance()"
+        )
 
 
 class Tcgen05Orientation(enum.Enum):
@@ -102,6 +130,10 @@ class CuteTcgen05GroupedPlan:
     source_m_tile: int | None = None
     m_size: int | None = None
     device_layout_kind: Literal["split_sizes", "offsets"] | None = None
+    # The source program drops negative-address rows before applying its
+    # static M cap; its original signed offset difference remains unchanged.
+    clipped_negative_start: bool = False
+    full_coverage: Tcgen05GroupedFullCoveragePlan | None = None
 
     def __post_init__(self) -> None:
         assert (self.valid_m is None) == (self.store_m is None)
@@ -113,6 +145,7 @@ class CuteTcgen05GroupedPlan:
         assert (self.d_mode is Tcgen05GroupedDMode.NONE) == (self.d_tensormap is None)
         assert not self.device_split_sizes or self.orientation is Tcgen05Orientation.NM
         assert self.device_layout_kind in (None, "split_sizes", "offsets")
+        assert not self.clipped_negative_start or self.device_layout_kind == "offsets"
         assert (self.device_layout_kind is not None) == self.device_split_sizes
         assert (self.runtime_tile_records is None) == (
             self.runtime_total_clusters is None
@@ -146,6 +179,19 @@ class CuteTcgen05GroupedPlan:
             assert self.orientation is Tcgen05Orientation.NM
             assert not self.device_split_sizes
             assert self.direct_pointers is None
+        if self.full_coverage is not None:
+            assert self.orientation is Tcgen05Orientation.NM
+            assert self.device_layout_kind == "offsets"
+            assert self.clipped_negative_start
+            assert not self.fixed_tensormaps
+            assert self.direct_pointers is None
+            assert self.d_mode is Tcgen05GroupedDMode.ALL_TILES
+            assert (
+                self.scheduler_mode is Tcgen05GroupedSchedulerMode.DEVICE_GROUP_SEARCH
+            )
+            assert self.source_m_tile == self.full_coverage.tile_m
+            assert self.m_size == self.full_coverage.m
+            assert int(self.count) == self.full_coverage.groups
         if self.static_problem_shapes is not None:
             assert self.orientation is Tcgen05Orientation.MN
             assert self.real_groups is None
@@ -216,6 +262,7 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     lifecycle_context: Tcgen05LifecycleContext
     output_block_ids: tuple[int, ...]
     pure_matmul_object: Tcgen05PureMatmulObjectModel | None = None
+    output_stores: tuple[Node, ...] | None = None
     bm: int = 0
     bn: int = 0
     bk: int = 0
@@ -253,6 +300,7 @@ class CuteTcgen05StoreValue(_CuteTcgen05OrientationMixin):
     segment_store_valid_m: Node | None = None
     orientation: Tcgen05Orientation = Tcgen05Orientation.MN
     output_column_major: bool = False
+    row_union: GroupedRowUnionPlan | None = None
 
     @property
     def d_store_layout(self) -> str:
@@ -308,6 +356,10 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     ab_stage_count: int
     c_stage_count: int
     epi_warp_count: int
+    # The actual logical M/N offset names, independent of block numbering
+    # and launch-axis ordering. Auxiliary producers share these coordinates
+    # with the MMA and epilogue roles after PID remapping.
+    output_offsets: tuple[str, str] | None = None
     ab_load_warp_count: int = 1
     one_shot_role_scheduler: bool = False
     # Dedicated scheduler warp count for ROLE_LOCAL_WITH_SCHEDULER. Default
@@ -341,6 +393,7 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     m_subtile_count: int = 1
     flat_role_launch_warp_count: int | None = None
     grouped: CuteTcgen05GroupedPlan | None = None
+    row_union: GroupedRowUnionPlan | None = None
     # Per-anchor auxiliary descriptors discovered by the forward FX walker. This
     # is store-fusion metadata, not a collective compatibility field:
     # two matmuls with identical collective parameters but different downstream
@@ -352,6 +405,33 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
     )
 
     def __post_init__(self) -> None:
+        if self.row_union is not None:
+            assert self.grouped is None
+            assert self.uses_role_local_persistent_body
+            if self.row_union.linear_record_clc:
+                assert self.has_scheduler_warp and self.is_clc_persistent
+                protocol = self.row_union.paired_protocol
+                assert protocol is not None
+                assert self.sched_stage_count == protocol.scheduler_stages
+                assert self.c_input_warp_count == self.store_warp_count == 0
+                assert self.epi_warp_count == 4 and self.ab_load_warp_count == 1
+            else:
+                assert not self.has_scheduler_warp
+                assert not self.is_clc_persistent
+            if self.row_union.schedule is None:
+                assert not self.is_two_cta and self.cluster_m == self.cluster_n == 1
+            else:
+                schedule = self.row_union.schedule
+                assert self.is_two_cta
+                assert (self.bm, self.bn, self.bk) == (
+                    schedule.mma_m,
+                    schedule.mma_n,
+                    schedule.block_k,
+                )
+                assert (self.cluster_m, self.cluster_n) == (
+                    schedule.cluster_m,
+                    schedule.cluster_n,
+                )
         if self.grouped is None:
             return
         scheduler_mode = self.grouped.scheduler_mode
@@ -375,6 +455,8 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
 
     @property
     def orientation(self) -> Tcgen05Orientation:
+        if self.row_union is not None and self.row_union.schedule is not None:
+            return Tcgen05Orientation.NM
         return self.grouped.orientation if self.grouped else Tcgen05Orientation.MN
 
     @property
@@ -512,11 +594,20 @@ class CuteDeviceFunctionState:
         # The launcher consults only names that survive final AST lowering;
         # this does not depend on blocked/strided index-expression spelling.
         self.grid_thread_extents: dict[str, tuple[int, int]] = {}
+        self.explicit_rng_seed_names: set[str] = set()
+        self.uniform_comparison_marker: str | None = None
+        self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
         # SIMT reduction-kernel thread-block cluster width (from the
         # ``cute_cluster_n`` config knob, applied by
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
+        # A reshape can reuse source lanes and leave its synthetic loop dead.
+        # Resolve this recorded alternative only after actual loop pruning.
+        self.reshape_lane_fallbacks: dict[str, tuple[str, int, int, str]] = {}
+        self.resident_sequence_regions: dict[int, SequenceRegion] = {}
+        self.completed_matmul_sums: dict[Node, CompletedMatmulSum] = {}
         # Number of DSM cluster-reduce call sites emitted; > 0 makes the
         # device function emit one mbarrier fence + cluster arrive/wait
         # after the preamble (covering every site's mbarrier init).
@@ -526,20 +617,11 @@ class CuteDeviceFunctionState:
             torch.fx.Node, Tcgen05GroupedTailEpilogueMatch
         ] = {}
         self._tcgen05_consumed_store_value_ids: set[int] = set()
-        # tcgen05 TMA-store atom/tensor kernel-arg names are allocated once per
-        # matmul accumulator. When a single accumulator fans out to multiple
-        # output stores (e.g. aux = pre-activation, out = gelu(pre)), each store
-        # site must emit its own descriptor kernel params or the generated
-        # function gets duplicate argument names. Track which StoreValue object
-        # ids have already emitted their TMA-store kernel params so 2nd+ store
-        # sites can allocate fresh per-store names.
-        self._tcgen05_emitted_tma_store_value_ids: set[int] = set()
-        # Snapshot of the accumulator consumer-state stage index, keyed by the
-        # acc consumer-state variable name. A multi-store fan-out reads the same
-        # accumulator TMEM stage; the primary store advances the consumer state
-        # after its loop, so later stores must read the stage index captured
-        # before that advance instead of the live (already-advanced) index.
-        self._tcgen05_acc_stage_index_vars: dict[str, str] = {}
+        # A same-graph fanout shares one accumulator pipeline transaction.
+        # The first store waits; the final store releases/advances only after
+        # every output has read TMEM. Each TMA store gets separate descriptors.
+        self._tcgen05_emitted_store_nodes: dict[int, set[Node | None]] = {}
+        self._tcgen05_pending_paired_stores: dict[Node, FanoutStore] = {}
         # FX matmul / hl.dot / addmm nodes lowered through tcgen05. The store
         # path uses this to recognize fused epilogue chains that must use the
         # tcgen05 store splice instead of falling through to SIMT store codegen.
@@ -563,6 +645,7 @@ class CuteDeviceFunctionState:
         # ownership does not leak into the generic DeviceFunction body.
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
+        self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -599,6 +682,14 @@ class CuteDeviceFunctionState:
         # masking for that axis (the serial loop already covers exactly [0, C)).
         # Empty except while re-materializing such an operand load.
         self.matmul_operand_index_override: dict[int, str] = {}
+        self.collective_mma_sites: list[CollectiveMmaSite] = []
+        self.collective_mma_static_layouts = False
+        # Late scalar-recipe staging may compose several contractions. These
+        # statements access only fresh compiler-owned shared buffers, so later
+        # sites can keep proving effects against the original global accesses.
+        self.collective_mma_emitted_stmt_ids: set[int] = set()
+        self.collective_mma_shared_results: set[str] = set()
+        self.collective_mma_pure_stmt_ids: set[int] = set()
         # Grouped two-phase lowering for structurally proven fixed-token,
         # split-input BF16 rank-1 recurrences.
         self.fixed_token_rank1_plan: CuteFixedTokenRank1Plan | None = None
@@ -616,9 +707,12 @@ class CuteDeviceFunctionState:
         # BF16 rank-1 state recurrence. The plan is absent by default and is
         # additionally gated by the user-facing fast_math setting.
         self.single_token_rank1_plan: CuteSingleTokenRank1Plan | None = None
+        self.collective_register_chain_lowered = False
+        self.collective_register_chain_block_dims: tuple[int, int, int] | None = None
         # Whole-root BT16 five-factor prepare schedule.  This is installed only
         # after the complete semantic graph and packed workspace ABI match.
         self.chunk_prepare_plan: CuteChunkPreparePlan | None = None
+        self.block_scaled_plan: BlockScaledMmaPlan | None = None
         # Whole-root BT16 KDA recurrence/output schedule. Like the
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
@@ -733,41 +827,38 @@ class CuteDeviceFunctionState:
             return value
         return None
 
-    def get_or_create_tcgen05_acc_stage_index_var(
-        self,
-        acc_consumer_state: str,
-        new_var: Callable[[str], str],
-    ) -> tuple[str, bool]:
-        """Return (snapshot_var, is_new) for an accumulator's stage index.
+    def claim_tcgen05_store_site(
+        self, value: CuteTcgen05StoreValue, store_node: Node | None
+    ) -> tuple[bool, bool]:
+        """Return (is_secondary, is_final) from the complete same-graph fanout.
 
-        The first (primary) store of an accumulator captures the consumer-state
-        stage index into this variable before it advances the consumer state.
-        Later fan-out stores reuse the snapshot so they read the same live
-        accumulator TMEM stage. ``is_new`` is True only for the primary store,
-        which must emit the ``<var> = <acc_consumer_state>.index`` assignment.
-        """
-        existing = self._tcgen05_acc_stage_index_vars.get(acc_consumer_state)
-        if existing is not None:
-            return existing, False
-        snapshot = new_var("tcgen05_acc_stage_index")
-        self._tcgen05_acc_stage_index_vars[acc_consumer_state] = snapshot
-        return snapshot, True
-
-    def tcgen05_tma_store_names_already_emitted(
-        self, value: CuteTcgen05StoreValue
-    ) -> bool:
-        """Return whether this StoreValue already emitted TMA-store kernel params.
-
-        The first store site that uses a given accumulator's StoreValue keeps the
-        per-matmul ``tma_store_atom`` / ``tma_store_tensor`` names. Later store
-        sites fanning out from the same accumulator must allocate fresh per-store
-        names so the generated kernel signature has no duplicate parameters and so
-        each store binds its own TMA descriptor.
+        Unknown fanout supports only one store. Multiple output stores must
+        have a proved complete set in one FX graph so they share an execution
+        scope. Releasing before its final store would let an independent MMA
+        role reuse TMEM while a later epilogue still reads the old tile.
         """
         value_id = id(value)
-        already_emitted = value_id in self._tcgen05_emitted_tma_store_value_ids
-        self._tcgen05_emitted_tma_store_value_ids.add(value_id)
-        return already_emitted
+        emitted = self._tcgen05_emitted_store_nodes.setdefault(value_id, set())
+        expected = value.output_stores
+        if expected is None:
+            if emitted:
+                raise exc.BackendUnsupported(
+                    "cute", "tcgen05 fanout requires a complete output store set"
+                )
+            emitted.add(store_node)
+            return False, True
+        if (
+            not expected
+            or len({store.graph for store in expected}) != 1
+            or store_node not in expected
+            or store_node in emitted
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "tcgen05 fanout requires distinct stores in one FX graph"
+            )
+        is_secondary = bool(emitted)
+        emitted.add(store_node)
+        return is_secondary, len(emitted) == len(expected)
 
     def register_tcgen05_matmul_plan(self, plan: CuteTcgen05MatmulPlan) -> None:
         if self.matmul_plan is not None:
@@ -777,6 +868,26 @@ class CuteDeviceFunctionState:
                 )
             return
         self.matmul_plan = plan
+
+    def register_paired_fanout_store(
+        self, store: FanoutStore, post_loop_stmts: Sequence[ast.AST]
+    ) -> bool:
+        """Keep the first marked body alive until its complete second store."""
+        from .epilogue_fanout import combine_stores
+
+        first, second = store.plan.stores
+        if store.site is first:
+            if first in self._tcgen05_pending_paired_stores:
+                raise exc.BackendUnsupported("cute", "duplicate paired fanout store")
+            self._tcgen05_pending_paired_stores[first] = store
+            return False
+        if store.site is not second or first not in self._tcgen05_pending_paired_stores:
+            raise exc.BackendUnsupported("cute", "unordered paired fanout stores")
+        combine_stores(self._tcgen05_pending_paired_stores.pop(first), store)
+        self._per_tile_stmt_ids.remove(id(store.main))
+        self._epi_role_stmt_ids.remove(id(store.main))
+        self._post_loop_stmt_ids.difference_update(id(stmt) for stmt in post_loop_stmts)
+        return True
 
     def register_tcgen05_sched_pipeline_plan(
         self, plan: _Tcgen05SchedPipelinePlan
@@ -1053,6 +1164,8 @@ class CuteDeviceFunctionState:
         self.finalize_tcgen05_owned_kloop_cleanup(device_loop)
 
     def finalize_tcgen05_pure_lifecycle_stores(self) -> None:
+        if self._tcgen05_pending_paired_stores:
+            raise exc.BackendUnsupported("cute", "incomplete paired fanout stores")
         if not self._tcgen05_pure_lifecycle_pending_store_loops:
             return
         raise exc.BackendUnsupported(

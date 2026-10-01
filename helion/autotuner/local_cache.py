@@ -22,6 +22,9 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir
 from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.config import Config
+from ..runtime.cute_structural_config import bound_structural_policy
+from ..runtime.cute_structural_config import decode_structural_policy
+from ..runtime.cute_structural_config import require_same_structural_policy
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
@@ -30,6 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from typing import Callable
 
+    from ..runtime.cute_structural_policy import CuteStructuralPolicy
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -165,6 +169,7 @@ class SavedBestConfig:
     config: Config
     config_spec_hash: str
     flat_config: tuple[object, ...] | None
+    cute_structural_policy: CuteStructuralPolicy | None = None
 
     def to_mutable_flat_config(self) -> list[object]:
         """Return the stored flat_config as a mutable list."""
@@ -194,6 +199,11 @@ def parse_cache_entry(raw: str) -> SavedBestConfig:
             config=Config.from_json(data["config"]),
             config_spec_hash=fields.get("config_spec_hash", ""),
             flat_config=flat_config,
+            cute_structural_policy=(
+                decode_structural_policy(data["cute_structural_policy"])
+                if "cute_structural_policy" in data
+                else None
+            ),
         )
     except (KeyError, TypeError, json.JSONDecodeError) as e:
         raise ValueError(f"malformed cache entry: {e}") from e
@@ -333,9 +343,25 @@ class LocalAutotuneCache(AutotuneCacheBase):
         path = self._get_local_cache_path()
         try:
             data = json.loads(path.read_text())
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        self._validate_config_policy(data)
+        try:
             return Config.from_json(data["config"])
         except Exception:
             return None
+
+    def _validate_config_policy(self, data: dict[str, object]) -> None:
+        policy = (
+            decode_structural_policy(data["cute_structural_policy"])
+            if "cute_structural_policy" in data
+            else None
+        )
+        require_same_structural_policy(
+            policy, bound_structural_policy(self.kernel), context="Cached config"
+        )
 
     def put(self, config: Config) -> None:
         path = self._get_local_cache_path()
@@ -356,6 +382,8 @@ class LocalAutotuneCache(AutotuneCacheBase):
             "config": config.to_json(),
             "key": key_dict,
         }
+        if (policy := bound_structural_policy(self.kernel)) is not None:
+            data["cute_structural_policy"] = policy.to_dict()
 
         config_gen = self.kernel.config_spec.create_config_generation(
             advanced_controls_files=self.autotuner.settings.autotune_search_acf or None

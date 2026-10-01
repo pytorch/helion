@@ -29,6 +29,7 @@ from helion._testing import skipUnlessPallas
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
+from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
@@ -978,6 +979,36 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    @skipIfPallasInterpret("device-side comparison requires a real TPU")
+    def test_large_autotune_accuracy_check(self) -> None:
+        x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_chunked_add,
+            (x,),
+            block_sizes=[128],
+        )
+        expected = x + 1.0
+
+        _chunked_assert_close(
+            result,
+            expected,
+            atol=1e-5,
+            rtol=1e-5,
+            chunk_size=1024,
+            scale_atol_by_expected_rms=True,
+        )
+
+        incorrect = expected.clone()
+        incorrect[-1, -1] += 1.0
+        with self.assertRaises(AssertionError):
+            _chunked_assert_close(
+                result,
+                incorrect,
+                atol=1e-5,
+                rtol=1e-5,
+                chunk_size=1024,
+            )
+
     def test_prefix_sum(self) -> None:
         x = torch.arange(256, device=DEVICE, dtype=torch.int32) % 7
         _code, (forward, reverse) = code_and_output(
@@ -3877,6 +3908,73 @@ class TestPallas(TestCase):
         )
         expected = torch.bmm(a.float(), b.float()).to(torch.bfloat16)
         torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    def test_pallas_autotune_filters_excessive_static_unroll(self) -> None:
+        """Autotuning avoids large generated programs but keeps explicit configs."""
+        args = (
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+            torch.randn(8, 16384, device=DEVICE, dtype=torch.float32),
+        )
+        bound = pallas_inner_loop_add.bind(args)
+        backend = bound.config_spec.backend
+        excessive = helion.Config(
+            block_sizes=[8, 128],
+            pallas_loop_type="unroll",
+        )
+        bounded = helion.Config(
+            block_sizes=[8, 1024],
+            pallas_loop_type="unroll",
+        )
+
+        self.assertFalse(
+            backend.autotune_config_is_viable(bound.config_spec, excessive)
+        )
+        self.assertTrue(backend.autotune_config_is_viable(bound.config_spec, bounded))
+
+        # The autotune-only guard does not alter explicit configurations.
+        result = bound.compile_config(
+            helion.Config(
+                block_sizes=[8, 16384],
+                pallas_loop_type="unroll",
+            )
+        )(*args)
+        torch.testing.assert_close(result, (args[0] + args[1]).to(result.device))
+
+    @skipIfPallasInterpret("large-grid admission requires a real TPU")
+    def test_pallas_autotune_bounds_total_grid_programs(self) -> None:
+        """Pallas admits imbalanced grids within one total-program limit."""
+        x = torch.randn(256, 32768, device=DEVICE, dtype=torch.float32)
+        y = torch.randn_like(x)
+        bound = pallas_add_2d.bind((x, y))
+        backend = bound.config_spec.backend
+        policy = backend.autotune_grid_policy(bound.config_spec)
+
+        self.assertFalse(policy.raise_independent_axis_block_size_minimums)
+        self.assertIsNotNone(policy.max_programs_per_root_grid)
+        self.assertEqual(
+            [spec.autotuner_min for spec in bound.config_spec.block_sizes],
+            [1, 1],
+        )
+
+        max_programs = policy.max_programs_per_root_grid
+        assert max_programs is not None
+        max_column_programs = max_programs // x.size(0)
+        self.assertGreater(max_column_programs, 1)
+        minimum_column_block = math.ceil(x.size(1) / max_column_programs)
+        accepted_column_block = 1 << (minimum_column_block - 1).bit_length()
+        accepted = helion.Config(block_sizes=[1, accepted_column_block])
+        oversized = helion.Config(block_sizes=[1, accepted_column_block // 2])
+        self.assertTrue(backend.autotune_config_is_viable(bound.config_spec, accepted))
+        self.assertFalse(
+            backend.autotune_config_is_viable(bound.config_spec, oversized)
+        )
+
+        numerical_config = helion.Config(block_sizes=[1, 4096])
+        self.assertTrue(
+            backend.autotune_config_is_viable(bound.config_spec, numerical_config)
+        )
+        result = bound.compile_config(numerical_config)(x, y)
+        torch.testing.assert_close(result, (x + y).to(result.device))
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
