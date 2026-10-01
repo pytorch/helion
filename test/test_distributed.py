@@ -287,6 +287,22 @@ def chained_exchange_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def row_exchange_kernel(
+    symm: torch.Tensor, x: torch.Tensor, group_name: hl.ProcessGroupName
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        symm[0, tile] = x[tile]
+    for tile in hl.tile(x.size(0)):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for peer in peers:
+            acc = acc + peer[0, tile]
+        out[tile] = acc
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -1256,6 +1272,24 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("@p bra SPIN"), 2)
         self.assertNotIn("_wait_at_least", code)
         self.assertNotIn("_add_on_every_rank", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_static_index_store(self) -> None:
+        # A static index is no tile axis: symm[0, tile] fills a [1, N] buffer.
+        symm, x = torch.zeros(1, 256, device=DEVICE), torch.zeros(256, device=DEVICE)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            bound = row_exchange_kernel.bind((symm, x, dist.group.WORLD.group_name))
+        (line,) = logs.output
+        self.assertIn("on peers/symm use inband", line)
+        code = bound.to_triton_code()
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), 4)
+        self.assertNotIn("_wait_at_least", code)
+        # In a [2, N] buffer the same store fills only row 0, which R2 rejects.
+        symm = torch.zeros(2, 256, device=DEVICE)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            row_exchange_kernel.bind((symm, x, dist.group.WORLD.group_name))
+        (line,) = logs.output
+        self.assertIn("on peers/symm use peer_counter (R2:", line)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:

@@ -6183,14 +6183,17 @@ def _inband_failure(
     root_axes = task_families[store.root].logical_axis_order
     tile_axes = [
         block_id
-        for block_id, full in zip(
+        for block_id, full, scalar, offset in zip(
             store.subscript_affine_block_ids,
             store.subscript_is_full_slice,
+            store.subscript_is_scalar,
+            store.subscript_offsets,
             strict=False,
         )
-        if not full
+        if not full and not (block_id is None and scalar and offset is not None)
     ]
-    # One task writes each tile once: full slices and distinct root axes.
+    # One task writes each tile once: full slices, static indices and distinct
+    # root axes. R2 checks that the tiles still fill the whole buffer.
     if not (
         len(stores) == 1
         and store.owner_rank is None
