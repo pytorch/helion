@@ -258,6 +258,35 @@ def pipelined_allreduce_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def chained_exchange_kernel(
+    symm: torch.Tensor,
+    moment: torch.Tensor,
+    x: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    moment_peers = _remote_views(moment, group_name)
+    total = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        symm[tile] = x[tile]
+    for tile in hl.tile(x.size(0)):
+        acc = hl.zeros([tile], dtype=x.dtype)
+        for peer in peers:
+            acc = acc + peer[tile]
+        total[tile] = acc
+    # A one-element exchange that depends on every tile of the last one.
+    for tile in hl.tile(moment.size(0)):
+        moment[tile] = hl.zeros([tile], dtype=x.dtype) + torch.sum(total[:]) / x.size(0)
+    for tile in hl.tile(x.size(0)):
+        acc = total[tile]
+        for moment_peer in moment_peers:
+            acc = acc + moment_peer[:]
+        out[tile] = acc
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -493,6 +522,37 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.cuda.synchronize()
         for step, out in enumerate(outs):
             expected = n * step * world + world * (world - 1) // 2
+            torch.testing.assert_close(out, torch.full_like(out, expected))
+        self._cleanup_process()
+
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_chained_exchanges_replay(self) -> None:
+        self._init_process()
+        group = dist.group.WORLD
+        world, n = self.world_size, 4096
+        symm, moment = (
+            symm_mem.empty(n, device=self.device),
+            symm_mem.empty(1, device=self.device),
+        )
+        symm_mem.rendezvous(symm, group=group)
+        symm_mem.rendezvous(moment, group=group)
+        x = torch.empty(n, device=self.device)
+        args = (symm, moment, x, group.group_name)
+        chained_exchange_kernel(*args)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = chained_exchange_kernel(*args)
+        for step in range(8):
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            x.fill_(step + self.rank)
+            if step % 2:
+                graph.replay()
+                out = graph_out
+            else:
+                out = chained_exchange_kernel(*args)
+            # total = world * step + 6, plus each rank's copy of its mean.
+            expected = (world + 1) * (world * step + world * (world - 1) // 2)
             torch.testing.assert_close(out, torch.full_like(out, expected))
         self._cleanup_process()
 
@@ -1182,6 +1242,20 @@ class TestDistributedTileDependencies(TestCase):
         code = bound.to_triton_code({**config, "range_num_stages": [0, 0, 3]})
         self.assertIn("_BLOCK_SIZE_2, num_stages=1)", code)
         self.assertNotIn("num_stages=3", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    def test_inband_chains_exchanges(self) -> None:
+        symm, x = torch.zeros(2, 4096, device=DEVICE)
+        moment = torch.zeros(1, device=DEVICE)
+        bound = chained_exchange_kernel.bind(
+            (symm, moment, x, dist.group.WORLD.group_name)
+        )
+        code = bound.to_triton_code()
+        # Both buffers go in band, each with its own push and poll.
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), 8)
+        self.assertEqual(code.count("@p bra SPIN"), 2)
+        self.assertNotIn("_wait_at_least", code)
+        self.assertNotIn("_add_on_every_rank", code)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:
