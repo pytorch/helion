@@ -171,6 +171,7 @@ def default_launcher(
         tuple[torch.Tensor, int, torch.dtype, bool], ...
     ] = (),
     _persistent_state_process_group_name: str | None = None,
+    _persistent_state_rank_digest: str | None = None,
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -222,6 +223,8 @@ def default_launcher(
             launch_cooperative_grid,
             tuple(sorted((name, repr(value)) for name, value in kwargs.items())),
             tuple(spec[1:] for spec in _persistent_state_specs),
+            # Symmetric state exchanges the namespace, so ranks compare digests.
+            _persistent_state_rank_digest,
         )
         for slot, (state_like, numel, dtype, symmetric) in enumerate(
             _persistent_state_specs

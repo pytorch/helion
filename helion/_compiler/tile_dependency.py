@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import hashlib
 import itertools
 import logging
 import math
@@ -4766,13 +4767,14 @@ class TileDependencyGraph:
             for dependency in edge.access_dependencies
         )
 
-    def rank_digest(self) -> tuple[object, ...]:
-        """Facts every rank must agree on; owners and regions may differ."""
-        return (
+    def rank_digest(self) -> str:
+        """Hash the facts every rank must agree on; owners and regions may differ."""
+        facts = (
             tuple(
                 (a.root, a.allocation_id, a.kind, a.is_atomic, a.owner_rank is None)
                 for a in self.accesses
             ),
+            tuple((a.dtype, a.tensor_shape, a.tensor_strides) for a in self.accesses),
             repr(self.task_families),
             tuple(
                 (allocation_id, self.inband_numel(allocation_id))
@@ -4789,6 +4791,7 @@ class TileDependencyGraph:
                 )
             ),
         )
+        return hashlib.sha256(repr(facts).encode()).hexdigest()[:16]
 
 
 @dataclasses.dataclass(frozen=True)

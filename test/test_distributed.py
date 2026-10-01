@@ -5,6 +5,7 @@ from datetime import timedelta
 import io
 import itertools
 import os
+import re
 import unittest
 from unittest.mock import patch
 import warnings
@@ -576,6 +577,30 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             # total = world * step + 6, plus each rank's copy of its mean.
             expected = (world + 1) * (world * step + world * (world - 1) // 2)
             torch.testing.assert_close(out, torch.full_like(out, expected))
+        self._cleanup_process()
+
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_ranks_disagree_at_first_launch(self) -> None:
+        self._init_process()
+        group = dist.group.WORLD
+        symm = symm_mem.empty(4096, device=self.device)
+        symm_mem.rendezvous(symm, group=group)
+        x = torch.zeros(4096, device=self.device)
+        # Rank 0 sees another dependency graph; every rank raises, none hangs.
+        with (
+            patch.object(
+                tile_dependency.TileDependencyGraph, "rank_digest", return_value="0"
+            )
+            if self.rank == 0
+            else contextlib.nullcontext(),
+            self.assertRaisesRegex(
+                RuntimeError, "require the same launch on every rank"
+            ),
+        ):
+            pipelined_allreduce_kernel(
+                symm, x, group.group_name, "inband", self.world_size
+            )
         self._cleanup_process()
 
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
@@ -1155,36 +1180,23 @@ class TestDistributedTileDependencies(TestCase):
             two_root_peer_read_kernel.bind((symm, other_group, group))
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
-    def test_ranks_agree_on_tile_dependencies(self) -> None:
+    def test_bind_makes_no_collective_call(self) -> None:
         group = dist.group.WORLD.group_name
-        symm = torch.zeros(256, device=DEVICE)
-        two_root_peer_read_kernel.reset()
-        for other, expected in (
-            (("other",), "ranks disagree"),
-            (("error", "boom"), "rank 1 failed: boom"),
-        ):
-            with (
-                self.subTest(expected=expected),
-                patch(
-                    "helion._dist_utils.all_gather_object",
-                    side_effect=lambda obj, name, other=other: [obj, other],
-                ),
-                self.assertRaisesRegex(helion.exc.CrossLoopSchedulingError, expected),
-            ):
-                two_root_peer_read_kernel.bind((symm, group, group))
-        # A rank-local failure still joins the exchange, so peers do not hang.
-        other_group = dist.new_group(list(range(4))).group_name
-        with (
-            patch(
-                "helion._dist_utils.all_gather_object",
-                side_effect=lambda obj, name: [obj] * 4,
-            ) as gather,
-            self.assertRaisesRegex(
-                helion.exc.CrossLoopSchedulingError, "allocation identity"
-            ),
-        ):
-            two_root_peer_read_kernel.bind((symm, other_group, group))
-        self.assertEqual(gather.call_args.args[0][0], "error")
+        pipelined_allreduce_kernel.reset()
+        digests = []
+        # Ranks may bind differently, so they compare digests at the first launch.
+        with patch.object(dist, "all_gather_object") as gather:
+            for dtype in (torch.float32, torch.float16):
+                symm, x = torch.zeros(2, 256, device=DEVICE, dtype=dtype)
+                bound = pipelined_allreduce_kernel.bind((symm, x, group, "inband", 4))
+                code = bound.to_triton_code()
+                digest = re.search(
+                    r"_persistent_state_rank_digest='([0-9a-f]{16})'", code
+                )
+                assert digest is not None
+                digests.append(digest[1])
+        gather.assert_not_called()
+        self.assertNotEqual(*digests)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))

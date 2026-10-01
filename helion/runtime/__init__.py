@@ -79,6 +79,7 @@ def default_launcher(
         tuple[torch.Tensor, int, torch.dtype, bool], ...
     ] = (),
     _persistent_state_process_group_name: str | None = None,
+    _persistent_state_rank_digest: str | None = None,
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -104,6 +105,7 @@ def default_launcher(
             _remote_copy_scratch_specs=_remote_copy_scratch_specs,
             _persistent_state_specs=_persistent_state_specs,
             _persistent_state_process_group_name=_persistent_state_process_group_name,
+            _persistent_state_rank_digest=_persistent_state_rank_digest,
             _minimum_resident_programs=_minimum_resident_programs,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,

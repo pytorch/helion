@@ -553,6 +553,7 @@ class TritonBackend(Backend):
             out.append("_rng_seed_buffer")
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
+        from ..host_function import HostFunction
 
         device_fn = DeviceFunction.current()
         if device_fn.triton_remote_copy_signal_slots:
@@ -605,6 +606,10 @@ class TritonBackend(Backend):
                 out.append(
                     f"_persistent_state_process_group_name={process_group_name!r}"
                 )
+                # Ranks compare the digest when they first allocate the state.
+                graph = HostFunction.current().device_ir.tile_dependency_graph
+                assert graph is not None
+                out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="
