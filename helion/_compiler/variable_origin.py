@@ -362,6 +362,21 @@ class TileEndOrigin(GridOrigin):
 
 
 @dataclasses.dataclass
+class TileExtentOrigin(GridOrigin):
+    """The number of elements the current tile of ``block_id`` holds.
+
+    The block size, clamped to the loop end on the last tile of a dim the
+    block does not divide (``tile.end - tile.begin``); a mean over the tile
+    divides by it rather than by the padded block.
+    """
+
+    def host_str(self) -> str:
+        from .device_function import DeviceFunction
+
+        return DeviceFunction.current().tile_extent_expr(self.block_id)
+
+
+@dataclasses.dataclass
 class TileCountOrigin(GridOrigin):
     def host_str(self) -> str:
         from .compile_environment import CompileEnvironment

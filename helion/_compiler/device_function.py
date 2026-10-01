@@ -51,6 +51,7 @@ from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
 from .variable_origin import TileBeginOrigin
+from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -774,6 +775,8 @@ class DeviceFunction:
                 return self.codegen.offset_var(resolved)
             if type(origin.origin) is TileBeginOrigin:
                 return self.codegen.tile_begin_var(resolved)
+            if type(origin.origin) is TileExtentOrigin:
+                return self.tile_extent_expr(resolved)
             # Render through the origin so each derived edge keeps its own
             # formula, but on the resolved live loop: host_str() reads
             # offset_var and active_device_loops by block_id, and an aliased
@@ -781,6 +784,32 @@ class DeviceFunction:
             derived = dataclasses.replace(origin.origin, block_id=resolved)
             return f"({derived.host_str()})"
         return self.expr_arg(expr, origin.origin).name
+
+    def tile_extent_expr(self, block_id: int) -> str:
+        """The elements the current tile of ``block_id`` holds, as device code.
+
+        The block size when the loop needs no mask (the block divides the
+        dim), otherwise ``min(begin + block, end) - begin``: the last tile of
+        a dim the block does not divide, or a block wider than the dim, holds
+        fewer elements than the block, and the masked ones must not count
+        in a mean.  Spelled as a parenthesized compound expression in that
+        case, as the other derived tile edges are.
+        """
+        env = CompileEnvironment.current()
+        block_size = self.block_size_var(env.canonical_block_id(block_id))
+        if block_size is None:
+            block_size = "1"
+        if self.codegen.mask_var(block_id) is None:
+            return block_size
+        begin = self.codegen.tile_begin_var(block_id)
+        end = (
+            self.codegen.active_device_loops[block_id][-1]
+            .block_id_to_info[block_id]
+            .end_var_name
+        )
+        assert end is not None
+        clamped = env.backend.minimum_expr(f"{begin} + {block_size}", end)
+        return f"(({clamped}) - {begin})"
 
     def user_sympy_expr(self, expr: sympy.Expr) -> str:
         """A sympy expression that flows into user computations."""

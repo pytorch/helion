@@ -562,6 +562,28 @@ def _jagged_row_sums_sum_and_max_stored(
     return tot, tot2
 
 
+def _jagged_row_means_stored(
+    x_values: torch.Tensor, x_offsets: torch.Tensor
+) -> torch.Tensor:
+    """The mean of the row sums over the columns, stored."""
+    total_rows, columns = x_values.shape
+    batch = x_offsets.size(0) - 1
+    tot = torch.empty([batch], dtype=x_values.dtype, device=x_values.device)
+    x_flat = x_values.view(-1)
+    for tile_b in hl.tile(batch):
+        starts = x_offsets[tile_b]
+        ends = x_offsets[tile_b.index + 1]
+        seq_lengths = ends - starts
+        for tile_m in hl.tile(columns):
+            row_sums = hl.zeros([tile_b, tile_m], dtype=x_values.dtype)
+            for tile_k in hl.jagged_tile(seq_lengths):
+                flat = (starts[:, None] + tile_k.index[None, :])[:, :, None] * columns
+                flat = flat + tile_m.index[None, None, :]
+                row_sums = row_sums + hl.load(x_flat, [flat]).sum(dim=1)
+            tot[tile_b] = row_sums.mean(dim=1)
+    return tot
+
+
 def _jagged_row_sums(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
     """Each sequence's column sums, zeros for the empty one."""
     return torch.stack(
@@ -661,3 +683,24 @@ def test_two_stored_reductions_of_one_accumulator_take_one_schedule_in_both_shap
     torch.testing.assert_close(static_max, row_sums.amax(dim=1), rtol=1e-4, atol=1e-3)
     assert torch.equal(static_tot, dynamic_tot)
     assert torch.equal(static_max, dynamic_max)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("lanes", [1, 2])
+@pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
+def test_a_mean_over_a_padded_column_block_divides_by_the_columns(
+    lanes: int, static_shapes: bool
+) -> None:
+    """A 1024-column block over 512 columns masks half its elements out of the sum; the mean divides by the 512 the tile holds, not by the block (it gave half the mean)."""
+    x, offsets = _jagged_inputs(512)
+    bound = _jagged_kernel(_jagged_row_means_stored, static_shapes=static_shapes).bind(
+        (x, offsets)
+    )
+    config = _jagged_column_block_config(lanes, 1024)
+    code = bound.to_code(config)
+    assert "1.0 / _BLOCK_SIZE_1" not in code and "/ _BLOCK_SIZE_1" not in code
+    assert "- tile_offset_1" in code
+    out = bound.compile_config(config)(x, offsets)
+    torch.testing.assert_close(
+        out, _jagged_row_sums(x, offsets).mean(dim=1), rtol=1e-4, atol=1e-4
+    )
