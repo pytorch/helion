@@ -17,6 +17,9 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.experimental.primitives as prims
 
+from ..prepared_warp_contraction import execute_prepared_blockdiag_fragment
+from ..prepared_warp_contraction import execute_prepared_warp_fragment
+from ..prepared_warp_contraction import execute_prepared_warp_k
 from . import common as cm
 from helion._compiler.cute.affine_recurrence_primitives import mma_blockdiag_8x8_f16
 from helion._compiler.cute.affine_recurrence_primitives import mma_m16n8k16_bf16
@@ -26,6 +29,7 @@ from helion._compiler.cute.affine_recurrence_primitives import (
 )
 from helion._compiler.cute.affine_recurrence_primitives import pack_f16x2
 from helion._compiler.cute.affine_recurrence_primitives import pack_input_b16x2_to_i32
+from helion._compiler.cute.affine_recurrence_primitives import pack_typed_b16x2_to_i32
 from helion._compiler.cute.warp_specialized_primitives import copy_b16x8_async
 
 
@@ -88,7 +92,45 @@ def pairwise16(smem_base, lhs_offset, rhs_offset, row_base, col_base, lane):
 
 
 @cute.jit
-def lower_values(smem_base, beta_offset, acc, row_base, col_base, lane):
+def prepared_pairwise16(
+    smem_base, stage_bytes, row_base, col_base, lane, PORT: cutlass.Constexpr
+):
+    """The original tile's ordered K loop using its graph-bound shared images."""
+    lhs_offset, rhs_offset, k_steps, n_atoms, row_extent = PORT
+    return execute_prepared_warp_k(
+        (
+            smem_base,
+            lhs_offset + stage_bytes,
+            lane,
+            row_base,
+            row_extent,
+        ),
+        (
+            smem_base,
+            rhs_offset + stage_bytes,
+            lane,
+            col_base,
+            row_extent,
+        ),
+        zero8(),
+        None,
+        k_steps,
+        True,
+        n_atoms,
+        B_TRANSPOSED_PACKED=True,
+    )
+
+
+@cute.jit
+def lower_values(
+    smem_base,
+    beta_offset,
+    acc,
+    row_base,
+    col_base,
+    lane,
+    PUBLICATION: cutlass.Constexpr = None,
+):
     """FP32 beta multiply followed by the explicit BF16 strict-lower boundary."""
     beta_row0 = row_base + lane // 4
     beta0 = cm.sptr(smem_base, beta_offset + beta_row0 * 4, cutlass.Float32).load()
@@ -99,16 +141,25 @@ def lower_values(smem_base, beta_offset, acc, row_base, col_base, lane):
     for index in cutlass.range_constexpr(8):
         row = row_base + lane // 4 + ((index % 4) // 2) * 8
         col = col_base + (index // 4) * 8 + (lane % 4) * 2 + index % 2
-        value = cutlass.Float32(0.0)
-        if row > col:
+        if cutlass.const_expr(PUBLICATION is None):
+            value = cutlass.Float32(0.0)
+            if row > col:
+                beta = beta0 if cutlass.const_expr(index % 4 < 2) else beta1
+                value = cutlass.Float32(cutlass.BFloat16(acc[index] * beta))
+        else:
             beta = beta0 if cutlass.const_expr(index % 4 < 2) else beta1
-            value = cutlass.Float32(cutlass.BFloat16(acc[index] * beta))
+            value = PUBLICATION(acc[index], beta, row, col)
         values[index] = value
     return values
 
 
 @cute.jit
-def inverse16_v2(values, lane):
+def inverse16_v2(
+    values,
+    lane,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+):
     """Actual CAKE388: FP32 additive bases, degree3 coupling snapshot.
 
     Accumulator slots0/1 and6/7 are the two8x8 diagonals. The lower8x8
@@ -119,63 +170,154 @@ def inverse16_v2(values, lane):
     fz = cutlass.Float32(0.0)
     d0 = pack_f16x2(values[0], values[1])
     d3 = pack_f16x2(values[6], values[7])
-    d2 = mma_blockdiag_8x8_f16(d0, d3, d0, d3)
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        d2 = mma_blockdiag_8x8_f16(d0, d3, d0, d3)
+    else:
+        d2 = execute_prepared_blockdiag_fragment(d0, d3, d0, d3, INVERSE_PROGRAM[0])
     d20 = pack_f16x2(d2[0], d2[1])
     d23 = pack_f16x2(d2[2], d2[3])
     row = lane // 4
     col = (lane % 4) * 2
-    n00 = -values[0] + cutlass.Float32(row == col)
-    n01 = -values[1] + cutlass.Float32(row == col + 1)
-    n10 = -values[6] + cutlass.Float32(row == col)
-    n11 = -values[7] + cutlass.Float32(row == col + 1)
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        n00 = -values[0] + cutlass.Float32(row == col)
+        n01 = -values[1] + cutlass.Float32(row == col + 1)
+        n10 = -values[6] + cutlass.Float32(row == col)
+        n11 = -values[7] + cutlass.Float32(row == col + 1)
+    else:
+        n00 = FACTOR_PUBLICATIONS[5](values[0], row, col)
+        n01 = FACTOR_PUBLICATIONS[5](values[1], row, col + 1)
+        n10 = FACTOR_PUBLICATIONS[5](values[6], row + 8, col + 8)
+        n11 = FACTOR_PUBLICATIONS[5](values[7], row + 8, col + 9)
     n0 = pack_f16x2(n00, n01)
     n3 = pack_f16x2(n10, n11)
-    add2 = mma_blockdiag_8x8_f16(n0, n3, d20, d23)
-    n00 = n00 + add2[0]
-    n01 = n01 + add2[1]
-    n10 = n10 + add2[2]
-    n11 = n11 + add2[3]
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        add2 = mma_blockdiag_8x8_f16(n0, n3, d20, d23)
+    else:
+        add2 = execute_prepared_blockdiag_fragment(n0, n3, d20, d23, INVERSE_PROGRAM[1])
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        n00 = n00 + add2[0]
+        n01 = n01 + add2[1]
+        n10 = n10 + add2[2]
+        n11 = n11 + add2[3]
+    else:
+        n00 = FACTOR_PUBLICATIONS[6](n00, add2[0])
+        n01 = FACTOR_PUBLICATIONS[6](n01, add2[1])
+        n10 = FACTOR_PUBLICATIONS[6](n10, add2[2])
+        n11 = FACTOR_PUBLICATIONS[6](n11, add2[3])
     # Keep H(N1) for coupling; do not refresh it after the D4 correction.
     coupling0 = pack_f16x2(n00, n01)
     coupling3 = pack_f16x2(n10, n11)
-    d4 = mma_blockdiag_8x8_f16(d20, d23, d20, d23)
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        d4 = mma_blockdiag_8x8_f16(d20, d23, d20, d23)
+    else:
+        d4 = execute_prepared_blockdiag_fragment(d20, d23, d20, d23, INVERSE_PROGRAM[2])
     d40 = pack_f16x2(d4[0], d4[1])
     d43 = pack_f16x2(d4[2], d4[3])
-    add4 = mma_blockdiag_8x8_f16(coupling0, coupling3, d40, d43)
-    n00 = n00 + add4[0]
-    n01 = n01 + add4[1]
-    n10 = n10 + add4[2]
-    n11 = n11 + add4[3]
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        add4 = mma_blockdiag_8x8_f16(coupling0, coupling3, d40, d43)
+    else:
+        add4 = execute_prepared_blockdiag_fragment(
+            coupling0, coupling3, d40, d43, INVERSE_PROGRAM[3]
+        )
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        n00 = n00 + add4[0]
+        n01 = n01 + add4[1]
+        n10 = n10 + add4[2]
+        n11 = n11 + add4[3]
+    else:
+        n00 = FACTOR_PUBLICATIONS[7](n00, add4[0])
+        n01 = FACTOR_PUBLICATIONS[7](n01, add4[1])
+        n10 = FACTOR_PUBLICATIONS[7](n10, add4[2])
+        n11 = FACTOR_PUBLICATIONS[7](n11, add4[3])
     cross = pack_f16x2(values[2], values[3])
-    first = mma_m16n8k16_f16(
-        coupling0, z, z, coupling3, z, movmatrix_b16(cross), fz, fz, fz, fz
-    )
-    negative = pack_f16x2(-first[2], -first[3])
-    coupled = mma_m16n8k16_f16(
-        z, negative, z, z, movmatrix_b16(coupling0), z, fz, fz, fz, fz
-    )
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        first = mma_m16n8k16_f16(
+            coupling0, z, z, coupling3, z, movmatrix_b16(cross), fz, fz, fz, fz
+        )
+    else:
+        first = execute_prepared_warp_fragment(
+            (coupling0, z, z, coupling3),
+            (z, movmatrix_b16(cross)),
+            (fz, fz, fz, fz),
+            INVERSE_PROGRAM[4],
+        )
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        negative = pack_f16x2(-first[2], -first[3])
+    else:
+        negative = pack_typed_b16x2_to_i32(
+            FACTOR_PUBLICATIONS[8](first[2], row + 8, col),
+            FACTOR_PUBLICATIONS[8](first[3], row + 8, col + 1),
+            cutlass.Float16,
+        )
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        coupled = mma_m16n8k16_f16(
+            z, negative, z, z, movmatrix_b16(coupling0), z, fz, fz, fz, fz
+        )
+    else:
+        coupled = execute_prepared_warp_fragment(
+            (z, negative, z, z),
+            (movmatrix_b16(coupling0), z),
+            (fz, fz, fz, fz),
+            INVERSE_PROGRAM[5],
+        )
     return n00, n01, coupled[2], coupled[3], fz, fz, n10, n11
 
 
 @cute.jit
-def store_inverse_work(smem_base, offset, values, row_base, col_base, lane):
-    row = row_base + lane % 16
-    col = col_base + (lane // 16) * 8
-    ptr = cm.sptr(smem_base, offset + work_sw128(row, col), cutlass.BFloat16)
-    prims.stmatrix(
-        ptr, bf16_pack8(values), prims.MMALayout.ROW, shape=prims.StoreShape.M8N8
-    )
+def publication_pack8(values, row_base, col_base, lane, PUBLICATION: cutlass.Constexpr):
+    published = []
+    for pair in cutlass.range_constexpr(4):
+        index = pair * 2
+        row = row_base + lane // 4 + ((index % 4) // 2) * 8
+        col = col_base + (index // 4) * 8 + (lane % 4) * 2
+        low = PUBLICATION(values[index], row, col)
+        high = PUBLICATION(values[index + 1], row, col + 1)
+        published.append(pack_typed_b16x2_to_i32(low, high, cutlass.BFloat16))
+    return published
 
 
 @cute.jit
-def store_qk_transpose(smem_base, combined_offset, acc, row_base, col_base, lane):
+def store_inverse_work(
+    smem_base,
+    offset,
+    values,
+    row_base,
+    col_base,
+    lane,
+    PUBLICATION: cutlass.Constexpr = None,
+):
+    row = row_base + lane % 16
+    col = col_base + (lane // 16) * 8
+    ptr = cm.sptr(smem_base, offset + work_sw128(row, col), cutlass.BFloat16)
+    if cutlass.const_expr(PUBLICATION is None):
+        prims.stmatrix(
+            ptr, bf16_pack8(values), prims.MMALayout.ROW, shape=prims.StoreShape.M8N8
+        )
+    else:
+        published = publication_pack8(values, row_base, col_base, lane, PUBLICATION)
+        prims.stmatrix(ptr, published, prims.MMALayout.ROW, shape=prims.StoreShape.M8N8)
+
+
+@cute.jit
+def store_qk_transpose(
+    smem_base,
+    combined_offset,
+    acc,
+    row_base,
+    col_base,
+    lane,
+    PUBLICATION: cutlass.Constexpr = None,
+):
     """Publish QK.T in the N128..159 slab of the final [32,160] operand."""
-    values = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
-    for index in cutlass.range_constexpr(8):
-        row = row_base + lane // 4 + ((index % 4) // 2) * 8
-        col = col_base + (index // 4) * 8 + (lane % 4) * 2 + index % 2
-        values[index] = acc[index] if row >= col else cutlass.Float32(0.0)
-    packed = bf16_pack8(values)
+    if cutlass.const_expr(PUBLICATION is None):
+        values = cutlass.Array(cutlass.Float32, 8, space=cutlass.AddressSpace.rmem)
+        for index in cutlass.range_constexpr(8):
+            row = row_base + lane // 4 + ((index % 4) // 2) * 8
+            col = col_base + (index // 4) * 8 + (lane % 4) * 2 + index % 2
+            values[index] = acc[index] if row >= col else cutlass.Float32(0.0)
+        packed = bf16_pack8(values)
+    else:
+        packed = publication_pack8(acc, row_base, col_base, lane, PUBLICATION)
     for pair in cutlass.range_constexpr(2):
         row = col_base + pair * 8 + lane % 8
         col = 128 + row_base + (lane // 8) * 8
@@ -225,7 +367,15 @@ def late_tid_x(*, loc=None, ip=None):
 
 
 @cute.jit
-def finish_inverse32(smem_base, work_offset, inverse_offset, lane):
+def finish_inverse32(
+    smem_base,
+    work_offset,
+    inverse_offset,
+    lane,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    PUBLICATION: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+):
     """One warp assembles BF16 outer16 correction and publishes all32x32."""
     row = lane % 16
     col = (lane // 16) * 8
@@ -241,25 +391,38 @@ def finish_inverse32(smem_base, work_offset, inverse_offset, lane):
         4,
         prims.MMALayout.COL,
     )
-    first = mma16(d, c, zero8(), cutlass.BFloat16)
-    negative = bf16_pack8(
-        (
-            -first[0],
-            -first[1],
-            -first[2],
-            -first[3],
-            -first[4],
-            -first[5],
-            -first[6],
-            -first[7],
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        first = mma16(d, c, zero8(), cutlass.BFloat16)
+    else:
+        first = execute_prepared_warp_fragment(d, c, zero8(), INVERSE_PROGRAM[6])
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        negative = bf16_pack8(
+            (
+                -first[0],
+                -first[1],
+                -first[2],
+                -first[3],
+                -first[4],
+                -first[5],
+                -first[6],
+                -first[7],
+            )
         )
-    )
+    else:
+        negative = publication_pack8(
+            first, cutlass.Int32(16), cutlass.Int32(0), lane, FACTOR_PUBLICATIONS[9]
+        )
     a = prims.ldmatrix(
         cm.sptr(smem_base, work_offset + work_sw128(row, col), cutlass.BFloat16),
         4,
         prims.MMALayout.COL,
     )
-    coupled = mma16(negative, a, zero8(), cutlass.BFloat16)
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        coupled = mma16(negative, a, zero8(), cutlass.BFloat16)
+    else:
+        coupled = execute_prepared_warp_fragment(
+            negative, a, zero8(), INVERSE_PROGRAM[7]
+        )
     store_lane = late_lane_id()
     store_row = store_lane % 16
     store_col = (store_lane // 16) * 8
@@ -283,16 +446,35 @@ def finish_inverse32(smem_base, work_offset, inverse_offset, lane):
         prims.MMALayout.COL,
         shape=prims.StoreShape.M8N8,
     )
-    prims.stmatrix(
-        cm.sptr(
-            smem_base,
-            inverse_offset + cm.sw32(16 + store_row, store_col),
-            cutlass.BFloat16,
-        ),
-        bf16_pack8(coupled),
-        prims.MMALayout.ROW,
-        shape=prims.StoreShape.M8N8,
-    )
+    if cutlass.const_expr(PUBLICATION is None):
+        prims.stmatrix(
+            cm.sptr(
+                smem_base,
+                inverse_offset + cm.sw32(16 + store_row, store_col),
+                cutlass.BFloat16,
+            ),
+            bf16_pack8(coupled),
+            prims.MMALayout.ROW,
+            shape=prims.StoreShape.M8N8,
+        )
+    else:
+        prims.stmatrix(
+            cm.sptr(
+                smem_base,
+                inverse_offset + cm.sw32(16 + store_row, store_col),
+                cutlass.BFloat16,
+            ),
+            publication_pack8(
+                coupled,
+                cutlass.Int32(16),
+                cutlass.Int32(0),
+                store_lane,
+                PUBLICATION,
+            ),
+            prims.MMALayout.ROW,
+            shape=prims.StoreShape.M8N8,
+        )
+
     zi = cutlass.Int32(0)
     prims.stmatrix(
         cm.sptr(
@@ -373,10 +555,19 @@ def tail_copy_v(smem_base, v, begin, seqlen, head, chunk, stage_bytes, tid):
 
 @cute.jit
 def materialize_centered(
-    smem_base, stage_bytes, tid, scale, gate_scale_log2, FAST_RCP: cutlass.Constexpr
+    smem_base,
+    stage_bytes,
+    tid,
+    scale,
+    gate_scale_log2,
+    FAST_RCP: cutlass.Constexpr,
+    FACTOR_INPUTS: cutlass.Constexpr = None,
 ):
     """Each16-lane group normalizes one row; each thread owns8 features."""
-    center = gate_scale_log2 * cutlass.Float32(16.0)
+    if cutlass.const_expr(FACTOR_INPUTS is None):
+        center = gate_scale_log2 * cutlass.Float32(16.0)
+    else:
+        center = FACTOR_INPUTS[7](gate_scale_log2)
     for work_pass in cutlass.range(4, unroll=1):
         item = work_pass * 128 + tid
         row = item // 16
@@ -394,33 +585,40 @@ def materialize_centered(
             .load(count=8, alignment=16)
             .to(cutlass.Float32)
         )
-        q0 = cutlass.Float32(0.0)
-        q1 = cutlass.Float32(0.0)
-        k0 = cutlass.Float32(0.0)
-        k1 = cutlass.Float32(0.0)
-        for pair in cutlass.range_constexpr(4):
-            q0, q1 = cm.ffma2(
-                (qv[pair * 2], qv[pair * 2 + 1]),
-                (qv[pair * 2], qv[pair * 2 + 1]),
-                (q0, q1),
-            )
-            k0, k1 = cm.ffma2(
-                (kv[pair * 2], kv[pair * 2 + 1]),
-                (kv[pair * 2], kv[pair * 2 + 1]),
-                (k0, k1),
-            )
-        qs = q0 + q1
-        ks = k0 + k1
-        for shift in cutlass.range_constexpr(4):
-            delta = 8 >> shift
-            qs = qs + cutlass.Float32(
-                prims.shfl_sync(cute.arch.FULL_MASK, qs, delta, 0x1F, prims.Shfl.BFLY)
-            )
-            ks = ks + cutlass.Float32(
-                prims.shfl_sync(cute.arch.FULL_MASK, ks, delta, 0x1F, prims.Shfl.BFLY)
-            )
-        qi = cute.math.rsqrt(qs + cutlass.Float32(1e-6), fastmath=True)
-        ki = cute.math.rsqrt(ks + cutlass.Float32(1e-6), fastmath=True)
+        if cutlass.const_expr(FACTOR_INPUTS is not None):
+            qi, ki = FACTOR_INPUTS[1](qv, kv, tid % 16)
+        else:
+            q0 = cutlass.Float32(0.0)
+            q1 = cutlass.Float32(0.0)
+            k0 = cutlass.Float32(0.0)
+            k1 = cutlass.Float32(0.0)
+            for pair in cutlass.range_constexpr(4):
+                q0, q1 = cm.ffma2(
+                    (qv[pair * 2], qv[pair * 2 + 1]),
+                    (qv[pair * 2], qv[pair * 2 + 1]),
+                    (q0, q1),
+                )
+                k0, k1 = cm.ffma2(
+                    (kv[pair * 2], kv[pair * 2 + 1]),
+                    (kv[pair * 2], kv[pair * 2 + 1]),
+                    (k0, k1),
+                )
+            qs = q0 + q1
+            ks = k0 + k1
+            for shift in cutlass.range_constexpr(4):
+                delta = 8 >> shift
+                qs = qs + cutlass.Float32(
+                    prims.shfl_sync(
+                        cute.arch.FULL_MASK, qs, delta, 0x1F, prims.Shfl.BFLY
+                    )
+                )
+                ks = ks + cutlass.Float32(
+                    prims.shfl_sync(
+                        cute.arch.FULL_MASK, ks, delta, 0x1F, prims.Shfl.BFLY
+                    )
+                )
+            qi = cute.math.rsqrt(qs + cutlass.Float32(1e-6), fastmath=True)
+            ki = cute.math.rsqrt(ks + cutlass.Float32(1e-6), fastmath=True)
         qd = cutlass.Array(
             cutlass.BFloat16, 8, space=cutlass.AddressSpace.rmem, alignment=16
         )
@@ -442,22 +640,40 @@ def materialize_centered(
                 cm.GATE_PREFIX + stage_bytes + (row * 128 + col + element + 1) * 4,
                 cutlass.Float32,
             ).load()
-            decay0 = cute.math.exp2(prefix0 - center, fastmath=True)
-            decay1 = cute.math.exp2(prefix1 - center, fastmath=True)
-            qn0, qn1 = cm.fmul2((qv[element], qv[element + 1]), (qi, qi))
-            kn0, kn1 = cm.fmul2((kv[element], kv[element + 1]), (ki, ki))
-            qscaled0, qscaled1 = cm.fmul2((qn0, qn1), (scale, scale))
-            qd0, qd1 = cm.fmul2((qscaled0, qscaled1), (decay0, decay1))
-            kd0, kd1 = cm.fmul2((kn0, kn1), (decay0, decay1))
-            reciprocal0 = cute.math.rcp(decay0, approx=True, ftz=FAST_RCP)
-            reciprocal1 = cute.math.rcp(decay1, approx=True, ftz=FAST_RCP)
-            ki0, ki1 = cm.fmul2((kn0, kn1), (reciprocal0, reciprocal1))
-            qd[element] = cutlass.BFloat16(qd0)
-            qd[element + 1] = cutlass.BFloat16(qd1)
-            kd[element] = cutlass.BFloat16(kd0)
-            kd[element + 1] = cutlass.BFloat16(kd1)
-            kinv[element] = cutlass.BFloat16(ki0)
-            kinv[element + 1] = cutlass.BFloat16(ki1)
+            if cutlass.const_expr(FACTOR_INPUTS is not None):
+                qd0, qd1, kd0, kd1, ki0, ki1 = FACTOR_INPUTS[2](
+                    (qv[element], qv[element + 1]),
+                    (kv[element], kv[element + 1]),
+                    (prefix0, prefix1),
+                    qi,
+                    ki,
+                    scale,
+                    center,
+                    FAST_RCP,
+                )
+                qd[element] = qd0
+                qd[element + 1] = qd1
+                kd[element] = kd0
+                kd[element + 1] = kd1
+                kinv[element] = ki0
+                kinv[element + 1] = ki1
+            else:
+                decay0 = cute.math.exp2(prefix0 - center, fastmath=True)
+                decay1 = cute.math.exp2(prefix1 - center, fastmath=True)
+                qn0, qn1 = cm.fmul2((qv[element], qv[element + 1]), (qi, qi))
+                kn0, kn1 = cm.fmul2((kv[element], kv[element + 1]), (ki, ki))
+                qscaled0, qscaled1 = cm.fmul2((qn0, qn1), (scale, scale))
+                qd0, qd1 = cm.fmul2((qscaled0, qscaled1), (decay0, decay1))
+                kd0, kd1 = cm.fmul2((kn0, kn1), (decay0, decay1))
+                reciprocal0 = cute.math.rcp(decay0, approx=True, ftz=FAST_RCP)
+                reciprocal1 = cute.math.rcp(decay1, approx=True, ftz=FAST_RCP)
+                ki0, ki1 = cm.fmul2((kn0, kn1), (reciprocal0, reciprocal1))
+                qd[element] = cutlass.BFloat16(qd0)
+                qd[element + 1] = cutlass.BFloat16(qd1)
+                kd[element] = cutlass.BFloat16(kd0)
+                kd[element + 1] = cutlass.BFloat16(kd1)
+                kinv[element] = cutlass.BFloat16(ki0)
+                kinv[element + 1] = cutlass.BFloat16(ki1)
         cm.sptr(smem_base, cm.QD + stage_bytes + offset, cutlass.BFloat16).store(
             qd.data_ptr().load(count=8, alignment=16), alignment=16
         )
@@ -478,6 +694,7 @@ def restore_qk(
     FIRST_ROW: cutlass.Constexpr,
     ROW_STRIDE: cutlass.Constexpr,
     PASSES: cutlass.Constexpr,
+    FACTOR_INPUTS: cutlass.Constexpr = None,
 ):
     """Restore disjoint rows with the original BF16/FP32 cast boundaries."""
     restore_lane = late_lane_id()
@@ -517,17 +734,29 @@ def restore_qk(
         )
         for pair in cutlass.range_constexpr(4):
             element = pair * 2
-            qr0, qr1 = cm.fmul2(
-                (qv[element], qv[element + 1]), (center_scale, center_scale)
-            )
-            kr0, kr1 = cm.fmul2(
-                (kv[element], kv[element + 1]),
-                (restore_factors[element], restore_factors[element + 1]),
-            )
-            qr[element] = cutlass.BFloat16(qr0)
-            qr[element + 1] = cutlass.BFloat16(qr1)
-            kr[element] = cutlass.BFloat16(kr0)
-            kr[element + 1] = cutlass.BFloat16(kr1)
+            if cutlass.const_expr(FACTOR_INPUTS is not None):
+                qr0, qr1, kr0, kr1 = FACTOR_INPUTS[0](
+                    (qv[element], qv[element + 1]),
+                    (kv[element], kv[element + 1]),
+                    (restore_factors[element], restore_factors[element + 1]),
+                    center_scale,
+                )
+                qr[element] = qr0
+                qr[element + 1] = qr1
+                kr[element] = kr0
+                kr[element + 1] = kr1
+            else:
+                qr0, qr1 = cm.fmul2(
+                    (qv[element], qv[element + 1]), (center_scale, center_scale)
+                )
+                kr0, kr1 = cm.fmul2(
+                    (kv[element], kv[element + 1]),
+                    (restore_factors[element], restore_factors[element + 1]),
+                )
+                qr[element] = cutlass.BFloat16(qr0)
+                qr[element + 1] = cutlass.BFloat16(qr1)
+                kr[element] = cutlass.BFloat16(kr0)
+                kr[element + 1] = cutlass.BFloat16(kr1)
         cm.sptr(smem_base, cm.QD + stage_bytes + offset, cutlass.BFloat16).store(
             qr.data_ptr().load(count=8, alignment=16), alignment=16
         )
@@ -547,6 +776,7 @@ def gate_prefix(
     bias,
     gate_scale_log2,
     MASK_TAIL: cutlass.Constexpr,
+    PUBLICATION: cutlass.Constexpr = None,
 ):
     """Serial FP32 gate-prefix DAG with a constexpr full-tile mask choice."""
     prefix = cutlass.Float32(0.0)
@@ -583,71 +813,105 @@ def gate_prefix(
                 cutlass.BFloat16,
             ).load()
         )
-        increment0 = cutlass.Float32(0.0)
-        increment1 = cutlass.Float32(0.0)
-        increment2 = cutlass.Float32(0.0)
-        increment3 = cutlass.Float32(0.0)
-        if cutlass.const_expr(MASK_TAIL):
-            if chunk * cm.BT + row0 < seqlen:
-                activated0 = cute.math.tanh(
-                    gate_rate * (raw0 + bias) * cutlass.Float32(0.5), approx=True
-                ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+        if cutlass.const_expr(PUBLICATION is None):
+            increment0 = cutlass.Float32(0.0)
+            increment1 = cutlass.Float32(0.0)
+            increment2 = cutlass.Float32(0.0)
+            increment3 = cutlass.Float32(0.0)
+            if cutlass.const_expr(MASK_TAIL):
+                if chunk * cm.BT + row0 < seqlen:
+                    activated0 = cute.math.tanh(
+                        gate_rate * (raw0 + bias) * cutlass.Float32(0.5), approx=True
+                    ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                    increment0 = gate_scale_log2 * activated0
+                if chunk * cm.BT + row1 < seqlen:
+                    activated1 = cute.math.tanh(
+                        gate_rate * (raw1 + bias) * cutlass.Float32(0.5), approx=True
+                    ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                    increment1 = gate_scale_log2 * activated1
+                if chunk * cm.BT + row2 < seqlen:
+                    activated2 = cute.math.tanh(
+                        gate_rate * (raw2 + bias) * cutlass.Float32(0.5), approx=True
+                    ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                    increment2 = gate_scale_log2 * activated2
+                if chunk * cm.BT + row3 < seqlen:
+                    activated3 = cute.math.tanh(
+                        gate_rate * (raw3 + bias) * cutlass.Float32(0.5), approx=True
+                    ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                    increment3 = gate_scale_log2 * activated3
+            else:
+                half = cutlass.Float32(0.5)
+                tanh0 = cute.math.tanh(gate_rate * (raw0 + bias) * half, approx=True)
+                tanh1 = cute.math.tanh(gate_rate * (raw1 + bias) * half, approx=True)
+                tanh2 = cute.math.tanh(gate_rate * (raw2 + bias) * half, approx=True)
+                tanh3 = cute.math.tanh(gate_rate * (raw3 + bias) * half, approx=True)
+                activated0, activated1 = cm.ffma2(
+                    (tanh0, tanh1), (half, half), (half, half)
+                )
+                activated2, activated3 = cm.ffma2(
+                    (tanh2, tanh3), (half, half), (half, half)
+                )
                 increment0 = gate_scale_log2 * activated0
-            if chunk * cm.BT + row1 < seqlen:
-                activated1 = cute.math.tanh(
-                    gate_rate * (raw1 + bias) * cutlass.Float32(0.5), approx=True
-                ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
                 increment1 = gate_scale_log2 * activated1
-            if chunk * cm.BT + row2 < seqlen:
-                activated2 = cute.math.tanh(
-                    gate_rate * (raw2 + bias) * cutlass.Float32(0.5), approx=True
-                ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
                 increment2 = gate_scale_log2 * activated2
-            if chunk * cm.BT + row3 < seqlen:
-                activated3 = cute.math.tanh(
-                    gate_rate * (raw3 + bias) * cutlass.Float32(0.5), approx=True
-                ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
                 increment3 = gate_scale_log2 * activated3
+            prefix = prefix + increment0
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row0 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefix)
+            prefix = prefix + increment1
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row1 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefix)
+            prefix = prefix + increment2
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row2 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefix)
+            prefix = prefix + increment3
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row3 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefix)
         else:
-            half = cutlass.Float32(0.5)
-            tanh0 = cute.math.tanh(gate_rate * (raw0 + bias) * half, approx=True)
-            tanh1 = cute.math.tanh(gate_rate * (raw1 + bias) * half, approx=True)
-            tanh2 = cute.math.tanh(gate_rate * (raw2 + bias) * half, approx=True)
-            tanh3 = cute.math.tanh(gate_rate * (raw3 + bias) * half, approx=True)
-            activated0, activated1 = cm.ffma2(
-                (tanh0, tanh1), (half, half), (half, half)
+            prefixes = PUBLICATION(
+                (raw0, raw1, raw2, raw3),
+                bias,
+                gate_rate,
+                gate_scale_log2,
+                prefix,
+                row0,
+                chunk,
+                seqlen,
+                MASK_TAIL,
             )
-            activated2, activated3 = cm.ffma2(
-                (tanh2, tanh3), (half, half), (half, half)
-            )
-            increment0 = gate_scale_log2 * activated0
-            increment1 = gate_scale_log2 * activated1
-            increment2 = gate_scale_log2 * activated2
-            increment3 = gate_scale_log2 * activated3
-        prefix = prefix + increment0
-        cm.sptr(
-            smem_base,
-            cm.GATE_PREFIX + stage_bytes + (row0 * 128 + tid) * 4,
-            cutlass.Float32,
-        ).store(prefix)
-        prefix = prefix + increment1
-        cm.sptr(
-            smem_base,
-            cm.GATE_PREFIX + stage_bytes + (row1 * 128 + tid) * 4,
-            cutlass.Float32,
-        ).store(prefix)
-        prefix = prefix + increment2
-        cm.sptr(
-            smem_base,
-            cm.GATE_PREFIX + stage_bytes + (row2 * 128 + tid) * 4,
-            cutlass.Float32,
-        ).store(prefix)
-        prefix = prefix + increment3
-        cm.sptr(
-            smem_base,
-            cm.GATE_PREFIX + stage_bytes + (row3 * 128 + tid) * 4,
-            cutlass.Float32,
-        ).store(prefix)
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row0 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefixes[0])
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row1 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefixes[1])
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row2 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefixes[2])
+            cm.sptr(
+                smem_base,
+                cm.GATE_PREFIX + stage_bytes + (row3 * 128 + tid) * 4,
+                cutlass.Float32,
+            ).store(prefixes[3])
+            prefix = prefixes[3]
     return prefix
 
 
@@ -676,13 +940,23 @@ def factor_loop(
     lane,
     scale: cutlass.Float32,
     gate_scale_log2: cutlass.Float32,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+    FACTOR_INPUTS: cutlass.Constexpr = None,
+    GATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
     """Owner-slot loop; all128 threads of exactly one factor team participate."""
     tid = local_warp * 32 + lane
     stage_bytes = team * cm.STAGE_BYTES
-    gate_rate = cute.math.exp2(
-        cutlass.Float32(a_log[head]) * cutlass.Float32(cm.LOG2_E), fastmath=True
-    )
+    if cutlass.const_expr(FACTOR_INPUTS is None):
+        gate_rate = cute.math.exp2(
+            cutlass.Float32(a_log[head]) * cutlass.Float32(cm.LOG2_E), fastmath=True
+        )
+    else:
+        gate_rate = FACTOR_INPUTS[6](
+            cutlass.Float32(a_log[head]), cutlass.Float32(cm.LOG2_E)
+        )
     bias = cutlass.Float32(dt_bias[head, tid])
     iterations = (num_chunks + cm.STAGES - 1 - team) // cm.STAGES
     for iteration in cutlass.range(iterations, unroll=1):
@@ -725,9 +999,12 @@ def factor_loop(
                         cutlass.BFloat16,
                     ).load()
                 )
-                early_beta = cute.math.tanh(
-                    raw * cutlass.Float32(0.5), approx=True
-                ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                if cutlass.const_expr(GATE_PUBLICATIONS is None):
+                    early_beta = cute.math.tanh(
+                        raw * cutlass.Float32(0.5), approx=True
+                    ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                else:
+                    early_beta = GATE_PUBLICATIONS[1](raw)
         # Q raw aliases Kr/final QK, so its copy retains the final-use waits.
         cm.wait(cm.bptr(smem_base, cm.SMEM_FREE, team), phase ^ 1)
         cm.wait(cm.bptr(smem_base, cm.V_FREE, team), phase ^ 1)
@@ -771,9 +1048,12 @@ def factor_loop(
                 raw = cutlass.Float32(0.0)
                 if chunk * cm.BT + phase_lane < seqlen:
                     raw = cutlass.Float32(beta[0, token, head])
-                early_beta = cute.math.tanh(
-                    raw * cutlass.Float32(0.5), approx=True
-                ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                if cutlass.const_expr(GATE_PUBLICATIONS is None):
+                    early_beta = cute.math.tanh(
+                        raw * cutlass.Float32(0.5), approx=True
+                    ) * cutlass.Float32(0.5) + cutlass.Float32(0.5)
+                else:
+                    early_beta = GATE_PUBLICATIONS[1](raw)
             cm.sptr(
                 smem_base, cm.PREP_BETA + stage_bytes + phase_lane * 4, cutlass.Float32
             ).store(early_beta)
@@ -789,6 +1069,9 @@ def factor_loop(
                 bias,
                 gate_scale_log2,
                 False,
+                PUBLICATION=None
+                if cutlass.const_expr(GATE_PUBLICATIONS is None)
+                else GATE_PUBLICATIONS[0],
             )
         else:
             prefix = gate_prefix(
@@ -801,17 +1084,26 @@ def factor_loop(
                 bias,
                 gate_scale_log2,
                 True,
+                PUBLICATION=None
+                if cutlass.const_expr(GATE_PUBLICATIONS is None)
+                else GATE_PUBLICATIONS[0],
             )
-        restore = cute.math.exp2(
-            prefix - gate_scale_log2 * cutlass.Float32(16.0), fastmath=True
-        )
+        if cutlass.const_expr(FACTOR_INPUTS is None):
+            restore = cute.math.exp2(
+                prefix - gate_scale_log2 * cutlass.Float32(16.0), fastmath=True
+            )
+        else:
+            restore = FACTOR_INPUTS[3](prefix, gate_scale_log2)
         cm.sptr(
             smem_base, cm.RESTORE_FACTOR + stage_bytes + phase_tid * 4, cutlass.Float32
         ).store(restore)
         if phase_tid == 0:
-            center_scale = cute.math.exp2(
-                gate_scale_log2 * cutlass.Float32(16.0), fastmath=True
-            )
+            if cutlass.const_expr(FACTOR_INPUTS is None):
+                center_scale = cute.math.exp2(
+                    gate_scale_log2 * cutlass.Float32(16.0), fastmath=True
+                )
+            else:
+                center_scale = FACTOR_INPUTS[4](gate_scale_log2)
             cm.sptr(
                 smem_base, cm.RESTORE_FACTOR + stage_bytes + 128 * 4, cutlass.Float32
             ).store(center_scale)
@@ -821,38 +1113,86 @@ def factor_loop(
             gate_scale_log2 <= cutlass.Float32(7.5)
         ):
             materialize_centered(
-                smem_base, stage_bytes, phase_tid, scale, gate_scale_log2, True
+                smem_base,
+                stage_bytes,
+                phase_tid,
+                scale,
+                gate_scale_log2,
+                True,
+                FACTOR_INPUTS,
             )
         else:
             materialize_centered(
-                smem_base, stage_bytes, phase_tid, scale, gate_scale_log2, False
+                smem_base,
+                stage_bytes,
+                phase_tid,
+                scale,
+                gate_scale_log2,
+                False,
+                FACTOR_INPUTS,
             )
         # The CTA barrier orders ordinary shared writes before pairwise reads.
         cm.team_sync(team)
         total = cm.sptr(
             smem_base, cm.PREFIX_LAST + stage_bytes + phase_tid * 4, cutlass.Float32
         ).load()
-        cm.sptr(
-            smem_base, cm.GAMMA + stage_bytes + phase_tid * 4, cutlass.Float32
-        ).store(cute.math.exp2(total, fastmath=True))
+        if cutlass.const_expr(FACTOR_INPUTS is None):
+            cm.sptr(
+                smem_base, cm.GAMMA + stage_bytes + phase_tid * 4, cutlass.Float32
+            ).store(cute.math.exp2(total, fastmath=True))
+        else:
+            cm.sptr(
+                smem_base, cm.GAMMA + stage_bytes + phase_tid * 4, cutlass.Float32
+            ).store(FACTOR_INPUTS[5](total))
         row_base = (local_warp // 2) * 16
         col_base = (local_warp % 2) * 16
         if row_base >= col_base:
-            kk = pairwise16(
+            if cutlass.const_expr(PAIRWISE_PROGRAM is None):
+                kk = pairwise16(
+                    smem_base,
+                    cm.KD + stage_bytes,
+                    cm.KI + stage_bytes,
+                    row_base,
+                    col_base,
+                    lane,
+                )
+            else:
+                kk = prepared_pairwise16(
+                    smem_base,
+                    stage_bytes,
+                    row_base,
+                    col_base,
+                    lane,
+                    PAIRWISE_PROGRAM[0],
+                )
+            lower = lower_values(
                 smem_base,
-                cm.KD + stage_bytes,
-                cm.KI + stage_bytes,
+                cm.PREP_BETA + stage_bytes,
+                kk,
                 row_base,
                 col_base,
                 lane,
-            )
-            lower = lower_values(
-                smem_base, cm.PREP_BETA + stage_bytes, kk, row_base, col_base, lane
+                PUBLICATION=None
+                if cutlass.const_expr(FACTOR_PUBLICATIONS is None)
+                else FACTOR_PUBLICATIONS[0],
             )
             if row_base == col_base:
-                inv = inverse16_v2(lower, lane)
+                inv = inverse16_v2(
+                    lower,
+                    lane,
+                    INVERSE_PROGRAM=INVERSE_PROGRAM,
+                    FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
+                )
                 store_inverse_work(
-                    smem_base, cm.INV_WORK + stage_bytes, inv, row_base, col_base, lane
+                    smem_base,
+                    cm.INV_WORK + stage_bytes,
+                    inv,
+                    row_base,
+                    col_base,
+                    lane,
+                    PUBLICATION=None
+                    if cutlass.const_expr(FACTOR_PUBLICATIONS is None)
+                    else FACTOR_PUBLICATIONS[2],
                 )
             else:
                 store_inverse_work(
@@ -862,6 +1202,9 @@ def factor_loop(
                     row_base,
                     col_base,
                     lane,
+                    PUBLICATION=None
+                    if cutlass.const_expr(FACTOR_PUBLICATIONS is None)
+                    else FACTOR_PUBLICATIONS[3],
                 )
         else:
             store_inverse_work(
@@ -869,27 +1212,53 @@ def factor_loop(
             )
         qk = zero8()
         if row_base >= col_base:
-            qk = pairwise16(
-                smem_base,
-                cm.QD + stage_bytes,
-                cm.KI + stage_bytes,
-                row_base,
-                col_base,
-                lane,
-            )
+            if cutlass.const_expr(PAIRWISE_PROGRAM is None):
+                qk = pairwise16(
+                    smem_base,
+                    cm.QD + stage_bytes,
+                    cm.KI + stage_bytes,
+                    row_base,
+                    col_base,
+                    lane,
+                )
+            else:
+                qk = prepared_pairwise16(
+                    smem_base,
+                    stage_bytes,
+                    row_base,
+                    col_base,
+                    lane,
+                    PAIRWISE_PROGRAM[1],
+                )
         store_qk_transpose(
-            smem_base, cm.FINAL_TRANS + stage_bytes, qk, row_base, col_base, lane
+            smem_base,
+            cm.FINAL_TRANS + stage_bytes,
+            qk,
+            row_base,
+            col_base,
+            lane,
+            PUBLICATION=None
+            if cutlass.const_expr(FACTOR_PUBLICATIONS is None)
+            else FACTOR_PUBLICATIONS[1],
         )
         # The CTA barrier orders ordinary shared writes before restore reads.
         cm.team_sync(team)
         if local_warp == 0:
             finish_inverse32(
-                smem_base, cm.INV_WORK + stage_bytes, cm.INV + stage_bytes, lane
+                smem_base,
+                cm.INV_WORK + stage_bytes,
+                cm.INV + stage_bytes,
+                lane,
+                INVERSE_PROGRAM=INVERSE_PROGRAM,
+                FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
+                PUBLICATION=None
+                if cutlass.const_expr(FACTOR_PUBLICATIONS is None)
+                else FACTOR_PUBLICATIONS[4],
             )
         if local_warp == 1:
-            restore_qk(smem_base, stage_bytes, local_warp, lane, 0, 2, 4)
+            restore_qk(smem_base, stage_bytes, local_warp, lane, 0, 2, 4, FACTOR_INPUTS)
         elif local_warp >= 2:
-            restore_qk(smem_base, stage_bytes, local_warp, lane, 8, 4, 6)
+            restore_qk(smem_base, stage_bytes, local_warp, lane, 8, 4, 6, FACTOR_INPUTS)
         cm.team_sync(team)
         if local_warp == 0:
             cm.fence_shared()

@@ -11,6 +11,7 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from ..prepared_tcgen_edge import execute_prepared_output
 from ..warp_specialized_primitives import matrix_16x16_transposed_lane_coordinates
 from . import common as cm
 from .state import tptr
@@ -64,6 +65,8 @@ def output_loop(
     num_chunks,
     warp,
     lane,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
     local_warp = warp - 4
     stage = cutlass.Int32(0)
@@ -72,52 +75,102 @@ def output_loop(
     for chunk in cutlass.range(num_chunks, unroll=1):
         cm.wait(cm.bptr(smem_base, cm.FINAL_READY, stage), phase)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-        if (chunk + 1) * cm.BT <= seqlen:
-            values0 = prims.tcgen05_ld(
-                "16x256b", tptr(tmem_base, warp, cm.TMEM_OUT, cutlass.Float32), num=4
-            )
-            values1 = prims.tcgen05_ld(
-                "16x256b",
-                cutlass.inttoptr(
-                    tmem_base + (local_warp * 32 + 16 << 16) + cm.TMEM_OUT,
-                    6,
-                    cutlass.Float32,
-                ),
-                num=4,
-            )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            publish_empty(smem_base, local_warp)
-            if local_warp == 0:
-                if chunk >= 2:
-                    prims.cp_async_bulk_wait_group(1, read=True)
-            cm.output_sync()
-            stage_half(smem_base, output_stage, values0, local_warp, lane, 0)
-            stage_half(smem_base, output_stage, values1, local_warp, lane, 1)
-            cm.output_sync()
-            if local_warp == 0:
-                cm.fence_shared()
-                if prims.elect_sync():
-                    prims.cp_async_bulk_tensor_global_shared_cta(
-                        descriptor.get_ptr(),
-                        cm.sptr(
-                            smem_base, cm.OUT + output_stage * 8192, cutlass.BFloat16
-                        ),
-                        (0, cutlass.Int32(begin) + chunk * cm.BT, head, 0),
-                    )
-                    prims.cp_async_bulk_commit_group()
-            output_stage = output_stage ^ 1
+        if cutlass.const_expr(OUTPUT_PROGRAM is not None):
+            if (chunk + 1) * cm.BT <= seqlen:
+                execute_prepared_output(
+                    OUTPUT_PROGRAM[0],
+                    tptr(tmem_base, warp, cm.TMEM_OUT, cutlass.Float32),
+                    cutlass.inttoptr(
+                        tmem_base + (local_warp * 32 + 16 << 16) + cm.TMEM_OUT,
+                        6,
+                        cutlass.Float32,
+                    ),
+                    cm.sptr(smem_base, cm.OUT + output_stage * 8192, cutlass.BFloat16),
+                    cm.sptr(smem_base, cm.OUT_EMPTY, cutlass.Int64),
+                    out,
+                    descriptor,
+                    begin,
+                    seqlen,
+                    head,
+                    chunk,
+                    local_warp,
+                    lane,
+                    STATE_PUBLICATIONS,
+                )
+                output_stage = output_stage ^ 1
+            else:
+                execute_prepared_output(
+                    OUTPUT_PROGRAM[1],
+                    tptr(tmem_base, warp, cm.TMEM_OUT, cutlass.Float32),
+                    None,
+                    None,
+                    cm.sptr(smem_base, cm.OUT_EMPTY, cutlass.Int64),
+                    out,
+                    None,
+                    begin,
+                    seqlen,
+                    head,
+                    chunk,
+                    local_warp,
+                    lane,
+                    STATE_PUBLICATIONS,
+                )
         else:
-            values = prims.tcgen05_ld(
-                "32x32b", tptr(tmem_base, warp, cm.TMEM_OUT, cutlass.Float32), num=32
-            )
-            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            publish_empty(smem_base, local_warp)
-            for column in cutlass.range_constexpr(32):
-                token = chunk * cm.BT + column
-                if token < seqlen:
-                    out[
-                        0, begin + cutlass.Int64(token), head, local_warp * 32 + lane
-                    ] = cutlass.BFloat16(values[column])
+            if (chunk + 1) * cm.BT <= seqlen:
+                values0 = prims.tcgen05_ld(
+                    "16x256b",
+                    tptr(tmem_base, warp, cm.TMEM_OUT, cutlass.Float32),
+                    num=4,
+                )
+                values1 = prims.tcgen05_ld(
+                    "16x256b",
+                    cutlass.inttoptr(
+                        tmem_base + (local_warp * 32 + 16 << 16) + cm.TMEM_OUT,
+                        6,
+                        cutlass.Float32,
+                    ),
+                    num=4,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                publish_empty(smem_base, local_warp)
+                if local_warp == 0:
+                    if chunk >= 2:
+                        prims.cp_async_bulk_wait_group(1, read=True)
+                cm.output_sync()
+                stage_half(smem_base, output_stage, values0, local_warp, lane, 0)
+                stage_half(smem_base, output_stage, values1, local_warp, lane, 1)
+                cm.output_sync()
+                if local_warp == 0:
+                    cm.fence_shared()
+                    if prims.elect_sync():
+                        prims.cp_async_bulk_tensor_global_shared_cta(
+                            descriptor.get_ptr(),
+                            cm.sptr(
+                                smem_base,
+                                cm.OUT + output_stage * 8192,
+                                cutlass.BFloat16,
+                            ),
+                            (0, cutlass.Int32(begin) + chunk * cm.BT, head, 0),
+                        )
+                        prims.cp_async_bulk_commit_group()
+                output_stage = output_stage ^ 1
+            else:
+                values = prims.tcgen05_ld(
+                    "32x32b",
+                    tptr(tmem_base, warp, cm.TMEM_OUT, cutlass.Float32),
+                    num=32,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                publish_empty(smem_base, local_warp)
+                for column in cutlass.range_constexpr(32):
+                    token = chunk * cm.BT + column
+                    if token < seqlen:
+                        out[
+                            0,
+                            begin + cutlass.Int64(token),
+                            head,
+                            local_warp * 32 + lane,
+                        ] = cutlass.BFloat16(values[column])
         stage = stage + 1
         if stage == cm.STAGES:
             stage = cutlass.Int32(0)

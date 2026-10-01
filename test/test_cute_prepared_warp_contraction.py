@@ -75,12 +75,14 @@ def test_original_accumulator_versions_and_low_before_high(steps, atoms):
     events: list[tuple[object, ...]] = []
     accumulator = tuple(("fp32-zero", slot) for slot in range(4 * atoms))
 
-    def load_a(source, k, packed):
+    def load_a(source, k, packed, transposed=False):
+        assert transposed is False
         assert source == "a" and packed is True
         events.append(("a", k))
         return tuple(("a", k, word) for word in range(4))
 
-    def load_b(source, k, packed, count):
+    def load_b(source, k, packed, count, transposed=False):
+        assert transposed is False
         assert source == "b" and packed is True and count == atoms
         events.append(("b", k))
         return tuple(("b", k, word) for word in range(2 * atoms))

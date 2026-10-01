@@ -288,6 +288,47 @@ class ContractionGraph:
 
 
 @dataclass(frozen=True)
+class ContractionPartition:
+    """Selected original specs in a physical owner's legal issue priority.
+
+    The full graph remains authoritative. Incoming preparation dependencies,
+    outgoing consumers and intermediate casts are retained, not replaced by
+    synthetic contraction nodes or claimed as covered by this partition.
+    """
+
+    graph: ContractionGraph
+    specs: tuple[ContractionSpec, ...]
+
+    def check(self) -> None:
+        self.graph.check()
+        selected = {id(spec): index for index, spec in enumerate(self.specs)}
+        original = {id(spec) for spec in self.graph.region.contractions}
+        if (
+            not selected
+            or len(selected) != len(self.specs)
+            or not selected.keys() <= original
+        ):
+            raise chain._UnsupportedChain("invalid contraction partition")
+        for consumer, spec in enumerate(self.specs):
+            ancestors = chain._ancestors(spec.node)
+            if any(item.node in ancestors for item in self.specs[consumer + 1 :]):
+                raise chain._UnsupportedChain(
+                    "partition reverses contraction dependency"
+                )
+
+    @property
+    def boundary(self) -> tuple[ContractionDependency, ...]:
+        self.check()
+        selected = {id(spec) for spec in self.specs}
+        return tuple(
+            dependency
+            for dependency in self.graph.dependencies
+            if (id(dependency.producer) in selected)
+            != (id(dependency.consumer) in selected)
+        )
+
+
+@dataclass(frozen=True)
 class IssuePlacement:
     """An original issue interval and its bound issuer/member, not a dot rank."""
 
@@ -596,7 +637,10 @@ def schedule_native_issues(
 
 
 def order_issue_placements(
-    graph: ContractionGraph, placements: tuple[IssuePlacement, ...]
+    graph: ContractionGraph,
+    placements: tuple[IssuePlacement, ...],
+    *,
+    partition: ContractionPartition | None = None,
 ) -> tuple[tuple[IssuePlacement, ...], ...]:
     """Schedule each original issuer separately, retaining cross-role edges.
 
@@ -608,7 +652,12 @@ def order_issue_placements(
     graph.check()
     if not placements or len({id(item) for item in placements}) != len(placements):
         raise chain._UnsupportedChain("missing or duplicate issue placement")
-    specs = {id(spec): spec for spec in graph.region.contractions}
+    if partition is not None:
+        partition.check()
+        if partition.graph is not graph:
+            raise chain._UnsupportedChain("foreign contraction partition")
+    selected = graph.region.contractions if partition is None else partition.specs
+    specs = {id(spec): spec for spec in selected}
     if {id(item.issue.spec) for item in placements} != set(specs):
         raise chain._UnsupportedChain("incomplete contraction issue schedule")
     owners = {id(item.owner) for item in placements}
@@ -644,11 +693,12 @@ def order_issue_placements(
             raise chain._UnsupportedChain("incomplete scheduled K prefix")
     # Disconnected result members are allowed only without overlap. Their
     # full owner/layout correspondence is still checked by the physical port.
-    for spec in graph.region.contractions:
+    for spec in selected:
         members = sorted(member for key, member in groups if key == id(spec))
         if any(left[1] > right[0] for left, right in pairwise(members)):
             raise chain._UnsupportedChain("overlapping issue result members")
-    rank = {id(spec): index for index, spec in enumerate(graph.order())}
+    priority = graph.order() if partition is None else partition.specs
+    rank = {id(spec): index for index, spec in enumerate(priority)}
     ordered = sorted(
         placements,
         key=lambda item: (

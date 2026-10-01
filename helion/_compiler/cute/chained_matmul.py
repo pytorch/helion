@@ -33,7 +33,9 @@ from ...language import view_ops
 from ...language.matmul_ops import dot
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
+from ..inductor_lowering import PointwiseCodegenPolicy
 from ..inductor_lowering import PointwiseLowering
+from ..inductor_lowering import prepare_pointwise_view
 from .chained_execution import ChainedExecution
 from .chained_workspace import plan_contraction_workspace
 from .contraction_region import collect_contraction_region
@@ -950,12 +952,16 @@ class _Expression:
     def __init__(
         self,
         cg: GenerateAST,
-        plan: ChainedMatmulPlan,
+        plan: ChainedMatmulPlan | None,
         boundaries: dict[Node, str],
     ) -> None:
         self.cg = cg
-        self.plan = plan
-        self.prepared_widenings = plan.prepared_widenings
+        self.context = plan
+        self.pointwise_policy: PointwiseCodegenPolicy | None = None
+        self.pointwise_views: dict[
+            Node, tuple[PointwiseLowering, tuple[Node, ...]]
+        ] = {}
+        self.prepared_widenings = None if plan is None else plan.prepared_widenings
         self.boundaries = boundaries
         self.statements: list[_Statement] = []
         self.memo: dict[tuple[Node, tuple[str, ...]], str] = {}
@@ -972,14 +978,41 @@ class _Expression:
         self.scan_inputs: list[_ScanInput] = []
         self.coordinate_names: set[str] = set()
         self.origins = {
-            axis_id: f"chain_origin_{axis_id}" for axis_id, _, _ in plan.axes
+            axis_id: f"chain_origin_{axis_id}"
+            for axis_id, _, _ in (() if plan is None else plan.axes)
         }
-        if plan.loop is not None:
+        if plan is not None and plan.loop is not None:
             self.boundaries = {**plan.loop.boundaries(), **boundaries}
             self.fragments.update(
                 (node, ((), name)) for node, name in plan.loop.captures().items()
             )
             self.origins[plan.loop.block_id] = "chain_loop_index"
+
+    @property
+    def plan(self) -> ChainedMatmulPlan:
+        if self.context is None:
+            raise _UnsupportedChain(
+                "register expression requires explicitly bound inputs"
+            )
+        return self.context
+
+    def pointwise(
+        self, node: Node
+    ) -> tuple[PointwiseLowering, tuple[Node, ...]] | None:
+        if node in self.pointwise_views:
+            return self.pointwise_views[node]
+        inputs = _pointwise_inputs(node)
+        if inputs is not None:
+            return cast("PointwiseLowering", node.meta["lowering"]), inputs
+        if (
+            self.context is None
+            and isinstance(node.target, torch._ops.OpOverload)
+            and torch.Tag.pointwise in node.target.tags
+        ):
+            result = prepare_pointwise_view(node)
+            self.pointwise_views[node] = result
+            return result
+        return None
 
     def block_size(self, block_id: int) -> int:
         size = self.cg.device_function.resolved_block_size(block_id)
@@ -1120,6 +1153,12 @@ class _Expression:
             return repr(arg)
         if not isinstance(arg, Node):
             raise _UnsupportedChain(f"scalar {arg}")
+        if arg in self.fragments:
+            coordinates, value = self.fragments[arg]
+            if coordinates:
+                raise _UnsupportedChain("non-scalar register binding used as scalar")
+            self.memo[arg, ()] = value
+            return value
         if arg.target in (tile_ops.tile_begin, tile_ops.tile_id):
             axis = self.block_id(cast("Node", arg.args[0]))
             origin = self.origins[axis]
@@ -1164,6 +1203,12 @@ class _Expression:
             if axis is not None:
                 return str(self.block_size(axis))
             if isinstance(value, (int, float, torch.SymInt, torch.SymFloat)):
+                if self.context is None and isinstance(
+                    value, (torch.SymInt, torch.SymFloat)
+                ):
+                    raise _UnsupportedChain(
+                        "register expression has an unbound symbolic scalar"
+                    )
                 return self.cg.device_function.literal_expr(value)
         if isinstance(arg.meta.get("val"), torch.Tensor) and not _shape(arg):
             return self.value(arg, ())
@@ -1449,6 +1494,8 @@ class _Expression:
         ):
             value = self.prepared_widenings.expression(self, node, coordinates)
         elif node.target is memory_ops.load:
+            if self.context is None:
+                raise _UnsupportedChain("register expression has an unbound load")
             value = self._load(node, coordinates)
         elif node.target is _tracing_ops._mask_to:
             source = cast("Node", node.args[0])
@@ -1535,7 +1582,8 @@ class _Expression:
             else:
                 remainder = self.bind(f"({left} % {right})")
                 value = self.bind(_signed_remainder_adjustment(remainder, right))
-        elif (inputs := _pointwise_inputs(node)) is not None:
+        elif (pointwise := self.pointwise(node)) is not None:
+            lowering, inputs = pointwise
             values: list[ast.AST] = []
             for input_node in inputs:
                 if not isinstance(input_node.meta.get("val"), torch.Tensor):
@@ -1552,9 +1600,13 @@ class _Expression:
             ctx.cg = self.cg
             ctx.env = {}
             statements: list[ast.AST] = []
-            lowering = cast("PointwiseLowering", node.meta["lowering"])
             with self.cg.set_statements(statements), V.set_current_node(node):
-                result = lowering.codegen_from_input_asts(ctx, node, values)
+                result = lowering.codegen_from_input_asts(
+                    ctx,
+                    node,
+                    values,
+                    policy=self.pointwise_policy,
+                )
             assert isinstance(result, ast.AST)
             for statement in statements:
                 self.record_statement(statement)

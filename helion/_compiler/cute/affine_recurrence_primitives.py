@@ -96,6 +96,46 @@ def pack_output_b16x2_to_i32(
     )
 
 
+@dsl_user_op
+def add_fp32_rn(left, right, *, loc=None, ip=None):
+    """One completed FP32 addition, including explicitly typed constant inputs."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [
+                cutlass.Float32(left).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(right).ir_value(loc=loc, ip=ip),
+            ],
+            "add.rn.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def materialize_fp32(value):
+    """Keep a selected FP32 image before a later typed conversion."""
+    return prims.inline_ptx_hl(
+        "mov.b32 {$w0}, {$r0};",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[value],
+    )
+
+
+@cute.jit
+def pack_typed_b16x2_to_i32(value0, value1, dtype: cutlass.Constexpr):
+    """Pack already converted 16-bit values without another rounding step."""
+
+    return cutlass.Vector.from_elements((value0, value1), dtype).bitcast(cutlass.Int32)[
+        0
+    ]
+
+
 @cute.jit
 def pack_bf16x2_inline(lo, hi):
     """Round and pack two FP32 values with the inline-PTX CuTe path."""

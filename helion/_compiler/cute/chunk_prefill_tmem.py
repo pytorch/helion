@@ -20,6 +20,8 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from . import prepared_tcgen_edge as prepared_tcgen
+from . import prepared_warp_contraction as prepared_warp
 from . import warp_specialized_primitives as pipeline_primitives
 from .affine_recurrence_primitives import accumulator_coordinate as acc_coord
 from .affine_recurrence_primitives import f16_round
@@ -30,6 +32,7 @@ from .affine_recurrence_primitives import movmatrix_b16_inline as movmatrix_b16
 from .affine_recurrence_primitives import pack_f16x2
 from .affine_recurrence_primitives import pack_input_b16x2_to_i32
 from .affine_recurrence_primitives import pack_output_b16x2_to_i32
+from .affine_recurrence_primitives import pack_typed_b16x2_to_i32
 from .affine_recurrence_primitives import packed_f32x2_binary as packed_f32x2_binary
 from .affine_recurrence_primitives import sub_b16x2_input_dtype
 from .warp_specialized_plan import chained_recurrence_tmem_layout
@@ -888,6 +891,7 @@ def tma_stage_load_inputs(
     tma_mbar,
     tma_tx_bytes: cutlass.Constexpr,
     gate_dtype: cutlass.Constexpr,
+    BT16_GATES: cutlass.Constexpr = None,
 ) -> None:
     """Overlap raw TMA with beta readiness and scalar sigmoid publication.
 
@@ -966,8 +970,13 @@ def tma_stage_load_inputs(
             if beta_g > cutlass.Int32(1):
                 b_idx = (sequence_start % beta_g + lane) * heads32 + head_idx
             beta_logit = beta_tile_stage[b_idx].to(cutlass.Float32)
-            half = cutlass.Float32(0.5)
-            beta_value = cute.math.tanh(beta_logit * half, approx=True) * half + half
+            if cutlass.const_expr(BT16_GATES is not None):
+                beta_value = BT16_GATES[4](beta_logit)
+            else:
+                half = cutlass.Float32(0.5)
+                beta_value = (
+                    cute.math.tanh(beta_logit * half, approx=True) * half + half
+                )
         raw_beta_smem[lane] = beta_value
     prims.bar_warp_sync(cute.arch.FULL_MASK)
     if prims.elect_sync():
@@ -1104,6 +1113,8 @@ def cg0_materialize_decay_operands(
     cg0_group_id,
     cg0_local_warp,
     lane,
+    BT16_INPUTS: cutlass.Constexpr = None,
+    BT16_GATES: cutlass.Constexpr = None,
 ) -> None:
     """Materialize safe-gate KDA decay operands for one key dimension.
 
@@ -1153,18 +1164,27 @@ def cg0_materialize_decay_operands(
                 prefix_idx1 = raw_f16_s128_smem_index(row1, prefix_dim)
                 gate0 = raw_gate_smem[prefix_idx0].to(cutlass.Float32)
                 gate1 = raw_gate_smem[prefix_idx1].to(cutlass.Float32)
-            gate0 = a_log_exp_half * (gate0 + dt_bias_value)
-            gate1 = a_log_exp_half * (gate1 + dt_bias_value)
-            gate0 = safe_gate_log2_increment_prehalved(
-                gate0,
-                SAFE_GATE,
-                GATE_SCALE_LOG2,
-            )
-            gate1 = safe_gate_log2_increment_prehalved(
-                gate1,
-                SAFE_GATE,
-                GATE_SCALE_LOG2,
-            )
+            if cutlass.const_expr(BT16_GATES is None):
+                gate0 = a_log_exp_half * (gate0 + dt_bias_value)
+                gate1 = a_log_exp_half * (gate1 + dt_bias_value)
+                gate0 = safe_gate_log2_increment_prehalved(
+                    gate0,
+                    SAFE_GATE,
+                    GATE_SCALE_LOG2,
+                )
+                gate1 = safe_gate_log2_increment_prehalved(
+                    gate1,
+                    SAFE_GATE,
+                    GATE_SCALE_LOG2,
+                )
+            else:
+                gate0, gate1 = BT16_GATES[0](
+                    gate0,
+                    gate1,
+                    a_log_exp,
+                    dt_bias_value,
+                    GATE_SCALE_LOG2,
+                )
             gate_pair = cutlass.Vector.from_elements((gate0, gate1), cutlass.Float32)
             g_prefix_regs[row0] = gate_pair[0]
             g_prefix_regs[row1] = gate_pair[1]
@@ -1211,14 +1231,27 @@ def cg0_materialize_decay_operands(
         row1 = row0 + 1
         # The scalar scan has the same dependency depth as packed fadd2 but
         # avoids the register copy needed to construct its first input pair.
-        prefix0 = prefix_acc + g_prefix_regs[row0]
-        prefix1 = prefix0 + g_prefix_regs[row1]
-        g_prefix_regs[row0] = prefix0
-        g_prefix_regs[row1] = prefix1
-        prefix_acc = prefix1
+        if cutlass.const_expr(BT16_GATES is None):
+            prefix0 = prefix_acc + g_prefix_regs[row0]
+            prefix1 = prefix0 + g_prefix_regs[row1]
+            g_prefix_regs[row0] = prefix0
+            g_prefix_regs[row1] = prefix1
+            prefix_acc = prefix1
+        else:
+            prefix0, prefix1 = BT16_GATES[1](
+                prefix_acc,
+                g_prefix_regs[row0],
+                g_prefix_regs[row1],
+            )
+            g_prefix_regs[row0] = prefix0
+            g_prefix_regs[row1] = prefix1
+            prefix_acc = prefix1
 
     for row in cutlass.range_constexpr(BT):
-        g_prefix_regs[row] = cute.math.exp2(g_prefix_regs[row], fastmath=True)
+        if cutlass.const_expr(BT16_GATES is None):
+            g_prefix_regs[row] = cute.math.exp2(g_prefix_regs[row], fastmath=True)
+        else:
+            g_prefix_regs[row] = BT16_GATES[2](g_prefix_regs[row])
 
     for row in cutlass.range_constexpr(BT):
         prefix_idx = raw_f32_exchange_smem_index(row, prefix_dim)
@@ -1270,21 +1303,28 @@ def cg0_materialize_decay_operands(
             k_val = raw_k_vec_f32[dim_offset]
             raw_q_regs[reg_base + dim_offset] = q_val
             raw_k_regs[reg_base + dim_offset] = k_val
-            q_sum_sq = q_sum_sq + q_val * q_val
-            k_sum_sq = k_sum_sq + k_val * k_val
+            if cutlass.const_expr(BT16_INPUTS is None):
+                q_sum_sq = q_sum_sq + q_val * q_val
+                k_sum_sq = k_sum_sq + k_val * k_val
 
-    q_sum_sq = warp_group_sum_8(q_sum_sq)
-    k_sum_sq = warp_group_sum_8(k_sum_sq)
-    norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
-    q_inv_norm = cute.math.rsqrt(
-        cute.math.max(q_sum_sq, norm_floor_sq, ftz=True),
-        fastmath=True,
-    )
-    k_inv_norm = cute.math.rsqrt(
-        cute.math.max(k_sum_sq, norm_floor_sq, ftz=True),
-        fastmath=True,
-    )
-
+    if cutlass.const_expr(BT16_INPUTS is None):
+        q_sum_sq = warp_group_sum_8(q_sum_sq)
+        k_sum_sq = warp_group_sum_8(k_sum_sq)
+        norm_floor_sq = cutlass.Float32(L2_NORM_EPS * L2_NORM_EPS)
+        q_inv_norm = cute.math.rsqrt(
+            cute.math.max(q_sum_sq, norm_floor_sq, ftz=True),
+            fastmath=True,
+        )
+        k_inv_norm = cute.math.rsqrt(
+            cute.math.max(k_sum_sq, norm_floor_sq, ftz=True),
+            fastmath=True,
+        )
+    else:
+        q_inv_norm, k_inv_norm = BT16_INPUTS[0](
+            raw_q_regs,
+            raw_k_regs,
+            lane_in_row_group,
+        )
     exp_g_regs = cutlass.Array(
         cutlass.Float32,
         2 * RAW_F16_TMA_SWIZZLE_GROUP_ELEMS,
@@ -1325,18 +1365,24 @@ def cg0_materialize_decay_operands(
             exp_g_regs[f32_reg_base + 1] = exp_g_vec[1]
             exp_g_regs[f32_reg_base + 2] = exp_g_vec[2]
             exp_g_regs[f32_reg_base + 3] = exp_g_vec[3]
-            exp_neg_g_regs[half_reg_base] = cute.math.rcp(
-                exp_g_vec[0], approx=True, ftz=True
-            )
-            exp_neg_g_regs[half_reg_base + 1] = cute.math.rcp(
-                exp_g_vec[1], approx=True, ftz=True
-            )
-            exp_neg_g_regs[half_reg_base + 2] = cute.math.rcp(
-                exp_g_vec[2], approx=True, ftz=True
-            )
-            exp_neg_g_regs[half_reg_base + 3] = cute.math.rcp(
-                exp_g_vec[3], approx=True, ftz=True
-            )
+            if cutlass.const_expr(BT16_INPUTS is None):
+                exp_neg_g_regs[half_reg_base] = cute.math.rcp(
+                    exp_g_vec[0], approx=True, ftz=True
+                )
+                exp_neg_g_regs[half_reg_base + 1] = cute.math.rcp(
+                    exp_g_vec[1], approx=True, ftz=True
+                )
+                exp_neg_g_regs[half_reg_base + 2] = cute.math.rcp(
+                    exp_g_vec[2], approx=True, ftz=True
+                )
+                exp_neg_g_regs[half_reg_base + 3] = cute.math.rcp(
+                    exp_g_vec[3], approx=True, ftz=True
+                )
+            else:
+                exp_neg_g_regs[half_reg_base] = BT16_INPUTS[1](exp_g_vec[0])
+                exp_neg_g_regs[half_reg_base + 1] = BT16_INPUTS[1](exp_g_vec[1])
+                exp_neg_g_regs[half_reg_base + 2] = BT16_INPUTS[1](exp_g_vec[2])
+                exp_neg_g_regs[half_reg_base + 3] = BT16_INPUTS[1](exp_g_vec[3])
             exp_g_last_regs[f32_reg_base] = exp_g_last_vec[0]
             exp_g_last_regs[f32_reg_base + 1] = exp_g_last_vec[1]
             exp_g_last_regs[f32_reg_base + 2] = exp_g_last_vec[2]
@@ -1352,31 +1398,48 @@ def cg0_materialize_decay_operands(
             dim1 = dim0 + 1
             raw_reg_idx0 = reg_base + dim0
             raw_reg_idx1 = reg_base + dim1
-            k_value0, k_value1 = fmul2(
-                (raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1]),
-                (k_inv_norm, k_inv_norm),
-            )
-            k_decay0, k_decay1 = fmul2(
-                (k_value0, k_value1),
-                (exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1]),
-            )
-            k_inv0, k_inv1 = fmul2(
-                (k_value0, k_value1),
-                (exp_neg_g_regs[dim0], exp_neg_g_regs[dim1]),
-            )
-            k_inv_regs[reg_base + dim0] = k_inv0.to(input_dtype)
-            k_inv_regs[reg_base + dim1] = k_inv1.to(input_dtype)
-            k_restore0, k_restore1 = fmul2(
-                (k_inv0, k_inv1),
-                (
-                    exp_g_last_regs[reg_base + dim0],
-                    exp_g_last_regs[reg_base + dim1],
-                ),
-            )
-            k_restore_all_regs[reg_base + dim0] = k_restore0.to(input_dtype)
-            k_restore_all_regs[reg_base + dim1] = k_restore1.to(input_dtype)
-            k_decay_vec_regs[dim0] = k_decay0.to(input_dtype)
-            k_decay_vec_regs[dim1] = k_decay1.to(input_dtype)
+            if cutlass.const_expr(BT16_INPUTS is None):
+                k_value0, k_value1 = fmul2(
+                    (raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1]),
+                    (k_inv_norm, k_inv_norm),
+                )
+                k_decay0, k_decay1 = fmul2(
+                    (k_value0, k_value1),
+                    (exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1]),
+                )
+                k_inv0, k_inv1 = fmul2(
+                    (k_value0, k_value1),
+                    (exp_neg_g_regs[dim0], exp_neg_g_regs[dim1]),
+                )
+                k_inv_regs[reg_base + dim0] = k_inv0.to(input_dtype)
+                k_inv_regs[reg_base + dim1] = k_inv1.to(input_dtype)
+                k_restore0, k_restore1 = fmul2(
+                    (k_inv0, k_inv1),
+                    (
+                        exp_g_last_regs[reg_base + dim0],
+                        exp_g_last_regs[reg_base + dim1],
+                    ),
+                )
+                k_restore_all_regs[reg_base + dim0] = k_restore0.to(input_dtype)
+                k_restore_all_regs[reg_base + dim1] = k_restore1.to(input_dtype)
+                k_decay_vec_regs[dim0] = k_decay0.to(input_dtype)
+                k_decay_vec_regs[dim1] = k_decay1.to(input_dtype)
+            else:
+                k_decay0, k_decay1, k_inv0, k_inv1, k_restore0, k_restore1 = (
+                    BT16_INPUTS[2](
+                        (raw_k_regs[raw_reg_idx0], raw_k_regs[raw_reg_idx1]),
+                        (exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1]),
+                        (exp_neg_g_regs[dim0], exp_neg_g_regs[dim1]),
+                        (exp_g_last_regs[raw_reg_idx0], exp_g_last_regs[raw_reg_idx1]),
+                        k_inv_norm,
+                    )
+                )
+                k_inv_regs[reg_base + dim0] = k_inv0.to(input_dtype)
+                k_inv_regs[reg_base + dim1] = k_inv1.to(input_dtype)
+                k_restore_all_regs[reg_base + dim0] = k_restore0.to(input_dtype)
+                k_restore_all_regs[reg_base + dim1] = k_restore1.to(input_dtype)
+                k_decay_vec_regs[dim0] = k_decay0.to(input_dtype)
+                k_decay_vec_regs[dim1] = k_decay1.to(input_dtype)
 
         k_inv_vec = cutlass.Vector.from_elements(
             (
@@ -1450,16 +1513,25 @@ def cg0_materialize_decay_operands(
             dim1 = dim0 + 1
             raw_reg_idx0 = reg_base + dim0
             raw_reg_idx1 = reg_base + dim1
-            q_value0, q_value1 = fmul2(
-                (raw_q_regs[raw_reg_idx0], raw_q_regs[raw_reg_idx1]),
-                (q_inv_norm, q_inv_norm),
-            )
-            q_decay0, q_decay1 = fmul2(
-                (q_value0, q_value1),
-                (exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1]),
-            )
-            q_decay_vec_regs[dim0] = q_decay0.to(input_dtype)
-            q_decay_vec_regs[dim1] = q_decay1.to(input_dtype)
+            if cutlass.const_expr(BT16_INPUTS is None):
+                q_value0, q_value1 = fmul2(
+                    (raw_q_regs[raw_reg_idx0], raw_q_regs[raw_reg_idx1]),
+                    (q_inv_norm, q_inv_norm),
+                )
+                q_decay0, q_decay1 = fmul2(
+                    (q_value0, q_value1),
+                    (exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1]),
+                )
+                q_decay_vec_regs[dim0] = q_decay0.to(input_dtype)
+                q_decay_vec_regs[dim1] = q_decay1.to(input_dtype)
+            else:
+                q_decay0, q_decay1 = BT16_INPUTS[3](
+                    (raw_q_regs[raw_reg_idx0], raw_q_regs[raw_reg_idx1]),
+                    (exp_g_regs[raw_reg_idx0], exp_g_regs[raw_reg_idx1]),
+                    q_inv_norm,
+                )
+                q_decay_vec_regs[dim0] = q_decay0.to(input_dtype)
+                q_decay_vec_regs[dim1] = q_decay1.to(input_dtype)
 
         q_decay_vec = cutlass.Vector.from_elements(
             (
@@ -1625,6 +1697,7 @@ def super_mma_build_l_fragment(
     n1_acc,
     l_frag,
     input_dtype: cutlass.Constexpr,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Build the packed `L = beta * tril(KK, -1)` registers into `l_frag`."""
 
@@ -1641,26 +1714,48 @@ def super_mma_build_l_fragment(
     beta_lo = raw_beta_smem[row_lo].to(cutlass.Float32)
     beta_hi = raw_beta_smem[row_hi].to(cutlass.Float32)
 
-    l_frag[0] = pack_input_b16x2_to_i32(
-        super_mma_strict_lower_beta_value(n0_acc[0], row_lo, n0_col0, beta_lo),
-        super_mma_strict_lower_beta_value(n0_acc[1], row_lo, n0_col1, beta_lo),
-        input_dtype,
-    )
-    l_frag[1] = pack_input_b16x2_to_i32(
-        super_mma_strict_lower_beta_value(n0_acc[2], row_hi, n0_col2, beta_hi),
-        super_mma_strict_lower_beta_value(n0_acc[3], row_hi, n0_col3, beta_hi),
-        input_dtype,
-    )
-    l_frag[2] = pack_input_b16x2_to_i32(
-        super_mma_strict_lower_beta_value(n1_acc[0], row_lo, n1_col0, beta_lo),
-        super_mma_strict_lower_beta_value(n1_acc[1], row_lo, n1_col1, beta_lo),
-        input_dtype,
-    )
-    l_frag[3] = pack_input_b16x2_to_i32(
-        super_mma_strict_lower_beta_value(n1_acc[2], row_hi, n1_col2, beta_hi),
-        super_mma_strict_lower_beta_value(n1_acc[3], row_hi, n1_col3, beta_hi),
-        input_dtype,
-    )
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        l_frag[0] = pack_input_b16x2_to_i32(
+            super_mma_strict_lower_beta_value(n0_acc[0], row_lo, n0_col0, beta_lo),
+            super_mma_strict_lower_beta_value(n0_acc[1], row_lo, n0_col1, beta_lo),
+            input_dtype,
+        )
+        l_frag[1] = pack_input_b16x2_to_i32(
+            super_mma_strict_lower_beta_value(n0_acc[2], row_hi, n0_col2, beta_hi),
+            super_mma_strict_lower_beta_value(n0_acc[3], row_hi, n0_col3, beta_hi),
+            input_dtype,
+        )
+        l_frag[2] = pack_input_b16x2_to_i32(
+            super_mma_strict_lower_beta_value(n1_acc[0], row_lo, n1_col0, beta_lo),
+            super_mma_strict_lower_beta_value(n1_acc[1], row_lo, n1_col1, beta_lo),
+            input_dtype,
+        )
+        l_frag[3] = pack_input_b16x2_to_i32(
+            super_mma_strict_lower_beta_value(n1_acc[2], row_hi, n1_col2, beta_hi),
+            super_mma_strict_lower_beta_value(n1_acc[3], row_hi, n1_col3, beta_hi),
+            input_dtype,
+        )
+    else:
+        l_frag[0] = pack_input_b16x2_to_i32(
+            FACTOR_PUBLICATIONS[0](n0_acc[0], beta_lo, row_lo, n0_col0),
+            FACTOR_PUBLICATIONS[0](n0_acc[1], beta_lo, row_lo, n0_col1),
+            input_dtype,
+        )
+        l_frag[1] = pack_input_b16x2_to_i32(
+            FACTOR_PUBLICATIONS[0](n0_acc[2], beta_hi, row_hi, n0_col2),
+            FACTOR_PUBLICATIONS[0](n0_acc[3], beta_hi, row_hi, n0_col3),
+            input_dtype,
+        )
+        l_frag[2] = pack_input_b16x2_to_i32(
+            FACTOR_PUBLICATIONS[0](n1_acc[0], beta_lo, row_lo, n1_col0),
+            FACTOR_PUBLICATIONS[0](n1_acc[1], beta_lo, row_lo, n1_col1),
+            input_dtype,
+        )
+        l_frag[3] = pack_input_b16x2_to_i32(
+            FACTOR_PUBLICATIONS[0](n1_acc[2], beta_hi, row_hi, n1_col2),
+            FACTOR_PUBLICATIONS[0](n1_acc[3], beta_hi, row_hi, n1_col3),
+            input_dtype,
+        )
 
 
 @cute.jit
@@ -1777,6 +1872,7 @@ def super_mma_stage_kk_blocks(
     k_block_hi: cutlass.Constexpr,
     kk_n0_acc,
     kk_n1_acc,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
 ):
     """Accumulate KK m16n8k16 K-blocks [k_block_lo, k_block_hi).
 
@@ -1800,40 +1896,61 @@ def super_mma_stage_kk_blocks(
             k_block,
         )
 
-        kk_n0_d0, kk_n0_d1, kk_n0_d2, kk_n0_d3 = ptx_mma_m16n8k16_b16_f32(
-            kk_lhs_vec[0],
-            kk_lhs_vec[1],
-            kk_lhs_vec[2],
-            kk_lhs_vec[3],
-            rhs_vec[0],
-            rhs_vec[1],
-            kk_n0_acc[0],
-            kk_n0_acc[1],
-            kk_n0_acc[2],
-            kk_n0_acc[3],
-            input_dtype,
-        )
-        kk_n0_acc[0] = kk_n0_d0
-        kk_n0_acc[1] = kk_n0_d1
-        kk_n0_acc[2] = kk_n0_d2
-        kk_n0_acc[3] = kk_n0_d3
-        kk_n1_d0, kk_n1_d1, kk_n1_d2, kk_n1_d3 = ptx_mma_m16n8k16_b16_f32(
-            kk_lhs_vec[0],
-            kk_lhs_vec[1],
-            kk_lhs_vec[2],
-            kk_lhs_vec[3],
-            rhs_vec[2],
-            rhs_vec[3],
-            kk_n1_acc[0],
-            kk_n1_acc[1],
-            kk_n1_acc[2],
-            kk_n1_acc[3],
-            input_dtype,
-        )
-        kk_n1_acc[0] = kk_n1_d0
-        kk_n1_acc[1] = kk_n1_d1
-        kk_n1_acc[2] = kk_n1_d2
-        kk_n1_acc[3] = kk_n1_d3
+        if cutlass.const_expr(PAIRWISE_PROGRAM is None):
+            kk_n0_d0, kk_n0_d1, kk_n0_d2, kk_n0_d3 = ptx_mma_m16n8k16_b16_f32(
+                kk_lhs_vec[0],
+                kk_lhs_vec[1],
+                kk_lhs_vec[2],
+                kk_lhs_vec[3],
+                rhs_vec[0],
+                rhs_vec[1],
+                kk_n0_acc[0],
+                kk_n0_acc[1],
+                kk_n0_acc[2],
+                kk_n0_acc[3],
+                input_dtype,
+            )
+            kk_n0_acc[0] = kk_n0_d0
+            kk_n0_acc[1] = kk_n0_d1
+            kk_n0_acc[2] = kk_n0_d2
+            kk_n0_acc[3] = kk_n0_d3
+            kk_n1_d0, kk_n1_d1, kk_n1_d2, kk_n1_d3 = ptx_mma_m16n8k16_b16_f32(
+                kk_lhs_vec[0],
+                kk_lhs_vec[1],
+                kk_lhs_vec[2],
+                kk_lhs_vec[3],
+                rhs_vec[2],
+                rhs_vec[3],
+                kk_n1_acc[0],
+                kk_n1_acc[1],
+                kk_n1_acc[2],
+                kk_n1_acc[3],
+                input_dtype,
+            )
+            kk_n1_acc[0] = kk_n1_d0
+            kk_n1_acc[1] = kk_n1_d1
+            kk_n1_acc[2] = kk_n1_d2
+            kk_n1_acc[3] = kk_n1_d3
+        else:
+            assert PAIRWISE_PROGRAM[0][2] == SUPER_MMA_K_BLOCKS
+            values = prepared_warp.execute_prepared_warp_fragment(
+                kk_lhs_vec,
+                rhs_vec,
+                (
+                    kk_n0_acc[0],
+                    kk_n0_acc[1],
+                    kk_n0_acc[2],
+                    kk_n0_acc[3],
+                    kk_n1_acc[0],
+                    kk_n1_acc[1],
+                    kk_n1_acc[2],
+                    kk_n1_acc[3],
+                ),
+                (PAIRWISE_PROGRAM[0][0], PAIRWISE_PROGRAM[0][1]),
+            )
+            for index in cutlass.range_constexpr(4):
+                kk_n0_acc[index] = values[index]
+                kk_n1_acc[index] = values[index + 4]
 
 
 @cute.jit
@@ -1843,6 +1960,8 @@ def super_mma_stage_qk(
     pairwise_smem,
     lane,
     input_dtype: cutlass.Constexpr,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Produce the causal QK tile consumed by the qkv tcgen05 MMA."""
 
@@ -1872,49 +1991,112 @@ def super_mma_stage_qk(
             k_block,
         )
 
-        qk_n0_d0, qk_n0_d1, qk_n0_d2, qk_n0_d3 = ptx_mma_m16n8k16_b16_f32(
-            qk_lhs_vec[0],
-            qk_lhs_vec[1],
-            qk_lhs_vec[2],
-            qk_lhs_vec[3],
-            rhs_vec[0],
-            rhs_vec[1],
-            qk_n0_acc[0],
-            qk_n0_acc[1],
-            qk_n0_acc[2],
-            qk_n0_acc[3],
-            input_dtype,
-        )
-        qk_n0_acc[0] = qk_n0_d0
-        qk_n0_acc[1] = qk_n0_d1
-        qk_n0_acc[2] = qk_n0_d2
-        qk_n0_acc[3] = qk_n0_d3
-        qk_n1_d0, qk_n1_d1, qk_n1_d2, qk_n1_d3 = ptx_mma_m16n8k16_b16_f32(
-            qk_lhs_vec[0],
-            qk_lhs_vec[1],
-            qk_lhs_vec[2],
-            qk_lhs_vec[3],
-            rhs_vec[2],
-            rhs_vec[3],
-            qk_n1_acc[0],
-            qk_n1_acc[1],
-            qk_n1_acc[2],
-            qk_n1_acc[3],
-            input_dtype,
-        )
-        qk_n1_acc[0] = qk_n1_d0
-        qk_n1_acc[1] = qk_n1_d1
-        qk_n1_acc[2] = qk_n1_d2
-        qk_n1_acc[3] = qk_n1_d3
+        if cutlass.const_expr(PAIRWISE_PROGRAM is None):
+            qk_n0_d0, qk_n0_d1, qk_n0_d2, qk_n0_d3 = ptx_mma_m16n8k16_b16_f32(
+                qk_lhs_vec[0],
+                qk_lhs_vec[1],
+                qk_lhs_vec[2],
+                qk_lhs_vec[3],
+                rhs_vec[0],
+                rhs_vec[1],
+                qk_n0_acc[0],
+                qk_n0_acc[1],
+                qk_n0_acc[2],
+                qk_n0_acc[3],
+                input_dtype,
+            )
+            qk_n0_acc[0] = qk_n0_d0
+            qk_n0_acc[1] = qk_n0_d1
+            qk_n0_acc[2] = qk_n0_d2
+            qk_n0_acc[3] = qk_n0_d3
+            qk_n1_d0, qk_n1_d1, qk_n1_d2, qk_n1_d3 = ptx_mma_m16n8k16_b16_f32(
+                qk_lhs_vec[0],
+                qk_lhs_vec[1],
+                qk_lhs_vec[2],
+                qk_lhs_vec[3],
+                rhs_vec[2],
+                rhs_vec[3],
+                qk_n1_acc[0],
+                qk_n1_acc[1],
+                qk_n1_acc[2],
+                qk_n1_acc[3],
+                input_dtype,
+            )
+            qk_n1_acc[0] = qk_n1_d0
+            qk_n1_acc[1] = qk_n1_d1
+            qk_n1_acc[2] = qk_n1_d2
+            qk_n1_acc[3] = qk_n1_d3
+        else:
+            assert PAIRWISE_PROGRAM[1][2] == SUPER_MMA_K_BLOCKS
+            values = prepared_warp.execute_prepared_warp_fragment(
+                qk_lhs_vec,
+                rhs_vec,
+                (
+                    qk_n0_acc[0],
+                    qk_n0_acc[1],
+                    qk_n0_acc[2],
+                    qk_n0_acc[3],
+                    qk_n1_acc[0],
+                    qk_n1_acc[1],
+                    qk_n1_acc[2],
+                    qk_n1_acc[3],
+                ),
+                (PAIRWISE_PROGRAM[1][0], PAIRWISE_PROGRAM[1][1]),
+            )
+            for index in cutlass.range_constexpr(4):
+                qk_n0_acc[index] = values[index]
+                qk_n1_acc[index] = values[index + 4]
 
-    qk_n0_acc[0] = super_mma_qk_causal_value(qk_n0_acc[0], lane, 0, 0)
-    qk_n0_acc[1] = super_mma_qk_causal_value(qk_n0_acc[1], lane, 0, 1)
-    qk_n0_acc[2] = super_mma_qk_causal_value(qk_n0_acc[2], lane, 0, 2)
-    qk_n0_acc[3] = super_mma_qk_causal_value(qk_n0_acc[3], lane, 0, 3)
-    qk_n1_acc[0] = super_mma_qk_causal_value(qk_n1_acc[0], lane, 1, 0)
-    qk_n1_acc[1] = super_mma_qk_causal_value(qk_n1_acc[1], lane, 1, 1)
-    qk_n1_acc[2] = super_mma_qk_causal_value(qk_n1_acc[2], lane, 1, 2)
-    qk_n1_acc[3] = super_mma_qk_causal_value(qk_n1_acc[3], lane, 1, 3)
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        qk_n0_acc[0] = super_mma_qk_causal_value(qk_n0_acc[0], lane, 0, 0)
+        qk_n0_acc[1] = super_mma_qk_causal_value(qk_n0_acc[1], lane, 0, 1)
+        qk_n0_acc[2] = super_mma_qk_causal_value(qk_n0_acc[2], lane, 0, 2)
+        qk_n0_acc[3] = super_mma_qk_causal_value(qk_n0_acc[3], lane, 0, 3)
+        qk_n1_acc[0] = super_mma_qk_causal_value(qk_n1_acc[0], lane, 1, 0)
+        qk_n1_acc[1] = super_mma_qk_causal_value(qk_n1_acc[1], lane, 1, 1)
+        qk_n1_acc[2] = super_mma_qk_causal_value(qk_n1_acc[2], lane, 1, 2)
+        qk_n1_acc[3] = super_mma_qk_causal_value(qk_n1_acc[3], lane, 1, 3)
+    else:
+        qk_n0_acc[0] = FACTOR_PUBLICATIONS[1](
+            qk_n0_acc[0],
+            super_mma_accumulator_row(lane, 0),
+            super_mma_accumulator_col(lane, 0, 0),
+        )
+        qk_n0_acc[1] = FACTOR_PUBLICATIONS[1](
+            qk_n0_acc[1],
+            super_mma_accumulator_row(lane, 1),
+            super_mma_accumulator_col(lane, 0, 1),
+        )
+        qk_n0_acc[2] = FACTOR_PUBLICATIONS[1](
+            qk_n0_acc[2],
+            super_mma_accumulator_row(lane, 2),
+            super_mma_accumulator_col(lane, 0, 2),
+        )
+        qk_n0_acc[3] = FACTOR_PUBLICATIONS[1](
+            qk_n0_acc[3],
+            super_mma_accumulator_row(lane, 3),
+            super_mma_accumulator_col(lane, 0, 3),
+        )
+        qk_n1_acc[0] = FACTOR_PUBLICATIONS[1](
+            qk_n1_acc[0],
+            super_mma_accumulator_row(lane, 0),
+            super_mma_accumulator_col(lane, 1, 0),
+        )
+        qk_n1_acc[1] = FACTOR_PUBLICATIONS[1](
+            qk_n1_acc[1],
+            super_mma_accumulator_row(lane, 1),
+            super_mma_accumulator_col(lane, 1, 1),
+        )
+        qk_n1_acc[2] = FACTOR_PUBLICATIONS[1](
+            qk_n1_acc[2],
+            super_mma_accumulator_row(lane, 2),
+            super_mma_accumulator_col(lane, 1, 2),
+        )
+        qk_n1_acc[3] = FACTOR_PUBLICATIONS[1](
+            qk_n1_acc[3],
+            super_mma_accumulator_row(lane, 3),
+            super_mma_accumulator_col(lane, 1, 3),
+        )
 
     super_mma_store_pairwise_tile_stmatrix_x4(
         pairwise_smem,
@@ -2096,7 +2278,12 @@ def super_mma_update_inverse_with_power_regs(
 
 @cute.jit
 def super_mma_stage_blockwise_inverse(
-    pairwise_smem, lane, l_frag, input_dtype: cutlass.Constexpr
+    pairwise_smem,
+    lane,
+    l_frag,
+    input_dtype: cutlass.Constexpr,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Block diagonal sparsity lowers this inverse to six warp MMA instructions."""
     l_vec = cutlass.Vector.from_elements(
@@ -2111,28 +2298,57 @@ def super_mma_stage_blockwise_inverse(
         eye = cutlass.Float32(0.0)
         if row == col:
             eye = cutlass.Float32(1.0)
-        diagonal[index] = eye - f16_round(l_values[slot])
+        if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+            diagonal[index] = eye - f16_round(l_values[slot])
+        else:
+            diagonal[index] = FACTOR_PUBLICATIONS[2](l_values[slot], row, col)
 
     d0 = pack_f16x2(l_values[0], l_values[1])
     d3 = pack_f16x2(l_values[6], l_values[7])
-    d2 = mma_blockdiag_8x8_f16(d0, d3, d0, d3)
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        d2 = mma_blockdiag_8x8_f16(d0, d3, d0, d3)
+    else:
+        d2 = prepared_warp.execute_prepared_blockdiag_fragment(
+            d0, d3, d0, d3, INVERSE_PROGRAM[0]
+        )
     d2_0 = pack_f16x2(d2[0], d2[1])
     d2_3 = pack_f16x2(d2[2], d2[3])
 
     diagonal_0 = pack_f16x2(diagonal[0], diagonal[1])
     diagonal_3 = pack_f16x2(diagonal[2], diagonal[3])
-    product = mma_blockdiag_8x8_f16(diagonal_0, diagonal_3, d2_0, d2_3)
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        product = mma_blockdiag_8x8_f16(diagonal_0, diagonal_3, d2_0, d2_3)
+    else:
+        product = prepared_warp.execute_prepared_blockdiag_fragment(
+            diagonal_0, diagonal_3, d2_0, d2_3, INVERSE_PROGRAM[1]
+        )
     for index in cutlass.range_constexpr(4):
-        diagonal[index] = f16_round(diagonal[index]) + product[index]
+        if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+            diagonal[index] = f16_round(diagonal[index]) + product[index]
+        else:
+            diagonal[index] = FACTOR_PUBLICATIONS[3](diagonal[index], product[index])
 
-    d4 = mma_blockdiag_8x8_f16(d2_0, d2_3, d2_0, d2_3)
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        d4 = mma_blockdiag_8x8_f16(d2_0, d2_3, d2_0, d2_3)
+    else:
+        d4 = prepared_warp.execute_prepared_blockdiag_fragment(
+            d2_0, d2_3, d2_0, d2_3, INVERSE_PROGRAM[2]
+        )
     d4_0 = pack_f16x2(d4[0], d4[1])
     d4_3 = pack_f16x2(d4[2], d4[3])
     diagonal_0 = pack_f16x2(diagonal[0], diagonal[1])
     diagonal_3 = pack_f16x2(diagonal[2], diagonal[3])
-    product = mma_blockdiag_8x8_f16(diagonal_0, diagonal_3, d4_0, d4_3)
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        product = mma_blockdiag_8x8_f16(diagonal_0, diagonal_3, d4_0, d4_3)
+    else:
+        product = prepared_warp.execute_prepared_blockdiag_fragment(
+            diagonal_0, diagonal_3, d4_0, d4_3, INVERSE_PROGRAM[3]
+        )
     for index in cutlass.range_constexpr(4):
-        diagonal[index] = f16_round(diagonal[index]) + product[index]
+        if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+            diagonal[index] = f16_round(diagonal[index]) + product[index]
+        else:
+            diagonal[index] = FACTOR_PUBLICATIONS[4](diagonal[index], product[index])
 
     # T1 = Binv @ A21 and X21 = -T1 @ Binv each have only the
     # lower-left output quadrant live, so each needs one N=8 MMA.
@@ -2141,42 +2357,70 @@ def super_mma_stage_blockwise_inverse(
     binv_0 = pack_f16x2(diagonal[0], diagonal[1])
     binv_3 = pack_f16x2(diagonal[2], diagonal[3])
     a21_1 = pack_f16x2(l_values[2], l_values[3])
-    t1 = mma_m16n8k16_f16(
-        binv_0,
-        zero_i32,
-        zero_i32,
-        binv_3,
-        zero_i32,
-        movmatrix_b16(a21_1),
-        zero_f32,
-        zero_f32,
-        zero_f32,
-        zero_f32,
-    )
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        t1 = mma_m16n8k16_f16(
+            binv_0,
+            zero_i32,
+            zero_i32,
+            binv_3,
+            zero_i32,
+            movmatrix_b16(a21_1),
+            zero_f32,
+            zero_f32,
+            zero_f32,
+            zero_f32,
+        )
+    else:
+        t1 = prepared_warp.execute_prepared_warp_fragment(
+            (binv_0, zero_i32, zero_i32, binv_3),
+            (zero_i32, movmatrix_b16(a21_1)),
+            (zero_f32, zero_f32, zero_f32, zero_f32),
+            INVERSE_PROGRAM[4],
+        )
     correction_1 = pack_f16x2(t1[2], t1[3])
-    correction = mma_m16n8k16_f16(
-        zero_i32,
-        correction_1,
-        zero_i32,
-        zero_i32,
-        movmatrix_b16(binv_0),
-        zero_i32,
-        zero_f32,
-        zero_f32,
-        zero_f32,
-        zero_f32,
-    )
+    if cutlass.const_expr(INVERSE_PROGRAM is None):
+        correction = mma_m16n8k16_f16(
+            zero_i32,
+            correction_1,
+            zero_i32,
+            zero_i32,
+            movmatrix_b16(binv_0),
+            zero_i32,
+            zero_f32,
+            zero_f32,
+            zero_f32,
+            zero_f32,
+        )
+    else:
+        correction = prepared_warp.execute_prepared_warp_fragment(
+            (zero_i32, correction_1, zero_i32, zero_i32),
+            (movmatrix_b16(binv_0), zero_i32),
+            (zero_f32, zero_f32, zero_f32, zero_f32),
+            INVERSE_PROGRAM[5],
+        )
 
-    inverse = (
-        diagonal[0],
-        diagonal[1],
-        -correction[2],
-        -correction[3],
-        zero_f32,
-        zero_f32,
-        diagonal[2],
-        diagonal[3],
-    )
+    if cutlass.const_expr(FACTOR_PUBLICATIONS is None):
+        inverse = (
+            diagonal[0],
+            diagonal[1],
+            -correction[2],
+            -correction[3],
+            zero_f32,
+            zero_f32,
+            diagonal[2],
+            diagonal[3],
+        )
+    else:
+        inverse = (
+            diagonal[0],
+            diagonal[1],
+            FACTOR_PUBLICATIONS[5](correction[2]),
+            FACTOR_PUBLICATIONS[5](correction[3]),
+            zero_f32,
+            zero_f32,
+            diagonal[2],
+            diagonal[3],
+        )
     n0_acc = cutlass.Array(cutlass.Float32, 4, alignment=16)
     n1_acc = cutlass.Array(cutlass.Float32, 4, alignment=16)
     for i in cutlass.range_constexpr(4):
@@ -2197,6 +2441,9 @@ def super_mma_stage_pairwise_pipeline(
     cg0_k_ready_phase,
     lane,
     input_dtype: cutlass.Constexpr,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Run the KK/L/inverse sequence inside the auxiliary-MMA warp.
 
@@ -2223,6 +2470,7 @@ def super_mma_stage_pairwise_pipeline(
         SUPER_MMA_K_BLOCKS // 2,
         kk_n0_acc,
         kk_n1_acc,
+        PAIRWISE_PROGRAM,
     )
     cg0_k_ready_wait(
         cg0_k_ready_stage_mbar,
@@ -2237,6 +2485,7 @@ def super_mma_stage_pairwise_pipeline(
         SUPER_MMA_K_BLOCKS,
         kk_n0_acc,
         kk_n1_acc,
+        PAIRWISE_PROGRAM,
     )
     l_frag = cutlass.Array(cutlass.Int32, SUPER_MMA_ACCUMULATORS_PER_LANE, alignment=16)
     super_mma_build_l_fragment(
@@ -2246,12 +2495,15 @@ def super_mma_stage_pairwise_pipeline(
         kk_n1_acc,
         l_frag,
         input_dtype,
+        FACTOR_PUBLICATIONS,
     )
     super_mma_stage_blockwise_inverse(
         pairwise_smem,
         lane,
         l_frag,
         input_dtype,
+        INVERSE_PROGRAM,
+        FACTOR_PUBLICATIONS,
     )
 
 
@@ -2308,6 +2560,7 @@ def tcgen05_store_initial_state_tmem(
     warp_idx,
     lane,
     HALF: cutlass.Constexpr,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Initialize recurrent TMEM from the optional external VK state.
 
@@ -2316,6 +2569,70 @@ def tcgen05_store_initial_state_tmem(
     zero-filled junk (kept written so the first pack reads defined data).
     """
 
+    if cutlass.const_expr(STATE_ABI_PROGRAM is not None):
+        assert state_ckpt is None
+        tmem_sp = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+        row = (tmem_raw_addr >> 16) + tmem_sp * THREADS_PER_WARP
+        value_dim = tmem_sp * THREADS_PER_WARP + lane
+        valid_lane = True
+        if cutlass.const_expr(HALF):
+            value_dim = (
+                dv_half * cutlass.Int32(DV_HALF)
+                + tmem_sp * ROWS_PER_WARP
+                + lane % ROWS_PER_WARP
+            )
+            valid_lane = lane < ROWS_PER_WARP
+        pointer = cutlass.inttoptr(
+            (row << 16) | ((tmem_raw_addr & 0xFFFF) + KDA_TMEM_STATE_COL_OFFSET),
+            6,
+            cutlass.Float32,
+        )
+        for panel in cutlass.range_constexpr((len(STATE_ABI_PROGRAM[0]) - 1) // 2):
+            read = STATE_ABI_PROGRAM[0][panel * 2]
+            store = STATE_ABI_PROGRAM[0][panel * 2 + 1]
+            state_block = prepared_tcgen.read_linear_state_abi(
+                initial_state,
+                (state_slot, bidy, value_dim),
+                read[2] * read[5],
+                read[5],
+                valid_lane,
+            )
+            prepared_tcgen.execute_prepared_store(
+                state_block[0 : store[5]],
+                pointer + store[2] * store[5],
+                None,
+                store[3],
+                store[6],
+            )
+        prepared_tcgen.execute_prepared_store_completion(True, False)
+    else:
+        _legacy_store_initial_state_tmem(
+            tmem_raw_addr,
+            initial_state,
+            state_ckpt,
+            ckpt_slot,
+            state_slot,
+            bidy,
+            dv_half,
+            warp_idx,
+            lane,
+            HALF,
+        )
+
+
+@cute.jit
+def _legacy_store_initial_state_tmem(
+    tmem_raw_addr,
+    initial_state: cute.Tensor | None,
+    state_ckpt: cute.Tensor | None,
+    ckpt_slot,
+    state_slot,
+    bidy,
+    dv_half,
+    warp_idx,
+    lane,
+    HALF: cutlass.Constexpr,
+):
     base_col_id = tmem_raw_addr & 0xFFFF
     base_row_id = tmem_raw_addr >> 16
     tmem_sp = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
@@ -2390,7 +2707,11 @@ def tcgen05_store_initial_state_tmem(
 
 
 @cute.jit
-def pack_state_input_x16(state_block, input_dtype: cutlass.Constexpr):
+def pack_state_input_x16(
+    state_block,
+    input_dtype: cutlass.Constexpr,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
+):
     """Pack one 16-column FP32 state fragment into an 8-column A fragment."""
 
     packed_state = cutlass.Array(
@@ -2402,11 +2723,18 @@ def pack_state_input_x16(state_block, input_dtype: cutlass.Constexpr):
         source_pair = packed_col ^ TCGEN05_F16_A_TMEM_PAIR_XOR
         key_dim0 = source_pair * 2
         key_dim1 = key_dim0 + 1
-        packed_state[packed_col] = pack_input_b16x2_to_i32(
-            state_block[key_dim0],
-            state_block[key_dim1],
-            input_dtype,
-        )
+        if cutlass.const_expr(STATE_PUBLICATIONS is None):
+            packed_state[packed_col] = pack_input_b16x2_to_i32(
+                state_block[key_dim0],
+                state_block[key_dim1],
+                input_dtype,
+            )
+        else:
+            packed_state[packed_col] = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[0](state_block[key_dim0]),
+                STATE_PUBLICATIONS[0](state_block[key_dim1]),
+                input_dtype,
+            )
     return packed_state
 
 
@@ -2420,6 +2748,8 @@ def tcgen05_stage_state_input_tmem(
     WAIT_OUTPUT_CONSUMED: cutlass.Constexpr,
     HALF: cutlass.Constexpr,
     DEFER_STORE_WAIT: cutlass.Constexpr,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
     """Pack one 64-column half of the recurrent state as a tcgen05 A operand.
 
@@ -2457,10 +2787,74 @@ def tcgen05_stage_state_input_tmem(
         cutlass.Float32,
     )
 
-    state0 = prims.tcgen05_ld("32x32b", state_ptr0, num=TCGEN05_STATE_INPUT_LOAD_COLS)
-    state1 = prims.tcgen05_ld("32x32b", state_ptr1, num=TCGEN05_STATE_INPUT_LOAD_COLS)
-    state2 = prims.tcgen05_ld("32x32b", state_ptr2, num=TCGEN05_STATE_INPUT_LOAD_COLS)
-    state3 = prims.tcgen05_ld("32x32b", state_ptr3, num=TCGEN05_STATE_INPUT_LOAD_COLS)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state0 = prims.tcgen05_ld(
+            "32x32b", state_ptr0, num=TCGEN05_STATE_INPUT_LOAD_COLS
+        )
+    else:
+        state0, _state_companion = prepared_tcgen.execute_prepared_read(
+            state_ptr0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[0][0][1],
+            STATE_PROGRAM[0][0][2],
+            STATE_PROGRAM[0][0][3],
+            DEFER_WAIT=True,
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state1 = prims.tcgen05_ld(
+            "32x32b", state_ptr1, num=TCGEN05_STATE_INPUT_LOAD_COLS
+        )
+    else:
+        state1, _state_companion = prepared_tcgen.execute_prepared_read(
+            state_ptr1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[0][0][1],
+            STATE_PROGRAM[0][0][2],
+            STATE_PROGRAM[0][0][3],
+            DEFER_WAIT=True,
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state2 = prims.tcgen05_ld(
+            "32x32b", state_ptr2, num=TCGEN05_STATE_INPUT_LOAD_COLS
+        )
+    else:
+        state2, _state_companion = prepared_tcgen.execute_prepared_read(
+            state_ptr2,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[0][0][1],
+            STATE_PROGRAM[0][0][2],
+            STATE_PROGRAM[0][0][3],
+            DEFER_WAIT=True,
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state3 = prims.tcgen05_ld(
+            "32x32b", state_ptr3, num=TCGEN05_STATE_INPUT_LOAD_COLS
+        )
+    else:
+        state3, _state_companion = prepared_tcgen.execute_prepared_read(
+            state_ptr3,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[0][0][1],
+            STATE_PROGRAM[0][0][2],
+            STATE_PROGRAM[0][0][3],
+            DEFER_WAIT=True,
+        )
     if cutlass.const_expr(WAIT_OUTPUT_CONSUMED):
         output_consumed_wait(
             output_consumed_mbar,
@@ -2487,17 +2881,66 @@ def tcgen05_stage_state_input_tmem(
         packed_row_addr + packed_col_id + 3 * TCGEN05_STATE_INPUT_PACKED_COLS,
         cutlass.Int8,
     )
-    packed0 = pack_state_input_x16(state0, input_dtype)
-    prims.tcgen05_st("32x32b", packed_ptr0, packed0[0:TCGEN05_STATE_INPUT_PACKED_COLS])
-    packed1 = pack_state_input_x16(state1, input_dtype)
-    prims.tcgen05_st("32x32b", packed_ptr1, packed1[0:TCGEN05_STATE_INPUT_PACKED_COLS])
-    packed2 = pack_state_input_x16(state2, input_dtype)
-    prims.tcgen05_st("32x32b", packed_ptr2, packed2[0:TCGEN05_STATE_INPUT_PACKED_COLS])
-    packed3 = pack_state_input_x16(state3, input_dtype)
-    prims.tcgen05_st("32x32b", packed_ptr3, packed3[0:TCGEN05_STATE_INPUT_PACKED_COLS])
+    packed0 = pack_state_input_x16(state0, input_dtype, STATE_PUBLICATIONS)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b", packed_ptr0, packed0[0:TCGEN05_STATE_INPUT_PACKED_COLS]
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            packed0[0:TCGEN05_STATE_INPUT_PACKED_COLS],
+            packed_ptr0,
+            None,
+            STATE_PROGRAM[0][1][1],
+            STATE_PROGRAM[0][1][4],
+        )
+    packed1 = pack_state_input_x16(state1, input_dtype, STATE_PUBLICATIONS)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b", packed_ptr1, packed1[0:TCGEN05_STATE_INPUT_PACKED_COLS]
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            packed1[0:TCGEN05_STATE_INPUT_PACKED_COLS],
+            packed_ptr1,
+            None,
+            STATE_PROGRAM[0][1][1],
+            STATE_PROGRAM[0][1][4],
+        )
+    packed2 = pack_state_input_x16(state2, input_dtype, STATE_PUBLICATIONS)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b", packed_ptr2, packed2[0:TCGEN05_STATE_INPUT_PACKED_COLS]
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            packed2[0:TCGEN05_STATE_INPUT_PACKED_COLS],
+            packed_ptr2,
+            None,
+            STATE_PROGRAM[0][1][1],
+            STATE_PROGRAM[0][1][4],
+        )
+    packed3 = pack_state_input_x16(state3, input_dtype, STATE_PUBLICATIONS)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b", packed_ptr3, packed3[0:TCGEN05_STATE_INPUT_PACKED_COLS]
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            packed3[0:TCGEN05_STATE_INPUT_PACKED_COLS],
+            packed_ptr3,
+            None,
+            STATE_PROGRAM[0][1][1],
+            STATE_PROGRAM[0][1][4],
+        )
 
     if cutlass.const_expr(not DEFER_STORE_WAIT):
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        if cutlass.const_expr(STATE_PROGRAM is None):
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        else:
+            prepared_tcgen.execute_prepared_store_completion(
+                STATE_PROGRAM[0][2][1], False
+            )
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     return state0, state1, state2, state3
 
@@ -2508,6 +2951,7 @@ def tcgen05_scale_state_x16_regs(
     state_scale_f32_ptr,
     key_block_start: cutlass.Constexpr,
     EXCHANGE_LAYOUT: cutlass.Constexpr,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
     """Build one true-FP32 scaled state fragment without issuing its store."""
 
@@ -2523,14 +2967,26 @@ def tcgen05_scale_state_x16_regs(
         if cutlass.const_expr(EXCHANGE_LAYOUT):
             scale_idx = raw_f32_exchange_smem_index(BT - 1, scale_dim)
         scale = (state_scale_f32_ptr + scale_idx).load(count=4, alignment=16)
-        scaled_state[reg_base], scaled_state[reg_base + 1] = fmul2(
-            (state_block[reg_base], state_block[reg_base + 1]),
-            (scale[0], scale[1]),
-        )
-        scaled_state[reg_base + 2], scaled_state[reg_base + 3] = fmul2(
-            (state_block[reg_base + 2], state_block[reg_base + 3]),
-            (scale[2], scale[3]),
-        )
+        if cutlass.const_expr(STATE_PUBLICATIONS is None):
+            scaled_state[reg_base], scaled_state[reg_base + 1] = fmul2(
+                (state_block[reg_base], state_block[reg_base + 1]),
+                (scale[0], scale[1]),
+            )
+            scaled_state[reg_base + 2], scaled_state[reg_base + 3] = fmul2(
+                (state_block[reg_base + 2], state_block[reg_base + 3]),
+                (scale[2], scale[3]),
+            )
+        else:
+            scaled_state[reg_base], scaled_state[reg_base + 1] = STATE_PUBLICATIONS[1](
+                (state_block[reg_base], state_block[reg_base + 1]),
+                (scale[0], scale[1]),
+            )
+            scaled_state[reg_base + 2], scaled_state[reg_base + 3] = STATE_PUBLICATIONS[
+                1
+            ](
+                (state_block[reg_base + 2], state_block[reg_base + 3]),
+                (scale[2], scale[3]),
+            )
     return scaled_state
 
 
@@ -2541,6 +2997,8 @@ def tcgen05_rescale_state_x32(
     state_scale_f32_ptr,
     key_block_start: cutlass.Constexpr,
     EXCHANGE_LAYOUT: cutlass.Constexpr,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Apply one 32-element FP32 decay fragment and store the state block."""
 
@@ -2553,15 +3011,36 @@ def tcgen05_rescale_state_x32(
         if cutlass.const_expr(EXCHANGE_LAYOUT):
             scale_idx = raw_f32_exchange_smem_index(BT - 1, scale_dim)
         scale = (state_scale_f32_ptr + scale_idx).load(count=4, alignment=16)
-        scaled_state[reg_base], scaled_state[reg_base + 1] = fmul2(
-            (state_block[reg_base], state_block[reg_base + 1]),
-            (scale[0], scale[1]),
+        if cutlass.const_expr(STATE_PUBLICATIONS is None):
+            scaled_state[reg_base], scaled_state[reg_base + 1] = fmul2(
+                (state_block[reg_base], state_block[reg_base + 1]),
+                (scale[0], scale[1]),
+            )
+            scaled_state[reg_base + 2], scaled_state[reg_base + 3] = fmul2(
+                (state_block[reg_base + 2], state_block[reg_base + 3]),
+                (scale[2], scale[3]),
+            )
+        else:
+            scaled_state[reg_base], scaled_state[reg_base + 1] = STATE_PUBLICATIONS[1](
+                (state_block[reg_base], state_block[reg_base + 1]),
+                (scale[0], scale[1]),
+            )
+            scaled_state[reg_base + 2], scaled_state[reg_base + 3] = STATE_PUBLICATIONS[
+                1
+            ](
+                (state_block[reg_base + 2], state_block[reg_base + 3]),
+                (scale[2], scale[3]),
+            )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st("32x32b", state_block_ptr, scaled_state[0:block_cols])
+    else:
+        prepared_tcgen.execute_prepared_store(
+            scaled_state[0:block_cols],
+            state_block_ptr,
+            None,
+            STATE_PROGRAM[1][1][1],
+            STATE_PROGRAM[1][1][4],
         )
-        scaled_state[reg_base + 2], scaled_state[reg_base + 3] = fmul2(
-            (state_block[reg_base + 2], state_block[reg_base + 3]),
-            (scale[2], scale[3]),
-        )
-    prims.tcgen05_st("32x32b", state_block_ptr, scaled_state[0:block_cols])
 
 
 @cute.jit
@@ -2576,6 +3055,8 @@ def tcgen05_publish_projection_then_rescale_state_regs(
     state3,
     HALF: cutlass.Constexpr,
     EXCHANGE_LAYOUT: cutlass.Constexpr,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Hide a projection-input store behind true-FP32 state scaling.
 
@@ -2617,52 +3098,98 @@ def tcgen05_publish_projection_then_rescale_state_regs(
         state_scale_f32_ptr,
         key_half_start,
         EXCHANGE_LAYOUT,
+        STATE_PUBLICATIONS,
     )
     scaled1 = tcgen05_scale_state_x16_regs(
         state1,
         state_scale_f32_ptr,
         key_half_start + TCGEN05_STATE_INPUT_LOAD_COLS,
         EXCHANGE_LAYOUT,
+        STATE_PUBLICATIONS,
     )
     scaled2 = tcgen05_scale_state_x16_regs(
         state2,
         state_scale_f32_ptr,
         key_half_start + 2 * TCGEN05_STATE_INPUT_LOAD_COLS,
         EXCHANGE_LAYOUT,
+        STATE_PUBLICATIONS,
     )
     scaled3 = tcgen05_scale_state_x16_regs(
         state3,
         state_scale_f32_ptr,
         key_half_start + 3 * TCGEN05_STATE_INPUT_LOAD_COLS,
         EXCHANGE_LAYOUT,
+        STATE_PUBLICATIONS,
     )
 
     # This wait retires only the already-issued packed projection stores.
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    else:
+        prepared_tcgen.execute_prepared_store_completion(STATE_PROGRAM[5][2][1], False)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     state_input_ready_arrive(state_input_ready_mbar)
 
-    prims.tcgen05_st(
-        "32x32b",
-        state_ptr0,
-        scaled0[0:TCGEN05_STATE_INPUT_LOAD_COLS],
-    )
-    prims.tcgen05_st(
-        "32x32b",
-        state_ptr1,
-        scaled1[0:TCGEN05_STATE_INPUT_LOAD_COLS],
-    )
-    prims.tcgen05_st(
-        "32x32b",
-        state_ptr2,
-        scaled2[0:TCGEN05_STATE_INPUT_LOAD_COLS],
-    )
-    prims.tcgen05_st(
-        "32x32b",
-        state_ptr3,
-        scaled3[0:TCGEN05_STATE_INPUT_LOAD_COLS],
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b",
+            state_ptr0,
+            scaled0[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            scaled0[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+            state_ptr0,
+            None,
+            STATE_PROGRAM[5][1][1],
+            STATE_PROGRAM[5][1][4],
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b",
+            state_ptr1,
+            scaled1[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            scaled1[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+            state_ptr1,
+            None,
+            STATE_PROGRAM[5][1][1],
+            STATE_PROGRAM[5][1][4],
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b",
+            state_ptr2,
+            scaled2[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            scaled2[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+            state_ptr2,
+            None,
+            STATE_PROGRAM[5][1][1],
+            STATE_PROGRAM[5][1][4],
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b",
+            state_ptr3,
+            scaled3[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            scaled3[0:TCGEN05_STATE_INPUT_LOAD_COLS],
+            state_ptr3,
+            None,
+            STATE_PROGRAM[5][1][1],
+            STATE_PROGRAM[5][1][4],
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    else:
+        prepared_tcgen.execute_prepared_store_completion(STATE_PROGRAM[5][2][1], False)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
@@ -2675,6 +3202,8 @@ def tcgen05_pack_rescale_state_half_tmem(
     input_dtype: cutlass.Constexpr,
     HALF: cutlass.Constexpr,
     EXCHANGE_LAYOUT: cutlass.Constexpr,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Pack and FP32-decay one state half from a single pair of TMEM loads.
 
@@ -2710,12 +3239,44 @@ def tcgen05_pack_rescale_state_half_tmem(
         cutlass.Int8,
     )
 
-    state0 = prims.tcgen05_ld("32x32b", state_ptr0, num=block_cols)
-    state1 = prims.tcgen05_ld("32x32b", state_ptr1, num=block_cols)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state0 = prims.tcgen05_ld("32x32b", state_ptr0, num=block_cols)
+    else:
+        state0, _state_companion = prepared_tcgen.execute_prepared_read(
+            state_ptr0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[6][0][1],
+            STATE_PROGRAM[6][0][2],
+            STATE_PROGRAM[6][0][3],
+            DEFER_WAIT=True,
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state1 = prims.tcgen05_ld("32x32b", state_ptr1, num=block_cols)
+    else:
+        state1, _state_companion = prepared_tcgen.execute_prepared_read(
+            state_ptr1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[6][0][1],
+            STATE_PROGRAM[6][0][2],
+            STATE_PROGRAM[6][0][3],
+            DEFER_WAIT=True,
+        )
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-    packed0 = pack_state_input_x16(state0[0:TCGEN05_STATE_INPUT_LOAD_COLS], input_dtype)
+    packed0 = pack_state_input_x16(
+        state0[0:TCGEN05_STATE_INPUT_LOAD_COLS], input_dtype, STATE_PUBLICATIONS
+    )
     packed1 = pack_state_input_x16(
-        state0[TCGEN05_STATE_INPUT_LOAD_COLS:block_cols], input_dtype
+        state0[TCGEN05_STATE_INPUT_LOAD_COLS:block_cols],
+        input_dtype,
+        STATE_PUBLICATIONS,
     )
     # Adjacent packed fragments share one contiguous TMEM store. Preserve
     # each fragment's operand permutation while halving store issue count.
@@ -2725,12 +3286,25 @@ def tcgen05_pack_rescale_state_half_tmem(
     for i in cutlass.range_constexpr(TCGEN05_STATE_INPUT_PACKED_COLS):
         combined0[i] = packed0[i]
         combined0[i + TCGEN05_STATE_INPUT_PACKED_COLS] = packed1[i]
-    prims.tcgen05_st(
-        "32x32b", packed_ptr0, combined0[0 : 2 * TCGEN05_STATE_INPUT_PACKED_COLS]
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b", packed_ptr0, combined0[0 : 2 * TCGEN05_STATE_INPUT_PACKED_COLS]
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            combined0[0 : 2 * TCGEN05_STATE_INPUT_PACKED_COLS],
+            packed_ptr0,
+            None,
+            STATE_PROGRAM[6][1][1],
+            STATE_PROGRAM[6][1][4],
+        )
+    packed2 = pack_state_input_x16(
+        state1[0:TCGEN05_STATE_INPUT_LOAD_COLS], input_dtype, STATE_PUBLICATIONS
     )
-    packed2 = pack_state_input_x16(state1[0:TCGEN05_STATE_INPUT_LOAD_COLS], input_dtype)
     packed3 = pack_state_input_x16(
-        state1[TCGEN05_STATE_INPUT_LOAD_COLS:block_cols], input_dtype
+        state1[TCGEN05_STATE_INPUT_LOAD_COLS:block_cols],
+        input_dtype,
+        STATE_PUBLICATIONS,
     )
     combined1 = cutlass.Array(
         cutlass.Int32, 2 * TCGEN05_STATE_INPUT_PACKED_COLS, alignment=16
@@ -2738,10 +3312,22 @@ def tcgen05_pack_rescale_state_half_tmem(
     for i in cutlass.range_constexpr(TCGEN05_STATE_INPUT_PACKED_COLS):
         combined1[i] = packed2[i]
         combined1[i + TCGEN05_STATE_INPUT_PACKED_COLS] = packed3[i]
-    prims.tcgen05_st(
-        "32x32b", packed_ptr2, combined1[0 : 2 * TCGEN05_STATE_INPUT_PACKED_COLS]
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b", packed_ptr2, combined1[0 : 2 * TCGEN05_STATE_INPUT_PACKED_COLS]
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            combined1[0 : 2 * TCGEN05_STATE_INPUT_PACKED_COLS],
+            packed_ptr2,
+            None,
+            STATE_PROGRAM[6][1][1],
+            STATE_PROGRAM[6][1][4],
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    else:
+        prepared_tcgen.execute_prepared_store_completion(STATE_PROGRAM[6][2][1], False)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     state_input_ready_arrive(state_input_ready_mbar)
 
@@ -2753,6 +3339,8 @@ def tcgen05_pack_rescale_state_half_tmem(
         state_scale_f32_ptr,
         key_half_start,
         EXCHANGE_LAYOUT,
+        STATE_PROGRAM,
+        STATE_PUBLICATIONS,
     )
     tcgen05_rescale_state_x32(
         state1,
@@ -2760,8 +3348,13 @@ def tcgen05_pack_rescale_state_half_tmem(
         state_scale_f32_ptr,
         key_half_start + block_cols,
         EXCHANGE_LAYOUT,
+        STATE_PROGRAM,
+        STATE_PUBLICATIONS,
     )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    else:
+        prepared_tcgen.execute_prepared_store_completion(STATE_PROGRAM[6][2][1], False)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
@@ -2777,30 +3370,55 @@ def tcgen05_issue_state_projection_mma(
     INITIAL_SCALE_D: cutlass.Constexpr,
     COMMIT: cutlass.Constexpr,
     M_DIM: cutlass.Constexpr,
+    ISSUE: cutlass.Constexpr = None,
 ) -> None:
     """Issue state*decay K-slices through tcgen05, optionally committing."""
 
-    pipeline_primitives.issue_tmem_smem_mma_slices(
-        tcgen05_decay_smem,
-        tmem_raw_addr,
-        acc_ready_mbar,
-        tmem_col_offset,
-        KDA_TMEM_STATE_AS_INPUT_COL_OFFSET,
-        input_dtype,
-        BT,
-        M_DIM,
-        TCGEN05_F16_K_ATOM,
-        TCGEN05_F16_ELEM_BYTES,
-        K_BLOCK_BEGIN,
-        K_BLOCK_END,
-        TCGEN05_STATE_K_B_LEADING_BYTES,
-        TCGEN05_STATE_K_B_STRIDE_BYTES,
-        TCGEN05_SW128_K_PHASES_PER_SLICE,
-        TCGEN05_SW128_BYTES,
-        BT,
-        INITIAL_SCALE_D,
-        COMMIT,
-    )
+    if cutlass.const_expr(ISSUE is not None):
+        prepared_tcgen.execute_prepared_issue(
+            (tmem_raw_addr, KDA_TMEM_STATE_AS_INPUT_COL_OFFSET),
+            (tcgen05_decay_smem, ISSUE[2], ISSUE[3]),
+            (tmem_raw_addr, 0, tmem_col_offset, 0),
+            (input_dtype, M_DIM, ISSUE[0]),
+            True,
+            acc_ready_mbar,
+            None,
+            None,
+            None,
+            True,
+            True,
+            K_BLOCK_BEGIN,
+            K_BLOCK_END,
+            16,
+            ISSUE[6],
+            INITIAL_SCALE_D,
+            COMMIT,
+            False,
+            ISSUE[4],
+            ISSUE[5],
+        )
+    else:
+        pipeline_primitives.issue_tmem_smem_mma_slices(
+            tcgen05_decay_smem,
+            tmem_raw_addr,
+            acc_ready_mbar,
+            tmem_col_offset,
+            KDA_TMEM_STATE_AS_INPUT_COL_OFFSET,
+            input_dtype,
+            BT,
+            M_DIM,
+            TCGEN05_F16_K_ATOM,
+            TCGEN05_F16_ELEM_BYTES,
+            K_BLOCK_BEGIN,
+            K_BLOCK_END,
+            TCGEN05_STATE_K_B_LEADING_BYTES,
+            TCGEN05_STATE_K_B_STRIDE_BYTES,
+            TCGEN05_SW128_K_PHASES_PER_SLICE,
+            TCGEN05_SW128_BYTES,
+            BT,
+            INITIAL_SCALE_D,
+            COMMIT,
+        )
 
 
 @cute.jit
@@ -2815,6 +3433,7 @@ def tcgen05_issue_state_k_mma(
     INITIAL_SCALE_D: cutlass.Constexpr,
     COMMIT: cutlass.Constexpr,
     M_DIM: cutlass.Constexpr,
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Issue a K-slice range of state*k into a scheduled shared_acc stage."""
 
@@ -2829,6 +3448,7 @@ def tcgen05_issue_state_k_mma(
         INITIAL_SCALE_D,
         COMMIT,
         M_DIM,
+        ISSUE=None if cutlass.const_expr(ISSUE_PROGRAM is None) else ISSUE_PROGRAM[0],
     )
 
 
@@ -2839,6 +3459,7 @@ def tcgen05_issue_state_q_mma(
     operand_smem_consumed_mbar,
     qstate_acc_stage,
     input_dtype: cutlass.Constexpr,
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Issue state*q and release q_decay when the tensor core consumes it."""
 
@@ -2853,6 +3474,7 @@ def tcgen05_issue_state_q_mma(
         False,
         True,
         DV,
+        ISSUE=None if cutlass.const_expr(ISSUE_PROGRAM is None) else ISSUE_PROGRAM[1],
     )
 
 
@@ -2882,6 +3504,8 @@ def tcgen05_stage_rhs_input_tmem(
     shared_acc_stage,
     shared_input_stage,
     input_dtype: cutlass.Constexpr,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Produce RHS = beta * (v - state*k) into shared_input TMEM by 16-row tiles."""
 
@@ -2900,20 +3524,48 @@ def tcgen05_stage_rhs_input_tmem(
     row_id0 = base_row_id + value_dim_base
     block_addr0 = (row_id0 << 16) | projection_col_id
     block_ptr0 = cutlass.inttoptr(block_addr0, 6, cutlass.Float32)
-    state_k0 = prims.tcgen05_ld(
-        "16x256b",
-        block_ptr0,
-        num=2,
-    )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state_k0 = prims.tcgen05_ld(
+            "16x256b",
+            block_ptr0,
+            num=2,
+        )
+    else:
+        state_k0, _state_companion = prepared_tcgen.execute_prepared_read(
+            block_ptr0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[2][0][1],
+            STATE_PROGRAM[2][0][2],
+            STATE_PROGRAM[2][0][3],
+            DEFER_WAIT=True,
+        )
 
     row_id1 = row_id0 + 16
     block_addr1 = (row_id1 << 16) | projection_col_id
     block_ptr1 = cutlass.inttoptr(block_addr1, 6, cutlass.Float32)
-    state_k1 = prims.tcgen05_ld(
-        "16x256b",
-        block_ptr1,
-        num=2,
-    )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        state_k1 = prims.tcgen05_ld(
+            "16x256b",
+            block_ptr1,
+            num=2,
+        )
+    else:
+        state_k1, _state_companion = prepared_tcgen.execute_prepared_read(
+            block_ptr1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[2][0][1],
+            STATE_PROGRAM[2][0][2],
+            STATE_PROGRAM[2][0][3],
+            DEFER_WAIT=True,
+        )
 
     raw_v_regs0 = prims.ldmatrix(
         raw_v_ldmatrix_trans_ptr(
@@ -2952,22 +3604,52 @@ def tcgen05_stage_rhs_input_tmem(
             state_k0,
             reg_idx,
         )
-        beta_pair = pack_input_b16x2_to_i32(beta0, beta1, input_dtype)
-        state_k_pair = pack_input_b16x2_to_i32(
-            state_k_val0,
-            state_k_val1,
-            input_dtype,
-        )
-        diff_pair = sub_b16x2_input_dtype(
-            raw_v_regs0[raw_matrix],
-            state_k_pair,
-            input_dtype,
-        )
-        packed_rhs0[reg_idx] = mul_b16x2_input_dtype(
-            beta_pair,
-            diff_pair,
-            input_dtype,
-        )
+        if cutlass.const_expr(STATE_PUBLICATIONS is None):
+            beta_pair = pack_input_b16x2_to_i32(beta0, beta1, input_dtype)
+            state_k_pair = pack_input_b16x2_to_i32(
+                state_k_val0,
+                state_k_val1,
+                input_dtype,
+            )
+            diff_pair = sub_b16x2_input_dtype(
+                raw_v_regs0[raw_matrix],
+                state_k_pair,
+                input_dtype,
+            )
+            packed_rhs0[reg_idx] = mul_b16x2_input_dtype(
+                beta_pair,
+                diff_pair,
+                input_dtype,
+            )
+        else:
+            beta_pair = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[3](beta0),
+                STATE_PUBLICATIONS[3](beta1),
+                input_dtype,
+            )
+            projection_pair = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[2](state_k_val0),
+                STATE_PUBLICATIONS[2](state_k_val1),
+                input_dtype,
+            )
+            raw = cutlass.Vector.from_elements(
+                (raw_v_regs0[raw_matrix],), cutlass.Int32
+            ).bitcast(input_dtype)
+            prediction = cutlass.Vector.from_elements(
+                (projection_pair,), cutlass.Int32
+            ).bitcast(input_dtype)
+            rounded_beta = cutlass.Vector.from_elements(
+                (beta_pair,), cutlass.Int32
+            ).bitcast(input_dtype)
+            packed_rhs0[reg_idx] = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[4](
+                    prediction[0], cutlass.Float32(raw[0]), rounded_beta[0]
+                ),
+                STATE_PUBLICATIONS[4](
+                    prediction[1], cutlass.Float32(raw[1]), rounded_beta[1]
+                ),
+                input_dtype,
+            )
 
     packed_rhs1 = cutlass.Array(
         cutlass.Int32,
@@ -2986,32 +3668,83 @@ def tcgen05_stage_rhs_input_tmem(
             state_k1,
             reg_idx,
         )
-        beta_pair = pack_input_b16x2_to_i32(beta0, beta1, input_dtype)
-        state_k_pair = pack_input_b16x2_to_i32(
-            state_k_val0,
-            state_k_val1,
-            input_dtype,
-        )
-        diff_pair = sub_b16x2_input_dtype(
-            raw_v_regs1[raw_matrix],
-            state_k_pair,
-            input_dtype,
-        )
-        packed_rhs1[reg_idx] = mul_b16x2_input_dtype(
-            beta_pair,
-            diff_pair,
-            input_dtype,
-        )
+        if cutlass.const_expr(STATE_PUBLICATIONS is None):
+            beta_pair = pack_input_b16x2_to_i32(beta0, beta1, input_dtype)
+            state_k_pair = pack_input_b16x2_to_i32(
+                state_k_val0,
+                state_k_val1,
+                input_dtype,
+            )
+            diff_pair = sub_b16x2_input_dtype(
+                raw_v_regs1[raw_matrix],
+                state_k_pair,
+                input_dtype,
+            )
+            packed_rhs1[reg_idx] = mul_b16x2_input_dtype(
+                beta_pair,
+                diff_pair,
+                input_dtype,
+            )
+        else:
+            beta_pair = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[3](beta0),
+                STATE_PUBLICATIONS[3](beta1),
+                input_dtype,
+            )
+            projection_pair = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[2](state_k_val0),
+                STATE_PUBLICATIONS[2](state_k_val1),
+                input_dtype,
+            )
+            raw = cutlass.Vector.from_elements(
+                (raw_v_regs1[raw_matrix],), cutlass.Int32
+            ).bitcast(input_dtype)
+            prediction = cutlass.Vector.from_elements(
+                (projection_pair,), cutlass.Int32
+            ).bitcast(input_dtype)
+            rounded_beta = cutlass.Vector.from_elements(
+                (beta_pair,), cutlass.Int32
+            ).bitcast(input_dtype)
+            packed_rhs1[reg_idx] = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[4](
+                    prediction[0], cutlass.Float32(raw[0]), rounded_beta[0]
+                ),
+                STATE_PUBLICATIONS[4](
+                    prediction[1], cutlass.Float32(raw[1]), rounded_beta[1]
+                ),
+                input_dtype,
+            )
 
     input_block_addr0 = (base_row_id << 16) | input_col_id
     input_block_ptr0 = prims.make_tmem_ptr(input_block_addr0, cutlass.Int8)
-    prims.tcgen05_st("16x128b", input_block_ptr0, packed_rhs0[0:4])
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st("16x128b", input_block_ptr0, packed_rhs0[0:4])
+    else:
+        prepared_tcgen.execute_prepared_store(
+            packed_rhs0[0:4],
+            input_block_ptr0,
+            None,
+            STATE_PROGRAM[2][1][1],
+            STATE_PROGRAM[2][1][4],
+        )
 
     input_block_addr1 = ((base_row_id + 16) << 16) | input_col_id
     input_block_ptr1 = prims.make_tmem_ptr(input_block_addr1, cutlass.Int8)
-    prims.tcgen05_st("16x128b", input_block_ptr1, packed_rhs1[0:4])
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st("16x128b", input_block_ptr1, packed_rhs1[0:4])
+    else:
+        prepared_tcgen.execute_prepared_store(
+            packed_rhs1[0:4],
+            input_block_ptr1,
+            None,
+            STATE_PROGRAM[2][1][1],
+            STATE_PROGRAM[2][1][4],
+        )
 
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    else:
+        prepared_tcgen.execute_prepared_store_completion(STATE_PROGRAM[2][2][1], False)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
@@ -3022,6 +3755,8 @@ def tcgen05_stage_update_input_tmem(
     shared_acc_stage,
     shared_input_stage,
     input_dtype: cutlass.Constexpr,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Move update from shared_acc TMEM into packed shared_input TMEM."""
 
@@ -3035,11 +3770,25 @@ def tcgen05_stage_update_input_tmem(
     )
     block_addr = (row_id << 16) | projection_col_id
     block_ptr = cutlass.inttoptr(block_addr, 6, cutlass.Float32)
-    update = prims.tcgen05_ld(
-        "32x32b",
-        block_ptr,
-        num=TCGEN05_TMEM_LOAD_COLS,
-    )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        update = prims.tcgen05_ld(
+            "32x32b",
+            block_ptr,
+            num=TCGEN05_TMEM_LOAD_COLS,
+        )
+    else:
+        update, _state_companion = prepared_tcgen.execute_prepared_read(
+            block_ptr,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[3][0][1],
+            STATE_PROGRAM[3][0][2],
+            STATE_PROGRAM[3][0][3],
+            DEFER_WAIT=True,
+        )
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
 
     packed_update = cutlass.Array(
@@ -3051,21 +3800,40 @@ def tcgen05_stage_update_input_tmem(
         source_pair = packed_col ^ TCGEN05_F16_A_TMEM_PAIR_XOR
         token0 = source_pair * 2
         token1 = token0 + 1
-        packed_update[packed_col] = pack_input_b16x2_to_i32(
-            update[token0],
-            update[token1],
-            input_dtype,
-        )
+        if cutlass.const_expr(STATE_PUBLICATIONS is None):
+            packed_update[packed_col] = pack_input_b16x2_to_i32(
+                update[token0],
+                update[token1],
+                input_dtype,
+            )
+        else:
+            packed_update[packed_col] = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[5](update[token0]),
+                STATE_PUBLICATIONS[5](update[token1]),
+                input_dtype,
+            )
 
     col_id = base_col_id + tcgen05_shared_input_tmem_col_offset(shared_input_stage)
     input_block_addr = (base_row_id << 16) | col_id
     input_block_ptr = prims.make_tmem_ptr(input_block_addr, cutlass.Int8)
-    prims.tcgen05_st(
-        "32x32b",
-        input_block_ptr,
-        packed_update[0:KDA_TMEM_SHARED_INPUT_COLS],
-    )
-    prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_st(
+            "32x32b",
+            input_block_ptr,
+            packed_update[0:KDA_TMEM_SHARED_INPUT_COLS],
+        )
+    else:
+        prepared_tcgen.execute_prepared_store(
+            packed_update[0:KDA_TMEM_SHARED_INPUT_COLS],
+            input_block_ptr,
+            None,
+            STATE_PROGRAM[3][1][1],
+            STATE_PROGRAM[3][1][4],
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+    else:
+        prepared_tcgen.execute_prepared_store_completion(STATE_PROGRAM[3][2][1], False)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
 
@@ -3079,6 +3847,7 @@ def tcgen05_issue_value_pairwise_mma(
     tmem_col_offset,
     scale_d: cutlass.Constexpr,
     input_dtype: cutlass.Constexpr,
+    ISSUE: cutlass.Constexpr = None,
 ) -> None:
     """Issue a `[DV,BT] @ [BT,BT]` value-side tcgen05 MMA.
 
@@ -3087,6 +3856,54 @@ def tcgen05_issue_value_pairwise_mma(
     `[N=token_i, K=token_j]` for tcgen05.
     """
 
+    if cutlass.const_expr(ISSUE is not None):
+        prepared_tcgen.execute_prepared_issue(
+            (tmem_raw_addr, tcgen05_shared_input_tmem_col_offset(shared_input_stage)),
+            (pairwise_stage_smem.subview(pairwise_tile_offset), ISSUE[2], ISSUE[3]),
+            (tmem_raw_addr, 0, tmem_col_offset, 0),
+            (input_dtype, DV, ISSUE[0]),
+            prims.elect_sync(),
+            acc_ready_mbar,
+            None,
+            None,
+            None,
+            True,
+            True,
+            0,
+            1,
+            16,
+            ISSUE[6],
+            scale_d,
+            True,
+            False,
+            ISSUE[4],
+            ISSUE[5],
+            ISSUER_ELECTED=True,
+        )
+    else:
+        _legacy_issue_value_pairwise_mma(
+            pairwise_stage_smem,
+            pairwise_tile_offset,
+            tmem_raw_addr,
+            acc_ready_mbar,
+            shared_input_stage,
+            tmem_col_offset,
+            scale_d,
+            input_dtype,
+        )
+
+
+@cute.jit
+def _legacy_issue_value_pairwise_mma(
+    pairwise_stage_smem,
+    pairwise_tile_offset: cutlass.Constexpr,
+    tmem_raw_addr,
+    acc_ready_mbar,
+    shared_input_stage,
+    tmem_col_offset,
+    scale_d: cutlass.Constexpr,
+    input_dtype: cutlass.Constexpr,
+):
     tmem_ptr = cutlass.inttoptr(
         tmem_raw_addr + tmem_col_offset,
         6,
@@ -3131,6 +3948,7 @@ def tcgen05_issue_update_mma(
     shared_acc_stage,
     shared_input_stage,
     input_dtype: cutlass.Constexpr,
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Issue update = A_inv @ rhs into a scheduled shared_acc TMEM stage."""
 
@@ -3143,6 +3961,7 @@ def tcgen05_issue_update_mma(
         tcgen05_shared_acc_tmem_col_offset(shared_acc_stage),
         False,
         input_dtype,
+        ISSUE=None if cutlass.const_expr(ISSUE_PROGRAM is None) else ISSUE_PROGRAM[2],
     )
 
 
@@ -3154,6 +3973,7 @@ def tcgen05_issue_qkv_mma(
     shared_input_stage,
     qstate_acc_stage,
     input_dtype: cutlass.Constexpr,
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Accumulate qkv = qk @ update into the live qstate_acc TMEM slot."""
 
@@ -3166,6 +3986,7 @@ def tcgen05_issue_qkv_mma(
         tcgen05_qstate_acc_tmem_col_offset(qstate_acc_stage),
         True,
         input_dtype,
+        ISSUE=None if cutlass.const_expr(ISSUE_PROGRAM is None) else ISSUE_PROGRAM[3],
     )
 
 
@@ -3179,6 +4000,8 @@ def tcgen05_load_qstate_output_tmem(
     qstate_acc_stage,
     scale: cutlass.Float32,
     output_dtype: cutlass.Constexpr,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ) -> None:
     """Drain `state_q + qkv` from qstate_acc TMEM with STSM.T output staging."""
 
@@ -3197,16 +4020,44 @@ def tcgen05_load_qstate_output_tmem(
     block_addr1 = (row_id1 << 16) | projection_col_id
     block_ptr0 = cutlass.inttoptr(block_addr0, 6, cutlass.Float32)
     block_ptr1 = cutlass.inttoptr(block_addr1, 6, cutlass.Float32)
-    loaded0 = prims.tcgen05_ld(
-        "16x256b",
-        block_ptr0,
-        num=2,
-    )
-    loaded1 = prims.tcgen05_ld(
-        "16x256b",
-        block_ptr1,
-        num=2,
-    )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        loaded0 = prims.tcgen05_ld(
+            "16x256b",
+            block_ptr0,
+            num=2,
+        )
+    else:
+        loaded0, _state_companion = prepared_tcgen.execute_prepared_read(
+            block_ptr0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[4][0][1],
+            STATE_PROGRAM[4][0][2],
+            STATE_PROGRAM[4][0][3],
+            DEFER_WAIT=True,
+        )
+    if cutlass.const_expr(STATE_PROGRAM is None):
+        loaded1 = prims.tcgen05_ld(
+            "16x256b",
+            block_ptr1,
+            num=2,
+        )
+    else:
+        loaded1, _state_companion = prepared_tcgen.execute_prepared_read(
+            block_ptr1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            STATE_PROGRAM[4][0][1],
+            STATE_PROGRAM[4][0][2],
+            STATE_PROGRAM[4][0][3],
+            DEFER_WAIT=True,
+        )
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
 
     stsm_regs0 = cutlass.Array(
@@ -3220,24 +4071,34 @@ def tcgen05_load_qstate_output_tmem(
         space=cutlass.AddressSpace.rmem,
     )
     for reg_idx in cutlass.range_constexpr(4):
-        scaled0_0, scaled0_1 = fmul2(
-            (loaded0[2 * reg_idx], loaded0[2 * reg_idx + 1]),
-            (scale, scale),
-        )
-        scaled1_0, scaled1_1 = fmul2(
-            (loaded1[2 * reg_idx], loaded1[2 * reg_idx + 1]),
-            (scale, scale),
-        )
-        stsm_regs0[reg_idx] = pack_output_b16x2_to_i32(
-            scaled0_0,
-            scaled0_1,
-            output_dtype,
-        )
-        stsm_regs1[reg_idx] = pack_output_b16x2_to_i32(
-            scaled1_0,
-            scaled1_1,
-            output_dtype,
-        )
+        if cutlass.const_expr(STATE_PUBLICATIONS is None):
+            scaled0_0, scaled0_1 = fmul2(
+                (loaded0[2 * reg_idx], loaded0[2 * reg_idx + 1]),
+                (scale, scale),
+            )
+            scaled1_0, scaled1_1 = fmul2(
+                (loaded1[2 * reg_idx], loaded1[2 * reg_idx + 1]),
+                (scale, scale),
+            )
+            stsm_regs0[reg_idx] = pack_output_b16x2_to_i32(
+                scaled0_0, scaled0_1, output_dtype
+            )
+            stsm_regs1[reg_idx] = pack_output_b16x2_to_i32(
+                scaled1_0, scaled1_1, output_dtype
+            )
+        else:
+            output0_0, output0_1 = STATE_PUBLICATIONS[6](
+                (loaded0[2 * reg_idx], loaded0[2 * reg_idx + 1]), scale
+            )
+            output1_0, output1_1 = STATE_PUBLICATIONS[6](
+                (loaded1[2 * reg_idx], loaded1[2 * reg_idx + 1]), scale
+            )
+            stsm_regs0[reg_idx] = pack_typed_b16x2_to_i32(
+                output0_0, output0_1, output_dtype
+            )
+            stsm_regs1[reg_idx] = pack_typed_b16x2_to_i32(
+                output1_0, output1_1, output_dtype
+            )
 
     smem_dst0 = o_smem_stmatrix_128b_ptr(
         o_smem,
@@ -3274,12 +4135,17 @@ def epilogue_stage_store(
     head_idx,
     chunk_start,
     o_stage_base,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Store the staged `[BT, DV]` output tile to global memory with TMA."""
 
     global_chunk_start = sequence_start + chunk_start
     if prims.elect_sync():
-        for value_segment in cutlass.range_constexpr(O_TMA_SEGMENTS):
+        for value_segment in cutlass.range_constexpr(
+            O_TMA_SEGMENTS
+            if cutlass.const_expr(OUTPUT_PROGRAM is None)
+            else OUTPUT_PROGRAM[3]
+        ):
             segment_base = (
                 o_stage_base + O_OUT_OFFSET + value_segment * BT * O_TMA_SWIZZLE_ELEMS
             )
@@ -3289,13 +4155,23 @@ def epilogue_stage_store(
                 head_idx,
                 cutlass.Int32(0),
             )
-            prims.cp_async_bulk_tensor_global_shared_cta(
-                tma_desc_o.get_ptr(),
-                o_smem.subview(segment_base),
-                o_coord,
-            )
-        prims.cp_async_bulk_commit_group()
-        prims.cp_async_bulk_wait_group(0, read=True)
+            if cutlass.const_expr(OUTPUT_PROGRAM is None):
+                prims.cp_async_bulk_tensor_global_shared_cta(
+                    tma_desc_o.get_ptr(),
+                    o_smem.subview(segment_base),
+                    o_coord,
+                )
+            else:
+                prepared_tcgen.execute_prepared_tma_segment(
+                    o_smem.subview(segment_base),
+                    tma_desc_o,
+                    o_coord,
+                )
+        if cutlass.const_expr(OUTPUT_PROGRAM is None):
+            prims.cp_async_bulk_commit_group()
+            prims.cp_async_bulk_wait_group(0, read=True)
+        else:
+            prepared_tcgen.complete_prepared_tma_store(True)
     prims.bar_warp_sync(cute.arch.FULL_MASK)
 
 
@@ -3309,11 +4185,19 @@ def epilogue_tail_store(
     seqlen,
     o_stage_base,
     lane,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Store a partial packed-sequence tail without crossing its boundary."""
 
     valid_tokens = seqlen - chunk_start
-    for elem_iter in cutlass.range_constexpr((BT * DV) // THREADS_PER_WARP):
+    for elem_iter in cutlass.range_constexpr(
+        (
+            BT * DV
+            if cutlass.const_expr(OUTPUT_PROGRAM is None)
+            else OUTPUT_PROGRAM[0] * OUTPUT_PROGRAM[1]
+        )
+        // THREADS_PER_WARP
+    ):
         linear_idx = elem_iter * THREADS_PER_WARP + lane
         token_coord = linear_idx // DV
         value_dim = linear_idx - token_coord * DV
@@ -3323,9 +4207,21 @@ def epilogue_tail_store(
                 value_dim,
                 token_coord,
             )
-            out[0, sequence_start + chunk_start + token_coord, head_idx, value_dim] = (
-                o_smem[smem_idx]
-            )
+            if cutlass.const_expr(OUTPUT_PROGRAM is None):
+                out[
+                    0, sequence_start + chunk_start + token_coord, head_idx, value_dim
+                ] = o_smem[smem_idx]
+            else:
+                prepared_tcgen.store_prepared_output_element(
+                    out,
+                    (
+                        0,
+                        sequence_start + chunk_start + token_coord,
+                        head_idx,
+                        value_dim,
+                    ),
+                    o_smem[smem_idx],
+                )
     prims.bar_warp_sync(cute.arch.FULL_MASK)
 
 
@@ -3339,6 +4235,7 @@ def epilogue_wait_and_store_full_output(
     head_idx,
     output_chunk,
     O_STAGES: cutlass.Constexpr,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
 ):
     """Drain one full staged output chunk from SMEM with TMA."""
 
@@ -3356,6 +4253,7 @@ def epilogue_wait_and_store_full_output(
         head_idx,
         output_chunk_start,
         o_stage_base,
+        OUTPUT_PROGRAM,
     )
     output_consumed_arrive(output_consumed_mbar.subview(o_stage))
 
@@ -3373,6 +4271,7 @@ def epilogue_wait_and_store_final_output(
     output_chunk,
     lane,
     O_STAGES: cutlass.Constexpr,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
 ):
     """Drain the final output chunk, guarding a partial packed tail."""
 
@@ -3386,6 +4285,7 @@ def epilogue_wait_and_store_final_output(
             head_idx,
             output_chunk,
             O_STAGES,
+            OUTPUT_PROGRAM,
         )
     else:
         output_chunk_start = output_chunk * BT
@@ -3404,6 +4304,7 @@ def epilogue_wait_and_store_final_output(
             seqlen,
             o_stage_base,
             lane,
+            OUTPUT_PROGRAM,
         )
         output_consumed_arrive(output_consumed_mbar.subview(o_stage))
 
@@ -3416,6 +4317,7 @@ def tcgen05_issue_final_state_delta_mma(
     k_restore_consumed_mbar,
     shared_input_stage,
     input_dtype: cutlass.Constexpr,
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Accumulate final_state += update @ k_restore in two N=64 halves.
 
@@ -3425,6 +4327,82 @@ def tcgen05_issue_final_state_delta_mma(
     full-completion contract for CG0 and the right pack.
     """
 
+    if cutlass.const_expr(ISSUE_PROGRAM is not None):
+        issue = ISSUE_PROGRAM[4]
+        if prims.elect_sync():
+            prepared_tcgen.execute_prepared_issue(
+                (
+                    tmem_raw_addr,
+                    tcgen05_shared_input_tmem_col_offset(shared_input_stage),
+                ),
+                (tcgen05_k_restore_smem, issue[2], issue[3]),
+                (tmem_raw_addr, 0, KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET, 0),
+                (input_dtype, DV, issue[0]),
+                True,
+                k_restore_consumed_l_mbar,
+                None,
+                None,
+                None,
+                True,
+                True,
+                0,
+                1,
+                16,
+                issue[6],
+                True,
+                True,
+                False,
+                issue[4],
+                issue[5],
+                ISSUER_ELECTED=True,
+            )
+            prepared_tcgen.execute_prepared_issue(
+                (
+                    tmem_raw_addr,
+                    tcgen05_shared_input_tmem_col_offset(shared_input_stage),
+                ),
+                (tcgen05_k_restore_smem, issue[2], issue[3]),
+                (tmem_raw_addr, 0, KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET + issue[0], 0),
+                (input_dtype, DV, issue[0]),
+                True,
+                k_restore_consumed_mbar,
+                None,
+                None,
+                None,
+                True,
+                True,
+                0,
+                1,
+                16,
+                issue[6],
+                True,
+                True,
+                False,
+                issue[4],
+                issue[5],
+                B_BASE_BYTES=issue[2],
+                ISSUER_ELECTED=True,
+            )
+    else:
+        _legacy_issue_final_state_delta_mma(
+            tcgen05_k_restore_smem,
+            tmem_raw_addr,
+            k_restore_consumed_l_mbar,
+            k_restore_consumed_mbar,
+            shared_input_stage,
+            input_dtype,
+        )
+
+
+@cute.jit
+def _legacy_issue_final_state_delta_mma(
+    tcgen05_k_restore_smem,
+    tmem_raw_addr,
+    k_restore_consumed_l_mbar,
+    k_restore_consumed_mbar,
+    shared_input_stage,
+    input_dtype: cutlass.Constexpr,
+):
     half_n = DK // 2
     tmem_ptr_l = cutlass.inttoptr(
         tmem_raw_addr + KDA_TMEM_FINAL_STATE_ACC_COL_OFFSET,
@@ -3494,6 +4472,7 @@ def tcgen05_store_final_state_tmem(
     warp_idx,
     lane,
     HALF: cutlass.Constexpr,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """Store the live recurrent TMEM state to the VK final_state tensor.
 
@@ -3501,6 +4480,57 @@ def tcgen05_store_final_state_tmem(
     (Layout F -- only the quadrant lanes 0..15 carry state).
     """
 
+    if cutlass.const_expr(STATE_ABI_PROGRAM is not None):
+        tmem_sp = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
+        row = (tmem_raw_addr >> 16) + tmem_sp * THREADS_PER_WARP
+        value_dim = tmem_sp * THREADS_PER_WARP + lane
+        valid_lane = True
+        if cutlass.const_expr(HALF):
+            value_dim = (
+                dv_half * cutlass.Int32(DV_HALF)
+                + tmem_sp * ROWS_PER_WARP
+                + lane % ROWS_PER_WARP
+            )
+            valid_lane = lane < ROWS_PER_WARP
+        pointer = cutlass.inttoptr(
+            (row << 16) | ((tmem_raw_addr & 0xFFFF) + state_col_offset),
+            6,
+            cutlass.Float32,
+        )
+        prepared_tcgen.execute_prepared_state_abi(
+            STATE_ABI_PROGRAM[1],
+            None,
+            final_state,
+            pointer,
+            (bidx, bidy, value_dim),
+            valid_lane,
+        )
+    else:
+        _legacy_store_final_state_tmem(
+            tmem_raw_addr,
+            state_col_offset,
+            final_state,
+            bidx,
+            bidy,
+            dv_half,
+            warp_idx,
+            lane,
+            HALF,
+        )
+
+
+@cute.jit
+def _legacy_store_final_state_tmem(
+    tmem_raw_addr,
+    state_col_offset,
+    final_state: cute.Tensor,
+    bidx,
+    bidy,
+    dv_half,
+    warp_idx,
+    lane,
+    HALF: cutlass.Constexpr,
+):
     base_col_id = tmem_raw_addr & 0xFFFF
     base_row_id = tmem_raw_addr >> 16
     tmem_sp = warp_idx % TCGEN05_STATE_K_TMEM_ROW_BLOCKS
@@ -3611,6 +4641,16 @@ def kernel(
     # pyrefly: ignore [bad-function-definition]
     SEQUENCE_BEGIN: cutlass.Int32 = 0,
     GROUPED: cutlass.Constexpr = False,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+    BT16_STATE_PROGRAM: cutlass.Constexpr = None,
+    BT16_ISSUE_PROGRAM: cutlass.Constexpr = None,
+    BT16_STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    BT16_STATE_PUBLICATIONS: cutlass.Constexpr = None,
+    BT16_INPUTS: cutlass.Constexpr = None,
+    BT16_GATES: cutlass.Constexpr = None,
+    BT16_OUTPUT_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     """BT=16 KDA forward kernel.
 
@@ -4051,11 +5091,16 @@ def kernel(
             # SAFE_GATE=True this traces exactly as before (byte-identical
             # generated code), the non-safe path now reads the same staged constants.
             if lane == 0:
-                raw_dt_bias_smem[RAW_DT_BIAS_A_LOG_EXP_OFFSET] = cute.math.exp2(
-                    # pyrefly: ignore [missing-attribute]
-                    a_log[bidy].to(cutlass.Float32) * LOG2_E,
-                    fastmath=True,
-                )
+                if cutlass.const_expr(BT16_GATES is not None):
+                    raw_dt_bias_smem[RAW_DT_BIAS_A_LOG_EXP_OFFSET] = BT16_GATES[3](
+                        cutlass.Float32(a_log[bidy]), LOG2_E
+                    )
+                else:
+                    raw_dt_bias_smem[RAW_DT_BIAS_A_LOG_EXP_OFFSET] = cute.math.exp2(
+                        # pyrefly: ignore [missing-attribute]
+                        a_log[bidy].to(cutlass.Float32) * LOG2_E,
+                        fastmath=True,
+                    )
             for dim_group in cutlass.range_constexpr(DK // THREADS_PER_WARP):
                 dim = dim_group * THREADS_PER_WARP + lane
                 # pyrefly: ignore [missing-attribute]
@@ -4131,6 +5176,7 @@ def kernel(
                     tma_mbar.subview(raw_stage),
                     tma_tx_bytes,
                     gate_dtype,
+                    BT16_GATES=BT16_GATES,
                 )
                 beta_next = chunk + BETA_TMA_LOOKAHEAD
                 if beta_next < num_chunks:
@@ -4194,6 +5240,9 @@ def kernel(
                     (chunk // DECAY_STAGE_COUNT) % 2,
                     lane,
                     input_dtype,
+                    PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+                    INVERSE_PROGRAM=INVERSE_PROGRAM,
+                    FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
                 )
                 pairwise_ready_arrive(pairwise_ready_mbar.subview(pairwise_stage))
                 operand_smem_consumed_arrive(
@@ -4251,6 +5300,7 @@ def kernel(
                     False,
                     False,
                     DV,
+                    ISSUE_PROGRAM=BT16_ISSUE_PROGRAM,
                 )
                 state_input_ready_phase = state_input_ready_wait(
                     state_input_ready_mbar,
@@ -4268,6 +5318,7 @@ def kernel(
                     True,
                     True,
                     DV,
+                    ISSUE_PROGRAM=BT16_ISSUE_PROGRAM,
                 )
                 shared_acc_event_id += cutlass.Int32(1)
 
@@ -4292,6 +5343,7 @@ def kernel(
                     operand_smem_consumed_mbar.subview(decay_stage),
                     qstate_acc_stage,
                     input_dtype,
+                    ISSUE_PROGRAM=BT16_ISSUE_PROGRAM,
                 )
                 pairwise_ready_wait(
                     pairwise_ready_mbar.subview(pairwise_stage),
@@ -4315,6 +5367,7 @@ def kernel(
                     update_acc_stage,
                     shared_input_stage,
                     input_dtype,
+                    ISSUE_PROGRAM=BT16_ISSUE_PROGRAM,
                 )
                 shared_acc_event_id += cutlass.Int32(1)
 
@@ -4332,6 +5385,7 @@ def kernel(
                     k_restore_consumed_mbar.subview(decay_stage),
                     shared_input_stage,
                     input_dtype,
+                    ISSUE_PROGRAM=BT16_ISSUE_PROGRAM,
                 )
 
                 pairwise_ready_wait(
@@ -4347,6 +5401,7 @@ def kernel(
                     shared_input_stage,
                     qstate_acc_stage,
                     input_dtype,
+                    ISSUE_PROGRAM=BT16_ISSUE_PROGRAM,
                 )
                 pairwise_consumed_arrive(pairwise_consumed_mbar.subview(pairwise_stage))
                 late_operand_stage, late_operand_wrapped = advance_ring_stage(
@@ -4391,6 +5446,8 @@ def kernel(
                     pairwise_stage_smem,
                     lane,
                     input_dtype,
+                    PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+                    FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
                 )
                 pairwise_ready_arrive(qk_ready_mbar.subview(pairwise_stage))
                 operand_smem_consumed_arrive(
@@ -4414,6 +5471,7 @@ def kernel(
                         bidy,
                         output_chunk,
                         O_STAGE_COUNT,
+                        OUTPUT_PROGRAM=BT16_OUTPUT_PROGRAM,
                     )
             if num_chunks > 0:
                 output_chunk = num_chunks - cutlass.Int32(1)
@@ -4429,6 +5487,7 @@ def kernel(
                     output_chunk,
                     lane,
                     O_STAGE_COUNT,
+                    OUTPUT_PROGRAM=BT16_OUTPUT_PROGRAM,
                 )
     elif is_compute_group0_warp(warp_idx):
         prims.setmaxregister(KDA_CG0_REGS, prims.SetMaxRegisterAction.INCREASE)
@@ -4533,6 +5592,8 @@ def kernel(
                 cg0_group_id,
                 cg0_local_warp,
                 lane,
+                BT16_INPUTS=BT16_INPUTS,
+                BT16_GATES=BT16_GATES,
             )
             q_k_restore_ready_arrive(
                 q_k_restore_ready_mbar.subview(q_k_restore_ready_stage)
@@ -4560,6 +5621,8 @@ def kernel(
                 input_dtype,
                 0,
                 True,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             raw_consumed_arrive(raw_consumed_mbar.subview(raw_stage))
             update_ready_arrive(update_ready_mbar)
@@ -4656,6 +5719,8 @@ def kernel(
                     cg0_group_id,
                     cg0_local_warp,
                     lane,
+                    BT16_INPUTS=BT16_INPUTS,
+                    BT16_GATES=BT16_GATES,
                 )
                 q_k_restore_ready_arrive(
                     q_k_restore_ready_mbar.subview(q_k_restore_ready_stage)
@@ -4683,6 +5748,8 @@ def kernel(
                     input_dtype,
                     0,
                     True,
+                    STATE_PROGRAM=BT16_STATE_PROGRAM,
+                    STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
                 )
                 raw_consumed_arrive(raw_consumed_mbar.subview(raw_stage))
                 update_ready_arrive(update_ready_mbar)
@@ -4714,6 +5781,7 @@ def kernel(
                 warp_idx,
                 lane,
                 HALF=False,
+                STATE_ABI_PROGRAM=BT16_STATE_ABI_PROGRAM,
             )
         else:
             tcgen05_store_initial_state_tmem(
@@ -4727,6 +5795,7 @@ def kernel(
                 warp_idx,
                 lane,
                 HALF=False,
+                STATE_ABI_PROGRAM=BT16_STATE_ABI_PROGRAM,
             )
         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
         state_input_ready_arrive(initial_state_ready_mbar)
@@ -4762,6 +5831,8 @@ def kernel(
                 False,
                 1,
                 True,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             # Decay the retained right half as soon as CG0 publishes the FP32
             # diagonal; K/Q materialization continues independently.
@@ -4777,6 +5848,8 @@ def kernel(
                 state3,
                 1,
                 True,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
 
             state_k_acc_stage = tcgen05_shared_acc_stage_from_event(shared_acc_event_id)
@@ -4795,6 +5868,8 @@ def kernel(
                 state_k_acc_stage,
                 shared_input_stage,
                 input_dtype,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             shared_acc_event_id += cutlass.Int32(1)
             rhs_ready_arrive(rhs_ready_mbar)
@@ -4814,6 +5889,8 @@ def kernel(
                 update_acc_stage,
                 shared_input_stage,
                 input_dtype,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             shared_acc_event_id += cutlass.Int32(1)
             update_ready_arrive(update_ready_mbar)
@@ -4849,6 +5926,7 @@ def kernel(
                             warp_idx,
                             post_scale_lane,
                             HALF=False,
+                            STATE_ABI_PROGRAM=BT16_STATE_ABI_PROGRAM,
                         )
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     checkpoint_read_done_arrive(checkpoint_read_done_mbar)
@@ -4897,6 +5975,8 @@ def kernel(
                 True,
                 1,
                 True,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             # The diagonal is complete before k_decay/q_decay/k_restore; use
             # that narrower dependency to hide right-half FP32 scaling.
@@ -4915,6 +5995,8 @@ def kernel(
                 state3,
                 1,
                 True,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             pre_scale_lane = cute.arch.lane_idx()
             qstate_acc_ready_phase = tcgen05_wait_acc_buffer_ready(
@@ -4930,6 +6012,8 @@ def kernel(
                 prev_qstate_acc_stage,
                 SCALE,
                 out.element_type,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             output_ready_arrive(output_ready_mbar.subview(prev_o_stage))
 
@@ -4953,6 +6037,8 @@ def kernel(
                 state_k_acc_stage,
                 shared_input_stage,
                 input_dtype,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             shared_acc_event_id += cutlass.Int32(1)
             rhs_ready_arrive(rhs_ready_mbar)
@@ -4972,6 +6058,8 @@ def kernel(
                 update_acc_stage,
                 shared_input_stage,
                 input_dtype,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             shared_acc_event_id += cutlass.Int32(1)
             update_ready_arrive(update_ready_mbar)
@@ -5018,6 +6106,7 @@ def kernel(
                             warp_idx,
                             post_scale_lane,
                             HALF=False,
+                            STATE_ABI_PROGRAM=BT16_STATE_ABI_PROGRAM,
                         )
                         prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                     checkpoint_read_done_arrive(checkpoint_read_done_mbar)
@@ -5055,6 +6144,8 @@ def kernel(
                 final_qstate_acc_stage,
                 SCALE,
                 out.element_type,
+                STATE_PROGRAM=BT16_STATE_PROGRAM,
+                STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
             )
             output_ready_arrive(output_ready_mbar.subview(final_o_stage))
 
@@ -5070,6 +6161,7 @@ def kernel(
                 warp_idx,
                 final_lane,
                 HALF=False,
+                STATE_ABI_PROGRAM=BT16_STATE_ABI_PROGRAM,
             )
         final_state_stored_arrive(final_state_stored_mbar)
 
@@ -5106,6 +6198,16 @@ def host(
     # pyrefly: ignore [bad-function-definition]
     SEQUENCE_BEGIN: cutlass.Int32 = 0,
     SEQUENCE_COUNT: cutlass.Constexpr = 0,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+    BT16_STATE_PROGRAM: cutlass.Constexpr = None,
+    BT16_ISSUE_PROGRAM: cutlass.Constexpr = None,
+    BT16_STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    BT16_STATE_PUBLICATIONS: cutlass.Constexpr = None,
+    BT16_INPUTS: cutlass.Constexpr = None,
+    BT16_GATES: cutlass.Constexpr = None,
+    BT16_OUTPUT_PROGRAM: cutlass.Constexpr = None,
 ) -> None:
     # pyrefly: ignore [bad-index]
     packed_batch = q.shape[0]
@@ -5244,6 +6346,16 @@ def host(
         SEGMENT_SIZE,
         SEQUENCE_BEGIN,
         SEQUENCE_COUNT > 0,
+        PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+        INVERSE_PROGRAM=INVERSE_PROGRAM,
+        FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
+        BT16_STATE_PROGRAM=BT16_STATE_PROGRAM,
+        BT16_ISSUE_PROGRAM=BT16_ISSUE_PROGRAM,
+        BT16_STATE_ABI_PROGRAM=BT16_STATE_ABI_PROGRAM,
+        BT16_STATE_PUBLICATIONS=BT16_STATE_PUBLICATIONS,
+        BT16_INPUTS=BT16_INPUTS,
+        BT16_GATES=BT16_GATES,
+        BT16_OUTPUT_PROGRAM=BT16_OUTPUT_PROGRAM,
     ).launch(
         grid=(heads, num_sequences, 1),
         block=(THREADS, 1, 1),

@@ -24,6 +24,7 @@ import inspect
 import json
 import linecache
 import logging
+import operator
 import os
 import sys
 import threading
@@ -2264,8 +2265,14 @@ def _create_cute_wrapper(
             )
         )
 
+    helper_sources: tuple[str, ...] = ()
+    if prefill_plans:
+        from .chunk_prefill import prepared_helper_sources
+
+        helper_sources = prepared_helper_sources(prefill_plans[0])
     source = "\n".join(
         [
+            *helper_sources,
             "@cute.jit",
             f"def {func_name}({', '.join(params)}) -> None:",
             *body,
@@ -2273,6 +2280,7 @@ def _create_cute_wrapper(
     )
 
     namespace: dict[str, Any] = {
+        "operator": operator,
         "cutlass": cutlass,
         "cute": cute,
         "CUstream": cuda_driver.CUstream,

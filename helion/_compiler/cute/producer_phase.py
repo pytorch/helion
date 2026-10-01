@@ -158,6 +158,37 @@ class CollectiveProducer:
     execution: ChainedExecution
 
 
+@dataclass(frozen=True)
+class RowSumPoint:
+    """One original point expression, evaluated at the caller's coordinates."""
+
+    name: str
+    statements: tuple[str, ...]
+    value: str
+
+
+@dataclass(frozen=True)
+class RowSumTopology:
+    """Physical lane ownership and the selected floating-point addition tree."""
+
+    lanes: int = 32
+    elements_per_lane: int = 4
+    contiguous: bool = False
+    local_accumulators: int = 1
+    shuffle: Literal["down", "xor"] = "down"
+    lane_block: int = 1
+
+    def check(self) -> None:
+        assert self.lanes in (2, 4, 8, 16, 32)
+        assert self.elements_per_lane >= 0
+        assert self.lane_block > 0
+        assert self.elements_per_lane % self.lane_block == 0
+        assert not self.contiguous or self.lane_block == 1
+        assert self.local_accumulators in (1, 2)
+        assert self.elements_per_lane % self.local_accumulators == 0
+        assert self.shuffle in ("down", "xor")
+
+
 def split_producer_reductions(
     loop: ast.For,
     shared_names: AbstractSet[str],
@@ -314,6 +345,161 @@ def _point_ir(*lines: str) -> PointIR:
     return PointIR(tuple(ast.parse("\n".join(lines)).body))
 
 
+def serial_prefix_actions(
+    accumulator: str,
+    points: tuple[PointValue, ...],
+    *,
+    evaluate_first: bool = False,
+    round_each_add: bool = False,
+) -> tuple[PointAction, ...]:
+    """Sequence admitted point instances without changing the prefix tree.
+
+    The caller supplies the carry and each original typed destination. Grouped
+    evaluation captures every value before the first add/publication; neither
+    the original statements nor the store descriptors are mutated. Explicit
+    rounding uses the shared ``_helion_add_fp32_rn`` native helper binding.
+    """
+    result: list[PointAction] = []
+    if evaluate_first:
+        for index, point in enumerate(points):
+            result.extend(
+                (
+                    PointIR(point.statements),
+                    _point_ir(
+                        f"{accumulator}_point_{index} = {ast.unparse(point.value)}"
+                    ),
+                )
+            )
+    for index, point in enumerate(points):
+        if not evaluate_first:
+            result.append(PointIR(point.statements))
+        value = (
+            f"{accumulator}_point_{index}"
+            if evaluate_first
+            else ast.unparse(point.value)
+        )
+        addition = (
+            f"{accumulator} = _helion_add_fp32_rn({accumulator}, {value})"
+            if round_each_add
+            else f"{accumulator} += {value}"
+        )
+        result.extend(
+            (
+                _point_ir(addition),
+                PointValue((), _expression(accumulator), point.store),
+            )
+        )
+    return tuple(result)
+
+
+def row_sum_actions(
+    points: tuple[RowSumPoint, ...],
+    topology: RowSumTopology,
+    *,
+    element: str,
+    position: str,
+    lane: str,
+    extent: int,
+    fast_math: bool = False,
+    target_device_capability: tuple[int, int] | None = None,
+) -> tuple[PointAction, ...]:
+    """Reduce original point IR with an explicit local and lane addition tree.
+
+    Adjacent original instances may use the existing packed arithmetic pass
+    when the selected topology has two local accumulators. That choice requires
+    fast math and a supported target. Publication and inter-team completion
+    remain the caller's responsibility.
+    """
+    from .factor_affine_reductions import pack_fp32_constexpr_loops
+
+    topology.check()
+    assert points and len({point.name for point in points}) == len(points)
+    assert 0 <= extent <= topology.lanes * topology.elements_per_lane
+    paired = topology.local_accumulators == 2
+    if paired:
+        assert extent > 0
+        assert fast_math and target_device_capability is not None
+        assert target_device_capability >= (10, 0)
+        # A predicate inside the packed loop can change participation. Partial
+        # rows use the existing scalar topology instead of a different tree.
+        assert extent == topology.lanes * topology.elements_per_lane
+    position_value = (
+        f"({lane}) * {topology.elements_per_lane} + {element}"
+        if topology.contiguous
+        else f"({lane}) + {element} * {topology.lanes}"
+    )
+    if topology.lane_block != 1:
+        block = topology.lane_block
+        position_value = (
+            f"({element} // {block}) * {topology.lanes * block}"
+            f" + ({lane}) * {block} + {element} % {block}"
+        )
+    body: list[PointAction] = [
+        _point_ir(f"{point.name}_acc = cutlass.Float32(0)") for point in points
+    ]
+    evaluations: list[PointAction] = []
+    for point in points:
+        acc = f"{point.name}_acc"
+        update = (
+            f"{acc} = {acc} + {point.value}" if paired else f"{acc} += {point.value}"
+        )
+        evaluations.extend((_point_ir(*point.statements), _point_ir(update)))
+    inner: tuple[PointAction, ...] = tuple(evaluations)
+    if not paired:
+        inner = (PointGuard(_expression(f"{position} < {extent}"), inner),)
+    body.append(
+        PointLoop(
+            element,
+            _expression(f"cutlass.range_constexpr({topology.elements_per_lane})"),
+            (_point_ir(f"{position} = {position_value}"), *inner),
+        )
+    )
+    if paired:
+        scalar = emit_point_actions(tuple(body))
+        assert scalar is not None
+        packed = pack_fp32_constexpr_loops(
+            list(scalar),
+            fast_math=fast_math,
+            target_device_capability=target_device_capability,
+        )
+        # Admission cannot silently turn the requested two-part tree back into
+        # the scalar tree when an unsupported point expression refuses packing.
+        initializers = [
+            statement
+            for statement in packed
+            if isinstance(statement, ast.Assign)
+            and ast.unparse(statement.value) == "cutlass.Float32(0)"
+        ]
+        assert len(initializers) == 2 * len(points)
+        # PointIR intentionally excludes loops. Keep the packed loop as a
+        # PointLoop so it passes through the same ownership interpreter.
+        body = []
+        for statement in packed:
+            if isinstance(statement, ast.For):
+                assert isinstance(statement.target, ast.Name)
+                body.append(
+                    PointLoop(
+                        statement.target.id,
+                        statement.iter,
+                        (PointIR(tuple(statement.body)),),
+                    )
+                )
+            else:
+                body.append(PointIR((statement,)))
+    offset = topology.lanes // 2
+    while offset:
+        for point in points:
+            acc = f"{point.name}_acc"
+            shuffle = (
+                f"cute.arch.shuffle_sync_bfly({acc}, offset={offset})"
+                if topology.shuffle == "xor"
+                else f"cute.arch.shuffle_sync_down({acc}, offset={offset})"
+            )
+            body.append(_point_ir(f"{acc} += {shuffle}"))
+        offset //= 2
+    return tuple(body)
+
+
 def _lane_actions(program: LaneProducer) -> tuple[PointAction, ...]:
     body: list[PointAction] = [
         PointLoop(
@@ -384,10 +570,15 @@ def _collective_actions(program: CollectiveProducer) -> tuple[PointAction, ...]:
                 PointLoop(
                     position,
                     _expression(f"cutlass.range({extent}, unroll=1)"),
-                    (
-                        _point_ir(*program.statements),
-                        _point_ir(f"{acc} += {value}"),
-                        publication,
+                    serial_prefix_actions(
+                        acc,
+                        (
+                            PointValue(
+                                tuple(ast.parse("\n".join(program.statements)).body),
+                                _expression(value),
+                                publication.store,
+                            ),
+                        ),
                     ),
                 ),
             )
@@ -395,29 +586,14 @@ def _collective_actions(program: CollectiveProducer) -> tuple[PointAction, ...]:
     else:
         assert program.kind == "sum"
         body.extend(
-            (
-                _point_ir(f"{acc} = cutlass.Float32(0)"),
-                PointLoop(
-                    f"{name}_part",
-                    _expression(f"cutlass.range_constexpr({(extent + 31) // 32})"),
-                    (
-                        _point_ir(
-                            f"{position} = {execution.thread} % 32 + {name}_part * 32"
-                        ),
-                        PointGuard(
-                            _expression(f"{position} < {extent}"),
-                            (
-                                _point_ir(*program.statements),
-                                _point_ir(f"{acc} += {value}"),
-                            ),
-                        ),
-                    ),
-                ),
+            row_sum_actions(
+                (RowSumPoint(name, program.statements, value),),
+                RowSumTopology(elements_per_lane=(extent + 31) // 32),
+                element=f"{name}_part",
+                position=position,
+                lane=f"{execution.thread} % 32",
+                extent=extent,
             )
-        )
-        body.extend(
-            _point_ir(f"{acc} += cute.arch.shuffle_sync_down({acc}, offset={offset})")
-            for offset in (16, 8, 4, 2, 1)
         )
         body.append(
             PointGuard(_expression(f"{execution.thread} % 32 == 0"), (publication,))

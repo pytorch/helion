@@ -21,18 +21,28 @@ the original selected layout; no workload layout is selected here.
 
 from __future__ import annotations
 
+from typing import Any
 from typing import Literal
+from typing import cast
 
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05
 import cutlass.experimental.primitives as prims
 
+from .affine_recurrence_primitives import ffma2
 from .affine_recurrence_primitives import fmul2
+from .affine_recurrence_primitives import materialize_fp32
+from .affine_recurrence_primitives import pack_bf16x2_inline
 from .affine_recurrence_primitives import pack_input_b16x2_to_i32
+from .affine_recurrence_primitives import pack_typed_b16x2_to_i32
+from .warp_specialized_primitives import arrive_mbarrier
 from .warp_specialized_primitives import elect_arrive_mbarrier
+from .warp_specialized_primitives import fence_async_shared
 from .warp_specialized_primitives import matrix_16x16_transposed_lane_coordinates
+from .warp_specialized_primitives import named_barrier_sync
 from .warp_specialized_primitives import segmented_swizzle_b16_element_index
+from .warp_specialized_primitives import swizzle_b16_index
 
 
 @cute.jit
@@ -109,6 +119,7 @@ def _issue_atom(
     TMEM_A: cutlass.Constexpr[bool],
     K_ATOM: cutlass.Constexpr[int],
     B_ADVANCE: cutlass.Constexpr,
+    ISSUER_ELECTED: cutlass.Constexpr[bool] = False,
 ):
     if cutlass.const_expr(DESCRIPTOR):
         raw, column = a
@@ -119,7 +130,10 @@ def _issue_atom(
         tmem_input = prims.make_tmem_ptr(raw, cutlass.Int8).subview(
             column + k * (K_ATOM // 2)
         )
-        if prims.elect_sync():
+        elected = True
+        if cutlass.const_expr(not ISSUER_ELECTED):
+            elected = prims.elect_sync()
+        if elected:
             prims.tcgen05_mma(
                 prims.Tcgen05MMAKind.F16,
                 prims.CTAGroup.CTA_1,
@@ -160,6 +174,7 @@ def execute_prepared_issue(
     B_SWIZZLE: cutlass.Constexpr[int] = 128,
     B_MAJOR: cutlass.Constexpr[Literal[0, 1]] = 0,
     B_BASE_BYTES: cutlass.Constexpr[int] = 0,
+    ISSUER_ELECTED: cutlass.Constexpr[bool] = False,
 ):
     """Original input wait, ordered issue/accumulation, commit and optional wait.
 
@@ -167,7 +182,10 @@ def execute_prepared_issue(
     waits later in execute_prepared_read. No issue completion is inferred from
     the return of an asynchronous span. The caller retains its original raw
     input ring wait, outside this local packed-operand readiness event.
+    ISSUER_ELECTED retains an existing whole-span election supplied by the
+    physical caller; the default preserves the original per-atom election.
     """
+    assert not ISSUER_ELECTED or DESCRIPTOR
     assert K_BEGIN >= 0 and K_END > K_BEGIN
     assert not WAIT_AFTER or COMMIT
     if cutlass.const_expr(input_ready is not None):
@@ -209,13 +227,17 @@ def execute_prepared_issue(
                 TMEM_A,
                 K_ATOM,
                 B_ADVANCE,
+                ISSUER_ELECTED,
             )
             if cutlass.const_expr(not DESCRIPTOR):
                 assert fragment_operation is not None
                 fragment_operation.set(tcgen05.Field.ACCUMULATE, True)
         if cutlass.const_expr(COMMIT):
             if cutlass.const_expr(DESCRIPTOR):
-                if prims.elect_sync():
+                elected = True
+                if cutlass.const_expr(not ISSUER_ELECTED):
+                    elected = prims.elect_sync()
+                if elected:
                     prims.tcgen05_commit(completion, group=prims.CTAGroup.CTA_1)
             else:
                 with cute.arch.elect_one():
@@ -341,6 +363,8 @@ def execute_prepared_read(
     DESCRIPTOR: cutlass.Constexpr[bool],
     LOAD_SHAPE: cutlass.Constexpr,
     LOAD_COUNT: cutlass.Constexpr[int],
+    COMPANION_TMEM: cutlass.Constexpr[bool] = False,
+    DEFER_WAIT: cutlass.Constexpr[bool] = False,
 ):
     """Wait/read the original FP32 result, including its ordered companion load.
 
@@ -355,13 +379,156 @@ def execute_prepared_read(
             execute_prepared_wait(completion, phase, True)
         values = prims.tcgen05_ld(LOAD_SHAPE, source, num=LOAD_COUNT)
         if cutlass.const_expr(companion is not None):
-            companion = _read_companion(companion)
-        prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+            if cutlass.const_expr(COMPANION_TMEM):
+                companion = prims.tcgen05_ld(LOAD_SHAPE, companion, num=LOAD_COUNT)
+            else:
+                companion = _read_companion(companion)
+        if cutlass.const_expr(not DEFER_WAIT):
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
     else:
         assert companion is None and completion is None
         cute.copy(copy, source, values)
         cute.arch.fence_view_async_tmem_load()
     return values, companion
+
+
+@cute.jit
+def execute_prepared_capture_release(
+    empty, issuer, BARRIER: cutlass.Constexpr[int], COUNT: cutlass.Constexpr[int]
+):
+    """Release a captured native value after all original readers have joined."""
+    named_barrier_sync(BARRIER, COUNT)
+    if issuer:
+        arrive_mbarrier(empty)
+
+
+@cute.jit
+def pack_output_half(values, CAST: cutlass.Constexpr = None):
+    packed = cutlass.Array(cutlass.Int32, 8, alignment=16)
+    for pair in cutlass.range_constexpr(8):
+        if cutlass.const_expr(CAST is not None):
+            packed[pair] = pack_typed_b16x2_to_i32(
+                CAST(values[pair * 2]), CAST(values[pair * 2 + 1]), cutlass.BFloat16
+            )
+        else:
+            packed[pair] = pack_bf16x2_inline(values[pair * 2], values[pair * 2 + 1])
+    return packed
+
+
+@cute.jit
+def store_output_half(
+    destination,
+    packed,
+    row_block,
+    lane,
+    HALF: cutlass.Constexpr,
+    MAP: cutlass.Constexpr,
+):
+    row, column = matrix_16x16_transposed_lane_coordinates(lane)
+    for token_group in cutlass.range_constexpr(2):
+        value = row_block * 32 + HALF * 16 + column
+        token = token_group * 16 + row
+        offset = swizzle_b16_index(token, value, *MAP)
+        prims.stmatrix(
+            destination + offset // 2,
+            [
+                packed[token_group * 4],
+                packed[token_group * 4 + 1],
+                packed[token_group * 4 + 2],
+                packed[token_group * 4 + 3],
+            ],
+            prims.MMALayout.COL,
+            shape=prims.StoreShape.M8N8,
+        )
+
+
+@cute.jit
+def execute_prepared_output(
+    PROGRAM: cutlass.Constexpr,
+    source,
+    companion,
+    destination,
+    empty,
+    out,
+    descriptor,
+    begin,
+    seqlen,
+    head,
+    iteration,
+    row_block,
+    lane,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
+):
+    """Execute scheduled capture, conversion, publication and completion leaves.
+
+    No loop/event generation or pointer ownership is selected here. Capture
+    and EMPTY release precede the original two-slot TMA reuse wait; conversion
+    occurs only after that wait, with the original per-half register lifetime.
+    """
+    output_cast = cast("Any", None)
+    if cutlass.const_expr(STATE_PUBLICATIONS is not None):
+        output_cast = STATE_PUBLICATIONS[5]
+    values = cast("Any", None)
+    second = None
+    packed = cast("Any", None)
+    for index in cutlass.range_constexpr(len(PROGRAM)):
+        instruction = PROGRAM[index]
+        if cutlass.const_expr(instruction[0] == 0):
+            values, second = execute_prepared_read(
+                source,
+                None,
+                None,
+                companion,
+                None,
+                None,
+                instruction[1],
+                instruction[2],
+                instruction[3],
+                instruction[5],
+            )
+        elif cutlass.const_expr(instruction[0] == 3):
+            if cutlass.const_expr(instruction[1] == 0):
+                packed = pack_output_half(values, output_cast)
+            else:
+                packed = pack_output_half(second, output_cast)
+        elif cutlass.const_expr(instruction[0] == 1):
+            store_output_half(
+                destination, packed, row_block, lane, instruction[1], instruction[2:]
+            )
+        elif cutlass.const_expr(instruction[0] == 4):
+            execute_prepared_capture_release(
+                empty, row_block == 0, instruction[1], instruction[2]
+            )
+        elif cutlass.const_expr(instruction[0] == 5):
+            if row_block == 0:
+                if iteration >= instruction[3]:
+                    prims.cp_async_bulk_wait_group(instruction[4], read=True)
+            named_barrier_sync(instruction[1], instruction[2])
+        elif cutlass.const_expr(instruction[0] == 2):
+            named_barrier_sync(instruction[1], instruction[2])
+            if row_block == 0:
+                fence_async_shared()
+                if prims.elect_sync():
+                    execute_prepared_tma_segment(
+                        destination,
+                        descriptor,
+                        (0, cutlass.Int32(begin) + iteration * instruction[3], head, 0),
+                    )
+                    complete_prepared_tma_store(False)
+        else:
+            assert instruction[0] == 6
+            for column in cutlass.range_constexpr(instruction[1]):
+                token = iteration * instruction[1] + column
+                if token < seqlen:
+                    if cutlass.const_expr(output_cast is not None):
+                        converted = output_cast(values[column])
+                    else:
+                        converted = cutlass.BFloat16(values[column])
+                    store_prepared_output_element(
+                        out,
+                        (0, begin + cutlass.Int64(token), head, row_block * 32 + lane),
+                        converted,
+                    )
 
 
 @cute.jit
@@ -432,13 +599,325 @@ def execute_prepared_store(
 @cute.jit
 def execute_prepared_store_completion(
     DESCRIPTOR: cutlass.Constexpr[bool],
+    FENCE: cutlass.Constexpr[bool] = True,
 ):
     """Retire the original store and perform its original visibility fence."""
     if cutlass.const_expr(DESCRIPTOR):
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-        prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+        if cutlass.const_expr(FENCE):
+            prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     else:
         cute.arch.fence_view_async_tmem_store()
+
+
+@cute.jit
+def read_linear_state_abi(
+    source,
+    coordinates,
+    BEGIN: cutlass.Constexpr,
+    COUNT: cutlass.Constexpr,
+    valid=True,
+):
+    """Read exact external FP32 state, or the original absent-input zeros."""
+    values = cutlass.Array(cutlass.Float32, COUNT, alignment=16)
+    for column in cutlass.range_constexpr(COUNT):
+        value = cutlass.Float32(0.0)
+        if cutlass.const_expr(source is not None):
+            if valid:
+                value = source[
+                    coordinates[0], coordinates[1], coordinates[2], BEGIN + column
+                ]
+        values[column] = value
+    return values
+
+
+@cute.jit
+def store_linear_state_abi(
+    values,
+    destination,
+    coordinates,
+    BEGIN: cutlass.Constexpr,
+    COUNT: cutlass.Constexpr,
+    valid=True,
+):
+    for column in cutlass.range_constexpr(COUNT):
+        if valid:
+            destination[
+                coordinates[0], coordinates[1], coordinates[2], BEGIN + column
+            ] = values[column]
+
+
+@cute.jit
+def execute_prepared_state_abi(
+    PROGRAM: cutlass.Constexpr, initial, final, state, coordinates, valid=True
+):
+    """Original root ABI effects; no allocation, loop or DONE authority."""
+    values = cast("Any", None)
+    for index in cutlass.range_constexpr(len(PROGRAM)):
+        instruction = PROGRAM[index]
+        if cutlass.const_expr(instruction[0] == 0):
+            if cutlass.const_expr(instruction[1] == 1):
+                values, companion = execute_prepared_read(
+                    state + instruction[2] * instruction[5],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    instruction[3],
+                    instruction[4],
+                    instruction[5],
+                )
+            else:
+                values = read_linear_state_abi(
+                    initial,
+                    coordinates,
+                    instruction[2] * instruction[5],
+                    instruction[5],
+                    valid,
+                )
+        elif cutlass.const_expr(instruction[0] == 1):
+            if cutlass.const_expr(instruction[1] == 0):
+                execute_prepared_store(
+                    values[0 : instruction[5]],
+                    state + instruction[2] * instruction[5],
+                    None,
+                    instruction[3],
+                    instruction[6],
+                )
+            else:
+                store_linear_state_abi(
+                    values,
+                    final,
+                    coordinates,
+                    instruction[2] * instruction[5],
+                    instruction[5],
+                    valid,
+                )
+        else:
+            assert instruction[0] == 2 and instruction[1] == 0
+            # Original initialization completes stores without a publication
+            # fence; later state-input publication retains that fence.
+            execute_prepared_store_completion(instruction[3], False)
+
+
+@cute.jit
+def pack_linear_state(values, CAST: cutlass.Constexpr = None):
+    """Original adjacent-pair BF16 packing, retaining the input FP32 registers."""
+    packed = cutlass.Array(cutlass.Int32, 16, alignment=16)
+    for pair in cutlass.range_constexpr(16):
+        if cutlass.const_expr(CAST is not None):
+            packed[pair] = pack_typed_b16x2_to_i32(
+                CAST(values[pair * 2]), CAST(values[pair * 2 + 1]), cutlass.BFloat16
+            )
+        else:
+            packed[pair] = pack_bf16x2_inline(values[pair * 2], values[pair * 2 + 1])
+    return packed
+
+
+@cute.jit
+def pack_affine_residual_half(
+    prediction,
+    raw,
+    coefficient,
+    row,
+    scale,
+    remaining,
+    HALF: cutlass.Constexpr[int],
+    MASK_TAIL: cutlass.Constexpr[bool],
+    ROWS: cutlass.Constexpr[int],
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
+):
+    """Original affine residual rounding, with masked rows explicit before pack."""
+    values = cutlass.Array(cutlass.Float32, 16, alignment=16)
+    beta = cutlass.Array(cutlass.Float32, 16, alignment=16)
+    for column in cutlass.range_constexpr(16):
+        token = HALF * 16 + column
+        values[column] = cutlass.Float32((raw + token * ROWS + row).load())
+        beta[column] = (coefficient + token).load()
+    packed = cutlass.Array(cutlass.Int32, 8, alignment=16)
+    for pair in cutlass.range_constexpr(8):
+        token = HALF * 16 + pair * 2
+        if cutlass.const_expr(STATE_PUBLICATIONS is not None):
+            low, high = STATE_PUBLICATIONS[1](
+                (prediction[token], prediction[token + 1]),
+                (values[pair * 2], values[pair * 2 + 1]),
+                (beta[pair * 2], beta[pair * 2 + 1]),
+                scale,
+            )
+        else:
+            low, high = ffma2(
+                (prediction[token], prediction[token + 1]),
+                (-scale, -scale),
+                (values[pair * 2], values[pair * 2 + 1]),
+            )
+            low, high = fmul2((low, high), (beta[pair * 2], beta[pair * 2 + 1]))
+        if cutlass.const_expr(MASK_TAIL):
+            if token >= remaining:
+                low = cutlass.Float32(0.0)
+            if token + 1 >= remaining:
+                high = cutlass.Float32(0.0)
+        if cutlass.const_expr(STATE_PUBLICATIONS is not None):
+            if cutlass.const_expr(MASK_TAIL):
+                low = materialize_fp32(low)
+                high = materialize_fp32(high)
+            packed[pair] = pack_typed_b16x2_to_i32(
+                STATE_PUBLICATIONS[3](low),
+                STATE_PUBLICATIONS[3](high),
+                cutlass.BFloat16,
+            )
+        else:
+            packed[pair] = pack_bf16x2_inline(low, high)
+    return packed
+
+
+@cute.jit
+def execute_prepared_state_product(
+    PROGRAM: cutlass.Constexpr,
+    source,
+    destination,
+    raw,
+    coefficient,
+    row,
+    scale,
+    remaining,
+    ready,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
+):
+    """Apply common state effects at the original solved-operand consumer cut."""
+    values = cast("Any", None)
+    packed = cast("Any", None)
+    for index in cutlass.range_constexpr(len(PROGRAM)):
+        instruction = PROGRAM[index]
+        if cutlass.const_expr(instruction[0] == 0):
+            values, unused_companion = execute_prepared_read(
+                source,
+                None,
+                None,
+                None,
+                None,
+                None,
+                instruction[3],
+                instruction[4],
+                instruction[5],
+            )
+        elif cutlass.const_expr(instruction[0] == 3):
+            packed = pack_affine_residual_half(
+                values,
+                raw,
+                coefficient,
+                row,
+                scale,
+                remaining,
+                instruction[1],
+                instruction[2],
+                instruction[3],
+                STATE_PUBLICATIONS,
+            )
+        elif cutlass.const_expr(instruction[0] == 4):
+            if cutlass.const_expr(STATE_PUBLICATIONS is not None):
+                packed = pack_linear_state(values, STATE_PUBLICATIONS[4])
+            else:
+                packed = pack_linear_state(values)
+        elif cutlass.const_expr(instruction[0] == 1):
+            execute_prepared_store(
+                packed[0 : instruction[2]],
+                destination + instruction[1],
+                None,
+                instruction[3],
+                instruction[6],
+            )
+        elif cutlass.const_expr(instruction[0] == 2):
+            execute_prepared_store_completion(instruction[3])
+        else:
+            assert instruction[0] == 5
+            for event in cutlass.range_constexpr(instruction[1]):
+                arrive_mbarrier(ready[event])
+
+
+@cute.jit
+def scale_linear_state(
+    values, coefficients, STATE_PUBLICATIONS: cutlass.Constexpr = None
+):
+    """Original two16-column scalar coefficient reads and packed FP32 multiply."""
+    scaled = cutlass.Array(cutlass.Float32, 32, alignment=16)
+    for half in cutlass.range_constexpr(2):
+        gamma = cutlass.Array(cutlass.Float32, 16, alignment=16)
+        for column in cutlass.range_constexpr(16):
+            gamma[column] = (coefficients + half * 16 + column).load()
+        for pair in cutlass.range_constexpr(8):
+            index = half * 16 + pair * 2
+            if cutlass.const_expr(STATE_PUBLICATIONS is not None):
+                lo, hi = STATE_PUBLICATIONS[0](
+                    (values[index], values[index + 1]),
+                    (gamma[pair * 2], gamma[pair * 2 + 1]),
+                )
+            else:
+                lo, hi = fmul2(
+                    (values[index], values[index + 1]),
+                    (gamma[pair * 2], gamma[pair * 2 + 1]),
+                )
+            scaled[index] = lo
+            scaled[index + 1] = hi
+    return scaled
+
+
+@cute.jit
+def execute_prepared_linear_state(
+    PROGRAM: cutlass.Constexpr,
+    source,
+    packed_target,
+    coefficients,
+    ready,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
+):
+    """Interpret bound state effects; native transfers share the root/DV2 leaves."""
+    original = None
+    packed = cast("Any", None)
+    scaled = cast("Any", None)
+    for index in cutlass.range_constexpr(len(PROGRAM)):
+        instruction = PROGRAM[index]
+        if cutlass.const_expr(instruction[0] == 0):
+            original, companion = execute_prepared_read(
+                source,
+                None,
+                None,
+                None,
+                None,
+                None,
+                instruction[2],
+                instruction[3],
+                instruction[4],
+            )
+        elif cutlass.const_expr(instruction[0] == 1):
+            if cutlass.const_expr(instruction[1] == 1):
+                execute_prepared_store(
+                    packed[0:16],
+                    packed_target,
+                    None,
+                    instruction[2],
+                    instruction[5],
+                )
+            else:
+                execute_prepared_store(
+                    scaled[0:32],
+                    source,
+                    None,
+                    instruction[2],
+                    instruction[5],
+                )
+        elif cutlass.const_expr(instruction[0] == 2):
+            execute_prepared_store_completion(instruction[2])
+        elif cutlass.const_expr(instruction[0] == 3):
+            if cutlass.const_expr(STATE_PUBLICATIONS is not None):
+                packed = pack_linear_state(original, STATE_PUBLICATIONS[2])
+            else:
+                packed = pack_linear_state(original)
+        elif cutlass.const_expr(instruction[0] == 4):
+            scaled = scale_linear_state(original, coefficients, STATE_PUBLICATIONS)
+        else:
+            assert instruction[0] == 5
+            arrive_mbarrier(ready)
 
 
 @cute.jit
@@ -464,3 +943,25 @@ def execute_prepared_publication(
         execute_prepared_store(values, destination, copy, False, STORE_SHAPE)
         execute_prepared_store_completion(False)
         participant_barrier.arrive_and_wait()
+
+
+@cute.jit
+def execute_prepared_tma_segment(source, descriptor, coordinates):
+    """Store one original segment under the caller's existing elected issuer."""
+    prims.cp_async_bulk_tensor_global_shared_cta(
+        descriptor.get_ptr(), source, coordinates
+    )
+
+
+@cute.jit
+def complete_prepared_tma_store(WAIT: cutlass.Constexpr[bool]):
+    """Commit the original store group; optionally retire its source read debt."""
+    prims.cp_async_bulk_commit_group()
+    if cutlass.const_expr(WAIT):
+        prims.cp_async_bulk_wait_group(0, read=True)
+
+
+@cute.jit
+def store_prepared_output_element(destination, coordinates, value):
+    """Store an already-typed original output at its selected external index."""
+    destination[coordinates[0], coordinates[1], coordinates[2], coordinates[3]] = value

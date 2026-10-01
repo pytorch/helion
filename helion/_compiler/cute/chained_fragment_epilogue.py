@@ -11,12 +11,16 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     from torch.fx import Node
 
     from ..generate_ast import GenerateAST
+    from ..inductor_lowering import PointwiseCodegenPolicy
     from . import chained_matmul as chain
     from .chained_matmul import ChainedMatmulPlan
+    from .prepared_graph_schedule import ContractionGraph
 
 
 @dataclass(frozen=True)
@@ -24,8 +28,8 @@ class FragmentExpression:
     expression: chain._Expression
     source: Node
     target: Node
-    coordinates: tuple[str, str]
-    target_coordinates: tuple[str, str]
+    coordinates: tuple[str, ...]
+    target_coordinates: tuple[str, ...]
     fragment: str
     dtype: str
     value: str
@@ -38,7 +42,8 @@ class FragmentExpression:
         expression = self.expression
         return (
             expression.cg,
-            expression.plan,
+            expression.context,
+            expression.pointwise_policy,
             self.source,
             self.target,
             self.coordinates,
@@ -48,6 +53,7 @@ class FragmentExpression:
             self.value,
             self.domain,
             tuple(expression.fragments.items()),
+            tuple(expression.pointwise_views.items()),
             tuple(expression.memo.items()),
             tuple(expression.lines),
         )
@@ -82,8 +88,8 @@ def bind_fragment_expression(
     scans: list[chain._ScanInput],
     source: Node,
     target: Node,
-    coordinates: tuple[str, str],
-    target_coordinates: tuple[str, str],
+    coordinates: tuple[str, ...],
+    target_coordinates: tuple[str, ...],
     fragment: str,
     dtype: str,
     *,
@@ -118,6 +124,68 @@ def bind_fragment_expression(
     )
     object.__setattr__(result, "_selection", result.facts())
     result.check()
+    return result
+
+
+def bind_register_fragment_expression(
+    cg: GenerateAST,
+    graph: ContractionGraph,
+    source: Node,
+    target: Node,
+    coordinates: tuple[str, ...],
+    target_coordinates: tuple[str, ...],
+    fragment: str,
+    dtype: str,
+    *,
+    inputs: dict[Node, tuple[tuple[str, ...], str]] | None = None,
+    policy: PointwiseCodegenPolicy | None = None,
+) -> FragmentExpression:
+    """Original pointwise lowering with every native register input explicit.
+
+    This view grants no completion/publication authority. The physical caller
+    owns each input image and the output store cut. No whole-root plan, global
+    load, materialization or synthetic graph is constructed for the expression.
+    """
+    from . import chained_matmul as chain
+
+    graph.check()
+    nodes = graph.region.nodes
+    bindings = dict(inputs or {})
+    if (
+        source in bindings
+        or source not in nodes
+        or target not in nodes
+        or any(node not in nodes for node in bindings)
+    ):
+        raise chain._UnsupportedChain("foreign native fragment expression input")
+    bindings[source] = (coordinates, fragment)
+    expression = chain._Expression(cg, None, {})
+    expression.pointwise_policy = policy
+    expression.fragments.update(bindings)
+    expression.coordinate_names.update(
+        name for coords, value in bindings.values() for name in coords
+    )
+    value = (
+        expression.scalar(target)
+        if not target_coordinates
+        and not isinstance(target.meta.get("val"), torch.Tensor)
+        else expression.value(target, target_coordinates)
+    )
+    result = FragmentExpression(
+        expression,
+        source,
+        target,
+        coordinates,
+        target_coordinates,
+        fragment,
+        dtype,
+        value,
+        (),
+        None,
+    )
+    object.__setattr__(result, "_selection", result.facts())
+    result.check()
+    graph.check()
     return result
 
 

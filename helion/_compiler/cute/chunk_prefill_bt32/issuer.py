@@ -10,6 +10,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.experimental.primitives as prims
 
+from ..prepared_tcgen_edge import execute_prepared_issue
 from . import common as cm
 
 
@@ -109,13 +110,66 @@ def final_product(smem_base, offset, tmem_base):
 
 
 @cute.jit
+def prepared_issue(smem_base, stage_bytes, tmem_base, PORT: cutlass.Constexpr):
+    """Lower the original graph-bound native port through the common issue leaf."""
+    (
+        a_column,
+        b_offset,
+        destination,
+        rows,
+        columns,
+        begin,
+        end,
+        initialized,
+        leading,
+        stride,
+        swizzle,
+        major,
+        advance,
+    ) = PORT
+    execute_prepared_issue(
+        (tmem_base, a_column),
+        (
+            cutlass.Array(
+                cm.sptr(smem_base, b_offset + stage_bytes, cutlass.BFloat16),
+                shape=columns * end * 16,
+                dtype=cutlass.BFloat16,
+            ),
+            leading,
+            stride,
+        ),
+        (tmem_base, 0, destination, 0),
+        (cutlass.BFloat16, rows, columns),
+        prims.elect_sync(),
+        None,
+        None,
+        None,
+        None,
+        True,
+        True,
+        begin,
+        end,
+        16,
+        advance,
+        initialized,
+        False,
+        False,
+        swizzle,
+        major,
+        ISSUER_ELECTED=True,
+    )
+
+
+@cute.jit
 def commit(pointer):
     if prims.elect_sync():
         prims.tcgen05_commit(pointer, group=prims.CTAGroup.CTA_1)
 
 
 @cute.jit
-def issuer_loop(smem_base, tmem_base, num_chunks):
+def issuer_loop(
+    smem_base, tmem_base, num_chunks, ISSUE_PROGRAM: cutlass.Constexpr = None
+):
     stage = cutlass.Int32(0)
     phase = cutlass.Int32(0)
     output_phase = cutlass.Int32(1)
@@ -126,17 +180,29 @@ def issuer_loop(smem_base, tmem_base, num_chunks):
         output_phase = output_phase ^ 1
         cm.wait(cm.bptr(smem_base, cm.STATE_INP_READY, stage), phase)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-        projection(smem_base, cm.KD + stage_bytes, tmem_base, cm.TMEM_PROJECTION)
+        if cutlass.const_expr(ISSUE_PROGRAM is None):
+            projection(smem_base, cm.KD + stage_bytes, tmem_base, cm.TMEM_PROJECTION)
+        else:
+            prepared_issue(smem_base, stage_bytes, tmem_base, ISSUE_PROGRAM[0])
         commit(cm.bptr(smem_base, cm.OLD_OUT_READY, stage))
-        projection(smem_base, cm.QD + stage_bytes, tmem_base, cm.TMEM_OUT)
+        if cutlass.const_expr(ISSUE_PROGRAM is None):
+            projection(smem_base, cm.QD + stage_bytes, tmem_base, cm.TMEM_OUT)
+        else:
+            prepared_issue(smem_base, stage_bytes, tmem_base, ISSUE_PROGRAM[1])
         commit(cm.bptr(smem_base, cm.RAW_INPUTS_FREE, stage))
         cm.wait(cm.bptr(smem_base, cm.U_INP_READY, stage), phase)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-        inverse_product(smem_base, cm.INV + stage_bytes, tmem_base)
+        if cutlass.const_expr(ISSUE_PROGRAM is None):
+            inverse_product(smem_base, cm.INV + stage_bytes, tmem_base)
+        else:
+            prepared_issue(smem_base, stage_bytes, tmem_base, ISSUE_PROGRAM[2])
         commit(cm.bptr(smem_base, cm.U2_ACC_READY, stage))
         cm.wait(cm.bptr(smem_base, cm.U2_INP_READY, stage), phase)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
-        final_product(smem_base, cm.FINAL_TRANS + stage_bytes, tmem_base)
+        if cutlass.const_expr(ISSUE_PROGRAM is None):
+            final_product(smem_base, cm.FINAL_TRANS + stage_bytes, tmem_base)
+        else:
+            prepared_issue(smem_base, stage_bytes, tmem_base, ISSUE_PROGRAM[3])
         commit(cm.bptr(smem_base, cm.FINAL_READY, stage))
         commit(cm.bptr(smem_base, cm.SMEM_FREE, stage))
         stage = stage + 1

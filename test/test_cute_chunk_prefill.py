@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import ast
+from dataclasses import replace
+import dis
 import importlib
+import inspect
+import itertools
+import linecache
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
+from unittest.mock import patch
 
 from benchmarks.cute.kda_prefill_fused import kda_prefill_native_math
 from benchmarks.cute.kda_prefill_fused_bt32 import kda_prefill_native_math_bt32
@@ -12,9 +20,25 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import helion
 from helion._compiler.autotuner_heuristics.cute import CuteChunkPrefillHeuristic
+from helion._compiler.cute import chained_matmul as chain
+from helion._compiler.cute import prepared_state_planner
 from helion._compiler.cute.chunk_prefill import _disjoint_storage
 from helion._compiler.cute.chunk_prefill import match_chunk_prefill_region
 from helion._compiler.cute.chunk_prefill import match_chunk_prefill_step
+from helion._compiler.cute.chunk_prefill_prepared_bt16 import bind_bt16
+from helion._compiler.cute.chunk_prefill_prepared_bt16_state import bind_bt16_issues
+from helion._compiler.cute.chunk_prefill_prepared_bt16_state import bind_bt16_output
+from helion._compiler.cute.chunk_prefill_prepared_bt16_state import bind_bt16_state
+from helion._compiler.cute.chunk_prefill_prepared_bt16_state import bind_bt16_state_abi
+from helion._compiler.cute.chunk_prefill_prepared_inverse import bind_fast_inverse
+from helion._compiler.cute.chunk_prefill_prepared_issue import bind_fast_recurrence
+from helion._compiler.cute.chunk_prefill_prepared_output import bind_fast_output
+from helion._compiler.cute.chunk_prefill_prepared_pairwise import bind_fast_pairwise
+from helion._compiler.cute.chunk_prefill_prepared_state import bind_fast_state
+from helion._compiler.cute.chunk_prefill_prepared_state_abi import bind_fast_state_abi
+from helion._compiler.cute.prepared_graph_schedule import ContractionPartition
+from helion._compiler.cute.prepared_graph_schedule import order_issue_placements
+from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import HelperFunctionGraphInfo
 from helion._compiler.device_ir import RootGraphInfo
@@ -25,10 +49,18 @@ from helion.autotuner.config_spec import CUTE_CHUNK_PREFILL_TASK_ORDER_KEY
 from helion.exc import InvalidConfig
 from helion.language.matmul_ops import dot
 from helion.language.memory_ops import store
+from helion.runtime.cute.chunk_prefill import append_host_call
+from helion.runtime.cute.chunk_prefill import prepared_helper_sources
+from helion.runtime.cute.launcher import _create_cute_wrapper
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
 
+    from helion._compiler.cute.chunk_prefill import CuteChunkPrefillRegion
+    from helion._compiler.cute.chunk_prefill_prepared_bt16 import BT16Bindings
+    from helion._compiler.cute.chunk_prefill_prepared_inverse import FastInverse
+    from helion._compiler.cute.chunk_prefill_prepared_issue import FastRecurrence
     from helion._compiler.device_ir import GraphInfo
     from helion.runtime.kernel import BoundKernel
 
@@ -367,7 +399,9 @@ def test_prefill_full_search_population_obeys_tensor_constraints(
     )["block_sizes"] == [64]
 
 
-@pytest.mark.parametrize("order", ["identity", "longest_first_precompute"])
+@pytest.mark.parametrize(
+    "order", ["identity", "longest_first", "longest_first_precompute"]
+)
 def test_bt32_codegen_and_search_space(bt32_bound: BoundKernel, order: str) -> None:
     assert bt32_bound.host_function is not None
     region = bt32_bound.host_function.device_ir.cute_chunk_prefill_region
@@ -382,6 +416,7 @@ def test_bt32_codegen_and_search_space(bt32_bound: BoundKernel, order: str) -> N
     assert spec.cute_chunk_prefill_schedule.choices == ("single",)
     assert spec.cute_chunk_prefill_task_order.choices == (
         "identity",
+        "longest_first",
         "longest_first_precompute",
     )
     seeds = CuteChunkPrefillHeuristic.get_seed_configs(
@@ -396,6 +431,7 @@ def test_bt32_codegen_and_search_space(bt32_bound: BoundKernel, order: str) -> N
         for seed in seeds
     } == {
         ("identity", "single"),
+        ("longest_first", "single"),
         ("longest_first_precompute", "single"),
     }
     config = helion.Config(
@@ -419,7 +455,6 @@ def test_bt32_codegen_and_search_space(bt32_bound: BoundKernel, order: str) -> N
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        (CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, "longest_first"),
         (CUTE_CHUNK_PREFILL_SCHEDULE_KEY, "prefix_tail_2"),
         (CUTE_CHUNK_PREFILL_SCHEDULE_KEY, "prefix_tail_4"),
     ],
@@ -840,3 +875,719 @@ def test_bt32_mixed_tails_and_task_orders() -> None:
         assert torch.equal(final, expected_state)
     for tensor, snapshot in zip((*args[:8], cu), frozen, strict=True):
         assert torch.equal(tensor, snapshot)
+
+
+@pytest.fixture
+def bt32_shared_capture(
+    bt32_bound: BoundKernel,
+) -> tuple[DeviceFunction, FastInverse, str]:
+    assert bt32_bound.host_function is not None
+    observed: list[tuple[DeviceFunction, FastInverse, torch.fx.GraphModule | None]] = []
+
+    def bind(region: CuteChunkPrefillRegion, loop: GraphInfo) -> FastRecurrence:
+        recurrence = bind_fast_recurrence(region, loop)
+        pairwise = bind_fast_pairwise(recurrence)
+        observed.append(
+            (
+                DeviceFunction.current(),
+                bind_fast_inverse(recurrence, pairwise),
+                recurrence.graph.region.graph.owning_module,
+            )
+        )
+        return recurrence
+
+    with patch(
+        "helion._compiler.cute.chunk_prefill_prepared_issue.bind_fast_recurrence", bind
+    ):
+        source = bt32_bound.to_code(bt32_bound.config_spec.default_config())
+    ((device, inverse, module),) = observed
+    # Pointwise helper preparation must preserve the already-bound semantic graph.
+    assert inverse.owner.graph.region.graph.owning_module is module
+    inverse.owner.graph.check()
+    return device, inverse, source
+
+
+@pytest.fixture
+def bt32_shared(
+    bt32_bound: BoundKernel,
+    bt32_shared_capture: tuple[DeviceFunction, FastInverse, str],
+) -> Iterator[FastInverse]:
+    device, inverse, _source = bt32_shared_capture
+    assert bt32_bound.host_function is not None
+    # The real DeviceFunction owns the resolved block extents used by the ports.
+    with bt32_bound.env, bt32_bound.host_function, device:
+        yield inverse
+
+
+@pytest.fixture
+def bt32_shared_plan(
+    bt32_shared_capture: tuple[DeviceFunction, FastInverse, str],
+) -> dict[str, object]:
+    assignments = [
+        node
+        for node in ast.walk(ast.parse(bt32_shared_capture[2]))
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_helion_cute_wrapper_plans"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    (plan,) = ast.literal_eval(assignments[0].value)
+    return plan
+
+
+def test_bt32_shared_partitions_cover_original_graph(bt32_shared: FastInverse) -> None:
+    inverse = bt32_shared
+    owner = inverse.owner
+    partitions = (owner.partition, inverse.pairwise.partition, inverse.partition)
+    assert tuple(len(partition.specs) for partition in partitions) == (5, 2, 8)
+    selected = [spec for partition in partitions for spec in partition.specs]
+    original = owner.graph.region.contractions
+    assert len(selected) == len(original) == len({id(spec) for spec in selected})
+    assert {id(spec) for spec in selected} == {id(spec) for spec in original}
+    assert all(partition.graph is owner.graph for partition in partitions)
+    assert owner.state_update.node is owner.region.step.state_output
+    assert inverse.final_bf16 in chain._ancestors(owner.region.step.inverse)
+    # Cross-partition edges keep their real producer, consumer and casts.
+    assert any(
+        edge.producer is inverse.pairwise.qk
+        and edge.consumer is owner.output_update
+        and inverse.pairwise.qk_value in edge.path
+        for edge in owner.partition.boundary
+    )
+    assert (
+        tuple(product.spec for product in inverse.products) == inverse.partition.specs
+    )
+    assert all(
+        product.operands == (product.spec.lhs, product.spec.rhs)
+        for product in inverse.products
+    )
+    assert [product.spec.operand_dtypes for product in inverse.products] == [
+        (torch.float16, torch.float16)
+    ] * 6 + [(torch.bfloat16, torch.bfloat16)] * 2
+
+
+def test_bt32_shared_native_groups_preserve_k_and_accumulators(
+    bt32_shared: FastInverse,
+) -> None:
+    owner = bt32_shared.owner
+    placements = tuple(item for port in owner.ports for item in port.placements)
+    assert tuple(len(port.placements) for port in owner.ports) == (1, 1, 1, 2)
+    assert order_issue_placements(
+        owner.graph, placements[::-1], partition=owner.partition
+    ) == (placements,)
+    with pytest.raises(chain._UnsupportedChain, match="incomplete"):
+        order_issue_placements(owner.graph, placements)
+    assert owner.ports[0].physical_left == owner.ports[1].physical_left
+    assert owner.ports[-1].physical_left == (
+        owner.inverse_product.node,
+        True,
+        (torch.bfloat16,),
+    )
+    final = owner.ports[-1]
+    assert tuple(item.issue.spec for item in final.placements) == (
+        owner.state_update,
+        owner.output_update,
+    )
+    for port in owner.ports:
+        payload = port.payload()
+        assert payload[4] == sum(
+            item.member[1] - item.member[0] for item in port.placements
+        )
+        for item in port.placements:
+            issue = item.issue
+            assert issue.region is owner.graph.region
+            assert issue.begin == 0
+            assert (
+                issue.end * issue.atom_k
+                == chain._host_shape(issue.spec.lhs.meta["val"])[1]
+            )
+            assert issue.initialized is (issue.spec.accumulator is not None)
+            assert payload[7] is issue.initialized
+    assert owner.output_update.accumulator is owner.query.node
+    assert owner.state_update.accumulator is owner.scaled_state
+    assert final.payload()[4] == 160
+    wrong_seed = replace(
+        final.placements[-1],
+        issue=replace(final.placements[-1].issue, initialized=False),
+    )
+    with pytest.raises(chain._UnsupportedChain, match="grouped native"):
+        replace(final, placements=(*final.placements[:-1], wrong_seed)).payload()
+
+
+def test_bt32_shared_rejects_incomplete_issue_partition(
+    bt32_shared: FastInverse,
+) -> None:
+    owner = bt32_shared.owner
+    placements = tuple(item for port in owner.ports for item in port.placements)
+    first = placements[0]
+    short = (
+        replace(first, issue=replace(first.issue, end=first.issue.end - 1)),
+        *placements[1:],
+    )
+    selected = owner.partition.specs
+    reversed_edge = ContractionPartition(
+        owner.graph, (selected[2], *selected[:2], *selected[3:])
+    )
+    for items, partition in (
+        (placements[:-1], owner.partition),
+        (short, owner.partition),
+        (placements, reversed_edge),
+    ):
+        with pytest.raises(chain._UnsupportedChain, match="incomplete|reverses"):
+            order_issue_placements(owner.graph, items, partition=partition)
+
+
+@pytest.mark.parametrize("boundary", ("state", "inverse"))
+def test_bt32_shared_rejects_changed_original_rounding(
+    bt32_shared: FastInverse,
+    boundary: str,
+) -> None:
+    owner = bt32_shared.owner
+    # Exercise both the recurrence BF16 snapshot and inverse FP16 boundary.
+    node = (
+        owner.packed_state_nodes[0]
+        if boundary == "state"
+        else bt32_shared.products[0].spec.lhs
+    )
+    assert node.target is torch.ops.prims.convert_element_type.default
+    original = node.args
+    node.args = (
+        original[0],
+        torch.float16 if original[1] is torch.bfloat16 else torch.bfloat16,
+    )
+    try:
+        with pytest.raises(chain._UnsupportedChain, match="changed"):
+            bt32_shared.payload()
+    finally:
+        node.args = original
+
+
+def test_bt32_shared_binding_is_independent_of_names(
+    bt32_shared: FastInverse, bt32_bound: BoundKernel
+) -> None:
+    owner = bt32_shared.owner
+    assert bt32_bound.host_function is not None
+    loop = next(
+        g
+        for g in bt32_bound.host_function.device_ir.cute_semantic_graphs
+        if g.graph_id == owner.region.loop_graph_id
+    )
+    expected = owner.payload(), bt32_shared.pairwise.payload(), bt32_shared.payload()
+    names = {node: node.name for node in owner.graph.region.graph.nodes}
+    try:
+        for index, node in enumerate(names):
+            node.name = f"anonymous_{index}"
+        rebound = bind_fast_recurrence(owner.region, loop)
+        pairwise = bind_fast_pairwise(rebound)
+        inverse = bind_fast_inverse(rebound, pairwise)
+        assert (rebound.payload(), pairwise.payload(), inverse.payload()) == expected
+    finally:
+        for node, name in names.items():
+            node.name = name
+
+
+def test_bt32_shared_state_read_and_output_release_cuts(
+    bt32_shared: FastInverse,
+) -> None:
+    owner = bt32_shared.owner
+    schedules = []
+    original = prepared_state_planner.plan_state_transfers
+
+    def plan(
+        requests: tuple[prepared_state_planner.StatePublication, ...],
+        cuts: tuple[prepared_state_planner.StateCut, ...],
+    ) -> prepared_state_planner.StateTransferPlan:
+        result = original(requests, cuts)
+        schedules.append(result)
+        return result
+
+    with patch.object(prepared_state_planner, "plan_state_transfers", plan):
+        bind_fast_state(owner)
+        state = tuple(schedules)
+        schedules.clear()
+        bind_fast_output(owner)
+        output = tuple(schedules)
+    assert len(state) >= 2
+    assert len(output) == 2
+    for panel in state[:2]:
+        assert len(panel.residency) == 1
+        assert panel.residency[0].source is owner.state_input
+        assert set(panel.residency[0].consumers) == {
+            owner.packed_state_nodes[0],
+            owner.scaled_state,
+        }
+        actions = panel.actions
+        assert actions[0].kind == "read"
+        assert actions[-1].kind == "store"
+        assert actions[-1].binding.destination is owner.scaled_state
+        assert sum(action.kind == "read" for action in actions) == 1
+    for cycle in output:
+        assert cycle.residency[0].source is owner.output_update.node
+        assert cycle.residency[0].first_interval == 0
+        assert cycle.residency[0].last_interval == 2
+        assert [effect.kind for effect in cycle.phases[0]] == ["read"]
+        assert not cycle.phases[1]
+        assert all(effect.kind != "read" for effect in cycle.phases[2])
+        assert all(request.read_before is cycle.cuts[0] for request in cycle.requests)
+        assert all(request.store_before is cycle.cuts[2] for request in cycle.requests)
+
+
+def test_bt32_shared_public_payloads_reach_host(
+    bt32_shared: FastInverse,
+    bt32_bound: BoundKernel,
+    bt32_shared_plan: dict[str, object],
+) -> None:
+    owner = bt32_shared.owner
+    assert bt32_bound.host_function is not None
+    root = next(
+        g
+        for g in bt32_bound.host_function.device_ir.cute_semantic_graphs
+        if g.graph_id == owner.region.root_graph_id
+    )
+    expected = {
+        "ISSUE_PROGRAM": owner.payload(),
+        "STATE_PROGRAM": bind_fast_state(owner),
+        "STATE_ABI_PROGRAM": bind_fast_state_abi(owner.region, root),
+        "OUTPUT_PROGRAM": bind_fast_output(owner),
+        "PAIRWISE_PROGRAM": bt32_shared.pairwise.payload(),
+        "INVERSE_PROGRAM": bt32_shared.payload(),
+    }
+    plan = bt32_shared_plan
+    for name, payload in expected.items():
+        assert plan[f"prepared_{name.lower()}"] == payload
+    body: list[str] = []
+    append_host_call(body, plan)
+    wrapper = ast.parse("def wrapper():\n" + "\n".join(body))
+    calls = [
+        node
+        for node in ast.walk(wrapper)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_helion_chunk_prefill_host"
+    ]
+    assert len(calls) == 1
+    assert {
+        keyword.arg: ast.literal_eval(keyword.value)
+        for keyword in calls[0].keywords
+        if keyword.arg in expected
+    } == expected
+    helpers = {
+        name: tuple(helper for helper, source in plan[f"prepared_{name.lower()}"])
+        for name in (
+            "FACTOR_PUBLICATIONS",
+            "STATE_PUBLICATIONS",
+            "FACTOR_INPUTS",
+            "GATE_PUBLICATIONS",
+        )
+    }
+    assert all(helpers.values())
+    assert {
+        keyword.arg for keyword in calls[0].keywords
+    } == expected.keys() | helpers.keys()
+    for keyword in calls[0].keywords:
+        if keyword.arg not in helpers:
+            continue
+        assert isinstance(keyword.value, ast.Tuple)
+        assert all(isinstance(value, ast.Name) for value in keyword.value.elts)
+        assert tuple(value.id for value in keyword.value.elts) == helpers[keyword.arg]
+
+
+def test_bt32_shared_helper_definitions_and_globals_reach_actual_wrapper(
+    bt32_shared_plan: dict[str, object],
+) -> None:
+    _assert_prefill_helper_namespace(bt32_shared_plan)
+
+
+def _assert_prefill_helper_namespace(plan: dict[str, object]) -> None:
+    declarations = (
+        *plan["prepared_factor_publications"],
+        *plan["prepared_state_publications"],
+        *plan["prepared_factor_inputs"],
+        *plan["prepared_gate_publications"],
+    )
+    names = tuple(name for name, source in declarations)
+    assert names and len(names) == len(set(names))
+    sources = prepared_helper_sources(plan)
+    assert sources == tuple(source for name, source in declarations)
+    # The production wrapper builder creates these functions without native
+    # compilation. Its input here is the real public graph's serialized plan.
+    kernel = SimpleNamespace(_helion_cute_wrapper_plans=[plan])
+    wrapper = inspect.unwrap(_create_cute_wrapper(kernel, (), (1024, 1, 1)))
+    module = ast.parse("".join(linecache.getlines(wrapper.__code__.co_filename)))
+    functions = [node for node in module.body if isinstance(node, ast.FunctionDef)]
+    assert tuple(node.name for node in functions) == (*names, wrapper.__name__)
+    expected_prefix = [node for source in sources for node in ast.parse(source).body]
+    assert [ast.dump(node) for node in module.body[:-1]] == [
+        ast.dump(node) for node in expected_prefix
+    ]
+    for name in names:
+        helper = inspect.unwrap(wrapper.__globals__[name])
+        globals_used = {
+            instruction.argval
+            for instruction in dis.get_instructions(helper)
+            if instruction.opname == "LOAD_GLOBAL"
+        }
+        assert globals_used <= helper.__globals__.keys() | helper.__builtins__.keys()
+
+
+def test_bt32_shared_device_routes_programs_to_original_roles() -> None:
+    from helion._compiler.cute.chunk_prefill_bt32 import device
+
+    tree = ast.parse(inspect.getsource(device))
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    programs = {
+        "ISSUE_PROGRAM",
+        "STATE_PROGRAM",
+        "STATE_ABI_PROGRAM",
+        "OUTPUT_PROGRAM",
+        "PAIRWISE_PROGRAM",
+        "INVERSE_PROGRAM",
+        "FACTOR_PUBLICATIONS",
+        "STATE_PUBLICATIONS",
+        "FACTOR_INPUTS",
+        "GATE_PUBLICATIONS",
+    }
+    routes = {
+        "host": {"kernel": programs, "empty_state_copy": {"STATE_ABI_PROGRAM"}},
+        "kernel": {
+            "state_loop": {"STATE_PROGRAM", "STATE_ABI_PROGRAM", "STATE_PUBLICATIONS"},
+            "output_loop": {"OUTPUT_PROGRAM", "STATE_PUBLICATIONS"},
+            "issuer_loop": {"ISSUE_PROGRAM"},
+            "factor_loop": {
+                "PAIRWISE_PROGRAM",
+                "INVERSE_PROGRAM",
+                "FACTOR_PUBLICATIONS",
+                "FACTOR_INPUTS",
+                "GATE_PUBLICATIONS",
+            },
+        },
+    }
+    for function, callees in routes.items():
+        calls = [
+            node
+            for node in ast.walk(functions[function])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+        for callee, expected in callees.items():
+            selected = [call for call in calls if call.func.id == callee]
+            assert len(selected) == 1
+            forwarded = {
+                keyword.arg: keyword.value
+                for keyword in selected[0].keywords
+                if keyword.arg in programs
+            }
+            assert set(forwarded) == expected
+            assert all(
+                isinstance(value, ast.Name) and value.id == name
+                for name, value in forwarded.items()
+            )
+
+
+@pytest.fixture
+def bt16_bound(prefill_cpu_target: None) -> BoundKernel:
+    return kda_prefill_native_math._bind_isolated(
+        _inputs(heads=8, sequences=7, device=torch.device("cpu"))
+    )
+
+
+@pytest.fixture
+def bt16_shared_capture(
+    bt16_bound: BoundKernel,
+) -> tuple[DeviceFunction, BT16Bindings, dict[str, object]]:
+    observed: list[
+        tuple[DeviceFunction, BT16Bindings, torch.fx.GraphModule | None]
+    ] = []
+
+    def bind(region: CuteChunkPrefillRegion, loop: GraphInfo) -> BT16Bindings:
+        owner = bind_bt16(region, loop)
+        observed.append(
+            (DeviceFunction.current(), owner, owner.graph.region.graph.owning_module)
+        )
+        return owner
+
+    with patch("helion._compiler.cute.chunk_prefill_prepared_bt16.bind_bt16", bind):
+        source = bt16_bound.to_code(bt16_bound.config_spec.default_config())
+    ((device, owner, module),) = observed
+    assert owner.graph.region.graph.owning_module is module
+    owner.check()
+    assignments = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute)
+            and target.attr == "_helion_cute_wrapper_plans"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    (plan,) = ast.literal_eval(assignments[0].value)
+    return device, owner, plan
+
+
+@pytest.fixture
+def bt16_shared(
+    bt16_bound: BoundKernel,
+    bt16_shared_capture: tuple[DeviceFunction, BT16Bindings, dict[str, object]],
+) -> Iterator[BT16Bindings]:
+    device, owner, _plan = bt16_shared_capture
+    assert bt16_bound.host_function is not None
+    with bt16_bound.env, bt16_bound.host_function, device:
+        yield owner
+
+
+def test_bt16_shared_partitions_cover_original_graph(bt16_shared: BT16Bindings) -> None:
+    owner = bt16_shared
+    partitions = (owner.partition, owner.pairwise_partition, owner.inverse_partition)
+    assert tuple(len(partition.specs) for partition in partitions) == (5, 2, 6)
+    selected = [spec for partition in partitions for spec in partition.specs]
+    original = owner.graph.region.contractions
+    assert len(selected) == len(original) == len({id(spec) for spec in selected}) == 13
+    assert {id(spec) for spec in selected} == {id(spec) for spec in original}
+    assert all(partition.graph is owner.graph for partition in partitions)
+    assert (
+        tuple(product.spec for product in owner.products)
+        == owner.inverse_partition.specs
+    )
+    assert all(
+        product.operands == (product.spec.lhs, product.spec.rhs)
+        and product.spec.operand_dtypes == (torch.float16, torch.float16)
+        for product in owner.products
+    )
+    assert owner.state_update.node is owner.region.step.state_output
+    assert owner.state_update.accumulator is owner.scaled_state
+    assert owner.output_update.accumulator is owner.query.node
+    assert any(
+        edge.producer is owner.qk and edge.consumer is owner.output_update
+        for edge in owner.partition.boundary
+    )
+
+
+@pytest.mark.parametrize("boundary", ("state", "inverse", "support"))
+def test_bt16_shared_rejects_changed_original_rounding_or_support(
+    bt16_shared: BT16Bindings, bt16_bound: BoundKernel, boundary: str
+) -> None:
+    owner = bt16_shared
+    if boundary == "support":
+        node = next(
+            node
+            for node in chain._ancestors(owner.diagonal)
+            if node.target is torch.ops.aten.lt.Scalar and node.args[1] == 8
+        )
+        changed = (*node.args[:1], 7)
+    else:
+        node = (
+            owner.packed_state_nodes[0]
+            if boundary == "state"
+            else owner.products[0].spec.lhs
+        )
+        assert node.target is torch.ops.prims.convert_element_type.default
+        changed = (
+            node.args[0],
+            torch.float16 if node.args[1] is torch.bfloat16 else torch.bfloat16,
+        )
+    original = node.args
+    node.args = changed
+    try:
+        with pytest.raises(chain._UnsupportedChain, match="changed"):
+            owner.check()
+        if boundary == "support":
+            assert bt16_bound.host_function is not None
+            loop = next(
+                graph
+                for graph in bt16_bound.host_function.device_ir.cute_semantic_graphs
+                if graph.graph_id == owner.region.loop_graph_id
+            )
+            with pytest.raises(chain._UnsupportedChain, match="sparse inverse"):
+                bind_bt16(owner.region, loop)
+    finally:
+        node.args = original
+
+
+@pytest.mark.parametrize("schedule", ("single", "prefix_tail_2", "prefix_tail_4"))
+def test_bt16_shared_programs_and_helpers_reach_every_host_segment(
+    bt16_shared: BT16Bindings,
+    bt16_bound: BoundKernel,
+    bt16_shared_capture: tuple[DeviceFunction, BT16Bindings, dict[str, object]],
+    schedule: str,
+) -> None:
+    owner = bt16_shared
+    assert bt16_bound.host_function is not None
+    root = next(
+        graph
+        for graph in bt16_bound.host_function.device_ir.cute_semantic_graphs
+        if graph.graph_id == owner.region.root_graph_id
+    )
+    expected = {
+        "PAIRWISE_PROGRAM": owner.pairwise_payload(),
+        "INVERSE_PROGRAM": owner.inverse_payload(),
+        "BT16_ISSUE_PROGRAM": bind_bt16_issues(owner),
+        "BT16_STATE_PROGRAM": bind_bt16_state(owner),
+        "BT16_OUTPUT_PROGRAM": bind_bt16_output(owner),
+        "BT16_STATE_ABI_PROGRAM": bind_bt16_state_abi(owner, root),
+    }
+    prefixes = {"single": 0, "prefix_tail_2": 2, "prefix_tail_4": 4}[schedule]
+    plan = {**bt16_shared_capture[2], "schedule": schedule, "prefix_count": prefixes}
+    helper_fields = {
+        "FACTOR_PUBLICATIONS": "prepared_factor_publications",
+        "BT16_STATE_PUBLICATIONS": "prepared_state_publications",
+        "BT16_INPUTS": "prepared_factor_inputs",
+        "BT16_GATES": "prepared_gate_publications",
+    }
+    helpers = {
+        parameter: tuple(name for name, source in plan[field])
+        for parameter, field in helper_fields.items()
+    }
+    assert all(helpers.values())
+    body: list[str] = []
+    append_host_call(body, plan)
+    tree = ast.parse("def wrapper():\n" + "\n".join(body))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_helion_chunk_prefill_host"
+    ]
+    for call in calls:
+        assert {
+            keyword.arg for keyword in call.keywords
+        } == expected.keys() | helpers.keys()
+        assert {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in call.keywords
+            if keyword.arg in expected
+        } == expected
+        for keyword in call.keywords:
+            if keyword.arg in helpers:
+                assert isinstance(keyword.value, ast.Tuple)
+                assert all(isinstance(value, ast.Name) for value in keyword.value.elts)
+                assert (
+                    tuple(value.id for value in keyword.value.elts)
+                    == helpers[keyword.arg]
+                )
+    initial = f"arg{plan['initial_state_idx']}"
+    final = f"arg{plan['final_state_idx']}"
+    if not prefixes:
+        assert len(calls) == 1
+        assert ast.unparse(calls[0].args[10]) == initial
+        assert ast.unparse(calls[0].args[12]) == final
+        return
+    groups = plan["sequence_groups"]
+    assert len(calls) == groups * (prefixes + 1)
+    sequence_intervals = []
+    for group in range(groups):
+        segments = calls[group * (prefixes + 1) : (group + 1) * (prefixes + 1)]
+        assert ast.unparse(segments[0].args[10]) == initial
+        assert ast.unparse(segments[-1].args[12]) == final
+        assert len({ast.unparse(call.args[13]) for call in segments}) == 1
+        assert ast.literal_eval(segments[0].args[24]) == 0
+        assert ast.literal_eval(segments[-1].args[25]) == -1
+        for previous, following in itertools.pairwise(segments):
+            assert ast.dump(previous.args[12]) == ast.dump(following.args[10])
+            assert ast.literal_eval(previous.args[24]) + ast.literal_eval(
+                previous.args[25]
+            ) == ast.literal_eval(following.args[24])
+        sequence_begin = segments[0].args[26]
+        assert isinstance(sequence_begin, ast.Call)
+        begin = ast.literal_eval(sequence_begin.args[0])
+        count = ast.literal_eval(segments[0].args[27])
+        assert all(
+            ast.dump(call.args[26]) == ast.dump(sequence_begin) for call in segments
+        )
+        assert all(ast.literal_eval(call.args[27]) == count for call in segments)
+        sequence_intervals.extend(range(begin, begin + count))
+    assert sequence_intervals == list(range(plan["sequences"]))
+
+
+def test_bt16_shared_helpers_reach_actual_wrapper_namespace(
+    bt16_shared_capture: tuple[DeviceFunction, BT16Bindings, dict[str, object]],
+) -> None:
+    _assert_prefill_helper_namespace(bt16_shared_capture[2])
+
+
+def test_bt16_shared_device_programs_reach_original_roles() -> None:
+    from helion._compiler.cute import chunk_prefill_tmem
+
+    tree = ast.parse(inspect.getsource(chunk_prefill_tmem))
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    programs = {
+        "PAIRWISE_PROGRAM",
+        "INVERSE_PROGRAM",
+        "FACTOR_PUBLICATIONS",
+        "BT16_ISSUE_PROGRAM",
+        "BT16_STATE_PROGRAM",
+        "BT16_OUTPUT_PROGRAM",
+        "BT16_STATE_ABI_PROGRAM",
+        "BT16_STATE_PUBLICATIONS",
+        "BT16_INPUTS",
+        "BT16_GATES",
+    }
+    routes = {
+        "super_mma_stage_pairwise_pipeline": {
+            name: name
+            for name in ("PAIRWISE_PROGRAM", "INVERSE_PROGRAM", "FACTOR_PUBLICATIONS")
+        },
+        "super_mma_stage_qk": {
+            name: name for name in ("PAIRWISE_PROGRAM", "FACTOR_PUBLICATIONS")
+        },
+        "tma_stage_load_inputs": {"BT16_GATES": "BT16_GATES"},
+        "cg0_materialize_decay_operands": {
+            "BT16_INPUTS": "BT16_INPUTS",
+            "BT16_GATES": "BT16_GATES",
+        },
+    }
+    for name in (
+        "tcgen05_issue_state_k_mma",
+        "tcgen05_issue_state_q_mma",
+        "tcgen05_issue_update_mma",
+        "tcgen05_issue_final_state_delta_mma",
+        "tcgen05_issue_qkv_mma",
+    ):
+        routes[name] = {"ISSUE_PROGRAM": "BT16_ISSUE_PROGRAM"}
+    for name in (
+        "tcgen05_store_initial_state_tmem",
+        "tcgen05_store_final_state_tmem",
+    ):
+        routes[name] = {"STATE_ABI_PROGRAM": "BT16_STATE_ABI_PROGRAM"}
+    for name in (
+        "tcgen05_pack_rescale_state_half_tmem",
+        "tcgen05_stage_state_input_tmem",
+        "tcgen05_publish_projection_then_rescale_state_regs",
+        "tcgen05_stage_rhs_input_tmem",
+        "tcgen05_stage_update_input_tmem",
+        "tcgen05_load_qstate_output_tmem",
+    ):
+        routes[name] = {
+            "STATE_PROGRAM": "BT16_STATE_PROGRAM",
+            "STATE_PUBLICATIONS": "BT16_STATE_PUBLICATIONS",
+        }
+    for name in (
+        "epilogue_wait_and_store_final_output",
+        "epilogue_wait_and_store_full_output",
+    ):
+        routes[name] = {"OUTPUT_PROGRAM": "BT16_OUTPUT_PROGRAM"}
+    for function, expected_routes in (
+        ("host", {"kernel": {name: name for name in programs}}),
+        ("kernel", routes),
+    ):
+        observed = set()
+        for call in ast.walk(functions[function]):
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name):
+                continue
+            forwarded = {
+                keyword.arg: keyword.value.id
+                for keyword in call.keywords
+                if isinstance(keyword.value, ast.Name) and keyword.value.id in programs
+            }
+            if forwarded:
+                assert forwarded == expected_routes[call.func.id]
+                observed.add(call.func.id)
+        assert observed == expected_routes.keys()

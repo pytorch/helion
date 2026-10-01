@@ -32,7 +32,7 @@ def validate_plan(plan: dict[str, object]) -> None:
             or plan.get("chunk_size") != 32
             or plan.get("numerical_policy") != "centered_bt32_fp32_rhs_v2"
             or plan.get("task_order", "identity")
-            not in ("identity", "longest_first_precompute")
+            not in ("identity", "longest_first", "longest_first_precompute")
             or plan.get("schedule", "single") != "single"
         ):
             raise exc.BackendUnsupported(
@@ -234,9 +234,34 @@ def append_host_call(body: list[str], plan: dict[str, object]) -> None:
             else plan.get("task_order", "identity")
         ),
     )
+    programs = tuple(
+        f"{parameter}={plan[key]!r}"
+        for key, parameter in (
+            ("prepared_pairwise_program", "PAIRWISE_PROGRAM"),
+            ("prepared_inverse_program", "INVERSE_PROGRAM"),
+            ("prepared_issue_program", "BT16_ISSUE_PROGRAM"),
+            ("prepared_state_program", "BT16_STATE_PROGRAM"),
+            ("prepared_output_program", "BT16_OUTPUT_PROGRAM"),
+            ("prepared_state_abi_program", "BT16_STATE_ABI_PROGRAM"),
+        )
+        if key in plan
+    )
+    for key, parameter in (
+        ("prepared_factor_publications", "FACTOR_PUBLICATIONS"),
+        ("prepared_state_publications", "BT16_STATE_PUBLICATIONS"),
+        ("prepared_factor_inputs", "BT16_INPUTS"),
+        ("prepared_gate_publications", "BT16_GATES"),
+    ):
+        if key in plan:
+            helpers = cast("tuple[tuple[str, str], ...]", plan[key])
+            programs += (
+                f"{parameter}=(" + ", ".join(name for name, source in helpers) + ",)",
+            )
     body.append("    _helion_cute_kernel_tag = 'chunk_prefill_sm100'")
     if plan.get("schedule", "single") == "single":
-        body.append(f"    _helion_chunk_prefill_host({', '.join(call_args)})")
+        body.append(
+            f"    _helion_chunk_prefill_host({', '.join((*call_args, *programs))})"
+        )
         return
     prefixes = cast("int", plan["prefix_count"])
     groups = cast("int", plan["sequence_groups"])
@@ -266,7 +291,9 @@ def append_host_call(body: list[str], plan: dict[str, object]) -> None:
                     str(end - begin),
                 )
             )
-            body.append(f"    _helion_chunk_prefill_host({', '.join(stage_args)})")
+            body.append(
+                f"    _helion_chunk_prefill_host({', '.join((*stage_args, *programs))})"
+            )
 
 
 def _append_bt32_host_call(body: list[str], plan: dict[str, object]) -> None:
@@ -326,11 +353,47 @@ def _append_bt32_host_call(body: list[str], plan: dict[str, object]) -> None:
             else plan.get("task_order", "identity")
         ),
     )
+    programs = tuple(
+        f"{parameter}={plan[key]!r}"
+        for key, parameter in (
+            ("prepared_issue_program", "ISSUE_PROGRAM"),
+            ("prepared_state_program", "STATE_PROGRAM"),
+            ("prepared_state_abi_program", "STATE_ABI_PROGRAM"),
+            ("prepared_output_program", "OUTPUT_PROGRAM"),
+            ("prepared_pairwise_program", "PAIRWISE_PROGRAM"),
+            ("prepared_inverse_program", "INVERSE_PROGRAM"),
+        )
+        if key in plan
+    )
+    for key, parameter in (
+        ("prepared_factor_publications", "FACTOR_PUBLICATIONS"),
+        ("prepared_state_publications", "STATE_PUBLICATIONS"),
+        ("prepared_factor_inputs", "FACTOR_INPUTS"),
+        ("prepared_gate_publications", "GATE_PUBLICATIONS"),
+    ):
+        if key in plan:
+            helpers = cast("tuple[tuple[str, str], ...]", plan[key])
+            names = ", ".join(name for name, source in helpers)
+            programs = (*programs, f"{parameter}=({names},)")
     body.extend(
         (
             "    _helion_cute_kernel_tag = 'chunk_prefill_sm100'",
-            f"    _helion_chunk_prefill_host({', '.join(call_args)})",
+            f"    _helion_chunk_prefill_host({', '.join((*call_args, *programs))})",
         )
+    )
+
+
+def prepared_helper_sources(plan: dict[str, object]) -> tuple[str, ...]:
+    """Original scalar expression helpers used by the selected physical adapter."""
+    return tuple(
+        source
+        for key in (
+            "prepared_factor_publications",
+            "prepared_state_publications",
+            "prepared_factor_inputs",
+            "prepared_gate_publications",
+        )
+        for name, source in cast("tuple[tuple[str, str], ...]", plan.get(key, ()))
     )
 
 

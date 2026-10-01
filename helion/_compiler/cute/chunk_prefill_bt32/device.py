@@ -16,6 +16,7 @@ import cutlass.cute as cute
 import cutlass.experimental.cuda as cuda
 import cutlass.experimental.primitives as prims
 
+from ..sequence_order import select_sequence_by_length
 from ..warp_specialized_primitives import initialize_mbarrier_region
 from . import common as cm
 from .factor import factor_loop
@@ -75,6 +76,17 @@ def kernel(
     final_state: cute.Tensor | None,
     scale: cutlass.Float32,
     gate_scale_log2: cutlass.Float32,
+    TASK_ORDER: cutlass.Constexpr = "identity",
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+    FACTOR_INPUTS: cutlass.Constexpr = None,
+    GATE_PUBLICATIONS: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
     thread, _, _ = cute.arch.thread_idx()
     warp = cute.arch.make_warp_uniform(thread // 32)
@@ -84,6 +96,10 @@ def kernel(
     sequence = cute.arch.make_warp_uniform(sequence)
     if cutlass.const_expr(seq_order is not None):
         sequence = cute.arch.make_warp_uniform(cutlass.Int32(seq_order[sequence]))
+    elif cutlass.const_expr(TASK_ORDER == "longest_first"):
+        sequence = cute.arch.make_warp_uniform(
+            select_sequence_by_length(cu_seqlens, sequence, thread, cm.THREADS)
+        )
     begin = cutlass.Int64(cu_seqlens[sequence])
     end = cutlass.Int64(cu_seqlens[sequence + 1])
     begin = cute.arch.make_warp_uniform(begin)
@@ -121,6 +137,9 @@ def kernel(
             warp,
             lane,
             gate_scale_log2,
+            STATE_PROGRAM=STATE_PROGRAM,
+            STATE_ABI_PROGRAM=STATE_ABI_PROGRAM,
+            STATE_PUBLICATIONS=STATE_PUBLICATIONS,
         )
     elif warp < cm.OUTPUT_LAST_WARP:
         prims.setmaxregister(cm.OUTPUT_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
@@ -135,11 +154,13 @@ def kernel(
             num_chunks,
             warp,
             lane,
+            OUTPUT_PROGRAM=OUTPUT_PROGRAM,
+            STATE_PUBLICATIONS=STATE_PUBLICATIONS,
         )
     elif warp < cm.SERVICE_LAST_WARP:
         prims.setmaxregister(cm.SERVICE_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
         if warp == 9:
-            issuer_loop(smem_base, tmem_base, num_chunks)
+            issuer_loop(smem_base, tmem_base, num_chunks, ISSUE_PROGRAM=ISSUE_PROGRAM)
     else:
         prims.setmaxregister(cm.FACTOR_REGISTERS, prims.SetMaxRegisterAction.DECREASE)
         factor_loop(
@@ -166,18 +187,38 @@ def kernel(
             lane,
             scale,
             gate_scale_log2,
+            PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+            INVERSE_PROGRAM=INVERSE_PROGRAM,
+            FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
+            FACTOR_INPUTS=FACTOR_INPUTS,
+            GATE_PUBLICATIONS=GATE_PUBLICATIONS,
         )
 
 
 @cute.kernel
-def empty_state_copy(initial_state: cute.Tensor | None, final_state: cute.Tensor):
+def empty_state_copy(
+    initial_state: cute.Tensor | None,
+    final_state: cute.Tensor,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+):
+    from ..prepared_tcgen_edge import execute_prepared_state_abi
+
     row, _, _ = cute.arch.thread_idx()
     head, sequence, _ = cute.arch.block_idx()
-    for column in cutlass.range_constexpr(128):
-        value = cutlass.Float32(0.0)
-        if cutlass.const_expr(initial_state is not None):
-            value = initial_state[sequence, head, row, column]
-        final_state[sequence, head, row, column] = value
+    if cutlass.const_expr(STATE_ABI_PROGRAM is not None):
+        execute_prepared_state_abi(
+            STATE_ABI_PROGRAM[2],
+            initial_state,
+            final_state,
+            None,
+            (sequence, head, row),
+        )
+    else:
+        for column in cutlass.range_constexpr(128):
+            value = cutlass.Float32(0.0)
+            if cutlass.const_expr(initial_state is not None):
+                value = initial_state[sequence, head, row, column]
+            final_state[sequence, head, row, column] = value
 
 
 def _validate_metadata(
@@ -211,7 +252,7 @@ def _validate_metadata(
     if THREADS != cm.THREADS or not SAFE_GATE:
         raise ValueError("BT32 prototype requires THREADS=1024 and SAFE_GATE=True")
     if (
-        TASK_ORDER != "identity"
+        TASK_ORDER not in ("identity", "longest_first")
         or SEGMENT_BEGIN != 0
         or SEGMENT_SIZE != -1
         or (SEQUENCE_COUNT != 0)
@@ -223,7 +264,7 @@ def _validate_metadata(
         or (checkpoint_state_indices is not None)
     ):
         raise ValueError(
-            "BT32 prototype supports identity, unsegmented, unindexed calls only"
+            "BT32 supports identity or longest-first unsegmented, unindexed calls"
         )
     if seq_order is not None and (
         seq_order.element_type is not cutlass.Int32
@@ -289,6 +330,16 @@ def host(
     SEGMENT_SIZE: cutlass.Constexpr = -1,
     SEQUENCE_BEGIN: cutlass.Constexpr = 0,
     SEQUENCE_COUNT: cutlass.Constexpr = 0,
+    ISSUE_PROGRAM: cutlass.Constexpr = None,
+    STATE_PROGRAM: cutlass.Constexpr = None,
+    STATE_ABI_PROGRAM: cutlass.Constexpr = None,
+    OUTPUT_PROGRAM: cutlass.Constexpr = None,
+    PAIRWISE_PROGRAM: cutlass.Constexpr = None,
+    INVERSE_PROGRAM: cutlass.Constexpr = None,
+    FACTOR_PUBLICATIONS: cutlass.Constexpr = None,
+    FACTOR_INPUTS: cutlass.Constexpr = None,
+    GATE_PUBLICATIONS: cutlass.Constexpr = None,
+    STATE_PUBLICATIONS: cutlass.Constexpr = None,
 ):
     _validate_metadata(
         q,
@@ -322,9 +373,9 @@ def host(
     sequences = cu_seqlens.shape[0] - 1
     if cutlass.const_expr(tokens == 0):
         if cutlass.const_expr(final_state is not None):
-            empty_state_copy(initial_state, final_state).launch(
-                grid=(heads, sequences, 1), block=(128, 1, 1), stream=stream
-            )
+            empty_state_copy(
+                initial_state, final_state, STATE_ABI_PROGRAM=STATE_ABI_PROGRAM
+            ).launch(grid=(heads, sequences, 1), block=(128, 1, 1), stream=stream)
     else:
         qk_layout = cute.make_layout(
             (64, tokens, 2, heads, 1), stride=(1, 128 * heads, 64, 128, 128)
@@ -391,6 +442,17 @@ def host(
             final_state,
             SCALE,
             GATE_SCALE_LOG2,
+            TASK_ORDER=TASK_ORDER,
+            ISSUE_PROGRAM=ISSUE_PROGRAM,
+            STATE_PROGRAM=STATE_PROGRAM,
+            STATE_ABI_PROGRAM=STATE_ABI_PROGRAM,
+            OUTPUT_PROGRAM=OUTPUT_PROGRAM,
+            PAIRWISE_PROGRAM=PAIRWISE_PROGRAM,
+            INVERSE_PROGRAM=INVERSE_PROGRAM,
+            FACTOR_PUBLICATIONS=FACTOR_PUBLICATIONS,
+            FACTOR_INPUTS=FACTOR_INPUTS,
+            GATE_PUBLICATIONS=GATE_PUBLICATIONS,
+            STATE_PUBLICATIONS=STATE_PUBLICATIONS,
         ).launch(
             grid=(heads, sequences, 1),
             block=(THREADS, 1, 1),

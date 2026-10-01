@@ -196,7 +196,7 @@ def register_chunk_prefill_search(env: CompileEnvironment, device_ir: DeviceIR) 
         if region.chunk_size == 32:
             env.config_spec.enable_cute_chunk_prefill_task_order_search(
                 schedules=("single",),
-                task_orders=("identity", "longest_first_precompute"),
+                task_orders=("identity", "longest_first", "longest_first_precompute"),
             )
         else:
             env.config_spec.enable_cute_chunk_prefill_task_order_search()
@@ -277,6 +277,7 @@ def codegen_chunk_prefill(cg: GenerateAST) -> bool:
             ],
             "sequence_groups": min(4, region.sequences),
             "device_abi": 1,
+            **_bt16_prepared_bindings(cg, region),
         }
     )
     df.placeholder_args.update((*names, output_scale, gate_scale))
@@ -286,9 +287,50 @@ def codegen_chunk_prefill(cg: GenerateAST) -> bool:
     return True
 
 
+def _bt16_prepared_bindings(
+    cg: GenerateAST, region: CuteChunkPrefillRegion
+) -> dict[str, object]:
+    from .chunk_prefill_prepared_bt16 import bind_bt16
+    from .chunk_prefill_prepared_bt16_factor import bind_bt16_factor_publications
+    from .chunk_prefill_prepared_bt16_gate import bind_bt16_gates
+    from .chunk_prefill_prepared_bt16_inputs import bind_bt16_inputs
+    from .chunk_prefill_prepared_bt16_state import bind_bt16_issues
+    from .chunk_prefill_prepared_bt16_state import bind_bt16_output
+    from .chunk_prefill_prepared_bt16_state import bind_bt16_state
+    from .chunk_prefill_prepared_bt16_state import bind_bt16_state_abi
+    from .chunk_prefill_prepared_bt16_state import bind_bt16_state_publications
+
+    graphs = cg.host_function.device_ir.cute_semantic_graphs
+    loop = next(graph for graph in graphs if graph.graph_id == region.loop_graph_id)
+    root = next(graph for graph in graphs if graph.graph_id == region.root_graph_id)
+    owner = bind_bt16(region, loop)
+    return {
+        "prepared_pairwise_program": owner.pairwise_payload(),
+        "prepared_inverse_program": owner.inverse_payload(),
+        "prepared_issue_program": bind_bt16_issues(owner),
+        "prepared_state_program": bind_bt16_state(owner),
+        "prepared_output_program": bind_bt16_output(owner),
+        "prepared_state_abi_program": bind_bt16_state_abi(owner, root),
+        "prepared_factor_publications": bind_bt16_factor_publications(cg, owner),
+        "prepared_state_publications": bind_bt16_state_publications(cg, owner),
+        "prepared_factor_inputs": bind_bt16_inputs(cg, owner),
+        "prepared_gate_publications": bind_bt16_gates(cg, owner),
+    }
+
+
 def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
     """Emit the implemented centered-BT32 single-stream schedules."""
     from .chunk_prefill_bt32.config import PIPELINE_PLAN
+    from .chunk_prefill_prepared_factor_inputs import bind_fast_factor_inputs
+    from .chunk_prefill_prepared_gate import bind_fast_gate_publications
+    from .chunk_prefill_prepared_inverse import bind_fast_inverse
+    from .chunk_prefill_prepared_issue import bind_fast_recurrence
+    from .chunk_prefill_prepared_output import bind_fast_output
+    from .chunk_prefill_prepared_pairwise import bind_fast_pairwise
+    from .chunk_prefill_prepared_publication import bind_fast_factor_publications
+    from .chunk_prefill_prepared_state import bind_fast_state
+    from .chunk_prefill_prepared_state_abi import bind_fast_state_abi
+    from .chunk_prefill_prepared_state_publication import bind_fast_state_publications
 
     df = cg.device_function
     region = df.cute_state.chunk_prefill_plan
@@ -304,7 +346,7 @@ def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
         region.chunk_size != 32
         or df.config.get(CUTE_CHUNK_PREFILL_SCHEDULE_KEY, "single") != "single"
         or df.config.get(CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, "identity")
-        not in ("identity", "longest_first_precompute")
+        not in ("identity", "longest_first", "longest_first_precompute")
     ):
         return False
     refs = (
@@ -319,6 +361,19 @@ def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
     gate_scale = df.literal_expr(region.step.gate_scale.meta["val"]._sympy_())
     if not output_scale.isidentifier() or not gate_scale.isidentifier():
         return False
+    semantic_loop = next(
+        graph
+        for graph in cg.host_function.device_ir.cute_semantic_graphs
+        if graph.graph_id == region.loop_graph_id
+    )
+    recurrence = bind_fast_recurrence(region, semantic_loop)
+    pairwise = bind_fast_pairwise(recurrence)
+    inverse = bind_fast_inverse(recurrence, pairwise)
+    semantic_root = next(
+        graph
+        for graph in cg.host_function.device_ir.cute_semantic_graphs
+        if graph.graph_id == region.root_graph_id
+    )
     keys = (
         "q",
         "k",
@@ -343,6 +398,18 @@ def _codegen_chunk_prefill_bt32(cg: GenerateAST) -> bool:
             "total_tokens": region.total_tokens,
             "threads": PIPELINE_PLAN.threads,
             "smem_bytes": PIPELINE_PLAN.shared_bytes,
+            "prepared_issue_program": recurrence.payload(),
+            "prepared_state_program": bind_fast_state(recurrence),
+            "prepared_state_abi_program": bind_fast_state_abi(region, semantic_root),
+            "prepared_output_program": bind_fast_output(recurrence),
+            "prepared_pairwise_program": pairwise.payload(),
+            "prepared_inverse_program": inverse.payload(),
+            "prepared_factor_publications": bind_fast_factor_publications(
+                cg, pairwise, inverse
+            ),
+            "prepared_state_publications": bind_fast_state_publications(cg, recurrence),
+            "prepared_factor_inputs": bind_fast_factor_inputs(cg, recurrence),
+            "prepared_gate_publications": bind_fast_gate_publications(cg, recurrence),
             "tmem_columns": PIPELINE_PLAN.tmem_columns,
             "min_blocks_per_mp": PIPELINE_PLAN.min_blocks_per_mp,
             "task_order": df.config.get(CUTE_CHUNK_PREFILL_TASK_ORDER_KEY, "identity"),

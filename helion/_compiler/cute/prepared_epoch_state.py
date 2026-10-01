@@ -191,6 +191,9 @@ class DescriptorStateBinding:
         )
 
     def check_publication(self, request: StatePublication) -> None:
+        if request.read_before is not None:
+            raise chain._UnsupportedChain("original result has no early capture cut")
+
         cycle = self.cycle
         packed_cut = (
             cycle.arrival

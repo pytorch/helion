@@ -197,6 +197,9 @@ class DescriptorProductBinding:
         )
 
     def check_publication(self, request: StatePublication) -> None:
+        if request.read_before is not None:
+            raise chain._UnsupportedChain("original result has no early capture cut")
+
         from .prepared_continuation import ContinuationOpcode
         from .prepared_epoch_protocol import EpochPort
         from .prepared_epoch_protocol import EpochPosition

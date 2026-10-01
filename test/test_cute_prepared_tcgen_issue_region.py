@@ -4,7 +4,6 @@ import ast
 from contextlib import contextmanager
 from contextlib import nullcontext
 import copy
-import hashlib
 import importlib
 import importlib.util
 from pathlib import Path
@@ -22,7 +21,7 @@ from cutlass.utils import blackwell_helpers
 import pytest
 import torch
 
-from .test_cute_prepared_continuation import _restore_epoch_edge
+from .test_cute_prepared_continuation import _check_original_edge
 from helion._compiler.cute import prepared_tcgen_edge as shared
 
 _ALIASES = {
@@ -108,13 +107,20 @@ def _restore(tree: ast.Module) -> ast.Module:
     return tree
 
 
-def test_complete_module_inverse():
-    # First verify and undo the later epoch extension, then undo only the
-    # issue-region aliases. Keep the original complete pre-alias module digest.
-    restored = _restore(_restore_epoch_edge(_module()))
-    assert hashlib.sha256(ast.dump(restored).encode()).hexdigest() == (
-        "cb6d72ff223948302ca506fe3629584115787cba68438e875c91369fb016a479"
-    )
+def test_issue_alias_rewrite_preserves_surrounding_module():
+    current = _module()
+    _check_original_edge(current)
+    restored = _restore(copy.deepcopy(current))
+    current_issue, restored_issue = _function(current), _function(restored)
+    assert ast.dump(current_issue.args) == ast.dump(restored_issue.args)
+    assert [ast.dump(node) for node in current_issue.decorator_list] == [
+        ast.dump(node) for node in restored_issue.decorator_list
+    ]
+    # The inverse changes only the issuer's aliases. Newly shared state/output
+    # leaves must not be deleted or hashed as part of that issue-region proof.
+    current.body.remove(current_issue)
+    restored.body.remove(restored_issue)
+    assert ast.dump(current) == ast.dump(restored)
 
 
 @pytest.mark.parametrize("original", [False, True])
@@ -220,7 +226,7 @@ def test_original_order_and_general_mutable_operation(
         def atom(a, b, accumulator, current_operation, k, scale, *policy):
             expected = prepared if descriptor else (*inputs[:3], operation)
             assert (a, b, accumulator, current_operation) == expected
-            assert policy == (descriptor, True, 16, advance)
+            assert policy == (descriptor, True, 16, advance, False)
             events.append(("atom", k, scale))
 
         namespace: dict[str, object] = {

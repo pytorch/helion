@@ -25,6 +25,11 @@ if TYPE_CHECKING:
     from .chained_root_stage import RootStageAction
     from .chained_seed_tiles import SeedPanel
     from .chained_tcgen_stage import StageGeometry
+    from .chunk_prefill_prepared_bt16_state import BT16StateBinding
+    from .chunk_prefill_prepared_output import FastOutputBinding
+    from .chunk_prefill_prepared_state import FastLoopStateBinding
+    from .chunk_prefill_prepared_state_abi import FastStateABIBinding
+    from .chunk_prefill_prepared_state_products import FastStateProductBinding
     from .prepared_epoch_product import DescriptorProductBinding
     from .prepared_epoch_state import DescriptorStateBinding
     from .prepared_state_planner import StatePublication
@@ -141,6 +146,9 @@ class FragmentStateBinding:
         )
 
     def check_publication(self, request: StatePublication) -> None:
+        if request.read_before is not None:
+            raise chain._UnsupportedChain("original state has no early capture cut")
+
         selected = self.plan.initialized_accumulator
         if (
             selected is None
@@ -164,7 +172,16 @@ class FragmentStateBinding:
 @dataclass(frozen=True)
 class StateEffect:
     kind: Literal["read", "transform", "store", "complete"]
-    binding: FragmentStateBinding | DescriptorStateBinding | DescriptorProductBinding
+    binding: (
+        FragmentStateBinding
+        | DescriptorStateBinding
+        | DescriptorProductBinding
+        | FastLoopStateBinding
+        | FastOutputBinding
+        | FastStateProductBinding
+        | FastStateABIBinding
+        | BT16StateBinding
+    )
     schedule: StateTransferPlan | None = field(default=None, repr=False, compare=False)
 
     @property
@@ -210,26 +227,42 @@ class StateTransfer:
     companion_values: str = "_state_companion"
 
 
+def state_transfer_instruction(
+    kind: Literal["read", "store", "complete"], transfer: StateTransfer
+) -> tuple[int, bool, str | None, int, str | None]:
+    """Native transfer geometry shared by source and constexpr-program emission."""
+    return (
+        ("read", "store", "complete").index(kind),
+        transfer.descriptor,
+        transfer.load_shape,
+        transfer.load_count,
+        transfer.store_shape,
+    )
+
+
 def emit_state_transfer(
     kind: Literal["read", "store", "complete"], transfer: StateTransfer
 ) -> list[str]:
+    _, descriptor, load_shape, load_count, store_shape = state_transfer_instruction(
+        kind, transfer
+    )
     if kind == "read":
-        call = f"prepared_tcgen_edge.execute_prepared_read({transfer.source}, {('None' if transfer.descriptor else transfer.values)}, {transfer.copy}, {transfer.companion}, None, None, {transfer.descriptor!r}, {transfer.load_shape!r}, {transfer.load_count})"
+        call = f"prepared_tcgen_edge.execute_prepared_read({transfer.source}, {('None' if descriptor else transfer.values)}, {transfer.copy}, {transfer.companion}, None, None, {descriptor!r}, {load_shape!r}, {load_count})"
         # Fragment copy mutates its already-allocated RMEM tensor. Discard its
         # redundant return rather than inventing a TMEM-derived tuple alias;
         # the original last-read storage analysis remains unchanged.
         return [
             f"{transfer.values}, {transfer.companion_values} = {call}"
-            if transfer.descriptor
+            if descriptor
             else call
         ]
     if kind == "store":
         return [
-            f"prepared_tcgen_edge.execute_prepared_store({transfer.values}, {transfer.destination}, {transfer.copy}, {transfer.descriptor!r}, {transfer.store_shape!r})"
+            f"prepared_tcgen_edge.execute_prepared_store({transfer.values}, {transfer.destination}, {transfer.copy}, {descriptor!r}, {store_shape!r})"
         ]
     if kind == "complete":
         return [
-            f"prepared_tcgen_edge.execute_prepared_store_completion({transfer.descriptor!r})"
+            f"prepared_tcgen_edge.execute_prepared_store_completion({descriptor!r})"
         ]
     raise chain._UnsupportedChain("unknown prepared state transfer")
 

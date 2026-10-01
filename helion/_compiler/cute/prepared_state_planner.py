@@ -22,12 +22,24 @@ from .prepared_state_body import StateEffect
 if TYPE_CHECKING:
     from torch.fx import Node
 
+    from .chunk_prefill_prepared_bt16_state import BT16StateBinding
+    from .chunk_prefill_prepared_output import FastOutputBinding
+    from .chunk_prefill_prepared_state import FastLoopStateBinding
+    from .chunk_prefill_prepared_state_abi import FastStateABIBinding
+    from .chunk_prefill_prepared_state_products import FastStateProductBinding
     from .prepared_epoch_product import DescriptorProductBinding
     from .prepared_epoch_state import DescriptorStateBinding
     from .prepared_state_body import FragmentStateBinding
 
     StateBinding = (
-        FragmentStateBinding | DescriptorStateBinding | DescriptorProductBinding
+        FragmentStateBinding
+        | DescriptorStateBinding
+        | DescriptorProductBinding
+        | FastLoopStateBinding
+        | FastOutputBinding
+        | FastStateProductBinding
+        | FastStateABIBinding
+        | BT16StateBinding
     )
 
 
@@ -71,6 +83,9 @@ class StateCut:
     def facts(self) -> object:
         from torch.fx import Node
 
+        from .chunk_prefill_prepared_output import FastOutputBoundary
+        from .chunk_prefill_prepared_state import FastLoopStateArrival
+        from .chunk_prefill_prepared_state_products import FastStateProductArrival
         from .prepared_epoch_protocol import EpochEvent
         from .prepared_epoch_protocol import EpochSynchronizationAction
         from .prepared_epoch_state import StateArrival
@@ -78,7 +93,15 @@ class StateCut:
         if isinstance(self.anchor, Node):
             anchor = self.anchor, _records((self.anchor.args, self.anchor.kwargs))
         elif isinstance(
-            self.anchor, (EpochEvent, EpochSynchronizationAction, StateArrival)
+            self.anchor,
+            (
+                EpochEvent,
+                EpochSynchronizationAction,
+                StateArrival,
+                FastLoopStateArrival,
+                FastOutputBoundary,
+                FastStateProductArrival,
+            ),
         ):
             owner = (
                 self.anchor.binding.owner
@@ -112,6 +135,10 @@ class StatePublication:
     transform_before: StateCut
     store_before: StateCut
     complete_before: StateCut | None
+    # Only adapters with an original detached-value lifetime may supply this.
+    # Other bindings reject it in check_publication; default reads stay at the
+    # first transform cut, preserving their existing readiness proof.
+    read_before: StateCut | None = None
 
     @property
     def source(self) -> Node:
@@ -144,6 +171,7 @@ class StatePublication:
             id(self.transform_before),
             id(self.store_before),
             id(self.complete_before),
+            id(self.read_before),
         )
 
 
@@ -245,6 +273,7 @@ def _plan_state_transfers(
     graph = requests[0].source.graph
     node_order = {node: index for index, node in enumerate(graph.nodes)}
     intervals: dict[int, tuple[int, int, int | None]] = {}
+    reads: dict[int, int] = {}
     groups: dict[tuple[object, ...], list[StatePublication]] = {}
     for request in requests:
         request.facts()
@@ -253,6 +282,8 @@ def _plan_state_transfers(
         selected = (request.transform_before, request.store_before)
         if request.complete_before is not None:
             selected = (*selected, request.complete_before)
+        if request.read_before is not None:
+            selected = (*selected, request.read_before)
         if any(id(cut) not in cut_index for cut in selected):
             raise chain._UnsupportedChain("foreign state consumer boundary")
         if any(cut.scope != request.source_view.scope for cut in selected):
@@ -265,8 +296,19 @@ def _plan_state_transfers(
             if request.complete_before is None
             else cut_index[id(request.complete_before)]
         )
-        if transform > store or complete is not None and store > complete:
+        read = (
+            transform
+            if request.read_before is None
+            else cut_index[id(request.read_before)]
+        )
+        if (
+            read > transform
+            or transform > store
+            or complete is not None
+            and store > complete
+        ):
             raise chain._UnsupportedChain("state publication precedes its value")
+        reads[id(request)] = read
         intervals[id(request)] = transform, store, complete
         key = (request.source, request.source_view.facts())
         groups.setdefault(key, []).append(request)
@@ -282,7 +324,7 @@ def _plan_state_transfers(
         for request in members:
             transform = intervals[id(request)][0]
             use_frontier.read(
-                view, PhysicalReadPoint(view.scope, transform, transform + 1)
+                view, PhysicalReadPoint(view.scope, reads[id(request)], transform + 1)
             )
     for index, request in enumerate(requests):
         a = request.destination_view
