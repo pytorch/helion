@@ -10664,14 +10664,17 @@ def _import_fa4() -> types.ModuleType:
     import flash_attn.cute as fc  # pyrefly: ignore[missing-import]
     import flash_attn.cute.utils as fu  # pyrefly: ignore[missing-import]
 
-    fu.fma_packed_f32x2 = functools.partial(cute.arch.fma_packed_f32x2, rnd="rn")
-    fu.mul_packed_f32x2 = functools.partial(cute.arch.mul_packed_f32x2, rnd="rn")
-    fu.add_packed_f32x2 = functools.partial(cute.arch.add_packed_f32x2, rnd="rn")
-    fu.sub_packed_f32x2 = functools.partial(
-        cute.arch.calc_packed_f32x2_op,
-        src_c=None,
-        calc_func=nvvm.sub_packed_f32x2,
-        rnd="rn",
+    # These compatibility functions extend the imported FA4 module's namespace.
+    vars(fu).update(
+        fma_packed_f32x2=functools.partial(cute.arch.fma_packed_f32x2, rnd="rn"),
+        mul_packed_f32x2=functools.partial(cute.arch.mul_packed_f32x2, rnd="rn"),
+        add_packed_f32x2=functools.partial(cute.arch.add_packed_f32x2, rnd="rn"),
+        sub_packed_f32x2=functools.partial(
+            cute.arch.calc_packed_f32x2_op,
+            src_c=None,
+            calc_func=nvvm.sub_packed_f32x2,
+            rnd="rn",
+        ),
     )
     return fc
 
