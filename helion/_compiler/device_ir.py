@@ -10,6 +10,7 @@ import logging
 import math
 import operator
 import re
+import sys
 import textwrap
 import threading
 from typing import TYPE_CHECKING
@@ -25,6 +26,7 @@ from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.traceback import preserve_node_meta
 from torch.utils import _pytree as pytree
 
@@ -136,6 +138,28 @@ def _lerp_scalar_decomp(
     return start + weight * (end - start)
 
 
+def _full_slice_decomp(
+    x: torch.Tensor,
+    dim: int = 0,
+    start: int | None = None,
+    end: int | torch.SymInt | None = None,
+    step: int = 1,
+) -> object:
+    # `x[:, None]` traces a full-range slice when x's size is a block var
+    # (concrete sizes elide it); inductor lowers it to its own input buffer.
+    size = x.size(dim)
+    full_end = (
+        end is None
+        or (isinstance(end, int) and end >= sys.maxsize)
+        or statically_known_true(end >= size)
+    )
+    if (start is None or (isinstance(start, int) and start == 0)) and (
+        isinstance(step, int) and step == 1 and full_end
+    ):
+        return torch.ops.aten.alias.default(x)
+    return NotImplemented
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
@@ -146,6 +170,7 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     decomp_table.pop(torch.ops.aten.stack.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
+    decomp_table[torch.ops.aten.slice.Tensor] = _full_slice_decomp
     # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.

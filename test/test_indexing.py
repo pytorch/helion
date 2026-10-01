@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import math
+import operator
 import unittest
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 import helion
@@ -15,6 +17,7 @@ from helion import exc
 from helion._compat import get_tensor_descriptor_fn_name
 from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
+from helion._compiler.device_ir import _get_custom_decomp_table
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -1000,6 +1003,21 @@ class TestIndexing(RefEagerTestBase, TestCase):
         self.assertNotEqual(
             passthrough.specialization_key((ft1,)),
             passthrough.specialization_key((ft2,)),
+        )
+
+    @skipIfRefEager("traces aten decompositions without running a kernel")
+    def test_full_slice_of_symbolic_tile_traces_as_alias(self) -> None:
+        # `x[:, None]` on a block-sized dim traces a full-range aten.slice.
+        mode = FakeTensorMode(shape_env=ShapeEnv())
+        x = mode.from_tensor(torch.randn(8, 4), static_shapes=False)
+        broadcast = operator.itemgetter((slice(None), None))
+        with mode:
+            graph = make_fx(broadcast, decomposition_table=_get_custom_decomp_table())(
+                x
+            ).graph
+        targets = [n.target for n in graph.nodes if n.op == "call_function"]
+        self.assertEqual(
+            targets, [torch.ops.aten.alias.default, torch.ops.aten.unsqueeze.default]
         )
 
     @skipIfRefEager("Test checks generated code")
