@@ -70,9 +70,7 @@ class TestFreshFinalistProcess(unittest.TestCase):
                 )
             )
             stack.enter_context(
-                patch.object(
-                    provider, "_probe_long_cute_flash_kernel", return_value=False
-                )
+                patch.object(provider, "_probe_long_kernel", return_value=False)
             )
             stack.enter_context(
                 patch(
