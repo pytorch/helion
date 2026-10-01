@@ -123,6 +123,12 @@ def _value_or(value: object, fallback: Callable[[], object]) -> object:
 
 
 class ConfigGeneration:
+    # Families whose neutral request the overrides normalize away (telemetry,
+    # not a design defect). The coverage design assigns the instance value; the
+    # class default keeps the validator usable on an instance built without
+    # ``__init__`` (tests mock the design method).
+    _flash_coverage_override_unreachable_families_cache: Sequence[object] = ()
+
     def __init__(
         self,
         config_spec: ConfigSpec,
@@ -216,6 +222,7 @@ class ConfigGeneration:
         self._flash_coverage_cache: list[FlatConfig] | None = None
         self._flash_coverage_active_values_cache: list[tuple[str, object]] | None = None
         self._flash_coverage_uncovered_cache: list[tuple[str, object]] | None = None
+        self._flash_coverage_override_unreachable_families_cache = []
         self._flash_coverage_underqualified_cache: (
             list[tuple[str, object, int]] | None
         ) = None
@@ -1102,6 +1109,7 @@ class ConfigGeneration:
             self._flash_coverage_cache = []
             self._flash_coverage_active_values_cache = []
             self._flash_coverage_uncovered_cache = []
+            self._flash_coverage_override_unreachable_families_cache = []
             self._flash_coverage_underqualified_cache = []
             self._flash_structural_leaf_catalog_cache = []
             self._flash_pipeline_lane_catalog_cache = {}
@@ -1172,6 +1180,7 @@ class ConfigGeneration:
             self._flash_coverage_cache = []
             self._flash_coverage_active_values_cache = []
             self._flash_coverage_uncovered_cache = []
+            self._flash_coverage_override_unreachable_families_cache = []
             self._flash_coverage_underqualified_cache = []
             self._flash_structural_leaf_catalog_cache = []
             self._flash_pipeline_lane_catalog_cache = {}
@@ -1357,6 +1366,25 @@ class ConfigGeneration:
 
         for raw in raw_contexts:
             add_candidate(normalize(raw))
+
+        # The surface advertises a family because its neutral request survives
+        # normalization; an override can still make it unreachable (a family
+        # whose only output path is the TMA store under a direct-epilogue
+        # override). It stays in the uncovered telemetry but is not a defect
+        # of the design.
+        unreachable_families: list[object] = []
+        family_axis = axes.get(FLASH_PIPELINE_FAMILY_KEY)
+        if family_axis is not None:
+            for value in family_axis[1]:
+                flat = copy.deepcopy(base)
+                flat[family_axis[0]] = value
+                normalized = normalize(flat)
+                if (
+                    normalized is None
+                    or normalized[0].config.get(FLASH_PIPELINE_FAMILY_KEY) != value
+                ):
+                    unreachable_families.append(value)
+        self._flash_coverage_override_unreachable_families_cache = unreachable_families
 
         interaction_goal_order: list[tuple[tuple[str, ...], tuple[object, ...]]] = []
         seen_interactions: set[tuple[tuple[str, ...], tuple[object, ...]]] = set()
@@ -1993,12 +2021,18 @@ class ConfigGeneration:
         assert self._flash_coverage_uncovered_interactions_cache is not None
         # A normalized family can legitimately have only one distinct effective
         # config. Keep two-witness shortfalls as strict-harness telemetry rather
-        # than rejecting an otherwise complete ordinary search.
+        # than rejecting an otherwise complete ordinary search. A family the
+        # overrides make unreachable is telemetry as well, not a design defect.
+        unreachable_families = self._flash_coverage_override_unreachable_families_cache
+        uncovered = [
+            goal
+            for goal in self._flash_coverage_uncovered_cache
+            if goal[0] != FLASH_PIPELINE_FAMILY_KEY
+            or goal[1] not in unreachable_families
+        ]
         problems: list[str] = []
-        if self._flash_coverage_uncovered_cache:
-            problems.append(
-                f"uncovered values={self._flash_coverage_uncovered_cache!r}"
-            )
+        if uncovered:
+            problems.append(f"uncovered values={uncovered!r}")
         if self._flash_coverage_uncovered_interactions_cache:
             problems.append(
                 "uncovered interactions="
