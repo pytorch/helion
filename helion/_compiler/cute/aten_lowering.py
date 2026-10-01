@@ -381,6 +381,17 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None or static_k_extent is not None
         else cute_static_serial_matmul_k_extent(lhs_node, rhs_node)
     )
+    if (
+        serial_k_extent is None
+        and node in ctx.cg.device_function.cute_state.direct_mm_collision_owners
+    ):
+        # The positional planner left this mm's repeated-axis operand to the
+        # direct path, which reads it by position; the per-thread fallback
+        # would see only its diagonal.
+        raise exc.BackendUnsupported(
+            "cute",
+            "aten.mm over a repeated-axis operand requires the direct mm lowering",
+        )
     env = CompileEnvironment.current()
     size_hint = getattr(env, "size_hint", None)
 

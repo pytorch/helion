@@ -2494,6 +2494,27 @@ def _(state: CodegenState) -> ast.AST:
         if isinstance(maybe_value_node, torch.fx.Node):
             value_node = maybe_value_node
 
+    if state.fx_node in state.device_function.cute_state.stack_store_collision_owners:
+        # The positional planner left this store's repeated-axis pointer tile
+        # to the native stack route, which reads it by position; the
+        # per-thread layout would see only its diagonal.
+        assert isinstance(tensor, torch.Tensor) and value_node is not None
+        rewritten_stmt = _codegen_cute_store_stack_load(
+            state,
+            tensor,
+            subscript,
+            ast_subscript,
+            state.ast_arg(2),
+            extra_mask,
+            value_node,
+        )
+        if rewritten_stmt is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                "repeated-axis stack tensor store requires the native stack lowering",
+            )
+        return rewritten_stmt
+
     if isinstance(tensor, torch.Tensor):
         affine_range_store = _codegen_cute_affine_range_store(
             state,

@@ -1304,6 +1304,14 @@ class CuteBackend(Backend):
         plan_fixed_token_rank1_recurrence(graphs, tile_strategy)
         if device_function.cute_state.fixed_token_rank1_plan is not None:
             return
+        # Ordinary layouts bind one coordinate per canonical block id. Preserve
+        # distinct tensor axes after the native whole-root routes decline.
+        from .positional_root import plan_positional_root
+
+        positional = plan_positional_root(graphs, device_function)
+        device_function.cute_state.positional_root_plan = positional
+        if positional is not None:
+            return
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
 
@@ -2544,6 +2552,12 @@ class CuteBackend(Backend):
         if chained_plan is not None:
             return launcher_args_with_compile_options(
                 f"block=({chained_plan.threads}, 1, 1)"
+            )
+        positional_plan = device_function.cute_state.positional_root_plan
+        if positional_plan is not None:
+            check_thread_limit(positional_plan.threads, context="positional root")
+            return launcher_args_with_compile_options(
+                f"block=({positional_plan.threads}, 1, 1)"
             )
         single_rank1_plan = device_function.cute_state.single_token_rank1_plan
         if single_rank1_plan is not None:

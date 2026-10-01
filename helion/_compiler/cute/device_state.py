@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
+    from .positional_root import PositionalRootPlan
     from .resident_reductions import ResidentReductionLayout
     from .resident_sequence import SequenceRegion
     from .signed_bitfield import SignedBytePacket
@@ -726,6 +727,13 @@ class CuteDeviceFunctionState:
         # packed workspace ABI have matched.
         self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
         self.chained_matmul_plan: ChainedMatmulPlan | None = None
+        self.positional_root_plan: PositionalRootPlan | None = None
+        # aten.mm nodes whose repeated-axis operands the positional planner
+        # left to the per-node direct mm lowering (see ``positional_root``).
+        self.direct_mm_collision_owners: frozenset[Node] = frozenset()
+        # Stores whose repeated-axis pointer tile the positional planner left
+        # to the native 2D stack store lowering.
+        self.stack_store_collision_owners: frozenset[Node] = frozenset()
         self.phi_snapshot_names: set[str] = set()
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the

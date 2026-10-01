@@ -143,6 +143,12 @@ def _collect_assigns_in_body(
                     all_written.add(_canonical(target.id))
                     # AugAssign reads + writes the same name; never invariant.
             # Recurse into nested for / if / with.
+            if isinstance(stmt, ast.For):
+                # A nested induction variable changes every inner iteration;
+                # never let the enclosing loop treat it as invariant.
+                for node in ast.walk(stmt.target):
+                    if isinstance(node, ast.Name):
+                        all_written.add(_canonical(node.id))
             if isinstance(stmt, (ast.For, ast.If, ast.With)):
                 _walk(stmt.body)
             if isinstance(stmt, (ast.For, ast.If)):
@@ -156,7 +162,7 @@ def _is_loop_invariant(
     name: str,
     assigns_by_target: dict[str, list[ast.expr]],
     all_written: set[str],
-    loop_target: str | None,
+    loop_target: frozenset[str],
     invariant_cache: dict[str, bool],
     visiting: set[str],
 ) -> bool:
@@ -178,8 +184,8 @@ def _is_loop_invariant(
     treated as non-invariant).
     """
     canon = _canonical(name)
-    canon_target = _canonical(loop_target) if loop_target is not None else None
-    if canon == canon_target:
+    canon_targets = {_canonical(target) for target in loop_target}
+    if canon in canon_targets:
         return False
     if canon in invariant_cache:
         return invariant_cache[canon]
@@ -256,7 +262,7 @@ def _resolve_root_name(
 
 def _find_invariant_div_binops(
     loop_body: list[ast.stmt],
-    loop_target: str | None,
+    loop_target: frozenset[str],
 ) -> dict[str, list[ast.BinOp]]:
     """Walk loop_body and find ``x / DIVISOR`` BinOp nodes where DIVISOR
     is loop-invariant.  Maps the loop-EXTERNAL root divisor-name ->
@@ -313,7 +319,9 @@ def _hoist_invariant_recips_in_for(
     Returns the number of statements inserted before ``for_idx`` (so the
     caller can adjust subsequent indices).
     """
-    loop_target = for_node.target.id if isinstance(for_node.target, ast.Name) else None
+    loop_target = frozenset(
+        node.id for node in ast.walk(for_node.target) if isinstance(node, ast.Name)
+    )
     divisor_map = _find_invariant_div_binops(for_node.body, loop_target)
     if not divisor_map:
         return 0
@@ -706,7 +714,7 @@ def _find_sub_assign_in_body(
 
 def _find_invariant_scale_subs(
     loop_body: list[ast.stmt],
-    loop_target: str | None,
+    loop_target: frozenset[str],
 ) -> dict[tuple[str, float], list[tuple[ast.BinOp, ast.BinOp, str]]]:
     """Walk loop_body and find one of two patterns equivalent to
     ``(A - B) * CONST`` where one of A/B is loop-invariant:
@@ -898,7 +906,9 @@ def _hoist_invariant_scaled_subs_in_for(
 
     Returns the count of statements inserted before ``for_idx``.
     """
-    loop_target = for_node.target.id if isinstance(for_node.target, ast.Name) else None
+    loop_target = frozenset(
+        node.id for node in ast.walk(for_node.target) if isinstance(node, ast.Name)
+    )
     scale_map = _find_invariant_scale_subs(for_node.body, loop_target)
     if not scale_map:
         return 0

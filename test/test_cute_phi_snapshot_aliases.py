@@ -56,3 +56,36 @@ def test_final_read_in_root_update_eliminates_snapshot() -> None:
     actual = {}
     exec(compile(ast.fix_missing_locations(tree), "<snapshots>", "exec"), actual)
     assert actual["value"] == 3
+
+
+def test_nested_loop_target_is_not_invariant() -> None:
+    # The enclosing loop must not hoist ``8 - inner`` out of the inner loop.
+    source = (
+        "result = []\n"
+        "for outer in range(2):\n"
+        "    for inner in range(4):\n"
+        "        result.append((8 - inner) * 2.0)\n"
+    )
+    expected = {}
+    exec(source, expected)
+    tree = ast.parse(source)
+    tree.body = hoist_loop_invariant_recips(tree.body)
+    actual = {}
+    exec(compile(ast.fix_missing_locations(tree), "<nested-loops>", "exec"), actual)
+    assert actual["result"] == expected["result"]
+
+
+@pytest.mark.parametrize("expression", ["(8 - outer) * 2.0", "8.0 / outer"])
+def test_tuple_loop_targets_are_not_invariant(expression: str) -> None:
+    source = (
+        "result = []\n"
+        "for outer, other in [(1, 2), (2, 3)]:\n"
+        f"    result.append({expression})\n"
+    )
+    expected = {}
+    exec(source, expected)
+    tree = ast.parse(source)
+    tree.body = hoist_loop_invariant_recips(tree.body)
+    actual = {}
+    exec(compile(ast.fix_missing_locations(tree), "<tuple-loop>", "exec"), actual)
+    assert actual["result"] == expected["result"]

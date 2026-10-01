@@ -1764,9 +1764,12 @@ class DeviceFunction:
                     f"{self.name}._helion_cute_helper_kinds = ('resident_reduction',)"
                 )
             )
-        if self.cute_state.chained_matmul_plan is not None:
-            # Guarded vector copies promote individual tiles to 16-byte
-            # alignment. Their scalar fallback only needs element alignment.
+        if (
+            self.cute_state.chained_matmul_plan is not None
+            or self.cute_state.positional_root_plan is not None
+        ):
+            # Positional scalar accesses only require element alignment.
+            # Chained vector copies separately guard promotion to 16 bytes.
             result.append(
                 statement_from_string(f"{self.name}._helion_cute_pointer_alignment = 1")
             )

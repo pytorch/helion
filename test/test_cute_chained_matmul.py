@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from collections import Counter
 import importlib
+import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
@@ -1443,14 +1444,44 @@ def test_scan_input_cache_shared_memory_admission() -> None:
         4 * (64 + 4),
     )
     capacity = sum((size + 127) // 128 * 128 for size in allocations)
-    assert "chain_1_mma" in _scan_cache_cpu_code(
-        args, "same", "cp_async_register_reuse", capacity
-    )
-    with pytest.raises(exc.BackendUnsupported, match="associative_scan input"):
-        _scan_cache_cpu_code(args, "same", capacity=capacity)
+    # One cached scan input: 64 bf16 values in its own 128-byte allocation.
+    cache = (64 * args[3].element_size() + 127) // 128 * 128
+
+    def native(schedule: str, limit: int) -> bool:
+        code = _scan_cache_cpu_code(args, "same", schedule, limit)
+        # A declined native plan must leave the root to the positional
+        # fallback, never to a partially native kernel.
+        assert ("chain_1_mma" in code) != ("ptp_thread" in code)
+        return "chain_1_mma" in code
+
+    assert native("cp_async_register_reuse", capacity)
+    assert not native("cp_async_register_reuse", capacity - 1)
     # The non-cache schedule must also count scan allocation alignment.
-    with pytest.raises(exc.BackendUnsupported, match="associative_scan input"):
-        _scan_cache_cpu_code(args, "same", "cp_async_register_reuse", sum(allocations))
+    assert not native("cp_async_register_reuse", sum(allocations))
+    # The cache schedule admits exactly its extra aligned allocation.
+    assert not native(SCAN_CACHE_SCHEDULE, capacity)
+    assert not native(SCAN_CACHE_SCHEDULE, capacity + cache - 1)
+    assert native(SCAN_CACHE_SCHEDULE, capacity + cache)
+    assert "chain_scan_0_input_" in _scan_cache_cpu_code(
+        args, "same", capacity=capacity + cache
+    )
+
+
+def test_declined_scan_chain_positional_fallback_bounds_gathered_tail() -> None:
+    # Native admission declines at this capacity; the positional fallback must
+    # bound the gathered decay[qq] by its logical length 49, not the padded 64.
+    code = _scan_cache_cpu_code(
+        _scan_cache_inputs("cpu", 49, 2), "same", "cp_async_register_reuse", 8192
+    )
+    assert "chain_1_mma" not in code
+    assert "ptp_thread" in code
+    accumulations = [
+        line
+        for line in code.splitlines()
+        if re.search(r"ptp_acc_\d+ = ptp_acc_\d+ \+", line)
+    ]
+    assert len(accumulations) == 2
+    assert re.search(r"if ptp_k_\d+ < 49 else", accumulations[1])
 
 
 def test_scan_input_cache_logical_tail_predicate() -> None:
@@ -1489,15 +1520,9 @@ def test_scan_input_cache_dtype_and_eight_warps_codegen(dtype: torch.dtype) -> N
     assert "cute.make_layout(8)" in code
 
 
-@pytest.mark.parametrize("mode", SCAN_CACHE_MODES)
-@pytest.mark.parametrize("length,stride", [(64, 1), (49, 2)])
-def test_scan_input_cache_runtime(mode: str, length: int, stride: int) -> None:
-    args = _scan_cache_inputs(DEVICE, length, stride)
-    frozen = tuple(arg.clone() for arg in args)
-    fn = _scan_cached_chain.bind((*args, mode)).compile_config(
-        helion.Config(cute_chained_mma_schedule=SCAN_CACHE_SCHEDULE)
-    )
-    output = fn(*args, mode)
+def _scan_cache_reference(
+    args: tuple[torch.Tensor, ...], mode: str, length: int
+) -> torch.Tensor:
     a, b, v, delta, other, permutation = args
     scan = delta[:, :length].double()
     if mode == "multiple":
@@ -1521,9 +1546,62 @@ def test_scan_input_cache_runtime(mode: str, length: int, stride: int) -> None:
     if mode != "scan_only":
         residual = delta[:, :length] if mode == "multiple" else selected
         result += residual[:, :, None].double()
+    return result.to(v.dtype)
+
+
+@pytest.mark.parametrize("mode", SCAN_CACHE_MODES)
+@pytest.mark.parametrize("length,stride", [(64, 1), (49, 2)])
+def test_scan_input_cache_runtime(mode: str, length: int, stride: int) -> None:
+    args = _scan_cache_inputs(DEVICE, length, stride)
+    frozen = tuple(arg.clone() for arg in args)
+    fn = _scan_cached_chain.bind((*args, mode)).compile_config(
+        helion.Config(cute_chained_mma_schedule=SCAN_CACHE_SCHEDULE)
+    )
+    output = fn(*args, mode)
+    expected = _scan_cache_reference(args, mode, length)
     torch.testing.assert_close(
         output,
-        result.to(v.dtype),
+        expected,
+        atol=0.003 if mode == "scan_only" else 0.0001,
+        rtol=0.02,
+    )
+    torch.testing.assert_close(fn(*args, mode), output, atol=0, rtol=0)
+    assert output.data_ptr() not in {arg.data_ptr() for arg in args}
+    for actual, original in zip(args, frozen, strict=True):
+        torch.testing.assert_close(actual, original, atol=0, rtol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA")
+@pytest.mark.parametrize("mode", SCAN_CACHE_MODES)
+@pytest.mark.parametrize("length,stride", [(49, 2), (33, 1), (64, 1)])
+def test_scan_chain_positional_fallback_runtime(
+    mode: str, length: int, stride: int
+) -> None:
+    args = _scan_cache_inputs(DEVICE, length, stride)
+    frozen = tuple(arg.clone() for arg in args)
+    _scan_cached_chain.reset()
+    bound = _scan_cached_chain.bind((*args, mode))
+    config = helion.Config(cute_chained_mma_schedule="cp_async_register_reuse")
+    with patch.object(
+        CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=8192
+    ):
+        code = bound.to_triton_code(config)
+        fn = bound.compile_config(config)
+    # Native admission declined; the positional root owns the whole kernel.
+    assert "chain_1_mma" not in code
+    assert "ptp_thread" in code
+    accumulations = [
+        line
+        for line in code.splitlines()
+        if re.search(r"ptp_acc_\d+ = ptp_acc_\d+ \+", line)
+    ]
+    assert len(accumulations) == 2
+    guarded = re.search(rf"if ptp_k_\d+ < {length} else", accumulations[1])
+    assert bool(guarded) == (length != 64)  # padded K tail of the gathered decay
+    output = fn(*args, mode)
+    torch.testing.assert_close(
+        output,
+        _scan_cache_reference(frozen, mode, length),
         atol=0.003 if mode == "scan_only" else 0.0001,
         rtol=0.02,
     )
@@ -1550,6 +1628,21 @@ def _typed_inputs(
     delta = args[3].to(dtype).repeat_interleave(2, dim=1)[:, ::2]
     other = args[4].to(torch.float32).repeat_interleave(2, dim=1)[:, ::2]
     return (*args[:3], delta, other, args[5])
+
+
+def _aligned_shared_bytes(code: str) -> int:
+    """Total 128-byte-aligned shared bytes of every ``alloc_smem`` in ``code``."""
+    sizes = {name: dtype.itemsize for dtype, name in _NAMES.items()}
+    total = 0
+    for node in ast.walk(ast.parse(code)):
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == (
+            "cute.arch.alloc_smem"
+        ):
+            dtype, count = node.args
+            assert ast.unparse(node.keywords[0].value) == "128"
+            size = sizes[ast.unparse(dtype)] * ast.literal_eval(count)
+            total += (size + 127) // 128 * 128
+    return total
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
@@ -1630,21 +1723,31 @@ def test_scan_cache_original_dtype_exact_shared_admission(dtype: torch.dtype) ->
         decisions.append(plan)
         return plan
 
-    with patch.object(
-        chained_matmul, "plan_chained_matmul", side_effect=observe_plan
-    ) as planner:
-        code = _scan_cache_cpu_code(args, "multiple", capacity=capacity)
-        assert "chain_1_mma" in code
-        assert planner.call_count == 1
-        assert len(decisions) == 1 and decisions[0] is not None
+    def compile_at(limit: int) -> str:
         decisions.clear()
-        planner.reset_mock()
-        # A fallback may reject for a different reason after this planner
-        # declines the chain. Check the actual admission decision directly.
-        with pytest.raises(exc.BackendUnsupported):
-            _scan_cache_cpu_code(args, "multiple", capacity=capacity - 1)
+        with patch.object(
+            chained_matmul, "plan_chained_matmul", side_effect=observe_plan
+        ) as planner:
+            code = _scan_cache_cpu_code(args, "multiple", capacity=limit)
         assert planner.call_count == 1
-        assert decisions == [None]
+        return code
+
+    code = compile_at(capacity)
+    assert "chain_1_mma" in code and "ptp_thread" not in code
+    assert len(decisions) == 1 and decisions[0] is not None
+    # One byte less and the native planner declines. The positional fallback
+    # then owns the whole root within its own, smaller shared budget.
+    code = compile_at(capacity - 1)
+    assert decisions == [None]
+    assert "chain_1_mma" not in code and "ptp_thread" in code
+    fallback = _aligned_shared_bytes(code)
+    assert 0 < fallback <= capacity - 1
+    # The fallback admits exactly its emitted aligned allocations.
+    assert "ptp_thread" in compile_at(fallback)
+    with pytest.raises(
+        exc.BackendUnsupported, match=f"{fallback} shared bytes exceed {fallback - 1}"
+    ):
+        compile_at(fallback - 1)
     assert torch.cuda.is_initialized() is initialized_before
 
 

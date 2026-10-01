@@ -1437,6 +1437,20 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # pyrefly: ignore[bad-return, bad-argument-type]
         return node.new(fields)
 
+    def _try_codegen_positional_root(self) -> bool:
+        plan = self.device_function.cute_state.positional_root_plan
+        if plan is None:
+            return False
+        root = self.current_root_graph_info
+        if root is None or root.graph_id != plan.root_graph_id:
+            raise exc.BackendUnsupported(
+                "cute", "positional root plan does not own the emitted root"
+            )
+        from .cute.positional_root import codegen_positional_root
+
+        codegen_positional_root(self, plan)
+        return True
+
     def _try_codegen_tile_loop_root(self) -> bool:
         if CompileEnvironment.current().backend_name != "cute":
             return False
@@ -1546,6 +1560,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
                         and not self._try_codegen_attention_flash_root()
+                        and not self._try_codegen_positional_root()
                         and not self._try_codegen_tile_loop_root()
                     ):
                         grid_state = self.current_grid_state
