@@ -254,6 +254,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
     def _generate_key(self) -> LooseAutotuneCacheKey:
         from .benchmark_provider import _MultiShapeAutotuneArgs
 
+        self.autotuner._validate_timing_policy()
         multi_args = (
             self.args if isinstance(self.args, _MultiShapeAutotuneArgs) else None
         )
@@ -322,6 +323,28 @@ class LocalAutotuneCache(AutotuneCacheBase):
                 getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
             ),
         )
+        if self.autotuner.timing_policy is not None:
+            from .search_timing import timing_error
+
+            timing_policy = self.autotuner.timing_policy
+            timing_policy.validate_settings(self.autotuner.settings)
+            policy = self.autotuner.cache_policy()
+            if policy is None:
+                timing_error(
+                    "Profiler search requires a cacheable built-in search policy"
+                )
+            encoded = json.dumps(
+                _search_policy_json_value(
+                    {
+                        "search": policy,
+                        "timing": timing_policy.cache_record(),
+                    }
+                ),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+            search_policy_hash = hashlib.sha256(encoded).hexdigest()
         return LooseAutotuneCacheKey(
             specialization_key=specialization_key,
             extra_results=extra_results,
@@ -340,6 +363,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         return get_helion_cache_dir() / f"{self.key.stable_hash()}.best_config"
 
     def get(self) -> Config | None:
+        self.autotuner._validate_timing_policy()
         path = self._get_local_cache_path()
         try:
             data = json.loads(path.read_text())
@@ -364,6 +388,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         )
 
     def put(self, config: Config) -> None:
+        self.autotuner._validate_timing_policy()
         path = self._get_local_cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -470,6 +495,10 @@ def stable_autotune_hash(autotuner: BaseSearch) -> str | None:
         if not autotuner.kernel.is_cacheable():
             return None
         return LocalAutotuneCache(autotuner)._generate_key().stable_hash()
-    except Exception:
+    except Exception as error:
+        if autotuner.timing_policy is not None:
+            from .search_timing import raise_timing_error
+
+            raise_timing_error(error)
         log.debug("Could not compute autotune cache hash", exc_info=True)
         return None

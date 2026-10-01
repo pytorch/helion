@@ -109,6 +109,7 @@ from helion.autotuner.metrics import KernelMetadata
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
+from helion.autotuner.search_timing import validate_timing_policy
 from helion.autotuner.surrogate_pattern_search import (
     flash_terminal_measurement_is_valid,
 )
@@ -1953,6 +1954,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.settings = SimpleNamespace(
             autotune_benchmark_fn=None,
             autotune_budget_seconds=None,
+            autotune_timing_method="default",
         )
         search.radius = 2
         search.min_improvement_delta = 0.001
@@ -2324,6 +2326,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.settings = SimpleNamespace(
             autotune_benchmark_fn=None,
             autotune_budget_seconds=None,
+            autotune_timing_method="default",
         )
         search.radius = 2
         search.min_improvement_delta = 0.001
@@ -2588,6 +2591,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             fn=lambda: None,
             status="error",
             compile_time=None,
+            measurement=None,
         )
 
         with patch.object(search, "benchmark_batch", return_value=[result]):
@@ -13487,6 +13491,11 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
         # Build a cache with NO autotuner_factory wired; this models the
         # external ``Cache(autotuner)`` constructor path.
         class _MinimalSearch:
+            timing_policy = None
+
+            def _validate_timing_policy(self):
+                validate_timing_policy(self.timing_policy, None, self.settings)
+
             def __init__(self):
                 self.kernel = bound
                 self.settings = bound.settings
@@ -13550,6 +13559,11 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
         trial_idx = {"n": 0}
 
         class MockTrialSearch:
+            timing_policy = None
+
+            def _validate_timing_policy(self):
+                validate_timing_policy(self.timing_policy, None, self.settings)
+
             def __init__(self, bound_kernel, args, **kwargs):
                 self.kernel = bound_kernel
                 self.settings = bound_kernel.settings
@@ -13786,6 +13800,11 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
         cfg = Config(block_sizes=[16, 32])
 
         class MockSearch:
+            timing_policy = None
+
+            def _validate_timing_policy(self):
+                validate_timing_policy(self.timing_policy, None, self.settings)
+
             def __init__(self, bound_kernel, args, **kwargs):
                 self.kernel = bound_kernel
                 self.settings = bound_kernel.settings
@@ -13882,6 +13901,11 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 pass
 
         class SingleTrialSearch:
+            timing_policy = None
+
+            def _validate_timing_policy(self):
+                validate_timing_policy(self.timing_policy, None, self.settings)
+
             def __init__(self, bound_kernel, args, **kwargs):
                 self.kernel = bound_kernel
                 self.settings = bound_kernel.settings
@@ -15518,6 +15542,7 @@ class TestAutotuneBudget(TestCase):
             perf=1.0,
             status="deduplicated",
             compile_time=None,
+            measurement=None,
         )
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.population = [member]
@@ -15751,10 +15776,21 @@ class TestAutotuneBudget(TestCase):
             backend.should_deduplicate_generated_sources(_cute_flash_test_config_spec())
         )
         self.assertFalse(
-            backend.should_deduplicate_generated_sources(
-                SimpleNamespace(cute_flash_search_enabled=False)
-            )
+            backend.should_deduplicate_generated_sources(ConfigSpec(backend=backend))
         )
+
+    def test_cute_backend_source_dedup_respects_search_families(self) -> None:
+        backend = CuteBackend()
+        config_spec = ConfigSpec(backend=backend)
+        for flash_enabled in (False, True):
+            for chained_enabled in (False, True):
+                with self.subTest(flash=flash_enabled, chained=chained_enabled):
+                    config_spec.cute_flash_search_enabled = flash_enabled
+                    config_spec.cute_chained_matmul_search_enabled = chained_enabled
+                    self.assertEqual(
+                        backend.should_deduplicate_generated_sources(config_spec),
+                        flash_enabled or chained_enabled,
+                    )
 
     def test_benchmark_provider_short_circuits_compile_loop(self) -> None:
         """``LocalBenchmarkProvider.benchmark`` must stop compiling

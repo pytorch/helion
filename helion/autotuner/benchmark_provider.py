@@ -23,6 +23,7 @@ from typing import NoReturn
 from typing import cast
 
 import torch
+from torch._inductor.runtime.triton_compat import OutOfResources
 import torch.distributed as dist
 from torch.utils._pytree import tree_flatten
 from torch.utils._pytree import tree_map_only
@@ -61,6 +62,11 @@ from .precompile_future import PrecompileFuture
 from .precompile_future import _ExtractedLaunchArgs
 from .precompile_future import _serialize_compiled_fn
 from .progress_bar import iter_with_progress
+from .search_timing import BenchmarkMeasurement
+from .search_timing import SearchTimingPolicy
+from .search_timing import raise_timing_error
+from .search_timing import timing_error
+from .search_timing import validate_timing_policy
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import sync_object
 
@@ -329,6 +335,8 @@ class BenchmarkResult(NamedTuple):
         "source_rejected",
     ]
     compile_time: float | None
+    measurement: BenchmarkMeasurement | None = None
+    timing_policy: SearchTimingPolicy | None = None
 
 
 class IsolatedBenchmarkFailure(NamedTuple):
@@ -341,7 +349,7 @@ class IsolatedBenchmarkFailure(NamedTuple):
     status: Literal["error", "timeout"]
 
 
-IsolatedBenchmarkTiming = float | None | IsolatedBenchmarkFailure
+IsolatedBenchmarkTiming = float | None | IsolatedBenchmarkFailure | BenchmarkMeasurement
 
 
 @dataclasses.dataclass(frozen=True)
@@ -450,6 +458,7 @@ class BenchmarkProvider(abc.ABC):
         rep: int,
         desc: str = "Benchmarking",
         fresh_process: bool = False,
+        fixed_repetitions: int | None = None,
     ) -> list[IsolatedBenchmarkTiming] | None:
         """Benchmark already-validated functions in an isolated subprocess.
 
@@ -488,6 +497,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # the picklability flag must resolve even before setup()/__init__ set it.
     _args_unpicklable: bool = False
     _subprocess_wrapper_unloadable: bool = False
+    timing_policy: SearchTimingPolicy | None = None
+    _resolved_timing_policy: SearchTimingPolicy | None = None
 
     def __init__(
         self,
@@ -497,13 +508,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         args: Sequence[object],
         log: AutotuningLogger,
         autotune_metrics: AutotuneMetrics,
+        timing_policy: SearchTimingPolicy | None = None,
     ) -> None:
         if isinstance(args, _MultiShapeAutotuneArgs):
             raise TypeError(
                 "LocalBenchmarkProvider cannot benchmark multi-shape args directly"
             )
         self.kernel = kernel
+        self.timing_policy = timing_policy
+        self._resolved_timing_policy = timing_policy
+        self._timing_measurements: dict[
+            Callable[..., object], BenchmarkMeasurement
+        ] = {}
         self.settings = settings
+        self._validate_timing_policy()
         self.config_spec = config_spec
         self.args = args
         self.log = log
@@ -542,6 +560,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self.mutated_arg_indices,
             self._baseline_post_args,
         ) = self._compute_baseline()
+        if self.timing_policy is not None and self.mutated_arg_indices:
+            timing_error("Profiler search does not support mutated arguments")
         self._effective_atol, self._effective_rtol = (
             self._compute_effective_tolerances()
         )
@@ -549,6 +569,47 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         # explicit absolute tolerance (see accuracy.assert_close).
         self._scale_atol = self.settings.autotune_baseline_atol is None
         self._jobs = self._decide_num_jobs()
+
+    def measurement_for(self, fn: Callable[..., object]) -> BenchmarkMeasurement | None:
+        self._validate_timing_policy()
+        if self.timing_policy is None:
+            return None
+        result = self._timing_measurements.get(fn)
+        if result is None:
+            timing_error("A successful profiler score has no measurement evidence")
+        assert result is not None
+        result.validate(self.timing_policy)
+        return result
+
+    def _check_timing_capability(self) -> None:
+        self._validate_timing_policy()
+        assert self.timing_policy is not None
+        self.timing_policy.validate_settings(self.settings)
+        if (
+            self._args_unpicklable
+            or self.config_spec.backend.name != "cute"
+            or self.kernel.env.device.type != "cuda"
+            or self._subprocess_wrapper_unloadable
+            or dist.is_initialized()
+            or self.kernel.env.process_group_name is not None
+            or self.mutated_arg_indices
+            or not self.kernel.supports_subprocess_benchmark()
+            or self.config_spec.backend.get_do_bench() is not None
+            or self.config_spec.backend.get_paired_device_micros_bench() is not None
+            or torch.autograd._profiler_enabled()
+        ):
+            timing_error("Profiler search lost its isolated local timing capability")
+
+    def _validate_timing_policy(self) -> None:
+        if (
+            self.timing_policy is None
+            and self._resolved_timing_policy is None
+            and "settings" not in vars(self)
+        ):
+            return
+        validate_timing_policy(
+            self.timing_policy, self._resolved_timing_policy, self.settings
+        )
 
     def _record_accuracy_failure(self, config: Config) -> None:
         self._autotune_metrics.num_accuracy_failures += 1
@@ -605,6 +666,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 perf=source_result.perf,
                 status="deduplicated",
                 compile_time=None,
+                measurement=source_result.measurement,
             )
             repaired[pending.config] = repair
             self._effective_source_repairs[pending.config] = repair
@@ -751,6 +813,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 synchronize_device()
             except Exception as e:
+                raise_timing_error(e, self.log.record_timing_failure)
                 if not self._can_back_off_baseline(e):
                     # A smaller config cannot fix this; report it as is.
                     failure = (e, config)
@@ -800,17 +863,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     def _can_back_off_baseline(self, error: Exception) -> bool:
         """Whether a smaller config might avoid *error* from a baseline attempt.
 
-        Uses the same classification as benchmarking a candidate: failures it
-        skips as config-specific (e.g. out of resources) may go away with
-        smaller block sizes, while unrecoverable runtime errors and errors it
-        raises (bugs) will not.
+        Candidate skip/log severity is not evidence that shrinking can repair
+        a failure: some backends skip arbitrary compiler errors. Retry only
+        typed resource exhaustion, never sticky device failures.
         """
         if match_unrecoverable_runtime_error(error):
             return False
-        action = self.config_spec.backend.classify_autotune_exception(
-            error
-        ) or classify_triton_exception(error)
-        return action != "raise"
+        return isinstance(error, (OutOfResources, torch.cuda.OutOfMemoryError))
 
     def _compute_effective_tolerances(self) -> tuple[float, float]:
         """
@@ -938,6 +997,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             try:
                 save_trusted_kernel_args(self.args, args_path)
             except (pickle.PicklingError, AttributeError, TypeError) as e:
+                if self.timing_policy is not None:
+                    timing_error(
+                        f"Profiler arguments cannot cross worker boundary: {e}"
+                    )
                 # Kernel args holding lambdas/closures (e.g. an epilogue
                 # callable) cannot cross a spawn boundary. Fall back to the
                 # in-process benchmark/accuracy path instead of failing the
@@ -993,6 +1056,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._effective_source_repairs.clear()
         self._compiler_seed_source_hashes.clear()
         self._compiler_seed_timeout_retry_claims.clear()
+        if self.timing_policy is not None:
+            self._timing_measurements.clear()
         # Drop the baseline tensors (GPU memory) so refcount frees them
         # the moment the provider loses its last external reference.
         self._baseline_output = None
@@ -1035,6 +1100,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         )
 
     def _subprocess_benchmark_enabled(self) -> bool:
+        self._validate_timing_policy()
+        if self.timing_policy is not None:
+            self._check_timing_capability()
+            return True
         """Subprocess benchmark path is opt-in and skipped for distributed /
         mutated-arg kernels where the worker's simple job shape doesn't fit."""
         if not self.settings.autotune_benchmark_subprocess:
@@ -1115,7 +1184,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         mode = self.settings.autotune_precompile
         if mode not in {"fork", "spawn"}:
             raise exc.InvalidAPIUsage("autotune_precompile must be 'fork' or 'spawn'")
-        args = _clone_args(self.args, self.kernel.env.process_group_name)
+        # Spawn loads its own private copy from args_path. Fork evaluates the
+        # host wrapper while extracting a launch, so it still needs isolation.
+        args = (
+            ()
+            if mode == "spawn"
+            else _clone_args(self.args, self.kernel.env.process_group_name)
+        )
         return PrecompileFuture.create(
             ctx=ctx,
             config=config,
@@ -1306,6 +1381,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=cached_result.perf,
                     status="deduplicated",
                     compile_time=None,
+                    measurement=cached_result.measurement,
                 )
                 deduplicated_indices.add(index)
                 self._autotune_metrics.num_source_deduplications += 1
@@ -1403,6 +1479,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=source_result.perf,
                     status=status,
                     compile_time=None,
+                    measurement=source_result.measurement,
                 )
                 deduplicated_indices.add(result_index)
                 self._autotune_metrics.num_source_deduplications += 1
@@ -1454,6 +1531,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     perf=perf,
                     status=status,
                     compile_time=compile_time,
+                    measurement=self.measurement_for(fn)
+                    if math.isfinite(perf)
+                    else None,
                 )
                 # Keep the actual terminal outcome even when a later source
                 # alias repairs this candidate. The repair is logged as a
@@ -1561,6 +1641,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 result = self._benchmark_function_subprocess(config, fn)
             if result is not None:
                 return result
+            if self.timing_policy is not None:
+                timing_error("Profiler search cannot fall back to in-process timing")
             # None means the subprocess path could not handle this config
             # (e.g., serialization failed); fall through to in-process.
 
@@ -1653,9 +1735,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 benchmark_runner = (
                     _backend.get_do_bench() if _backend is not None else None
                 ) or do_bench
-                benchmark_callable = functools.partial(
-                    benchmark_function, *timing_args
-                )
+                benchmark_callable = functools.partial(benchmark_function, *timing_args)
                 if benchmark_runner in (do_bench, do_bench_generic):
                     # The exact callable ran immediately above.
                     res = benchmark_runner(
@@ -1687,6 +1767,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return res
         except Exception as e:
             # e.__traceback__ holds references to all local variables in the call stack frames.
+            if (
+                self._resolved_timing_policy is not None
+                or self.timing_policy is not None
+            ):
+                raise_timing_error(e, self.log.record_timing_failure)
+            self._validate_timing_policy()
             # When a Triton kernel fails, the output tensors allocated by the Helion kernel function
             # were being held by the traceback, preventing them from being freed.
             e.__traceback__ = None
@@ -1782,6 +1868,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             try:
                 latency = self._run_subprocess_benchmark_job(fn, warmup=1, rep=50)
             except BenchmarkTimeout:
+                self._validate_timing_policy()
                 if (
                     not retry_compiler_seed_timeout
                     or not self._claim_compiler_seed_timeout_retry(
@@ -1803,11 +1890,13 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     rep=50,
                     fixed_repetitions=retry_repetitions,
                 )
+            self._validate_timing_policy()
             if latency is None:
                 return None
         except BenchmarkWorkerUnkillable:
             raise
         except BenchmarkSubprocessError as e:
+            self._validate_timing_policy()
             # Timeout or unexpected worker exit; skip config and continue.
             self.log.warning(f"Benchmark subprocess failed for {config!r}: {e}")
             self._record_worker_failure(
@@ -1816,6 +1905,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             )
             return inf
         except Exception as e:
+            if (
+                self._resolved_timing_policy is not None
+                or self.timing_policy is not None
+            ):
+                raise_timing_error(e, self.log.record_timing_failure)
+            self._validate_timing_policy()
             e.__traceback__ = None
             if match_unrecoverable_runtime_error(e):
                 # Worker is already killed; parent CUDA is unaffected.
@@ -1841,6 +1936,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             except BenchmarkWorkerUnkillable:
                 raise
             except BenchmarkSubprocessError as e:
+                self._validate_timing_policy()
                 self.log.warning(
                     f"Accuracy check subprocess failed for {config!r}: {e}"
                 )
@@ -1850,6 +1946,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
                 return inf
             except Exception as e:
+                if (
+                    self._resolved_timing_policy is not None
+                    or self.timing_policy is not None
+                ):
+                    raise_timing_error(e, self.log.record_timing_failure)
+                self._validate_timing_policy()
                 e.__traceback__ = None
                 if match_unrecoverable_runtime_error(e):
                     # Worker is already killed; parent CUDA is unaffected.
@@ -1886,6 +1988,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
             # None means a custom check fn or uncommon kernel can't run in the
             # worker; validate in-process instead.
+            if self.timing_policy is not None:
+                timing_error("Profiler search requires isolated accuracy validation")
             try:
                 with capture_output():
                     working_args = _clone_args(
@@ -1924,13 +2028,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     def _run_subprocess_accuracy_check_job(
         self, fn: CompiledConfig
     ) -> AccuracyCheckResult | None:
+        self._validate_timing_policy()
         if not self._subprocess_accuracy_check_enabled():
+            if self.timing_policy is not None:
+                timing_error("Profiler search lost isolated accuracy capability")
             return None
         if self._precompile_args_path is None or self._precompile_baseline_path is None:
+            if self.timing_policy is not None:
+                timing_error("Profiler search requires isolated accuracy arguments")
             return None
         try:
             fn_spec = _serialize_compiled_fn(fn)
         except RuntimeError:
+            if self.timing_policy is not None:
+                timing_error("Profiler accuracy callable cannot be serialized")
             return None
 
         if self._benchmark_worker is None:
@@ -1945,14 +2056,19 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             scale_atol=self._scale_atol,
         )
         try:
-            return cast(
+            result = cast(
                 "AccuracyCheckResult",
                 self._benchmark_worker.run(
                     job,
                     timeout=float(self.settings.autotune_benchmark_timeout),
                 ),
             )
+            self._validate_timing_policy()
+            return result
         except CompiledFunctionLoadError as error:
+            self._validate_timing_policy()
+            if self.timing_policy is not None:
+                timing_error(f"Profiler accuracy callable cannot be loaded: {error}")
             self._disable_unloadable_benchmark_worker(error)
             return None
 
@@ -1964,11 +2080,16 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         rep: int,
         fixed_repetitions: int | None = None,
     ) -> float | None:
+        self._validate_timing_policy()
         if self._precompile_args_path is None or self._subprocess_wrapper_unloadable:
+            if self.timing_policy is not None:
+                timing_error("Profiler search requires serialized isolated arguments")
             return None
         try:
             fn_spec = _serialize_compiled_fn(fn)
-        except RuntimeError:
+        except RuntimeError as error:
+            if self.timing_policy is not None:
+                timing_error(f"Profiler callable serialization failed: {error}")
             return None
 
         if self._benchmark_worker is None:
@@ -1982,15 +2103,36 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
             probe_long_kernel=self._probe_long_kernel(),
             fixed_repetitions=fixed_repetitions,
+            timing_policy=self.timing_policy,
         )
         try:
-            return float(
-                self._benchmark_worker.run(
-                    job,
-                    timeout=float(self.settings.autotune_benchmark_timeout),
-                )
+            raw = self._benchmark_worker.run(
+                job, timeout=float(self.settings.autotune_benchmark_timeout)
             )
+            self._validate_timing_policy()
+            if self.timing_policy is None:
+                return float(cast("float", raw))
+            from .profiler_timing import CallableIdentity
+
+            self._check_timing_capability()
+            if not isinstance(raw, BenchmarkMeasurement):
+                timing_error("Profiler worker returned an untagged score")
+            assert isinstance(raw, BenchmarkMeasurement)
+            raw.validate(
+                self.timing_policy,
+                CallableIdentity(
+                    fn_spec.function_name,
+                    hashlib.sha256(fn_spec.source_code.encode()).hexdigest(),
+                ),
+                fixed_repetitions,
+            )
+            self._timing_measurements[fn] = raw
+            self.log.record_timing_measurement(raw)
+            return raw.perf
         except CompiledFunctionLoadError as error:
+            self._validate_timing_policy()
+            if self.timing_policy is not None:
+                timing_error(f"Profiler worker cannot load callable: {error}")
             self._disable_unloadable_benchmark_worker(error)
             return None
 
@@ -2019,7 +2161,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         rep: int,
         desc: str = "Benchmarking",
         fresh_process: bool = False,
+        fixed_repetitions: int | None = None,
     ) -> list[IsolatedBenchmarkTiming] | None:
+        self._validate_timing_policy()
         if not self._subprocess_benchmark_enabled():
             return None
         if self.settings.autotune_benchmark_fn is not None:
@@ -2036,18 +2180,31 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         cast("CompiledConfig", fn),
                         warmup=warmup,
                         rep=rep,
+                        **(
+                            {"fixed_repetitions": fixed_repetitions}
+                            if fixed_repetitions is not None
+                            else {}
+                        ),
                     )
                 except BenchmarkWorkerUnkillable:
                     raise
                 except BenchmarkTimeout as e:
+                    self._validate_timing_policy()
                     self.log.warning(f"{desc} subprocess failed: {e}")
                     self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
                     timings.append(IsolatedBenchmarkFailure("timeout"))
                     continue
                 except BenchmarkSubprocessError as e:
+                    self._validate_timing_policy()
                     self.log.warning(f"{desc} subprocess failed: {e}")
                     timing = None
                 except Exception as e:
+                    if (
+                        self._resolved_timing_policy is not None
+                        or self.timing_policy is not None
+                    ):
+                        raise_timing_error(e, self.log.record_timing_failure)
+                    self._validate_timing_policy()
                     e.__traceback__ = None
                     if match_unrecoverable_runtime_error(e):
                         self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
@@ -2063,9 +2220,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 # Treat the whole isolated batch as unavailable so the caller
                 # rebenchmarks every finalist in-process instead of mixing partial
                 # fresh timings with stale population measurements.
+                self._validate_timing_policy()
                 if self._subprocess_wrapper_unloadable:
                     return None
-                timings.append(None if timing is None else float(timing))
+                if timing is None and self.timing_policy is not None:
+                    timing_error("Isolated profiler measurement did not complete")
+                if self.timing_policy is not None:
+                    # Capture now: source dedup can give several configurations the
+                    # same callable, whose latest-observation map changes next job.
+                    measurement = self.measurement_for(fn)
+                    assert measurement is not None
+                    if timing != measurement.perf:
+                        timing_error("Isolated score disagrees with profiler evidence")
+                    timings.append(measurement)
+                else:
+                    timings.append(None if timing is None else float(timing))
             finally:
                 if fresh_process and self._benchmark_worker is not None:
                     self._benchmark_worker.shutdown()

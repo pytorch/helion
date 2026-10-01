@@ -48,6 +48,7 @@ from .benchmark_provider import _clone_args
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _unset_fn
 from .benchmarking import MirroredBenchmarkTrace
+from .benchmarking import _mirrored_bench_call_layout
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
@@ -57,6 +58,11 @@ from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
 from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
+from .search_timing import BenchmarkMeasurement
+from .search_timing import ProfilerSweepTrace
+from .search_timing import SearchTimingPolicy
+from .search_timing import timing_error
+from .search_timing import validate_timing_policy
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
@@ -364,6 +370,9 @@ class BaseSearch(BaseAutotuner):
         counters: A counter to track various metrics during the search.
     """
 
+    timing_policy: SearchTimingPolicy | None = None
+    _resolved_timing_policy: SearchTimingPolicy | None = None
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -402,6 +411,63 @@ class BaseSearch(BaseAutotuner):
         self._search_space_tracker: SearchSpaceTracker | None = None
         self._uncacheable_search_policy_nonce: str | None = None
         self._search_policy_cacheable = True
+        if self.settings.autotune_timing_method != "default":
+            from . import search_algorithms
+            from .finite_search import CachedFiniteSearch
+
+            if (
+                self.config_spec.backend.name != "cute"
+                or kernel.env.device.type != "cuda"
+                or dist.is_initialized()
+                or kernel.env.process_group_name is not None
+                or isinstance(args, _MultiShapeAutotuneArgs)
+                or benchmark_provider_cls is not LocalBenchmarkProvider
+                or self.settings.autotune_cache == "AOTAutotuneCache"
+                or self.config_spec.backend.get_do_bench() is not None
+                or not kernel.supports_subprocess_benchmark()
+                or self.config_spec.backend.get_paired_device_micros_bench() is not None
+                or type(self) not in (*search_algorithms.values(), CachedFiniteSearch)
+            ):
+                timing_error(
+                    "Explicit profiler search requires a local isolated CuTe search"
+                )
+            self.timing_policy = SearchTimingPolicy.create()
+            self._resolved_timing_policy = self.timing_policy
+            self.timing_policy.validate_settings(self.settings)
+
+    def _validate_timing_policy(self) -> None:
+        # Default pure-history helpers also support uninitialized search shells.
+        if (
+            self.timing_policy is None
+            and self._resolved_timing_policy is None
+            and "settings" not in vars(self)
+        ):
+            return
+        validate_timing_policy(
+            self.timing_policy, self._resolved_timing_policy, self.settings
+        )
+        if self.timing_policy is not None and (
+            self.config_spec.backend.name != "cute"
+            or self.kernel.env.device.type != "cuda"
+            or self.kernel.env.process_group_name is not None
+            or dist.is_initialized()
+            or not self.kernel.supports_subprocess_benchmark()
+            or self.config_spec.backend.get_do_bench() is not None
+            or self.config_spec.backend.get_paired_device_micros_bench() is not None
+        ):
+            timing_error(
+                "Resolved profiler search lost its backend/isolation capability"
+            )
+
+    def _check_timing_measurement(
+        self, measurement: BenchmarkMeasurement | None
+    ) -> None:
+        self._validate_timing_policy()
+        if self.timing_policy is not None:
+            if measurement is None:
+                timing_error("Untagged timing cannot enter profiler search history")
+            assert measurement is not None
+            measurement.validate(self.timing_policy)
 
     def _algorithm_cache_policy(self) -> dict[str, object] | None:
         """Return explicit behavior-affecting state for a built-in search."""
@@ -533,6 +599,7 @@ class BaseSearch(BaseAutotuner):
 
         This is called at the start of autotune() so that cache hits skip it.
         """
+        self._validate_timing_policy()
         if self._prepared:
             return
         self._prepared = True
@@ -640,6 +707,11 @@ class BaseSearch(BaseAutotuner):
             args=self.args,
             log=self.log,
             autotune_metrics=self._autotune_metrics,
+            **(
+                {"timing_policy": self.timing_policy}
+                if self.timing_policy is not None
+                else {}
+            ),
         )
         if self.config_spec.compiler_seed_timeout_retry_repetitions is not None:
             seed_config_gen = self.config_spec.create_config_generation(
@@ -808,6 +880,7 @@ class BaseSearch(BaseAutotuner):
         Returns:
             A list of BenchmarkResult entries, one per input config.
         """
+        self._validate_timing_policy()
         passing_configs, passing_indices = self._apply_config_filter(configs)
         # Record configs for exploration tracking. Diagnostic only; must never
         # interfere with benchmarking.
@@ -845,7 +918,17 @@ class BaseSearch(BaseAutotuner):
                         )
                     )
 
+        if self.timing_policy is not None:
+            results = [r._replace(timing_policy=self.timing_policy) for r in results]
         for r in results:
+            if self.timing_policy is not None and math.isfinite(r.perf):
+                self._check_timing_measurement(r.measurement)
+                assert r.measurement is not None
+                if r.perf != r.measurement.perf:
+                    timing_error("Candidate score differs from profiler evidence")
+                self.log.record_timing_measurement(
+                    r.measurement, phase=desc, config=repr(r.config)
+                )
             if r.perf < self.best_perf_so_far:
                 self.best_perf_so_far = r.perf
 
@@ -1259,6 +1342,10 @@ class PopulationMember:
         "unknown",
     ] = "unknown"
     compile_time: float | None = None
+    measurement: BenchmarkMeasurement | None = None
+    measurements: list[BenchmarkMeasurement] = dataclasses.field(
+        default_factory=list, repr=False
+    )
 
     @property
     def perf(self) -> float:
@@ -1736,6 +1823,9 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
+            member.measurement = result.measurement
+            if result.measurement is not None:
+                member.measurements.append(result.measurement)
             self._record_benchmarked_member(member)
         repairs = self.benchmark_provider.take_effective_source_repairs()
         if repairs:
@@ -1774,10 +1864,35 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = repair.fn
             member.status = repair.status
             member.compile_time = None
+            member.measurement = repair.measurement
+            if repair.measurement is not None:
+                member.measurements.append(repair.measurement)
             self._record_benchmarked_member(member)
 
     def _record_benchmarked_member(self, member: PopulationMember) -> None:
         """Keep successful benchmarked members available for final verification."""
+        self._validate_timing_policy()
+        if (
+            self.timing_policy is not None
+            and member.perfs
+            and math.isfinite(member.perf)
+        ):
+            if member.measurement is None:
+                timing_error("Untagged timing cannot enter profiler search history")
+            assert member.measurement is not None
+            member.measurement.validate(self.timing_policy)
+            if member.perf != member.measurement.perf:
+                timing_error("Population score disagrees with its profiler evidence")
+            measurements = member.measurements or [member.measurement]
+            for measurement in measurements:
+                measurement.validate(self.timing_policy)
+            if any(
+                math.isfinite(perf) and perf not in {m.perf for m in measurements}
+                for perf in member.perfs
+            ):
+                timing_error("Population history contains an untagged profiler score")
+            if not member.measurements:
+                member.measurements.append(member.measurement)
         terminal_members = getattr(self, "_terminal_refinement_members", None)
         if terminal_members is not None:
             self._record_terminal_refinement_member(terminal_members, member)
@@ -1851,6 +1966,7 @@ class PopulationBasedSearch(BaseSearch):
             target[snapshot] = dataclasses.replace(
                 member,
                 perfs=copy.deepcopy(member.perfs),
+                measurements=list(member.measurements),
                 flat_values=copy.deepcopy(member.flat_values),
                 config=snapshot,
             )
@@ -2234,6 +2350,27 @@ class PopulationBasedSearch(BaseSearch):
             member.perf
         )
 
+    def _clone_finalist_args(self, count: int) -> list[Sequence[object]]:
+        """Allocate isolated finalist inputs and release partial allocations."""
+        arguments: list[Sequence[object]] = []
+        try:
+            for _ in range(count):
+                arguments.append(
+                    _clone_args(
+                        self.args,
+                        self.kernel.env.process_group_name,
+                        idx_to_clone=None,
+                    )
+                )
+        except torch.OutOfMemoryError as error:
+            arguments.clear()
+            raise exc.AutotuneError(
+                "Unable to allocate candidate-private arguments "
+                "for in-process finalist isolation. Reduce "
+                f"{_FINAL_REBENCHMARK_TOP_K_ENV} and retry."
+            ) from error
+        return arguments
+
     def rebenchmark(
         self,
         members: list[PopulationMember],
@@ -2255,7 +2392,17 @@ class PopulationBasedSearch(BaseSearch):
                 when unavailable, retain a sacrificial allocation to avoid recycled
                 allocator addresses. All candidates always have private storage.
         """
+        self._validate_timing_policy()
         if len(members) < 2:
+            return
+        if self.timing_policy is not None:
+            self._profiler_rebenchmark(
+                members,
+                desc=desc,
+                target_ms=target_ms,
+                confirm_suspicious=confirm_suspicious and not use_isolated,
+                fresh_process=candidate_private_args,
+            )
             return
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
             provider_timings = self.benchmark_provider.rebenchmark(
@@ -2314,24 +2461,10 @@ class PopulationBasedSearch(BaseSearch):
         # reference reports no mutation. A rejected candidate can write scratch
         # or inputs that the reference never changes. The optional extra clone
         # retains the existing allocator-address isolation policy.
-        isolated_args: list[Sequence[object]] = []
-        try:
-            isolated_args = [
-                _clone_args(
-                    self.args,
-                    self.kernel.env.process_group_name,
-                    idx_to_clone=None,
-                )
-                for _ in range(len(members) + int(in_process_isolation))
-            ]
-            benchmark_args_by_member = isolated_args[int(in_process_isolation) :]
-        except torch.OutOfMemoryError as error:
-            isolated_args.clear()
-            raise exc.AutotuneError(
-                "Unable to allocate candidate-private arguments "
-                "for in-process finalist isolation. Reduce "
-                f"{_FINAL_REBENCHMARK_TOP_K_ENV} and retry."
-            ) from error
+        isolated_args = self._clone_finalist_args(
+            len(members) + int(in_process_isolation)
+        )
+        benchmark_args_by_member = isolated_args[int(in_process_isolation) :]
 
         def make_rebenchmark_callable(
             member: PopulationMember,
@@ -2436,16 +2569,164 @@ class PopulationBasedSearch(BaseSearch):
             failure_statuses=failure_statuses,
         )
 
+    def _profiler_rebenchmark(
+        self,
+        members: list[PopulationMember],
+        *,
+        desc: str,
+        target_ms: float,
+        confirm_suspicious: bool = False,
+        fresh_process: bool = False,
+    ) -> None:
+        assert self.timing_policy is not None
+        assert isinstance(self.benchmark_provider, LocalBenchmarkProvider)
+        for member in members:
+            if math.isfinite(member.perf):
+                self._check_timing_measurement(member.measurement)
+        results = self.benchmark_provider.benchmark_isolated(
+            [member.fn for member in members],
+            warmup=1,
+            rep=self._isolated_rep_ms(
+                target_ms, self.settings.autotune_benchmark_timeout
+            ),
+            desc=desc,
+            fresh_process=fresh_process,
+        )
+        if results is None or any(result is None for result in results):
+            timing_error(
+                "Profiler rebenchmark cannot fall back to another timing domain"
+            )
+        assert results is not None
+        timings, failures = self._resolve_isolated_rebenchmark_results(members, results)
+        if confirm_suspicious:
+            confirmed = self._confirm_suspicious_rebenchmark_timings(
+                members,
+                timings,
+                desc=desc,
+                initial_results=results,
+                fresh_process=fresh_process,
+            )
+            results = confirmed
+            timings, confirmed_failures = self._resolve_isolated_rebenchmark_results(
+                members, confirmed
+            )
+            failures = [
+                failure or confirmed_failure
+                for failure, confirmed_failure in zip(
+                    failures, confirmed_failures, strict=True
+                )
+            ]
+        measurements = [
+            result if isinstance(result, BenchmarkMeasurement) else member.measurement
+            for member, result in zip(members, results, strict=True)
+        ]
+        self._apply_rebenchmark_timings(
+            members, timings, failure_statuses=failures, measurements=measurements
+        )
+
+    def _profiler_mirrored_rebenchmark(
+        self, members: list[PopulationMember], *, desc: str, target_ms: float
+    ) -> ProfilerSweepTrace:
+        assert self.timing_policy is not None
+        assert isinstance(self.benchmark_provider, LocalBenchmarkProvider)
+        reference = self._repeat_reference_perf(members)
+        repeat = self._repeat_for_target_ms(target_ms, reference)
+        if (capstr := os.getenv("HELION_CAP_REBENCHMARK_REPEAT")) is not None:
+            repeat = max(2, min(repeat, int(capstr)))
+            repeat -= repeat % 2
+        else:
+            repeat = max(2, repeat + repeat % 2)
+        sweeps, calls, total = _mirrored_bench_call_layout(repeat)
+        orders: list[list[int]] = []
+        observations: list[list[BenchmarkMeasurement]] = [[] for _ in members]
+        indices = list(range(len(members)))
+        for member in members:
+            self._check_timing_measurement(member.measurement)
+        for sweep in range(sweeps):
+            offset = (sweep // 2) % len(indices)
+            rotated = indices[offset:] + indices[:offset]
+            order = rotated if sweep % 2 == 0 else list(reversed(rotated))
+            orders.append(order)
+            for index in order:
+                member = members[index]
+                result = self.benchmark_provider.benchmark_isolated(
+                    [member.fn],
+                    warmup=0,
+                    rep=1,
+                    desc=desc,
+                    fixed_repetitions=calls,
+                )
+                if (
+                    result is None
+                    or len(result) != 1
+                    or not isinstance(result[0], BenchmarkMeasurement)
+                ):
+                    timing_error("Incomplete terminal profiler sweep")
+                assert result is not None and isinstance(
+                    result[0], BenchmarkMeasurement
+                )
+                measurement = result[0]
+                self._check_timing_measurement(measurement)
+                assert measurement is not None
+                measurement.validate(self.timing_policy, fixed_repetitions=calls)
+                observations[index].append(measurement)
+        means: list[float] = []
+        measurements: list[BenchmarkMeasurement] = []
+        for member, blocks in zip(members, observations, strict=True):
+            from .profiler_timing import ProfilerTimingObservation
+
+            for block in blocks:
+                block.validate(self.timing_policy, blocks[0].observation.identity)
+            observation = ProfilerTimingObservation(
+                blocks[0].observation.policy,
+                blocks[0].observation.identity,
+                tuple(chunk for block in blocks for chunk in block.observation.chunks),
+            )
+            measurement = BenchmarkMeasurement(
+                self.timing_policy, observation, 0, total
+            )
+            measurement.validate(self.timing_policy, fixed_repetitions=total)
+            measurements.append(measurement)
+            self.log.record_timing_measurement(
+                measurement, phase=desc, config=repr(member.config)
+            )
+            means.append(measurement.perf)
+        self._apply_rebenchmark_timings(members, means, measurements=measurements)
+        return ProfilerSweepTrace(
+            orders, observations, means, target_ms, reference, sweeps, calls, total
+        )
+
     def mirrored_rebenchmark(
         self,
         members: list[PopulationMember],
         *,
         desc: str,
         target_ms: float = _REBENCHMARK_TARGET_MS_DEFAULT,
-    ) -> MirroredBenchmarkTrace:
+    ) -> MirroredBenchmarkTrace | ProfilerSweepTrace:
         """Rebenchmark candidates with deterministic mirrored wall-time sweeps."""
+        self._validate_timing_policy()
+        if self.timing_policy is not None and len(members) < 2:
+            for member in members:
+                self._check_timing_measurement(member.measurement)
+                assert member.measurement is not None
+                if member.perf != member.measurement.perf:
+                    timing_error("Retained terminal score has foreign evidence")
+            return ProfilerSweepTrace(
+                [],
+                [],
+                [member.perf for member in members],
+                target_ms,
+                self._repeat_reference_perf(members) if members else 0.0,
+                0,
+                0,
+                0,
+            )
         if len(members) < 2:
             return MirroredBenchmarkTrace([], [], [member.perf for member in members])
+        if self.timing_policy is not None:
+            return self._profiler_mirrored_rebenchmark(
+                members, desc=desc, target_ms=target_ms
+            )
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
             raise exc.AutotuneError(
                 "mirrored terminal refinement does not support multi-shape benchmarking"
@@ -2463,9 +2744,7 @@ class PopulationBasedSearch(BaseSearch):
         else:
             repeat = max(2, repeat + repeat % 2)
 
-        benchmark_args_by_member = [
-            _clone_args(self.args, self.kernel.env.process_group_name) for _ in members
-        ]
+        benchmark_args_by_member = self._clone_finalist_args(len(members))
 
         def after_call(index: int) -> None:
             clear_jit_fast_path_caches(members[index].fn, self.log)
@@ -2525,7 +2804,15 @@ class PopulationBasedSearch(BaseSearch):
                 else:
                     timings.append(member.perf)
                     failure_statuses.append(None)
+            elif isinstance(result, BenchmarkMeasurement):
+                if self.timing_policy is None:
+                    timing_error("Unexpected profiler result in default timing domain")
+                self._check_timing_measurement(result)
+                timings.append(result.perf)
+                failure_statuses.append(None)
             else:
+                if self.timing_policy is not None and result is not None:
+                    timing_error("Profiler rebenchmark returned an untagged score")
                 timings.append(member.perf if result is None else result)
                 failure_statuses.append(None)
         return timings, failure_statuses
@@ -2536,15 +2823,34 @@ class PopulationBasedSearch(BaseSearch):
         timings: Sequence[float],
         *,
         failure_statuses: Sequence[Literal["error", "timeout"] | None] | None = None,
+        measurements: Sequence[BenchmarkMeasurement | None] | None = None,
     ) -> None:
+        self._validate_timing_policy()
         if failure_statuses is None:
             failure_statuses = [None] * len(members)
-        for member, timing, failure_status in zip(
-            members, timings, failure_statuses, strict=True
-        ):
+        if measurements is None:
+            measurements = [member.measurement for member in members]
+        pending = list(
+            zip(members, timings, failure_statuses, measurements, strict=True)
+        )
+        # Validate the complete batch before mutating any ranking or history.
+        if self.timing_policy is not None:
+            for _member, timing, failure_status, measurement in pending:
+                if failure_status is None and math.isfinite(timing):
+                    self._check_timing_measurement(measurement)
+                    assert measurement is not None
+                    if timing != measurement.perf:
+                        timing_error(
+                            "Rebenchmark score disagrees with profiler evidence"
+                        )
+        for member, timing, failure_status, measurement in pending:
             if failure_status is not None:
                 continue
             member.perfs.append(timing)
+            if self.timing_policy is not None and math.isfinite(timing):
+                assert measurement is not None
+                member.measurement = measurement
+                member.measurements.append(measurement)
             if timing < self.best_perf_so_far:
                 self.best_perf_so_far = timing
         invalidated = self._invalidate_cute_flash_rebenchmark_failures(
@@ -2656,8 +2962,12 @@ class PopulationBasedSearch(BaseSearch):
         timings: list[float],
         *,
         desc: str,
+        initial_results: Sequence[IsolatedBenchmarkTiming] | None = None,
+        fresh_process: bool = False,
     ) -> list[IsolatedBenchmarkTiming]:
-        updated: list[IsolatedBenchmarkTiming] = list(timings)
+        updated: list[IsolatedBenchmarkTiming] = list(
+            timings if initial_results is None else initial_results
+        )
         ratio = self.settings.get_suspicious_rebenchmark_ratio()
         if ratio is None or ratio <= 0:
             return updated
@@ -2677,8 +2987,11 @@ class PopulationBasedSearch(BaseSearch):
             warmup=_SUSPICIOUS_REBENCHMARK_WARMUP,
             rep=_SUSPICIOUS_REBENCHMARK_REP,
             desc=f"{desc}: confirming suspicious timings",
+            **({"fresh_process": True} if fresh_process else {}),
         )
         if confirmed is None:
+            if self.timing_policy is not None:
+                timing_error("Profiler confirmation cannot change timing domains")
             return updated
 
         for i, timing in zip(suspicious, confirmed, strict=True):
@@ -2838,6 +3151,8 @@ class PopulationBasedSearch(BaseSearch):
             config=minimal_config,
             status=current.status,
             compile_time=current.compile_time,
+            measurement=current.measurement,
+            measurements=list(current.measurements),
         )
         self._selected_member = current
         self.log(f"Finishing phase complete: final config={current.config}")
@@ -2913,6 +3228,7 @@ class PopulationBasedSearch(BaseSearch):
         Shared tail of the search ``_autotune`` methods; the final-pick re-rank
         runs only on TPU/Pallas (see ``_final_pick_supported``).
         """
+        self._validate_timing_policy()
         best = self.final_rebenchmark_best(self.best)
         best = self.run_finishing_phase(best, self.finishing_rounds)
         best = self.run_terminal_refinement(best)
@@ -2963,27 +3279,32 @@ class PopulationBasedSearch(BaseSearch):
         per-call device µs isn't masked by the ~125µs dispatch overhead. Picks the
         smallest delta (tie-broken by absolute device µs). Device µs is not folded
         into ``perfs`` (those are wall-clock ms). Falls back to the absolute-median
-        rebench on any error.
+        rebench if device timing fails. Input-copy allocation failures raise an
+        actionable error before timing starts.
         """
+        arguments = self._clone_finalist_args(len(candidates) + 1)
         candidate_fns: list[Callable[..., object]] = [
-            functools.partial(
-                member.fn,
-                *_clone_args(self.args, self.kernel.env.process_group_name),
-            )
-            for member in candidates
+            functools.partial(member.fn, *args)
+            for member, args in zip(candidates, arguments[:-1], strict=True)
         ]
-        reference_fn: Callable[..., object] = functools.partial(
-            best.fn, *_clone_args(self.args, self.kernel.env.process_group_name)
+        reference_fn: Callable[..., object] | None = functools.partial(
+            best.fn, *arguments[-1]
         )
         desc = (
             "Final-pick verification device_micros"
             if self.settings.autotune_progress_bar
             else None
         )
+        results = None
         try:
             results = device_micros_bench(candidate_fns, reference_fn, desc=desc)
         except Exception as err:
             self.log(f"Device-µs re-rank failed ({err!r}); falling back to rebench.")
+        finally:
+            candidate_fns.clear()
+            arguments.clear()
+            reference_fn = None
+        if results is None:
             return self._rebench_and_pick(best, candidates)
 
         # results[i] == (absolute device µs, paired delta vs best).

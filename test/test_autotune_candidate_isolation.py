@@ -7,6 +7,7 @@ from typing import Any
 from typing import Literal
 from typing import cast
 from unittest.mock import Mock
+import weakref
 
 import pytest
 import torch
@@ -258,8 +259,13 @@ def test_precompile_parent_never_passes_template(
     monkeypatch.setattr(provider, "_next_precompile_result_path", lambda: "unused")
 
     def create(**kwargs: Any) -> None:
-        _bad(*kwargs["args"])
-        assert kwargs["args"][0] is not args[0]
+        if mode == "spawn":
+            # Spawn only consumes the serialized args_path in its child.
+            # No caller tensor or unused device clone needs to cross this API.
+            assert kwargs["args"] == ()
+        else:
+            _bad(*kwargs["args"])
+            assert kwargs["args"][0] is not args[0]
 
     monkeypatch.setattr(precompile_future.PrecompileFuture, "create", create)
     provider._create_precompile_future(helion.Config(), cast("Any", _bad))
@@ -313,7 +319,17 @@ def _search(args: Sequence[object]) -> PopulationBasedSearch:
 
 @pytest.mark.parametrize(
     "mode",
-    ["sequential", "interleaved", "custom", "mirrored", "device", "sacrificial", "oom"],
+    [
+        "sequential",
+        "interleaved",
+        "custom",
+        "mirrored",
+        "device",
+        "sacrificial",
+        "oom",
+        "mirrored_oom",
+        "device_oom",
+    ],
 )
 def test_finalists_never_share_storage(
     monkeypatch: pytest.MonkeyPatch, mode: str
@@ -360,14 +376,21 @@ def test_finalists_never_share_storage(
     monkeypatch.setattr(base_search, "mirrored_bench_generic", mirrored)
     if mode == "custom":
         search.settings.autotune_benchmark_fn = multiple
-    if mode == "oom":
+    if mode.endswith("oom"):
         monkeypatch.setattr(
             base_search,
             "_clone_args",
             Mock(side_effect=torch.OutOfMemoryError("private allocation")),
         )
         with pytest.raises(exc.AutotuneError, match="candidate-private"):
-            search.rebenchmark(members, use_isolated=False)
+            if mode == "mirrored_oom":
+                search.mirrored_rebenchmark(members, desc="test", target_ms=1)
+            elif mode == "device_oom":
+                search._run_final_pick_verification_device_micros(
+                    members[0], members, device_micros_bench=device
+                )
+            else:
+                search.rebenchmark(members, use_isolated=False)
         assert seen == []
     elif mode == "mirrored":
         search.mirrored_rebenchmark(members, desc="test", target_ms=1)
@@ -387,6 +410,64 @@ def test_finalists_never_share_storage(
     assert len({value.data_ptr() for value in seen}) == len(seen)
     assert all(value is not original for value in seen)
     assert torch.equal(original, torch.zeros_like(original))
+
+
+@pytest.mark.parametrize("failure", ["exception", "nonfinite", "empty"])
+def test_device_finalist_fallback_releases_private_inputs(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    original = torch.zeros(4)
+    search = _search((original,))
+    members = [
+        PopulationMember(cast("Any", lambda value: value), [1.0], [], helion.Config())
+        for _ in range(2)
+    ]
+    copies: list[weakref.ReferenceType[torch.Tensor]] = []
+
+    def device(fns, reference, **kwargs):
+        copies.extend(weakref.ref(fn.args[0]) for fn in [*fns, reference])
+        assert all(ref() is not original for ref in copies)
+        if failure == "exception":
+            raise RuntimeError("device timer failed")
+        if failure == "empty":
+            return []
+        return [(float("inf"), float("inf"))] * len(fns)
+
+    def fallback(best, candidates):
+        assert len(copies) == len(members) + 1
+        assert all(ref() is None for ref in copies)
+        return best
+
+    monkeypatch.setattr(search, "_rebench_and_pick", fallback)
+    assert (
+        search._run_final_pick_verification_device_micros(
+            members[0], members, device_micros_bench=device
+        )
+        is members[0]
+    )
+
+
+@pytest.mark.parametrize("challenger_delta,winner", [(2.0, 0), (0.0, 0), (-2.0, 1)])
+def test_device_finalist_requires_measured_win(challenger_delta, winner) -> None:
+    search = _search((torch.zeros(4),))
+    members = [
+        PopulationMember(
+            cast("Any", lambda value: value),
+            [1.0],
+            [],
+            helion.Config(num_warps=warps),
+        )
+        for warps in (4, 8)
+    ]
+    selected = search._run_final_pick_verification_device_micros(
+        members[0],
+        members,
+        device_micros_bench=lambda *args, **kwargs: [
+            (100.0, 4.0),
+            (90.0, challenger_delta),
+        ],
+    )
+    assert selected is members[winner]
 
 
 def test_multishape_reference_does_not_write_child_template(

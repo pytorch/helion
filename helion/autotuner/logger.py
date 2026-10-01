@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
     from .metrics import KernelMetadata
+    from .search_timing import BenchmarkMeasurement
 
 else:
     CsvWriter = Any  # type: ignore[assignment]
@@ -166,6 +167,36 @@ class AutotuningLogger:
         if self._log_sink is None:
             return
         self._log_sink.record(entry)
+
+    def record_timing_measurement(
+        self,
+        measurement: BenchmarkMeasurement,
+        *,
+        phase: str = "benchmark",
+        config: str | None = None,
+    ) -> None:
+        """Opt-in evidence sidecar; the existing CSV/schema stay unchanged."""
+        if not self._settings.autotune_log:
+            return
+        path = Path(self._settings.autotune_log).with_suffix(".timing.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {"phase": phase, "config": config, **measurement.record()},
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
+    def record_timing_failure(self, error: BaseException) -> None:
+        """Keep failed raw collector evidence beyond ephemeral worker cleanup."""
+        fd, filename = tempfile.mkstemp(
+            prefix="helion-profiler-failure-", suffix=".json"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"error": type(error).__name__, "args": error.args}, stream)
+        self.warning(f"Profiler timing failed; preserved evidence: {filename}")
 
     def register_config(self, config: Config) -> str | None:
         """Return the content-addressed ``config_id`` (registering it on the sink

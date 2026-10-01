@@ -582,6 +582,9 @@ class _Settings:
     autotune_baseline_rtol: float | None = None
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_timing_method: Literal["default", "torch_profiler"] = dataclasses.field(
+        default="default", repr=False
+    )
     autotune_best_available_max_configs: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
@@ -887,6 +890,10 @@ class Settings(_Settings):
             "remote caching via a user-provided RemoteCacheBackend subclass. "
             "Defaults to 'LocalAutotuneCache'."
         ),
+        "autotune_timing_method": (
+            "Explicit search score: default preserves backend timing; torch_profiler "
+            "uses isolated CuTe mean kernel work with a separate cache domain."
+        ),
         "autotune_benchmark_fn": (
             "Custom benchmark function for rebenchmarking during autotuning. "
             "Should have the following signature: "
@@ -974,6 +981,16 @@ class Settings(_Settings):
         super().__init__(**settings)
         self._cute_structural_origins = CuteStructuralOrigins(**origins)
 
+        if type(
+            self.autotune_timing_method
+        ) is not str or self.autotune_timing_method not in (
+            "default",
+            "torch_profiler",
+        ):
+            raise ValueError(
+                "autotune_timing_method must be 'default' or 'torch_profiler'"
+            )
+
         if self.backend == "tileir" and os.environ.get("ENABLE_TILE", "0") != "1":
             raise exc.MissingEnableTile
 
@@ -1055,11 +1072,14 @@ class Settings(_Settings):
 
         # Only include fields that are meant to be public (repr=True)
         public_fields = {f.name for f in dataclasses.fields(self) if f.repr}
-        return {
+        result = {
             k: shallow_copy(v)
             for k, v in dataclasses.asdict(self).items()
             if k in public_fields
         }
+        if self.autotune_timing_method != "default":
+            result["autotune_timing_method"] = self.autotune_timing_method
+        return result
 
     def check_autotuning_disabled(self) -> None:
         msg = None
