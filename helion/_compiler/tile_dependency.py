@@ -34,6 +34,9 @@ TILE_ACCESS_META = "tile_access_ids"
 _ALLOCATION_ADDRESS_AXIS = -1
 _MAX_RELATION_PIECES = 4_096
 _MAX_RELATION_PRODUCT_STATES = 65_536
+# Caps the tagged words each rank pushes per buffer, which bounds its mailbox (two
+# parities per rank). A size bound, not a measured crossover.
+_INBAND_PUSH_BYTES = 1 << 20
 DependencyObligation = tuple[int, int | None, int | None]
 # Local counters, tagged data pushed to every rank, or counters every rank sees.
 Transport = Literal["counter", "inband", "peer_counter"]
@@ -6176,6 +6179,7 @@ def _inband_failure(
     accesses: list[TileAccess],
     task_families: tuple[TaskFamily, ...],
     runs_at_root: Callable[[TileAccess], bool],
+    world_size: int,
 ) -> str | None:
     """The first rule a symmetric allocation breaks for inband transport."""
     stores = [access for access in accesses if access.kind == "store"]
@@ -6226,6 +6230,19 @@ def _inband_failure(
         return "R2: the store fills a dense buffer of at most 4-byte elements"
     if any(load.root <= store.root for load in peer_loads):
         return "R3: peer loads run in a later root than the store"
+    # Every rank receives the whole buffer, so no polled rank's reads may surely miss
+    # part of it. A read may touch its whole interval, or all of an unknown one.
+    for rank in {load.owner_rank for load in peer_loads}:
+        spans = [
+            _access_region(load, task_families[load.root]).address_interval
+            for load in peer_loads
+            if load.owner_rank == rank
+        ]
+        covers = tuple(_linear_region(*(span or (0, numel))) for span in spans)
+        if _subtract_regions(region, covers):
+            return "R6: peer loads read the whole buffer of each polled rank"
+    if 8 * world_size * numel > _INBAND_PUSH_BYTES:
+        return "R7: each rank pushes at most 1 MiB of tagged words"
     return None
 
 
@@ -6527,7 +6544,10 @@ def build_tile_dependency_graph(
     }
     failures = {
         allocation_id: _inband_failure(
-            accesses_by_allocation[allocation_id], task_families, runs_at_root
+            accesses_by_allocation[allocation_id],
+            task_families,
+            runs_at_root,
+            world_size,
         )
         for allocation_id in crossing_allocation_ids
     }

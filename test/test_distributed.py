@@ -195,6 +195,8 @@ def inband_rule_kernel(
 ) -> torch.Tensor:
     peers = _remote_views(symm, group_name)
     out = torch.empty_like(symm)
+    # R6: the consumer reads only half of each peer's buffer.
+    read = symm.size(0) // 2 if broken_rule == "R6" else symm.size(0)
     for tile in hl.tile(symm.size(0)):
         if broken_rule == "R3":
             out[tile] = peers[1][tile]
@@ -204,7 +206,7 @@ def inband_rule_kernel(
         symm[tile] = x[tile]
         if broken_rule == "R1":
             symm[tile] = x[tile] + 1
-    for tile in hl.tile(symm.size(0)):
+    for tile in hl.tile(read):
         acc = peers[1][tile] + peers[2][tile]
         if broken_rule != "R4":
             acc = acc + peers[0][tile] + peers[3][tile]
@@ -1179,8 +1181,12 @@ class TestDistributedTileDependencies(TestCase):
             ("", torch.float64, "use peer_counter (R2:"),
             ("R3", torch.float32, "use peer_counter (R3:"),
             ("R4", torch.float32, "use peer_counter (R4:"),
+            ("R6", torch.float32, "use peer_counter (R6:"),
+            # 4 ranks * 2**17 words * 8 bytes is past the 1 MiB push cap.
+            ("R7", torch.float32, "use peer_counter (R7:"),
         ):
-            symm, x = torch.zeros(2, 256, device=DEVICE, dtype=dtype)
+            n = 1 << 17 if broken_rule == "R7" else 256
+            symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
             with (
                 self.subTest(broken_rule=broken_rule, dtype=dtype),
                 self.assertLogs(tile_dependency.log, "INFO") as logs,
