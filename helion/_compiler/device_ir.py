@@ -3502,7 +3502,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                             for candidate, _lhs, _rhs, node in mma_candidates
                         },
                     )
-        config_spec.raise_grid_block_minimums()
+        grid_policy = config_spec.backend.autotune_grid_policy(config_spec)
+        if grid_policy.raise_independent_axis_block_size_minimums:
+            config_spec.raise_grid_block_minimums()
         if (
             len(device_ir.root_ids) > 1
             and CompileEnvironment.current().cute_fission_plan is None
