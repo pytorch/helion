@@ -4379,8 +4379,9 @@ def test_attention_canonical_compiler_seeds_fit_all_eight_b200_populations(
 @pytest.mark.parametrize(
     ("kernel_name", "shape", "expected_raw_count", "expected_effective_count"),
     (
-        # The dense hd128 surface seeds the four plain batched exp2 packets too.
-        ("attention_output", (2, 32, 262144, 128), 12, 12),
+        # The dense hd128 surface seeds the four plain batched exp2 packets too
+        # and the alternating-warpgroup family.
+        ("attention_output", (2, 32, 262144, 128), 13, 13),
         ("causal_attention_output", (2, 32, 524288, 128), 2, 2),
         ("attention_output", (1, 32, 524288, 64), 16, 15),
         ("causal_attention_output", (1, 32, 1048576, 64), 8, 8),

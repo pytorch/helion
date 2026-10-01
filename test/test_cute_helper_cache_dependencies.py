@@ -91,6 +91,11 @@ def _key(kernel: SimpleNamespace) -> str | None:
             "chunk_recurrence_sm100",
         ),
         (
+            "helion_flash",
+            "_compiler/cute/_flash_alt_runtime.py",
+            "helion_flash_row_mma",
+        ),
+        (
             "helion_flash_gated",
             "_compiler/cute/_flash_gemm_ptx.py",
             "gathered_mma_tma",

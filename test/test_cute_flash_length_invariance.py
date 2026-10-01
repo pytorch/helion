@@ -1977,13 +1977,14 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     assert _active_choices(
         enum_fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
     ) == frozenset(("ws_overlap",))
-    # 59: the ws surface pins every dimension it cannot vary to one value,
+    # 60: the ws surface pins every dimension it cannot vary to one value,
     # including the KV tile width, the query-tile height, the one-pass
-    # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice and
-    # the two row-program knobs (``cute_flash_row_warps``,
-    # ``cute_flash_row_tile_m`` of the ``row_mma`` family); the two-warpgroup
-    # body measures both of its O epilogues (``cute_flash_epi_stg``).
-    assert len(active_values) <= 59
+    # softmax of the 64-row tile, the (fa4-only) row-epilogue warp choice,
+    # the (fa4-only) per-chunk P release and the two row-program knobs
+    # (``cute_flash_row_warps``, ``cute_flash_row_tile_m`` of the ``row_mma``
+    # family); the two-warpgroup body measures both of its O epilogues
+    # (``cute_flash_epi_stg``).
+    assert len(active_values) <= 60
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(

@@ -165,6 +165,9 @@ def flash_fa4_shared_storage(
             s_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             pfor_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             pfor2_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            # Per-chunk staged-P release (p_chunk_arrive): the second and third
+            # P chunks' barriers per Q slot (cnt 128); pfor/pfor2 carry the first/last.
+            pforc_mbar: cute.struct.MemRange[cutlass.Int64, 4]
             o_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             corr_epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
             aux_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
@@ -202,6 +205,9 @@ def flash_fa4_shared_storage(
             s_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             pfor_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             pfor2_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            # Per-chunk staged-P release (p_chunk_arrive): the second and third
+            # P chunks' barriers per Q slot (cnt 128); pfor/pfor2 carry the first/last.
+            pforc_mbar: cute.struct.MemRange[cutlass.Int64, 4]
             o_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             # correction -> epilogue TMA-store full/empty handshakes.
             corr_epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
@@ -240,6 +246,9 @@ def flash_fa4_shared_storage(
         s_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
         pfor_mbar: cute.struct.MemRange[cutlass.Int64, 2]
         pfor2_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+        # Per-chunk staged-P release (p_chunk_arrive): the second and third
+        # P chunks' barriers per Q slot (cnt 128); pfor/pfor2 carry the first/last.
+        pforc_mbar: cute.struct.MemRange[cutlass.Int64, 4]
         o_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
         corr_epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
         aux_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
@@ -1592,6 +1601,7 @@ def fa4_disc_exp_convert_store(
     pfor_self_cta_rank: object = None,
     pair_batch: int = 1,
     emu_batch: int = 1,
+    pforc_ptr_stage: object = None,
     *,
     loc: object = None,
     ip: object = None,
@@ -1610,6 +1620,11 @@ def fa4_disc_exp_convert_store(
     MMA's first PV K-chunk group; after the last chunk a fence + ``mbarrier_arrive(
     pfor2)`` releases the final group. Load chunk ci and store chunk ci alias the
     SAME TMEM cols (read-before-write in place), so this is safe.
+
+    PER-CHUNK release (``pforc_ptr_stage`` given, 4 chunks): chunk 0 arrives on
+    ``pfor``, chunks 1 and 2 on ``pforc_ptr_stage + 0/1``, the last chunk on
+    ``pfor2``; the MMA's PTX PV stream waits before each K-chunk quarter, so the
+    first three quarters of PV run under this pass. Same stores, same order.
 
     The exp2 pipe-split gate is CHUNK-LOCAL (pair index ``i`` within the 32-elem
     chunk == FA4's ``k``; ``ci`` == FA4's fragment index ``j``; last chunk forced to
@@ -1637,16 +1652,56 @@ def fa4_disc_exp_convert_store(
         )
         _disc_chunk_convert_store(frg, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(frg)
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+        _disc_chunk_release(
+            ci,
+            p_store_split,
+            p_store_chunks,
+            pfor_ptr_stage,
+            pfor2_ptr_stage,
+            pforc_ptr_stage,
+            pfor_peer_cta_rank,
+            pfor_self_cta_rank,
+        )
     cute.arch.fence_view_async_tmem_store()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     else:
         mbarrier_arrive(pfor2_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
     return p_sum
+
+
+def _disc_chunk_release(
+    ci: int,
+    p_store_split: int,
+    p_store_chunks: int,
+    pfor_ptr_stage: object,
+    pfor2_ptr_stage: object,
+    pforc_ptr_stage: object,
+    pfor_peer_cta_rank: object,
+    pfor_self_cta_rank: object,
+) -> None:
+    """The staged-P arrival that follows P chunk ``ci``'s store (the last chunk's
+    arrival stays with the caller). Split release: one arrival on ``pfor`` after
+    chunk ``p_store_split - 1``. Per-chunk release (``pforc_ptr_stage`` given):
+    chunk 0 on ``pfor``, chunk ``i`` of the middle chunks on
+    ``pforc_ptr_stage + (i - 1)``."""
+    if ci >= p_store_chunks - 1:
+        return
+    if cutlass.const_expr(pforc_ptr_stage is not None):
+        assert p_store_chunks == 4, "the per-chunk P release is written for 4 chunks"
+        cute.arch.fence_view_async_tmem_store()
+        if ci == 0:
+            mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+        else:
+            mbarrier_arrive(
+                pforc_ptr_stage + (ci - 1),  # pyrefly: ignore[unsupported-operation]
+                pfor_peer_cta_rank,
+                pfor_self_cta_rank,
+            )
+    if cutlass.const_expr(pforc_ptr_stage is None and pfor2_ptr_stage is not None):
+        if ci == p_store_split - 1:
+            cute.arch.fence_view_async_tmem_store()
+            mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
 
 
 def fa4_disc_exp_convert_store_causal(
@@ -3936,6 +3991,7 @@ def fa4_disc_exp_convert_store_pipe(
     degree2: bool = False,
     degree1: bool = False,
     f16x2_xu: bool = False,
+    pforc_ptr_stage: object = None,
 ) -> Float32:
     """SOFTWARE-PIPELINED chunked-t2r PASS 2 (the L1 lever). Same numerics + staged-P
     handshake + zero-spill peak (ONE chunk + a bounded pipeline window) as the serial
@@ -3962,7 +4018,10 @@ def fa4_disc_exp_convert_store_pipe(
     ``pipe_depth >= p_store_chunks`` (the hd64 default: 4 chunks, depth 4), all
     chunks are prefetched and pinned in the prologue, then consumed without steady
     prefetches. That full-prologue mode intentionally trades a larger fragment
-    window for fewer loop-carried t2r scheduling points."""
+    window for fewer loop-carried t2r scheduling points.
+
+    ``pforc_ptr_stage`` selects the per-chunk staged-P release described on the
+    serial helper (one arrival per chunk instead of the 3/4 + 1/4 split)."""
     p_sum = cutlass.Float32(0.0)
     ld_shape = tLDcS[None, 0, None, None].shape  # pyrefly: ignore[missing-attribute]
     n_buf = pipe_depth + 1
@@ -4004,10 +4063,16 @@ def fa4_disc_exp_convert_store_pipe(
         )
         _disc_chunk_convert_store(cur, tiled_st, tSTtS, tSTcS, ci, io_dtype)
         p_sum = p_sum + _disc_chunk_rowsum(cur)
-        if cutlass.const_expr(pfor2_ptr_stage is not None):
-            if ci == p_store_split - 1:
-                cute.arch.fence_view_async_tmem_store()
-                mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)
+        _disc_chunk_release(
+            ci,
+            p_store_split,
+            p_store_chunks,
+            pfor_ptr_stage,
+            pfor2_ptr_stage,
+            pforc_ptr_stage,
+            pfor_peer_cta_rank,
+            pfor_self_cta_rank,
+        )
     cute.arch.fence_view_async_tmem_store()
     if cutlass.const_expr(pfor2_ptr_stage is None):
         mbarrier_arrive(pfor_ptr_stage, pfor_peer_cta_rank, pfor_self_cta_rank)

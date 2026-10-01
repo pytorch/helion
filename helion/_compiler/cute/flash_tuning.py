@@ -38,6 +38,7 @@ _FLASH_POLICY_PIPELINE_FAMILIES = frozenset(
         "fa4_clc_tma_4d",
         "fa4_clc_local_tma",
         "fa4_clc_local_tma_4d",
+        "fa4_alt",
     }
 )
 _FLASH_POLICY_FP16_HD64_PIPELINE_FAMILIES = frozenset(
