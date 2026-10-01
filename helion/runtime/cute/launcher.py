@@ -298,6 +298,7 @@ def _append_cute_wrapper_plan(
     call_args: list[str],
     plan: dict[str, object],
     num_sm: int | None = None,
+    schema_key: Sequence[tuple[object, ...]] | None = None,
 ) -> None:
     descriptor_identity = plan.get("wrapped_grouped_descriptors")
     descriptors = (
@@ -693,6 +694,36 @@ def _append_cute_wrapper_plan(
             [
                 f"    grid_x = cutlass.Int32({seq})",
                 f"    grid_y = cutlass.Int32({batch})",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+    if kind == "helion_flash_row_mma":
+        # Register-MMA row programs: one CTA per (batch*head, row tile), plain
+        # tensor arguments, no host-side descriptors. The body moves 16-byte
+        # cp.async and st.global.v4 packets from the tensor bases; codegen
+        # resolves bindings with an under-aligned base to the tcgen05
+        # families, and a wrapper schema that still proves one only 8-byte
+        # aligned is refused here rather than faulting on the device.
+        if schema_key is not None:
+            aux_keys = tuple(
+                f"epi_aux{index}_idx"
+                for index in range(plan_int("epi_aux_count", default=0))
+            )
+            for key in ("q_idx", "k_idx", "v_idx", "o_idx", "lse_idx", *aux_keys):
+                index = plan_optional_int(key)
+                if index is not None and (
+                    _cute_schema_pointer_alignment(schema_key[index]) % 16
+                ):
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        "row_mma flash requires 16-byte-aligned q/k/v/o/lse "
+                        "and row-epilogue aux bases",
+                    )
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_tiles')})",
+                "    grid_y = cutlass.Int32(1)",
                 "    grid_z = cutlass.Int32(1)",
             ]
         )
@@ -2376,7 +2407,9 @@ def _create_cute_wrapper(
             "cute", "TF32 TMA RN requires its proved 256-thread block"
         )
     for plan in wrapper_plans:
-        _append_cute_wrapper_plan(body, call_args, plan, num_sm=num_sm)
+        _append_cute_wrapper_plan(
+            body, call_args, plan, num_sm=num_sm, schema_key=schema_key
+        )
     gathered_plans = [
         plan for plan in wrapper_plans if plan.get("kind") == "gathered_mma_tma"
     ]
@@ -3300,6 +3333,84 @@ def _cute_schema_pointer_alignment(entry: tuple[object, ...]) -> int:
     """Read a tensor/wrapper tensor entry's optional alignment specialization."""
     has_alignment = len(entry) in (4, 6) if entry[0] == "tensor" else len(entry) == 7
     return cast("int", entry[-1]) if has_alignment else 16
+
+
+# Wrapper plans whose device bodies address the named tensors with 16-byte-wide
+# instructions: TMA tensor maps over q/k/v (and the outputs the epilogues store
+# or reduce through TMA), 128-bit copies of the output tile, the row programs'
+# 16-byte packets. A TMA descriptor encodes its global address in 16-byte
+# units, and the CuTe DSL builds one over a pointer whose assumed alignment
+# is only 8 bytes without complaint: the base is rounded down to 16 bytes and
+# every tile reads (or writes) 8 bytes before the tensor, giving a wrong
+# result instead of a fault. ``default_cute_launcher`` therefore stages an
+# under-aligned binding of these operands through a 16-byte-aligned copy and
+# copies the outputs back after the launch. Values are (input index keys,
+# output index keys); the flash kinds add their ``epi_aux{i}_idx`` inputs.
+_CUTE_STAGED_PLAN_OPERANDS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "helion_flash": (
+        ("q_idx", "k_idx", "v_idx", "bias_idx", "alibi_idx", "document_idx"),
+        ("o_idx", "lse_idx"),
+    ),
+    "helion_flash_row_mma": (("q_idx", "k_idx", "v_idx"), ("o_idx", "lse_idx")),
+    "helion_flash_gated": (("q_idx", "k_idx", "v_idx"), ("o_idx",)),
+    "helion_flash_bwd": (
+        ("q_idx", "k_idx", "v_idx", "do_idx", "lse_idx", "delta_idx"),
+        ("dq_idx", "dk_idx", "dv_idx"),
+    ),
+}
+_CUTE_STAGED_OPERAND_ALIGNMENT = 16
+
+
+def _cute_staged_plan_operands(
+    cute_kernel: object,
+) -> tuple[tuple[int, bool], ...]:
+    """The (argument index, is_output) operands the kernel's plans stage."""
+    operands: dict[int, bool] = {}
+    for plan in getattr(cast("Any", cute_kernel), "_helion_cute_wrapper_plans", ()):
+        kind = str(plan.get("kind"))
+        roles = _CUTE_STAGED_PLAN_OPERANDS.get(kind)
+        if roles is None:
+            continue
+        input_keys, output_keys = roles
+        if kind in ("helion_flash", "helion_flash_row_mma"):
+            aux_count = plan.get("epi_aux_count", 0)
+            assert isinstance(aux_count, int)
+            input_keys += tuple(f"epi_aux{i}_idx" for i in range(aux_count))
+        for keys, is_output in ((input_keys, False), (output_keys, True)):
+            for key in keys:
+                index = plan.get(key)
+                if isinstance(index, int):
+                    operands[index] = operands.get(index, False) or is_output
+    return tuple(operands.items())
+
+
+def _cute_stage_under_aligned_operands(
+    cute_kernel: object, args: tuple[object, ...]
+) -> tuple[tuple[object, ...], list[tuple[torch.Tensor, torch.Tensor]]] | None:
+    """Replace under-aligned staged operands by 16-byte-aligned copies.
+
+    Returns the launch arguments with each such operand cloned (a fresh
+    allocation is at least 16-byte aligned) and the (destination, copy) pairs
+    to write back after the launch, or None when every operand is aligned.
+    """
+    staged: list[object] | None = None
+    copy_backs: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for index, is_output in _cute_staged_plan_operands(cute_kernel):
+        tensor = args[index]
+        if (
+            not isinstance(tensor, torch.Tensor)
+            or tensor.data_ptr() % _CUTE_STAGED_OPERAND_ALIGNMENT == 0
+        ):
+            continue
+        if staged is None:
+            staged = list(args)
+        copy = tensor.clone()
+        staged[index] = copy
+        if is_output:
+            copy_backs.append((tensor, copy))
+    if staged is None:
+        return None
+    return tuple(staged), copy_backs
 
 
 def _validate_tcgen05_grouped_tensor_devices(
@@ -5364,6 +5475,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
     kind = str(plan.get("kind", ""))
     if kind in {
         "helion_small_biased_attention",
+        "helion_flash_row_mma",
         "chunk_prepare_tma",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",
@@ -6871,6 +6983,31 @@ def default_cute_launcher(
         )
         if hit:
             return result
+    # Under-aligned TMA/vector operands of the staged plan kinds never reach
+    # the compiled wrapper: the fast path's alignment guard rejected them
+    # above, and the copies below are what the slower paths see and cache.
+    staging = _cute_stage_under_aligned_operands(cute_kernel, args_tuple)
+    if staging is None:
+        return _launch_cute_marshalled(
+            cute_kernel, args_tuple, grid_xyz, block_xyz, cute_compile_options
+        )
+    staged_args, copy_backs = staging
+    result = _launch_cute_marshalled(
+        cute_kernel, staged_args, grid_xyz, block_xyz, cute_compile_options
+    )
+    for destination, copy in copy_backs:
+        destination.copy_(copy)
+    return result
+
+
+def _launch_cute_marshalled(
+    cute_kernel: object,
+    args_tuple: tuple[object, ...],
+    grid_xyz: tuple[int, int, int],
+    block_xyz: tuple[int, int, int],
+    cute_compile_options: str | None,
+) -> object:
+    """Launch through the last-launch cache or the schema-cached build path."""
     last_launch = _cute_last_launch_cache_entry(
         cute_kernel,
         args_tuple,

@@ -271,6 +271,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 plan.get("kind")
                 in {
                     "helion_small_biased_attention",
+                    "helion_flash_row_mma",
                     "helion_flash",
                     "helion_flash_gated",
                     "chunk_prepare_tma",

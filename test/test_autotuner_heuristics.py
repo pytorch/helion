@@ -5923,7 +5923,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_flash_accepts_extra_knobs(self) -> None:
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_AUTOTUNE_CONFIG_KEYS)
         self.assertIn(FLASH_PIPELINE_FAMILY_KEY, FLASH_CONFIG_KEYS)
-        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 15)
+        self.assertEqual(len(FLASH_PIPELINE_FAMILIES), 16)
         self.assertEqual(
             set(FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS),
             {
@@ -6307,10 +6307,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         assert_qualified(population)
 
+        # The quick effort's initial population covers this surface's parent
+        # rows; wider surfaces are raised to their leaf count by the flash
+        # population floor.
+        quick_size = get_effort_profile("quick").pattern_search.initial_population
+        assert quick_size is not None
         random_state = random.getstate()
         try:
             random.seed(1)
-            quick_population = config_gen.random_population(30)
+            quick_population = config_gen.random_population(quick_size)
         finally:
             random.setstate(random_state)
         for key, values in (
@@ -6391,7 +6396,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         assert_qualified(best_available_population)
 
         search.best_available_pad_random = False
-        search.initial_population = 30
+        search.initial_population = quick_size
         search._pinned_finalist_configs = set()
         search._autotune_seed_configs = lambda: ()
         quick_population = [
@@ -6399,7 +6404,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for flat in search._generate_initial_population_flat()
         ]
         expected_quick = {
-            *coverage[: config_gen.flash_structural_population_budget(30)],
+            *coverage[: config_gen.flash_structural_population_budget(quick_size)],
             compiler_seed,
             default_config,
         }
