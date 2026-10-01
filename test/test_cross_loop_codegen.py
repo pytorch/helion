@@ -637,6 +637,46 @@ def mixed_radix_continuation(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def runtime_bound_store_chain(
+    x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+) -> torch.Tensor:
+    rows, columns = x.size()
+    tmp = torch.zeros_like(x)
+    out = torch.empty([rows], dtype=x.dtype, device=x.device)
+    for producer_tile in hl.tile(rows, block_size=1):
+        row = producer_tile.begin
+        for column in hl.grid(starts[row], ends[row]):
+            tmp[row, column] = x[row, column] * 2
+    for consumer_tile in hl.tile(rows, block_size=1):
+        out[consumer_tile] = torch.sum(tmp[consumer_tile, :], dim=-1)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def runtime_bound_loop_chain(
+    x: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+) -> torch.Tensor:
+    rows, columns = x.size()
+    tmp = torch.empty([rows], dtype=x.dtype, device=x.device)
+    out = torch.empty([rows], dtype=x.dtype, device=x.device)
+    for producer_tile in hl.tile(rows, block_size=1):
+        row = producer_tile.begin
+        acc = hl.zeros([1], dtype=torch.float32)
+        for column in hl.grid(starts[row], ends[row]):
+            acc = acc + x[row, column]
+        tmp[producer_tile] = acc
+    for consumer_tile in hl.tile(rows, block_size=1):
+        out[consumer_tile] = tmp[consumer_tile] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def specialized_quotient_chain(
     x: torch.Tensor,
     numerator: int,
@@ -1558,6 +1598,49 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tl.cast(32, tl.uint32) - 1", code)
         self.assertNotIn("tile_dependency_root_barrier", code)
         self.assertLessEqual(code.count("tl.where"), 2)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_runtime_bound_inner_loop_store_is_ordered(self) -> None:
+        x = torch.randn((8, 16), device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 5, 0, 3, 8, 2, 4], device=DEVICE)
+        ends = torch.tensor([0, 2, 9, 16, 3, 15, 16, 11], device=DEVICE)
+        code, out = code_and_output(
+            runtime_bound_store_chain,
+            (x, starts, ends),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        columns = torch.arange(16, device=DEVICE)
+        mask = (columns[None, :] >= starts[:, None]) & (
+            columns[None, :] < ends[:, None]
+        )
+        torch.testing.assert_close(out, torch.sum(x * mask, dim=1) * 2)
+        # The store's site has no geometry, so the edge falls back to a barrier.
+        self.assertIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_runtime_bound_inner_loop_keeps_exact_readiness(self) -> None:
+        x = torch.randn((8, 16), device=DEVICE, dtype=torch.float32)
+        starts = torch.tensor([0, 1, 5, 0, 3, 8, 2, 4], device=DEVICE)
+        ends = torch.tensor([0, 2, 9, 16, 3, 15, 16, 11], device=DEVICE)
+        code, out = code_and_output(
+            runtime_bound_loop_chain,
+            (x, starts, ends),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+        columns = torch.arange(16, device=DEVICE)
+        mask = (columns[None, :] >= starts[:, None]) & (
+            columns[None, :] < ends[:, None]
+        )
+        torch.testing.assert_close(out, torch.sum(x * mask, dim=1) * 2)
+        self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

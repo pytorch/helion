@@ -315,15 +315,16 @@ def _static_block_axis_geometry(
     device_function: DeviceFunction,
 ) -> tuple[int, int] | None:
     """Return ``(task_count, block_size)`` for one statically sized axis."""
-    env = CompileEnvironment.current()
+    info = CompileEnvironment.current().block_sizes[block_id]
+    # No static extent (data-dependent bounds, reused block sizes): no geometry.
+    if not isinstance(info.size, (int, torch.SymInt)):
+        return None
     try:
-        numel_expr = env.block_sizes[block_id].numel
+        numel_expr = info.numel
         if not numel_expr.is_number:
             return None
         numel = int(numel_expr)
-        block = int(
-            env.block_sizes[block_id].from_config_assert(device_function.config)
-        )
+        block = int(info.from_config_assert(device_function.config))
     except (KeyError, TypeError, ValueError):
         return None
     return (numel + block - 1) // block, block
