@@ -743,7 +743,10 @@ def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> in
     for size in output_size:
         block_id = None if isinstance(size, int) else env.resolve_block_id(size)
         if block_id is not None:
-            size = env.block_sizes[block_id].from_config_assert(state.config)
+            # A global block size is a SymInt; read its hint, as int() would pin it.
+            size = env.size_hint(
+                env.block_sizes[block_id].from_config_assert(state.config)
+            )
         if not isinstance(size, int):
             return 1
         numel *= size
