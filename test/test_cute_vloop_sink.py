@@ -437,12 +437,14 @@ def test_per_element_load_conditions_are_unsupported(cpu_only: None) -> None:
             declined.append(True)
             raise
 
+    # The knob-off code puts the row threads on the z axis, whose launch limit
+    # is 64; 128 of them were an unlaunchable ``block=(2, 4, 128)``.
     with patch.object(sink_vector_loops._Sinker, "run", run):
         code = _both(
             col_reduce_sum_lower_triangle_static,
             (x,),
             **_sink_config(
-                block_sizes=[1024, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+                block_sizes=[1024, 16], num_threads=[64, 4], vec=[1, 4], unroll=8
             ),
         )
     assert declined == [True]
