@@ -1,3 +1,12 @@
+"""Tests for view / reshape / expand operations inside Helion kernels.
+
+No per-backend gap decorators here — declare opt-outs in
+``test/backends/<backend>.py``.  See ``test/portable/__init__.py`` for the
+policy and the allowed prerequisite skips.
+
+Emitted-code assertions live in ``test/triton_codegen/test_views_codegen.py``.
+"""
+
 from __future__ import annotations
 
 import unittest
@@ -11,17 +20,11 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfPallas
-from helion._testing import xfailIfPallasInterpret
-from helion._testing import xfailIfPallasTpu
 import helion.language as hl
-from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton", "pallas", "cute"])
 class TestViews(RefEagerTestBase, TestCase):
     def test_specialize_reshape(self):
         @helion.kernel()
@@ -37,7 +40,7 @@ class TestViews(RefEagerTestBase, TestCase):
 
         chunk_size = 32
         x = torch.randn(2, chunk_size * 3, device=DEVICE)
-        code, result = code_and_output(
+        _code, result = code_and_output(
             fn,
             (x, chunk_size),
             block_sizes=[1, 1, 32],
@@ -58,7 +61,7 @@ class TestViews(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE)
-        code, result = code_and_output(softmax, (x,))
+        _code, result = code_and_output(softmax, (x,))
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
@@ -77,7 +80,7 @@ class TestViews(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([1024, 1024], device=DEVICE, dtype=HALF_DTYPE)
-        code, result = code_and_output(softmax, (x,))
+        _code, result = code_and_output(softmax, (x,))
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
@@ -97,7 +100,7 @@ class TestViews(RefEagerTestBase, TestCase):
             torch.randn([1024, 1024], device=DEVICE),
             torch.randn([1024, 1], device=DEVICE),
         )
-        code, result = code_and_output(fn, args)
+        _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1][:, 0].unsqueeze(0))
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
@@ -211,12 +214,9 @@ class TestViews(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([256, 2], device=DEVICE)
-        code, result = code_and_output(fn, (x,))
+        _code, result = code_and_output(fn, (x,))
         expected = torch.stack((x[:, 1], x[:, 0]), dim=-1)
         torch.testing.assert_close(result, expected)
-        if _get_backend() == "triton":
-            self.assertIn("tl.split", code)
-            self.assertIn("tl.join", code)
 
     def test_join_broadcast_scalar(self):
         @helion.kernel(config={"block_size": 64})
@@ -230,12 +230,10 @@ class TestViews(RefEagerTestBase, TestCase):
 
         x = torch.randn([128], device=DEVICE)
         y = torch.randn([1], device=DEVICE)
-        code, result = code_and_output(fn, (x, y))
+        _code, result = code_and_output(fn, (x, y))
         broadcast_y = torch.broadcast_to(y, x.shape)
         expected = torch.stack((x, broadcast_y), dim=-1)
         torch.testing.assert_close(result, expected)
-        if _get_backend() == "triton":
-            self.assertIn("tl.join", code)
 
     def test_scalar_broadcast_2d(self):
         """Test that scalars broadcast correctly with 2D tensors."""
@@ -261,7 +259,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = input_tensor * scale_tensor[0]
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallasInterpret("jax interpret-mode discharge bug on pipeline buffers")
     def test_reshape_input_types(self):
         @helion.kernel(static_shapes=True)
         def reshape_reduction_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -310,11 +307,10 @@ class TestViews(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn(3, 4, 5, device=DEVICE)
-        code, result = code_and_output(fn, (x,))
+        _code, result = code_and_output(fn, (x,))
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(
@@ -353,7 +349,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected[1::2] = b  # Every 2nd row starting from 1
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_non_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_non_power_of_2_kernel(
@@ -382,40 +377,19 @@ class TestViews(RefEagerTestBase, TestCase):
         b = torch.randn(M, N, dtype=torch.float32, device=device)
         c = torch.randn(M, N, dtype=torch.float32, device=device)
 
-        code, result = code_and_output(test_stack_non_power_of_2_kernel, (a, b, c))
+        _code, result = code_and_output(test_stack_non_power_of_2_kernel, (a, b, c))
         expected = torch.stack([a, b, c], dim=1)
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
     @skipIfRefEager("ref eager does not support lifted variable")
-    def test_view_blocksize_constexpr(self):
-        @helion.kernel(static_shapes=True, autotune_effort="none")
-        def foo(x: torch.Tensor) -> torch.Tensor:
-            N = x.shape[0]
-            N = hl.specialize(N)
-            out = x.new_empty(N // 2)
-            for (n_tile,) in hl.tile([N]):
-                val = x[n_tile]
-                val = val.view(n_tile.block_size // 2, 2)
-                val_a, val_b = hl.split(val)
-                out[n_tile.begin + hl.arange(0, n_tile.block_size // 2)] = val_a + val_b
-            return out
-
-        x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
-        code, result = code_and_output(foo, (x,))
-        self.assertEqual(result.numel(), x.numel() // 2)
-        if _get_backend() == "triton":
-            self.assertIn("tl.reshape", code)
-
-    @skipIfRefEager("ref eager does not support lifted variable")
-    @xfailIfPallasTpu(
-        "Mosaic does not support reshaping a 1D vector to [..., 2] on TPU"
-    )
     def test_view_blocksize_constexpr_pairsum(self):
         # The split-over-view + compacted-store machinery exercised by
-        # ``test_view_blocksize_constexpr`` (which only checks codegen shape)
-        # must produce genuine ``x.view(N // 2, 2).sum(-1)`` values.  This
-        # variant writes the compacted result to the matching output offset
-        # (``n_tile.begin // 2``) so the result is numerically meaningful.
+        # ``test_view_blocksize_constexpr_lowers_to_reshape`` in
+        # ``test/triton_codegen/test_views_codegen.py`` (which only checks codegen
+        # shape) must produce genuine ``x.view(N // 2, 2).sum(-1)`` values.
+        # This variant writes the compacted result to the matching output
+        # offset (``n_tile.begin // 2``) so the result is numerically
+        # meaningful.
         @helion.kernel(static_shapes=True, autotune_effort="none")
         def foo(x: torch.Tensor) -> torch.Tensor:
             N = x.shape[0]
@@ -435,7 +409,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.view(x.numel() // 2, 2).sum(-1)
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_dim0(self):
         with torch._inductor.config.patch(
             {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}
@@ -469,7 +442,7 @@ class TestViews(RefEagerTestBase, TestCase):
             b = torch.randn(M, N, dtype=torch.float32, device=device)
             c = torch.randn(M, N, dtype=torch.float32, device=device)
 
-            code, result = code_and_output(test_stack_dim0_kernel, (a, b, c))
+            _code, result = code_and_output(test_stack_dim0_kernel, (a, b, c))
             expected = torch.stack([a, b, c], dim=0)
             torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
@@ -492,7 +465,6 @@ class TestViews(RefEagerTestBase, TestCase):
             assert "aten.cat" in self._graph and "aten.stack" not in self._graph
 
     @skipIfRefEager("ref eager does not support view dtype")
-    @xfailIfPallas("view dtype reinterpret not supported on pallas")
     def test_view_dtype_reinterpret(self):
         """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""
 
@@ -511,15 +483,10 @@ class TestViews(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn(1024, dtype=torch.bfloat16, device=DEVICE)
-        code, result = code_and_output(view_dtype_kernel, (x,))
+        _code, result = code_and_output(view_dtype_kernel, (x,))
         # Verify that the operation is a bitcast (add 1 to raw bits)
         expected = (x.view(dtype=torch.int16) + 1).view(dtype=torch.bfloat16)
         torch.testing.assert_close(result, expected)
-        if _get_backend() == "triton":
-            self.assertTrue(
-                ".to(tl.int16)" in code or "tl.cast(" in code,
-                "Expected bitcast to int16 via .to() or tl.cast()",
-            )
 
 
 if __name__ == "__main__":
