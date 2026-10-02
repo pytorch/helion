@@ -1010,6 +1010,8 @@ def _cute_index_tuple(index_exprs: list[str]) -> str:
 
 
 def _cute_scalar_pointer_expr(tensor_name: str, index_exprs: list[str]) -> str:
+    if not index_exprs:
+        return f"{tensor_name}.iterator"
     env = CompileEnvironment.current()
     index_dtype = env.index_type()
     offset = " + ".join(
