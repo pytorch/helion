@@ -1284,6 +1284,8 @@ def _split_task_loop(
 
 # Device modules a dry pass runs unchanged: memory goes through ``tl`` only.
 _DRY_PASS_PURE_MODULES = frozenset({"tl", "triton_helpers", "tl_math", "libdevice"})
+# Waiting singleton packets that may run ahead of monotone admission.
+_MAX_HOISTED_PACKETS = 8
 # Inductor helpers that only compute; the others load, spin, or publish.
 _DRY_PASS_PURE_HELPERS = frozenset(
     {
@@ -1643,7 +1645,8 @@ def emit_cross_loop_schedule(
         raise AssertionError("dynamic packet stream requires at least one task")
 
     # Static ownership requires every worker to be simultaneously resident.
-    # Dynamic packets rely on monotone admission and exact readiness instead.
+    # Dynamic packets rely on monotone admission past any hoisted packets and
+    # on exact readiness instead.
     if not uses_packet_dispatch:
         device_function.triton_minimum_resident_programs = strategy.grid_size_expr
     device_function.preamble.extend(strategy._persistent_setup_statements(total_expr))
@@ -3577,6 +3580,28 @@ def emit_cross_loop_schedule(
             )
     else:
         assert dispatch_ticket is not None
+        # A waiting single-task root that a full wave of later tickets would
+        # crowd goes first, so a warm CTA waits for it. The other roots keep
+        # monotone admission, which one program beyond the hoisted ones
+        # sustains: fewer than one per SM, so always resident.
+        hoisted = [
+            (root, begin, end)
+            for root, begin, end in packet_ranges
+            if end - begin == 1
+            and packet_count - end >= configured_worker_count
+            and waits_on_dependency(root)
+        ]
+        num_sm = CompileEnvironment.current().config_spec.num_sm
+        hoisted = hoisted[: min(_MAX_HOISTED_PACKETS, num_sm - 1)]
+        packet_order = [
+            *hoisted,
+            *(entry for entry in packet_ranges if entry not in hoisted),
+        ]
+        packet_ranges = []
+        packet_begin = 0
+        for root, begin, end in packet_order:
+            packet_ranges.append((root, packet_begin, packet_begin + end - begin))
+            packet_begin += end - begin
         packet_branches: list[tuple[int, bool, ast.stmt]] = []
         for root, packet_begin, packet_end in packet_ranges:
             local_task = f"({dispatch_ticket} - {packet_begin})"

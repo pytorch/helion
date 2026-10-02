@@ -1486,7 +1486,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_dynamic_waiting_root_runs_a_dry_pass(self) -> None:
+    def test_dynamic_singleton_gate_is_hoisted_and_dry_run(self) -> None:
         width = 32 * torch.cuda.get_device_properties(DEVICE).multi_processor_count
         x = torch.arange(width, device=DEVICE, dtype=torch.float32).reshape(1, width)
         code, out = code_and_output(
@@ -1500,14 +1500,16 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * (x + 1).sum(-1, keepdim=True))
-        # The waiting gate first runs once with memory masked and zero-filled.
+        # The gate takes the first ticket and runs a dry pass; the producer
+        # follows it.
         self.assertIn(
-            "for tile_dependency_dry_pass in "
-            "tl.range(tile_dependency_dispatch_ticket_1 // 1073741824, 2, 1, "
-            "num_stages=1):",
+            "if tile_dependency_dispatch_ticket_1 >= 0 and "
+            "tile_dependency_dispatch_ticket_1 < 1:\n"
+            "        for tile_dependency_dry_pass in "
+            "tl.range(tile_dependency_dispatch_ticket_1 // 1073741824, 2",
             code,
         )
-        self.assertIn("other=0.0", code)
+        self.assertIn("tile_dependency_dispatch_ticket_1 >= 1 and", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
