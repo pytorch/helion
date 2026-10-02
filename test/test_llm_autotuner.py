@@ -58,6 +58,7 @@ class TestLLMGuidedSearch(TestCase):
 
         # Mock config_spec with a normalize that accepts anything.
         search.config_spec = SimpleNamespace(
+            backend_name="triton",
             normalize=lambda raw, _fix_invalid=False: None,
             default_config=lambda: helion.Config(block_sizes=[64]),
             _flat_fields=dict,
@@ -556,7 +557,12 @@ class TestReductionWorkloadHints(TestCase):
 
     def test_reduction_gets_eviction_hint_family_general(self):
         args = (_meta_tensor([1024, 1024]),)
-        hints = compute_workload_hints(args, workload_traits=frozenset({"reduction"}))
+        hints = compute_workload_hints(
+            args,
+            flat_fields={},
+            backend="triton",
+            workload_traits=frozenset({"reduction"}),
+        )
         self.assertIn("load_eviction_policies", hints)
         self.assertIn("last", hints.lower())
         # Family-general: no specific kernel name or shape.
@@ -575,7 +581,12 @@ class TestReductionWorkloadHints(TestCase):
                     _meta_tensor([1024, 1024]),
                     _meta_tensor([1024, 1024]),
                 )
-                hints = compute_workload_hints(args, workload_traits=traits)
+                hints = compute_workload_hints(
+                    args,
+                    flat_fields={},
+                    backend="triton",
+                    workload_traits=traits,
+                )
                 self.assertNotIn(sentence, hints)
 
 
@@ -594,7 +605,12 @@ class TestLargeMatmulWorkloadHints(TestCase):
     @staticmethod
     def _hints(shapes, traits=frozenset({"matmul"})):
         args = tuple(_meta_tensor(s) for s in shapes)
-        return compute_workload_hints(args, workload_traits=frozenset(traits))
+        return compute_workload_hints(
+            args,
+            flat_fields={},
+            backend="triton",
+            workload_traits=frozenset(traits),
+        )
 
     def test_large_2d_gemm_gets_flat_k32_and_suppresses_default(self):
         hints = self._hints([[4096, 4096], [4096, 4096]])
