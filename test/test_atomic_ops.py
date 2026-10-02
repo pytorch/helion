@@ -843,6 +843,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @skipIfRocm("Tensor descriptor not supported on ROCm")
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("TMA drains are codegen-only")
     def test_release_drains_tma_store_after_tile_index(self):
         """A tile-index read shifts codegen's memory-op slots; the TMA store still drains."""
 
