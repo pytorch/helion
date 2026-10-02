@@ -21,6 +21,8 @@ from helion._compiler.cross_loop_codegen import _clone_opaque_statements
 from helion._compiler.cross_loop_codegen import (
     _clone_opaque_statements_with_loop_segments,
 )
+from helion._compiler.cross_loop_codegen import _dry_pass_binds
+from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
@@ -280,6 +282,25 @@ def prewait_singleton_reduction(x: torch.Tensor) -> torch.Tensor:
                 tmp[consumer_batch, reduction_width].to(torch.float32), dim=-1
             )
         out[consumer_batch] = acc + first
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def singleton_gate_chain(x: torch.Tensor) -> torch.Tensor:
+    batch, width = x.size()
+    tmp = torch.empty_like(x)
+    gate = torch.empty((batch,), dtype=torch.float32, device=x.device)
+    out = torch.empty_like(x)
+
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        tmp[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for gate_batch in hl.tile(batch, block_size=1):
+        gate[gate_batch] = torch.sum(tmp[gate_batch, :].to(torch.float32), dim=-1)
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        out[tile_batch, tile_width] = tmp[tile_batch, tile_width] * gate[tile_batch]
     return out
 
 
@@ -799,6 +820,52 @@ class TestCrossLoopCodegenHelpers(TestCase):
         self.assertFalse(_triton_root_requires_kernel_scope(dot_body, (9, 0)))
         self.assertFalse(_triton_root_requires_kernel_scope(ordinary_body, (10, 0)))
 
+    def test_dry_pass_masks_memory_and_guards_waits(self) -> None:
+        acquire = (
+            "tl.inline_asm_elementwise(asm='ld.acquire.gpu.global.u32 $0, [$1];', "
+            "constraints='=r,l', args=[state], dtype=tl.uint32, is_pure=False, pack=1)"
+        )
+        reciprocal = (
+            "tl.inline_asm_elementwise(asm='rcp.approx.ftz.f32 $0, $1;', "
+            "constraints='=f,f', args=[value], dtype=tl.float32, is_pure=True, pack=1)"
+        )
+        body = ast.parse(
+            f"flag = {acquire}\n"
+            "while flag != 1:\n"
+            f"    flag = {acquire}\n"
+            "value = tl.load(x + offsets, None).to(tl.float32)\n"
+            f"scale = {reciprocal}\n"
+            "tl.store(out + offsets, value * scale, mask)\n"
+            "tl.atomic_add(state, 1, sem='release')\n"
+        ).body
+        guards: list[ast.If] = []
+        rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
+
+        self.assertTrue(_dry_pass_binds(rewritten, guards, set()))
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(
+            ast.unparse(rewritten[1:]),
+            "value = tl.load(x + offsets, live, other=0.0).to(tl.float32)\n"
+            f"scale = {reciprocal}\n"
+            "tl.store(out + offsets, value * scale, mask & live)\n"
+            "tl.atomic_add(state, 1, sem='release', mask=live)",
+        )
+        # The dry pass takes one trip through each loop.
+        body = ast.parse(
+            "for k in tl.range(0, 2048, BLOCK, num_stages=4):\n"
+            "    acc += tl.load(x + k, None)\n"
+        ).body
+        self.assertEqual(
+            ast.unparse(_dry_pass_rewrite(body, "live", frozenset(), [])),
+            "for k in tl.range(0, tl.where(live, 2048, 0 + BLOCK), BLOCK, "
+            "num_stages=4):\n    acc += tl.load(x + k, live, other=0.0)",
+        )
+        # A value only a skipped descriptor load produces disables the pass.
+        body = ast.parse("word = desc.load([0])\ntl.store(out, word)\n").body
+        guards = []
+        rewritten = _dry_pass_rewrite(body, "live", frozenset(), guards)
+        self.assertFalse(_dry_pass_binds(rewritten, guards, set()))
+
     def test_opaque_tile_body_clone_is_structurally_identical(self) -> None:
         body = ast.parse("value = value * 2\nout[index] = value\n").body
         cloned = _clone_opaque_statements(body)
@@ -1263,6 +1330,31 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         ]
         self.assertIn("tile_dependency_root_1_scheduled_task", helper)
         self.assertNotIn("tile_dependency_root_0_scheduled_task", helper)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_dynamic_waiting_root_runs_a_dry_pass(self) -> None:
+        width = 32 * torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        x = torch.arange(width, device=DEVICE, dtype=torch.float32).reshape(1, width)
+        code, out = code_and_output(
+            singleton_gate_chain,
+            (x,),
+            block_sizes=[1, 16, 1, 16],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="dynamic",
+            num_sm_multiplier=1,
+            num_warps=1,
+        )
+
+        torch.testing.assert_close(out, (x + 1) * (x + 1).sum(-1, keepdim=True))
+        # The waiting gate first runs once with memory masked and zero-filled.
+        self.assertIn(
+            "for tile_dependency_dry_pass in "
+            "tl.range(tile_dependency_dispatch_ticket_1 // 1073741824, 2, 1, "
+            "num_stages=1):",
+            code,
+        )
+        self.assertIn("other=0.0", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
