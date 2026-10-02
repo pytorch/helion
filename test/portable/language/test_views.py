@@ -1,3 +1,32 @@
+"""Tests for view / reshape / expand operations inside Helion kernels.
+
+Backend policy
+--------------
+This file contains no per-backend decorators for feature gaps.  Every test
+runs against whatever backend is selected via ``HELION_BACKEND``.
+
+Backend-specific opt-outs (xfail markers) are declared centrally in
+``test/backends/<backend>.py`` and applied automatically by the conftest at
+collection time.  To mark a test as an expected failure for a backend, add an
+entry to that backend's profile file — do not add ``@xfailIfPallas`` or
+similar decorators here.
+
+The only backend-related decorators that may appear in this file are:
+
+``@skipUnlessTensorDescriptor(...)``
+    A *hardware* skip for tests that require CUDA sm90+ tensor-descriptor
+    hardware.  This is a genuine hardware prerequisite, not a feature gap.
+
+``@skipIfRefEager(...)``
+    Skips tests that are meaningless in the ``HELION_INTERPRET=1`` eager
+    reference mode (orthogonal to the backend).
+
+``@skipIfPallas(...)`` (exceptional cases only)
+    Used only when a test contains a precondition check that triggers a known
+    upstream bug on Pallas (e.g. JAX/vmap dispatch corruption).  Must include
+    a TODO comment explaining the bug and the path to fixing it.
+"""
+
 from __future__ import annotations
 
 import unittest
@@ -11,16 +40,13 @@ from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
-from helion._testing import xfailIfPallas
-from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
 
-@onlyBackends(["triton", "pallas", "cute"])
 class TestViews(RefEagerTestBase, TestCase):
     def test_specialize_reshape(self):
         @helion.kernel()
@@ -312,7 +338,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.sum(dim=(1, 2))
         torch.testing.assert_close(result, expected)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_power_of_2_kernel(
@@ -351,7 +376,6 @@ class TestViews(RefEagerTestBase, TestCase):
         expected[1::2] = b  # Every 2nd row starting from 1
         torch.testing.assert_close(result, expected, rtol=1e-5, atol=1e-5)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
     def test_stack_non_power_of_2(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def test_stack_non_power_of_2_kernel(
@@ -405,9 +429,6 @@ class TestViews(RefEagerTestBase, TestCase):
             self.assertIn("tl.reshape", code)
 
     @skipIfRefEager("ref eager does not support lifted variable")
-    @xfailIfPallasTpu(
-        "Mosaic does not support reshaping a 1D vector to [..., 2] on TPU"
-    )
     def test_view_blocksize_constexpr_pairsum(self):
         # The split-over-view + compacted-store machinery exercised by
         # ``test_view_blocksize_constexpr`` (which only checks codegen shape)
@@ -433,7 +454,16 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = x.view(x.numel() // 2, 2).sum(-1)
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
-    @xfailIfPallas("torch.stack not supported on pallas")
+    # TODO(#3738): torch.compile(backend="inductor") with TPU device tensors
+    # corrupts JAX/vmap dispatch state, causing unrelated tests to fail.  The
+    # inductor check inside this test verifies a precondition that Helion
+    # relies on (see device_ir.py: aten.stack is popped from the decomp
+    # table).  Skipping on Pallas is a temporary workaround — the root
+    # corruption bug should be fixed and this decorator removed.
+    @skipIfPallas(
+        "torch.compile(backend='inductor') with TPU device tensors corrupts "
+        "JAX/vmap dispatch state"
+    )
     def test_stack_dim0(self):
         with torch._inductor.config.patch(
             {"use_static_cuda_launcher": False} if use_tileir_tunables() else {}
@@ -490,7 +520,6 @@ class TestViews(RefEagerTestBase, TestCase):
             assert "aten.cat" in self._graph and "aten.stack" not in self._graph
 
     @skipIfRefEager("ref eager does not support view dtype")
-    @xfailIfPallas("view dtype reinterpret not supported on pallas")
     def test_view_dtype_reinterpret(self):
         """Test viewing a tensor with a different dtype (bitcast/reinterpret)."""
 
