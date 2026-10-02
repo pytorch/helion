@@ -133,10 +133,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             args[0] @ args[1],
         )
 
-    @xfailIfPallasInterpret(
-        "emit_pipeline ds-pad DMA uses a tracer-size dynamic_slice, unsupported"
-        " in JAX Pallas interpret mode"
-    )
     def test_matmul_bias_epilogue_wrapper(self):
         from typing import Any
         from typing import Callable
@@ -998,7 +994,6 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
-    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_biased_attention_output(self):
         args = (
             torch.randn(1, 2, 128, 64, dtype=HALF_DTYPE, device=DEVICE),
@@ -1082,6 +1077,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=0.3,
         )
 
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_xsa(self):
         args = (
             torch.randn(2, 32, 1024, 64, dtype=HALF_DTYPE, device=DEVICE),
@@ -1097,6 +1093,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[1, 64, 32],
         )
 
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_xsa_near_zero_v(self):
         q = torch.randn(2, 4, 128, 64, dtype=HALF_DTYPE, device=DEVICE)
         k = torch.randn_like(q)
