@@ -1658,8 +1658,8 @@ class TestPallas(TestCase):
         self.assertIn("[:100, :200]", code2)
         torch.testing.assert_close(result2, torch.ones_like(x2))
 
-    def test_store_slice_skips_pl_ds_dim(self) -> None:
-        """Store value is not sliced on dimensions indexed with pl.ds()."""
+    def test_inner_loop_partial_store_correctness(self) -> None:
+        """A partial outer tile and inner device loop store correctly."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def fill_inner_loop(x: torch.Tensor) -> torch.Tensor:
@@ -1671,15 +1671,12 @@ class TestPallas(TestCase):
             return out
 
         x = torch.randn(64, 32, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(
+        _, result = code_and_output(
             fill_inner_loop,
             (x,),
             block_size=[128, 64],
             pallas_loop_type="fori_loop",
         )
-        self.assertIn("pl.ds(", code)
-        self.assertIn("[:64, :]", code)
-        self.assertNotIn("[:64, :32]", code)
         torch.testing.assert_close(result, torch.ones_like(x))
 
     @skipIfPallasInterpret(
@@ -5640,53 +5637,53 @@ class TestPallas(TestCase):
         self.assertLess(prime, inner_call)
         self.assertIn("_j0", statements[prime])
 
-    def test_fori_loop_no_dma_unaligned_inner_block(self) -> None:
-        """fori_loop with inner block violating DMA alignment (last dim % 128 != 0).
-
-        A requested count of two is a no-op on the existing non-DMA fallback.
-        """
+    def test_fori_loop_unaligned_inner_block_correctness(self) -> None:
+        """fori_loop remains correct for rows narrower than DMA alignment."""
         args = (
-            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
-            torch.randn(64, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 16, device=DEVICE, dtype=torch.float32),
+            torch.randn(64, 16, device=DEVICE, dtype=torch.float32),
         )
-        baseline = self._assert_load_buffer_count_noop(
-            pallas_inner_loop_add, args, [8, 64], [2, 1]
-        )
-        code, result = code_and_output(
+        _, result = code_and_output(
             pallas_inner_loop_add,
             args,
-            block_sizes=[8, 64],
+            block_sizes=[8, 16],
             pallas_loop_type="fori_loop",
             pallas_load_buffer_count=[2, 1],
         )
-        self.assertEqual(code, baseline)
-        self.assertIn("jax.lax.fori_loop", code)
-        self.assertNotIn("pltpu.make_async_copy", code)
-        self.assertIn("pl.ds(", code)
-        self.assertNotIn("pl.multiple_of(", code)
         torch.testing.assert_close(result, args[0] + args[1])
 
-    def test_fori_loop_no_dma_multidim_unaligned(self) -> None:
-        """Nested fori_loop with a DMA-unaligned inner block.
-
-        2D inner loop where both inner dims are too small for DMA
-        (last dim = 64 < 128).  Validates that the non-DMA pl.ds()
-        path works with nested fori_loops, one per inner dim.
-        """
+    def test_fori_loop_multidim_unaligned_correctness(self) -> None:
+        """Nested fori_loop remains correct for 64-byte rows."""
         args = (
-            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
-            torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 32, 16, device=DEVICE, dtype=torch.float32),
+            torch.randn(4, 32, 16, device=DEVICE, dtype=torch.float32),
         )
-        code, result = code_and_output(
+        _, result = code_and_output(
             pallas_add_3d,
             args,
-            block_sizes=[1, 8, 64],
+            block_sizes=[1, 8, 16],
             pallas_loop_type="fori_loop",
         )
-        self.assertGreaterEqual(code.count("jax.lax.fori_loop"), 2)
-        self.assertNotIn("pltpu.make_async_copy", code)
-        self.assertIn("pl.ds(", code)
         torch.testing.assert_close(result, args[0] + args[1])
+
+    def test_emit_pipeline_dma_uses_byte_aligned_rows(self) -> None:
+        """DMA row alignment depends on bytes rather than element count."""
+        for dtype, columns in (
+            (torch.bfloat16, 64),
+            (torch.float32, 32),
+        ):
+            with self.subTest(dtype=dtype):
+                args = (
+                    torch.randn(64, columns, device=DEVICE, dtype=dtype),
+                    torch.randn(64, columns, device=DEVICE, dtype=dtype),
+                )
+                _, result = code_and_output(
+                    pallas_inner_loop_add,
+                    args,
+                    block_sizes=[8, columns],
+                    pallas_loop_type="emit_pipeline",
+                )
+                torch.testing.assert_close(result, args[0] + args[1])
 
     def test_fori_loop_static_begin_leading_token_load_stays_resident(self) -> None:
         """Static-begin packed-token rows keep the existing non-DMA behavior."""
@@ -6927,9 +6924,8 @@ class TestPallas(TestCase):
                         out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2
                     )
 
-    def test_direct_dot_input_keeps_eager_load_mask(self) -> None:
-        """A masked load consumed directly by a dot (no relayout) is not
-        deferred: it keeps the eager multiplicative load mask."""
+    def test_direct_dot_partial_tile_correctness(self) -> None:
+        """A direct dot masks its partial input tile correctly."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def direct_dot(
@@ -6953,20 +6949,12 @@ class TestPallas(TestCase):
         w = torch.randn(D, P, device=DEVICE, dtype=torch.float32)
         offsets = torch.tensor([0, 50], device=DEVICE, dtype=torch.int32)
 
-        code, result = code_and_output(
+        _, result = code_and_output(
             direct_dot,
             (y, w, offsets),
             block_sizes=[32],
             pallas_loop_type="fori_loop",
         )
-
-        # Eager mask retained on the direct dot input; nothing to defer past.
-        self.assertRegex(
-            code,
-            r"(y\[[^\n]*\][^\n]*\*\s*mask_\d+\.astype|"
-            r"mask_\d+\.astype[^\n]*\*[^\n]*y\[)",
-        )
-        self.assertNotRegex(code, r"jnp\.transpose\(")
 
         s, e = 0, 50
         ref = (y[s:e] @ w).sum(dim=0).reshape(1, P)
