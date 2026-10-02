@@ -209,64 +209,34 @@ def test_kda_decode_uses_existing_tuning_surface() -> None:
     assert not kernel.settings.static_shapes
     assert not kernel.settings.triton_do_not_specialize
     assert kernel.settings.persistent_reserved_sms == 88
-    assert heuristic.CONFIGS[1, 12]["block_sizes"] == [
+    expected_blocks = [
+        2,
         8,
-        32,
-        32,
-        128,
-        32,
-        8,
-        8,
-        512,
-        128,
-        128,
-        128,
-    ]
-    assert heuristic.CONFIGS[2, 12]["block_sizes"] == [
-        8,
+        2,
         32,
         32,
         128,
         32,
         8,
-        64,
-        512,
-        128,
-        128,
-        64,
-    ]
-    assert heuristic.CONFIGS[1, 16]["block_sizes"] == [
-        8,
-        32,
-        32,
-        128,
-        32,
-        8,
+        2,
         8,
         512,
         128,
         128,
         128,
     ]
-    assert heuristic.CONFIGS[2, 16]["block_sizes"] == [
-        8,
-        32,
-        32,
-        128,
-        32,
-        8,
-        32,
-        512,
-        128,
-        128,
-        64,
-    ]
-    assert heuristic.CONFIGS[1, 16] is not heuristic.CONFIGS[1, 12]
-    assert heuristic.CONFIGS[2, 16] is not heuristic.CONFIGS[2, 12]
-    assert heuristic.CONFIGS[1, 12]["maxnreg"] == 96
-    assert heuristic.CONFIGS[2, 12]["maxnreg"] == 240
-    assert heuristic.CONFIGS[1, 16]["maxnreg"] == 96
-    assert heuristic.CONFIGS[2, 16]["maxnreg"] == 240
+    assert set(heuristic.CONFIGS) == {
+        (batch, heads) for batch in (1, 2, 4) for heads in (12, 16)
+    }
+    assert all(
+        config["block_sizes"] == expected_blocks
+        for config in heuristic.CONFIGS.values()
+    )
+    assert all(
+        config is heuristic._SHARED_CONFIG for config in heuristic.CONFIGS.values()
+    )
+    assert all(config["num_stages"] == 6 for config in heuristic.CONFIGS.values())
+    assert all(config["maxnreg"] == 240 for config in heuristic.CONFIGS.values())
     for config in heuristic.CONFIGS.values():
         assert config["cross_loop_pipeline"] == "dynamic"
         assert config["num_sm_multiplier"] == 1
@@ -288,8 +258,10 @@ def test_kda_decode_uses_existing_tuning_surface() -> None:
     assert {(batch, heads) for batch, heads, _seed in module.CORRECTNESS_CASES} == {
         (1, 12),
         (2, 12),
+        (4, 12),
         (1, 16),
         (2, 16),
+        (4, 16),
     }
 
 
@@ -732,7 +704,7 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     # regression signal.  Combined with the 10% band below, 1.0 expresses a
     # 0.90x production-vLLM floor for every model-region benchmark.
     "kda_decode": {
-        "sm100": ExpectedPerf(helion_wins=2, total=2, geomean=1.00, wins_slack=2),
+        "sm100": ExpectedPerf(helion_wins=3, total=3, geomean=1.00, wins_slack=3),
     },
     "qwen3_decode_layer": {
         "sm100": ExpectedPerf(helion_wins=3, total=3, geomean=1.00, wins_slack=3),

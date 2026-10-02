@@ -7,53 +7,24 @@ from copy import deepcopy
 import torch
 
 
-# Tuned on GB200 with cold L2 against the matched six-launch PDL pipeline. Keep
-# each B/H envelope independent: equal values are results, not coupled knobs.
+# Tuned on GB200 with cold L2 against production vLLM and the matched
+# six-launch PDL pipeline.  One configuration covers every supported B/H
+# envelope; the source contains no batch- or head-dependent algorithm branch.
+_SHARED_CONFIG: dict[str, object] = {
+    "block_sizes": [2, 8, 2, 32, 32, 128, 32, 8, 2, 8, 512, 128, 128, 128],
+    "num_warps": 1,
+    "num_stages": 6,
+    "pid_type": "persistent_blocked",
+    "cross_loop_pipeline": "dynamic",
+    "num_sm_multiplier": 1,
+    "maxnreg": 240,
+    "indexing": "block_ptr",
+    "load_eviction_policies": "",
+}
 CONFIGS: dict[tuple[int, int], dict[str, object]] = {
-    (1, 12): {
-        "block_sizes": [8, 32, 32, 128, 32, 8, 8, 512, 128, 128, 128],
-        "num_warps": 1,
-        "num_stages": 8,
-        "pid_type": "persistent_blocked",
-        "cross_loop_pipeline": "dynamic",
-        "num_sm_multiplier": 1,
-        "maxnreg": 96,
-        "indexing": "block_ptr",
-        "load_eviction_policies": "",
-    },
-    (2, 12): {
-        "block_sizes": [8, 32, 32, 128, 32, 8, 64, 512, 128, 128, 64],
-        "num_warps": 1,
-        "num_stages": 8,
-        "pid_type": "persistent_blocked",
-        "cross_loop_pipeline": "dynamic",
-        "num_sm_multiplier": 1,
-        "maxnreg": 240,
-        "indexing": "block_ptr",
-        "load_eviction_policies": "",
-    },
-    (1, 16): {
-        "block_sizes": [8, 32, 32, 128, 32, 8, 8, 512, 128, 128, 128],
-        "num_warps": 1,
-        "num_stages": 8,
-        "pid_type": "persistent_blocked",
-        "cross_loop_pipeline": "dynamic",
-        "num_sm_multiplier": 1,
-        "maxnreg": 96,
-        "indexing": "block_ptr",
-        "load_eviction_policies": "",
-    },
-    (2, 16): {
-        "block_sizes": [8, 32, 32, 128, 32, 8, 32, 512, 128, 128, 64],
-        "num_warps": 1,
-        "num_stages": 8,
-        "pid_type": "persistent_blocked",
-        "cross_loop_pipeline": "dynamic",
-        "num_sm_multiplier": 1,
-        "maxnreg": 240,
-        "indexing": "block_ptr",
-        "load_eviction_policies": "",
-    },
+    (batch, heads): _SHARED_CONFIG
+    for batch in (1, 2, 4)
+    for heads in (12, 16)
 }
 
 _SCALE = 128**-0.5
@@ -98,7 +69,8 @@ def _static_args(heads: int) -> tuple[object, ...]:
 
 _SUPPORTED = tuple(
     (_signature(batch, heads), _static_args(heads), batch, heads)
-    for batch, heads in ((1, 12), (2, 12), (1, 16), (2, 16))
+    for batch in (1, 2, 4)
+    for heads in (12, 16)
 )
 
 # The canonical signature is exposed for the common fixed-shape heuristic test.
@@ -107,7 +79,7 @@ _STATIC_ARGS = _SUPPORTED[0][1]
 
 
 def key_kda_decode(*args) -> int:
-    """Validate one of the four pretuned B/H physical envelopes."""
+    """Validate one of the six pretuned B/H physical envelopes."""
     tensor_count = len(_TENSOR_SIGNATURES)
     if len(args) != tensor_count + len(_STATIC_ARGS):
         raise ValueError("kda_decode expects eleven tensors and eight static args")
@@ -120,7 +92,7 @@ def key_kda_decode(*args) -> int:
     ):
         if tensor_signature == supported_tensors and static_args == supported_static:
             return index
-    raise ValueError("kda_decode is pretuned only for B1/B2 x H12/H16 KDA decode")
+    raise ValueError("kda_decode is pretuned only for B1/B2/B4 x H12/H16 KDA decode")
 
 
 def autotune_kda_decode(*args) -> dict[str, object]:

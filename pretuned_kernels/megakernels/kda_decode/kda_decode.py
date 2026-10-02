@@ -5,8 +5,8 @@ The single persistent Helion kernel covers the local KDA sublayer from the
 fused input projection through the output projection.  Its independent input,
 gate, and QKV work is dynamically scheduled around the causal-convolution and
 recurrent-state dependencies.  Mutable cache contents and ``state_indices``
-remain runtime values; the checked-in heuristic supports the four physical
-envelopes B1/B2 x H12/H16 at hidden size 2304 and head dimension 128.
+remain runtime values; the checked-in heuristic supports the six physical
+envelopes B1/B2/B4 x H12/H16 at hidden size 2304 and head dimension 128.
 
 The benchmark compares against a production-boundary-matched standalone Helion
 PDL pipeline and, for H12, vLLM's production fused conv1d + KDA + gated-RMSNorm
@@ -37,14 +37,20 @@ POOL_SIZE = 32
 EPS = 1e-5
 SCALE = HEAD_DIM**-0.5
 OUTPUT_SPLITS = 1
-SUPPORTED_BATCHES = (1, 2)
+SUPPORTED_BATCHES = (1, 2, 4)
 SUPPORTED_HEADS = (12, 16)
-BENCHMARK_CASES = (("b1_h12", 1, 12, 101), ("b2_h12", 2, 12, 202))
+BENCHMARK_CASES = (
+    ("b1_h12", 1, 12, 101),
+    ("b2_h12", 2, 12, 202),
+    ("b4_h12", 4, 12, 204),
+)
 CORRECTNESS_CASES = (
     (1, 12, 301),
     (2, 12, 302),
+    (4, 12, 304),
     (1, 16, 401),
     (2, 16, 402),
+    (4, 16, 404),
 )
 VLLM_LIBRARY_ENV = "HELION_VLLM_LIBRARY"
 
@@ -135,12 +141,15 @@ def kda_decode(
         )
     )
 
+    gate_input_batch_block = hl.register_block_size(1, 16)
     gate_input_block = hl.register_block_size(4, 64)
+    projection_batch_block = hl.register_block_size(1, 16)
     projection_block = hl.register_block_size(4, 64)
     forget_gate_block = hl.register_block_size(4, 128)
     conv_block = hl.register_block_size(4, 128)
     norm_gate_block = hl.register_block_size(4, 128)
     recurrent_block = hl.register_block_size(4, value_dim)
+    output_batch_block = hl.register_block_size(1, 16)
     output_block = hl.register_block_size(4, 64)
     gate_input_k_block = hl.register_block_size(32, 512)
     qkv_input_k_block = hl.register_block_size(32, 512)
@@ -157,7 +166,7 @@ def kda_decode(
         qkv_width_static + heads_static : projection_width_static
     ].view(2, key_dim_static, hidden)
     projected_qkv = torch.empty(
-        (batch_heads, 3, key_dim),
+        (batch, heads_static, 3, key_dim),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
@@ -190,7 +199,9 @@ def kda_decode(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    normalized_output_flat = normalized_output.view(batch * heads * value_dim)
+    normalized_output_flat = normalized_output.view(
+        batch, heads_static * value_dim_static
+    )
     output = torch.empty(
         (batch, output_hidden),
         dtype=hidden_states.dtype,
@@ -206,7 +217,8 @@ def kda_decode(
     # readiness lets downstream gate, convolution, and recurrence work begin
     # without waiting for the entire projection region.
     for tile_batch, tile_kind, tile_dim in hl.tile(
-        [batch, 2, key_dim], block_size=[1, 1, gate_input_block]
+        [batch, 2, key_dim],
+        block_size=[gate_input_batch_block, 1, gate_input_block],
     ):
         kind = tile_kind.id
         accumulator = hl.zeros([tile_batch, tile_dim], dtype=torch.float32)
@@ -220,24 +232,24 @@ def kda_decode(
             projected_gate_inputs.dtype
         )
 
-    for tile_batch_head, tile_kind, tile_dim in hl.tile(
-        [batch_heads, 3, key_dim], block_size=[1, 1, projection_block]
+    for tile_batch, tile_head, tile_kind, tile_dim in hl.tile(
+        [batch, heads_static, 3, key_dim],
+        block_size=[projection_batch_block, 1, 1, projection_block],
     ):
-        batch_indices = tile_batch_head.index // heads_static
         kind = tile_kind.id
-        accumulator = hl.zeros([tile_batch_head, tile_dim], dtype=torch.float32)
+        accumulator = hl.zeros([tile_batch, tile_dim], dtype=torch.float32)
         for tile_hidden in hl.tile(hidden, block_size=qkv_input_k_block):
             accumulator = torch.addmm(
                 accumulator,
-                hidden_states[batch_indices, tile_hidden],
+                hidden_states[tile_batch, tile_hidden],
                 qkv_input_weight[
                     kind,
-                    tile_batch_head.id % heads_static,
+                    tile_head.id,
                     tile_dim,
                     tile_hidden,
                 ].T,
             )
-        projected_qkv[tile_batch_head, kind, tile_dim] = accumulator.to(
+        projected_qkv[tile_batch, tile_head.id, kind, tile_dim] = accumulator.to(
             projected_qkv.dtype
         )
 
@@ -304,7 +316,12 @@ def kda_decode(
             + (tile_batch_head.id % heads_static) * key_dim_static
             + tile_dim.index
         )
-        x = projected_qkv[batch_head_index, kind, tile_dim].float()
+        x = projected_qkv[
+            tile_batch_head.id // heads_static,
+            tile_batch_head.id % heads_static,
+            kind,
+            tile_dim,
+        ].float()
         value = hl.zeros([tile_dim], dtype=torch.float32)
         if state_index >= 0:
             state_0 = conv_state[state_index, 0, channel].float()
@@ -389,17 +406,15 @@ def kda_decode(
         ).to(normalized_output.dtype)
 
     for tile_batch, tile_split, tile_out in hl.tile(
-        [batch, output_splits, output_hidden], block_size=[1, 1, output_block]
+        [batch, output_splits, output_hidden],
+        block_size=[output_batch_block, 1, output_block],
     ):
         accumulator = hl.zeros([tile_batch, tile_out], dtype=torch.float32)
         for tile_local_input in hl.tile(output_chunk_static, block_size=output_k_block):
             tile_input = tile_split.id * output_chunk_static + tile_local_input.index
             accumulator = torch.addmm(
                 accumulator,
-                normalized_output_flat[
-                    tile_batch.index[:, None] * (heads_static * value_dim_static)
-                    + tile_input[None, :]
-                ],
+                normalized_output_flat[tile_batch, tile_input],
                 output_weight[tile_out, tile_input].T,
             )
         if output_splits == 1:
