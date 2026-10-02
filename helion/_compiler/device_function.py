@@ -26,6 +26,7 @@ from torch.utils._sympy.symbol import symbol_is_type
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
 from .._compat import is_hip
+from .._compat import target_device_capability
 from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import ExtendedAST
 from .ast_extension import create
@@ -296,7 +297,14 @@ def _selects_tma_access(config: Config) -> bool:
     Over-reports: fact slots do not always match codegen's memory-op slots.
     """
     env = CompileEnvironment.current()
-    if env.backend_name != "triton" or env.device.type != "cuda" or is_hip():
+    capability = target_device_capability(env.device)
+    if (
+        env.backend_name != "triton"
+        or env.device.type != "cuda"
+        or is_hip()
+        or capability is None
+        or capability < (9, 0)
+    ):
         return False
     return indexing_uses_tensor_descriptor(config.atomic_indexing) or (
         indexing_uses_tensor_descriptor(config.indexing)

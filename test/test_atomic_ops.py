@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -917,11 +918,16 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
         x2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
         y2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
-        code2, result2 = code_and_output(atomic_add_td_release_kernel, (x2, y2))
+        with patch(
+            "helion._compiler.device_function.target_device_capability",
+            return_value=(8, 0),
+        ):
+            code2, result2 = code_and_output(atomic_add_td_release_kernel, (x2, y2))
         expected2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
         torch.testing.assert_close(result2, expected2)
         self.assertIn("tl.atomic_add", code2)
         self.assertNotIn("desc.atomic_add(", code2)
+        self.assertNotIn("cp.async.bulk.wait_group", code2)
 
     @onlyBackends("triton")
     @skipIfRocm("Tensor descriptor not supported on ROCm")
