@@ -50,6 +50,7 @@ from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 
 _PERSISTENT_BRANCH_VEC_LOAD = "_helion_persistent_branch_vec_load"
 _PERSISTENT_BRANCH_VEC_STORE = "_helion_persistent_branch_vec_store"
@@ -130,11 +131,15 @@ def _looks_like_unmasked_load(node: ast.AST) -> ast.Call | None:
 def _looks_like_vec_load(node: ast.AST) -> ast.Call | None:
     """Return the Call if ``node`` is a ``cute.arch.load(ptr, vec_type)``
     expression — the hoisted U16 vec load emitted by the LoopedReductionStrategy
-    ``unroll`` mode.
+    ``unroll`` mode — or a cache-hinted vector load helper of the same call
+    shape (``_cute_load_l2_evict_last_8b(ptr, vec_type)``, see
+    ``cache_policy_loads``).
     """
     if not isinstance(node, ast.Call):
         return None
     func = node.func
+    if isinstance(func, ast.Name) and func.id in _CUTE_CACHE_LOAD_HELPER_NAMES:
+        return node
     if not isinstance(func, ast.Attribute):
         return None
     if func.attr != "load":
@@ -384,10 +389,26 @@ def _scalar_load_ptr_text(node: ast.AST) -> str | None:
     return ast.unparse(func.value)
 
 
+def _plain_vec_load_spelling(node: ast.AST) -> ast.AST:
+    """A cache-hinted vector load helper call respelled as the plain
+    ``cute.arch.load(ptr, vec_type)`` it stands for, so the hinted and
+    unhinted twins of one load match across sweeps; other nodes unchanged."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _CUTE_CACHE_LOAD_HELPER_NAMES
+    ):
+        plain = cast("ast.Call", clone_ast(node))
+        plain.func = cast("ast.expr", expr_from_string("cute.arch.load"))
+        return plain
+    return node
+
+
 def _normalized_load_text(node: ast.AST) -> str:
     """Unparse with cache hints stripped and the two scalar load forms
-    collapsed onto one spelling (see ``_scalar_load_ptr_text``)."""
-    node = _unwrap_persistent_branch_vec_load(node)
+    collapsed onto one spelling (see ``_scalar_load_ptr_text``); a hinted
+    vector load helper collapses onto ``cute.arch.load``."""
+    node = _plain_vec_load_spelling(_unwrap_persistent_branch_vec_load(node))
     ptr = _scalar_load_ptr_text(node)
     if ptr is not None:
         return f"__scalar_load__({ptr})"
@@ -779,8 +800,18 @@ class _CuteFuseTwoPassLoads:
                 target = stmt.targets[0].id
                 has_memory_access = any(
                     isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in ("load", "store")
+                    and (
+                        (
+                            isinstance(node.func, ast.Attribute)
+                            and node.func.attr in ("load", "store")
+                        )
+                        or (
+                            isinstance(node.func, ast.Name)
+                            and node.func.id.startswith(
+                                ("_cute_load_", "_cute_store_", "_cute_atomic_")
+                            )
+                        )
+                    )
                     for node in ast.walk(stmt.value)
                 )
                 if not has_memory_access:

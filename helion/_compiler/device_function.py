@@ -1417,6 +1417,23 @@ class DeviceFunction:
                     thread_block_dims = exact_thread_block_dims
                     thread_block_dims_are_exact = True
             if exact_thread_block_dims is not None:
+                # The strategies' launch shape is final here: size the
+                # cross-warp shared reductions for the threads that launch
+                # instead of the 1024-thread budget they were emitted against.
+                # Declined when the body claimed a wider axis (a free
+                # ``hl.arange`` thread axis the launcher adds to ``block=``);
+                # the launcher checks the recorded shape against its launch.
+                from .cute.finalize_reduce_groups import (
+                    finalize_shared_reduce_groups_for_launch,
+                )
+
+                kernel_body, sized_for = finalize_shared_reduce_groups_for_launch(
+                    kernel_body,
+                    thread_block_dims=exact_thread_block_dims,
+                    claimed_axis_sizes=self.codegen.launch_thread_axis_sizes(),
+                )
+                if sized_for is not None:
+                    self.cute_state.shared_reduce_launch_block = sized_for
                 kernel_body = fuse_two_pass_loads(
                     kernel_body,
                     constexpr_values,

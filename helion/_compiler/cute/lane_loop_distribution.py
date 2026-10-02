@@ -270,7 +270,6 @@ from typing import TypeVar
 import sympy
 
 from ... import exc
-from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -289,6 +288,7 @@ from .address_maps import loop_symbol
 from .address_maps import thread_symbol
 from .address_maps import uniform_symbol
 from .address_maps import whole_quantities
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -362,12 +362,8 @@ class LanePlacement:
 
 
 _PLAIN_STORE_HELPERS = frozenset({"_cute_store_u16_vec", "_cute_store_u32_vec"})
-# Inline-PTX cache-hinted loads and their 8-byte variants.
-_PLAIN_LOAD_HELPERS = frozenset(
-    name
-    for helper in _CUTE_CACHE_LOAD_HELPERS.values()
-    for name in (helper, f"{helper}_8b")
-)
+# Inline-PTX cache-hinted loads (16-, 8- and 4-byte variants).
+_PLAIN_LOAD_HELPERS = _CUTE_CACHE_LOAD_HELPER_NAMES
 # The persistent-reduction markers (``cute/persistent_branch_vec.py``) a later
 # pass expands into vector accesses: a load through the pointer in its fifth
 # argument and a store through the pointer in its fourth.  Bodies holding
