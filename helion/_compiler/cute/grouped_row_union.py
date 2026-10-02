@@ -136,6 +136,23 @@ PAIRED_CLC = RowUnionSchedule(
 )
 
 
+def target_supported(
+    capability: tuple[int, int] | None, profile: RowUnionSchedule | None
+) -> bool:
+    """The ordinary and paired CLC protocols use Blackwell operations.
+
+    Their correctness proofs depend on tcgen05, scheduler operations and the
+    separately checked shared-memory capacity, rather than the B200 product.
+    The paired search requires its ordinary carrier. The transposed cluster4
+    schedule retains its existing SM100 admission.
+    """
+    return capability == (10, 0) or (
+        capability is not None
+        and capability[0] == 10
+        and (profile is None or profile.linear_record_clc)
+    )
+
+
 def schedule_by_name(name: object) -> RowUnionSchedule | None:
     for profile in (TRANSPOSED, PAIRED_CLC):
         if name == profile.name:

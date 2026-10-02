@@ -337,7 +337,9 @@ def _flash_config_spec(
     supports_tensor_4d_tma: bool = True,
     output_requires_tma: bool = False,
 ) -> ConfigSpec:
-    spec = ConfigSpec(backend=CuteBackend())
+    # Exercise the generic structural search independently of the local GPU.
+    # Hardware-specific measured seeds are covered by test_cute_flash_arch.py.
+    spec = ConfigSpec(backend=CuteBackend(), target_device_capability=None)
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
     spec.enable_cute_flash_search(

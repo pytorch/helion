@@ -26,8 +26,10 @@ from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import STARTUP_PREFILL_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
+from helion._compiler.cute.grouped_row_union import target_supported
 from helion._compiler.program_id import ProgramIDs
 from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+from helion._hardware import HardwareInfo
 from helion._testing import skipUnlessBackends
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
@@ -270,6 +272,52 @@ def test_non_original_domains_emit(m, n, k, g):
     assert "tcgen05_prefill_state" in source
 
 
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("partial", [False, True], ids=["full", "partial_g31"])
+@skipUnlessBackends(["cute"])
+def test_paired_profile_codegen_across_blackwell(capability, partial):
+    hardware_name = "NVIDIA B200" if capability == (10, 0) else "NVIDIA GB300"
+    with (
+        patch(
+            "helion.runtime.kernel.target_device_capability", return_value=capability
+        ),
+        patch(
+            "helion._compiler.compile_environment.target_device_capability",
+            return_value=capability,
+        ),
+        patch(
+            "helion._hardware.get_hardware_info",
+            return_value=HardwareInfo(
+                device_kind="cuda",
+                hardware_name=hardware_name,
+                runtime_version="13.0",
+                compute_capability=f"sm{capability[0]}{capability[1]}",
+            ),
+        ),
+    ):
+        bound, _ = _bound(640 if partial else 768, 256, 512, 31 if partial else 1)
+        with bound.env:
+            config = grouped_row_union_paired_clc_carrier(
+                bound.env, bound.host_function.device_ir
+            )
+        assert config is not None
+        assert config[SCHEDULE_KEY] == PAIRED_CLC_SCHEDULE
+        for startup in (False, True):
+            config.config[STARTUP_PREFILL_KEY] = startup
+            source = bound.to_code(config)
+            assert "block=(32, 8, 1)" in source
+            assert ("tcgen05_prefill_state" in source) is startup
+            assert "StaticPersistentTileScheduler" not in source
+            ab, out = _plans(source)
+            assert (ab["bm"], ab["bn"], ab["bk"], ab["ab_stage_count"]) == (
+                256,
+                192,
+                64,
+                7,
+            )
+            assert (out["epi_tile_m"], out["epi_tile_n"]) == (128, 32)
+
+
 @pytest.mark.parametrize(
     "m,n,k,g",
     [
@@ -290,6 +338,15 @@ def test_legacy_cluster4_whole_tile_domain_stays_separate():
     assert TRANSPOSED.index_domain(8, 2560, 512, 512)
     assert PAIRED_CLC.index_domain(16, 10240, 1024, 1024)
     assert PAIRED_CLC.shared_upper_bound == 219136
+
+
+@pytest.mark.parametrize("capability", [None, (9, 0), (10, 0), (10, 3), (12, 0)])
+def test_row_union_target_support_keeps_architecture_and_profile_guards(capability):
+    for profile in (None, PAIRED_CLC):
+        assert target_supported(capability, profile) is (
+            capability in ((10, 0), (10, 3))
+        )
+    assert target_supported(capability, TRANSPOSED) is (capability == (10, 0))
 
 
 @pytest.mark.parametrize(

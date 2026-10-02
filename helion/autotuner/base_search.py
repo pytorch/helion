@@ -57,6 +57,7 @@ from .metrics import AutotuneMetrics
 from .metrics import KernelMetadata
 from .metrics import _run_post_autotune_hooks
 from .precompile_future import PrecompileFuture as PrecompileFuture
+from .search_space_logger import canonical_config_id
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
@@ -435,6 +436,7 @@ class BaseSearch(BaseAutotuner):
                 for callback in (
                     settings.autotune_config_filter,
                     settings.autotune_benchmark_fn,
+                    settings.autotune_final_benchmark_fn,
                     settings.autotune_baseline_accuracy_check_fn,
                 )
             )
@@ -2177,15 +2179,48 @@ class PopulationBasedSearch(BaseSearch):
         # opts into isolated finalist timing, keep suspicious confirmation
         # enabled for the in-process fallback.
         use_isolated = self._final_rebenchmark_use_isolated()
-        self.rebenchmark(
-            finalists,
-            desc=f"Final verification top {len(finalists)} configs",
-            target_ms=self._final_rebenchmark_target_ms(),
-            use_isolated=use_isolated,
-            confirm_suspicious=use_isolated,
-            use_interleaved=not use_isolated,
-            candidate_private_args=use_isolated,
-        )
+        final_benchmark_fn = self.settings.autotune_final_benchmark_fn
+        if final_benchmark_fn is None:
+            self.rebenchmark(
+                finalists,
+                desc=f"Final verification top {len(finalists)} configs",
+                target_ms=self._final_rebenchmark_target_ms(),
+                use_isolated=use_isolated,
+                confirm_suspicious=use_isolated,
+                use_interleaved=not use_isolated,
+                candidate_private_args=use_isolated,
+            )
+        else:
+            if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
+                raise exc.AutotuneError(
+                    "autotune_final_benchmark_fn does not support multi-shape searches"
+                )
+            candidates = [
+                {
+                    "config_id": canonical_config_id(member.config),
+                    "config": copy.deepcopy(dict(member.config)),
+                    "source_hash": self.config_spec.backend.generated_source_hash(
+                        member.fn
+                    ),
+                    "prior_perfs_ms": [
+                        perf if math.isfinite(perf) else None for perf in member.perfs
+                    ],
+                    "pinned": member.config in pinned_configs,
+                }
+                for member in finalists
+            ]
+            self.rebenchmark(
+                finalists,
+                desc=f"Final verification top {len(finalists)} configs",
+                target_ms=self._final_rebenchmark_target_ms(),
+                use_isolated=False,
+                # Do not mix a custom final objective with stock event timings.
+                confirm_suspicious=False,
+                candidate_private_args=True,
+                benchmark_fn=functools.partial(
+                    final_benchmark_fn, candidates=candidates
+                ),
+            )
         live_finalists = [member for member in finalists if math.isfinite(member.perf)]
         if not live_finalists:
             raise exc.NoConfigFound
@@ -2244,6 +2279,7 @@ class PopulationBasedSearch(BaseSearch):
         confirm_suspicious: bool = True,
         use_interleaved: bool = True,
         candidate_private_args: bool = False,
+        benchmark_fn: Callable[..., list[float]] | None = None,
     ) -> None:
         """
         Re-benchmark a list of population members to avoid outliers.
@@ -2274,8 +2310,13 @@ class PopulationBasedSearch(BaseSearch):
             repeat = min(repeat, int(capstr))
         repeat = max(1, repeat)
 
-        in_process_isolation = False
-        if use_isolated and self.settings.autotune_benchmark_fn is None:
+        final_override = benchmark_fn is not None
+        if benchmark_fn is None:
+            benchmark_fn = self.settings.autotune_benchmark_fn
+        in_process_isolation = (
+            final_override and candidate_private_args and not dist.is_initialized()
+        )
+        if use_isolated and benchmark_fn is None:
             isolated_results = self.benchmark_provider.benchmark_isolated(
                 [m.fn for m in members],
                 warmup=1,
@@ -2365,7 +2406,7 @@ class PopulationBasedSearch(BaseSearch):
 
         _backend = getattr(getattr(self, "config_spec", None), "backend", None)
         try:
-            if use_interleaved or self.settings.autotune_benchmark_fn is not None:
+            if use_interleaved or benchmark_fn is not None:
                 iterator = [
                     make_rebenchmark_callable(
                         member,
@@ -2377,8 +2418,8 @@ class PopulationBasedSearch(BaseSearch):
                     )
                 ]
                 benchmark_function: Callable[..., list[float]]
-                if self.settings.autotune_benchmark_fn is not None:
-                    benchmark_function = self.settings.autotune_benchmark_fn
+                if benchmark_fn is not None:
+                    benchmark_function = benchmark_fn
                 else:
                     interleaved_benchmark = (
                         _backend.get_interleaved_bench()
@@ -2393,7 +2434,7 @@ class PopulationBasedSearch(BaseSearch):
                     benchmark_function = functools.partial(
                         interleaved_benchmark, max_total_ms=target_ms * len(members)
                     )
-                if self.settings.autotune_progress_bar:
+                if final_override or self.settings.autotune_progress_bar:
                     new_timings = benchmark_function(iterator, repeat=repeat, desc=desc)
                 else:
                     new_timings = benchmark_function(iterator, repeat=repeat)

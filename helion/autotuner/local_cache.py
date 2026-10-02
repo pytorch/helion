@@ -112,16 +112,18 @@ def _cute_flash_search_policy_hash(
 
     A cached quick or explicitly truncated search must not satisfy a later full
     request. Unknown/custom policies get a unique one-shot key; other kernels
-    retain their historical cache keys.
+    retain their historical cache keys unless a custom final objective is set.
     """
-    if not cute_flash_search_enabled:
+    if (
+        not cute_flash_search_enabled
+        and autotuner.settings.autotune_final_benchmark_fn is None
+    ):
         return ""
 
     policy = autotuner.cache_policy()
     if policy is None:
         log.warning(
-            "CuTe-flash autotune cache reuse is disabled for unsupported search "
-            "policy %s",
+            "Autotune cache reuse is disabled for unsupported search policy %s",
             type(autotuner).__qualname__,
         )
         policy = _uncacheable_search_policy(autotuner)
@@ -134,7 +136,7 @@ def _cute_flash_search_policy_hash(
             allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        log.warning("CuTe-flash autotune cache reuse is disabled: %s", error)
+        log.warning("Autotune cache reuse is disabled: %s", error)
         encoded = json.dumps(
             _uncacheable_search_policy(autotuner),
             sort_keys=True,

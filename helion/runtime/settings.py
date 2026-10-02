@@ -582,6 +582,7 @@ class _Settings:
     autotune_baseline_rtol: float | None = None
     autotune_baseline_accuracy_check_fn: Callable[[object, object], None] | None = None
     autotune_benchmark_fn: Callable[..., list[float]] | None = None
+    autotune_final_benchmark_fn: Callable[..., list[float]] | None = None
     autotune_best_available_max_configs: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
@@ -892,6 +893,16 @@ class Settings(_Settings):
             "Should have the following signature: "
             "(fns: list[Callable[[], object]], *, repeat: int, desc: str | None = None) -> list[float]. "
             "If None (default), uses the built-in benchmark function."
+        ),
+        "autotune_final_benchmark_fn": (
+            "Optional final-shortlist benchmark function for population searches. "
+            "Receives (fns, *, candidates, repeat, desc) and returns milliseconds "
+            "in the same order. candidates contains config_id, config, source_hash, "
+            "prior_perfs_ms and pinned metadata for each independent bound callable. "
+            "Runs in the search process, without built-in timing confirmation. "
+            "Exploration and generation rebenchmarking retain their existing timers. "
+            "Not supported for multi-shape searches. None preserves normal behavior. "
+            "Custom final objectives disable persistent autotune-cache reuse."
         ),
         "autotune_best_available_max_configs": (
             "Maximum number of cached configs to use for FROM_BEST_AVAILABLE initial population "

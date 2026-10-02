@@ -1238,10 +1238,12 @@ class DeviceFunction:
                 )
                 exact_thread_block_dims = thread_block_dims = (288, 1, 1)
                 thread_block_dims_are_exact = True
-            if self.cute_state.collective_register_chain_block_dims is not None:
-                exact_thread_block_dims = thread_block_dims = (
-                    self.cute_state.collective_register_chain_block_dims
-                )
+            owned_block_dims = (
+                self.cute_state.collective_register_chain_block_dims
+                or self.cute_state.owned_root_block_dims
+            )
+            if owned_block_dims is not None:
+                exact_thread_block_dims = thread_block_dims = owned_block_dims
                 thread_block_dims_are_exact = True
             # Autotuner-selected reload mode per rolled or persistent
             # reduction dim ("auto" / "register" / "gmem").
