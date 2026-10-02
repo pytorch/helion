@@ -3638,7 +3638,8 @@ def emit_cross_loop_schedule(
                 for edge in dependency_graph.edges
                 if edge.consumer_root == root
             )
-            # Triton cannot loop over kernel-scoped tensor-memory work.
+            # Kernel-scoped tensor-memory roots get no dry pass: tl.range fails to
+            # compile around dot_scaled, and the while-loop form is slower.
             if (
                 waits_on_dependency(root)
                 and root not in kernel_scope_roots
