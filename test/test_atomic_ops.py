@@ -759,6 +759,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
     @onlyBackends("triton")
     @skipIfNotCUDA()
     @skipIfTileIR("TileIR does not legalize tl.debug_barrier")
+    @skipIfRefEager("program-level atomic synchronization is codegen-only")
     def test_release_acquire_atomics_sync_program(self):
         """Release and acquire atomics order every thread of the program, not only the issuing one."""
         config = helion.Config(block_sizes=[128], num_warps=4)

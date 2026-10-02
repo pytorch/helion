@@ -34,6 +34,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipIfTileIR
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -361,6 +362,7 @@ def test_deepseek_v3_attention_nvfp4_tp_exchanges_natively() -> None:
 
 
 @skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipIfTileIR("in-band polling assertions inspect Triton PTX codegen")
 def test_deepseek_v3_tp_megakernels_exchange_in_band() -> None:
     if _current_compute_capability() != "sm100":
         pytest.skip("the TP4 megakernels are pretuned for SM100")

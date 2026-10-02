@@ -1343,6 +1343,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("tl.float32", code)
         self.assertIn("tl.bfloat16", code)
 
+    @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
+    @skipIfXPU("implicit cross-loop scheduling is unavailable on XPU")
     def test_device_symint_local_not_lifted_as_host_arg(self):
         """A SymInt local assigned in an earlier root's device code leaks into
         the locals seen at the next top-level loop.  It must not be given a
@@ -1373,6 +1375,8 @@ class TestMisc(RefEagerTestBase, TestCase):
         launches = [line for line in code.splitlines() if "_launcher(" in line]
         self.assertFalse(any("group_begin" in line for line in launches))
 
+    @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
+    @skipIfXPU("implicit cross-loop scheduling is unavailable on XPU")
     def test_device_size_local_does_not_rename_host_size(self):
         """``m = x.size(0)`` in an earlier root's device code must not replace
         the host origin of ``x.size(0)`` with the device-only name ``m``."""
