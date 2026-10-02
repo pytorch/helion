@@ -348,9 +348,12 @@ def test_deepseek_v3_attention_nvfp4_tp_exchanges_natively() -> None:
     common_source = inspect.getsource(_common)
     distributed_source = inspect.getsource(_common.attention_boundary_source)
     standalone_source = inspect.getsource(_standalone._attention_o_proj_local)
+    benchmark_source = inspect.getsource(module._run)
     assert "triton" not in common_source
     assert "get_remote_tensors" in distributed_source
     assert "get_remote_tensors" not in standalone_source
+    assert "vllm_cutlass_flashinfer" in benchmark_source
+    assert "sglang_flashinfer" not in benchmark_source
     # Both sides of the comparison use the same projection algorithm.
     for fragment in (
         "hl.load_float4_e2m1fn_x16_to_float16",

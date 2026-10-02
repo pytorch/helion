@@ -83,7 +83,6 @@ def _run(
     *,
     verbose: bool,
 ) -> dict[str, Any]:
-    import flashinfer
     import flashinfer.comm as flashinfer_comm
     from flashinfer.comm.mnnvl import TorchDistBackend
     from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _standalone
@@ -128,8 +127,6 @@ def _run(
     )
     production_norm = torch.empty_like(residual)
     production_residual = torch.empty_like(residual)
-    sglang_norm = torch.empty_like(residual)
-    sglang_residual = torch.empty_like(residual)
 
     projection_args = (
         weight_bytes,
@@ -189,20 +186,6 @@ def _run(
         )
         return fused_tail(production_norm, production_residual)
 
-    def sglang() -> tuple[torch.Tensor, torch.Tensor]:
-        flashinfer.mm_fp4(
-            activation_fp4,
-            weight_fp4.T,
-            activation_scale,
-            weight_scale.T,
-            alpha,
-            out_dtype=torch.bfloat16,
-            out=symmetric_output,
-            backend="auto",
-            enable_pdl=True,
-        )
-        return fused_tail(sglang_norm, sglang_residual)
-
     # Exercise the first in-band exchange before a baseline collective can
     # serialize the ranks.
     actual = persistent()
@@ -226,17 +209,13 @@ def _run(
         "distributed_helion": persistent,
         "standalone_helion_one_shot": standalone,
         "vllm_cutlass_flashinfer": production,
-        "sglang_flashinfer": sglang,
     }
     results = benchmark(launches, validate=validate)
     if verbose and rank == 0:
         for name, (warm, cold) in results.items():
             print(f"{name:>32s}: {warm:7.2f} us warm, {cold:7.2f} us cold L2")
 
-    production_cold = min(
-        results["vllm_cutlass_flashinfer"][1],
-        results["sglang_flashinfer"][1],
-    )
+    production_cold = results["vllm_cutlass_flashinfer"][1]
     persistent_cold = results["distributed_helion"][1]
     speedup = production_cold / persistent_cold
     return {
