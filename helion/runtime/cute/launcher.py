@@ -3324,8 +3324,6 @@ def _cute_scalar_cache_value(scalar_kind: str, scalar_value: object) -> object:
 def _validate_cute_launcher_tensor(arg: torch.Tensor) -> None:
     if arg.device.type != "cuda":
         raise exc.BackendUnsupported("cute", "launcher requires CUDA tensors")
-    if arg.ndim <= 0:
-        raise exc.BackendUnsupported("cute", "launcher requires tensor rank >= 1")
 
 
 def _cute_pointer_alignment(data_ptr: int) -> int:
@@ -6065,10 +6063,6 @@ def _build_cute_schema_and_args(
         if isinstance(arg, torch.Tensor):
             _validate_cute_launcher_tensor(arg)
             ndim = arg.ndim
-            if ndim <= 0:
-                raise exc.BackendUnsupported(
-                    "cute", "launcher requires tensor rank >= 1"
-                )
             sizes_t = tuple(int(arg.size(d)) for d in range(ndim))
             strides_t = tuple(int(arg.stride(d)) for d in range(ndim))
             data_ptr = int(arg.data_ptr())
