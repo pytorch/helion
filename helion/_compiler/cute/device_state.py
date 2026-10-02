@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from .cute_flash_gated import GatedAttentionPlan
     from .cute_mma import _Tcgen05AuxPipelinePlan
     from .cute_mma import _Tcgen05SchedPipelinePlan
+    from .cute_warp_mma_gemm import CuteWarpMmaGemmMatch
     from .direct_affine_candidate import DirectAffineCandidate
     from .direct_affine_plan import DirectAffinePlan
     from .epilogue_fanout import FanoutStore
@@ -824,6 +825,11 @@ class CuteDeviceFunctionState:
         # matched kernel facts and the inner Q-loop block ids.
         self.attention_flash_bwd_match: AttentionBwdMatch | None = None
         self.attention_flash_bwd_block_ids: list[int] | None = None
+        # Set by the register-MMA GEMM detector (``cute_matmul_family=
+        # "warp_mma"``, cute_warp_mma_gemm.py): the matched plain GEMM and
+        # its tile; the dedicated codegen emits the whole device body and
+        # the launch runs ``32 * warps`` threads per CTA.
+        self.warp_mma_gemm_plan: CuteWarpMmaGemmMatch | None = None
 
     def register_tcgen05_fragment_epilogue_plan(
         self, plan: Tcgen05FragmentEpiloguePlan

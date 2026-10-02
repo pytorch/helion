@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from itertools import zip_longest
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 from torch._dynamo.source import TensorPropertySource
@@ -15,6 +17,8 @@ from .._compiler.compile_environment import _symint_free_symbols
 from .._compiler.compile_environment import _to_sympy
 from .._compiler.compile_environment import format_shape
 from .._compiler.compile_environment import shape_env_var_hints
+from .._compiler.cute.cute_warp_mma_gemm import WARP_MMA_MIN_BM
+from .._compiler.cute.cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from .._compiler.cute.matmul_utils import cute_outer_accumulates_result
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
@@ -389,6 +393,10 @@ class CuteTcgen05SearchPlan:
     max_search_k: int
     min_search_m: int
     min_search_n: int
+    # The register-MMA GEMM family (``cute_matmul_family="warp_mma"``) is
+    # searched only on static, latency-bound problems with the operand
+    # layouts its ldmatrix paths move (see ``warp_mma_admission_reason``).
+    warp_mma_admitted: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -413,8 +421,16 @@ def _plan_cute_tcgen05_search_candidate(
     supports_small_n_role_local_tma: bool = False,
     supports_small_n_scalar_fallback: bool = False,
     allow_dynamic_hints: bool = False,
+    lhs_source: torch.Tensor | None = None,
+    rhs_source: torch.Tensor | None = None,
+    operands_permuted: bool = False,
 ) -> _CuteTcgen05SearchPlanningResult:
-    """Plan one candidate and retain guards even when the candidate is rejected."""
+    """Plan one candidate and retain guards even when the candidate is rejected.
+
+    ``lhs`` / ``rhs`` are the matmul's operand values (the loaded tiles);
+    ``lhs_source`` / ``rhs_source`` are the host tensors they were loaded
+    from, whose layouts decide the register-MMA family's admission.
+    """
     m, n, k = _dot_dimensions(lhs, rhs)
     env = CompileEnvironment.current()
 
@@ -609,6 +625,37 @@ def _plan_cute_tcgen05_search_candidate(
         or static_k % max_search_k != 0
     ):
         return reject()
+    from .._compiler.cute.cute_mma import _tcgen05_tma_matrix_major
+    from .._compiler.cute.cute_warp_mma_gemm import warp_mma_admission_reason
+
+    def static_strides(tensor: torch.Tensor | None) -> tuple[int, ...] | None:
+        if tensor is None:
+            return None
+        strides = [_static_dim_value(env, stride) for stride in tensor.stride()]
+        if any(stride is None for stride in strides):
+            return None
+        return tuple(cast("list[int]", strides))
+
+    warp_mma_admitted = (
+        warp_mma_admission_reason(
+            static_m=static_m,
+            static_n=static_n,
+            static_k=static_k,
+            leading=leading_work_multiplier,
+            dtype=lhs.dtype,
+            lhs_major=_tcgen05_tma_matrix_major(
+                lhs if lhs_source is None else lhs_source
+            ),
+            rhs_major=_tcgen05_tma_matrix_major(
+                rhs if rhs_source is None else rhs_source
+            ),
+            num_sms=_cuda_num_sms_or_zero(lhs.device),
+            lhs_strides=static_strides(lhs_source),
+            rhs_strides=static_strides(rhs_source),
+            operands_permuted=operands_permuted,
+        )
+        is None
+    )
     return _CuteTcgen05SearchPlanningResult(
         plan=CuteTcgen05SearchPlan(
             m=m,
@@ -630,6 +677,7 @@ def _plan_cute_tcgen05_search_candidate(
             max_search_k=max_search_k,
             min_search_m=min_search_m,
             min_search_n=min_search_n,
+            warp_mma_admitted=warp_mma_admitted,
         ),
         required_specialized_vars=frozen_required_specialized_vars,
         guards_complete=True,
@@ -666,6 +714,8 @@ def enable_cute_tcgen05_search(
     input_dtype: torch.dtype,
     has_leading_passthrough: bool,
     explicit_epi_tile_compatible: bool,
+    leading_block_id: int | None = None,
+    warp_mma_plain_kernel: bool = True,
 ) -> None:
     """Apply one preflighted tcgen05 search plan to the shared config."""
     env = CompileEnvironment.current()
@@ -760,6 +810,15 @@ def enable_cute_tcgen05_search(
     one_wave_only_cluster_m2_search = False
     num_sms = _cuda_num_sms_or_zero(lhs.device)
     spec._cute_tcgen05_config.device_sm_count = num_sms
+    # The register-MMA family replaces the whole device body of ONE GEMM (its
+    # root tile loop around its K loop; ``detect_warp_mma_gemm`` proves that
+    # root holds nothing else); kernels with several matmuls keep the tcgen05
+    # surface alone.
+    warp_mma_admitted = plan.warp_mma_admitted and warp_mma_plain_kernel
+    spec._cute_tcgen05_config.warp_mma_admitted = warp_mma_admitted
+    spec._cute_tcgen05_config.tcgen05_min_search_m = plan.min_search_m
+    spec._cute_tcgen05_config.tcgen05_min_search_n = plan.min_search_n
+    spec._cute_tcgen05_config.matmul_leading_block_id = leading_block_id
     if allow_cluster_m2_search:
         assert static_m is not None and static_n is not None and static_k is not None
         if num_sms > 0:
@@ -820,13 +879,29 @@ def enable_cute_tcgen05_search(
         if block_idx is None:
             continue
         if axis_name == "k":
-            min_size = plan.mma_k
+            floor = min_size = plan.mma_k
         elif axis_name == "m":
-            min_size = plan.min_search_m
+            # The register-MMA family's 16-row tiles widen the M (and N)
+            # search floor where it is admitted; ``cute_matmul_family=
+            # "tcgen05"`` configs are clamped back to the tcgen05 floor by
+            # ``CuteTcgen05Config._normalize_warp_mma_family``.
+            floor = plan.min_search_m
+            min_size = WARP_MMA_MIN_BM if warp_mma_admitted else floor
         else:
-            min_size = plan.min_search_n
+            floor = plan.min_search_n
+            min_size = min(WARP_MMA_MIN_BN, floor) if warp_mma_admitted else floor
         env.block_sizes[block_idx].update_min_block(min_size, allow_flattened=True)
         env.block_sizes[block_idx].update_max_block(max_size)
+        if min_size < floor:
+            # The widened floor must not move the default (non-autotuned)
+            # block: the default config stays the tcgen05 tile it was, and the
+            # autotuner's flat default round-trips through normalization.
+            with contextlib.suppress(KeyError):
+                block_spec = spec.block_sizes.block_id_lookup(block_idx)
+                if block_spec.default_size is None:
+                    block_spec.default_size = max(
+                        block_spec._fragment(spec).default(), floor
+                    )
 
 
 @_decorators.register_fake(dot)
