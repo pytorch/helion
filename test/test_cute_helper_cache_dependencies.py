@@ -105,6 +105,11 @@ def _key(kernel: SimpleNamespace) -> str | None:
             "_compiler/cute/_flash_row_mma_runtime.py",
             "helion_flash",
         ),
+        (
+            "helion_warp_mma_gemm",
+            "_compiler/cute/_warp_mma_runtime.py",
+            "helion_flash_row_mma",
+        ),
     ],
 )
 def test_transitive_helper_changes_only_its_family(

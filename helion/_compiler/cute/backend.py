@@ -1483,6 +1483,8 @@ class CuteBackend(Backend):
             or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
+            or key == "cute_matmul_family"
+            or key == "cute_warp_mma_warps"
             or key.startswith(
                 ("tcgen05_", "cute_flash_", "cute_async_load_", "cute_scaled_")
             )
@@ -2609,6 +2611,14 @@ class CuteBackend(Backend):
                 f"block=({gdn_plan.threads}, 1, 1)"
             )
 
+        # The register-MMA GEMM family owns the whole device body and runs
+        # one CTA of ``32 * warps`` threads per output tile.
+        warp_mma_plan = device_function.cute_state.warp_mma_gemm_plan
+        if warp_mma_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({warp_mma_plan.threads}, 1, 1)"
+            )
+
         # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)
         # or 256 threads (Stage-4 warp-spec producer/consumer split). The custom
         # flash codegen owns the whole device body, so the SIMT thread-axis
@@ -3475,7 +3485,17 @@ class CuteBackend(Backend):
             mma_mode = False
             detect_mma = self.name == "cute"
             if is_device_loop and detect_mma:
-                if _detect_attention_mma_loop(
+                from .cute_warp_mma_gemm import MATMUL_FAMILY_WARP_MMA
+                from .cute_warp_mma_gemm import WARP_MMA_FAMILY_KEY
+                from .cute_warp_mma_gemm import detect_warp_mma_gemm
+
+                if config.get(WARP_MMA_FAMILY_KEY) == MATMUL_FAMILY_WARP_MMA:
+                    # The register-MMA GEMM family: the dedicated codegen
+                    # emits the whole device body (``32 * warps`` threads);
+                    # a kernel that is not the plain GEMM it lowers fails
+                    # closed with the reason instead of running tcgen05.
+                    mma_mode = detect_warp_mma_gemm(fn, block_ids, config=config)
+                elif _detect_attention_mma_loop(
                     fn,
                     block_ids,
                     config=config,

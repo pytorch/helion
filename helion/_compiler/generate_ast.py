@@ -272,6 +272,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 in {
                     "helion_small_biased_attention",
                     "helion_flash_row_mma",
+                    "helion_warp_mma_gemm",
                     "helion_flash",
                     "helion_flash_gated",
                     "chunk_prepare_tma",
@@ -514,6 +515,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
+
+    def _try_codegen_warp_mma_gemm_root(self) -> bool:
+        if self.device_function.cute_state.warp_mma_gemm_plan is None:
+            return False
+        from .cute.cute_warp_mma_gemm import codegen_warp_mma_gemm
+
+        if codegen_warp_mma_gemm(self):
+            return True
+        self.device_function.cute_state.warp_mma_gemm_plan = None
+        raise exc.BackendUnsupported(
+            "cute", "warp_mma GEMM family failed late validation"
+        )
 
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
@@ -1615,6 +1628,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
+                        and not self._try_codegen_warp_mma_gemm_root()
                         and not self._try_codegen_attention_flash_root()
                     ):
                         grid_state = self.current_grid_state

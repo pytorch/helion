@@ -77,6 +77,10 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "helion_flash_gated": _FLASH_DEPENDENCIES,
     "helion_flash_bwd": _FLASH_DEPENDENCIES,
     "helion_flash_row_mma": ("_compiler/cute/_flash_row_mma_runtime.py",),
+    "helion_warp_mma_gemm": (
+        "_compiler/cute/_warp_mma_runtime.py",
+        "_compiler/cute/_flash_row_mma_runtime.py",
+    ),
     "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
     "chunk_recurrence_warp_dv4": (
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",

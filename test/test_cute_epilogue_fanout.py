@@ -602,9 +602,15 @@ def test_carrierless_binding_keeps_old_search_registry() -> None:
     # include one-CTA small-grid tiles (128x{16,32,64}x64), and those carry
     # the fanout. Carrierless bindings therefore need a geometry no small
     # tile divides: odd rows, or a column count off the 16/32/64 tile widths.
+    # (The register-MMA family's 8-column seeds may still tile 120 columns;
+    # they never carry the fanout.)
     for bound in (bind(rows=257), bind(columns=120)):
         assert plan_for(bound)
-        assert not bound.config_spec.compiler_seed_configs
+        assert all(
+            FANOUT_CONFIG_KEY not in seed.config
+            and seed.config.get("cute_matmul_family") == "warp_mma"
+            for seed in bound.config_spec.compiler_seed_configs
+        )
         state = bound.config_spec._cute_tcgen05_config
         assert not state.epilogue_fanout_search_enabled
         assert not any(

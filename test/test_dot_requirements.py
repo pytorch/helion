@@ -326,8 +326,11 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
         spec = bound.config_spec
         # Two 128x128 output tiles on this device: the search admits the
         # 64-row one-CTA tile for grids smaller than the SM count (the
-        # 256-row operands alone would pin the floor at 128 rows).
-        self.assertEqual([x.min_size for x in spec.block_sizes], [64, 8, 16])
+        # 256-row operands alone would pin the floor at 128 rows), and the
+        # register-MMA family (``cute_matmul_family="warp_mma"``) admitted on
+        # this latency-bound problem widens the M floor to its 16-row atom;
+        # the default config below keeps the tcgen05 tile.
+        self.assertEqual([x.min_size for x in spec.block_sizes], [16, 8, 16])
         # tile_k upper bound was previously hardcoded to 16; the cute tcgen05
         # path now allows multiples of 16 up to min(128, static_k) so the
         # autotuner can pack more cute.gemm instructions per K iteration.

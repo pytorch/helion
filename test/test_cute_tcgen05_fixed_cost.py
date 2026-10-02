@@ -368,12 +368,17 @@ def _m_block_fragment_low(bound: BoundKernel) -> int:
 def test_small_grids_admit_64_row_tiles_in_search() -> None:
     # 256^3: four 128x128 tiles on 148 SMs.  The operands admit 256-row tiles,
     # which used to pin the search floor at 128 rows; the 64-row one-CTA tile
-    # (cuBLAS runs this shape as 128 CTAs of 64x8) is now searchable.
-    assert _m_block_fragment_low(_bind_gemm((256, 256, 256), torch.float16)) == 64
+    # (cuBLAS runs this shape as 128 CTAs of 64x8) is searchable, and the
+    # register-MMA family admitted on this latency-bound problem widens the
+    # floor to its 16-row atom (tcgen05-family configs clamp back to 64, see
+    # test_cute_warp_mma_gemm.py).
+    assert _m_block_fragment_low(_bind_gemm((256, 256, 256), torch.float16)) == 16
     # A grid that fills the machine keeps the 128-row floor.
     assert _m_block_fragment_low(_bind_gemm((2048, 2048, 256), torch.float16)) == 128
     # The batch axis counts toward the grid: 64 x 256x256 fills it.
     assert _m_block_fragment_low(_bind_bmm((64, 256, 256, 256), torch.float16)) == 128
+    # 8 x 256x512x256 is small-grid but beyond the register-MMA family's
+    # latency-bound regime: the 64-row tcgen05 floor stays.
     assert _m_block_fragment_low(_bind_bmm((8, 256, 512, 256), torch.float16)) == 64
 
 

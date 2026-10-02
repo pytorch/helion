@@ -729,6 +729,18 @@ def _append_cute_wrapper_plan(
         )
         return
 
+    if kind == "helion_warp_mma_gemm":
+        # Register-MMA GEMM tiles: one CTA per (batch, m, n) output tile,
+        # plain tensor arguments, no host-side descriptors.
+        body.extend(
+            [
+                f"    grid_x = cutlass.Int32({plan_int('total_tiles')})",
+                "    grid_y = cutlass.Int32(1)",
+                "    grid_z = cutlass.Int32(1)",
+            ]
+        )
+        return
+
     if kind == "helion_flash":
         # Fused tcgen05 flash-attention host setup: reorder Helion's (B, S, D)
         # tensors to the reference (S, D, B) / (D, S, B) layouts, build the two
@@ -5476,6 +5488,7 @@ def _cute_wrapper_plan_bakes_tensor_shapes(plan: dict[str, object]) -> bool:
     if kind in {
         "helion_small_biased_attention",
         "helion_flash_row_mma",
+        "helion_warp_mma_gemm",
         "chunk_prepare_tma",
         "chunk_recurrence_sm100",
         "chunk_recurrence_warp_dv4",

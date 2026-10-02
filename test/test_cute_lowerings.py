@@ -14519,7 +14519,15 @@ class TestCuteLowerings(unittest.TestCase):
                 l2_groupings=SimpleNamespace(config_get=lambda *args: 1),
             ),
         )
-        config = SimpleNamespace(loop_orders=None, l2_groupings=None, num_threads=None)
+        # The planner reads the matmul family key through ``Config.get``
+        # (``warp_mma`` takes its own detector); the fake config carries no
+        # family, so the tcgen05 detectors below run.
+        config = SimpleNamespace(
+            loop_orders=None,
+            l2_groupings=None,
+            num_threads=None,
+            get=lambda key, default=None: default,
+        )
 
         with (
             patch.object(CompileEnvironment, "current", return_value=env),
