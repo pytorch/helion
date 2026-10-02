@@ -2141,32 +2141,6 @@ def emit_cross_loop_schedule(
             or root in inband_consumer_roots
         )
 
-    inband_pushers = {
-        access.allocation_id: access.root
-        for access in dependency_graph.accesses
-        if dependency_graph.is_inband(access) and access.kind == "store"
-    }
-    inband_edges = [
-        (inband_pushers[access.allocation_id], access.root)
-        for access in dependency_graph.accesses
-        if dependency_graph.is_inband(access) and access.kind != "store"
-    ]
-
-    def dependency_producers(root: int) -> set[int]:
-        plans = [
-            plan
-            for plan, _consumer in (
-                *readiness_consumers_by_root.get(root, ()),
-                *nested_loop_counters_by_consumer.get(root, ()),
-            )
-        ]
-        return {
-            *root_barrier_incoming.get(root, ()),
-            *(producer.producer_root for plan in plans for producer in plan.producers),
-            *(producer for producer, consumer in peer_edges if consumer == root),
-            *(producer for producer, consumer in inband_edges if consumer == root),
-        }
-
     def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
         """Run a waiting task once with memory masked and waits skipped.
 
@@ -3656,10 +3630,12 @@ def emit_cross_loop_schedule(
             # root is admitted, so a dry pass would only delay it. A continuation
             # producer has no packet of its own and gives no such bound.
             ready_on_admission = all(
-                producer in packet_ends
-                and producer not in hoisted_roots
-                and packet_begin - packet_ends[producer] >= configured_worker_count
-                for producer in dependency_producers(root)
+                edge.producer_root in packet_ends
+                and edge.producer_root not in hoisted_roots
+                and packet_begin - packet_ends[edge.producer_root]
+                >= configured_worker_count
+                for edge in dependency_graph.edges
+                if edge.consumer_root == root
             )
             # Triton cannot loop over kernel-scoped tensor-memory work.
             if (
