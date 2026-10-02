@@ -1357,6 +1357,20 @@ def emit_cross_loop_schedule(
             or any(consumer == root for _producer, consumer in peer_edges)
         )
 
+    def dependency_producers(root: int) -> set[int]:
+        plans = [
+            plan
+            for plan, _consumer in (
+                *readiness_consumers_by_root.get(root, ()),
+                *nested_loop_counters_by_consumer.get(root, ()),
+            )
+        ]
+        return {
+            *root_barrier_incoming.get(root, ()),
+            *(producer.producer_root for plan in plans for producer in plan.producers),
+            *(producer for producer, consumer in peer_edges if consumer == root),
+        }
+
     def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
         """Run a waiting task once with memory masked and waits skipped.
 
@@ -2399,6 +2413,8 @@ def emit_cross_loop_schedule(
         for root, begin, end in packet_order:
             packet_ranges.append((root, packet_begin, packet_begin + end - begin))
             packet_begin += end - begin
+        hoisted_roots = {root for root, _begin, _end in hoisted}
+        packet_ends = {root: end for root, _begin, end in packet_ranges}
         packet_branches: list[tuple[int, bool, ast.stmt]] = []
         for root, packet_begin, packet_end in packet_ranges:
             local_task = f"({dispatch_ticket} - {packet_begin})"
@@ -2421,8 +2437,19 @@ def emit_cross_loop_schedule(
                 task_body.extend(_release_sync(device_function))
             task_body.extend(root_barrier_publication(root, synced=bool(publications)))
             task_body.extend(publications)
+            # Producers a full wave of tickets earlier are usually done when this
+            # root is admitted, so a dry pass would only delay it.
+            ready_on_admission = all(
+                producer not in hoisted_roots
+                and packet_begin - packet_ends[producer] >= configured_worker_count
+                for producer in dependency_producers(root)
+            )
             # Triton cannot loop over kernel-scoped tensor-memory work.
-            if waits_on_dependency(root) and root not in kernel_scope_roots:
+            if (
+                waits_on_dependency(root)
+                and root not in kernel_scope_roots
+                and not ready_on_admission
+            ):
                 task_body = dry_pass_task(task_body) or task_body
             packet_branches.append(
                 (
