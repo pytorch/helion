@@ -1357,6 +1357,17 @@ def emit_cross_loop_schedule(
             or any(consumer == root for _producer, consumer in peer_edges)
         )
 
+    inband_pushers = {
+        access.allocation_id: access.root
+        for access in dependency_graph.accesses
+        if dependency_graph.is_inband(access) and access.kind == "store"
+    }
+    inband_edges = [
+        (inband_pushers[access.allocation_id], access.root)
+        for access in dependency_graph.accesses
+        if dependency_graph.is_inband(access) and access.kind != "store"
+    ]
+
     def dependency_producers(root: int) -> set[int]:
         plans = [
             plan
@@ -1369,6 +1380,7 @@ def emit_cross_loop_schedule(
             *root_barrier_incoming.get(root, ()),
             *(producer.producer_root for plan in plans for producer in plan.producers),
             *(producer for producer, consumer in peer_edges if consumer == root),
+            *(producer for producer, consumer in inband_edges if consumer == root),
         }
 
     def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
