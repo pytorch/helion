@@ -614,44 +614,87 @@ class TestReductions(RefEagerTestBase, TestCase):
         torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
     def test_fp16_var_mean(self):
+        """Check BF16 LayerNorm with both reduction schedules."""
+
         @helion.kernel(static_shapes=True)
         def layer_norm_fwd_repro(
             x: torch.Tensor,
             weight: torch.Tensor,
             bias: torch.Tensor,
             eps: float = 1e-5,
-        ) -> torch.Tensor:
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             m, n = x.size()
             out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out_var = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+            out_mean = torch.empty_like(out_var)
             for tile_m in hl.tile(m):
                 x_part = x[tile_m, :]
                 var, mean = torch.var_mean(x_part, dim=-1, keepdim=True, correction=0)
+                out_var[tile_m, :] = var
+                out_mean[tile_m, :] = mean
                 normalized = (x_part - mean) * torch.rsqrt(var.to(torch.float32) + eps)
                 out[tile_m, :] = normalized * (weight[:].to(torch.float32)) + (
                     bias[:].to(torch.float32)
                 )
-            return out
+            return out, out_var, out_mean
 
         batch_size = 32
         dim = 64
-        x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
-        weight = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
-        bias = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
-        eps = 1e-4
-        code1, result1 = code_and_output(
-            layer_norm_fwd_repro,
-            (x, weight, bias, eps),
-            block_sizes=[32],
-            reduction_loops=[None],
-        )
-
-        code2, result2 = code_and_output(
-            layer_norm_fwd_repro,
-            (x, weight, bias, eps),
-            block_sizes=[32],
-            reduction_loops=[8],
-        )
-        torch.testing.assert_close(result1, result2, rtol=1e-3, atol=1e-3)
+        for seed in (None, 3437):
+            with self.subTest(seed=seed):
+                if seed is not None:
+                    torch.manual_seed(seed)
+                x = torch.randn([batch_size, dim], device=DEVICE, dtype=torch.bfloat16)
+                weight = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
+                bias = torch.randn([dim], device=DEVICE, dtype=torch.bfloat16)
+                expected_stats = torch.var_mean(x, dim=-1, keepdim=True, correction=0)
+                for reduction_loop in (None, 8):
+                    # A larger epsilon makes its contribution visible in BF16.
+                    for eps in (1e-4, 0.25):
+                        with self.subTest(reduction_loop=reduction_loop, eps=eps):
+                            code, (result, var, mean) = code_and_output(
+                                layer_norm_fwd_repro,
+                                (x, weight, bias, eps),
+                                block_sizes=[32],
+                                reduction_loops=[reduction_loop],
+                            )
+                            # Reduction order can move a variance across a BF16
+                            # rounding midpoint. Validate the statistics, then
+                            # use the kernel's rounded values in the LayerNorm
+                            # reference so that difference is not amplified.
+                            torch.testing.assert_close(
+                                (var, mean),
+                                expected_stats,
+                                rtol=torch.finfo(x.dtype).eps,
+                                atol=1e-5,
+                            )
+                            centered = x.float() - mean.float()
+                            rstd = torch.rsqrt(var.float() + eps)
+                            expected = (
+                                centered * rstd * weight.float() + bias.float()
+                            ).to(x.dtype)
+                            # Some backends retain centering in FP32. Bound the
+                            # propagated BF16 subtraction error per element,
+                            # plus final output rounding and FP32 arithmetic.
+                            centered_error = (
+                                centered.to(x.dtype).float() - centered
+                            ).abs()
+                            propagated_error = (
+                                centered_error * rstd * weight.float().abs()
+                            )
+                            allowed_error = (
+                                propagated_error
+                                + torch.finfo(x.dtype).eps
+                                * (expected.float().abs() + propagated_error)
+                                + 1e-5
+                            )
+                            self.assertEqual(result.dtype, x.dtype)
+                            torch.testing.assert_close(
+                                (result.float() - expected.float()) / allowed_error,
+                                torch.zeros_like(allowed_error),
+                                rtol=0,
+                                atol=1,
+                            )
 
     @xfailIfPallasTpu("fp16/bf16 1D tensors hit TPU Mosaic sublane alignment error")
     @skipIfTileIR("TileIR does not support log1p")
