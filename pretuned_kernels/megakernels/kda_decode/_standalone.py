@@ -54,6 +54,18 @@ RECURRENCE_CONFIGS = {
         "num_stages": 2,
         "pid_type": "flat",
     },
+    8: {
+        "block_sizes": [32],
+        "num_warps": 1,
+        "num_stages": 2,
+        "pid_type": "flat",
+    },
+    16: {
+        "block_sizes": [8],
+        "num_warps": 1,
+        "num_stages": 2,
+        "pid_type": "flat",
+    },
 }
 NORM_CONFIG = {
     "num_warps": 1,
@@ -75,6 +87,18 @@ OUTPUT_CONFIGS = {
     },
     4: {
         "block_sizes": [8, 128],
+        "num_warps": 1,
+        "num_stages": 4,
+        "pid_type": "flat",
+    },
+    8: {
+        "block_sizes": [16, 128],
+        "num_warps": 1,
+        "num_stages": 4,
+        "pid_type": "flat",
+    },
+    16: {
+        "block_sizes": [32, 64],
         "num_warps": 1,
         "num_stages": 4,
         "pid_type": "flat",
