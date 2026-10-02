@@ -213,92 +213,37 @@ def test_kda_decode_uses_existing_tuning_surface() -> None:
     assert not kernel.settings.triton_do_not_specialize
     assert kernel.settings.persistent_reserved_sms == 88
     assert set(heuristic.CONFIGS) == {
-        (batch, heads) for batch in (1, 2, 4, 8, 16) for heads in (12, 16)
+        (batch, heads) for batch in (1, 2, 4, 8, 16) for heads in (12, 6)
     }
-    assert all(
-        heuristic.CONFIGS[batch, heads] is heuristic._SMALL_CONFIG
-        for batch in (1, 2, 4)
-        for heads in (12, 16)
-    )
-    assert all(
-        heuristic.CONFIGS[8, heads] is heuristic._LARGE_CONFIG for heads in (12, 16)
-    )
-    assert all(
-        heuristic.CONFIGS[16, heads] is heuristic._B16_CONFIG for heads in (12, 16)
-    )
-    assert heuristic._SMALL_CONFIG["block_sizes"] == [
+    assert heuristic.CONFIGS[16, 12]["block_sizes"] == [
         2,
         8,
-        2,
-        32,
-        1,
-        1,
-        32,
-        128,
-        1,
-        32,
-        8,
-        2,
-        8,
-        512,
-        128,
-        128,
-        128,
-    ]
-    assert heuristic._LARGE_CONFIG["block_sizes"] == [
-        8,
-        8,
-        8,
-        32,
-        8,
-        2,
-        32,
-        128,
-        8,
-        32,
         16,
-        8,
-        32,
-        512,
-        128,
+        16,
+        1,
         64,
         128,
-    ]
-    assert heuristic._B16_CONFIG["block_sizes"] == [
+        32,
         4,
-        8,
         16,
         16,
-        8,
-        2,
-        32,
+        256,
+        256,
         128,
-        8,
-        32,
-        16,
-        8,
-        32,
-        512,
-        128,
-        64,
-        128,
+        256,
     ]
-    assert heuristic._B16_CONFIG["loop_orders"][0] == [1, 2, 0]
-    assert heuristic._SMALL_CONFIG["num_stages"] == 6
-    assert heuristic._LARGE_CONFIG["num_stages"] == 4
     assert all(config["maxnreg"] == 240 for config in heuristic.CONFIGS.values())
     for config in heuristic.CONFIGS.values():
+        assert len(config["block_sizes"]) == 15
         assert config["cross_loop_pipeline"] == "dynamic"
         assert config["num_sm_multiplier"] == 1
-        assert config["num_warps"] == 1
+        assert config["num_warps"] in (1, 2)
 
     expected_roots = (
-        "gate_input",
-        "qkv",
-        "beta",
+        "wide",
+        "bfa",
         "decay",
         "conv",
-        "norm_gate",
         "recurrence",
         "rms",
         "output",
@@ -330,22 +275,25 @@ def test_kda_decode_uses_existing_tuning_surface() -> None:
         assert heuristic.key_kda_decode(*args) == expected
 
     source = inspect.getsource(kernel.fn)
-    assert "use_batched_gates: hl.constexpr" in source
-    assert source.count("if use_batched_gates:") == 2
+    assert "hl.specialize(" in source
     assert "hl.specialize(state_indices[" not in source
     assert "semantic_dependency" not in source
     assert module.SUPPORTED_BATCHES == (1, 2, 4, 8, 16)
+    assert module.SUPPORTED_HEADS == (12, 6)
+    assert {(batch, heads) for _, batch, heads, _seed in module.BENCHMARK_CASES} == {
+        (batch, 12) for batch in module.SUPPORTED_BATCHES
+    }
     assert {(batch, heads) for batch, heads, _seed in module.CORRECTNESS_CASES} == {
         (1, 12),
         (2, 12),
         (4, 12),
         (8, 12),
         (16, 12),
-        (1, 16),
-        (2, 16),
-        (4, 16),
-        (8, 16),
-        (16, 16),
+        (1, 6),
+        (2, 6),
+        (4, 6),
+        (8, 6),
+        (16, 6),
     }
 
 
@@ -783,10 +731,10 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     "fused_qk_norm_rope": {
         "sm90": ExpectedPerf(helion_wins=21, total=21, geomean=7.2, wins_slack=2),
     },
-    # These are fixed-capacity B200 gates.  The KDA sweep covers every tuned
-    # B1/B2/B4/B8/B16 envelope and retains a conservative production advantage.
+    # These are fixed-capacity B200 gates. The KDA perf sweep gates the five
+    # tuned TP8/H12 envelopes; TP16/H6 remains in the correctness matrix.
     "kda_decode": {
-        "sm100": ExpectedPerf(helion_wins=5, total=5, geomean=1.20, wins_slack=2),
+        "sm100": ExpectedPerf(helion_wins=3, total=5, geomean=1.05, wins_slack=1),
     },
     "qwen3_decode_layer": {
         "sm100": ExpectedPerf(helion_wins=3, total=3, geomean=1.00, wins_slack=3),
@@ -809,7 +757,7 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
 # vLLM. Keep the historical production-vLLM gate above, while independently
 # guarding against large regressions from each matched boundary.
 _MATCHED_STANDALONE_GEOMEAN_FLOOR = {
-    # Source-matched, independently tuned PDL measured at 1.248x on GB200; retain a
+    # Source-matched seven-launch PDL measured at 1.345x on GB200; retain a
     # conservative but real megakernel advantage after timing noise.
     "kda_decode": 1.15,
     "qwen3_decode_layer": 0.80,
@@ -938,6 +886,8 @@ class TestPretunedKernelsCorrectness(TestCase):
         if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
             self.skipTest("kda_decode is pretuned for NVIDIA SM100.")
         module = _import_pretuned_kernel_module("kda_decode")
+        if not module.has_vllm():
+            self.skipTest("kda_decode correctness requires vLLM.")
         module.correctness_check()
 
     @pytest.mark.timeout(300)

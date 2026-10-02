@@ -47,7 +47,7 @@ pretuned_kernels/
 ├── causal_conv1d/                    # TPU/Pallas fixed-config decode kernel
 ├── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
 └── megakernels/
-    ├── kda_decode/                   # Kimi-Linear KDA decode sublayer
+    ├── kda_decode/                   # Kimi-K3 KDA decode sublayer
     ├── qwen3_decode_layer/          # Qwen3-8B decode layer
     └── gemma4_a4b_moe/              # Gemma 4 26B-A4B MoE
 ```
@@ -80,7 +80,7 @@ At runtime Helion picks the file matching the current GPU.
 | `fused_qk_norm_rope` | vLLM `(num_tokens, q_heads, kv_heads)` shapes | torch-native fused QK-RMSNorm + RoPE |
 | `causal_conv1d` | TPU decode `N=512, H=4, D=128, W=4` | tpu-inference `ragged_causal_conv1d` |
 | `gdn_decode` | TPU decode `N=512, H=2, K=V=128` | tpu-inference `fused_decoding_gdn` |
-| `kda_decode` | Kimi-Linear BF16/FP32-state decode, hidden 2304, B1/B2, H12/H16 | vLLM `fused_kda_decode` with matched projections (H12) |
+| `kda_decode` | Kimi-K3 BF16/FP32-state decode, hidden 7168, B1/B2/B4/B8/B16, TP8/H12 and TP16/H6 | vLLM native fused decode (H12) and Triton fallback (H6), with matched projections |
 | `qwen3_decode_layer` | Qwen3-8B FP8 batch-1 decode, context 8192, 128 attention splits | compiled vLLM `Qwen3DecoderLayer` with default backends |
 | `gemma4_a4b_moe` | Gemma 4 26B-A4B BF16 batch-1 MoE | vLLM Gemma 4 router + fused MoE with default backend selection |
 
@@ -104,10 +104,13 @@ Both grouped benchmarks replay pre-captured graphs, clear L2 before every
 measurement, warm the GPU before each case, and rotate/reverse implementation
 order to reduce clock and ordering bias.
 
-The model-region entries are fixed-capacity B200 examples. KDA decode ships
-four physical envelopes (B1/B2 by H12/H16) and benchmarks the H12 envelopes
-against vLLM's production CUDA fusion plus identical projections. Its mutable
-convolution/recurrent caches and state-slot indices remain runtime data.
+The model-region entries are fixed-capacity B200 examples. KDA decode ships ten
+Kimi-K3 physical envelopes (B1/B2/B4/B8/B16 by TP8/H12 or TP16/H6). The perf
+gate benchmarks H12 against vLLM's production CUDA fusion plus identical
+projections; correctness also covers vLLM's H6 fallback. Decode sequence length
+is absent from the signature, while mutable convolution/recurrent caches and
+state-slot indices remain runtime data. A source-matched seven-launch PDL graph
+separately measures the advantage from persistent cross-root scheduling.
 Each Helion definition contains the complete computation in one generated
 Triton kernel; the checked-in source does not import or assemble code from the
 probe directory. Their benchmark baselines require vLLM and correctness is

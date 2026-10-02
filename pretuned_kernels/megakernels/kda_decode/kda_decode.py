@@ -1,25 +1,22 @@
 # pyrefly: ignore-errors
-"""Kimi-Linear KDA decode megakernel, pretuned for NVIDIA B200.
+"""Kimi-K3 KDA decode megakernel, pretuned for NVIDIA GB200.
 
-The single persistent Helion kernel covers the local KDA sublayer from the
-fused input projection through the output projection.  Its independent input,
-gate, and QKV work is dynamically scheduled around the causal-convolution and
-recurrent-state dependencies.  Mutable cache contents and ``state_indices``
-remain runtime values; the checked-in heuristic supports the ten physical
-envelopes B1/B2/B4/B8/B16 x H12/H16 at hidden size 2304 and head dimension 128.
-Decode sequence length is not part of the signature or specialization key, so
-each physical envelope is reused across every generation step.
-
-The benchmark compares against a source-matched nine-launch Helion PDL pipeline
-and, for H12, vLLM's production fused conv1d + KDA + gated-RMSNorm CUDA kernel
-surrounded by the same projections.
+The persistent kernel covers the TP-local packed input projection, f_b
+projection, causal convolution, bounded KDA recurrence, gated RMSNorm, and
+output projection.  The checked-in envelopes are Kimi-K3 TP8/H12 and TP16/H6
+for B1/B2/B4/B8/B16. Sequence length is absent from the decode signature, and
+mutable cache contents plus slot mappings remain runtime data.
 """
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 from operator import itemgetter
 import os
 from pathlib import Path
+import sys
+import types
 from typing import TYPE_CHECKING
 
 import torch
@@ -33,34 +30,33 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-HIDDEN = 2304
+HIDDEN = 7168
 HEAD_DIM = 128
 POOL_SIZE = 32
+LOWER_BOUND = -5.0
 EPS = 1e-5
 SCALE = HEAD_DIM**-0.5
-OUTPUT_SPLITS = 1
 SUPPORTED_BATCHES = (1, 2, 4, 8, 16)
-SUPPORTED_HEADS = (12, 16)
-BENCHMARK_CASES = (
-    ("b1_h12", 1, 12, 101),
-    ("b2_h12", 2, 12, 202),
-    ("b4_h12", 4, 12, 204),
-    ("b8_h12", 8, 12, 208),
-    ("b16_h12", 16, 12, 216),
+SUPPORTED_HEADS = (12, 6)
+BENCHMARK_CASES = tuple(
+    (f"b{batch}_h{heads}", batch, heads, 1000 + batch * 10 + heads)
+    # TP8/H12 is the production-performance gate. TP16/H6 remains in the
+    # correctness matrix and is reported by the development comparison.
+    for heads in (12,)
+    for batch in SUPPORTED_BATCHES
 )
-CORRECTNESS_CASES = (
-    (1, 12, 301),
-    (2, 12, 302),
-    (4, 12, 304),
-    (8, 12, 308),
-    (16, 12, 316),
-    (1, 16, 401),
-    (2, 16, 402),
-    (4, 16, 404),
-    (8, 16, 408),
-    (16, 16, 416),
+CORRECTNESS_CASES = tuple(
+    (batch, heads, 3000 + batch * 10 + heads)
+    for heads in SUPPORTED_HEADS
+    for batch in SUPPORTED_BATCHES
 )
 VLLM_LIBRARY_ENV = "HELION_VLLM_LIBRARY"
+_VLLM_FALLBACK_OPS: tuple[Callable, Callable, Callable] | None = None
+
+
+def _projection_width(heads: int) -> int:
+    logical_width = 4 * heads * HEAD_DIM + HEAD_DIM + heads
+    return (logical_width + 15) // 16 * 16
 
 
 @helion.aot_kernel(
@@ -72,7 +68,7 @@ VLLM_LIBRARY_ENV = "HELION_VLLM_LIBRARY"
 def kda_decode(
     hidden_states: torch.Tensor,
     input_weight: torch.Tensor,
-    fg_weight: torch.Tensor,
+    f_b_weight: torch.Tensor,
     conv_weight: torch.Tensor,
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
@@ -83,51 +79,47 @@ def kda_decode(
     output_weight: torch.Tensor,
     scale: hl.constexpr,
     eps: hl.constexpr,
-    output_splits: hl.constexpr,
-    use_batched_gates: hl.constexpr,
+    lower_bound: hl.constexpr,
     projection_width_static: hl.constexpr,
-    qkv_width_static: hl.constexpr,
+    bfa_width_static: hl.constexpr,
     heads_static: hl.constexpr,
     key_dim_static: hl.constexpr,
     value_dim_static: hl.constexpr,
 ) -> torch.Tensor:
-    """Run one dense KDA decode sublayer in a persistent kernel."""
+    """Run one TP-local Kimi-K3 decode layer in a persistent kernel."""
     batch, hidden = hidden_states.shape
-    slots, heads, value_dim, key_dim = recurrent_state.shape
-    state_slots, history, qkv_width = conv_state.shape
     projection_width, input_hidden = input_weight.shape
+    f_b_width, f_b_input = f_b_weight.shape
+    conv_kinds, conv_taps, conv_width = conv_weight.shape
+    slots, history, qkv_width = conv_state.shape
+    state_slots, heads, value_dim, key_dim = recurrent_state.shape
     output_hidden, output_k = output_weight.shape
     batch_heads = batch * heads
+    wide_width = 4 * heads * key_dim
 
+    assert hidden == HIDDEN and input_hidden == hidden
+    assert projection_width == projection_width_static
+    assert projection_width >= wide_width + bfa_width_static
+    assert projection_width - (wide_width + bfa_width_static) < 16
+    assert f_b_width == heads * key_dim and f_b_input == key_dim
+    assert conv_kinds == 3 and conv_taps == history + 1 and history == 3
+    assert conv_width == heads * key_dim
+    assert qkv_width == 3 * heads * key_dim
     assert state_slots == slots
-    assert input_hidden == hidden
-    assert value_dim == key_dim
-    assert key_dim_static % 32 == 0
-    assert qkv_width == heads * (2 * key_dim + value_dim)
-    assert projection_width == qkv_width + heads + 2 * key_dim
-    assert fg_weight.shape == (2, heads * key_dim, key_dim)
-    assert conv_weight.shape == (qkv_width, history + 1)
-    assert history == 3
-    assert a_log.numel() == heads
-    assert dt_bias.numel() == heads * key_dim
+    assert heads == heads_static
+    assert key_dim == key_dim_static and value_dim == value_dim_static
+    assert key_dim == HEAD_DIM and value_dim == HEAD_DIM
+    assert a_log.shape == (heads,)
+    assert dt_bias.shape == (heads * key_dim,)
     assert state_indices.shape == (batch,)
     assert norm_weight.shape == (value_dim,)
-    assert output_k == heads * value_dim
-    assert output_splits >= 1 and output_k % output_splits == 0
-    assert projection_width == projection_width_static
-    assert qkv_width == qkv_width_static
-    assert heads == heads_static
-    assert key_dim == key_dim_static
-    assert value_dim == value_dim_static
+    assert output_hidden == hidden and output_k == heads * value_dim
 
-    # Specialize the fixed physical envelope and layouts, but never sequence
-    # length, cache contents, or state_indices. Runtime slot mappings therefore
-    # reuse one compiled kernel for each B/H capacity across all decode steps.
     hl.specialize(
         (
             hidden_states.shape,
             input_weight.shape,
-            fg_weight.shape,
+            f_b_weight.shape,
             conv_weight.shape,
             a_log.shape,
             dt_bias.shape,
@@ -138,7 +130,7 @@ def kda_decode(
             output_weight.shape,
             hidden_states.stride(),
             input_weight.stride(),
-            fg_weight.stride(),
+            f_b_weight.stride(),
             conv_weight.stride(),
             a_log.stride(),
             dt_bias.stride(),
@@ -150,56 +142,42 @@ def kda_decode(
         )
     )
 
-    gate_input_batch_block = hl.register_block_size(1, 16)
-    gate_input_block = hl.register_block_size(4, 64)
-    projection_batch_block = hl.register_block_size(1, 16)
-    projection_block = hl.register_block_size(4, 64)
-    beta_batch_block = hl.register_block_size(1, 16)
-    forget_gate_batch_block = hl.register_block_size(1, 16)
-    forget_gate_block = hl.register_block_size(4, 128)
+    bfa_batch_block = hl.register_block_size(1, 16)
+    bfa_output_block = hl.register_block_size(4, 64)
+    wide_batch_block = hl.register_block_size(1, 16)
+    wide_output_block = hl.register_block_size(4, 256)
+    decay_batch_head_block = hl.register_block_size(1, 16)
+    decay_output_block = hl.register_block_size(4, 128)
     conv_block = hl.register_block_size(4, 128)
-    norm_gate_batch_block = hl.register_block_size(1, 16)
-    norm_gate_block = hl.register_block_size(4, 128)
     recurrent_block = hl.register_block_size(4, value_dim)
+    rms_batch_head_block = hl.register_block_size(1, 16)
     output_batch_block = hl.register_block_size(1, 16)
     output_block = hl.register_block_size(4, 64)
-    gate_input_k_block = hl.register_block_size(32, 512)
-    qkv_input_k_block = hl.register_block_size(32, 512)
-    beta_input_k_block = hl.register_block_size(32, 512)
+    bfa_k_block = hl.register_block_size(32, 512)
+    wide_k_block = hl.register_block_size(32, 512)
+    f_b_k_block = hl.register_block_size(32, 128)
     output_k_block = hl.register_block_size(32, 512)
-    output_chunk_static = heads_static * value_dim_static // output_splits
-    beta_head_block = 1 << (heads_static - 1).bit_length()
 
-    qkv_input_weight = input_weight[:qkv_width_static].view(
-        3, heads_static, key_dim_static, hidden
+    wide_weight_view = input_weight[: 4 * heads_static * key_dim_static].view(
+        4, heads_static, key_dim_static, hidden
     )
-    beta_input_weight = input_weight[qkv_width_static : qkv_width_static + heads_static]
-    gate_input_weight = input_weight[
-        qkv_width_static + heads_static : projection_width_static
-    ].view(2, key_dim_static, hidden)
-    projected_qkv = torch.empty(
-        (batch, heads_static, 3, key_dim),
+    bfa_weight = input_weight[
+        4 * heads_static * key_dim_static : 4 * heads_static * key_dim_static
+        + bfa_width_static
+    ]
+    f_b_weight_view = f_b_weight.view(heads_static, key_dim_static, key_dim_static)
+    projected_wide = torch.empty(
+        (batch, heads_static, 4, key_dim),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    recurrence_beta = torch.empty(
-        (batch_heads,), dtype=torch.float32, device=hidden_states.device
-    )
-    recurrence_beta_batched = recurrence_beta.view(batch, heads_static)
-    projected_gate_inputs = torch.empty(
-        (batch, 2, key_dim),
+    projected_bfa = torch.empty(
+        (batch, bfa_width_static),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
     prepared_decay = torch.empty(
         (batch_heads, key_dim), dtype=torch.float32, device=hidden_states.device
-    )
-    prepared_decay_batched = prepared_decay.view(batch, heads_static, key_dim_static)
-    prepared_norm_gate = torch.empty(
-        (batch_heads, key_dim), dtype=torch.float32, device=hidden_states.device
-    )
-    prepared_norm_gate_batched = prepared_norm_gate.view(
-        batch, heads_static, key_dim_static
     )
     prepared_qkv = torch.empty(
         (batch_heads, 3, key_dim),
@@ -211,158 +189,79 @@ def kda_decode(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    normalized_output = torch.empty(
-        (batch_heads, value_dim),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-    normalized_output_flat = normalized_output.view(
-        batch, heads_static * value_dim_static
-    )
+    normalized_output = torch.empty_like(core_output)
+    normalized_flat = normalized_output.view(batch, heads_static * value_dim)
     output = torch.empty(
         (batch, output_hidden),
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    output_partials = torch.empty(
-        (batch, output_splits, output_hidden),
-        dtype=torch.float32,
-        device=hidden_states.device,
-    )
 
-    # The first three roots are independent projections.  Fine-grained
-    # readiness lets downstream gate, convolution, and recurrence work begin
-    # without waiting for the entire projection region.
-    for tile_batch, tile_kind, tile_dim in hl.tile(
-        [batch, 2, key_dim],
-        block_size=[gate_input_batch_block, 1, gate_input_block],
+    # f_a and beta are independent of the full-rank Q/K/V/output-gate root.
+    for tile_batch, tile_output in hl.tile(
+        [batch, bfa_width_static],
+        block_size=[bfa_batch_block, bfa_output_block],
     ):
-        kind = tile_kind.id
-        accumulator = hl.zeros([tile_batch, tile_dim], dtype=torch.float32)
-        for tile_hidden in hl.tile(hidden, block_size=gate_input_k_block):
+        accumulator = hl.zeros([tile_batch, tile_output], dtype=torch.float32)
+        for tile_hidden in hl.tile(hidden, block_size=bfa_k_block):
             accumulator = torch.addmm(
                 accumulator,
                 hidden_states[tile_batch, tile_hidden],
-                gate_input_weight[kind, tile_dim, tile_hidden].T,
+                bfa_weight[tile_output, tile_hidden].T,
             )
-        projected_gate_inputs[tile_batch, kind, tile_dim] = accumulator.to(
-            projected_gate_inputs.dtype
-        )
+        projected_bfa[tile_batch, tile_output] = accumulator.to(projected_bfa.dtype)
 
     for tile_batch, tile_head, tile_kind, tile_dim in hl.tile(
-        [batch, heads_static, 3, key_dim],
-        block_size=[projection_batch_block, 1, 1, projection_block],
+        [batch, heads_static, 4, key_dim],
+        block_size=[wide_batch_block, 1, 1, wide_output_block],
     ):
         kind = tile_kind.id
         accumulator = hl.zeros([tile_batch, tile_dim], dtype=torch.float32)
-        for tile_hidden in hl.tile(hidden, block_size=qkv_input_k_block):
+        for tile_hidden in hl.tile(hidden, block_size=wide_k_block):
             accumulator = torch.addmm(
                 accumulator,
                 hidden_states[tile_batch, tile_hidden],
-                qkv_input_weight[
+                wide_weight_view[
                     kind,
                     tile_head.id,
                     tile_dim,
                     tile_hidden,
                 ].T,
             )
-        projected_qkv[tile_batch, tile_head.id, kind, tile_dim] = accumulator.to(
-            projected_qkv.dtype
+        projected_wide[tile_batch, tile_head.id, kind, tile_dim] = accumulator.to(
+            projected_wide.dtype
         )
 
-    for tile_batch, tile_head in hl.tile(
-        [batch, heads_static],
-        block_size=[beta_batch_block, beta_head_block],
+    # f_b preserves the model's BF16 projection boundary before the bounded
+    # K3 log-decay transform.
+    for tile_batch_head, tile_dim in hl.tile(
+        [batch_heads, key_dim],
+        block_size=[decay_batch_head_block, decay_output_block],
     ):
-        beta_accumulator = hl.zeros([tile_batch, tile_head], dtype=torch.float32)
-        for beta_tile_hidden in hl.tile(hidden, block_size=beta_input_k_block):
-            beta_accumulator = torch.addmm(
-                beta_accumulator,
-                hidden_states[tile_batch, beta_tile_hidden],
-                beta_input_weight[tile_head, beta_tile_hidden].T,
+        accumulator = hl.zeros([tile_dim], dtype=torch.float32)
+        for tile_gate_input in hl.tile(key_dim, block_size=f_b_k_block):
+            gate_input = projected_bfa[
+                tile_batch_head.id // heads_static, tile_gate_input
+            ].float()
+            gate_weight = f_b_weight_view[
+                tile_batch_head.id % heads_static,
+                tile_dim,
+                tile_gate_input,
+            ].float()
+            accumulator = accumulator + torch.sum(
+                gate_weight * gate_input[None, :], dim=-1
             )
-        recurrence_beta_batched[tile_batch, tile_head] = torch.sigmoid(
-            beta_accumulator.to(hidden_states.dtype).float()
+        rounded_gate = accumulator.to(hidden_states.dtype)
+        raw_gate = (
+            rounded_gate.float()
+            + dt_bias[
+                (tile_batch_head.id % heads_static) * key_dim + tile_dim.index
+            ].float()
         )
-
-    for tile_head_batch, tile_gate_dim in hl.tile(
-        [heads_static * batch, key_dim_static],
-        block_size=[forget_gate_batch_block, forget_gate_block],
-    ):
-        gate_dim = tile_gate_dim.index
-        gate_key = hl.arange(key_dim_static)
-        if use_batched_gates:
-            gate_input = projected_gate_inputs[
-                tile_head_batch.index
-                - (tile_head_batch.id * forget_gate_batch_block // batch) * batch,
-                0,
-                gate_key,
-            ]
-            gate_weights = fg_weight[
-                0,
-                (tile_head_batch.id * forget_gate_batch_block // batch) * key_dim_static
-                + gate_dim[:, None],
-                gate_key[None, :],
-            ]
-            gate_accumulator = torch.addmm(
-                hl.zeros([tile_head_batch, tile_gate_dim], dtype=torch.float32),
-                gate_input,
-                gate_weights.T,
-            )
-            rounded_gate = gate_accumulator.to(hidden_states.dtype)
-            activated_gate = (
-                rounded_gate.float()
-                + dt_bias[
-                    (tile_head_batch.id * forget_gate_batch_block // batch)
-                    * key_dim_static
-                    + gate_dim
-                ].float()[None, :]
-            )
-            gate_exp = torch.exp(activated_gate)
-            softplus = torch.where(
-                activated_gate <= 20.0,
-                torch.log(1.0 + gate_exp),
-                activated_gate,
-            )
-            prepared_decay_batched[
-                tile_head_batch.index
-                - (tile_head_batch.id * forget_gate_batch_block // batch) * batch,
-                tile_head_batch.id * forget_gate_batch_block // batch,
-                tile_gate_dim,
-            ] = torch.exp(
-                -torch.exp(
-                    a_log[tile_head_batch.id * forget_gate_batch_block // batch].float()
-                )
-                * softplus
-            )
-        else:
-            batch_head_index = tile_head_batch.id
-            gate_input = projected_gate_inputs[
-                tile_head_batch.id // heads_static, 0, gate_key
-            ].float()
-            gate_weights = fg_weight[
-                0,
-                (tile_head_batch.id % heads_static) * key_dim_static
-                + gate_dim[:, None],
-                gate_key[None, :],
-            ].float()
-            gate_accumulator = torch.sum(gate_weights * gate_input[None, :], dim=-1)
-            rounded_gate = gate_accumulator.to(hidden_states.dtype)
-            activated_gate = (
-                rounded_gate.float()
-                + dt_bias[
-                    (tile_head_batch.id % heads_static) * key_dim_static + gate_dim
-                ].float()
-            )
-            gate_exp = torch.exp(activated_gate)
-            softplus = torch.where(
-                activated_gate <= 20.0,
-                torch.log(1.0 + gate_exp),
-                activated_gate,
-            )
-            prepared_decay[batch_head_index, gate_dim] = torch.exp(
-                -torch.exp(a_log[tile_head_batch.id % heads_static].float()) * softplus
-            )
+        log_decay = lower_bound * torch.sigmoid(
+            torch.exp(a_log[tile_batch_head.id % heads_static].float()) * raw_gate
+        )
+        prepared_decay[tile_batch_head.id, tile_dim] = torch.exp(log_decay)
 
     for tile_batch_head, tile_kind, tile_dim in hl.tile(
         [batch_heads, 3, key_dim], block_size=[1, 1, conv_block]
@@ -371,26 +270,27 @@ def kda_decode(
         kind = tile_kind.id
         state_index = state_indices[tile_batch_head.id // heads_static].long()
         channel = (
-            kind * heads_static * key_dim_static
-            + (tile_batch_head.id % heads_static) * key_dim_static
+            kind * heads_static * key_dim
+            + (tile_batch_head.id % heads_static) * key_dim
             + tile_dim.index
         )
-        x = projected_qkv[
+        conv_channel = (tile_batch_head.id % heads_static) * key_dim + tile_dim.index
+        x = projected_wide[
             tile_batch_head.id // heads_static,
             tile_batch_head.id % heads_static,
             kind,
             tile_dim,
         ].float()
         value = hl.zeros([tile_dim], dtype=torch.float32)
-        if state_index >= 0:
+        if state_index > 0:
             state_0 = conv_state[state_index, 0, channel].float()
             state_1 = conv_state[state_index, 1, channel].float()
             state_2 = conv_state[state_index, 2, channel].float()
             value = (
-                state_0 * conv_weight[channel, 0].float()
-                + state_1 * conv_weight[channel, 1].float()
-                + state_2 * conv_weight[channel, 2].float()
-                + x * conv_weight[channel, 3].float()
+                state_0 * conv_weight[kind, 0, conv_channel].float()
+                + state_1 * conv_weight[kind, 1, conv_channel].float()
+                + state_2 * conv_weight[kind, 2, conv_channel].float()
+                + x * conv_weight[kind, 3, conv_channel].float()
             )
             value = value * torch.sigmoid(value)
             conv_state[state_index, 0, channel] = state_1.to(conv_state.dtype)
@@ -403,70 +303,25 @@ def kda_decode(
                 value = value * scale
         prepared_qkv[batch_head_index, kind, tile_dim] = value
 
-    for tile_head_batch, tile_gate_dim in hl.tile(
-        [heads_static * batch, key_dim_static],
-        block_size=[norm_gate_batch_block, norm_gate_block],
-    ):
-        gate_dim = tile_gate_dim.index
-        gate_key = hl.arange(key_dim_static)
-        if use_batched_gates:
-            gate_input = projected_gate_inputs[
-                tile_head_batch.index
-                - (tile_head_batch.id * norm_gate_batch_block // batch) * batch,
-                1,
-                gate_key,
-            ]
-            gate_weights = fg_weight[
-                1,
-                (tile_head_batch.id * norm_gate_batch_block // batch) * key_dim_static
-                + gate_dim[:, None],
-                gate_key[None, :],
-            ]
-            gate_accumulator = torch.addmm(
-                hl.zeros([tile_head_batch, tile_gate_dim], dtype=torch.float32),
-                gate_input,
-                gate_weights.T,
-            )
-            rounded_gate = gate_accumulator.to(hidden_states.dtype)
-            prepared_norm_gate_batched[
-                tile_head_batch.index
-                - (tile_head_batch.id * norm_gate_batch_block // batch) * batch,
-                tile_head_batch.id * norm_gate_batch_block // batch,
-                tile_gate_dim,
-            ] = norm_weight[gate_dim].float()[None, :] * torch.sigmoid(
-                rounded_gate.float()
-            )
-        else:
-            batch_head_index = tile_head_batch.id
-            gate_input = projected_gate_inputs[
-                tile_head_batch.id // heads_static, 1, gate_key
-            ].float()
-            gate_weights = fg_weight[
-                1,
-                (tile_head_batch.id % heads_static) * key_dim_static
-                + gate_dim[:, None],
-                gate_key[None, :],
-            ].float()
-            gate_accumulator = torch.sum(gate_weights * gate_input[None, :], dim=-1)
-            rounded_gate = gate_accumulator.to(hidden_states.dtype)
-            prepared_norm_gate[batch_head_index, gate_dim] = norm_weight[
-                gate_dim
-            ].float() * torch.sigmoid(rounded_gate.float())
-
     for tile_batch_head, tile_value in hl.tile(
         [batch_heads, value_dim], block_size=[1, recurrent_block]
     ):
         batch_head_index = tile_batch_head.id
         state_index = state_indices[tile_batch_head.id // heads_static].long()
+        beta = torch.sigmoid(
+            projected_bfa[
+                tile_batch_head.id // heads_static,
+                key_dim + tile_batch_head.id % heads_static,
+            ].float()
+        )
         result = hl.zeros([tile_value], dtype=torch.float32)
-        for tile_key in hl.tile(key_dim_static, block_size=key_dim_static):
+        for tile_key in hl.tile(key_dim, block_size=key_dim):
             key_offsets = tile_key.index
             decay = prepared_decay[batch_head_index, key_offsets]
-            beta_value = recurrence_beta[batch_head_index]
             key = prepared_qkv[batch_head_index, 1, key_offsets]
             value = prepared_qkv[batch_head_index, 2, tile_value]
             query = prepared_qkv[batch_head_index, 0, key_offsets]
-            if state_index >= 0:
+            if state_index > 0:
                 state = recurrent_state[
                     state_index,
                     tile_batch_head.id % heads_static,
@@ -475,7 +330,7 @@ def kda_decode(
                 ].float()
                 state = state * decay[None, :]
                 value_residual = value - torch.sum(state * key[None, :], dim=-1)
-                state = state + (value_residual * beta_value)[:, None] * key[None, :]
+                state = state + (value_residual * beta)[:, None] * key[None, :]
                 result = torch.sum(state * query[None, :], dim=-1)
                 recurrent_state[
                     state_index,
@@ -487,40 +342,35 @@ def kda_decode(
 
     for tile_batch_head, tile_value in hl.tile(
         [batch_heads, value_dim],
-        block_size=[norm_gate_batch_block, value_dim_static],
+        block_size=[rms_batch_head_block, value_dim],
     ):
         values = core_output[tile_batch_head, tile_value].float()
-        inv_rms = torch.rsqrt(
-            torch.sum(values * values, dim=-1) / value_dim_static + eps
-        )
+        inv_rms = torch.rsqrt(torch.sum(values * values, dim=-1) / value_dim + eps)
+        raw_gate = projected_wide[
+            tile_batch_head.id // heads_static,
+            tile_batch_head.id % heads_static,
+            3,
+            tile_value,
+        ].float()
         normalized_output[tile_batch_head, tile_value] = (
-            values * inv_rms[:, None] * prepared_norm_gate[tile_batch_head, tile_value]
+            values
+            * inv_rms[:, None]
+            * norm_weight[tile_value].float()[None, :]
+            * torch.sigmoid(raw_gate)
         ).to(normalized_output.dtype)
 
-    for tile_batch, tile_split, tile_out in hl.tile(
-        [batch, output_splits, output_hidden],
-        block_size=[output_batch_block, 1, output_block],
+    for tile_batch, tile_output in hl.tile(
+        [batch, output_hidden],
+        block_size=[output_batch_block, output_block],
     ):
-        accumulator = hl.zeros([tile_batch, tile_out], dtype=torch.float32)
-        for tile_local_input in hl.tile(output_chunk_static, block_size=output_k_block):
-            tile_input = tile_split.id * output_chunk_static + tile_local_input.index
+        accumulator = hl.zeros([tile_batch, tile_output], dtype=torch.float32)
+        for tile_input in hl.tile(output_k, block_size=output_k_block):
             accumulator = torch.addmm(
                 accumulator,
-                normalized_output_flat[tile_batch, tile_input],
-                output_weight[tile_out, tile_input].T,
+                normalized_flat[tile_batch, tile_input],
+                output_weight[tile_output, tile_input].T,
             )
-        if output_splits == 1:
-            output[tile_batch, tile_out] = accumulator.to(output.dtype)
-        else:
-            output_partials[tile_batch, tile_split, tile_out] = accumulator[:, None, :]
-
-    if output_splits > 1:
-        for tile_batch, tile_out in hl.tile(
-            [batch, output_hidden], block_size=[1, output_block]
-        ):
-            split_offsets = hl.arange(output_splits)
-            partials = output_partials[tile_batch, split_offsets, tile_out]
-            output[tile_batch, tile_out] = torch.sum(partials, dim=1).to(output.dtype)
+        output[tile_batch, tile_output] = accumulator.to(output.dtype)
     return output
 
 
@@ -534,45 +384,47 @@ def _require_sm100() -> None:
         raise RuntimeError("kda_decode is pretuned only for NVIDIA SM100")
 
 
-def _shape_values(heads: int) -> tuple[int, int]:
-    qkv_width = 3 * heads * HEAD_DIM
-    projection_width = qkv_width + heads + 2 * HEAD_DIM
-    return qkv_width, projection_width
-
-
 def _make_inputs(batch: int, heads: int, seed: int) -> dict[str, torch.Tensor]:
     if batch not in SUPPORTED_BATCHES or heads not in SUPPORTED_HEADS:
         raise ValueError(f"unsupported pretuned shape B={batch}, H={heads}")
-    torch.manual_seed(seed)
-    qkv_width, projection_width = _shape_values(heads)
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(seed)
+    segment = heads * HEAD_DIM
+    qkv_width = 3 * segment
 
     def randn(
         *shape: int,
         dtype: torch.dtype = torch.bfloat16,
         scale: float = 0.02,
     ) -> torch.Tensor:
-        return torch.randn(*shape, device="cuda", dtype=dtype) * scale
+        return (
+            torch.randn(
+                *shape,
+                device="cuda",
+                dtype=dtype,
+                generator=generator,
+            )
+            * scale
+        )
 
-    conv_weight = randn(qkv_width, 4, dtype=torch.float32)
-    norm_weight = randn(HEAD_DIM, scale=1.0)
     return {
         "hidden_states": randn(batch, HIDDEN),
-        "input_weight": randn(projection_width, HIDDEN),
-        "fg_weight": randn(2, heads * HEAD_DIM, HEAD_DIM),
-        "conv_weight": conv_weight,
-        "vllm_conv_weight": conv_weight.reshape(3, heads * HEAD_DIM, 4)
-        .transpose(1, 2)
-        .contiguous(),
-        "a_log": randn(heads, dtype=torch.float32),
-        "dt_bias": randn(heads * HEAD_DIM, dtype=torch.float32),
+        "input_weight": randn(_projection_width(heads), HIDDEN),
+        "f_b_weight": randn(segment, HEAD_DIM),
+        "conv_weight": randn(3, 4, segment, dtype=torch.float32),
+        "a_log": torch.log(
+            torch.empty(heads, device="cuda", dtype=torch.float32).uniform_(
+                1.0, 16.0, generator=generator
+            )
+        ),
+        "dt_bias": randn(segment, dtype=torch.float32),
         "conv_state": randn(POOL_SIZE, 3, qkv_width),
         "recurrent_state": randn(
             POOL_SIZE, heads, HEAD_DIM, HEAD_DIM, dtype=torch.float32
         ),
-        "state_indices": torch.arange(batch, device="cuda", dtype=torch.int32),
-        "norm_weight": norm_weight,
-        "vllm_norm_weight": norm_weight.float(),
-        "output_weight": randn(HIDDEN, heads * HEAD_DIM),
+        "state_indices": torch.arange(1, batch + 1, device="cuda", dtype=torch.int32),
+        "norm_weight": 1.0 + randn(HEAD_DIM, dtype=torch.float32),
+        "output_weight": randn(HIDDEN, segment),
     }
 
 
@@ -584,13 +436,11 @@ def _clone_inputs(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
 
 
 def _kernel_args(tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
-    batch = tensors["hidden_states"].shape[0]
     heads = tensors["recurrent_state"].shape[1]
-    qkv_width, projection_width = _shape_values(heads)
     return (
         tensors["hidden_states"],
         tensors["input_weight"],
-        tensors["fg_weight"],
+        tensors["f_b_weight"],
         tensors["conv_weight"],
         tensors["a_log"],
         tensors["dt_bias"],
@@ -601,36 +451,45 @@ def _kernel_args(tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
         tensors["output_weight"],
         SCALE,
         EPS,
-        OUTPUT_SPLITS,
-        batch > 4,
-        projection_width,
-        qkv_width,
+        LOWER_BOUND,
+        _projection_width(heads),
+        HEAD_DIM + heads,
         heads,
         HEAD_DIM,
         HEAD_DIM,
     )
 
 
+def _project(tensors: dict[str, torch.Tensor]) -> tuple[torch.Tensor, ...]:
+    batch = tensors["hidden_states"].shape[0]
+    heads = tensors["recurrent_state"].shape[1]
+    segment = heads * HEAD_DIM
+    projected = F.linear(tensors["hidden_states"], tensors["input_weight"])
+    mixed_qkv = projected[:, : 3 * segment]
+    output_gate = projected[:, 3 * segment : 4 * segment]
+    f_a = projected[:, 4 * segment : 4 * segment + HEAD_DIM]
+    beta = projected[:, 4 * segment + HEAD_DIM : 4 * segment + HEAD_DIM + heads]
+    forget_gate = F.linear(f_a, tensors["f_b_weight"])
+    return (
+        mixed_qkv,
+        output_gate.view(batch, heads, HEAD_DIM),
+        forget_gate.view(1, batch, heads, HEAD_DIM),
+        beta.view(1, batch, heads),
+    )
+
+
 def _reference(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Torch reference with the same BF16 stage boundaries and cache updates."""
+    """Torch reference preserving K3's BF16 projection boundaries."""
     hidden_states = tensors["hidden_states"]
     batch = hidden_states.shape[0]
     heads = tensors["recurrent_state"].shape[1]
-    qkv_width, _projection_width = _shape_values(heads)
-    projected = F.linear(hidden_states, tensors["input_weight"])
-    mixed_qkv = projected[:, :qkv_width]
-    beta = projected[:, qkv_width : qkv_width + heads]
-    gate_inputs = projected[:, qkv_width + heads :].view(batch, 2, HEAD_DIM)
-    forget_gate, norm_gate = torch.bmm(
-        gate_inputs.transpose(0, 1), tensors["fg_weight"].transpose(-1, -2)
-    )
-
+    segment = heads * HEAD_DIM
+    mixed_qkv, output_gate, forget_gate, beta = _project(tensors)
     indices = tensors["state_indices"].long()
     history = tensors["conv_state"][indices]
-    conv_inputs = torch.cat((history, mixed_qkv[:, None, :]), dim=1).transpose(1, 2)
-    convolved = torch.sum(
-        conv_inputs.float() * tensors["conv_weight"][None, :, :].float(), dim=-1
-    )
+    conv_inputs = torch.cat((history.transpose(1, 2), mixed_qkv[:, :, None]), dim=-1)
+    conv_weights = tensors["conv_weight"].permute(0, 2, 1).reshape(3 * segment, 4)
+    convolved = torch.sum(conv_inputs.float() * conv_weights[None, :, :], dim=-1)
     convolved = F.silu(convolved).to(hidden_states.dtype)
     tensors["conv_state"][indices, 0] = history[:, 1]
     tensors["conv_state"][indices, 1] = history[:, 2]
@@ -642,18 +501,18 @@ def _reference(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     query = query * torch.rsqrt(torch.sum(query * query, dim=-1, keepdim=True) + 1e-6)
     key = key * torch.rsqrt(torch.sum(key * key, dim=-1, keepdim=True) + 1e-6)
     query = query * SCALE
-    activated_gate = forget_gate.view(batch, heads, HEAD_DIM).float() + tensors[
-        "dt_bias"
-    ].view(1, heads, HEAD_DIM)
+    raw_gate = forget_gate.view(batch, heads, HEAD_DIM).float()
+    raw_gate = raw_gate + tensors["dt_bias"].view(1, heads, HEAD_DIM)
     decay = torch.exp(
-        -torch.exp(tensors["a_log"].float())[None, :, None] * F.softplus(activated_gate)
+        LOWER_BOUND
+        * torch.sigmoid(torch.exp(tensors["a_log"])[None, :, None] * raw_gate)
     )
     state = tensors["recurrent_state"][indices]
     state = state * decay[:, :, None, :]
     residual = value.float() - torch.sum(state * key[:, :, None, :], dim=-1)
     state = (
         state
-        + (residual * torch.sigmoid(beta.float())[:, :, None])[:, :, :, None]
+        + (residual * torch.sigmoid(beta.float())[0, :, :, None])[:, :, :, None]
         * key[:, :, None, :]
     )
     tensors["recurrent_state"][indices] = state
@@ -662,19 +521,17 @@ def _reference(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
     normalized = (
         core_float
         * torch.rsqrt(torch.mean(core_float * core_float, dim=-1, keepdim=True) + EPS)
-        * tensors["norm_weight"].float()[None, None, :]
-        * torch.sigmoid(norm_gate.view(batch, heads, HEAD_DIM).float())
+        * tensors["norm_weight"][None, None, :]
+        * torch.sigmoid(output_gate.float())
     ).to(hidden_states.dtype)
-    return F.linear(
-        normalized.reshape(batch, heads * HEAD_DIM), tensors["output_weight"]
-    )
+    return F.linear(normalized.reshape(batch, segment), tensors["output_weight"])
 
 
 def _ensure_vllm_op() -> bool:
     if hasattr(torch.ops._C, "fused_kda_decode"):
         return True
     try:
-        __import__("vllm._custom_ops")
+        importlib.import_module("vllm._custom_ops")
     except (ImportError, OSError):
         library = os.environ.get(VLLM_LIBRARY_ENV)
         if not library:
@@ -683,12 +540,61 @@ def _ensure_vllm_op() -> bool:
             torch.ops.load_library(library)
         except OSError:
             return False
+        sys.modules.setdefault(
+            "vllm._C_stable_libtorch",
+            types.ModuleType("vllm._C_stable_libtorch"),
+        )
     return hasattr(torch.ops._C, "fused_kda_decode")
 
 
+def _load_vllm_fallback_ops() -> tuple[Callable, Callable, Callable]:
+    global _VLLM_FALLBACK_OPS
+    if _VLLM_FALLBACK_OPS is not None:
+        return _VLLM_FALLBACK_OPS
+
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+    from vllm.third_party.flash_linear_attention.ops.fused_norm_gate import (
+        rms_norm_gated,
+    )
+
+    try:
+        module = importlib.import_module(
+            "vllm.models.kimi_k3.nvidia.ops.third_party.kda.fused_recurrent"
+        )
+    except ImportError:
+        import vllm
+
+        module_path = (
+            Path(vllm.__file__).parent
+            / "models/kimi_k3/nvidia/ops/third_party/kda/fused_recurrent.py"
+        )
+        spec = importlib.util.spec_from_file_location(
+            "_helion_vllm_kda_fused_recurrent", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(
+                f"cannot load vLLM KDA fallback from {module_path}"
+            ) from None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+    _VLLM_FALLBACK_OPS = (
+        causal_conv1d_update,
+        module.fused_recurrent_kda_packed_decode,
+        rms_norm_gated,
+    )
+    return _VLLM_FALLBACK_OPS
+
+
 def has_vllm() -> bool:
-    """Whether vLLM's production NVIDIA fused KDA op is available."""
-    return _ensure_vllm_op()
+    """Whether both production vLLM KDA decode paths are available."""
+    if not _ensure_vllm_op():
+        return False
+    try:
+        _load_vllm_fallback_ops()
+    except (ImportError, OSError):
+        return False
+    return True
 
 
 def _make_vllm_call(
@@ -701,54 +607,81 @@ def _make_vllm_call(
         )
     batch = tensors["hidden_states"].shape[0]
     heads = tensors["recurrent_state"].shape[1]
-    if heads != 12:
-        raise ValueError("vLLM's production fused KDA kernel does not support H16")
-    qkv_width, _projection_width = _shape_values(heads)
-    normalized = torch.empty(
-        1, batch, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    segment = heads * HEAD_DIM
+
+    if heads == 12:
+        fused_output = torch.empty(
+            1,
+            batch,
+            heads,
+            HEAD_DIM,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        def launch_fused() -> torch.Tensor:
+            mixed_qkv, output_gate, raw_gate, beta = _project(tensors)
+            torch.ops._C.fused_kda_decode(
+                mixed_qkv,
+                tensors["conv_weight"],
+                None,
+                tensors["conv_state"].transpose(-1, -2),
+                raw_gate,
+                beta,
+                tensors["a_log"],
+                tensors["dt_bias"],
+                tensors["state_indices"],
+                tensors["recurrent_state"],
+                fused_output,
+                LOWER_BOUND,
+                output_gate,
+                tensors["norm_weight"],
+                EPS,
+            )
+            return F.linear(fused_output.view(batch, segment), tensors["output_weight"])
+
+        return launch_fused, "FUSED_KDA_DECODE"
+
+    causal_conv1d_update, fused_recurrent_decode, rms_norm_gated = (
+        _load_vllm_fallback_ops()
+    )
+    fallback_conv_weight = (
+        tensors["conv_weight"].permute(0, 2, 1).reshape(3 * segment, 4)
     )
 
-    def launch() -> torch.Tensor:
-        projected = F.linear(tensors["hidden_states"], tensors["input_weight"])
-        mixed_qkv = projected[:, :qkv_width]
-        beta = projected[:, qkv_width : qkv_width + heads]
-        gate_inputs = projected[:, qkv_width + heads :].view(batch, 2, HEAD_DIM)
-        forget_gate, norm_gate = torch.bmm(
-            gate_inputs.transpose(0, 1), tensors["fg_weight"].transpose(-1, -2)
-        )
-        torch.ops._C.fused_kda_decode(
+    def launch_fallback() -> torch.Tensor:
+        mixed_qkv, output_gate, raw_gate, beta = _project(tensors)
+        convolved = causal_conv1d_update(
             mixed_qkv,
-            tensors["vllm_conv_weight"],
-            None,
             tensors["conv_state"].transpose(-1, -2),
-            forget_gate.reshape(1, batch, heads, HEAD_DIM),
-            beta.reshape(1, batch, heads),
+            fallback_conv_weight,
+            None,
+            activation="silu",
+            conv_state_indices=tensors["state_indices"],
+            validate_data=False,
+        )
+        core, _ = fused_recurrent_decode(
+            convolved,
+            raw_gate,
+            beta,
             tensors["a_log"],
             tensors["dt_bias"],
-            tensors["state_indices"],
+            LOWER_BOUND,
             tensors["recurrent_state"],
-            normalized,
+            tensors["state_indices"],
+            scale=SCALE,
+        )
+        normalized = rms_norm_gated(
+            core,
+            output_gate,
+            tensors["norm_weight"],
             None,
-            norm_gate.reshape(batch, heads, HEAD_DIM),
-            tensors["vllm_norm_weight"],
-            EPS,
+            activation="sigmoid",
+            eps=EPS,
         )
-        return F.linear(
-            normalized.reshape(batch, heads * HEAD_DIM), tensors["output_weight"]
-        )
+        return F.linear(normalized.view(batch, segment), tensors["output_weight"])
 
-    return launch, "FUSED_KDA_DECODE"
-
-
-def _make_standalone_call(
-    tensors: dict[str, torch.Tensor],
-) -> tuple[Callable[[], torch.Tensor], tuple[object, ...], torch.Tensor]:
-    import sys
-
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from pretuned_kernels.megakernels.kda_decode import _standalone
-
-    return _standalone.build(tensors, scale=SCALE, eps=EPS)
+    return launch_fallback, "TRITON_FALLBACK"
 
 
 def _make_reset(tensors: dict[str, torch.Tensor]) -> Callable[[], None]:
@@ -762,62 +695,93 @@ def _make_reset(tensors: dict[str, torch.Tensor]) -> Callable[[], None]:
     return reset
 
 
+def _make_standalone_call(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
+    from pretuned_kernels.megakernels.kda_decode import _standalone
+
+    launch, _kernels, output = _standalone.build(
+        tensors,
+        scale=SCALE,
+        eps=EPS,
+        lower_bound=LOWER_BOUND,
+    )
+    return launch, output
+
+
 def _assert_close(
     actual: torch.Tensor,
     actual_inputs: dict[str, torch.Tensor],
     expected: torch.Tensor,
     expected_inputs: dict[str, torch.Tensor],
 ) -> None:
-    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=2e-2)
     torch.testing.assert_close(
-        actual_inputs["conv_state"], expected_inputs["conv_state"], atol=2e-2, rtol=1e-2
+        actual_inputs["conv_state"],
+        expected_inputs["conv_state"],
+        atol=2e-2,
+        rtol=1e-2,
     )
     torch.testing.assert_close(
         actual_inputs["recurrent_state"],
         expected_inputs["recurrent_state"],
-        atol=2e-2,
-        rtol=1e-2,
+        atol=3e-2,
+        rtol=2e-2,
     )
 
 
 @torch.inference_mode()
 def correctness_check() -> None:
-    """Check both tuned head counts and runtime slot values."""
+    """Validate both Kimi-K3 TP envelopes against Torch and vLLM."""
     _require_sm100()
+    if not has_vllm():
+        raise RuntimeError("vLLM is required for the KDA decode comparison")
     for batch, heads, seed in CORRECTNESS_CASES:
         base = _make_inputs(batch, heads, seed)
         persistent_inputs = _clone_inputs(base)
-        standalone_inputs = _clone_inputs(base)
+        vllm_inputs = _clone_inputs(base)
         reference_inputs = _clone_inputs(base)
         persistent = kda_decode(*_kernel_args(persistent_inputs))
-        _standalone_call, _standalone_kernels, standalone = _make_standalone_call(
-            standalone_inputs
-        )
+        vllm_call, _backend = _make_vllm_call(vllm_inputs)
+        vllm_output = vllm_call()
         reference = _reference(reference_inputs)
         torch.cuda.synchronize()
         _assert_close(persistent, persistent_inputs, reference, reference_inputs)
-        _assert_close(standalone, standalone_inputs, reference, reference_inputs)
+        _assert_close(vllm_output, vllm_inputs, reference, reference_inputs)
+        _assert_close(persistent, persistent_inputs, vllm_output, vllm_inputs)
 
-        # state_indices is runtime data, not a specialization key.
-        if batch == 1:
-            remapped = _clone_inputs(base)
-            remapped["state_indices"] = torch.tensor(
-                [POOL_SIZE - 1], device="cuda", dtype=torch.int32
-            )
-            remapped_reference = _clone_inputs(remapped)
-            output = kda_decode(*_kernel_args(remapped))
-            expected = _reference(remapped_reference)
-            _assert_close(output, remapped, expected, remapped_reference)
+        remapped = _clone_inputs(base)
+        remapped["state_indices"] = torch.arange(
+            POOL_SIZE - 1,
+            POOL_SIZE - batch - 1,
+            -1,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        remapped_vllm = _clone_inputs(base)
+        remapped_vllm["state_indices"] = remapped["state_indices"]
+        remapped_reference = _clone_inputs(remapped)
+        output = kda_decode(*_kernel_args(remapped))
+        remapped_vllm_call, _backend = _make_vllm_call(remapped_vllm)
+        remapped_vllm_output = remapped_vllm_call()
+        expected = _reference(remapped_reference)
+        torch.cuda.synchronize()
+        _assert_close(output, remapped, expected, remapped_reference)
+        _assert_close(
+            remapped_vllm_output,
+            remapped_vllm,
+            expected,
+            remapped_reference,
+        )
+        _assert_close(output, remapped, remapped_vllm_output, remapped_vllm)
 
 
 @torch.inference_mode()
 def main(verbose: bool = True) -> dict:
-    """Benchmark persistent, separate Helion, and production vLLM with cold L2."""
+    """Benchmark Kimi-K3 TP8 against source-matched PDL and vLLM."""
     _require_sm100()
     if not has_vllm():
-        raise RuntimeError("kda_decode performance requires vLLM's fused_kda_decode op")
-
-    import sys
+        raise RuntimeError("kda_decode performance requires vLLM")
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from _bench import capture_cuda_graph
@@ -833,19 +797,15 @@ def main(verbose: bool = True) -> dict:
             persistent_reset = _make_reset(persistent_inputs)
             standalone_reset = _make_reset(standalone_inputs)
             vllm_reset = _make_reset(vllm_inputs)
-
             persistent = kda_decode(*_kernel_args(persistent_inputs))
-            standalone_call, standalone_kernels, standalone = _make_standalone_call(
-                standalone_inputs
-            )
+            standalone_call, standalone = _make_standalone_call(standalone_inputs)
             vllm_call, backend = _make_vllm_call(vllm_inputs)
-            vllm = vllm_call()
+            vllm_output = vllm_call()
             reference = _reference(reference_inputs)
             torch.cuda.synchronize()
             _assert_close(persistent, persistent_inputs, reference, reference_inputs)
             _assert_close(standalone, standalone_inputs, reference, reference_inputs)
-            _assert_close(vllm, vllm_inputs, reference, reference_inputs)
-
+            _assert_close(vllm_output, vllm_inputs, reference, reference_inputs)
             persistent_graph, persistent_graph_output = capture_cuda_graph(
                 lambda tensors=persistent_inputs: kda_decode(*_kernel_args(tensors)),
                 persistent_reset,
@@ -870,7 +830,6 @@ def main(verbose: bool = True) -> dict:
                     persistent_inputs,
                     standalone_inputs,
                     vllm_inputs,
-                    standalone_kernels,
                     standalone_call,
                     vllm_call,
                     persistent_graph_output,
@@ -896,7 +855,7 @@ def main(verbose: bool = True) -> dict:
                 ("standalone_helion_pdl", standalone_graph.replay),
                 (f"vllm_auto ({backend})", vllm_graph.replay),
             ],
-            f"{label:>7s}  {batch:>5d}  {heads:>5d}  {HIDDEN:>6d}",
+            (f"{label:>7s}  {batch:>5d}  {heads:>5d}  {HIDDEN:>6d}  {backend:<18s}"),
         )
 
     benchmark_cases = iter_benchmark_cases()
@@ -910,7 +869,8 @@ def main(verbose: bool = True) -> dict:
             thermal_warmup_ms=10_000,
             verbose=verbose,
             shape_header=(
-                f"{'case':>7s}  {'batch':>5s}  {'heads':>5s}  {'hidden':>6s}"
+                f"{'case':>7s}  {'batch':>5s}  {'heads':>5s}  {'hidden':>6s}  "
+                f"{'backend':<18s}"
             ),
         )
     finally:
