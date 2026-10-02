@@ -3654,9 +3654,11 @@ def emit_cross_loop_schedule(
             task_body.extend(root_barrier_publication(root, synced=bool(publications)))
             task_body.extend(publications)
             # Producers a full wave of tickets earlier are usually done when this
-            # root is admitted, so a dry pass would only delay it.
+            # root is admitted, so a dry pass would only delay it. A continuation
+            # producer has no packet of its own and gives no such bound.
             ready_on_admission = all(
-                producer not in hoisted_roots
+                producer in packet_ends
+                and producer not in hoisted_roots
                 and packet_begin - packet_ends[producer] >= configured_worker_count
                 for producer in dependency_producers(root)
             )
