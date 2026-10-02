@@ -7,8 +7,8 @@ from copy import deepcopy
 import torch
 
 
-# Tuned on GB200 with cold L2 against production vLLM and the matched
-# six-launch PDL pipeline.
+# Tuned on GB200 with cold L2 against production vLLM. The benchmark also
+# reports the source-matched nine-launch PDL ablation.
 _SMALL_CONFIG: dict[str, object] = {
     "block_sizes": [
         2, 8, 2, 32, 1, 1, 32, 128, 1, 32, 8, 2, 8, 512, 128, 128, 128

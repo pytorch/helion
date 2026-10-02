@@ -10,9 +10,9 @@ envelopes B1/B2/B4/B8/B16 x H12/H16 at hidden size 2304 and head dimension 128.
 Decode sequence length is not part of the signature or specialization key, so
 each physical envelope is reused across every generation step.
 
-The benchmark compares against a production-boundary-matched standalone Helion
-PDL pipeline and, for H12, vLLM's production fused conv1d + KDA + gated-RMSNorm
-CUDA kernel surrounded by the same projections.
+The benchmark compares against a source-matched nine-launch Helion PDL pipeline
+and, for H12, vLLM's production fused conv1d + KDA + gated-RMSNorm CUDA kernel
+surrounded by the same projections.
 """
 
 from __future__ import annotations

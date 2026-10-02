@@ -194,6 +194,9 @@ def test_qwen3_decode_layer_has_explicit_runtime_metadata_contract() -> None:
 def test_kda_decode_uses_existing_tuning_surface() -> None:
     module = _import_pretuned_kernel_module("kda_decode")
     heuristic = _import_pretuned_heuristic("kda_decode")
+    standalone = importlib.import_module(
+        "pretuned_kernels.megakernels.kda_decode._standalone"
+    )
 
     runner_path = PRETUNED_KERNELS_DIR / "run.py"
     runner_spec = importlib.util.spec_from_file_location(
@@ -288,6 +291,33 @@ def test_kda_decode_uses_existing_tuning_surface() -> None:
         assert config["cross_loop_pipeline"] == "dynamic"
         assert config["num_sm_multiplier"] == 1
         assert config["num_warps"] == 1
+
+    expected_roots = (
+        "gate_input",
+        "qkv",
+        "beta",
+        "decay",
+        "conv",
+        "norm_gate",
+        "recurrence",
+        "rms",
+        "output",
+    )
+    assert tuple(standalone._BLOCK_INDICES) == expected_roots
+    for batch in module.SUPPORTED_BATCHES:
+        for heads in module.SUPPORTED_HEADS:
+            megakernel_blocks = heuristic.CONFIGS[batch, heads]["block_sizes"]
+            for root in expected_roots:
+                standalone_config = standalone._root_config(batch, heads, root)
+                megakernel_root_blocks = [
+                    megakernel_blocks[index]
+                    for index in standalone._BLOCK_INDICES[root]
+                ]
+                expected_blocks = standalone._ROOT_BLOCK_OVERRIDES[batch].get(
+                    root, megakernel_root_blocks
+                )
+                assert standalone_config["block_sizes"] == expected_blocks
+                assert standalone_config["pid_type"] == "flat"
 
     meta_device = torch.device("meta")
     for expected, (signatures, static_args, _batch, _heads) in enumerate(
@@ -779,7 +809,9 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
 # vLLM. Keep the historical production-vLLM gate above, while independently
 # guarding against large regressions from each matched boundary.
 _MATCHED_STANDALONE_GEOMEAN_FLOOR = {
-    "kda_decode": 1.05,
+    # Source-matched, independently tuned PDL measured at 1.248x on GB200; retain a
+    # conservative but real megakernel advantage after timing noise.
+    "kda_decode": 1.15,
     "qwen3_decode_layer": 0.80,
     "gemma4_a4b_moe": 0.80,
     "gpt_oss_moe": 0.80,
