@@ -4728,6 +4728,23 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_attention_emit_pipeline_correctness_head_dim_64(self) -> None:
+        """Pre-broadcast state can feed consumers narrower than 128 lanes."""
+        query = torch.randn(2, 2, 128, 64, dtype=torch.bfloat16, device=DEVICE)
+        key = torch.randn(2, 2, 128, 64, dtype=torch.bfloat16, device=DEVICE)
+        value = torch.randn(2, 2, 128, 64, dtype=torch.bfloat16, device=DEVICE)
+        _, result = code_and_output(
+            pallas_attention,
+            (query, key, value),
+            block_sizes=[4, 128, 128],
+            pallas_loop_type="emit_pipeline",
+            pallas_pre_broadcast=True,
+        )
+        ref = torch.nn.functional.scaled_dot_product_attention(
+            query.float().cpu(), key.float().cpu(), value.float().cpu()
+        ).to(dtype=query.dtype, device=DEVICE)
+        torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
+
     def test_attention_grouped_emit_pipeline_correctness(self) -> None:
         """One DMA stage may contain several consecutive compute tiles."""
         query = torch.randn(1, 1, 128, 128, dtype=torch.float32, device=DEVICE)
@@ -6225,12 +6242,8 @@ class TestPallas(TestCase):
         ref = _cumsum_broadcast_ref(a, b, block_k=128)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
-    def test_pre_broadcast_skipped_non_multiple_of_128(self) -> None:
-        """Pre-broadcast is skipped when broadcast dim is not a multiple of 128.
-
-        Uses head_dim=64 so the broadcast target has last dim 64.
-        Since 64 % 128 != 0, the transform is skipped.
-        """
+    def test_pre_broadcast_narrow_consumer_correctness(self) -> None:
+        """Pre-broadcast state can feed a 64-wide consumer correctly."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def cumsum_broadcast_d64(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -6249,19 +6262,12 @@ class TestPallas(TestCase):
 
         a = torch.randn(2, 128, 256, device=DEVICE, dtype=torch.float32)
         b = torch.randn(2, 256, 64, device=DEVICE, dtype=torch.float32)
-        code, result = code_and_output(
+        _, result = code_and_output(
             cumsum_broadcast_d64,
             (a, b),
             block_sizes=[2, 128, 128],
             pallas_loop_type="emit_pipeline",
             pallas_pre_broadcast=True,
-        )
-        self.assertNotIn("jnp.tile(", code)
-        self.assertIn(
-            "_scratch_shapes=["
-            "((2, 128), 'jnp.float32', 'vmem'), "
-            "((2, 128, 64), 'jnp.float32', 'vmem')]",
-            code,
         )
         ref = _cumsum_broadcast_ref(a, b, block_k=128)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
