@@ -88,6 +88,7 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
 @pytest.mark.parametrize(
     "name",
     (
+        "kda_decode",
         "qwen3_decode_layer",
         "gemma4_a4b_moe",
         "gpt_oss_moe",
@@ -188,6 +189,108 @@ def test_qwen3_decode_layer_has_explicit_runtime_metadata_contract() -> None:
     assert len(module.CONTEXT_LENGTHS) == 3
     assert all(length & (length - 1) for length in module.CONTEXT_LENGTHS)
     assert max(module.CONTEXT_LENGTHS) <= module.CONTEXT
+
+
+def test_kda_decode_uses_existing_tuning_surface() -> None:
+    module = _import_pretuned_kernel_module("kda_decode")
+    heuristic = _import_pretuned_heuristic("kda_decode")
+
+    runner_path = PRETUNED_KERNELS_DIR / "run.py"
+    runner_spec = importlib.util.spec_from_file_location(
+        "_kda_pretuned_runner", runner_path
+    )
+    assert runner_spec is not None and runner_spec.loader is not None
+    runner = importlib.util.module_from_spec(runner_spec)
+    runner_spec.loader.exec_module(runner)
+    assert "kda_decode" in runner.KERNELS
+    assert runner._supported_hardware("kda_decode") == {"b200"}
+
+    kernel = module.kda_decode
+    assert not kernel.settings.static_shapes
+    assert not kernel.settings.triton_do_not_specialize
+    assert kernel.settings.persistent_reserved_sms == 88
+    assert heuristic.CONFIGS[1, 12]["block_sizes"] == [
+        8,
+        32,
+        32,
+        128,
+        32,
+        8,
+        8,
+        512,
+        128,
+        128,
+        128,
+    ]
+    assert heuristic.CONFIGS[2, 12]["block_sizes"] == [
+        8,
+        32,
+        32,
+        128,
+        32,
+        8,
+        64,
+        512,
+        128,
+        128,
+        64,
+    ]
+    assert heuristic.CONFIGS[1, 16]["block_sizes"] == [
+        8,
+        32,
+        32,
+        128,
+        32,
+        8,
+        8,
+        512,
+        128,
+        128,
+        128,
+    ]
+    assert heuristic.CONFIGS[2, 16]["block_sizes"] == [
+        8,
+        32,
+        32,
+        128,
+        32,
+        8,
+        32,
+        512,
+        128,
+        128,
+        64,
+    ]
+    assert heuristic.CONFIGS[1, 16] is not heuristic.CONFIGS[1, 12]
+    assert heuristic.CONFIGS[2, 16] is not heuristic.CONFIGS[2, 12]
+    assert heuristic.CONFIGS[1, 12]["maxnreg"] == 96
+    assert heuristic.CONFIGS[2, 12]["maxnreg"] == 240
+    assert heuristic.CONFIGS[1, 16]["maxnreg"] == 96
+    assert heuristic.CONFIGS[2, 16]["maxnreg"] == 240
+    for config in heuristic.CONFIGS.values():
+        assert config["cross_loop_pipeline"] == "dynamic"
+        assert config["num_sm_multiplier"] == 1
+        assert config["num_warps"] == 1
+
+    meta_device = torch.device("meta")
+    for expected, (signatures, static_args, _batch, _heads) in enumerate(
+        heuristic._SUPPORTED
+    ):
+        args = [
+            torch.empty(shape, dtype=dtype, device=meta_device)
+            for shape, dtype in signatures
+        ] + list(static_args)
+        assert heuristic.key_kda_decode(*args) == expected
+
+    source = inspect.getsource(kernel.fn)
+    assert "hl.specialize(state_indices[" not in source
+    assert "semantic_dependency" not in source
+    assert {(batch, heads) for batch, heads, _seed in module.CORRECTNESS_CASES} == {
+        (1, 12),
+        (2, 12),
+        (1, 16),
+        (2, 16),
+    }
 
 
 def test_gemma4_a4b_moe_has_explicit_runtime_routing_contract() -> None:
@@ -628,6 +731,9 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
     # cross parity avoids a flaky binary pass/fail; the aggregate geomean is the
     # regression signal.  Combined with the 10% band below, 1.0 expresses a
     # 0.90x production-vLLM floor for every model-region benchmark.
+    "kda_decode": {
+        "sm100": ExpectedPerf(helion_wins=2, total=2, geomean=1.00, wins_slack=2),
+    },
     "qwen3_decode_layer": {
         "sm100": ExpectedPerf(helion_wins=3, total=3, geomean=1.00, wins_slack=3),
     },
@@ -649,6 +755,7 @@ _EXPECTED_PERF: dict[str, dict[str, ExpectedPerf]] = {
 # vLLM. Keep the historical production-vLLM gate above, while independently
 # guarding against large regressions from each matched boundary.
 _MATCHED_STANDALONE_GEOMEAN_FLOOR = {
+    "kda_decode": 0.80,
     "qwen3_decode_layer": 0.80,
     "gemma4_a4b_moe": 0.80,
     "gpt_oss_moe": 0.80,
@@ -769,6 +876,13 @@ class TestPretunedKernelsCorrectness(TestCase):
 
     def test_fused_qk_norm_rope(self):
         self._run_vllm_ported_correctness("fused_qk_norm_rope", needs_fp8=False)
+
+    @pytest.mark.timeout(300)
+    def test_kda_decode(self):
+        if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
+            self.skipTest("kda_decode is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("kda_decode")
+        module.correctness_check()
 
     @pytest.mark.timeout(300)
     def test_qwen3_decode_layer(self):
@@ -1319,6 +1433,13 @@ class TestPretunedKernelsPerformance(TestCase):
     @pytest.mark.timeout(600)
     def test_fused_qk_norm_rope(self):
         self._run_pretuned_kernel_perf("fused_qk_norm_rope")
+
+    @pytest.mark.timeout(600)
+    def test_kda_decode(self):
+        module = _import_pretuned_kernel_module("kda_decode")
+        if not module.has_vllm():
+            self.skipTest("kda_decode performance requires vLLM.")
+        self._run_pretuned_kernel_perf("kda_decode")
 
     @pytest.mark.timeout(600)
     def test_qwen3_decode_layer(self):
