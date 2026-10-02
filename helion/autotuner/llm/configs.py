@@ -144,6 +144,7 @@ def describe_fragment(frag: ConfigSpecFragment) -> str:
     from ..config_fragment import BooleanFragment
     from ..config_fragment import EnumFragment
     from ..config_fragment import IntegerFragment
+    from ..config_fragment import NumThreadsFragment
     from ..config_fragment import PermutationFragment
     from ..config_fragment import PowerOfTwoFragment
 
@@ -154,6 +155,8 @@ def describe_fragment(frag: ConfigSpecFragment) -> str:
     if isinstance(frag, EnumFragment):
         choices_str = ", ".join(repr(choice) for choice in frag.choices)
         return f"enum({choices_str})"
+    if isinstance(frag, NumThreadsFragment):
+        return f"integer(0=auto, or power_of_2(min=1, max={frag.high}), default=0)"
     if isinstance(frag, BooleanFragment):
         return "boolean(default=False)"
     if isinstance(frag, PermutationFragment):
