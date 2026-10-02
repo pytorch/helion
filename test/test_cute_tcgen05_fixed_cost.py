@@ -818,6 +818,69 @@ def test_explicit_n_axis_other_than_the_resolved_width_takes_the_generic_simt_pa
 
 
 # --------------------------------------------------------------------------
+# An epilogue callable may read a module-level global (lifted globals are
+# faked once per host function, like closure cells)
+# --------------------------------------------------------------------------
+
+# A CPU tensor at import time: the pins below only render.
+GLOBAL_BIAS = torch.empty((512,), dtype=torch.float16)
+
+
+def _gemm_with_epilogue(
+    a: torch.Tensor, b: torch.Tensor, epilogue: Callable[..., torch.Tensor]
+) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = epilogue(acc, (tile_m, tile_n)).to(out.dtype)
+    return out
+
+
+def _closure_bias_epilogue(bias: torch.Tensor) -> Callable[..., torch.Tensor]:
+    return lambda acc, tile: acc + bias[tile[1]]
+
+
+def _bind_epilogue_gemm(epilogue: Callable[..., torch.Tensor]) -> BoundKernel:
+    args = (
+        torch.empty((512, 256), dtype=torch.float16, device=CPU_DEVICE),
+        torch.empty((256, 512), dtype=torch.float16, device=CPU_DEVICE),
+        epilogue,
+    )
+    return helion.kernel(_gemm_with_epilogue, backend="cute", static_shapes=True).bind(
+        args
+    )
+
+
+def test_epilogue_lambda_reading_a_module_global_renders_like_a_closure() -> None:
+    # A static-shapes kernel fakes a global tensor through
+    # ``torch.empty_strided``; read again while the device body was traced,
+    # that allocation was recorded as a device ``empty_strided`` node with no
+    # host origin and codegen failed with a KeyError in the aux-store splice.
+    # The global is now faked once per host function and arrives as a
+    # ``_global_source`` argument, like a closure cell.
+    config = _plain_config(pid_type="persistent_interleaved")
+    source = _source(
+        _bind_epilogue_gemm(lambda acc, tile: acc + GLOBAL_BIAS[tile[1]]), config
+    )
+    kernel = _kernel_body(source)
+    # The kernel's own module is imported as ``_source_module``.
+    assert "_source_module.GLOBAL_BIAS" in source
+    assert "empty_strided" not in kernel
+    assert "cute.copy(tcgen05_tma_store_atom" in kernel
+    assert "cute.nvgpu.CopyR2GOp()" not in kernel
+    closure = _kernel_body(
+        _source(_bind_epilogue_gemm(_closure_bias_epilogue(GLOBAL_BIAS)), config)
+    )
+    # Same kernel up to the bias argument's name.
+    assert kernel.count("\n") == closure.count("\n")
+    assert "cute.copy(tcgen05_tma_store_atom" in closure
+
+
+# --------------------------------------------------------------------------
 # Search hygiene: direct store x split epilogue layout (review F4)
 # --------------------------------------------------------------------------
 

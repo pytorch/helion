@@ -28,8 +28,10 @@ from test.test_cute_tcgen05_fixed_chain_gpu import _config
 from test.test_cute_tcgen05_fixed_chain_gpu import _gemm
 from test.test_cute_tcgen05_fixed_cost import FRESH_FACTORY_GEMMS
 from test.test_cute_tcgen05_fixed_cost import TMA_STORE_ILLEGAL_OUTPUTS
+from test.test_cute_tcgen05_fixed_cost import _closure_bias_epilogue
 from test.test_cute_tcgen05_fixed_cost import _gemm_empty_strided_column_major
 from test.test_cute_tcgen05_fixed_cost import _gemm_into
+from test.test_cute_tcgen05_fixed_cost import _gemm_with_epilogue
 from test.test_cute_tcgen05_fixed_cost import _output_view
 from test.test_cute_tcgen05_fixed_cost import _row_bias_gemm
 
@@ -549,3 +551,33 @@ def test_fresh_column_major_strided_output_is_stored_exactly() -> None:
     for out in outputs:
         assert out.stride() == (1, 512)
         assert torch.equal(out.contiguous(), reference[0])
+
+
+# Assigned by the test (a CUDA tensor cannot be created at import time); the
+# epilogue lambda below reads it as a module-level global.
+GPU_GLOBAL_BIAS: torch.Tensor | None = None
+
+
+def test_epilogue_lambda_reading_a_module_global_matches_the_closure_form() -> None:
+    global GPU_GLOBAL_BIAS
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    GPU_GLOBAL_BIAS = torch.randn(512, device=DEVICE, dtype=torch.float16)
+    config = _config(pid_type="persistent_interleaved")
+    closure, closure_source = _outputs(
+        _gemm_with_epilogue, (a, b, _closure_bias_epilogue(GPU_GLOBAL_BIAS)), config
+    )
+    outputs, source = _outputs(
+        _gemm_with_epilogue,
+        (a, b, lambda acc, tile: acc + GPU_GLOBAL_BIAS[tile[1]]),
+        config,
+    )
+    assert "cute.copy(tcgen05_tma_store_atom" in source
+    assert "cute.copy(tcgen05_tma_store_atom" in closure_source
+    # The global lives in this module, which the kernel's module imports.
+    assert "_global_source0.GPU_GLOBAL_BIAS" in source
+    for out in outputs:
+        assert torch.equal(out, closure[0])
+    expected = a.float() @ b.float() + GPU_GLOBAL_BIAS.float()
+    torch.testing.assert_close(outputs[0].float(), expected, rtol=2e-2, atol=2e-2)
