@@ -920,7 +920,7 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         x2 = torch.zeros(M, N, device=DEVICE, dtype=torch.float32)
         y2 = torch.ones(M, N, device=DEVICE, dtype=torch.float32)
         with patch(
-            "helion._compiler.device_function.target_device_capability",
+            "helion._compiler.compile_environment.target_device_capability",
             return_value=(8, 0),
         ):
             code2, result2 = code_and_output(atomic_add_td_release_kernel, (x2, y2))
