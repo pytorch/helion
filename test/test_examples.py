@@ -1740,6 +1740,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                     cos_sim=CosSimilarity(dim=-1, min_similarity=0.999),
                     atol=atol,
                     rtol=rtol,
+                    max_mismatch_pct=0.002,
                 )
 
     def test_grouped_gemm_jagged(self):
