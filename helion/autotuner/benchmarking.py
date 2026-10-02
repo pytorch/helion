@@ -298,10 +298,12 @@ def interleaved_bench(
     if max_total_ms is not None:
         repeat = min(repeat, _interleaved_repeat_cap(fns, clear_cache, max_total_ms))
     # Large finalist passes can create hundreds of thousands of live HIP events
-    # and crash in hipEventCreateWithFlags. Reuse a bounded set after collecting
-    # each batch's timings, preserving the full sample count and interleaving.
+    # and crash in hipEventCreateWithFlags. On XPU, queueing tens of thousands
+    # of timed events without a sync fails with UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY.
+    # Reuse a bounded set after collecting each batch's timings, preserving the
+    # full sample count and interleaving.
     batch_size = repeat
-    if torch.version.hip is not None:
+    if torch.version.hip is not None or torch.version.xpu is not None:
         batch_size = min(
             repeat, max(1, _ROCM_INTERLEAVED_EVENT_PAIRS // max(1, len(fns)))
         )
