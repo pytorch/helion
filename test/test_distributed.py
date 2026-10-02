@@ -35,6 +35,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
@@ -510,6 +511,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
 
         torch.testing.assert_close(result, expected, rtol=1e-1, atol=1e-1)
 
+    @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize("variant", ("inband", "R1"))
@@ -548,6 +550,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             torch.testing.assert_close(out, torch.full_like(out, expected))
         self._cleanup_process()
 
+    @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize("moment_dtype", (torch.float32, torch.float64))
@@ -581,6 +584,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             torch.testing.assert_close(out, torch.full_like(out, expected))
         self._cleanup_process()
 
+    @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_ranks_disagree_at_first_launch(self) -> None:
@@ -1118,6 +1122,8 @@ class TestDistributedGating(CommonTestCase):
             pass
 
 
+@onlyBackends(["triton"])
+@skipIfNotCUDA()
 @instantiate_parametrized_tests
 class TestDistributedTileDependencies(TestCase):
     """Single-process compile checks of cross-rank tile dependencies."""
