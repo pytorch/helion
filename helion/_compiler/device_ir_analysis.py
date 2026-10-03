@@ -12,6 +12,7 @@ from typing import cast
 import sympy
 import torch
 
+from .. import exc
 from .. import language as hl
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import AccumulatorFact
@@ -30,6 +31,7 @@ from ..autotuner.config_spec import ResolvedMatmulFact
 from ..autotuner.config_spec import RootGridFact
 from ..autotuner.config_spec import SymbolicLoopBound
 from ..language import _tracing_ops
+from ..language._decorators import is_api_func
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
@@ -37,8 +39,11 @@ from .compile_environment import _symint_sympy_expr
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
+from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
+from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
+from .variable_origin import TileIdOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,6 +54,7 @@ if TYPE_CHECKING:
     from .compile_environment import CompileEnvironment
     from .device_ir import DeviceIR
     from .device_ir import GraphInfo
+    from .host_function import CompilerState
     from .host_function import HostFunction
     from .tile_dependency import AffineSubscriptRange
     from .tile_dependency import IntegerExpression
@@ -200,6 +206,36 @@ def _load_needs_eviction_tunable(node: torch.fx.Node) -> bool:
     return eviction_policy_arg is None
 
 
+# Ops that touch no memory: they route tensors through SSA values and subgraphs,
+# read metadata or only debug.
+_TENSOR_ROUTING_OPS = (
+    _tracing_ops._phi,
+    _tracing_ops._new_var,
+    _tracing_ops._for_loop,
+    _tracing_ops._for_loop_step,
+    _tracing_ops._while_loop,
+    _tracing_ops._if,
+    operator.getitem,
+    torch.ops.aten.sym_size.int,
+    torch.ops.aten.sym_stride.int,
+    hl.device_print,
+    hl.breakpoint,
+)
+
+
+def _may_access_memory_unseen(node: torch.fx.Node, state: CompilerState) -> bool:
+    """Whether a side-effecting Helion op or an op on symmetric memory hides accesses."""
+    if node.target in _TENSOR_ROUTING_OPS:
+        return False
+    # Peer views, and the local copies other ranks reach through theirs.
+    symmetric = {*state.peer_views, *(v[0] for v in state.peer_views.values() if v)}
+    return (is_api_func(node.target) and node.is_impure(impure_random=False)) or any(
+        not symmetric.isdisjoint(state.ssa_storages(value))
+        for arg in node.all_input_nodes
+        if isinstance(value := arg.meta.get("val"), torch.Tensor)
+    )
+
+
 def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
     """Fake tensor of the buffer a load/store accesses."""
     arg = node.args[0] if node.args else None
@@ -216,79 +252,122 @@ def _subscript_block_id(env: CompileEnvironment, subscript: object) -> int | Non
     return info.block_id if info is not None else None
 
 
-def _subscript_is_scalar_tile_index(subscript: object) -> bool:
-    """Return whether an affine subscript is derived from ``tile.id``."""
-    if isinstance(subscript, int):
-        return True
-    if not isinstance(subscript, torch.fx.Node) or isinstance(
-        subscript.meta.get("val"), torch.Tensor
-    ):
-        return False
-    node = subscript
-    seen: set[torch.fx.Node] = set()
-    while node not in seen:
-        seen.add(node)
-        if node.target is hl.tile_id:
-            return True
-        node_args = [arg for arg in node.args if isinstance(arg, torch.fx.Node)]
-        if len(node_args) != 1:
-            return False
-        node = node_args[0]
-    return False
+# A cast preserves an index only into a 32/64-bit integer.
+_INDEX_CASTS = (
+    torch.ops.prims.convert_element_type.default,
+    torch.ops.aten._to_copy.default,
+)
+_INDEX_DTYPES = (torch.int32, torch.int64)
 
 
-def _subscript_static_offset(
+def _scalar_subscript_affine(
     env: CompileEnvironment,
+    host: HostFunction,
+    value: int | torch.SymInt,
+) -> tuple[int | None, int, int | None, bool]:
+    """Classify a scalar subscript from its symbolic value, not its FX chain."""
+    expression = (
+        env.shape_env.simplify(_symint_sympy_expr(value))
+        if isinstance(value, torch.SymInt)
+        else sympy.Integer(value)
+    )
+    free_symbols = expression.free_symbols
+    if len(free_symbols) == 1:
+        (symbol,) = free_symbols
+        origin_info = host.expr_to_origin.get(symbol)
+        origin = origin_info.origin if origin_info is not None else None
+        offset = env.shape_env.simplify(expression - symbol)
+        # tile.id + c and a unit-step index + c (grid, tile.begin) are points. One
+        # point per block of size > 1 is not representable: whole dimension.
+        if isinstance(origin, GridOrigin):
+            source = env.block_sizes[origin.block_id].block_size_source
+            if offset.is_Integer and (
+                type(origin) is TileIdOrigin
+                or (
+                    type(origin) in (GridOrigin, TileBeginOrigin)
+                    and isinstance(source, FixedBlockSizeSource)
+                    and env.known_equal(source.value, 1)
+                )
+            ):
+                return origin.block_id, 1, int(offset), type(origin) is TileIdOrigin
+            return None, 1, None, True
+    # A block-size symbol is the tile slice itself.
+    block_id = env.get_block_id(value)
+    if block_id is not None:
+        return block_id, 1, 0, False
+    if expression.is_Integer:
+        return None, 1, int(expression), True
+    return None, 1, None, True
+
+
+def _subscript_affine(
+    env: CompileEnvironment,
+    host: HostFunction,
     subscript: object,
-) -> int | None:
-    """Recover a constant offset through affine and shape-only FX nodes."""
-    if isinstance(subscript, int):
-        return subscript
+) -> tuple[int | None, int, int | None, bool]:
+    """Return ``(block_id, scale, offset, is_scalar)`` for one subscript.
+
+    Tensor chains step only through integer add/mul and value-preserving nodes;
+    anything else is unknown (no block, offset ``None``), i.e. the whole dimension.
+    """
+    if type(subscript) is int:
+        return None, 1, subscript, True
     if not isinstance(subscript, torch.fx.Node):
-        return None
-    node = subscript
+        return None, 1, None, False
+    value = subscript.meta.get("val")
+    if isinstance(value, (int, torch.SymInt)):
+        return _scalar_subscript_affine(env, host, value)
     scale = 1
     offset = 0
-    seen: set[torch.fx.Node] = set()
-    while node not in seen:
-        seen.add(node)
+    node: object = subscript
+    while isinstance(node, torch.fx.Node):
         info = subscript_tile_info(env, node)
         if info is not None:
             if isinstance(info.offset, int):
-                return offset + scale * info.offset
+                return info.block_id, scale, offset + scale * info.offset, False
             if env.known_equal(info.offset, 0):
-                return offset
-            return None
-        if node.target is torch.ops.prims.iota.default:
-            start = node.kwargs.get("start", 0)
-            step = node.kwargs.get("step", 1)
-            if isinstance(start, int) and step == 1:
-                return offset + scale * start
-            return None
+                return info.block_id, scale, offset, False
+            break
+        target = node.target
         args = node.args
-        if node.target is torch.ops.aten.add.Tensor and len(args) == 2:
+        if target is torch.ops.prims.iota.default:
+            start = node.kwargs.get("start", 0)
+            if scale == 1 and type(start) is int and node.kwargs.get("step", 1) == 1:
+                return None, 1, offset + start, False
+            break
+        if (
+            target in (torch.ops.aten.add.Tensor, torch.ops.aten.mul.Tensor)
+            and len(args) == 2
+            and not node.kwargs
+        ):
             constant, operand = args[1], args[0]
-            if not isinstance(constant, int):
+            if type(constant) is not int:
                 constant, operand = operand, constant
-            if isinstance(constant, int) and isinstance(operand, torch.fx.Node):
+            if type(constant) is not int:
+                break
+            if target is torch.ops.aten.add.Tensor:
                 offset += scale * constant
-                node = operand
-                continue
-            return None
-        if node.target is torch.ops.aten.mul.Tensor and len(args) == 2:
-            factor, operand = args[1], args[0]
-            if not isinstance(factor, int):
-                factor, operand = operand, factor
-            if isinstance(factor, int) and isinstance(operand, torch.fx.Node):
-                scale *= factor
-                node = operand
-                continue
-            return None
-        node_args = [arg for arg in args if isinstance(arg, torch.fx.Node)]
-        if len(node_args) != 1:
-            return None
-        node = node_args[0]
-    return None
+            elif constant >= 1:
+                scale *= constant
+            else:
+                break
+            node = operand
+        elif (
+            target is hl.tile_index
+            or (target in _INDEX_CASTS and node.meta["val"].dtype in _INDEX_DTYPES)
+            or (
+                target is hl.subscript
+                and len(args) == 2
+                and isinstance(args[1], (list, tuple))
+                and all(
+                    item is None or _subscript_is_full_slice(item) for item in args[1]
+                )
+            )
+        ):
+            node = args[0]
+        else:
+            break
+    return None, 1, None, False
 
 
 def _subscript_static_extent(subscript: object) -> int | None:
@@ -364,16 +443,21 @@ def _subscript_dense_span(
     ):
         return None
     axis = origin.block_id
-    block_size = env.block_sizes[env.canonical_block_id(axis)].var
+    info = env.block_sizes[env.canonical_block_id(axis)]
+    # A fixed block size keeps a symbolic var, but arange(value * scale) traces
+    # as a constant extent; accept either spelling.
+    block_sizes: list[object] = [info.var]
+    source = info.block_size_source
+    if isinstance(source, FixedBlockSizeSource) and type(source.value) is int:
+        block_sizes.append(source.value)
     extent = scalar_expression(contiguous.extent)
-    block_size_expression = scalar_expression(block_size)
-    if (
-        extent is None
-        or block_size_expression is None
-        or env.shape_env.simplify(
-            cast("Any", extent) - cast("Any", coefficient) * block_size_expression
+    if extent is None or not any(
+        (size := scalar_expression(block_size)) is not None
+        and env.shape_env.simplify(
+            cast("Any", extent) - cast("Any", coefficient) * size
         )
-        != 0
+        == 0
+        for block_size in block_sizes
     ):
         return None
     return axis, int(coefficient), int(remainder)
@@ -1628,7 +1712,7 @@ class DeviceIRAnalysis:
             return ()
 
         graph_owners = owner_roots_by_graph_id(device_ir)
-        allocation_ids: dict[int, int] = {}
+        allocation_ids: dict[torch.UntypedStorage, int] = {}
         accesses: list[TileAccess] = []
         memory_op_index = 0
 
@@ -1640,11 +1724,22 @@ class DeviceIRAnalysis:
                 is_store = node.target is memory_ops.store
                 is_atomic = node.target in ATOMIC_OPS
                 if not (is_load or is_store or is_atomic):
+                    if env.process_group_name is not None and (
+                        _may_access_memory_unseen(node, host.compiler_state)
+                    ):
+                        raise exc.CrossLoopSchedulingError(
+                            f"because {node.name} may access another rank's "
+                            "memory outside a load or store"
+                        )
                     continue
 
                 fake = _accessed_tensor_fake(node)
+                if fake is not None:
+                    # An SSA copy stands for its source; an ambiguous join is unknown.
+                    fake = host.compiler_state.ssa_source(fake)
                 origin = host.tensor_to_origin.get(fake) if fake is not None else None
                 allocation_id = -1
+                owner_rank: int | None = None
                 tensor_shape: tuple[sympy.Expr, ...] = ()
                 tensor_strides: tuple[sympy.Expr, ...] = ()
                 storage_offset: sympy.Expr = sympy.Integer(0)
@@ -1661,10 +1756,15 @@ class DeviceIRAnalysis:
 
                 if fake is not None:
                     storage = fake.untyped_storage()
-                    storage_key = int(getattr(storage, "_cdata", id(storage)))
-                    allocation_id = allocation_ids.setdefault(
-                        storage_key, len(allocation_ids)
+                    # A peer view stands for the local allocation on its owner rank.
+                    allocation = host.compiler_state.peer_views.get(
+                        storage, (storage, None)
                     )
+                    if allocation is not None:
+                        storage, owner_rank = allocation
+                        allocation_id = allocation_ids.setdefault(
+                            storage, len(allocation_ids)
+                        )
 
                     def symbolic_layout_value(
                         value: int | torch.SymInt,
@@ -1696,23 +1796,13 @@ class DeviceIRAnalysis:
                     if isinstance(index_list, (list, tuple)):
                         subscript_dims = tuple(range(min(len(index_list), fake.ndim)))
                         affine = tuple(
-                            subscript_index_scale(env, index_list[position])
+                            _subscript_affine(env, host, index_list[position])
                             for position in subscript_dims
                         )
-                        subscript_affine_block_ids = tuple(
-                            block_id for block_id, _scale in affine
-                        )
-                        subscript_index_scales = tuple(
-                            scale for _block_id, scale in affine
-                        )
-                        subscript_offsets = tuple(
-                            _subscript_static_offset(env, index_list[position])
-                            for position in subscript_dims
-                        )
-                        subscript_is_scalar = tuple(
-                            _subscript_is_scalar_tile_index(index_list[position])
-                            for position in subscript_dims
-                        )
+                        subscript_affine_block_ids = tuple(item[0] for item in affine)
+                        subscript_index_scales = tuple(item[1] for item in affine)
+                        subscript_offsets = tuple(item[2] for item in affine)
+                        subscript_is_scalar = tuple(item[3] for item in affine)
                         subscript_is_full_slice = tuple(
                             _subscript_is_full_slice(index_list[position])
                             for position in subscript_dims
@@ -1731,6 +1821,12 @@ class DeviceIRAnalysis:
                                 index_list[0],
                             )
 
+                if allocation_id < 0 and env.process_group_name is not None:
+                    # A barrier cannot order an unknown access against other ranks.
+                    raise exc.CrossLoopSchedulingError(
+                        "because a memory operation's allocation identity is "
+                        "unavailable"
+                    )
                 has_explicit_mask = (
                     not is_atomic
                     and len(node.args) > (2 if is_load else 3)
@@ -1741,6 +1837,10 @@ class DeviceIRAnalysis:
                     if graph_analysis.graph_id < len(graph_owners)
                     else ()
                 )
+                if owner_roots:
+                    node.meta[TILE_ACCESS_META] = tuple(
+                        range(len(accesses), len(accesses) + len(owner_roots))
+                    )
                 for owner_root in owner_roots:
                     accesses.append(
                         TileAccess(
@@ -1749,6 +1849,8 @@ class DeviceIRAnalysis:
                             graph_id=graph_analysis.graph_id,
                             root=owner_root,
                             allocation_id=allocation_id,
+                            owner_rank=owner_rank,
+                            dtype=fake.dtype if fake is not None else None,
                             kind="load" if is_load else "store",
                             tensor_name=origin.root_rw_name() if origin else None,
                             tensor_shape=tensor_shape,
@@ -2127,7 +2229,6 @@ class DeviceIRAnalysis:
 
         from .host_function import HostFunction
         from .variable_origin import BlockSizeOrigin
-        from .variable_origin import TileIdOrigin
 
         origins = HostFunction.current().expr_to_origin
 

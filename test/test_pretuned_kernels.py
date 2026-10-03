@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import math
 import os
+import subprocess
 import sys
 from typing import TYPE_CHECKING
 import unittest
@@ -19,7 +20,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._environment import is_fbcode
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
 from helion._hardware import get_hardware_info
@@ -31,6 +34,7 @@ from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipIfTileIR
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -50,6 +54,14 @@ def _current_compute_capability() -> str | None:
 def _pretuned_kernel_directory(name: str) -> Path:
     megakernel = PRETUNED_KERNELS_DIR / "megakernels" / name
     return megakernel if megakernel.is_dir() else PRETUNED_KERNELS_DIR / name
+
+
+def _require_four_sm100_gpus() -> None:
+    """Skip distributed TP4 pretuned-kernel checks without four local B200s."""
+    if not is_cuda() or torch.cuda.device_count() < 4:
+        pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
+    if any(torch.cuda.get_device_capability(device) != (10, 0) for device in range(4)):
+        pytest.skip("distributed TP4 pretuned kernels require four SM100 GPUs")
 
 
 def _import_pretuned_kernel_module(name):
@@ -290,6 +302,146 @@ def test_deepseek_v3_moe_nvfp4_uses_existing_tuning_surface() -> None:
     assert "source_ticket" not in source
     assert "w13_tma" in source
     assert "__deepseek" not in source
+
+
+def test_deepseek_v3_moe_nvfp4_tp_uses_explicit_sources() -> None:
+    module = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4_tp import _standalone
+
+    config = module.deepseek_v3_moe_nvfp4_tp.configs[0].config
+    standalone_config = _standalone.deepseek_v3_moe_nvfp4_tp_local.configs[0].config
+    assert not module.deepseek_v3_moe_nvfp4_tp.settings.static_shapes
+    assert module.WORLD_SIZE == 4
+    assert config["cross_loop_pipeline"] == "dynamic"
+    assert config["host_tensor_descriptors"]
+    assert config["num_sm_multiplier"] == 1
+    assert module.W13_SPLIT_K == 7
+    assert module.COMMUNICATION_N == 512
+    assert standalone_config["cross_loop_pipeline"] == "dynamic"
+
+    distributed_source = inspect.getsource(module._deepseek_v3_moe_nvfp4_tp)
+    local_source = inspect.getsource(_standalone._deepseek_v3_moe_nvfp4_tp_local)
+    assert "get_remote_tensors" in distributed_source
+    assert "get_remote_tensors" not in local_source
+    for fragment in (
+        "w13_tile_split",
+        "for w2_tile_group in hl.tile(w2_groups, block_size=16):",
+        "for shared_w2_tile_group in hl.tile(w2_groups, block_size=32):",
+    ):
+        assert fragment in distributed_source
+        assert fragment in local_source
+    assert "inline_triton" not in distributed_source
+
+
+def test_deepseek_v3_attention_nvfp4_tp_exchanges_natively() -> None:
+    module = _import_pretuned_kernel_module("deepseek_v3_attention_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _common
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _standalone
+
+    config = module.deepseek_v3_attention_nvfp4_tp.configs[0].config
+    assert not module.deepseek_v3_attention_nvfp4_tp.settings.static_shapes
+    assert module.WORLD_SIZE == 4
+    assert config["cross_loop_pipeline"] == "dynamic"
+    assert config["num_sm_multiplier"] == 4
+    assert config["maxnreg"] == 128
+
+    common_source = inspect.getsource(_common)
+    distributed_source = inspect.getsource(_common.attention_boundary_source)
+    standalone_source = inspect.getsource(_standalone._attention_o_proj_local)
+    benchmark_source = inspect.getsource(module._run)
+    assert "triton" not in common_source
+    assert "get_remote_tensors" in distributed_source
+    assert "get_remote_tensors" not in standalone_source
+    assert "vllm_cutlass_flashinfer" in benchmark_source
+    assert "sglang_flashinfer" not in benchmark_source
+    # Both sides of the comparison use the same projection algorithm.
+    for fragment in (
+        "hl.load_float4_e2m1fn_x16_to_float16",
+        "nvfp4.swizzled_scale_offsets",
+        "contribution.to(torch.float32) * scale",
+    ):
+        assert fragment in distributed_source
+        assert fragment in standalone_source
+
+
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipIfTileIR("in-band polling assertions inspect Triton PTX codegen")
+def test_deepseek_v3_tp_megakernels_exchange_in_band() -> None:
+    if _current_compute_capability() != "sm100":
+        pytest.skip("the TP4 megakernels are pretuned for SM100")
+    moe = _import_pretuned_kernel_module("deepseek_v3_moe_nvfp4_tp")
+    attention = _import_pretuned_kernel_module("deepseek_v3_attention_nvfp4_tp")
+    from pretuned_kernels.megakernels.deepseek_v3_attention_nvfp4_tp import _common
+    from pretuned_kernels.megakernels.deepseek_v3_moe_nvfp4 import (
+        deepseek_v3_moe_nvfp4 as source,
+    )
+
+    dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
+    try:
+        group = dist.group.WORLD.group_name
+        shape = source.Shape(intermediate=2048 // 4)
+        bf16 = {"device": DEVICE, "dtype": torch.bfloat16}
+        moe_args = (
+            *source._kernel_args(source._allocate(shape), shape),
+            moe.W13_SPLIT_K,
+            torch.zeros((shape.batch, shape.hidden), **bf16),
+            group,
+        )
+        n, k = _common.OUTPUT_FEATURES, _common.LOCAL_K
+        attention_args = (
+            torch.zeros((n, k // 2), device=DEVICE, dtype=torch.uint8),
+            torch.zeros((k // 2,), device=DEVICE, dtype=torch.uint8),
+            torch.zeros((n * (k // 16),), device=DEVICE, dtype=torch.int8),
+            torch.zeros((128 * (k // 16),), device=DEVICE, dtype=torch.int8),
+            1.0,
+            torch.zeros((1, n), **bf16),
+            torch.zeros((1, n), **bf16),
+            torch.zeros((n,), **bf16),
+            group,
+        )
+        for kernel, args in (
+            (moe.deepseek_v3_moe_nvfp4_tp, moe_args),
+            (attention.deepseek_v3_attention_nvfp4_tp, attention_args),
+        ):
+            code = kernel.bind(args).to_triton_code(kernel.configs[0])
+            # One store per rank pushes each word, a plain load reads each of the
+            # 4 mailboxes, one asm reloads the stale words (4 per thread), and
+            # nothing else orders the ranks.
+            assert code.count("st.relaxed.sys.global.u64") == 4
+            assert code.count("volatile=True") == 4
+            assert code.count("@p bra SPIN") == 1
+            assert code.count("ld.volatile.global.b64") == 4 * 4
+            assert "_wait_at_least" not in code
+            assert "_add_on_every_rank" not in code
+    finally:
+        dist.destroy_process_group()
+
+
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@pytest.mark.parametrize(
+    "name", ["deepseek_v3_moe_nvfp4_tp", "deepseek_v3_attention_nvfp4_tp"]
+)
+def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
+    _require_four_sm100_gpus()
+    if _under_xdist():
+        pytest.skip("four-rank runs need every local GPU")
+    # main() checks every rank's output against the matched references.
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=4",
+            str(_pretuned_kernel_directory(name) / f"{name}.py"),
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(PRETUNED_KERNELS_DIR.parent),
+            "NVSHMEM_DISABLE_CUDA_VMM": "1",
+        },
+        check=True,
+    )
 
 
 def test_pre_captured_graph_sweep_passes_resets(

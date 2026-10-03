@@ -2649,13 +2649,15 @@ class ConfigSpec:
             return False
         return self.backend.supports_config_key(key)
 
-    def enable_cross_loop_pipeline(self) -> None:
+    def enable_cross_loop_pipeline(
+        self, *, choices: tuple[str, ...] = VALID_CROSS_LOOP_PIPELINES
+    ) -> None:
         """Expose the compiler-owned cross-loop execution dimension."""
         if not self.supports_config_key("cross_loop_pipeline"):
             raise InvalidConfig(
                 f"cross_loop_pipeline is not supported by backend {self.backend_name!r}"
             )
-        self.cross_loop_pipeline = EnumFragment(VALID_CROSS_LOOP_PIPELINES)
+        self.cross_loop_pipeline = EnumFragment(choices)
 
     def enable_cute_async_load_pipeline(self) -> None:
         """Expose the narrow CuTe async state-load search dimensions."""

@@ -743,7 +743,7 @@ class ForEachProgramID(ProgramIDs):
                 )
             )
             if boundary != boundaries[-1] and barrier_stmt is not None:
-                loops.append(statement_from_string(barrier_stmt))
+                loops.extend(device_function.cta_barrier(barrier_stmt))
             start_expr = boundary
         return loops
 

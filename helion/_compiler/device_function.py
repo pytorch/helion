@@ -25,6 +25,8 @@ from torch.utils._sympy.symbol import symbol_is_type
 
 from .. import exc
 from .._compat import get_tensor_descriptor_fn_name
+from .._compat import is_hip
+from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import create_arg
@@ -51,12 +53,14 @@ from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from .cross_loop_codegen import PeerState
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
     from .program_id import ProgramIDs
     from .tile_dispatch import TileStrategyDispatch
+    from .triton.distributed_ops import InbandPoll
     from helion._compiler.pallas.dma import DmaResources
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
@@ -285,6 +289,28 @@ class PallasMemorySpace(enum.Enum):
     VMEM = "vmem"  # Vector/slice access (default)
 
 
+def _selects_tma_access(config: Config) -> bool:
+    """Whether the config may lower some global access through TMA (async proxy).
+
+    Decided before codegen, since a handoff can be emitted before the access.
+    Over-reports: fact slots do not always match codegen's memory-op slots.
+    """
+    env = CompileEnvironment.current()
+    capability = env.config_spec.target_device_capability
+    if (
+        env.backend_name != "triton"
+        or env.device.type != "cuda"
+        or is_hip()
+        or capability is None
+        or capability < (9, 0)
+    ):
+        return False
+    return indexing_uses_tensor_descriptor(config.atomic_indexing) or (
+        indexing_uses_tensor_descriptor(config.indexing)
+        and any(2 <= fact.ndim <= 5 for fact in env.config_spec.memory_op_facts)
+    )
+
+
 class DeviceFunction:
     def __init__(
         self,
@@ -297,6 +323,9 @@ class DeviceFunction:
         self.config = config
         self.codegen = codegen
         self.has_barrier = CompileEnvironment.current().has_barrier
+        self.uses_async_proxy_global = _selects_tma_access(config)
+        self._async_store_drained = False
+        self._tma_store_warp_specialized = False
         self.arguments: list[Argument] = []
         self.preamble: list[ast.AST] = []
         self.body: list[ast.AST] = []
@@ -399,8 +428,14 @@ class DeviceFunction:
         # Compiler-owned state that must persist across launches (for example,
         # epoch-scaled tile-dependency counters). The Triton launcher allocates it
         # once per kernel/device/stream and appends it to the kernel arguments.
+        # A symmetric spec also appends the per-rank base pointer table.
         self.triton_persistent_state_args: list[str] = []
-        self.triton_persistent_state_specs: list[tuple[str, str, str]] = []
+        self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
+        # Cross-rank transport state (cross_loop_codegen.peer_state), the polls
+        # awaiting their first use, and the inband accesses emitted so far.
+        self.peer_state: PeerState | None = None
+        self.inband_polls: list[InbandPoll] = []
+        self.inband_access_ids: set[int] = set()
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -796,6 +831,57 @@ class DeviceFunction:
         if dce:
             self.dce_vars.append(name)
         return name
+
+    def _thread_asm(self, prefix: str, asm: str) -> ast.stmt:
+        var = self.new_var(prefix, dce=False)
+        return statement_from_string(
+            f"{var} = tl.inline_asm_elementwise("
+            f"asm='{asm} mov.u32 $0, $1;', "
+            "constraints='=r,r', args=[tl.arange(0, 32)], "
+            "dtype=tl.uint32, is_pure=False, pack=1)"
+        )
+
+    def async_store_drain(self) -> list[ast.stmt]:
+        """Complete this thread's TMA global writes before a cross-thread sync."""
+        if not self.uses_async_proxy_global:
+            return []
+        self._async_store_drained = True
+        self._check_async_store_drain()
+        # wait_group.read (emitted per TMA store) only frees the smem source.
+        return [
+            self._thread_asm(
+                "async_store_drain",
+                "cp.async.bulk.wait_group 0; fence.proxy.async.global;",
+            )
+        ]
+
+    def async_load_fence(self) -> list[ast.stmt]:
+        """Order a completed acquire before later TMA global reads or writes."""
+        if not self.uses_async_proxy_global:
+            return []
+        return [self._thread_asm("async_load_fence", "fence.proxy.async.global;")]
+
+    def cta_barrier(self, barrier: str = "tl.debug_barrier()") -> list[ast.stmt]:
+        """A barrier that also orders TMA global accesses across threads."""
+        return [
+            *self.async_store_drain(),
+            statement_from_string(barrier),
+            *self.async_load_fence(),
+        ]
+
+    def note_tma_store(self, *, warp_specialized: bool) -> None:
+        """Record a TMA global store or reduction for async_store_drain."""
+        self._tma_store_warp_specialized |= warp_specialized
+        self._check_async_store_drain()
+
+    def _check_async_store_drain(self) -> None:
+        # Bulk groups are per issuing thread; a warp-specialized worker's stores
+        # are invisible to the default warps that drain and publish.
+        if self._async_store_drained and self._tma_store_warp_specialized:
+            raise exc.InvalidConfig(
+                "TMA stores in a range_warp_specialize loop cannot be drained "
+                "before a cross-thread sync"
+            )
 
     def tensor_arg(
         self, fake_value: torch.Tensor, prefer_name: str | None = None

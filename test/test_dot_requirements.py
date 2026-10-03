@@ -1849,6 +1849,10 @@ class TestDotRequirements(RefEagerTestDisabled, TestCase):
                 "helion.runtime.kernel._find_process_group_name",
                 return_value="world",
             ),
+            patch(
+                "helion._dist_utils._resolve_process_group",
+                return_value=object(),
+            ),
             patch("helion._dist_utils.max_num_blocks_for_symm_mem", return_value=10000),
         ):
             bound = _cute_two_matmuls_distributed_kernel.bind(args)

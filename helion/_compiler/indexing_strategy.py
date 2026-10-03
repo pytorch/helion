@@ -482,6 +482,18 @@ def _scalar_tensor_index_expr(
     ).id
 
 
+def _in_warp_specialized_loop(state: CodegenState) -> bool:
+    env = CompileEnvironment.current()
+    specialized = state.device_function.config.range_warp_specializes
+    return any(
+        loops
+        and env.config_spec.range_warp_specialize.config_get(
+            specialized, block_idx, None
+        )
+        for block_idx, loops in state.codegen.active_device_loops.items()
+    )
+
+
 def _has_active_codegen_block(state: CodegenState, block_idx: int) -> bool:
     loops = state.codegen.active_device_loops.get(block_idx)
     return bool(loops)
@@ -1397,6 +1409,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        state.device_function.note_tma_store(
+            warp_specialized=_in_warp_specialized_loop(state)
+        )
 
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)
@@ -1450,6 +1465,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         if not self.is_supported(state, fake_tensor, subscript):
             return fallback(op, state, fake_tensor, subscript, value, sem)
         indexing = BlockedSubscriptIndexing.create(state, fake_tensor, subscript)
+        state.device_function.note_tma_store(
+            warp_specialized=_in_warp_specialized_loop(state)
+        )
         desc_arg = indexing.tensor_descriptor_arg(state)
         atomic_value = indexing.reshape_store(state, value)
 
