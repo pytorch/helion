@@ -4765,17 +4765,46 @@ class TileDependencyGraph:
             access.kind == "store" or access.owner_rank is not None
         )
 
-    def inband_numel(self, allocation_id: int) -> int:
-        """Elements per mailbox slot: R2 makes the store fill the buffer."""
-        store = next(
+    def inband_store(self, allocation_id: int) -> TileAccess:
+        return next(
             access
             for access in self.accesses
             if access.allocation_id == allocation_id and access.kind == "store"
         )
+
+    def inband_numel(self, allocation_id: int) -> int:
+        """Elements per mailbox slot: R2 makes the store fill the buffer."""
         return math.prod(
             _concrete_integer(extent, description="inband shape")
-            for extent in store.tensor_shape
+            for extent in self.inband_store(allocation_id).tensor_shape
         )
+
+    def inband_row(self, store: TileAccess, block_size: Callable[[int], int]) -> int:
+        """Consecutive elements each store tile writes, aligned to their count."""
+        dim = len(store.tensor_shape) - 1
+        row = _concrete_integer(store.tensor_shape[dim], description="inband shape")
+        extent = row
+        if dim in store.subscript_dims:
+            position = store.subscript_dims.index(dim)
+            block_id = store.subscript_affine_block_ids[position]
+            family = self.task_families[store.root]
+            axis = None if block_id is None else family.axis(block_id)
+            if store.subscript_is_full_slice[position]:
+                pass
+            elif (
+                axis is not None
+                and axis.canonical_origin
+                and store.subscript_index_scales[position] == 1
+                and store.subscript_offsets[position] == 0
+                and not store.subscript_is_scalar[position]
+            ):
+                extent = block_size(axis.block_id)
+            else:
+                return 1
+        stride = _concrete_integer(
+            store.tensor_strides[dim], description="inband stride"
+        )
+        return extent if stride == 1 and row % extent == 0 else 1
 
     def crosses_ranks(self) -> bool:
         """Whether any dependency needs a cross-rank transport."""

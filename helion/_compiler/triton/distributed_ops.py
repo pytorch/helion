@@ -649,6 +649,41 @@ def _inline_asm(
     )
 
 
+def _lift(
+    state: CodegenState, template: str, x: ast.AST | str, prefix: str = "inband_lane"
+) -> str:
+    """Name ``template`` with ``{x}`` filled in, as a dead-code-eliminable var."""
+    if isinstance(x, str):
+        x = expr_from_string(x)
+    return state.codegen.lift(
+        expr_from_string(template.replace("{value}", "{x}"), x=x),
+        dce=True,
+        prefix=prefix,
+    ).id
+
+
+def _interleaved(
+    state: CodegenState, tensor: str, dims: list[str], count: int
+) -> list[str]:
+    """Split ``tensor``'s last axis into ``count`` parts; part i holds the
+    elements at i mod ``count``."""
+    if count == 1:
+        return [tensor]
+    levels = count.bit_length() - 1
+    shape = ", ".join([*dims[:-1], f"{dims[-1]} // {count}", *["2"] * levels])
+    parts = [_lift(state, f"tl.reshape({{x}}, [{shape}])", tensor)]
+    for _ in range(levels):
+        halves: list[str] = []
+        for part in parts:
+            lo = state.device_function.new_var("inband_lane")
+            hi = state.device_function.new_var("inband_lane")
+            state.add_statement(statement_from_string(f"{lo}, {hi} = tl.split({part})"))
+            halves += [lo, hi]
+        parts = halves
+    # Each split peels the lowest index bit, so parts come out bit-reversed.
+    return [parts[int(f"{i:0{levels}b}"[::-1], 2)] for i in range(count)]
+
+
 def inband_store_codegen(
     state: CodegenState, codegen_store: StoreCodegen
 ) -> StoreCodegen:
@@ -693,29 +728,57 @@ def inband_store_codegen(
             )
         offset = state.codegen.lift(offset, dce=True, prefix="inband_offset")
         dtype = fake_tensor.dtype
-        word = state.codegen.lift(
-            expr_from_string(
-                f"tl.cast(tl.cast(tl.cast({{value}}, {backend.dtype_str(dtype)}), "
-                f"{_bits(dtype)}, bitcast=True), tl.uint64) | ({peer.epoch} << 32)",
-                value=word_value,
-            ),
-            dce=True,
-            prefix="inband_word",
+        _, _, lanes, pair = peer.mailboxes[access.allocation_id]
+        bits = (
+            f"tl.cast(tl.cast({{value}}, {backend.dtype_str(dtype)}), "
+            f"{_bits(dtype)}, bitcast=True)"
         )
-        slot = peer.mailbox(access.allocation_id, peer.rank)
-        store = "st.relaxed.sys.global.u64 [$1], $2;"
-        mask = []
-        if indexing.has_mask():
-            mask = [
+        epoch = f"({peer.epoch} << 32)"
+        mask = indexing.mask_expr if indexing.has_mask() else None
+        if lanes == 1 and not pair:
+            words = [
                 state.codegen.lift(
                     expr_from_string(
-                        "tl.cast({mask}, tl.int32)", mask=indexing.mask_expr
+                        f"tl.cast({bits}, tl.uint64) | {epoch}", value=word_value
                     ),
                     dce=True,
-                    prefix="inband_mask",
+                    prefix="inband_word",
                 ).id
             ]
-            store = f"{{ .reg .pred p; setp.ne.b32 p, $3, 0; @p {store} }}"
+            address = offset.id
+            masks = []
+            if mask is not None:
+                masks = [_lift(state, "tl.cast({x}, tl.int32)", mask, "inband_mask")]
+        else:
+            # Pack row-adjacent elements into each word, then pair adjacent words.
+            assert indexing.block_shaped_offset
+            dims = state.tile_strategy.shape_dims(output_size)
+            shape = f"[{', '.join(dims)}]"
+            group = lanes * (2 if pair else 1)
+            full = _lift(state, backend.broadcast_to_expr(bits, shape), value)
+            payload = " | ".join(
+                f"(tl.cast({part}, tl.uint64) << {8 * dtype.itemsize * i})"
+                for i, part in enumerate(_interleaved(state, full, dims, lanes))
+            )
+            word = _lift(state, f"{{x}} | {epoch}", expr_from_string(payload))
+            row = [*dims[:-1], f"{dims[-1]} // {lanes}"]
+            words = _interleaved(state, word, row, 2) if pair else [word]
+            first = _interleaved(state, offset.id, dims, group)[0]
+            address = _lift(state, f"{{x}} // {lanes}", expr_from_string(first))
+            masks = []
+            if mask is not None:
+                cast = backend.broadcast_to_expr("tl.cast({x}, tl.int32)", shape)
+                masks = _interleaved(state, _lift(state, cast, mask), dims, group)[:1]
+        store = (
+            "st.relaxed.sys.global.v2.u64 [$1], {$2, $3};"
+            if pair
+            else "st.relaxed.sys.global.u64 [$1], $2;"
+        )
+        if masks:
+            store = (
+                f"{{ .reg .pred p; setp.ne.b32 p, ${2 + len(words)}, 0; @p {store} }}"
+            )
+        slot = peer.mailbox(access.allocation_id, peer.rank)
         # Each word is single-copy atomic and carries its epoch: no fence needed.
         # One asm per peer keeps that peer's stores adjacent, which is faster.
         for base in peer.bases:
@@ -723,8 +786,8 @@ def inband_store_codegen(
                 _inline_asm(
                     device_function.new_var("inband_push", dce=False),
                     f"{store} mov.u32 $0, 0;",
-                    "=r,l,l" + ",r" * len(mask),
-                    [f"{base} + ({slot}) + {offset.id}", word.id, *mask],
+                    "=r,l" + ",l" * len(words) + ",r" * len(masks),
+                    [f"{base} + ({slot}) + {address}", *words, *masks],
                     "tl.int32",
                     1,
                 )
@@ -783,6 +846,17 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 offset=offset,
             )
         slot = peer.mailbox(access.allocation_id, access.owner_rank)
+        _, _, lanes, _ = peer.mailboxes[access.allocation_id]
+        dtype = fake_tensor.dtype
+        shift = ""
+        if lanes > 1:
+            # Each lane polls the word holding its element and shifts it out.
+            offset = state.codegen.lift(offset, dce=True, prefix="inband_offset")
+            shift = (
+                f" >> (tl.cast({offset.id} % {lanes}, tl.uint64)"
+                f" * {8 * dtype.itemsize})"
+            )
+            offset = expr_from_string(f"{offset.id} // {lanes}")
         address = state.codegen.lift(
             expr_from_string(f"{peer.state} + ({slot}) + {{offset}}", offset=offset),
             dce=True,
@@ -793,10 +867,9 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             mask = state.codegen.lift(
                 indexing.mask_expr, dce=True, prefix="inband_mask"
             ).id
-        dtype = fake_tensor.dtype
         word = device_function.new_var("inband_word", dce=False)
         result = expr_from_string(
-            f"tl.cast(tl.cast({word}, {_bits(dtype)}), "
+            f"tl.cast(tl.cast({word}{shift}, {_bits(dtype)}), "
             f"{backend.dtype_str(dtype)}, bitcast=True)"
         )
         # Triton's pipeliner would make the first read an early, weak cp.async.

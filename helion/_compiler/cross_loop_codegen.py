@@ -551,18 +551,19 @@ class PeerState:
     ptrs: str
     rank: str
     bases: tuple[str, ...]
-    # allocation id -> (first word, elements per slot)
-    mailboxes: dict[int, tuple[int, int]]
+    # allocation id -> (first word, words per slot, elements per word, whether
+    # stores may write 16-byte word pairs)
+    mailboxes: dict[int, tuple[int, int, int, bool]]
     slots: dict[int, int]
     done: int
     launch: int
 
     def mailbox(self, allocation_id: int, source: object) -> str:
         """Word offset of ``source``'s slot for this launch's parity."""
-        offset, numel = self.mailboxes[allocation_id]
+        offset, words, _, _ = self.mailboxes[allocation_id]
         return (
             f"{offset} + tl.cast({self.epoch} & 1, tl.int64) * "
-            f"{len(self.bases) * numel} + {source} * {numel}"
+            f"{len(self.bases) * words} + {source} * {words}"
         )
 
 
@@ -578,12 +579,25 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     world_size = torch.distributed.get_world_size(
         _resolve_process_group(process_group_name)
     )
-    mailboxes: dict[int, tuple[int, int]] = {}
+    env = CompileEnvironment.current()
+    config = device_function.config
+
+    def block_size(block_id: int) -> int:
+        return env.size_hint(env.block_sizes[block_id].from_config_assert(config))
+
+    mailboxes: dict[int, tuple[int, int, int, bool]] = {}
     words = 0
     for allocation_id in sorted(graph.inband_allocation_ids):
-        numel = graph.inband_numel(allocation_id)
-        mailboxes[allocation_id] = (words, numel)
-        words += 2 * world_size * numel
+        # Sub-word elements share a tagged word when tile rows align to it.
+        store = graph.inband_store(allocation_id)
+        assert store.dtype is not None
+        row = graph.inband_row(store, block_size)
+        lanes = 4 // store.dtype.itemsize
+        lanes = lanes if row % lanes == 0 else 1
+        size = graph.inband_numel(allocation_id) // lanes
+        pair = row % (2 * lanes) == 0 and size % 2 == 0
+        mailboxes[allocation_id] = (words, size, lanes, pair)
+        words += 2 * world_size * size
     words = -(-words // _PEER_SLOT_WORDS) * _PEER_SLOT_WORDS
     producers = sorted(
         {
