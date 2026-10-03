@@ -3695,8 +3695,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 env.require_persistent_blocked(reason)
+                # Peer transports order static and dynamic schedules alike.
                 config_spec.enable_cross_loop_pipeline(
-                    choices=device_ir.tile_dependency_graph.cross_rank_pipelines()
+                    choices=("static", "dynamic")
                     if cross_rank
                     else VALID_CROSS_LOOP_PIPELINES
                 )

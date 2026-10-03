@@ -6,6 +6,7 @@ import io
 import itertools
 import os
 import re
+from typing import TYPE_CHECKING
 import unittest
 from unittest.mock import patch
 import warnings
@@ -46,6 +47,9 @@ from helion.autotuner.effort_profile import DifferentialEvolutionConfig
 from helion.autotuner.effort_profile import PatternSearchConfig
 from helion.autotuner.effort_profile import RandomSearchConfig
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from helion.runtime.kernel import BoundKernel
 
 autotuner_names = ["fixed", *search_algorithms]
 
@@ -103,6 +107,15 @@ def _remote_views(
     t: torch.Tensor, group_name: hl.constexpr
 ) -> tuple[torch.Tensor, ...]:
     return torch.ops.symm_mem.get_remote_tensors(t, group_name)
+
+
+def _with_pipeline(
+    kernel: helion.Kernel, args: tuple[object, ...], pipeline: str
+) -> BoundKernel[object]:
+    bound = kernel.bind(args)
+    config = bound.config_spec.default_config().config
+    bound.set_config(helion.Config(**{**config, "cross_loop_pipeline": pipeline}))
+    return bound
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -515,7 +528,8 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     @parametrize("variant", ("inband", "R1"))
-    def test_pipelined_allreduce_replays(self, variant: str) -> None:
+    @parametrize("pipeline", ("static", "dynamic"))
+    def test_pipelined_allreduce_replays(self, variant: str, pipeline: str) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
@@ -523,6 +537,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         symm_mem.rendezvous(symm, group=group)
         x = torch.empty(n, device=self.device)
         args = (symm, x, group.group_name, variant, world)
+        bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline)
         outs = []
 
         def launch(step: int, replay: bool = False) -> None:
@@ -534,13 +549,13 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 graph.replay()
                 outs.append(graph_out.clone())
             else:
-                outs.append(pipelined_allreduce_kernel(*args).clone())
+                outs.append(bound(*args).clone())
 
         for step in range(4):
             launch(step)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_out = pipelined_allreduce_kernel(*args)
+            graph_out = bound(*args)
         # Alternate graph replays with eager launches.
         for step in range(4, 12):
             launch(step, replay=step % 2 == 0)
@@ -561,8 +576,9 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             (torch.float64, torch.float32),
         ),
     )
+    @parametrize("pipeline", ("static", "dynamic"))
     def test_chained_exchanges_replay(
-        self, dtypes: tuple[torch.dtype, torch.dtype]
+        self, dtypes: tuple[torch.dtype, torch.dtype], pipeline: str
     ) -> None:
         self._init_process()
         group = dist.group.WORLD
@@ -576,10 +592,11 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         symm_mem.rendezvous(moment, group=group)
         x = torch.empty(n, device=self.device, dtype=dtypes[0])
         args = (symm, moment, x, group.group_name)
-        chained_exchange_kernel(*args)
+        bound = _with_pipeline(chained_exchange_kernel, args, pipeline)
+        bound(*args)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            graph_out = chained_exchange_kernel(*args)
+            graph_out = bound(*args)
         for step in range(8):
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
             x.fill_(step + self.rank)
@@ -587,7 +604,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 graph.replay()
                 out = graph_out
             else:
-                out = chained_exchange_kernel(*args)
+                out = bound(*args)
             # total = world * step + 6, plus each rank's copy of its mean.
             expected = (world + 1) * (world * step + world * (world - 1) // 2)
             torch.testing.assert_close(out, torch.full_like(out, expected))
@@ -1252,7 +1269,7 @@ class TestDistributedTileDependencies(TestCase):
         symm, x = torch.zeros(2, 256, device=DEVICE)
         group = self._world(world, inband_rule_kernel)
         bound = inband_rule_kernel.bind((symm, x, group, "R1", world))
-        # Peer counters order either pipeline; inband data needs the dynamic one.
+        # Peer counters and inband data order either pipeline.
         self.assertEqual(
             bound.config_spec.cross_loop_pipeline.choices, ("static", "dynamic")
         )
@@ -1291,9 +1308,9 @@ class TestDistributedTileDependencies(TestCase):
                 else:
                     self.assertNotIn(expected, code)
         bound = inband_rule_kernel.bind((symm, x, group, "", world))
-        self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("dynamic",))
-        with self.assertRaisesRegex(helion.exc.InvalidConfig, "cross_loop_pipeline"):
-            bound.config_spec.normalize({**config, "cross_loop_pipeline": "static"})
+        self.assertEqual(
+            bound.config_spec.cross_loop_pipeline.choices, ("static", "dynamic")
+        )
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1386,6 +1403,10 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("_add_on_every_rank"), 1)
         self.assertIn("_add_on_every_rank(tile_dependency_peer_keys_ptrs", code)
         self.assertNotIn("_wait_at_least", code)
+        # Without a done barrier each static worker counts its own launches.
+        launch = "tile_dependency_peer_launch + tl.program_id(0)"
+        self.assertIn(f"tile_dependency_peer_epoch = tl.load({launch}) + 1", code)
+        self.assertIn(f"tl.store({launch}, tile_dependency_peer_epoch)", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
