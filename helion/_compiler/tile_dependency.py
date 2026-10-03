@@ -4716,6 +4716,8 @@ class TileDependencyGraph:
     noncanonical_axes: frozenset[int] = frozenset()
     # Symmetric allocations whose cross-rank dependencies poll tagged data.
     inband_allocation_ids: frozenset[int] = frozenset()
+    # Roots of inband stores whose words every rank's launch polls in full.
+    inband_read_roots: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if tuple(site.site_id for site in self.execution_sites) != tuple(
@@ -4783,12 +4785,46 @@ class TileDependencyGraph:
             for dependency in edge.access_dependencies
         )
 
+    def peer_counter_graph(self) -> TileDependencyGraph:
+        """The peer_counter dependencies over rank-invariant endpoint accesses."""
+        edges = tuple(
+            dataclasses.replace(edge, access_dependencies=peer)
+            for edge in self.edges
+            if (
+                peer := tuple(
+                    dependency
+                    for dependency in edge.access_dependencies
+                    if self.transport(dependency) == "peer_counter"
+                )
+            )
+        )
+        endpoints = {
+            access_id
+            for edge in edges
+            for dependency in edge.access_dependencies
+            for access_id in (
+                dependency.producer_access_id,
+                dependency.consumer_access_id,
+            )
+        }
+        return dataclasses.replace(
+            self,
+            accesses=tuple(
+                _rank_invariant(access, self.task_families[access.root])
+                if access.access_id in endpoints
+                else access
+                for access in self.accesses
+            ),
+            edges=edges,
+        )
+
     def cross_rank_pipelines(self) -> tuple[str, ...]:
         """R5: peer counters order static or dynamic schedules, inband data dynamic."""
         return ("dynamic",) if self.inband_allocation_ids else ("static", "dynamic")
 
     def rank_digest(self) -> str:
         """Hash the facts every rank must agree on; owners and regions may differ."""
+        peer = self.peer_counter_graph()
         facts = (
             tuple(
                 (a.root, a.allocation_id, a.kind, a.is_atomic, a.owner_rank is None)
@@ -4799,6 +4835,19 @@ class TileDependencyGraph:
             tuple(
                 (allocation_id, self.inband_numel(allocation_id))
                 for allocation_id in sorted(self.inband_allocation_ids)
+            ),
+            # Keyed peer counters read only these rank-invariant subscripts.
+            tuple(
+                (
+                    peer.accesses[access_id].subscript_is_full_slice,
+                    peer.accesses[access_id].subscript_dense_spans,
+                )
+                for edge in peer.edges
+                for dependency in edge.access_dependencies
+                for access_id in (
+                    dependency.producer_access_id,
+                    dependency.consumer_access_id,
+                )
             ),
             tuple(
                 sorted(
@@ -6170,6 +6219,56 @@ def _crosses_ranks(first: TileAccess, second: TileAccess) -> bool:
     return first.owner_rank is not None or second.owner_rank is not None
 
 
+def _rank_invariant(access: TileAccess, family: TaskFamily) -> TileAccess:
+    """Widen every subscript but a full slice or a tile axis spanning its dimension.
+
+    Ranks compile their own rank constants into offsets and constant indices; a
+    spanning axis has offset 0 on every rank or its access is out of bounds.
+    """
+
+    def spans_dimension(position: int, block_id: int | None) -> bool:
+        axis = None if block_id is None else family.axis(block_id)
+        return (
+            axis is not None
+            and axis.canonical_origin
+            and isinstance(axis.extent, sympy.Expr)
+            and sympy.simplify(
+                axis.extent - access.tensor_shape[access.subscript_dims[position]]
+            )
+            == 0
+        )
+
+    spans = access.subscript_dense_spans or (None,) * len(access.subscript_dims)
+    kept = tuple(
+        full
+        or (
+            (span[1:] == (1, 0) if span is not None else (scale, offset) == (1, 0))
+            and spans_dimension(position, block if span is None else span[0])
+        )
+        for position, (full, block, scale, offset, span) in enumerate(
+            zip(
+                access.subscript_is_full_slice,
+                access.subscript_affine_block_ids,
+                access.subscript_index_scales,
+                access.subscript_offsets,
+                spans,
+                strict=True,
+            )
+        )
+    )
+    return dataclasses.replace(
+        access,
+        subscript_is_full_slice=tuple(
+            full or not keep
+            for full, keep in zip(access.subscript_is_full_slice, kept, strict=True)
+        ),
+        subscript_dense_spans=tuple(
+            span if keep else None for keep, span in zip(kept, spans, strict=True)
+        ),
+        affine_subscript_ranges=None,
+    )
+
+
 def _subtract_reaching_accesses(
     reaching: list[_ReachingAccess],
     writes: tuple[_ReachingAccess, ...],
@@ -6589,6 +6688,25 @@ def build_tile_dependency_graph(
             )
         )
         inband_allocation_ids = set()
+    # R6 covers each polled rank; polls at root on every rank read every task.
+    inband_read_roots = {
+        access.root
+        for allocation_id in inband_allocation_ids
+        if _polls_every_rank(
+            tuple(accesses_by_allocation[allocation_id]),
+            {allocation_id},
+            task_families,
+            runs_at_root,
+            world_size,
+        )
+        and all(
+            runs_at_root(access) and not access.has_explicit_mask
+            for access in accesses_by_allocation[allocation_id]
+            if access.owner_rank is not None
+        )
+        for access in accesses_by_allocation[allocation_id]
+        if access.kind == "store"
+    }
     for allocation_id, failure in sorted(failures.items()):
         log.info(
             "Cross-rank dependencies on %s use %s",
@@ -6603,6 +6721,7 @@ def build_tile_dependency_graph(
         site_ids_by_access=tuple(site_ids_by_access),
         noncanonical_axes=noncanonical_task_origin_block_ids,
         inband_allocation_ids=frozenset(inband_allocation_ids),
+        inband_read_roots=frozenset(inband_read_roots),
     )
 
 

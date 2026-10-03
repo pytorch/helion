@@ -1215,13 +1215,14 @@ def emit_cross_loop_schedule(
             *device_function.async_load_fence(),
         ]
 
+    lanes = 1 << (world_size - 1).bit_length()
+
     def peer_publications(root: int) -> list[ast.stmt]:
         if peer is None:
             return []
-        slots = [peer.slots[root]] if root in peer.slots else []
+        slots = [peer.slots[root]] if any(p == root for p, _ in peer_edges) else []
         if root in done_roots:
             slots.append(peer.done)
-        lanes = 1 << (world_size - 1).bit_length()
         return [
             statement_from_string(
                 f"helion_dist_utils._add_on_every_rank({peer.ptrs}, {slot}, "
@@ -1230,18 +1231,117 @@ def emit_cross_loop_schedule(
             for slot in slots
         ]
 
+    # Keyed peer counters: one uint64 line per key on every rank, which each
+    # producer task (live or skipped) bumps once per launch.
+    peer_counter_plans = static_pipeline_plan.peer_counters
+    peer_key_offsets: dict[ReadinessCounterPlan, int] = {}
+    peer_key_words = 0
+    for plan in peer_counter_plans:
+        peer_key_offsets[plan] = peer_key_words
+        peer_key_words += plan.readiness_key_domain.size * _PEER_SLOT_WORDS
+    peer_keys = peer_key_ptrs = ""
+    if peer_counter_plans:
+        peer_keys = _register_cross_loop_state(
+            device_function,
+            name_hint="tile_dependency_peer_keys",
+            numel=str(peer_key_words),
+            dtype=torch.uint64,
+            symmetric=True,
+        )
+        peer_key_ptrs = device_function.triton_persistent_state_args[-1]
+
+    def peer_key_word(plan: ReadinessCounterPlan, key: str) -> str:
+        return f"{peer_key_offsets[plan]} + ({key}) * {_PEER_SLOT_WORDS}"
+
+    def peer_counter_publications(
+        root: int, coordinates: dict[int, str], sem: str
+    ) -> list[ast.stmt]:
+        result: list[ast.stmt] = []
+        for plan in peer_counter_plans:
+            publication = plan.producers[0].incidence.keys_by_item
+            if plan.producers[0].producer_root != root or publication is None:
+                continue
+            key, membership = relation_flat_target(
+                publication,
+                coordinates,
+                trusted_single_valued=True,
+                trusted_total_point_map=publication.is_total_function(),
+            )
+            # Scalar ptrs table only: outlined noinline tasks take no vectors.
+            add = statement_from_string(
+                f"helion_dist_utils._add_on_every_rank({peer_key_ptrs}, "
+                f"{peer_key_word(plan, key)}, {world_size}, {lanes}, '{sem}')"
+            )
+            result.append(
+                add
+                if membership == "True"
+                else create(
+                    ast.If, test=expr_from_string(membership), body=[add], orelse=[]
+                )
+            )
+        return result
+
+    def peer_counter_waits(
+        root: int, coordinates: dict[int, str]
+    ) -> tuple[list[ast.stmt], list[str]]:
+        """Per-task acquire spins whose zero results gate the task's PID."""
+        statements: list[ast.stmt] = []
+        tokens: list[str] = []
+        fence = (
+            "fence.proxy.async.global; "
+            if device_function.uses_async_proxy_global
+            else ""
+        )
+        for plan in peer_counter_plans:
+            arrivals = cast("int", plan.uniform_arrival_count()) * world_size
+            for consumer in plan.consumers:
+                if consumer.consumer_root != root:
+                    continue
+                assert peer is not None
+                key, membership = relation_flat_target(
+                    consumer.keys_by_consumer, coordinates
+                )
+                target = f"{peer.epoch} * {arrivals}"
+                if membership != "True":
+                    key = f"tl.where({membership}, {key}, 0)"
+                    target = f"tl.where({membership}, {target}, 0)"
+                token = device_function.new_var("tile_dependency_peer_token", dce=False)
+                statements.append(
+                    statement_from_string(
+                        f"{token} = tl.inline_asm_elementwise("
+                        "asm='{ .reg .pred p; .reg .b64 v; PEER_WAIT: "
+                        "ld.acquire.sys.global.u64 v, [$1]; setp.lt.u64 p, v, $2; "
+                        "@p bra PEER_WAIT; bar.warp.sync 0xffffffff; "
+                        f"{fence}mov.u32 $0, 0; }}', constraints='=r,l,l', "
+                        f"args=[{peer_keys} + {peer_key_word(plan, key)}, "
+                        f"tl.cast({target}, tl.uint64)], dtype=tl.int32, "
+                        "is_pure=False, pack=1)"
+                    )
+                )
+                tokens.append(token)
+        return statements, tokens
+
     dispatch_ticket: str | None = None
+    peer_launch = ""
     if not uses_packet_dispatch:
         assert state_arg is not None
         result: list[ast.stmt] = [
             statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
         ]
         if peer is not None:
-            # uint64 so peer targets never wrap; worker 0 advances it at exit.
-            result.append(
-                statement_from_string(
-                    f"{peer.epoch} = tl.load({peer.state} + {peer.launch}) + 1"
+            # uint64 so peer targets never wrap. Worker 0 advances it after the
+            # done barrier, or else every worker counts its own launches.
+            peer_launch = f"{peer.state} + {peer.launch}"
+            if not done_roots:
+                launches = _register_cross_loop_state(
+                    device_function,
+                    name_hint="tile_dependency_peer_launch",
+                    numel=str(launch_worker_count),
+                    dtype=torch.uint64,
                 )
+                peer_launch = f"{launches} + {worker}"
+            result.append(
+                statement_from_string(f"{peer.epoch} = tl.load({peer_launch}) + 1")
             )
     else:
         assert dispatch_ticket_arg is not None
@@ -2153,6 +2253,21 @@ def emit_cross_loop_schedule(
             raise AssertionError(f"missing nested producer sites {missing}")
         return result
 
+    def execution_coordinates(root: int, local_task: str) -> dict[int, str]:
+        execution = static_pipeline_plan.execution_orders[root].tasks_by_ordinal
+        coordinates, membership = relation_point_coordinates(
+            execution,
+            flat_task_coordinates(
+                local_task,
+                execution.source_domain.axis_order,
+                execution.source_domain.axis_count_expressions,
+            ),
+            trusted_total_point_map=True,
+        )
+        if membership != "True":
+            raise AssertionError("proved root execution order is not total")
+        return coordinates
+
     def scheduled_root_task_body(
         root: int,
         root_local_pid_task: str,
@@ -2167,19 +2282,7 @@ def emit_cross_loop_schedule(
         has_task_scheduling = root in nested_loop_counters_by_consumer
         producer_counters = tuple(root_counters_by_producer.get(root, ()))
         scheduled_logical_pid = logical_pid
-        execution = static_pipeline_plan.execution_orders[root].tasks_by_ordinal
-        ordinal_coordinates = flat_task_coordinates(
-            root_local_pid_task,
-            execution.source_domain.axis_order,
-            execution.source_domain.axis_count_expressions,
-        )
-        scheduled_coordinates, execution_membership = relation_point_coordinates(
-            execution,
-            ordinal_coordinates,
-            trusted_total_point_map=True,
-        )
-        if execution_membership != "True":
-            raise AssertionError("proved root execution order is not total")
+        scheduled_coordinates = execution_coordinates(root, root_local_pid_task)
         if producer_counters or root in nested_producer_roots:
             has_task_scheduling = True
         if root in scheduled_task_roots:
@@ -2228,6 +2331,14 @@ def emit_cross_loop_schedule(
                 )
             else:
                 body.extend(wait)
+        peer_counter_spins, peer_tokens = peer_counter_waits(
+            root, scheduled_coordinates
+        )
+        if peer_tokens:
+            # Zero tokens make every PID-derived address depend on the spins.
+            has_task_scheduling = True
+            body.extend(peer_counter_spins)
+            scheduled_logical_pid = " + ".join([scheduled_logical_pid, *peer_tokens])
         nested_loop_consumers = nested_loop_counters_by_consumer.get(root, ())
         if nested_loop_consumers:
             # Instrument the original logical loop before segmentation.
@@ -2283,7 +2394,10 @@ def emit_cross_loop_schedule(
                     noinline=force_noinline,
                 )
             )
-        if producer_counters:
+        peer_counter_adds = peer_counter_publications(
+            root, scheduled_coordinates, "release"
+        )
+        if producer_counters or peer_counter_adds:
             has_task_scheduling = True
             body.extend(_release_sync(device_function))
         for producer_counter_plan, readiness_producer in producer_counters:
@@ -2294,6 +2408,7 @@ def emit_cross_loop_schedule(
                     scheduled_coordinates,
                 )
             )
+        body.extend(peer_counter_adds)
         if not has_task_scheduling or root in kernel_scope_roots:
             return body
         # Entry-only bookkeeping on a single-trip root may inline. Counter
@@ -2306,6 +2421,7 @@ def emit_cross_loop_schedule(
         scheduled_wrapper_noinline = (
             not is_single_trip_occurrence
             or bool(producer_counters)
+            or bool(peer_counter_adds)
             or root in nested_producer_roots
         )
         return [
@@ -2336,6 +2452,7 @@ def emit_cross_loop_schedule(
         )
         extent = guarded_extents.get(root)
         hoisted: list[ast.stmt] = []
+        skipped_dispatch: list[ast.stmt] = []
         segment_stop = f"({segment_end})"
         if extent is not None:
             live = device_function.new_var("tile_dependency_live_tasks", dce=False)
@@ -2350,6 +2467,36 @@ def emit_cross_loop_schedule(
                 ),
             ]
             segment_stop = f"tl.minimum({segment_begin} + {live}, {segment_end})"
+            if any(
+                plan.producers[0].producer_root == root for plan in peer_counter_plans
+            ):
+                # Guard-skipped tasks still count once per launch for keyed peers.
+                skipped = device_function.new_var(
+                    "tile_dependency_skipped_task", dce=False
+                )
+                first = (
+                    f"{segment_begin} + ({lane}) + tl.maximum({live} - ({lane}) + "
+                    f"{launch_worker_count - 1}, 0) // {launch_worker_count} * "
+                    f"{launch_worker_count}"
+                )
+                skipped_dispatch.append(
+                    create(
+                        ast.For,
+                        target=create(ast.Name, id=skipped, ctx=ast.Store()),
+                        iter=expr_from_string(
+                            f"range({first}, {segment_end}, {launch_worker_count})"
+                        ),
+                        body=peer_counter_publications(
+                            root,
+                            execution_coordinates(
+                                root, f"({skipped}) - {segment_begin}"
+                            ),
+                            "relaxed",
+                        ),
+                        orelse=[],
+                        type_comment=None,
+                    )
+                )
         task_dispatch: list[ast.stmt] = [
             *hoisted,
             create(
@@ -2382,6 +2529,7 @@ def emit_cross_loop_schedule(
                 orelse=[],
                 type_comment=None,
             ),
+            *skipped_dispatch,
         ]
         incoming_roots = root_barrier_incoming.get(root, ())
         waits = peer_waits(root)
@@ -2434,12 +2582,14 @@ def emit_cross_loop_schedule(
                             f"helion_dist_utils._wait_at_least({peer.state} + "
                             f"{peer.done}, {peer_target(done_roots)})"
                         ),
-                        statement_from_string(
-                            f"tl.store({peer.state} + {peer.launch}, {peer.epoch})"
-                        ),
+                        statement_from_string(f"tl.store({peer_launch}, {peer.epoch})"),
                     ],
                     orelse=[],
                 )
+            )
+        elif peer is not None:
+            result.append(
+                statement_from_string(f"tl.store({peer_launch}, {peer.epoch})")
             )
     else:
         assert dispatch_ticket is not None
