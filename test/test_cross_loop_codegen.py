@@ -677,6 +677,25 @@ def runtime_bound_loop_chain(
     static_shapes=True,
     autotune_effort="none",
 )
+def guarded_prefix_chain(
+    x: torch.Tensor, flags: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, columns = x.size()
+    tmp = torch.zeros_like(x)
+    out = torch.empty_like(x)
+    for tile_c, tile_r in hl.tile([columns, rows], block_size=[64, 1]):
+        live = torch.sum((flags[:] > 0).to(torch.int32))
+        if tile_r.begin < live:
+            tmp[tile_r, tile_c] = x[tile_r, tile_c] + 1
+    for tile_r in hl.tile(rows, block_size=4):
+        out[tile_r, :] = tmp[tile_r, :] * 2 + tmp[0, :][None, :]
+    return tmp, out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def split_merge_chain(x: torch.Tensor) -> torch.Tensor:
     keys, splits = x.size()
     partial = torch.empty_like(x)
@@ -1754,6 +1773,39 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(out, torch.sum(x * mask, dim=1) * 2)
         self.assertNotIn("tile_dependency_root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_invariant_guard_bounds_the_static_task_loop(self) -> None:
+        x = torch.randn((32, 256), device=DEVICE, dtype=torch.float32)
+        for live in (0, 1, 5, 16):
+            flags = (torch.arange(16, device=DEVICE) < live).to(torch.int32)
+            code, (tmp, out) = code_and_output(
+                guarded_prefix_chain,
+                (x, flags),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=4,
+            )
+            expected = torch.zeros_like(x)
+            expected[:live] = x[:live] + 1
+            torch.testing.assert_close(tmp, expected)
+            torch.testing.assert_close(out, expected * 2 + expected[0][None, :])
+        kernel = _generated_function(code, "_helion_guarded_prefix_chain")
+        task_loop = next(
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.For) and ast.unparse(node.target) == "virtual_pid"
+        )
+        # The invariant bound is hoisted and caps the loop; tasks keep no guard.
+        prologue = ast.unparse(kernel).split("for virtual_pid")[0]
+        self.assertIn("tile_dependency_live_tasks", ast.unparse(task_loop.iter))
+        self.assertIn("redux.sync.min.s32", prologue)
+        self.assertIn("tl.sum(", prologue)
+        root = _generated_function(code, "tile_dependency_root_0")
+        self.assertFalse(any(isinstance(node, ast.If) for node in ast.walk(root)))
+        self.assertNotIn("flags", ast.unparse(root))
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
