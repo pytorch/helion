@@ -127,6 +127,23 @@ class TestControlFlow(RefEagerTestBase, TestCase):
         )
         torch.testing.assert_close(result, expected)
 
+    def test_if_stores_to_host_tensor_list(self):
+        @helion.kernel
+        def fn(x: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            outputs = [torch.zeros_like(x), torch.zeros_like(x)]
+            for tile in hl.tile(x.shape[0]):
+                if (y[tile] != 0).sum():
+                    for output in outputs:
+                        output[tile] = x[tile] * 2
+            return outputs[0], outputs[1]
+
+        x = torch.tensor([1.0, 2.0, 3.0, 4.0], device=DEVICE)
+        y = torch.tensor([0, 1, 0, 1], device=DEVICE, dtype=torch.int32)
+        expected = torch.tensor([0.0, 4.0, 0.0, 8.0], device=DEVICE)
+        code, (first, second) = code_and_output(fn, (x, y), block_size=1)
+        torch.testing.assert_close(first, expected)
+        torch.testing.assert_close(second, expected)
+
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     def test_constant_true(self):
         @helion.kernel(
