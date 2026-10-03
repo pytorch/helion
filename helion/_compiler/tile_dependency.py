@@ -4783,6 +4783,10 @@ class TileDependencyGraph:
             for dependency in edge.access_dependencies
         )
 
+    def cross_rank_pipelines(self) -> tuple[str, ...]:
+        """R5: peer counters order static or dynamic schedules, inband data dynamic."""
+        return ("dynamic",) if self.inband_allocation_ids else ("static", "dynamic")
+
     def rank_digest(self) -> str:
         """Hash the facts every rank must agree on; owners and regions may differ."""
         facts = (
@@ -6179,12 +6183,16 @@ def _subtract_reaching_accesses(
 
 
 def _reject_same_root_cross_rank_hazards(root_accesses: list[TileAccess]) -> None:
-    """No transport orders two ranks' accesses inside one root."""
+    """No transport orders a store and a load of two ranks inside one root.
+
+    Tasks of one root are unordered on every rank, so overlapping stores are the
+    program's race; pushes to peers order against later roots like local stores.
+    """
     for first, second in itertools.combinations_with_replacement(root_accesses, 2):
         if (
             first.allocation_id == second.allocation_id
             and _crosses_ranks(first, second)
-            and "store" in (first.kind, second.kind)
+            and {first.kind, second.kind} == {"store", "load"}
             and not (first.is_atomic and second.is_atomic)
         ):
             raise exc.CrossLoopSchedulingError(

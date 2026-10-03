@@ -538,7 +538,8 @@ def _register_cross_loop_state(
 
 @dataclasses.dataclass(frozen=True)
 class PeerState:
-    """Symmetric uint64 state: inband mailboxes, peer counters, a done slot.
+    """Symmetric uint64 state: inband mailboxes, peer counters, a done slot and
+    the static pipeline's launch epoch.
 
     Laid out from the dependency graph alone, so body codegen and the
     schedule agree on it whichever registers it first.
@@ -553,6 +554,7 @@ class PeerState:
     mailboxes: dict[int, tuple[int, int]]
     slots: dict[int, int]
     done: int
+    launch: int
 
     def mailbox(self, allocation_id: int, source: object) -> str:
         """Word offset of ``source``'s slot for this launch's parity."""
@@ -595,7 +597,7 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     state = _register_cross_loop_state(
         device_function,
         name_hint="tile_dependency_peer_state",
-        numel=str(done + 1),
+        numel=str(done + 2),
         dtype=torch.uint64,
         symmetric=True,
     )
@@ -626,6 +628,7 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
         mailboxes=mailboxes,
         slots=slots,
         done=done,
+        launch=done + 1,
     )
     return device_function.peer_state
 
@@ -713,11 +716,11 @@ def emit_cross_loop_schedule(
     pipeline = device_function.config.cross_loop_pipeline
     dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
     assert dependency_graph is not None
-    # Only the dynamic pipeline emits peer transports; R5 offers no other choice.
-    if pipeline != "dynamic" and dependency_graph.crosses_ranks():
-        raise AssertionError(
-            "cross-rank tile dependencies require cross_loop_pipeline='dynamic'"
-        )
+    if (
+        dependency_graph.crosses_ranks()
+        and pipeline not in dependency_graph.cross_rank_pipelines()
+    ):
+        raise AssertionError(f"cross-rank tile dependencies cannot use {pipeline!r}")
     if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)
@@ -963,12 +966,15 @@ def emit_cross_loop_schedule(
     ):
         raise AssertionError("an inband access was not emitted as a push or poll")
 
+    def peer_arrivals(root: int) -> int:
+        # Dynamic tasks publish one by one, static workers once per root.
+        tasks = int(static_pipeline_plan.execution_orders[root].task_count)
+        return tasks if pipeline == "dynamic" else min(tasks, launch_worker_count)
+
     def peer_target(roots: Iterable[int]) -> str:
         assert peer is not None
-        tasks = sum(
-            static_pipeline_plan.execution_orders[root].task_count for root in roots
-        )
-        return f"{peer.epoch} * {int(tasks) * world_size}"
+        arrivals = sum(peer_arrivals(root) for root in roots)
+        return f"{peer.epoch} * {arrivals * world_size}"
 
     def peer_waits(root: int) -> list[ast.stmt]:
         producers = sorted(
@@ -1010,6 +1016,13 @@ def emit_cross_loop_schedule(
         result: list[ast.stmt] = [
             statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
         ]
+        if peer is not None:
+            # uint64 so peer targets never wrap; worker 0 advances it at exit.
+            result.append(
+                statement_from_string(
+                    f"{peer.epoch} = tl.load({peer.state} + {peer.launch}) + 1"
+                )
+            )
     else:
         assert dispatch_ticket_arg is not None
         raw_dispatch_ticket = device_function.new_var(
@@ -2086,9 +2099,13 @@ def emit_cross_loop_schedule(
             )
         ]
         incoming_roots = root_barrier_incoming.get(root, ())
+        waits = peer_waits(root)
+        publications = peer_publications(root)
         if (
             not incoming_roots
             and root not in root_barrier_indices
+            and not waits
+            and not publications
             and active_worker_count == launch_worker_count
         ):
             return task_dispatch
@@ -2098,9 +2115,12 @@ def emit_cross_loop_schedule(
             dependencies=root_barrier_input_dependencies(root),
             prefix="tile_dependency_root_barrier_wait",
         )
+        active_body.extend(waits)
         active_body.extend(task_dispatch)
-        if root in root_barrier_indices:
-            active_body.extend(root_barrier_publication(root))
+        if publications:
+            active_body.extend(_release_sync(device_function))
+        active_body.extend(root_barrier_publication(root, synced=bool(publications)))
+        active_body.extend(publications)
         return [
             create(
                 ast.If,
@@ -2117,6 +2137,25 @@ def emit_cross_loop_schedule(
         result.append(
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
         )
+        if done_roots:
+            # Every worker that reads the epoch publishes to the done slot first.
+            assert peer is not None
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"{worker} == 0"),
+                    body=[
+                        statement_from_string(
+                            f"helion_dist_utils._wait_at_least({peer.state} + "
+                            f"{peer.done}, {peer_target(done_roots)})"
+                        ),
+                        statement_from_string(
+                            f"tl.store({peer.state} + {peer.launch}, {peer.epoch})"
+                        ),
+                    ],
+                    orelse=[],
+                )
+            )
     else:
         assert dispatch_ticket is not None
         packet_branches: list[tuple[int, bool, ast.stmt]] = []

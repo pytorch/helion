@@ -3693,9 +3693,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 env.require_persistent_blocked(reason)
-                # R5: only the dynamic pipeline has cross-rank transports.
                 config_spec.enable_cross_loop_pipeline(
-                    choices=("dynamic",) if cross_rank else VALID_CROSS_LOOP_PIPELINES
+                    choices=device_ir.tile_dependency_graph.cross_rank_pipelines()
+                    if cross_rank
+                    else VALID_CROSS_LOOP_PIPELINES
                 )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
