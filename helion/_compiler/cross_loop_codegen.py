@@ -936,11 +936,8 @@ def emit_cross_loop_schedule(
     pipeline = device_function.config.cross_loop_pipeline
     dependency_graph = HostFunction.current().device_ir.tile_dependency_graph
     assert dependency_graph is not None
-    if (
-        dependency_graph.crosses_ranks()
-        and pipeline not in dependency_graph.cross_rank_pipelines()
-    ):
-        raise AssertionError(f"cross-rank tile dependencies cannot use {pipeline!r}")
+    if dependency_graph.crosses_ranks() and pipeline == "barrier":
+        raise AssertionError("cross-rank tile dependencies cannot use 'barrier'")
     if pipeline == "barrier":
         device_function.has_barrier = True
         return owner._emit_phase_loops(strategy, device_function, total_expr)

@@ -4818,10 +4818,6 @@ class TileDependencyGraph:
             edges=edges,
         )
 
-    def cross_rank_pipelines(self) -> tuple[str, ...]:
-        """R5: peer counters order static or dynamic schedules, inband data dynamic."""
-        return ("dynamic",) if self.inband_allocation_ids else ("static", "dynamic")
-
     def rank_digest(self) -> str:
         """Hash the facts every rank must agree on; owners and regions may differ."""
         peer = self.peer_counter_graph()
