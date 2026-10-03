@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -701,6 +702,209 @@ def _triton_root_requires_kernel_scope(
     )
 
 
+_PURE_TL_CALLS = frozenset(
+    {
+        "arange",
+        "broadcast_to",
+        "cast",
+        "cdiv",
+        "cumsum",
+        "expand_dims",
+        "full",
+        "join",
+        "load",
+        "max",
+        "maximum",
+        "min",
+        "minimum",
+        "permute",
+        "reduce",
+        "reshape",
+        "split",
+        "sum",
+        "where",
+        "zeros",
+    }
+)
+# Hoisting these from a persistent task loop saves memory traffic or a reduction.
+_HOIST_ANCHOR_CALLS = frozenset({"cumsum", "load", "max", "min", "reduce", "sum"})
+
+
+@dataclasses.dataclass(frozen=True)
+class _GuardedExtent:
+    """A root whose slowest-axis guard against a task-invariant bound became a
+    dynamic task count, with the bound's slice hoisted out of the task loop."""
+
+    hoisted: list[ast.stmt]
+    body: list[ast.stmt]
+    hoisted_names: tuple[str, ...]
+    live_tasks: str
+
+
+def _is_tl_call(node: ast.AST, names: frozenset[str]) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.func.attr in names
+    )
+
+
+def _is_pure_call(node: ast.Call) -> bool:
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if func.attr == "to":
+        return True
+    return isinstance(func.value, ast.Name) and (
+        func.value.id in ("libdevice", "tl_math")
+        or (func.value.id == "tl" and func.attr in _PURE_TL_CALLS)
+    )
+
+
+def _guarded_extent(
+    body: list[ast.stmt],
+    *,
+    slowest: PIDInfo,
+    block_size: int,
+    inner_tasks: int,
+    variant_names: frozenset[str],
+    read_only_tensors: frozenset[str],
+    tensor_names: frozenset[str],
+) -> _GuardedExtent | None:
+    """Turn a trailing ``if offset < bound`` on the slowest PID axis into a task count.
+
+    Every other top-level statement must be a pure single assignment, so tasks past
+    the bound are no-ops. Invariant loads and reductions are hoisted with the bound.
+    """
+    if not body or not isinstance(guard := body[-1], ast.If):
+        return None
+    prefix = body[:-1]
+    if not isinstance(guard.test, ast.Name) or not all(
+        isinstance(statement, ast.Pass) for statement in guard.orelse
+    ):
+        return None
+    if not all(
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and all(
+            _is_pure_call(node)
+            for node in ast.walk(statement.value)
+            if isinstance(node, ast.Call)
+        )
+        for statement in prefix
+    ):
+        return None
+    stores: dict[str, int] = {}
+    loads: dict[str, int] = {}
+    for statement in body:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name):
+                counts = stores if isinstance(node.ctx, ast.Store) else loads
+                counts[node.id] = counts.get(node.id, 0) + 1
+    values = {
+        cast("ast.Name", statement.targets[0]).id: statement.value
+        for statement in cast("list[ast.Assign]", prefix)
+    }
+    test = guard.test.id
+    predicate = values.get(test)
+    if (
+        stores.get(test) != 1
+        or loads.get(test) != 1
+        or not isinstance(predicate, ast.Compare)
+        or len(predicate.ops) != 1
+    ):
+        return None
+    left, right = predicate.left, predicate.comparators[0]
+    if isinstance(predicate.ops[0], ast.Gt):
+        bound, offset = left, right
+    elif isinstance(predicate.ops[0], ast.Lt):
+        bound, offset = right, left
+    else:
+        return None
+    if not isinstance(bound, ast.Name) or not isinstance(offset, ast.Name):
+        return None
+    # The guarded offset must be the tile begin of the slowest axis.
+    pid = slowest.pid_var
+    offset_value = values.get(offset.id)
+    if (
+        stores.get(offset.id) != 1
+        or offset_value is None
+        or ast.unparse(offset_value)
+        not in (f"{pid} * {slowest.block_size_var}", *([pid] * (block_size == 1)))
+    ):
+        return None
+
+    def is_invariant(value: ast.expr, invariant: set[str]) -> bool:
+        for node in ast.walk(value):
+            if (
+                isinstance(node, ast.Name)
+                and node.id not in invariant
+                and (node.id in stores or node.id in variant_names)
+            ):
+                return False
+            if _is_tl_call(node, frozenset({"load"})) and (
+                not node.args
+                or any(keyword.arg == "volatile" for keyword in node.keywords)
+                or any(
+                    pointer.id in tensor_names and pointer.id not in read_only_tensors
+                    for pointer in ast.walk(node.args[0])
+                    if isinstance(pointer, ast.Name)
+                )
+            ):
+                return False
+        return True
+
+    invariant: set[str] = set()
+    for name, value in values.items():
+        if stores[name] == 1 and is_invariant(value, invariant):
+            invariant.add(name)
+    if bound.id not in invariant and (bound.id in stores or bound.id in variant_names):
+        return None
+
+    anchors = [
+        name
+        for name in invariant
+        if name == bound.id
+        or any(
+            _is_tl_call(node, _HOIST_ANCHOR_CALLS) for node in ast.walk(values[name])
+        )
+    ]
+    hoisted: set[str] = set()
+    while anchors:
+        name = anchors.pop()
+        if name in hoisted:
+            continue
+        hoisted.add(name)
+        anchors.extend(
+            node.id
+            for node in ast.walk(values[name])
+            if isinstance(node, ast.Name) and node.id in invariant
+        )
+    hoisted_statements = [
+        _clone_stmt(statement)
+        for statement in cast("list[ast.Assign]", prefix)
+        if cast("ast.Name", statement.targets[0]).id in hoisted
+    ]
+    remaining = [
+        _clone_stmt(statement)
+        for statement in cast("list[ast.Assign]", prefix)
+        if cast("ast.Name", statement.targets[0]).id not in {*hoisted, test}
+    ]
+    tiles = bound.id if block_size == 1 else f"tl.cdiv({bound.id}, {block_size})"
+    return _GuardedExtent(
+        hoisted=hoisted_statements,
+        body=[*remaining, *(_clone_stmt(statement) for statement in guard.body)],
+        hoisted_names=tuple(
+            cast("ast.Name", statement.targets[0]).id
+            for statement in hoisted_statements
+        ),
+        live_tasks=tiles if inner_tasks == 1 else f"{inner_tasks} * {tiles}",
+    )
+
+
 def emit_cross_loop_schedule(
     owner: ForEachProgramID,
     strategy: PersistentProgramIDs,
@@ -1170,6 +1374,49 @@ def emit_cross_loop_schedule(
             nested_loop_counters_by_consumer.setdefault(
                 readiness_consumer.consumer_root, []
             ).append((plan, readiness_consumer))
+    # A skipped task must not owe a per-task publication or reorder body PIDs.
+    written_allocations = {
+        access.allocation_id
+        for access in dependency_graph.accesses
+        if access.kind == "store"
+    }
+    access_names = {
+        written: frozenset(
+            access.tensor_name
+            for access in dependency_graph.accesses
+            if access.tensor_name is not None
+            and (access.allocation_id in written_allocations) == written
+        )
+        for written in (False, True)
+    }
+    guarded_extents: dict[int, _GuardedExtent] = {}
+    for root in () if uses_packet_dispatch else static_pipeline_plan.resident_roots:
+        axis_order, axis_counts, block_sizes = case_geometries[root]
+        inner_counts = [axis_counts[block_id] for block_id in axis_order[:-1]]
+        if (
+            root in scheduled_task_roots
+            or root in root_counters_by_producer
+            or root in nested_producer_roots
+            or root in nested_loop_counters_by_consumer
+            or isinstance(owner.cases[root], L2GroupingProgramIDs)
+            or not all(isinstance(count, int) for count in inner_counts)
+        ):
+            continue
+        extent = _guarded_extent(
+            case_bodies[root],
+            slowest=_case_pid_info(owner.cases[root])[-1],
+            block_size=block_sizes[axis_order[-1]],
+            inner_tasks=math.prod(cast("list[int]", inner_counts)),
+            variant_names=frozenset({owner.shared_pid_var, strategy.virtual_pid_var}),
+            read_only_tensors=access_names[False] - access_names[True],
+            tensor_names=frozenset(
+                argument.name
+                for argument in device_function.arguments
+                if isinstance(argument, TensorArg)
+            ),
+        )
+        if extent is not None:
+            guarded_extents[root] = extent
 
     def flat_task_coordinates(
         task: str,
@@ -1899,6 +2146,8 @@ def emit_cross_loop_schedule(
         force_noinline: bool = False,
     ) -> list[ast.stmt]:
         body: list[ast.stmt] = []
+        extent = guarded_extents.get(root)
+        root_body = case_bodies[root] if extent is None else extent.body
         has_task_scheduling = root in nested_loop_counters_by_consumer
         producer_counters = tuple(root_counters_by_producer.get(root, ()))
         scheduled_logical_pid = logical_pid
@@ -1970,7 +2219,7 @@ def emit_cross_loop_schedule(
             # expression instead of rebasing publication IDs per segment.
             scheduled_root_body = body_with_nested_loop_publications(
                 root,
-                case_bodies[root],
+                root_body,
                 scheduled_coordinates,
             )
             for loop_plan, loop_consumer in sorted(
@@ -2001,7 +2250,7 @@ def emit_cross_loop_schedule(
                 *_clone_opaque_statements(
                     body_with_nested_loop_publications(
                         root,
-                        case_bodies[root],
+                        root_body,
                         scheduled_coordinates,
                     )
                 ),
@@ -2069,7 +2318,24 @@ def emit_cross_loop_schedule(
             if active_worker_count == 1
             else f"(({lane}) >= 0 and ({lane}) < {active_worker_count})"
         )
+        extent = guarded_extents.get(root)
+        hoisted: list[ast.stmt] = []
+        segment_stop = f"({segment_end})"
+        if extent is not None:
+            live = device_function.new_var("tile_dependency_live_tasks", dce=False)
+            # redux.sync makes the bound provably warp-uniform, so tcgen05 issue
+            # inside the task loop stays a single elected thread.
+            hoisted = [
+                *extent.hoisted,
+                statement_from_string(
+                    f"{live} = tl.inline_asm_elementwise('redux.sync.min.s32 $0, $1, "
+                    f"0xffffffff;', '=r,r', [tl.cast({extent.live_tasks}, tl.int32)], "
+                    "dtype=tl.int32, is_pure=True, pack=1)"
+                ),
+            ]
+            segment_stop = f"tl.minimum({segment_begin} + {live}, {segment_end})"
         task_dispatch: list[ast.stmt] = [
+            *hoisted,
             create(
                 ast.For,
                 target=create(
@@ -2083,7 +2349,7 @@ def emit_cross_loop_schedule(
                         device_function.config,
                         [info.block_id for info in _case_pid_info(owner.cases[root])],
                         begin=f"(({lane}) - 0) + ({segment_begin})",
-                        end=f"({segment_end})",
+                        end=segment_stop,
                         step=str(launch_worker_count),
                     )
                 ),
@@ -2092,11 +2358,14 @@ def emit_cross_loop_schedule(
                     f"({strategy.virtual_pid_var}) - {segment_begin}",
                     f"{case_offsets[root]} + "
                     f"(({strategy.virtual_pid_var}) - {segment_begin})",
-                    (strategy.virtual_pid_var,),
+                    (
+                        strategy.virtual_pid_var,
+                        *(() if extent is None else extent.hoisted_names),
+                    ),
                 ),
                 orelse=[],
                 type_comment=None,
-            )
+            ),
         ]
         incoming_roots = root_barrier_incoming.get(root, ())
         waits = peer_waits(root)
