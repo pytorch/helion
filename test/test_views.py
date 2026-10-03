@@ -244,6 +244,18 @@ class TestViews(RefEagerTestBase, TestCase):
             expected = torch.chunk(x, 2, dim=-1)
             for use_method in (False, True):
                 with self.subTest(d=d, use_method=use_method):
+                    if not self._in_ref_eager_mode:
+                        bound = fn.bind((x, use_method))
+                        # The specialized full axis must stay persistent.
+                        self.assertEqual(
+                            bound.env.config_spec.reduction_loops.valid_block_ids(), []
+                        )
+                        with self.assertRaisesRegex(
+                            helion.exc.InvalidConfig, "Too many values.*reduction_loops"
+                        ):
+                            bound.compile_config(
+                                helion.Config(block_sizes=[32], reduction_loops=[16])
+                            )
                     code, result = code_and_output(
                         fn, (x, use_method), block_sizes=[32]
                     )
@@ -306,6 +318,18 @@ class TestViews(RefEagerTestBase, TestCase):
             expected = torch.unbind(x.reshape(65, 2, d // 2), dim=1)
             for use_method in (False, True):
                 with self.subTest(d=d, use_method=use_method):
+                    if not self._in_ref_eager_mode:
+                        bound = fn.bind((x, use_method))
+                        # Reshaping the full slice must not permit partial loads.
+                        self.assertEqual(
+                            bound.env.config_spec.reduction_loops.valid_block_ids(), []
+                        )
+                        with self.assertRaisesRegex(
+                            helion.exc.InvalidConfig, "Too many values.*reduction_loops"
+                        ):
+                            bound.compile_config(
+                                helion.Config(block_sizes=[32], reduction_loops=[16])
+                            )
                     _code, result = code_and_output(
                         fn, (x, use_method), block_sizes=[32]
                     )
