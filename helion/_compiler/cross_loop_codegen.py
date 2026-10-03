@@ -797,7 +797,8 @@ def _guarded_extent(
         return node.id if isinstance(node, ast.Name) else None
 
     if not all(
-        (name := target(statement)) is not None
+        isinstance(statement, (ast.Assign, ast.AugAssign))
+        and (name := target(statement)) is not None
         and (isinstance(statement, ast.Assign) or name in variant_names)
         and all(
             _is_pure_call(node)
@@ -856,13 +857,18 @@ def _guarded_extent(
                 and (node.id in stores or node.id in variant_names)
             ):
                 return False
-            if _is_tl_call(node, frozenset({"load"})) and (
-                not node.args
-                or any(keyword.arg == "volatile" for keyword in node.keywords)
-                or any(
-                    pointer.id in tensor_names and pointer.id not in read_only_tensors
-                    for pointer in ast.walk(node.args[0])
-                    if isinstance(pointer, ast.Name)
+            if (
+                isinstance(node, ast.Call)
+                and _is_tl_call(node, frozenset({"load"}))
+                and (
+                    not node.args
+                    or any(keyword.arg == "volatile" for keyword in node.keywords)
+                    or any(
+                        pointer.id in tensor_names
+                        and pointer.id not in read_only_tensors
+                        for pointer in ast.walk(node.args[0])
+                        if isinstance(pointer, ast.Name)
+                    )
                 )
             ):
                 return False
