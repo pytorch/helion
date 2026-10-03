@@ -30,6 +30,7 @@ from helion._testing import patch_cute_mma_support
 from helion._testing import skipUnlessBackends
 from helion.exc import InvalidConfig
 import helion.language as hl
+from helion.runtime.kernel import Kernel
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -68,6 +69,26 @@ def _hstu_args(
 
 def _hstu2_module() -> Any:
     return import_path(EXAMPLES_DIR / "jagged_hstu_attn_2.py")
+
+
+def _with_fast_math(kernel: Any, enabled: bool) -> Any:
+    """``kernel`` with the ``fast_math`` setting forced to ``enabled``.
+
+    The HSTU examples ship with ``fast_math=True`` (the approximate gate
+    division is Triton's contract); the exact-division renders are pinned
+    through this twin, which keeps every other setting of the example.
+    """
+    return Kernel(kernel.fn, settings=kernel.settings.copy(fast_math=enabled))
+
+
+# The gate's division: the IEEE divide of the exact path, and the approximate
+# reciprocal multiply the ``fast_math`` setting selects (the only line of the
+# gate program that differs between the two modes).
+_IEEE_GATE_DIVISION = re.compile(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", re.MULTILINE)
+_APPROX_GATE_DIVISION = re.compile(
+    r"flash_g\d+ = flash_g\d+ \* cute\.math\.rcp\(flash_g\d+, approx=True, ftz=True\)$",
+    re.MULTILINE,
+)
 
 
 def _hstu2_args(
@@ -868,12 +889,15 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
     )
     assert "flash_g7 = cutlass.select_(flash_g5, flash_g6, cutlass.Int32(0))" in code
     assert "flash_g9 = flash_g7 & flash_g8" in code
-    # ``exp`` feeding ``1 + e`` uses the flush-to-zero ex2 (identical result);
-    # the division stays IEEE.
+    # ``exp`` feeding ``1 + e`` uses the flush-to-zero ex2 (identical result).
+    # The example ships with ``fast_math=True``, so the gate's division is the
+    # approximate reciprocal multiply; the exact twin's IEEE division is
+    # pinned in ``test_fast_math_setting_selects_approximate_gate_math``.
     assert re.search(
         r"cute\.math\.exp2\(flash_g\d+ \* 1\.4426950408889634, fastmath=True\)", code
     )
-    assert re.search(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", code, re.MULTILINE)
+    assert _APPROX_GATE_DIVISION.search(code)
+    assert not _IEEE_GATE_DIVISION.search(code)
     # The P handoff ring: warp 0 waits for P, issues the PV MMAs and releases
     # the stage (the gate's second acquire of a stage waits on that release).
     assert "flash_p_full = flash_p_ready_cons.wait_and_advance()" in code
@@ -1135,6 +1159,7 @@ def test_hstu2_sequence_form_selects_gated_body(head_dim: int) -> None:
             cute_flash_gate_warpgroups=2,
         )
         code = bound.to_code(config)
+        exact = _with_fast_math(kernel, False).bind(args).to_code(config)
     assert _gated_markers(code)
     # One CTA per (sequence, head): the grid is multiplied by the head count and
     # the head is the fastest coordinate.
@@ -1172,7 +1197,12 @@ def test_hstu2_sequence_form_selects_gated_body(head_dim: int) -> None:
     )
     assert "tSTrS.store(flash_p_v)" in code
     assert "St32x32bOp(cute_tcgen05_flash.Repetition(32))" in code
-    assert re.search(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", code, re.MULTILINE)
+    # The example ships with ``fast_math=True``: approximate gate division; the
+    # exact twin keeps the IEEE divide.
+    assert _APPROX_GATE_DIVISION.search(code)
+    assert not _IEEE_GATE_DIVISION.search(code)
+    assert _IEEE_GATE_DIVISION.search(exact)
+    assert not _APPROX_GATE_DIVISION.search(exact)
     assert "block=(384, 1, 1)" in code
 
 
@@ -1372,10 +1402,12 @@ def test_hstu_64_row_tile_codegen(
 
 def test_fast_math_setting_selects_approximate_gate_math() -> None:
     """The existing fast_math setting (never a config knob) switches the gate's
-    division and exp2 to the approximate forms; the default stays IEEE."""
+    division and exp2 to the approximate forms; without it the gate stays IEEE.
+    The shipped example enables the setting; its exact twin is built here."""
     mod = _hstu_module()
-    exact_kernel = mod._helion_jagged_attention_kernel
-    fast_kernel = helion.kernel(fast_math=True)(exact_kernel.fn)
+    fast_kernel = mod._helion_jagged_attention_kernel
+    assert fast_kernel.settings.fast_math
+    exact_kernel = _with_fast_math(fast_kernel, False)
     config = helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=2)
     args = _hstu_args()
     with _cpu_codegen_patches():
@@ -1384,13 +1416,13 @@ def test_fast_math_setting_selects_approximate_gate_math() -> None:
         fast = fast_kernel.bind(args).to_code(config)
     assert _gated_markers(exact) and _gated_markers(fast)
     assert "approx=True" not in exact
-    # The only fast-math exp2 of the exact path is the ``1 + exp(v)`` site,
-    # where the flush-to-zero form is provably identical.
-    assert exact.count("fastmath=True") == 1
-    assert re.search(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", exact, re.MULTILINE)
-    assert "cute.math.rcp(" in fast and "approx=True, ftz=True" in fast
-    assert "fastmath=True" in fast
-    assert not re.search(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", fast, re.MULTILINE)
+    # The ``1 + exp(v)`` site is the only flush-to-zero exp2 in BOTH modes (the
+    # ftz form is provably identical there); the setting changes the division.
+    assert exact.count("fastmath=True") == fast.count("fastmath=True") == 1
+    assert _IEEE_GATE_DIVISION.search(exact)
+    assert not _APPROX_GATE_DIVISION.search(exact)
+    assert _APPROX_GATE_DIVISION.search(fast)
+    assert not _IEEE_GATE_DIVISION.search(fast)
 
 
 def test_gated_match_facts_and_online_softmax_rejection() -> None:
@@ -1657,9 +1689,7 @@ def test_gated_kernel_compiles_without_gpu(
     )
     args = _hstu_args(head_dim=head_dim)
     mod = _hstu_module()
-    kernel = mod._helion_jagged_attention_kernel
-    if fast_math:
-        kernel = helion.kernel(fast_math=True)(kernel.fn)
+    kernel = _with_fast_math(mod._helion_jagged_attention_kernel, fast_math)
     with _cpu_codegen_patches(), patch.dict(os.environ, env_patch):
         kernel.reset()
         bound = kernel.bind(args)
@@ -2019,7 +2049,9 @@ def test_gated_oversubscribed_grid_is_deterministic(q_tile: int) -> None:
 # pyrefly: ignore [bad-argument-type]
 @onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gated_fast_math_matches_reference_on_gpu() -> None:
+def test_gated_exact_math_matches_reference_on_gpu() -> None:
+    """The shipped example runs the fast_math gate in every other GPU test;
+    this one runs the exact (IEEE division) twin against the reference."""
     torch.manual_seed(11)
     max_seq_len = 300
     q, k, v, seq_offsets = _jagged_inputs([300, 173, 261, 5], 2, 64)
@@ -2034,12 +2066,11 @@ def test_gated_fast_math_matches_reference_on_gpu() -> None:
         keep=_causal_keep,
         kv_end="tile_end",
     )
-    kernel = helion.kernel(fast_math=True)(
-        _hstu_module()._helion_jagged_attention_kernel.fn
-    )
+    kernel = _with_fast_math(_hstu_module()._helion_jagged_attention_kernel, False)
     config = helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=3)
     out = _run_gated(kernel, args, config)
-    assert "approx=True" in kernel.bind(args).to_code(config)
+    code = kernel.bind(args).to_code(config)
+    assert _IEEE_GATE_DIVISION.search(code) and not _APPROX_GATE_DIVISION.search(code)
     _assert_matches(out, expected, 3e-2)
 
 
