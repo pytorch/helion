@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import unittest
 
 import torch
@@ -127,13 +128,17 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
             return out
 
         code, result = code_and_output(jagged_row_sum, (x, offsets))
+        torch.testing.assert_close(result, ref(x, offsets))
         if _get_backend() == "cute":
+            self.assertIn(
+                "mask_0 = cutlass.Int32(cute.arch.thread_idx()[0]) < _BLOCK_SIZE_0 and indices_0 < 4",
+                code,
+            )
             self.assertIn("mask_1 = indices_1 < v_2", code)
-            self.assertIn("if mask_1 else cutlass.Float32(0)", code)
+            self.assertIn("if mask_0 and mask_1 else cutlass.Float32(0)", code)
         else:
             self.assertIn("mask_1 = indices_1[None, :] < v_2[:, None]", code)
             self.assertIn("mask_0[:, None] & mask_1", code)
-        torch.testing.assert_close(result, ref(x, offsets))
 
     def test_nested_jagged_tile(self):
         @helion.kernel(autotune_effort="none")
@@ -191,7 +196,27 @@ class TestJaggedTile(RefEagerTestDisabled, TestCase):
         if _get_backend() == "cute":
             self.assertIn("mask_1 = indices_1 < row_feature_counts", code)
             self.assertIn("mask_2 = indices_2 < row_lengths_copy_0", code)
-            self.assertIn("if mask_0 and mask_2 and mask_1 else", code)
+            # Boolean balancing may change parentheses, while the guarded
+            # load must retain all three masks in their short-circuit order.
+            loads = [
+                node.value
+                for node in ast.walk(ast.parse(code))
+                if isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == "load"
+                    for target in node.targets
+                )
+            ]
+            self.assertEqual(len(loads), 1)
+            load = loads[0]
+            assert isinstance(load, ast.IfExp)
+
+            def conjuncts(node: ast.AST) -> list[str]:
+                if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And):
+                    return [term for value in node.values for term in conjuncts(value)]
+                return [ast.unparse(node)]
+
+            self.assertEqual(conjuncts(load.test), ["mask_0", "mask_2", "mask_1"])
         else:
             self.assertIn(
                 "mask_1 = indices_1[None, :] < row_feature_counts[:, None]", code

@@ -2488,14 +2488,14 @@ def _apply_pre_broadcast_transform(
 
     - The subscript[..., None] unsqueezes become identity (the trailing dim
       is already present in the scratch).
-    - A _pre_broadcast_tile op is inserted where the narrow (128-wide)
-      value needs to match a wider dimension (e.g. head_dim=256), generating
-      jnp.tile(tensor, block_size // 128) in the output code.
+    - A _pre_broadcast_tile op is inserted where the 128-wide value needs to
+      match a consumer. Wider dimensions are tiled in 128-element groups;
+      narrower dimensions read the required prefix.
     - Lower-rank values (e.g. reduction results) get an unsqueeze to [..., 1]
       so JAX broadcasting against the [..., 128] scratch still works.
 
     The transform is gated by the pallas_pre_broadcast config flag and only
-    applies when all broadcast target dimensions are multiples of 128.
+    applies when each broadcast target is at most 128 or a multiple of 128.
     """
     candidates = _find_pre_broadcast_candidates(
         graph, carried, proxy_args, env, state.config
@@ -2560,12 +2560,20 @@ def _dim_concrete_size(
     """
     if isinstance(dim, int):
         return dim
+    replaced = env.shape_env.replace(_symint_sympy_expr(dim))
+    if isinstance(replaced, (int, sympy.Integer, sympy.Number)):
+        return int(replaced)
     block_id = env.get_block_id(dim)
     if block_id is not None and block_id < len(env.block_sizes):
         val = env.block_sizes[block_id].from_config(config)
         if isinstance(val, int):
             return val
     return None
+
+
+def _pre_broadcast_target_is_supported(size: int) -> bool:
+    """Whether a 128-wide value can be repeated or sliced to ``size``."""
+    return size <= PRE_BROADCAST_SIZE or size % PRE_BROADCAST_SIZE == 0
 
 
 def _placeholder_has_broadcast_usage(
@@ -2580,8 +2588,8 @@ def _placeholder_has_broadcast_usage(
     First finds unsqueeze nodes (subscript[..., None]) reachable from the
     placeholder through same-rank ops.  Then checks whether any unsqueeze
     result is consumed by an op whose sibling arg has a wider last dimension,
-    confirming an actual broadcast.  All broadcast target dimensions must be
-    multiples of PRE_BROADCAST_SIZE for the optimization to be valid.
+    confirming an actual broadcast. Each target must be at most
+    PRE_BROADCAST_SIZE or a multiple of it.
     """
     unsqueeze_nodes: list[torch.fx.Node] = []
     worklist = [ph]
@@ -2622,7 +2630,7 @@ def _placeholder_has_broadcast_usage(
                 if isinstance(arg_last, int) and arg_last == 1:
                     continue
                 size = _dim_concrete_size(arg_last, env, config)
-                if size is not None and size % PRE_BROADCAST_SIZE != 0:
+                if size is not None and not _pre_broadcast_target_is_supported(size):
                     return False
                 found_broadcast = True
     return found_broadcast
@@ -2786,7 +2794,7 @@ def _rewrite_scratch_init_for_pre_broadcast(
 def _rewrite_outer_subscripts_for_pre_broadcast(
     for_loop_node: torch.fx.Node | None,
     candidates: dict[int, torch.fx.Node],
-    config: object,
+    config: Config,
 ) -> None:
     """Rewrite outer-scope subscript[..., None] to identity for pre-broadcast results.
 
@@ -2871,16 +2879,33 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
         last_dim_int = int(last_dim)
         if last_dim_int > PRE_BROADCAST_SIZE:
             continue
+        # A same-rank narrow peer fixes the result width. In that case the
+        # pre-broadcast operand is sliced at this consumer instead of making
+        # the consumer itself 128-wide.
         has_pre_broadcast_arg = False
+        has_narrow_peer = False
         for arg in node.args:
-            if isinstance(arg, torch.fx.Node) and arg.name in all_pre_broadcast_outer:
-                arg_val = arg.meta.get("val", None)
-                if isinstance(arg_val, torch.Tensor) and len(arg_val.shape) >= 2:
-                    arg_last = arg_val.shape[-1]
-                    if isinstance(arg_last, int) and arg_last == PRE_BROADCAST_SIZE:
-                        has_pre_broadcast_arg = True
-                        break
-        if has_pre_broadcast_arg:
+            if not isinstance(arg, torch.fx.Node):
+                continue
+            arg_val = arg.meta.get("val", None)
+            if not isinstance(arg_val, torch.Tensor) or len(arg_val.shape) < 2:
+                continue
+            arg_last = arg_val.shape[-1]
+            arg_last_size = _dim_concrete_size(
+                arg_last, CompileEnvironment.current(), config
+            )
+            if (
+                arg.name in all_pre_broadcast_outer
+                and arg_last_size == PRE_BROADCAST_SIZE
+            ):
+                has_pre_broadcast_arg = True
+            elif (
+                len(arg_val.shape) == len(node_val.shape)
+                and arg_last_size is not None
+                and arg_last_size not in (1, PRE_BROADCAST_SIZE)
+            ):
+                has_narrow_peer = True
+        if has_pre_broadcast_arg and not has_narrow_peer:
             new_shape = [*node_val.shape[:-1], PRE_BROADCAST_SIZE]
             node.meta["val"] = node_val.new_empty(new_shape)
             all_pre_broadcast_outer.add(node.name)
@@ -2895,7 +2920,7 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
             continue
         last_dim = node_val.shape[-1]
         last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
             continue
         args_list = list(node.args)
         changed = False
@@ -3013,7 +3038,7 @@ def _annotate_pre_broadcast(
             continue
         last_dim = node_val.shape[-1]
         last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) <= PRE_BROADCAST_SIZE:
+        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
             continue
         args_list = list(node.args)
         changed = False
@@ -3117,35 +3142,40 @@ def _annotate_pre_broadcast(
                         prepare_node_lowering(graph_lowering, node)
 
 
-@_decorators.codegen(_pre_broadcast_tile, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    tensor_ast = state.ast_arg(0)
-    target_size = state.proxy_arg(1)
-    if isinstance(target_size, torch.SymInt):
-        target_expr = state.sympy_expr(_symint_sympy_expr(target_size))
-        block_id = CompileEnvironment.current().get_block_id(target_size)
-        bs_var = (
-            state.device_function.block_size_var(block_id)
-            if block_id is not None
-            else None
-        )
-        if bs_var:
-            return expr_from_string(
-                f"jnp.tile({{tensor}}, {bs_var} // {PRE_BROADCAST_SIZE})",
-                tensor=tensor_ast,
-            )
+def _pre_broadcast_to_fixed_size(tensor_ast: ast.AST, target_size: int) -> ast.AST:
+    """Repeat or trim a 128-wide value to one fixed consumer width."""
+    if target_size < PRE_BROADCAST_SIZE:
         return expr_from_string(
-            f"jnp.tile({{tensor}}, {target_expr} // {PRE_BROADCAST_SIZE})",
+            f"{{tensor}}[..., :{target_size}]",
             tensor=tensor_ast,
         )
-    assert isinstance(target_size, int)
     factor = target_size // PRE_BROADCAST_SIZE
-    if factor <= 1:
+    if factor == 1:
         return tensor_ast
     return expr_from_string(
         f"jnp.tile({{tensor}}, {factor})",
         tensor=tensor_ast,
     )
+
+
+@_decorators.codegen(_pre_broadcast_tile, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor_ast = state.ast_arg(0)
+    target_size = state.proxy_arg(1)
+    if isinstance(target_size, torch.SymInt):
+        env = CompileEnvironment.current()
+        fixed_size = _dim_concrete_size(target_size, env, state.config)
+        if fixed_size is not None:
+            return _pre_broadcast_to_fixed_size(tensor_ast, fixed_size)
+        target_expr = state.sympy_expr(_symint_sympy_expr(target_size))
+        return expr_from_string(
+            f"jnp.tile({{tensor}}, max(1, ({target_expr} + "
+            f"{PRE_BROADCAST_SIZE - 1}) // {PRE_BROADCAST_SIZE}))"
+            f"[..., :{target_expr}]",
+            tensor=tensor_ast,
+        )
+    assert isinstance(target_size, int)
+    return _pre_broadcast_to_fixed_size(tensor_ast, target_size)
 
 
 def _lane_tile(

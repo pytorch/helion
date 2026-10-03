@@ -32,6 +32,7 @@ from helion._testing import code_and_output
 from helion._testing import get_test_dot_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
@@ -1342,6 +1343,61 @@ class TestMisc(RefEagerTestBase, TestCase):
         self.assertIn("libdevice.tanh", code)
         self.assertIn("tl.float32", code)
         self.assertIn("tl.bfloat16", code)
+
+    @skipIfNotCUDA()
+    @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
+    @onlyBackends(["triton"])
+    def test_device_symint_local_not_lifted_as_host_arg(self):
+        """A SymInt local assigned in an earlier root's device code leaks into
+        the locals seen at the next top-level loop.  It must not be given a
+        host ``NameOrigin``, or the device codegen lifts its expression as an
+        undefined host kernel argument (``NameError: group_begin``)."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.zeros_like(x)
+            out2 = torch.empty_like(x)
+            for tile_m in hl.tile(m, block_size=8):
+                if tile_m.begin < m:
+                    for s in [1, 2]:
+                        out[tile_m, :] += s
+                    for tile_n in hl.tile(n, block_size=8):
+                        group_begin = tile_m.begin * 2 + tile_n.begin
+                        out[tile_m, tile_n] += x[tile_m, tile_n] + group_begin
+            for tile in hl.tile(m, block_size=8):
+                out2[tile, :] = out[tile, :] * 2
+            return out2
+
+        x = torch.randn(32, 16, device=DEVICE)
+        code, result = code_and_output(kernel, (x,))
+        rows = torch.arange(32, device=DEVICE)[:, None] // 8 * 8
+        cols = torch.arange(16, device=DEVICE)[None, :] // 8 * 8
+        torch.testing.assert_close(result, (x + 3 + rows * 2 + cols) * 2)
+        launches = [line for line in code.splitlines() if "_launcher(" in line]
+        self.assertFalse(any("group_begin" in line for line in launches))
+
+    @skipIfNotCUDA()
+    @skipIfTileIR("implicit cross-loop scheduling is unavailable on TileIR")
+    @onlyBackends(["triton"])
+    def test_device_size_local_does_not_rename_host_size(self):
+        """``m = x.size(0)`` in an earlier root's device code must not replace
+        the host origin of ``x.size(0)`` with the device-only name ``m``."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=False)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            out2 = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                m = x.size(0)
+                out[tile] = x[tile] + m
+            for tile in hl.tile(x.size(0)):
+                out2[tile] = out[tile] * 2
+            return out2
+
+        x = torch.randn(64, device=DEVICE)
+        _, result = code_and_output(kernel, (x,))
+        torch.testing.assert_close(result, (x + 64) * 2)
 
 
 instantiate_parametrized_tests(TestMisc)

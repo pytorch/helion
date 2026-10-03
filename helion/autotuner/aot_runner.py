@@ -34,9 +34,13 @@ from typing import Any
 import uuid
 
 from .._hardware import get_hardware_info
+from .aot_structural_policy import measurement_files
+from .aot_structural_policy import policy_path
+from .aot_structural_policy import policy_suffix
 from .heuristic_generator import PerformanceTarget
 from .heuristic_generator import evaluate_heuristic
 from .heuristic_generator import generate_heuristic
+from .heuristic_generator import load_measurements
 
 # Global state for signal handling
 _current_process: subprocess.Popen[str] | None = None
@@ -262,14 +266,16 @@ def run_measure_phase(config: RunConfig) -> bool:
         return False
 
     # Check that we have measurements
-    measurements_file = config.run_dir / f"measurements_{config.hardware_id}.csv"
-    if not measurements_file.exists():
+    partitions = measurement_files(config.run_dir, config.hardware_id)
+    if not partitions:
         log.error("No measurements were recorded")
         return False
 
     # Count measurements
-    with open(measurements_file) as f:
-        num_measurements = sum(1 for _ in f) - 1  # Subtract header
+    num_measurements = 0
+    for measurements_file in partitions:
+        with open(measurements_file) as f:
+            num_measurements += sum(1 for _ in f) - 1  # Subtract header
     log.info(f"Recorded {num_measurements} measurements")
 
     return True
@@ -281,13 +287,9 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
 
     Returns True if successful.
     """
-    from .aot_cache import load_kernel_source_files
-
     log.info("=" * 60)
     log.info("PHASE 3: Building heuristics")
     log.info("=" * 60)
-
-    measurements_file = config.run_dir / f"measurements_{config.hardware_id}.csv"
 
     target = PerformanceTarget(
         goal_type=config.goal_type,  # type: ignore[arg-type]
@@ -302,49 +304,62 @@ def run_build_heuristic_phase(config: RunConfig) -> bool:
         file_header=config.file_header,
     )
 
-    # Load kernel source files from tuned configs
-    kernel_source_files = load_kernel_source_files(config.run_dir, config.hardware_id)
-
     try:
-        results = generate_heuristic(
-            measurements_file=measurements_file,
-            output_dir=config.run_dir,
-            target=target,
-            kernel_source_files=kernel_source_files,
-        )
-
-        # Dump generated code to stdout if requested
-        if config.dump_code:
-            for kernel_name, result in results.items():
-                print(f"\n{'=' * 60}")
-                print(f"# Generated heuristic for: {kernel_name}")
-                print(f"# Backend: {result.backend_used}")
-                print(f"# Accuracy: {result.model_accuracy:.2%}")
-                print(f"{'=' * 60}\n")
-                print(result.generated_code)
-
-        # Save summary (skip when just dumping code)
-        if not config.dump_code:
-            summary: dict[str, Any] = {}
-            for kernel_name, result in results.items():
-                summary[kernel_name] = {
-                    "num_configs": len(result.selected_configs),
-                    "model_accuracy": result.model_accuracy,
-                    "performance_stats": result.performance_stats,
-                    "backend": result.backend_used,
-                }
-
-            summary_file = (
-                config.run_dir / f"heuristic_summary_{config.hardware_id}.json"
-            )
-            summary_file.write_text(json.dumps(summary, indent=2))
-            log.info(f"Saved heuristic summary to {summary_file}")
-
+        partitions = measurement_files(config.run_dir, config.hardware_id) or [
+            config.run_dir / f"measurements_{config.hardware_id}.csv"
+        ]
+        for measurements_file in partitions:
+            _build_measurement_partition(config, measurements_file, target)
         return True
-
     except Exception:
         log.exception("Failed to build heuristics")
         return False
+
+
+def _build_measurement_partition(
+    config: RunConfig, measurements_file: Path, target: PerformanceTarget
+) -> None:
+    from .aot_cache import load_kernel_source_files
+
+    data = load_measurements(measurements_file)
+    policy = next(iter(data.values())).cute_structural_policy if data else None
+    kernel_source_files = load_kernel_source_files(
+        config.run_dir, config.hardware_id, policy=policy
+    )
+
+    results = generate_heuristic(
+        measurements_file=measurements_file,
+        output_dir=config.run_dir,
+        target=target,
+        kernel_source_files=kernel_source_files,
+    )
+
+    # Dump generated code to stdout if requested
+    if config.dump_code:
+        for kernel_name, result in results.items():
+            print(f"\n{'=' * 60}")
+            print(f"# Generated heuristic for: {kernel_name}")
+            print(f"# Backend: {result.backend_used}")
+            print(f"# Accuracy: {result.model_accuracy:.2%}")
+            print(f"{'=' * 60}\n")
+            print(result.generated_code)
+
+    # Save summary (skip when just dumping code)
+    if not config.dump_code:
+        summary: dict[str, Any] = {}
+        for kernel_name, result in results.items():
+            summary[kernel_name] = {
+                "num_configs": len(result.selected_configs),
+                "model_accuracy": result.model_accuracy,
+                "performance_stats": result.performance_stats,
+                "backend": result.backend_used,
+            }
+
+        summary_file = policy_path(
+            config.run_dir / f"heuristic_summary_{config.hardware_id}.json", policy
+        )
+        summary_file.write_text(json.dumps(summary, indent=2))
+        log.info(f"Saved heuristic summary to {summary_file}")
 
 
 def run_evaluate_phase(config: RunConfig) -> bool:
@@ -358,11 +373,25 @@ def run_evaluate_phase(config: RunConfig) -> bool:
     log.info("=" * 60)
 
     # First evaluate against measurement data
-    measurements_file = config.run_dir / f"measurements_{config.hardware_id}.csv"
-    eval_results = evaluate_heuristic(
-        measurements_file=measurements_file,
-        heuristic_dir=config.run_dir,
-    )
+    eval_results: dict[str, dict[str, float]] = {}
+    evaluations: list[tuple[Path, dict[str, dict[str, float]]]] = []
+    partitions = measurement_files(config.run_dir, config.hardware_id) or [
+        config.run_dir / f"measurements_{config.hardware_id}.csv"
+    ]
+    for measurements_file in partitions:
+        data = load_measurements(measurements_file)
+        policy = next(iter(data.values())).cute_structural_policy if data else None
+        results = evaluate_heuristic(
+            measurements_file=measurements_file,
+            heuristic_dir=config.run_dir,
+        )
+        eval_file = policy_path(
+            config.run_dir / f"evaluation_{config.hardware_id}.json", policy
+        )
+        evaluations.append((eval_file, results))
+        eval_results.update(
+            {f"{name}{policy_suffix(policy)}": stats for name, stats in results.items()}
+        )
 
     # Check if performance goals are met
     all_passed = True
@@ -400,10 +429,9 @@ def run_evaluate_phase(config: RunConfig) -> bool:
         if return_code != 0:
             log.warning(f"Evaluate benchmark failed with return code {return_code}")
 
-    # Save evaluation results
-    eval_file = config.run_dir / f"evaluation_{config.hardware_id}.json"
-    eval_file.write_text(json.dumps(eval_results, indent=2))
-    log.info(f"Saved evaluation results to {eval_file}")
+    for eval_file, results in evaluations:
+        eval_file.write_text(json.dumps(results, indent=2))
+        log.info(f"Saved evaluation results to {eval_file}")
 
     return all_passed
 

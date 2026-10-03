@@ -246,8 +246,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
     # ── Prompt building ─────────────────────────────────────────────
 
     def _build_system_prompt(self) -> str:
-        """Return the fixed instruction block shared by every LLM request."""
-        return build_system_prompt()
+        """Build the instruction block for this backend."""
+        return build_system_prompt(backend=self.config_spec.backend_name)
 
     def _build_initial_search_guidance(self) -> str:
         """Describe the round-0 search strategy for this config space."""
@@ -255,6 +255,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
             configs_per_round=self.configs_per_round,
             compile_timeout_s=self.settings.autotune_compile_timeout,
             flat_fields=self.config_spec._flat_fields(),
+            backend=self.config_spec.backend_name,
         )
 
     def _build_initial_prompt(self) -> str:
@@ -269,8 +270,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
 
     def _build_refinement_prompt(self, round_num: int) -> str:
         """Summarize search progress so the LLM can propose the next batch."""
-        del round_num
         return build_refinement_prompt(
+            backend=self.config_spec.backend_name,
             configs_per_round=self.configs_per_round,
             compile_timeout_s=self.settings.autotune_compile_timeout,
             failed_count=len(failed_benchmark_results(self._all_benchmark_results)),

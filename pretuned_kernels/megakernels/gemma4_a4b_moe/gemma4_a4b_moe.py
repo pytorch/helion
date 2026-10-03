@@ -5,8 +5,9 @@
 The single Helion function's eight top-level tile loops implement router
 projection, hierarchical top-k, gate/up projection, GeGLU, down projection,
 expert reduction, and output RMSNorm.  The benchmark uses the production
-batch-one geometry and checks the result against vLLM's Gemma 4 router and
-fused-MoE implementation.
+batch-one geometry and checks it against a same-source, root-matched
+eight-launch Helion graph with programmatic dependent launch (PDL) and vLLM's
+Gemma 4 router and fused-MoE implementation.
 """
 
 from __future__ import annotations
@@ -32,7 +33,11 @@ TOP_K = 8
 EPS = 1e-6
 
 
-@helion.aot_kernel(static_shapes=True, backend="triton")
+@helion.aot_kernel(
+    static_shapes=False,
+    backend="triton",
+    triton_do_not_specialize=False,
+)
 def gemma4_a4b_moe(
     residual,
     pre_ff_norm_weight,
@@ -46,6 +51,40 @@ def gemma4_a4b_moe(
     top_k,
     eps,
 ):
+    # The pretuned entry has one fixed-capacity/model-geometry bucket, while
+    # token values and the derived routing decisions remain runtime data.
+    # Spell out that distinction instead of asking ``static_shapes=True`` to
+    # specialize every size implicitly.
+    hl.specialize(residual.size(0))
+    hl.specialize(residual.size(1))
+    hl.specialize(pre_ff_norm_weight.size(0))
+    hl.specialize(router_scale.size(0))
+    hl.specialize(router_weight.size(0))
+    hl.specialize(router_weight.size(1))
+    hl.specialize(per_expert_scale.size(0))
+    hl.specialize(expert_gate_up_weight.size(0))
+    hl.specialize(expert_gate_up_weight.size(1))
+    hl.specialize(expert_gate_up_weight.size(2))
+    hl.specialize(expert_down_weight.size(0))
+    hl.specialize(expert_down_weight.size(1))
+    hl.specialize(expert_down_weight.size(2))
+    hl.specialize(post_ff_norm_weight.size(0))
+
+    hl.specialize(residual.stride(0))
+    hl.specialize(residual.stride(1))
+    hl.specialize(pre_ff_norm_weight.stride(0))
+    hl.specialize(router_scale.stride(0))
+    hl.specialize(router_weight.stride(0))
+    hl.specialize(router_weight.stride(1))
+    hl.specialize(per_expert_scale.stride(0))
+    hl.specialize(expert_gate_up_weight.stride(0))
+    hl.specialize(expert_gate_up_weight.stride(1))
+    hl.specialize(expert_gate_up_weight.stride(2))
+    hl.specialize(expert_down_weight.stride(0))
+    hl.specialize(expert_down_weight.stride(1))
+    hl.specialize(expert_down_weight.stride(2))
+    hl.specialize(post_ff_norm_weight.stride(0))
+
     router_project_hidden = residual
     router_project_scale = router_scale
     router_project_root_size = root_size
@@ -532,6 +571,25 @@ def _make_inputs(seed: int = 0) -> dict[str, torch.Tensor]:
     }
 
 
+def _make_routing_cases() -> tuple[tuple[str, torch.Tensor], ...]:
+    """Choose distinct deterministic B1 inputs for runtime-routing coverage."""
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(20260913)
+    return tuple(
+        (
+            f"route_{index}",
+            torch.randn(
+                (BATCH, HIDDEN),
+                generator=generator,
+                device="cuda",
+                dtype=torch.bfloat16,
+            )
+            * 1.4,
+        )
+        for index in range(3)
+    )
+
+
 def _kernel_args(tensors: dict[str, torch.Tensor]) -> tuple[object, ...]:
     return (
         tensors["residual"],
@@ -719,27 +777,63 @@ def _assert_vllm_close(
     )
 
 
+def _assert_standalone_exact(
+    persistent_outputs: tuple[torch.Tensor, ...],
+    standalone_outputs: tuple[torch.Tensor, ...],
+) -> None:
+    """Prove the scheduler-only comparison preserves every returned value."""
+    assert len(persistent_outputs) == len(standalone_outputs)
+    for persistent, standalone in zip(
+        persistent_outputs, standalone_outputs, strict=True
+    ):
+        torch.testing.assert_close(persistent, standalone, atol=0, rtol=0)
+
+
+def _make_standalone_call(
+    tensors: dict[str, torch.Tensor],
+) -> tuple[Callable[[], tuple[torch.Tensor, ...]], tuple[torch.Tensor, ...]]:
+    """Build the matched, independently tuned eight-launch Helion graph."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from pretuned_kernels.megakernels.gemma4_a4b_moe import _standalone
+
+    return _standalone.build(tensors, TOP_K, EPS)
+
+
 @torch.inference_mode()
 def correctness_check() -> None:
-    """Check the one pretuned shape against vLLM's production MoE path."""
+    """Check several runtime routing patterns against production vLLM."""
     _require_sm100()
     if not has_vllm():
         raise RuntimeError("vLLM is required for the Gemma 4 A4B comparison")
     tensors = _make_inputs()
     vllm_call, vllm_routing, _backend, close_vllm = _make_vllm_call(tensors)
     try:
-        helion_outputs = gemma4_a4b_moe(*_kernel_args(tensors))
-        vllm_outputs = vllm_call()
-        routing = vllm_routing(vllm_outputs[1])
-        torch.cuda.synchronize()
-        _assert_vllm_close(helion_outputs, vllm_outputs, routing)
+        standalone_call, _standalone_outputs = _make_standalone_call(tensors)
+        selected_routes = set()
+        for _label, residual in _make_routing_cases():
+            tensors["residual"].copy_(residual)
+            helion_outputs = gemma4_a4b_moe(*_kernel_args(tensors))
+            standalone_outputs = standalone_call()
+            vllm_outputs = vllm_call()
+            routing = vllm_routing(vllm_outputs[1])
+            torch.cuda.synchronize()
+            _assert_vllm_close(helion_outputs, vllm_outputs, routing)
+            _assert_vllm_close(standalone_outputs, vllm_outputs, routing)
+            _assert_standalone_exact(helion_outputs, standalone_outputs)
+            selected_routes.add(
+                tuple(sorted(int(value) for value in helion_outputs[3][0]))
+            )
+        if len(selected_routes) != 3:
+            raise AssertionError("routing fixtures must select three distinct routes")
     finally:
         close_vllm()
 
 
 @torch.inference_mode()
 def main(verbose: bool = True) -> dict:
-    """Benchmark the one production shape against vLLM with cold-L2 replay."""
+    """Benchmark persistent, separate Helion, and vLLM with cold-L2 replay."""
     _require_sm100()
     if not has_vllm():
         raise RuntimeError("vLLM is required for the Gemma 4 A4B comparison")
@@ -753,22 +847,44 @@ def main(verbose: bool = True) -> dict:
     tensors = _make_inputs()
     vllm_call, vllm_routing, backend, close_vllm = _make_vllm_call(tensors)
     try:
-        helion_outputs = gemma4_a4b_moe(*_kernel_args(tensors))
-        vllm_outputs = vllm_call()
-        routing = vllm_routing(vllm_outputs[1])
-        torch.cuda.synchronize()
-        _assert_vllm_close(helion_outputs, vllm_outputs, routing)
+        standalone_call, _standalone_outputs = _make_standalone_call(tensors)
+        routing_cases = []
+        for label, residual in _make_routing_cases():
+            tensors["residual"].copy_(residual)
+            helion_outputs = gemma4_a4b_moe(*_kernel_args(tensors))
+            standalone_outputs = standalone_call()
+            vllm_outputs = vllm_call()
+            routing = vllm_routing(vllm_outputs[1])
+            torch.cuda.synchronize()
+            _assert_vllm_close(helion_outputs, vllm_outputs, routing)
+            _assert_vllm_close(standalone_outputs, vllm_outputs, routing)
+            _assert_standalone_exact(helion_outputs, standalone_outputs)
+            expert_ids = tuple(int(value) for value in helion_outputs[3][0].tolist())
+            routing_cases.append((label, residual, expert_ids))
+
+        if len({tuple(sorted(case[2])) for case in routing_cases}) != len(
+            routing_cases
+        ):
+            raise AssertionError("routing fixtures must select distinct expert sets")
+
+        tensors["residual"].copy_(routing_cases[0][1])
 
         helion_graph, _ = capture_cuda_graph(
             lambda: gemma4_a4b_moe(*_kernel_args(tensors))
         )
+        standalone_graph, _ = capture_cuda_graph(standalone_call)
         vllm_graph, _ = capture_cuda_graph(vllm_call)
+
+        label, _residual, expert_ids = routing_cases[0]
 
         def make_calls(_shape: None) -> tuple:
             return (
                 helion_graph.replay,
-                [(f"vllm_auto ({backend})", vllm_graph.replay)],
-                f"{BATCH:>5d}  {HIDDEN:>6d}  {NUM_EXPERTS:>7d}",
+                [
+                    ("standalone_helion_pdl", standalone_graph.replay),
+                    (f"vllm_auto ({backend})", vllm_graph.replay),
+                ],
+                f"{label:>10s}  {expert_ids!s:>34s}",
             )
 
         return run_sweep(
@@ -778,7 +894,7 @@ def main(verbose: bool = True) -> dict:
             pre_captured_cudagraph=True,
             thermal_warmup_ms=10_000,
             verbose=verbose,
-            shape_header=f"{'batch':>5s}  {'hidden':>6s}  {'experts':>7s}",
+            shape_header=f"{'routing':>10s}  {'expert_ids':>34s}",
         )
     finally:
         close_vllm()

@@ -24,7 +24,9 @@ DmaDirection = Literal["load", "store"]
 def is_tpu_dma_aligned_shape(shape: tuple[int, ...], dtype: torch.dtype) -> bool:
     """Whether a concrete VMEM shape satisfies TPU local-DMA alignment."""
     if len(shape) >= 2:
-        return shape[-1] % 128 == 0 and shape[-2] % 8 == 0
+        # TPU DMA rows must contain a multiple of 128 contiguous bytes and
+        # transfers must contain a multiple of eight rows.
+        return shape[-1] * dtype.itemsize % 128 == 0 and shape[-2] % 8 == 0
     if len(shape) == 1:
         bitwidth = min(dtype.itemsize * 8, 32)
         return shape[0] % (128 * (32 // bitwidth)) == 0

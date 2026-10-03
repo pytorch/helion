@@ -19,12 +19,46 @@ from ...language.distributed_ops import start_async_remote_copy_descriptor
 from ...language.distributed_ops import wait_async_remote_copy
 from ...language.distributed_ops import wait_recv_async_remote_copy
 from ...language.distributed_ops import wait_send_async_remote_copy
+from ..ast_extension import create
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
+from ..cross_loop_codegen import peer_state
+from ..host_function import HostFunction
+from ..indexing_strategy import SubscriptIndexing
+from ..tile_dependency import TILE_ACCESS_META
+from ..tile_strategy import DeviceLoopState
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..device_function import DeviceFunction
+    from ..helper_function import CodegenInterface
     from ..inductor_lowering import CodegenState
+    from ..tile_dependency import TileAccess
+
+    StoreCodegen = Callable[
+        [
+            CodegenState,
+            torch.Tensor,
+            list[object],
+            ast.AST,
+            ast.AST | None,
+            ast.AST | None,
+        ],
+        ast.AST,
+    ]
+    LoadCodegen = Callable[
+        [
+            CodegenState,
+            torch.Tensor,
+            list[object],
+            ast.AST | None,
+            ast.AST | None,
+            ast.AST | None,
+        ],
+        ast.AST,
+    ]
 
 
 _FLAT_PROGRAM_ID = (
@@ -138,6 +172,7 @@ def _(state: CodegenState) -> ast.AST:
             )
         )
     statements = [
+        *device_fn.async_store_drain(),
         statement_from_string("nvshmem.quiet()"),
         statement_from_string("tl.debug_barrier()"),
     ]
@@ -158,6 +193,7 @@ def _(state: CodegenState) -> ast.AST:
             )
         )
     statements.append(statement_from_string("tl.debug_barrier()"))
+    statements.extend(device_fn.async_load_fence())
     for statement in statements:
         state.codegen.add_statement(statement)
     state.device_function.has_barrier = True
@@ -523,8 +559,13 @@ def _emit_statements(
 @_decorators.codegen(start_async_remote_copy_descriptor, "triton")
 def _(state: CodegenState) -> ast.AST:
     info = _paired_copy_info(state)
+    # Every thread reads the source, so other threads' TMA stores to it must be
+    # complete first. A CTA barrier only, so has_barrier stays unset.
+    sync: list[ast.stmt] = []
+    if drain := state.device_function.async_store_drain():
+        sync = [*drain, statement_from_string("tl.debug_barrier()")]
     return _emit_statements(
-        state, [*info.source_materialization, *info.start_statements]
+        state, [*sync, *info.source_materialization, *info.start_statements]
     )
 
 
@@ -539,7 +580,8 @@ def _receive_wait_statements(state: CodegenState) -> list[ast.stmt]:
         statement_from_string(
             "helion_dist_utils._wait_and_consume_signal("
             f"{signal}, tl.cast(1, tl.int64))"
-        )
+        ),
+        *state.device_function.async_load_fence(),
     ]
 
 
@@ -553,9 +595,316 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(wait_send_async_remote_copy, "triton")
 def _(state: CodegenState) -> ast.AST:
-    return _emit_statements(state, [statement_from_string("nvshmem.quiet()")])
+    # Order the completed source reads before later TMA writes to the source.
+    return _emit_statements(
+        state,
+        [
+            statement_from_string("nvshmem.quiet()"),
+            *state.device_function.async_load_fence(),
+        ],
+    )
 
 
 @_decorators.codegen(wait_recv_async_remote_copy, "triton")
 def _(state: CodegenState) -> ast.AST:
     return _emit_statements(state, _receive_wait_statements(state))
+
+
+@dataclass(frozen=True)
+class InbandPoll:
+    """A mailbox read whose wait is deferred to the first use of any poll."""
+
+    node: torch.fx.Node
+    address: str
+    mask: str | None
+    # Polls of one address shape share an asm; None polls alone.
+    group: str | None
+    pack: int
+    word: str
+    result: ast.stmt
+
+
+def _inband_access(state: CodegenState) -> tuple[TileAccess, tuple[int, ...]] | None:
+    """The access an inband push or poll emits, and the node's access ids."""
+    graph = HostFunction.current().device_ir.tile_dependency_graph
+    assert state.fx_node is not None
+    ids = state.fx_node.meta.get(TILE_ACCESS_META, ())
+    if graph is None or not ids or not graph.is_inband(graph.accesses[ids[0]]):
+        return None
+    return graph.accesses[ids[0]], ids
+
+
+def _bits(dtype: torch.dtype) -> str:
+    return f"tl.uint{dtype.itemsize * 8}"
+
+
+def _inline_asm(
+    outputs: str, asm: str, constraints: str, args: list[str], dtype: str, pack: int
+) -> ast.stmt:
+    return statement_from_string(
+        f"{outputs} = tl.inline_asm_elementwise(asm={{asm}}, "
+        f"constraints={constraints!r}, args=[{', '.join(args)}], "
+        f"dtype={dtype}, is_pure=False, pack={pack})",
+        asm=create(ast.Constant, value=asm),
+    )
+
+
+def inband_store_codegen(
+    state: CodegenState, codegen_store: StoreCodegen
+) -> StoreCodegen:
+    """Make an inband store also push its tile, epoch tagged, to every rank."""
+    inband = _inband_access(state)
+    if inband is None:
+        return codegen_store
+    access, ids = inband
+
+    def push(
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        value: ast.AST,
+        extra_mask: ast.AST | None,
+        cache_modifier: ast.AST | None,
+    ) -> ast.AST:
+        device_function = state.device_function
+        if not isinstance(value, ast.Constant):
+            value = state.codegen.lift(value, dce=True, prefix="inband_value")
+        # The local store registers its tensor, which the peer state may need.
+        local_store = codegen_store(
+            state, fake_tensor, subscript, value, extra_mask, cache_modifier
+        )
+        peer = peer_state(device_function)
+        assert peer is not None
+        backend = CompileEnvironment.current().backend
+        indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+        word_value = value
+        if not indexing.block_shaped_offset and output_size:
+            word_value = expr_from_string(
+                backend.reshape_expr("{value}", "[]"), value=value
+            )
+        offset = indexing.index_expr
+        if indexing.needs_broadcast():
+            offset = expr_from_string(
+                backend.broadcast_to_expr(
+                    "{offset}", state.tile_strategy.shape_str(output_size)
+                ),
+                offset=offset,
+            )
+        offset = state.codegen.lift(offset, dce=True, prefix="inband_offset")
+        dtype = fake_tensor.dtype
+        word = state.codegen.lift(
+            expr_from_string(
+                f"tl.cast(tl.cast(tl.cast({{value}}, {backend.dtype_str(dtype)}), "
+                f"{_bits(dtype)}, bitcast=True), tl.uint64) | ({peer.epoch} << 32)",
+                value=word_value,
+            ),
+            dce=True,
+            prefix="inband_word",
+        )
+        slot = peer.mailbox(access.allocation_id, peer.rank)
+        store = "st.relaxed.sys.global.u64 [$1], $2;"
+        mask = []
+        if indexing.has_mask():
+            mask = [
+                state.codegen.lift(
+                    expr_from_string(
+                        "tl.cast({mask}, tl.int32)", mask=indexing.mask_expr
+                    ),
+                    dce=True,
+                    prefix="inband_mask",
+                ).id
+            ]
+            store = f"{{ .reg .pred p; setp.ne.b32 p, $3, 0; @p {store} }}"
+        # Each word is single-copy atomic and carries its epoch: no fence needed.
+        # One asm per peer keeps that peer's stores adjacent, which is faster.
+        for base in peer.bases:
+            state.add_statement(
+                _inline_asm(
+                    device_function.new_var("inband_push", dce=False),
+                    f"{store} mov.u32 $0, 0;",
+                    "=r,l,l" + ",r" * len(mask),
+                    [f"{base} + ({slot}) + {offset.id}", word.id, *mask],
+                    "tl.int32",
+                    1,
+                )
+            )
+        device_function.inband_access_ids.update(ids)
+        return local_store
+
+    return push
+
+
+def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> int:
+    """Words per asm lane: more than a thread's elements would fault."""
+    env = CompileEnvironment.current()
+    numel = 1
+    for size in output_size:
+        block_id = None if isinstance(size, int) else env.resolve_block_id(size)
+        if block_id is not None:
+            # A global block size is a SymInt; read its hint, as int() would pin it.
+            size = env.size_hint(
+                env.block_sizes[block_id].from_config_assert(state.config)
+            )
+        if not isinstance(size, int):
+            return 1
+        numel *= size
+    threads = 32 * state.config.num_warps
+    return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
+
+
+def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadCodegen:
+    """Make an inband peer load poll this rank's own mailbox instead."""
+    inband = _inband_access(state)
+    if inband is None:
+        return codegen_load
+    access, ids = inband
+
+    def poll(
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        extra_mask: ast.AST | None,
+        eviction_policy: ast.AST | None,
+        cache_modifier: ast.AST | None,
+    ) -> ast.AST:
+        device_function = state.device_function
+        peer = peer_state(device_function)
+        assert peer is not None and state.fx_node is not None
+        env = CompileEnvironment.current()
+        backend = env.backend
+        indexing = SubscriptIndexing.create(state, fake_tensor, subscript, extra_mask)
+        output_size = SubscriptIndexing.compute_shape(fake_tensor, subscript, state)
+        shape = state.tile_strategy.shape_str(output_size)
+        offset = indexing.index_expr
+        if indexing.has_mask() and not indexing.block_shaped_offset:
+            offset = expr_from_string(
+                f"{{offset}} + {backend.zeros_expr(shape, env.index_type())}",
+                offset=offset,
+            )
+        slot = peer.mailbox(access.allocation_id, access.owner_rank)
+        address = state.codegen.lift(
+            expr_from_string(f"{peer.state} + ({slot}) + {{offset}}", offset=offset),
+            dce=True,
+            prefix="inband_address",
+        )
+        mask = None
+        if indexing.has_mask():
+            mask = state.codegen.lift(
+                indexing.mask_expr, dce=True, prefix="inband_mask"
+            ).id
+        dtype = fake_tensor.dtype
+        word = device_function.new_var("inband_word", dce=False)
+        result = expr_from_string(
+            f"tl.cast(tl.cast({word}, {_bits(dtype)}), "
+            f"{backend.dtype_str(dtype)}, bitcast=True)"
+        )
+        # Triton's pipeliner would make the first read an early, weak cp.async.
+        for loops in state.codegen.active_device_loops.values():
+            for loop in loops:
+                call = loop.for_node.iter if isinstance(loop, DeviceLoopState) else None
+                if isinstance(call, ast.Call) and ast.unparse(call.func) == "tl.range":
+                    call.keywords = [
+                        *(kw for kw in call.keywords if kw.arg != "num_stages"),
+                        create(ast.keyword, arg="num_stages", value=ast.Constant(1)),
+                    ]
+        group, pack = None, 1
+        if indexing.needs_broadcast():
+            result = expr_from_string(
+                backend.broadcast_to_expr("{value}", shape), value=result
+            )
+        elif indexing.block_shaped_offset or mask is not None:
+            group, pack = shape, _poll_pack(state, output_size)
+        else:
+            group = "scalar"
+        value = device_function.new_var("inband_value", dce=True)
+        device_function.inband_polls.append(
+            InbandPoll(
+                node=state.fx_node,
+                address=address.id,
+                mask=mask,
+                group=group,
+                pack=pack,
+                word=word,
+                result=statement_from_string(f"{value} = {{result}}", result=result),
+            )
+        )
+        device_function.inband_access_ids.update(ids)
+        return create(ast.Name, id=value, ctx=ast.Load())
+
+    return poll
+
+
+def _poll_asm(polls: int, pack: int) -> tuple[str, str]:
+    """Reload only the stale words of a first load until all are current.
+
+    Operands: words, first-load words, addresses, then the tag.
+    """
+    count = polls * pack
+    check = [
+        f"mov.b64 {{lo, hi}}, ${word}; setp.ne.b32 p, hi, ${3 * count + word % pack}; "
+        f"@p ld.volatile.global.b64 ${word}, [${2 * count + word}]; "
+        "@p mov.u32 stale, 1;"
+        for word in range(count)
+    ]
+    asm = " ".join(
+        [
+            "{ .reg .pred p; .reg .b32 lo, hi, stale;",
+            *(f"mov.b64 ${word}, ${count + word};" for word in range(count)),
+            "SPIN${:uid}: mov.u32 stale, 0;",
+            *check,
+            "setp.ne.u32 p, stale, 0; @p bra SPIN${:uid}; }",
+        ]
+    )
+    return asm, ",".join(["=l"] * count + ["l"] * 2 * count + ["r"] * pack)
+
+
+def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
+    """Wait on the pending polls of ``node``'s graph once ``node`` reads one.
+
+    The wait is per thread: a CTA-wide reduction would skip replicated lanes.
+    """
+    device_function = cg.device_function
+    polls = [
+        poll for poll in device_function.inband_polls if poll.node.graph is node.graph
+    ]
+    if not polls or (
+        node.op != "output"
+        and not any(poll.node in node.all_input_nodes for poll in polls)
+    ):
+        return
+    device_function.inband_polls = [
+        poll for poll in device_function.inband_polls if poll not in polls
+    ]
+    peer = device_function.peer_state
+    assert peer is not None
+    groups: dict[str, list[InbandPoll]] = {}
+    for poll in polls:
+        groups.setdefault(poll.group or poll.word, []).append(poll)
+    for group in groups.values():
+        # A plain volatile load vectorizes; masked lanes read as current.
+        for poll in group:
+            mask = "" if poll.mask is None else f", {poll.mask}, {peer.epoch} << 32"
+            cg.add_statement(
+                statement_from_string(
+                    f"{poll.word} = tl.load({poll.address}{mask}, volatile=True)"
+                )
+            )
+        words = [poll.word for poll in group]
+        asm, constraints = _poll_asm(len(words), group[0].pack)
+        cg.add_statement(
+            _inline_asm(
+                ", ".join(words),
+                asm,
+                constraints,
+                [
+                    *words,
+                    *(poll.address for poll in group),
+                    f"tl.cast({peer.epoch}, tl.uint32)",
+                ],
+                "tl.uint64" if len(group) == 1 else f"({'tl.uint64, ' * len(group)})",
+                group[0].pack,
+            )
+        )
+        for poll in group:
+            cg.add_statement(poll.result)

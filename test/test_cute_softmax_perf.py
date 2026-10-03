@@ -22,9 +22,8 @@ performance from ~0.45x ATen to ~0.66x ATen on (4096, *) shapes:
   shared across two consecutive constexpr V-loops (online softmax max +
   sum passes) into a small ``cute.make_rmem_tensor(V, fp32)`` so V-loop 2
   reads the cached fp32 value rather than re-bitcasting from the
-  underlying U16 vec load.  Same pass also elides the redundant
-  ``Float32(Float16(warp_reduction(...)))`` round-trip on warp-reduce
-  results.
+  underlying U16 vec load. The same pass removes repeated casts to the
+  same dtype while retaining reduction-result narrowing.
 """
 
 from __future__ import annotations
@@ -423,7 +422,7 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
 
     * P2/P5 fuser bail: trip = 99 > cache cap 64, so both sweeps load
       from gmem (guards the P8 register-pressure regression).
-    * P14 ``merge_sibling_v_loops``: vmerge cache + double-cast elision.
+    * P14 ``merge_sibling_v_loops``: vmerge cache + preserved result dtype.
     * P16 reciprocal hoist: ``1.0 / di`` hoisted, inner divide becomes
       a multiply.
     * P17 extended hoists: alias DCE (``*_copy`` chains inlined),
@@ -478,16 +477,12 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
             "_helion_vmerge_cache_0 = cute.make_rmem_tensor(4, cutlass.Float32)",
             code,
         )
-        # P14 double-cast peephole: ``local_amax =
-        # Float16(warp_reduction_max(...))`` must have been elided to
-        # just ``local_amax = warp_reduction_max(...)`` (the hoist pass
-        # already promoted the V-fold acc to fp32, so the Float16 wrap
-        # was a no-op cycle).
-        self.assertNotIn(
+        # Accumulation in Float32 still requires the original result cast.
+        self.assertIn(
             "local_amax = cutlass.Float16(cute.arch.warp_reduction_max",
             code,
         )
-        self.assertIn(
+        self.assertNotIn(
             "local_amax = cute.arch.warp_reduction_max",
             code,
         )
@@ -518,7 +513,10 @@ class TestCuteCanonicalSoftmaxArtifact(TestCase):
         # new-max from the warp_reduce before the V-loop) is
         # V-loop-invariant, so the hoist fires there too.
         self.assertIn("= v_1 * 1.4426950408889634", code)
-        self.assertIn("cute.math.exp2(v_5 * 1.4426950408889634 - _helion_scaled_", code)
+        self.assertIn(
+            "cute.math.exp2(cute.math.fma(v_5, 1.4426950408889634, -_helion_scaled_",
+            code,
+        )
         # P17 DCE: the consume-loop ``v_10 = v_9 - mi`` and the reduce
         # V-loop ``v_6 = v_5 - v_1`` are dead after the FMA hoists and
         # must be removed; statements that ARE read (``v_4`` feeds

@@ -16,6 +16,7 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
+from helion._testing import xfailIfPallasInterpret
 from helion._testing import xfailIfPallasTpu
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -509,6 +510,7 @@ class TestViews(RefEagerTestBase, TestCase):
         expected = input_tensor * scale_tensor[0]
         torch.testing.assert_close(result, expected)
 
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on pipeline buffers")
     def test_reshape_input_types(self):
         @helion.kernel(static_shapes=True)
         def reshape_reduction_dim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

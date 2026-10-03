@@ -16,6 +16,7 @@ import torch
 from ... import exc
 from ...language import _decorators
 from ...language.quantized_ops import float4_e2m1fn_x2_to_float32
+from ...language.quantized_ops import load_bfloat16_x16_to_float16
 from ...language.quantized_ops import load_float4_e2m1fn_x16_to_float16
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
@@ -125,4 +126,73 @@ def _(state: CodegenState) -> list[ast.AST]:
         keywords=[],
     )
     result = state.codegen.lift(call, dce=True, prefix="fp4_lanes")
+    return [expr_from_string(f"{result.id}[{i}]") for i in range(16)]
+
+
+_BF16X16_TO_F16_ASM = """
+{
+    .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
+    .reg .b16 b0,b1,b2,b3,b4,b5,b6,b7,b8,b9,b10,b11,b12,b13,b14,b15;
+    mov.b64 {w0,w1}, $16; mov.b64 {w2,w3}, $17;
+    mov.b64 {w4,w5}, $18; mov.b64 {w6,w7}, $19;
+    mov.b32 {b0,b1}, w0; mov.b32 {b2,b3}, w1;
+    mov.b32 {b4,b5}, w2; mov.b32 {b6,b7}, w3;
+    mov.b32 {b8,b9}, w4; mov.b32 {b10,b11}, w5;
+    mov.b32 {b12,b13}, w6; mov.b32 {b14,b15}, w7;
+    cvt.rn.f16.bf16 $0, b0; cvt.rn.f16.bf16 $1, b1;
+    cvt.rn.f16.bf16 $2, b2; cvt.rn.f16.bf16 $3, b3;
+    cvt.rn.f16.bf16 $4, b4; cvt.rn.f16.bf16 $5, b5;
+    cvt.rn.f16.bf16 $6, b6; cvt.rn.f16.bf16 $7, b7;
+    cvt.rn.f16.bf16 $8, b8; cvt.rn.f16.bf16 $9, b9;
+    cvt.rn.f16.bf16 $10, b10; cvt.rn.f16.bf16 $11, b11;
+    cvt.rn.f16.bf16 $12, b12; cvt.rn.f16.bf16 $13, b13;
+    cvt.rn.f16.bf16 $14, b14; cvt.rn.f16.bf16 $15, b15;
+}
+"""
+
+
+@_decorators.codegen(load_bfloat16_x16_to_float16, "triton")
+def _(state: CodegenState) -> list[ast.AST]:
+    storage = state.proxy_arg(0)
+    if not isinstance(storage, torch.Tensor):
+        raise exc.InvalidAPIUsage(
+            "hl.load_bfloat16_x16_to_float16 expects tensor storage"
+        )
+    group_offset = state.ast_arg(1)
+    extra_mask = state.ast_args[2]
+    base = state.device_function.tensor_arg(storage).name
+    qwords = []
+    for word in range(4):
+        if extra_mask is None:
+            load_call = expr_from_string(
+                f"tl.load({base}.to(tl.pointer_type(tl.uint64)) + "
+                f"({{offset}} * 4 + {word}))",
+                offset=group_offset,
+            )
+        else:
+            assert isinstance(extra_mask, ast.AST)
+            load_call = expr_from_string(
+                f"tl.load({base}.to(tl.pointer_type(tl.uint64)) + "
+                f"({{offset}} * 4 + {word}), {{mask}}, other=0)",
+                offset=group_offset,
+                mask=extra_mask,
+            )
+        qwords.append(state.codegen.lift(load_call, dce=True, prefix="bf16_qword"))
+    call = create(
+        ast.Call,
+        func=expr_from_string("tl.inline_asm_elementwise"),
+        args=[
+            create(ast.Constant, value=_BF16X16_TO_F16_ASM),
+            create(
+                ast.Constant,
+                value=f"{','.join('=h' for _ in range(16))},l,l,l,l",
+            ),
+            create(ast.List, elts=qwords, ctx=ast.Load()),
+            expr_from_string("(" + ", ".join("tl.float16" for _ in range(16)) + ")"),
+            create(ast.Constant, value=True),
+            create(ast.Constant, value=1),
+        ],
+        keywords=[],
+    )
+    result = state.codegen.lift(call, dce=True, prefix="bf16_lanes")
     return [expr_from_string(f"{result.id}[{i}]") for i in range(16)]

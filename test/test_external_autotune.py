@@ -116,6 +116,8 @@ class TestExternalAutotune(TestCase):
             algorithm="PatternSearch",
             max_generations=2,
             initial_population=5,
+            # Cap the search wall clock; the assertions only need a result.
+            autotune_budget_seconds=30,
         )
 
         assert "block" in best

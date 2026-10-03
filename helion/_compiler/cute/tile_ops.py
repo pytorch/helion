@@ -24,10 +24,26 @@ if TYPE_CHECKING:
 @_decorators.codegen(tile_begin, "cute")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
+    from ..tile_strategy import NDTileStrategy
+
+    loops = state.codegen.active_device_loops.get(index)
+    grid_state = state.codegen.current_grid_state
+    strategy = (
+        loops[-1].strategy
+        if loops
+        else (grid_state.strategy if grid_state is not None else None)
+    )
+    if isinstance(strategy, NDTileStrategy) and index in strategy.block_ids:
+        # _grid_local_coord_expr is index - offset for an ND tile, including
+        # its blocked/strided/vector lanes and any cluster CTA slice. Use the
+        # authoritative logical offset directly instead of index-(index-offset).
+        # Besides removing redundant integer arithmetic, this keeps a uniform
+        # tile boundary from creating false lane-index dependencies in siblings.
+        return expr_from_string(strategy.offset_var(index))
+
     global_index = state.codegen.index_var(index)
 
     thread_axis = None
-    loops = state.codegen.active_device_loops.get(index)
     if loops:
         from .cute_reshape import _per_thread_nd_tile_offset
 
@@ -38,7 +54,6 @@ def _(state: CodegenState) -> ast.AST:
             return expr_from_string(tile_offset)
         thread_axis = loops[-1].block_thread_axes.get(index)
     if thread_axis is None:
-        grid_state = state.codegen.current_grid_state
         if grid_state is not None:
             thread_axis = grid_state.block_thread_axes.get(index)
     if thread_axis is None:

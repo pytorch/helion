@@ -28,6 +28,9 @@ from .._compat import supports_maxnreg
 from .._compat import supports_tensor_descriptor
 from .._compat import target_device_capability as get_target_device_capability
 from .._compat import warps_to_threads
+from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
+from .._compiler.cute.block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
+from .._compiler.cute.block_scaled_config import normalize_block_scaled_config
 from .._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
 from .._compiler.cute.cute_flash import FLASH_CONFIG_KEYS
 from .._compiler.cute.cute_flash import FLASH_CORR_REGS_KEY
@@ -66,6 +69,21 @@ from .._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from .._compiler.cute.cute_flash import resolve_flash_config
 from .._compiler.cute.cutedsl_compat import fixed_l2_evict_last_store_policy_supported
 from .._compiler.cute.direct_affine_plan import direct_affine_schedule_choices
+from .._compiler.cute.split_k_cluster import validate_cluster_config
+from .._compiler.cute.split_k_cluster_config import (
+    FINALIZER_KEY as SPLIT_K_FINALIZER_KEY,
+)
+from .._compiler.cute.split_k_cluster_config import FINALIZER_WARPS
+from .._compiler.cute.split_k_cluster_config import SCHEDULE_KEY as SPLIT_K_SCHEDULE_KEY
+from .._compiler.cute.split_k_cluster_config import SCHEDULES as SPLIT_K_SCHEDULES
+from .._compiler.cute.split_k_cluster_config import normalize_cluster_finalizer
+from .._compiler.cute.split_k_cluster_config import normalize_cluster_schedule
+from .._compiler.cute.split_k_workspace_config import STAGES_KEY as SPLIT_K_STAGES_KEY
+from .._compiler.cute.split_k_workspace_config import WORKSPACE_CONFIG_KEYS
+from .._compiler.cute.split_k_workspace_config import (
+    WORKSPACE_KEY as SPLIT_K_WORKSPACE_KEY,
+)
+from .._compiler.cute.split_k_workspace_config import normalize_workspace_config
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_DIAGNOSTIC_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_STRATEGY_CONFIG_KEYS
 from .._compiler.cute.tcgen05_config import CUTE_TCGEN05_TUNABLE_KEYS
@@ -73,12 +91,46 @@ from .._compiler.cute.tcgen05_config import CuteTcgen05Config
 from .._compiler.cute.tcgen05_config import Tcgen05AbStagesThreeSearchConstraints
 from .._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from .._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    CONFIG_KEYS as GROUPED_RNA_CONFIG_KEYS,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    CONVERTER_WARPS as GROUPED_RNA_WARPS,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import K_KEY as GROUPED_RNA_K_KEY
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    PREFIX_SCAN_KEY as GROUPED_PREFIX_SCAN_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    PREFIX_SCANS as GROUPED_PREFIX_SCANS,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    RESIDENT_CTAS_KEY as GROUPED_RNA_RESIDENT_CTAS_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    STAGES_KEY as GROUPED_RNA_STAGES_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import (
+    WARPS_KEY as GROUPED_RNA_WARPS_KEY,
+)
+from .._compiler.cute.tcgen05_flat_grouped_config import normalize_grouped_rna_config
+from .._compiler.cute.tcgen05_grouped_descriptors import DESCRIPTOR_KEY
+from .._compiler.cute.tcgen05_grouped_descriptors import DYNAMIC
+from .._compiler.cute.tcgen05_grouped_descriptors import WRAPPED
+from .._compiler.cute.tcgen05_tma_rn import AUTO as CUTE_MMA_F32_AUTO
+from .._compiler.cute.tcgen05_tma_rn import (
+    CONVERSION_KEY as CUTE_MMA_F32_CONVERSION_KEY,
+)
+from .._compiler.cute.tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
+from .._compiler.cute.tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from .._utils import indexing_uses_tensor_descriptor
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
+from .compiler_coverage import CompilerCoverageGroup
+from .compiler_coverage import coverage_policy
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -100,6 +152,8 @@ if TYPE_CHECKING:
     import sympy
 
     from .._compiler.backend import Backend
+    from .._compiler.cute.loop_nesting import TileLoopPath
+    from .._compiler.cute.split_k_cluster import ClusterKFacts
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
@@ -838,6 +892,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     BACKEND_TUNABLE_KEYS
     | _BACKEND_DIAGNOSTIC_CONFIG_KEYS
     | _BACKEND_STRATEGY_CONFIG_KEYS
+    | BLOCK_SCALED_CONFIG_KEYS
+    | {SPLIT_K_SCHEDULE_KEY, SPLIT_K_FINALIZER_KEY}
+    | WORKSPACE_CONFIG_KEYS
+    | GROUPED_RNA_CONFIG_KEYS
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_pipeline",
@@ -849,13 +907,44 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_reduction_schedule",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_reduction_group_rows",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_register_chain",
+        "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
         "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         "load_cache_modifiers",
@@ -911,13 +1000,44 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
+        "cute_reduction_schedule",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_reduction_group_rows",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_register_chain",
+        "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
         "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
         *BACKEND_TUNABLE_KEYS,
@@ -930,6 +1050,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_flash_bwd_persistent",
         "cute_flash_bwd_two_cta",
         "cute_flash_bwd_exp2_f32",
+        *BLOCK_SCALED_CONFIG_KEYS,
+        SPLIT_K_SCHEDULE_KEY,
+        SPLIT_K_FINALIZER_KEY,
+        *WORKSPACE_CONFIG_KEYS,
+        *GROUPED_RNA_CONFIG_KEYS,
     ]
 )
 # Loop types the autotuner searches by default for every Pallas inner loop.
@@ -977,13 +1102,48 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "pid_type",
         "num_sm_multiplier",
         "maxnreg",
+        "cute_reduction_schedule",
+        "cute_reduction_pipeline_depth",
+        "cute_reduction_local_tree",
+        "cute_reduction_row_schedule",
+        "cute_reduction_pack_output",
+        "cute_reduction_sequence",
+        "cute_host_paired_sum",
+        "cute_reduction_group_rows",
+        "cute_materialized_schedule",
+        "cute_materialized_operand_schedule",
+        "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
         "cute_async_load_group_rows",
         "cute_async_load_cache",
         "cute_async_store_policy",
         "cute_bf16x2_recurrence",
+        "cute_register_chain",
+        "cute_signed_bitfield_bf16",
+        "cute_collective_mma",
+        "cute_collective_static_layouts",
+        "cute_collective_copy",
+        "cute_collective_recipe",
+        "cute_collective_operand_packets",
+        "cute_collective_epilogue",
+        "cute_collective_stages",
+        "cute_collective_compute",
+        "cute_collective_native_seeded",
+        "cute_collective_tmem_seed",
+        "cute_collective_tmem_a",
+        "cute_gathered_mma_n",
+        "cute_gathered_mma_stages",
         "cute_proven_bounds",
+        "cute_rng_packet",
+        "cute_independent_reduction",
+        "cute_replicated_reduction",
+        "cute_vector_packet_unroll",
+        "cute_packet_prefetch",
+        *BLOCK_SCALED_CONFIG_KEYS,
+        SPLIT_K_SCHEDULE_KEY,
+        SPLIT_K_FINALIZER_KEY,
+        *WORKSPACE_CONFIG_KEYS,
     }
 )
 
@@ -1012,7 +1172,17 @@ def get_valid_eviction_policies(backend_name: str) -> tuple[str, ...]:
         # loads only — triton's evict_last equivalent, which keeps up to
         # ~L2-size of a streaming input resident across other traffic
         # (+1.7% on fp32 elementwise mul on B200).
-        return ("", "first", "last", "streaming", "l2_last")
+        # Matching explicit L1/L2 priorities preserve a packet for later
+        # row passes or evict it after its final use; also 16-byte loads only.
+        return (
+            "",
+            "first",
+            "last",
+            "streaming",
+            "l2_last",
+            "l1_l2_first",
+            "l1_l2_last",
+        )
     return ("",)
 
 
@@ -1073,6 +1243,10 @@ class ConfigSpec:
         # before configs are normalized.
         self.reduction_block_ids: set[int] = set()
         self.cute_indexed_reduction_block_ids: set[int] = set()
+        # Non-reduction tiles that execute simultaneously. Sibling loops and
+        # separate roots reuse physical axes during CuTe launch planning.
+        self.cute_tile_loop_paths: tuple[TileLoopPath, ...] = ()
+        self.cute_inactive_tile_block_ids: set[int] = set()
         self.user_defined_tunables = (
             {} if user_defined_tunables is None else dict(user_defined_tunables)
         )
@@ -1113,9 +1287,15 @@ class ConfigSpec:
         )
         # Device-IR facts enable this only for plausible in-place 16-bit state
         # updates. Generated-AST matching is stricter and remains authoritative.
+        self.cute_resident_reduction_blocks: set[int] = set()
+        self.cute_sequence_reduction_blocks: set[int] = set()
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
+        self.cute_signed_bitfield_bf16_available = False
+        self.cute_scaled_mma_available = False
         self.cute_proven_bounds_enabled = False
+        self.cute_rng_packet_enabled = False
+        self.cute_packet_prefetch_enabled = False
         self.range_unroll_factors: BlockIdSequence[RangeUnrollFactorSpec] = (
             BlockIdSequence()
         )
@@ -1194,6 +1374,28 @@ class ConfigSpec:
         # The first choice is the semantic-neutral ordinary lowering.
         self.cute_affine_scan_schedule: EnumFragment | None = None
         self._cute_tcgen05_config = CuteTcgen05Config(self)
+        self.cute_host_paired_sum_available: bool = False
+        # A separately launched, proved pointwise producer can share one
+        # Config with a native GEMM. Keep its ordinary SIMT layout knobs in
+        # the native search schema; MMA-owned axes retain their auto layout.
+        self.cute_pointwise_region_block_ids: frozenset[int] = frozenset()
+        # Separately launched pointwise grids whose axes have one root owner.
+        # Their search floors use the rank of that launch, independently of
+        # any native MMA region sharing the complete kernel configuration.
+        self.cute_pointwise_region_grid_groups: tuple[tuple[int, ...], ...] = ()
+        self.cute_split_k_cluster_facts: ClusterKFacts | None = None
+        self.cute_split_k_workspace_available: bool = False
+        self.cute_materialized_schedule_available: bool = False
+        self.cute_materialized_schedule_search_enabled: bool = False
+        self.cute_row_matrix_transport_available: bool = False
+        self.cute_materialized_operand_schedule_available: bool = False
+        self.cute_materialized_operand_schedule_search_enabled: bool = False
+        self.cute_grouped_rna_k_choices: tuple[int, ...] = ()
+        self.cute_grouped_warp_tf32_available = False
+        self.cute_grouped_rn_two_stage_ctas: tuple[int, ...] = ()
+        self.cute_grouped_block_prefix_recipes: tuple[tuple[int, int, int], ...] = ()
+        self.cute_grouped_block_prefix_seed_enabled = False
+        self.cute_grouped_wrapped_descriptors_available = False
         # CuTe flash-attention autotune surface gating.
         # Default False so the flash knobs never appear in the search surface
         # and behavior is byte-identical to the env-only path. Set True when the
@@ -1239,6 +1441,9 @@ class ConfigSpec:
         self._cute_flash_bwd_two_cta_allowed: bool = False
         self.compiler_default_config: helion.Config | None = None
         self.compiler_seed_configs: list[helion.Config] = []
+        self._compiler_coverage_groups: tuple[CompilerCoverageGroup, ...] = ()
+        self._compiler_coverage_fields: tuple[tuple[str | int, ...], ...] = ()
+        self.cute_matmul_min_blocks_search_enabled: bool = False
         # Compiler paths can opt their seeds into a single bounded timeout
         # retry. ``None`` leaves all benchmark behavior unchanged.
         self.compiler_seed_timeout_retry_repetitions: int | None = None
@@ -1265,6 +1470,57 @@ class ConfigSpec:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
             )
+
+    @property
+    def compiler_coverage_groups(self) -> tuple[CompilerCoverageGroup, ...]:
+        return self._compiler_coverage_groups
+
+    def register_compiler_coverage_group(self, group: CompilerCoverageGroup) -> None:
+        """Register ranked coverage after ordinary facts/defaults/seeds are built.
+
+        Consumers expose and normalize their own optional scalar field. They
+        must not change old field domains to make a coverage mode admissible.
+        No user config, compiler default or seed is changed by registration.
+        """
+        for current in self._compiler_coverage_groups:
+            if current.mechanism == group.mechanism or current.key == group.key:
+                raise ValueError("Duplicate compiler coverage mechanism or field")
+        fields = self._flat_fields()
+        fragment = fields.get(group.key)
+        if not isinstance(fragment, ConfigSpecFragment):
+            raise ValueError(f"Unknown or non-scalar coverage field {group.key!r}")
+        group.validate_field(fragment)
+        group.validate_dependencies(self._compiler_coverage_groups)
+        groups = (*self._compiler_coverage_groups, group)
+        owned = {entry.key for entry in groups}
+        fingerprint = tuple(
+            (key, *value.fingerprint()) for key, value in fields.items()
+        )
+        if self._compiler_coverage_groups and tuple(
+            row for row in self._compiler_coverage_fields if row[0] not in owned
+        ) != tuple(row for row in fingerprint if row[0] not in owned):
+            raise ValueError("Compiler coverage registration changed old field layout")
+        self._compiler_coverage_groups = groups
+        self._compiler_coverage_fields = fingerprint
+
+    def validate_compiler_coverage_groups(self) -> None:
+        """Reject stale domains before constructing an immutable initial view."""
+        if not self._compiler_coverage_groups:
+            return
+        fields = self._flat_fields()
+        fingerprint = tuple(
+            (key, *value.fingerprint()) for key, value in fields.items()
+        )
+        if fingerprint != self._compiler_coverage_fields:
+            raise ValueError(
+                "Config fields changed after compiler coverage registration"
+            )
+        for index, group in enumerate(self._compiler_coverage_groups):
+            fragment = fields[group.key]
+            if not isinstance(fragment, ConfigSpecFragment):
+                raise ValueError("Compiler coverage requires independent scalar fields")
+            group.validate_field(fragment)
+            group.validate_dependencies(self._compiler_coverage_groups[:index])
 
     def _should_keep_epilogue_subtile_for_autotune(self) -> bool:
         if self.epilogue_subtile_autotune_choices is None:
@@ -2393,13 +2649,15 @@ class ConfigSpec:
             return False
         return self.backend.supports_config_key(key)
 
-    def enable_cross_loop_pipeline(self) -> None:
+    def enable_cross_loop_pipeline(
+        self, *, choices: tuple[str, ...] = VALID_CROSS_LOOP_PIPELINES
+    ) -> None:
         """Expose the compiler-owned cross-loop execution dimension."""
         if not self.supports_config_key("cross_loop_pipeline"):
             raise InvalidConfig(
                 f"cross_loop_pipeline is not supported by backend {self.backend_name!r}"
             )
-        self.cross_loop_pipeline = EnumFragment(VALID_CROSS_LOOP_PIPELINES)
+        self.cross_loop_pipeline = EnumFragment(choices)
 
     def enable_cute_async_load_pipeline(self) -> None:
         """Expose the narrow CuTe async state-load search dimensions."""
@@ -2427,6 +2685,232 @@ class ConfigSpec:
         if self.backend_name != "cute":
             raise InvalidConfig("proven bounds cleanup requires CuTe")
         self.cute_proven_bounds_enabled = True
+
+    def enable_cute_packet_prefetch(self) -> None:
+        """Expose independent packet staging to the pointwise tuner."""
+        if self.backend_name != "cute":
+            raise InvalidConfig("packet prefetch requires CuTe")
+        self.cute_packet_prefetch_enabled = True
+
+    def _normalize_cute_pointwise_pid_type(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_pointwise_pid_type"
+        value = config.get(key, "inherit")
+        if type(value) is str and value == "inherit":
+            config.pop(key, None)
+            return
+        if (
+            type(value) is str
+            and value == "flat"
+            and self.cute_pointwise_region_block_ids
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(f"{key}={value!r} requires a proved pointwise region")
+
+    def _normalize_cute_materialized_operand_schedule(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_materialized_operand_schedule"
+        value = config.get(key, "off")
+        if type(value) is str and value == "off":
+            config.pop(key, None)
+            return
+        if (
+            type(value) is str
+            and value == "warp_narrow4"
+            and self.cute_materialized_operand_schedule_available
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(f"{key}={value!r} requires a proved packed byte operand")
+
+    @property
+    def cute_materialized_schedule_choices(self) -> tuple[str, ...]:
+        choices = ("off", "warp_rows2")
+        if self.cute_row_matrix_transport_available:
+            return (*choices, "warp_rows2_matrix")
+        return choices
+
+    def _normalize_cute_materialized_schedule(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_materialized_schedule"
+        value = config.get(key, "off")
+        if type(value) is str and value == "off":
+            config.pop(key, None)
+            return
+        if (
+            type(value) is str
+            and value in self.cute_materialized_schedule_choices[1:]
+            and self.cute_materialized_schedule_available
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a proved compact row-resident pair"
+        )
+
+    def _normalize_cute_host_paired_sum(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_host_paired_sum"
+        value = config.get(key, "off")
+        if not self.cute_host_paired_sum_available:
+            if value != "off" and not fix_invalid:
+                raise InvalidConfig(
+                    "host sums require a typed independent pair or terminal sum/cast"
+                )
+            config.pop(key, None)
+            return
+        if value not in ("off", "mapped", "narrow"):
+            if not fix_invalid:
+                raise InvalidConfig(f"unsupported paired host sum layout: {value!r}")
+            value = "off"
+        config[key] = value
+
+    def _normalize_cute_reduction_sequence(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_reduction_sequence"
+        if not self.cute_sequence_reduction_blocks:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "resident sequences require a device-tile reduction chain"
+                )
+            config.pop(key, None)
+            return
+        value = config.setdefault(key, "scalar")
+        if value not in ("scalar", "reload", "resident", "bounded", "bounded_layout"):
+            if fix_invalid:
+                config[key] = "scalar"
+            else:
+                raise InvalidConfig(f"unsupported CuTe reduction sequence: {value!r}")
+
+    def _normalize_cute_reduction_local_tree(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_reduction_local_tree"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_resident_reduction_blocks
+            and config.get("cute_reduction_schedule") in ("resident", "pipelined")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+        else:
+            raise InvalidConfig(
+                "cute_reduction_local_tree requires a resident FP32 sum schedule"
+            )
+
+    def _normalize_cute_reduction_row_output(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        row_key = "cute_reduction_row_schedule"
+        pack_key = "cute_reduction_pack_output"
+        row = config.get(row_key, "batched")
+        resident = bool(self.cute_resident_reduction_blocks) and config.get(
+            "cute_reduction_schedule"
+        ) in ("resident", "pipelined")
+        if row == "batched":
+            config.pop(row_key, None)
+        elif (
+            type(row) is str
+            and row in ("serial", "serial_deferred")
+            and resident
+            and (
+                row != "serial_deferred"
+                or (
+                    config.get("cute_reduction_schedule") == "pipelined"
+                    and config.get("cute_reduction_pipeline_depth", 2) == 2
+                )
+            )
+        ):
+            pass
+        elif fix_invalid:
+            config.pop(row_key, None)
+        else:
+            raise InvalidConfig(
+                f"{row_key} requires a resident schedule; deferred retirement requires a two-slot pipeline"
+            )
+        pack = config.get(pack_key, False)
+        if pack is False:
+            config.pop(pack_key, None)
+        elif (
+            pack is True
+            and resident
+            and self.target_device_capability is not None
+            and self.target_device_capability[0] == 10
+        ):
+            pass
+        elif fix_invalid:
+            config.pop(pack_key, None)
+        else:
+            raise InvalidConfig(
+                f"{pack_key} requires a Boolean and a resident FP32 output product on SM100"
+            )
+
+    def _normalize_cute_reduction_schedule(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_reduction_schedule"
+        group_key = "cute_reduction_group_rows"
+        depth_key = "cute_reduction_pipeline_depth"
+        if not self.cute_resident_reduction_blocks:
+            if (
+                any(k in config for k in (key, group_key, depth_key))
+                and not fix_invalid
+            ):
+                raise InvalidConfig(
+                    "resident CuTe reductions require static serial-row sums"
+                )
+            config.pop(key, None)
+            config.pop(group_key, None)
+            config.pop(depth_key, None)
+            return
+        value = config.setdefault(key, "scalar")
+        if value not in ("scalar", "resident", "pipelined"):
+            if fix_invalid:
+                config[key] = "scalar"
+            else:
+                raise InvalidConfig(f"unsupported CuTe reduction schedule: {value!r}")
+        group = config.setdefault(group_key, 1)
+        if type(group) is not int or group not in (1, 2, 3, 4):
+            if fix_invalid:
+                config[group_key] = 1
+            else:
+                raise InvalidConfig(f"unsupported CuTe reduction group size: {group!r}")
+        if config[key] == "scalar":
+            config[group_key] = 1
+        # An omitted depth must not add a key to old normalized configs or
+        # generated-source headers. The search fragment still defaults to 2.
+        depth = config.get(depth_key, 2)
+        if type(depth) is not int or depth not in (2, 4):
+            if fix_invalid:
+                config[depth_key] = 2
+            else:
+                raise InvalidConfig(
+                    f"unsupported CuTe reduction pipeline depth: {depth!r}"
+                )
+        if config[key] != "pipelined" and config.get(depth_key, 2) != 2:
+            if fix_invalid:
+                config[depth_key] = 2
+            else:
+                raise InvalidConfig(
+                    "CuTe reduction pipeline depth 4 requires the pipelined schedule"
+                )
 
     def _normalize_cute_async_load_pipeline(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -2507,6 +2991,24 @@ class ConfigSpec:
                     "cute_async_load_stages"
                 )
 
+    def _normalize_cute_signed_bitfield_bf16(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_signed_bitfield_bf16"
+        value = config.get(key, False)
+        if type(value) is bool and (
+            not value or self.cute_signed_bitfield_bf16_available
+        ):
+            if not value:
+                config.pop(key, None)
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a Boolean and a signed-byte BF16 candidate on sm_100a"
+        )
+
     def _normalize_cute_bf16x2_recurrence(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -2526,6 +3028,41 @@ class ConfigSpec:
                 raise InvalidConfig(f"{key} must be a boolean, got {value!r}")
         elif config.get("cute_async_load_stages", 0) == 0:
             config[key] = False
+
+    def _normalize_cute_vector_reductions(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        for key in (
+            "cute_independent_reduction",
+            "cute_replicated_reduction",
+            "cute_vector_packet_unroll",
+        ):
+            if key in config and type(config[key]) is not bool:
+                if fix_invalid:
+                    config[key] = False
+                else:
+                    raise InvalidConfig(f"{key} must be a boolean")
+
+    def _normalize_cute_register_chain(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_register_chain"
+        if key not in config:
+            return
+        value = config[key]
+        supported = (
+            bool(self.matmul_facts)
+            and self.target_device_capability is not None
+            and self.target_device_capability[0] >= 8
+        )
+        if type(value) is not bool or (value and not supported):
+            if fix_invalid:
+                config[key] = False
+            else:
+                raise InvalidConfig(
+                    "cute_register_chain requires a boolean, matrix contractions, "
+                    "and CUDA compute capability >= 8.0"
+                )
 
     def _normalize_cute_proven_bounds(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -2566,6 +3103,44 @@ class ConfigSpec:
                     f"{CUTE_AFFINE_SCAN_SCHEDULE_KEY} must be one of "
                     f"{fragment.choices!r}, got {value!r}"
                 )
+
+    def _normalize_cute_rng_packet(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_rng_packet"
+        value = config.get(key, False)
+        if not self.cute_rng_packet_enabled or type(value) is not bool:
+            if key in config and not fix_invalid:
+                raise InvalidConfig(
+                    "cute_rng_packet requires the philox4 stream and a boolean"
+                )
+            config.pop(key, None)
+            return
+        config.setdefault(key, False)
+
+    def _normalize_cute_packet_prefetch(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_packet_prefetch"
+        value = config.get(key, 0)
+        if type(value) is not int or value not in (0, 2, 4, 8):
+            if not fix_invalid:
+                raise InvalidConfig(f"{key} must be 0, 2, 4, or 8, got {value!r}")
+            config.pop(key, None)
+            return
+        if value == 0:
+            config.pop(key, None)
+            return
+        if (
+            not self.cute_packet_prefetch_enabled
+            or not self.cute_proven_bounds_enabled
+            or config.get("cute_proven_bounds") is not True
+        ):
+            if not fix_invalid:
+                raise InvalidConfig(
+                    "cute_packet_prefetch requires pointwise facts and cute_proven_bounds"
+                )
+            config.pop(key, None)
 
     def supported_config_keys(self) -> frozenset[str]:
         return frozenset(key for key in VALID_KEYS if self.supports_config_key(key))
@@ -2825,13 +3400,193 @@ class ConfigSpec:
                         f"Unsupported config keys for backend {self.backend_name!r}: {backend_specific}"
                     )
         if self.backend_name == "cute":
+            normalize_cluster_schedule(
+                config,
+                available=self.cute_split_k_cluster_facts is not None,
+                fix_invalid=_fix_invalid,
+            )
+            validate_cluster_config(self, config, fix_invalid=_fix_invalid)
+            normalize_cluster_finalizer(
+                config,
+                available=self.cute_split_k_cluster_facts is not None,
+                fix_invalid=_fix_invalid,
+            )
+            normalize_workspace_config(
+                config,
+                available=self.cute_split_k_workspace_available,
+                fix_invalid=_fix_invalid,
+            )
+            normalize_grouped_rna_config(
+                config,
+                available_k=self.cute_grouped_rna_k_choices,
+                rn_two_stage_ctas=self.cute_grouped_rn_two_stage_ctas,
+                block_prefix_recipes=self.cute_grouped_block_prefix_recipes,
+                warp_raw_available=self.cute_grouped_warp_tf32_available,
+                wrapped_descriptors_available=self.cute_grouped_wrapped_descriptors_available,
+                fix_invalid=_fix_invalid,
+            )
             self._cute_tcgen05_config.prepare_normalization(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_reduction_schedule(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_reduction_local_tree(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_reduction_row_output(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_reduction_sequence(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_host_paired_sum(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_materialized_operand_schedule(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_pointwise_pid_type(config, fix_invalid=_fix_invalid)
             self._normalize_cute_async_load_pipeline(config, fix_invalid=_fix_invalid)
             self._normalize_cute_bf16x2_recurrence(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_signed_bitfield_bf16(config, fix_invalid=_fix_invalid)
             self._normalize_cute_proven_bounds(config, fix_invalid=_fix_invalid)
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
+            if self.matmul_facts:
+                value = config.setdefault("cute_collective_mma", False)
+                if not isinstance(value, bool):
+                    if _fix_invalid:
+                        config["cute_collective_mma"] = False
+                    else:
+                        raise InvalidConfig("cute_collective_mma must be a boolean")
+                for key in (
+                    "cute_collective_native_seeded",
+                    "cute_collective_tmem_seed",
+                    "cute_collective_tmem_a",
+                ):
+                    seeded = config.setdefault(key, False)
+                    if not isinstance(seeded, bool):
+                        if _fix_invalid:
+                            config[key] = False
+                        else:
+                            raise InvalidConfig(f"{key} must be a boolean")
+                    if seeded is True and (
+                        self.target_device_capability is None
+                        or self.target_device_capability[0] != 10
+                    ):
+                        if _fix_invalid:
+                            config[key] = False
+                        else:
+                            raise InvalidConfig(f"{key} requires SM100-family hardware")
+                packet_key = "cute_collective_operand_packets"
+                if not isinstance(config.get(packet_key, False), bool):
+                    if _fix_invalid:
+                        config[packet_key] = False
+                    else:
+                        raise InvalidConfig(f"{packet_key} must be a boolean")
+                copy = config.setdefault("cute_collective_copy", "scalar")
+                if copy not in ("scalar", "async", "async_cached"):
+                    if _fix_invalid:
+                        config["cute_collective_copy"] = "scalar"
+                    else:
+                        raise InvalidConfig(
+                            "cute_collective_copy must be scalar, async, or async_cached"
+                        )
+                for key in ("cute_collective_recipe", "cute_collective_epilogue"):
+                    recipe = config.get(key, "scalar")
+                    if recipe not in ("scalar", "vector", "vector_unrolled"):
+                        if _fix_invalid:
+                            config[key] = "scalar"
+                        else:
+                            raise InvalidConfig(
+                                f"{key} must be scalar, vector, or vector_unrolled"
+                            )
+                compute = config.setdefault("cute_collective_compute", "warp")
+                if compute not in ("warp", "tcgen05", "tma_gather"):
+                    if _fix_invalid:
+                        config["cute_collective_compute"] = "warp"
+                    else:
+                        raise InvalidConfig(
+                            "cute_collective_compute must be warp, tcgen05, or tma_gather"
+                        )
+                if compute in ("tcgen05", "tma_gather") and (
+                    self.target_device_capability is None
+                    or self.target_device_capability[0] != 10
+                ):
+                    if _fix_invalid:
+                        config["cute_collective_compute"] = "warp"
+                    else:
+                        raise InvalidConfig(
+                            "native collective compute requires SM100-family hardware"
+                        )
+                for key, choices, default in (
+                    ("cute_collective_stages", (1, 2, 3, 4), 1),
+                    ("cute_gathered_mma_n", (128, 256, 512), 256),
+                    ("cute_gathered_mma_stages", (2, 3, 4), 3),
+                ):
+                    if key in config and (
+                        type(config[key]) is not int or config[key] not in choices
+                    ):
+                        if _fix_invalid:
+                            config[key] = default
+                        else:
+                            raise InvalidConfig(f"{key} must be one of {choices}")
+                if compute == "tma_gather":
+                    n = config.setdefault("cute_gathered_mma_n", 256)
+                    stages = config.setdefault("cute_gathered_mma_stages", 3)
+                    if n == 512 and stages != 2:
+                        if _fix_invalid:
+                            config["cute_gathered_mma_stages"] = 2
+                        else:
+                            raise InvalidConfig(
+                                "512-column gathered MMA requires two stages"
+                            )
+            elif any(
+                key in config
+                for key in (
+                    "cute_collective_mma",
+                    "cute_collective_copy",
+                    "cute_collective_recipe",
+                    "cute_collective_operand_packets",
+                    "cute_collective_epilogue",
+                    "cute_collective_stages",
+                    "cute_collective_compute",
+                    "cute_collective_native_seeded",
+                    "cute_collective_tmem_seed",
+                    "cute_collective_tmem_a",
+                    "cute_gathered_mma_n",
+                    "cute_gathered_mma_stages",
+                )
+            ):
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        "cute_collective_mma requires a matrix contraction"
+                    )
+                config.pop("cute_collective_mma", None)
+                config.pop("cute_collective_copy", None)
+                config.pop("cute_collective_recipe", None)
+                config.pop("cute_collective_operand_packets", None)
+                config.pop("cute_collective_epilogue", None)
+                config.pop("cute_collective_stages", None)
+                config.pop("cute_collective_compute", None)
+                config.pop("cute_collective_native_seeded", None)
+                config.pop("cute_collective_tmem_seed", None)
+                config.pop("cute_collective_tmem_a", None)
+                config.pop("cute_gathered_mma_n", None)
+                config.pop("cute_gathered_mma_stages", None)
+        if self.backend_name == "cute":
+            key = "cute_collective_static_layouts"
+            value = config.get(key, False)
+            if value is False:
+                config.pop(key, None)
+            elif (
+                value is True
+                and self.matmul_facts
+                and config.get("cute_collective_mma", False)
+                and config.get("cute_collective_compute", "warp") == "warp"
+            ):
+                pass
+            elif _fix_invalid:
+                config.pop(key, None)
+            else:
+                raise InvalidConfig(
+                    "cute_collective_static_layouts requires warp collective MMA"
+                )
         provided_keys = set(config)
         if _fix_invalid:
             self._pre_normalize_cute_flash_block_sizes(config)
@@ -3168,6 +3923,13 @@ class ConfigSpec:
         for key, fragment in self.backend_tunable_fragments.items():
             config.setdefault(key, fragment.default())
         self._normalize_amd_mfma(config, fix_invalid=_fix_invalid)
+        if self.backend_name == "cute":
+            normalize_block_scaled_config(
+                config,
+                available=self.cute_scaled_mma_available,
+                capability=self.target_device_capability,
+                fix_invalid=_fix_invalid,
+            )
         cross_loop_pipeline_fragment = self.cross_loop_pipeline
         if cross_loop_pipeline_fragment is not None:
             cross_loop_pipeline = config.setdefault(
@@ -3599,6 +4361,14 @@ class ConfigSpec:
             for key in _CUTE_IMPLICIT_DEFAULT_KEYS - provided_keys - preserve_keys:
                 config.pop(key, None)
 
+        if self.backend_name == "cute":
+            validate_cluster_config(self, config, fix_invalid=_fix_invalid)
+            normalize_cluster_finalizer(
+                config,
+                available=self.cute_split_k_cluster_facts is not None,
+                fix_invalid=_fix_invalid,
+            )
+
         # Allow tunable parameter keys in addition to backend-supported keys.
         allowed_keys = self.supported_config_keys() | {
             *self.user_defined_tunables.keys()
@@ -3607,7 +4377,7 @@ class ConfigSpec:
             raise InvalidConfig(f"Invalid config keys {sorted(invalid_keys)!r}")
 
     def raise_grid_block_minimums(self) -> None:
-        """Raise min_size for grid block dimensions based on problem size.
+        """Raise search floors for grid block dimensions based on problem size.
 
         Very small block sizes produce enormous grids that the autotuner
         wastes time exploring.  This heuristic sets a floor so the total
@@ -3624,6 +4394,11 @@ class ConfigSpec:
         n_cus = num_compute_units()
         n_dims = len(self.grid_block_ids)
         max_blocks_per_dim = math.ceil((n_cus * 64) ** (1.0 / n_dims))
+        independent_max_blocks: dict[int, int] = {
+            block_id: math.ceil((n_cus * 64) ** (1.0 / len(grid)))
+            for grid in self.cute_pointwise_region_grid_groups
+            for block_id in grid
+        }
 
         for grid_bid in self.grid_block_ids:
             try:
@@ -3633,7 +4408,9 @@ class ConfigSpec:
             if spec.size_hint <= 0:
                 continue
             default = spec._fragment(self).default_val
-            min_block = spec.size_hint // max_blocks_per_dim
+            min_block = spec.size_hint // independent_max_blocks.get(
+                grid_bid, max_blocks_per_dim
+            )
             min_block = min(min_block, default)
             if min_block >= 2:
                 min_block = 1 << (min_block.bit_length() - 1)
@@ -3648,6 +4425,7 @@ class ConfigSpec:
         overrides: Mapping[str, object] | None = None,
         advanced_controls_files: list[str] | None = None,
         process_group_name: str | None = None,
+        compiler_coverage_enabled: bool = True,
     ) -> ConfigGeneration:
         from .config_generation import ConfigGeneration
 
@@ -3730,6 +4508,7 @@ class ConfigSpec:
             _flash_pipeline_family_override=family_override,
             advanced_controls_files=advanced_controls_files,
             process_group_name=process_group_name,
+            compiler_coverage_enabled=compiler_coverage_enabled,
         )
 
     def flatten_missing_field_default(
@@ -3738,6 +4517,12 @@ class ConfigSpec:
         config: dict[str, object],
     ) -> tuple[bool, object]:
         if self.backend_name == "cute":
+            if key == "cute_materialized_schedule":
+                return True, "off"
+            if key == "cute_materialized_operand_schedule":
+                return True, "off"
+            if key == "cute_signed_bitfield_bf16":
+                return True, False
             if self.cute_flash_search_enabled and key == FLASH_PIPELINE_FAMILY_KEY:
                 return True, self._resolve_cute_flash_config(config).pipeline_family
             return self._cute_tcgen05_config.flatten_missing_field_default(key, config)
@@ -3817,6 +4602,12 @@ class ConfigSpec:
 
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
+        # The additive finalizer choice must not change existing seed configs.
+        config.config.pop(SPLIT_K_FINALIZER_KEY, None)
+        if self.cute_matmul_min_blocks_search_enabled:
+            # This optional matmul coordinate has no old default Config key.
+            # Keep the public default exact; flat search still represents zero.
+            config.config.pop("cute_min_blocks_per_mp", None)
         self._shrink_for_numel_constraints(config)
         return config
 
@@ -3860,6 +4651,33 @@ class ConfigSpec:
         shrink_block_sizes_for_numel_constraints(
             self.tensor_numel_constraints, block_sizes, min_sizes
         )
+
+    def shrink_block_sizes_once(self, config: helion.Config) -> helion.Config | None:
+        """Return a copy of *config* with its largest block size halved.
+
+        ``None`` once every block size sits at its minimum.  Used to back off a
+        config Helion chose itself after the backend compiler rejected it for a
+        hardware limit Helion cannot model (scratch space, shared memory,
+        register pressure).
+        """
+        block_sizes = config.config.get("block_sizes")
+        if not isinstance(block_sizes, list) or not block_sizes:
+            return None
+        best_idx: int | None = None
+        best_val = -1
+        for i, value in enumerate(block_sizes):
+            if not isinstance(value, int):
+                continue
+            if value // 2 >= max(self.block_sizes[i].min_size, 1) and value > best_val:
+                best_val = value
+                best_idx = i
+        if best_idx is None:
+            return None
+        shrunk = [*block_sizes]
+        shrunk[best_idx] //= 2
+        new_config = helion.Config.from_dict({**config.config, "block_sizes": shrunk})
+        self.normalize(new_config, _fix_invalid=True)
+        return new_config
 
     def iter_search_dimensions(
         self, value_limit: int = 100
@@ -3909,8 +4727,30 @@ class ConfigSpec:
             "block_sizes": self.block_sizes,
         }
         if self.backend_name == "cute":
+            if self.cute_signed_bitfield_bf16_available:
+                fields["cute_signed_bitfield_bf16"] = BooleanFragment()
+            if self.cute_host_paired_sum_available:
+                fields["cute_host_paired_sum"] = EnumFragment(
+                    choices=("off", "mapped", "narrow")
+                )
+            if self.cute_materialized_schedule_search_enabled:
+                fields["cute_materialized_schedule"] = EnumFragment(
+                    choices=self.cute_materialized_schedule_choices
+                )
+            if self.cute_materialized_operand_schedule_search_enabled:
+                fields["cute_materialized_operand_schedule"] = EnumFragment(
+                    choices=("off", "warp_narrow4")
+                )
+            if self.cute_pointwise_region_block_ids:
+                fields["cute_pointwise_pid_type"] = EnumFragment(
+                    choices=("inherit", "flat")
+                )
             if self.cute_tcgen05_search_enabled:
                 fields.update(self._cute_tcgen05_config.flat_fields())
+                if self.cute_pointwise_region_block_ids:
+                    fields["num_threads"] = self.num_threads
+                    fields["cute_vector_widths"] = self.cute_vector_widths
+                    fields["cute_lane_layouts"] = self.cute_lane_layouts
             elif self.cute_flash_search_enabled:
                 fields.update(
                     self._cute_flash_autotune_fragments(
@@ -3989,6 +4829,35 @@ class ConfigSpec:
                     and len(self.cute_reduction_reloads) > 0
                 ):
                     fields["cute_reduction_reloads"] = self.cute_reduction_reloads
+                if self.cute_sequence_reduction_blocks:
+                    fields["cute_reduction_sequence"] = EnumFragment(
+                        choices=(
+                            "scalar",
+                            "reload",
+                            "resident",
+                            "bounded",
+                            "bounded_layout",
+                        )
+                    )
+                if self.cute_resident_reduction_blocks:
+                    fields["cute_reduction_local_tree"] = BooleanFragment()
+                    fields["cute_reduction_schedule"] = EnumFragment(
+                        choices=("scalar", "resident", "pipelined")
+                    )
+                    fields["cute_reduction_group_rows"] = EnumFragment(
+                        choices=(1, 2, 4, 3)
+                    )
+                    fields["cute_reduction_row_schedule"] = EnumFragment(
+                        choices=("batched", "serial", "serial_deferred")
+                    )
+                    if (
+                        self.target_device_capability is not None
+                        and self.target_device_capability[0] == 10
+                    ):
+                        fields["cute_reduction_pack_output"] = BooleanFragment()
+                    fields["cute_reduction_pipeline_depth"] = EnumFragment(
+                        choices=(2, 4)
+                    )
                 if self.cute_async_load_pipeline_enabled:
                     fields["cute_async_load_stages"] = EnumFragment(
                         choices=(0, 3, 4, 5)
@@ -4007,8 +4876,151 @@ class ConfigSpec:
                     )
                 if self.cute_bf16x2_recurrence_enabled:
                     fields["cute_bf16x2_recurrence"] = BooleanFragment()
+                if self.matmul_facts:
+                    if (
+                        self.cute_grouped_rna_k_choices
+                        or self.cute_grouped_warp_tf32_available
+                    ):
+                        fields[CUTE_MMA_F32_CONVERSION_KEY] = EnumFragment(
+                            choices=(CUTE_MMA_F32_AUTO,)
+                            + (
+                                (CUTE_MMA_F32_TMA_RN,)
+                                if self.cute_grouped_rna_k_choices
+                                else ()
+                            )
+                            + (
+                                (CUTE_MMA_F32_WARP_RAW,)
+                                if self.cute_grouped_warp_tf32_available
+                                else ()
+                            )
+                        )
+                    if self.cute_grouped_rna_k_choices:
+                        fields[GROUPED_RNA_WARPS_KEY] = EnumFragment(
+                            choices=GROUPED_RNA_WARPS
+                        )
+                        fields[GROUPED_RNA_K_KEY] = EnumFragment(
+                            choices=self.cute_grouped_rna_k_choices
+                        )
+                        if self.cute_grouped_rn_two_stage_ctas:
+                            fields[GROUPED_RNA_STAGES_KEY] = EnumFragment(
+                                choices=(0, 2)
+                            )
+                            fields[GROUPED_RNA_RESIDENT_CTAS_KEY] = EnumFragment(
+                                choices=self.cute_grouped_rn_two_stage_ctas
+                            )
+                        if self.cute_grouped_wrapped_descriptors_available:
+                            fields[DESCRIPTOR_KEY] = EnumFragment(
+                                choices=(DYNAMIC, WRAPPED)
+                            )
+                        if self.cute_grouped_block_prefix_recipes:
+                            fields[GROUPED_PREFIX_SCAN_KEY] = EnumFragment(
+                                choices=GROUPED_PREFIX_SCANS
+                            )
+                    if self.cute_split_k_cluster_facts is not None:
+                        fields[SPLIT_K_SCHEDULE_KEY] = EnumFragment(SPLIT_K_SCHEDULES)
+                        fields[SPLIT_K_FINALIZER_KEY] = EnumFragment(FINALIZER_WARPS)
+                    if self.cute_split_k_workspace_available:
+                        fields[SPLIT_K_WORKSPACE_KEY] = BooleanFragment()
+                        fields[SPLIT_K_STAGES_KEY] = IntegerFragment(1, 16, 2)
+                    fields["cute_collective_mma"] = BooleanFragment()
+                    fields["cute_collective_static_layouts"] = BooleanFragment()
+                    native_collective = (
+                        self.target_device_capability is not None
+                        and self.target_device_capability[0] == 10
+                    )
+                    gathered_collective = native_collective and any(
+                        seed.config.get("cute_collective_compute") == "tma_gather"
+                        for seed in self.compiler_seed_configs
+                    )
+                    fields["cute_collective_compute"] = EnumFragment(
+                        choices=("warp", "tcgen05", "tma_gather")
+                        if native_collective
+                        else ("warp",),
+                        search_choices=("warp", "tcgen05", "tma_gather")
+                        if gathered_collective
+                        else ("warp", "tcgen05")
+                        if native_collective
+                        else ("warp",),
+                    )
+                    fields["cute_collective_native_seeded"] = (
+                        BooleanFragment()
+                        if native_collective
+                        else EnumFragment(choices=(False,))
+                    )
+                    fields["cute_collective_tmem_seed"] = (
+                        BooleanFragment()
+                        if native_collective
+                        else EnumFragment(choices=(False,))
+                    )
+                    fields["cute_collective_tmem_a"] = (
+                        BooleanFragment()
+                        if native_collective
+                        else EnumFragment(choices=(False,))
+                    )
+                    fields["cute_collective_stages"] = EnumFragment(
+                        choices=(1, 2, 3, 4)
+                    )
+                    fields["cute_collective_copy"] = EnumFragment(
+                        choices=("scalar", "async", "async_cached")
+                    )
+                    fields["cute_collective_recipe"] = EnumFragment(
+                        choices=("scalar", "vector", "vector_unrolled")
+                    )
+                    fields["cute_collective_operand_packets"] = EnumFragment(
+                        choices=(False, True),
+                        search_choices=(False, True)
+                        if any(
+                            fact.lhs_dtype == torch.float32
+                            for fact in self.matmul_facts
+                        )
+                        else (False,),
+                    )
+                    fields["cute_collective_epilogue"] = EnumFragment(
+                        choices=("scalar", "vector", "vector_unrolled")
+                    )
+                    fields["cute_gathered_mma_n"] = EnumFragment(
+                        choices=(256, 128, 512),
+                        search_choices=(256, 128, 512)
+                        if gathered_collective
+                        else (256,),
+                    )
+                    fields["cute_gathered_mma_stages"] = EnumFragment(
+                        choices=(3, 2, 4),
+                        search_choices=(3, 2, 4) if gathered_collective else (3,),
+                    )
                 if self.cute_proven_bounds_enabled:
                     fields["cute_proven_bounds"] = BooleanFragment()
+                if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
+                    for key in (
+                        "cute_independent_reduction",
+                        "cute_replicated_reduction",
+                        "cute_vector_packet_unroll",
+                    ):
+                        seeded = any(
+                            seed.config.get(key) is True
+                            for seed in self.compiler_seed_configs
+                        )
+                        fields[key] = EnumFragment(
+                            (False, True),
+                            search_choices=(False, True) if seeded else (False,),
+                        )
+                if self.cute_rng_packet_enabled:
+                    fields["cute_rng_packet"] = BooleanFragment()
+                if self.cute_packet_prefetch_enabled:
+                    fields["cute_packet_prefetch"] = EnumFragment(choices=(0, 2, 4, 8))
+                if (
+                    self.matmul_facts
+                    and self.target_device_capability is not None
+                    and self.target_device_capability[0] >= 8
+                ):
+                    chain_seeded = any(
+                        seed.config.get("cute_register_chain") is True
+                        for seed in self.compiler_seed_configs
+                    )
+                    fields["cute_register_chain"] = EnumFragment(
+                        (False, True),
+                        search_choices=(False, True) if chain_seeded else (False,),
+                    )
                 # CuTe's SIMT search normally has no pid_type coordinate.  A
                 # metadata-specialized compiler seed may nevertheless prove one
                 # exact 3-D ``xyz`` launch safe after the earlier, deliberately
@@ -4077,6 +5089,17 @@ class ConfigSpec:
                 )
             if self.cute_affine_scan_schedule is not None:
                 fields[CUTE_AFFINE_SCAN_SCHEDULE_KEY] = self.cute_affine_scan_schedule
+            if (
+                self.cute_scaled_mma_available
+                and self.target_device_capability is not None
+                and self.target_device_capability[0] == 10
+            ):
+                fields.update(
+                    (key, EnumFragment(choices=choices))
+                    for key, choices in BLOCK_SCALED_CHOICES.items()
+                )
+            if self.cute_matmul_min_blocks_search_enabled:
+                fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))
             fields.update(self.user_defined_tunables)
             return fields
 
@@ -4193,6 +5216,8 @@ class ConfigSpec:
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_emit_pipeline_group_size"):
                 fields["pallas_emit_pipeline_group_size"] = PowerOfTwoFragment(1, 16, 1)
+            if self.supports_config_key("pallas_use_low_level_scheduler"):
+                fields["pallas_use_low_level_scheduler"] = BooleanFragment()
             if self.supports_config_key("pallas_pre_broadcast"):
                 fields["pallas_pre_broadcast"] = BooleanFragment()
             if (
@@ -4267,6 +5292,28 @@ class ConfigSpec:
         structural_hash = self.structural_fingerprint_hash(
             advanced_controls_files=advanced_controls_files
         )
+        legacy_hash = self._cache_fingerprint_from_structural_hash(structural_hash)
+        policy = coverage_policy(self.compiler_coverage_groups)
+        if policy is None:
+            return legacy_hash
+        return hashlib.sha256(repr((legacy_hash, policy)).encode("utf-8")).hexdigest()
+
+    def projected_cache_fingerprint_hash(
+        self, *, advanced_controls_files: list[str] | None = None
+    ) -> str:
+        """Identity of the old layout, used only by initial warm-base decoding."""
+        owned = {group.key for group in self.compiler_coverage_groups}
+        fingerprint = tuple(
+            row
+            for row in self.structural_fingerprint(
+                advanced_controls_files=advanced_controls_files
+            )
+            if row[0] not in owned
+        )
+        structural_hash = hashlib.sha256(repr(fingerprint).encode("utf-8")).hexdigest()
+        return self._cache_fingerprint_from_structural_hash(structural_hash)
+
+    def _cache_fingerprint_from_structural_hash(self, structural_hash: str) -> str:
         target_policy_identity: object | None = None
         if self.backend_name == "cute" and self.cute_flash_search_enabled:
             from .._compiler.cute.flash_policy import flash_target_policy_cache_identity
@@ -4380,10 +5427,21 @@ class ConfigSpec:
         fields: Mapping[str, BlockIdSequence[Any] | ConfigSpecFragment],
         *,
         advanced_controls_files: list[str] | None,
+        _fix_invalid: bool = True,
     ) -> helion.Config:
         config: dict[str, Any] = {}
         for key, field in fields.items():
             config[key] = field._flat_config(self, fn)
+
+        # None is the flat representation of these absent grouped overrides.
+        # Preserve that absence before strict validation, which intentionally
+        # rejects an explicitly supplied None for either option.
+        for key in (
+            "tcgen05_grouped_mode",
+            "tcgen05_grouped_worklist_source_m_tile",
+        ):
+            if config.get(key) is None:
+                config.pop(key, None)
 
         for name in (
             "loop_orders",
@@ -4409,7 +5467,7 @@ class ConfigSpec:
         acf_fragment = self._advanced_controls_file_fragment(advanced_controls_files)
         if acf_fragment is not None:
             config["advanced_controls_file"] = fn(acf_fragment)
-        self.normalize(config, _fix_invalid=True)
+        self.normalize(config, _fix_invalid=_fix_invalid)
         return helion.Config(**config)
 
 
@@ -4551,6 +5609,14 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # Needed for matmul dims smaller than the heuristic default (e.g. M<16),
         # where the default would otherwise overshoot to a masked tile.
         default = min(default, self.dim_max_size)
+        if any(
+            self.block_id in group for group in base.cute_pointwise_region_grid_groups
+        ):
+            # Widen independent pointwise searches without changing the old
+            # effective default, which the fragment clamps to its soft floor.
+            # Shared axes and hard layout/alignment minima remain unchanged.
+            default = max(min(default, self.max_size), low)
+            low = min(self.min_size, self.max_size)
         return BlockSizeFragment(
             low,
             self.max_size,
@@ -4569,7 +5635,13 @@ class NumThreadsSpec(_PowerOfTwoBlockIdItem):
             return 0
         return super()._normalize(name, value)
 
-    def _fragment(self, base: ConfigSpec) -> NumThreadsFragment:
+    def _fragment(self, base: ConfigSpec) -> NumThreadsFragment | EnumFragment:
+        if (
+            base.cute_tcgen05_search_enabled
+            and base.cute_pointwise_region_block_ids
+            and self.block_id not in base.cute_pointwise_region_block_ids
+        ):
+            return EnumFragment((0,))
         max_threads = min(max(self.size_hint, 1), 1024)
         default = next_power_of_2(max_threads)
         return NumThreadsFragment(default)
@@ -4732,6 +5804,12 @@ class CuteLaneLayoutSpec(_BlockIdItem):
         super().__init__([block_id])
 
     def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if (
+            base.cute_tcgen05_search_enabled
+            and base.cute_pointwise_region_block_ids
+            and self.block_id not in base.cute_pointwise_region_block_ids
+        ):
+            return EnumFragment(("blocked",))
         return EnumFragment(choices=_CUTE_LANE_LAYOUT_CHOICES)
 
     def _normalize(self, name: str, value: object) -> str:
@@ -4763,6 +5841,12 @@ class CuteVectorWidthSpec(_BlockIdItem):
         self.size_hint = size_hint
 
     def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        if (
+            base.cute_tcgen05_search_enabled
+            and base.cute_pointwise_region_block_ids
+            and self.block_id not in base.cute_pointwise_region_block_ids
+        ):
+            return EnumFragment((1,))
         return EnumFragment(choices=_CUTE_VECTOR_WIDTH_CHOICES)
 
     def _normalize(self, name: str, value: object) -> int:

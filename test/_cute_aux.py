@@ -95,6 +95,9 @@ def _rank_two_inputs() -> tuple[torch.Tensor, ...]:
 def _cpu_codegen() -> Iterator[None]:
     with (
         patch_cute_mma_support(),
+        # These tests inspect generated source without compiling or launching
+        # CuTe. They do not require the installed runtime DSL or TVM FFI.
+        patch("helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements"),
         patch("torch.cuda.is_available", return_value=False),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")),
         patch(

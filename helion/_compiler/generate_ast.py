@@ -7,6 +7,7 @@ import dataclasses
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import cast
 
 import sympy
 import torch
@@ -29,6 +30,7 @@ from .compile_environment import CompileEnvironment
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
+from .device_function import TensorArg
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
@@ -46,7 +48,7 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
-    from ..runtime import Config
+    from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -106,6 +108,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         store_transform: Callable[..., ast.AST] | None = None,
         load_transform: Callable[..., ast.AST] | None = None,
         extra_params: list[str] | None = None,
+        codegen_graphs: list[GraphInfo] | None = None,
     ) -> None:
         # Initialize NodeVisitor first
         NodeVisitor.__init__(self)
@@ -119,11 +122,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
         # Initialize our attributes
         self.host_function = func
-        self.codegen_graphs = func.device_ir.build_codegen_graphs(config)
+        config = CompileEnvironment.current().backend.codegen_config(config)
+        self.codegen_graphs = (
+            func.device_ir.build_codegen_graphs(config)
+            if codegen_graphs is None
+            else codegen_graphs
+        )
         self.host_statements: list[ast.AST] = []
         self.module_statements: list[ast.stmt] = []
         self.cute_wrapper_plans: list[dict[str, object]] = []
-        self.cute_uses_matmul: bool = False
+        self._cute_uses_matmul: bool = False
+        self._cute_matmul_declaration_count = 0
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
@@ -209,6 +218,60 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._compute_inter_loop_barriers()
         # Same, for a store->load read-after-write *within* one loop body.
         self._compute_intra_loop_barriers()
+
+    @property
+    def cute_uses_matmul(self) -> bool:
+        return self._cute_uses_matmul
+
+    @cute_uses_matmul.setter
+    def cute_uses_matmul(self, value: bool) -> None:
+        self._cute_uses_matmul = value
+        # Count declarations, not False-to-True transitions: an unrelated
+        # matmul path must not inherit a register chain's shape-bake exemption.
+        if value:
+            self._cute_matmul_declaration_count += 1
+
+    def _cute_can_bake_tensor_shapes(self) -> bool:
+        if not self.cute_uses_matmul:
+            return True
+        if self.cute_wrapper_plans:
+            return all(
+                plan.get("kind")
+                in {
+                    "helion_small_biased_attention",
+                    "helion_flash",
+                    "chunk_prepare_tma",
+                    "chunk_recurrence_sm100",
+                    "chunk_recurrence_warp_dv4",
+                    "helion_flash_bwd",
+                    "gathered_mma_tma",
+                    "block_scaled_mma",
+                }
+                for plan in self.cute_wrapper_plans
+            )
+        state = self.device_function.cute_state
+        return (
+            state.collective_register_chain_lowered
+            and self._cute_matmul_declaration_count >= 2
+            and self._cute_matmul_declaration_count == len(state.collective_mma_sites)
+        ) or self._cute_has_complete_static_collectives()
+
+    def allow_dead_assignments_owned_by_nodes(self, nodes: tuple[Node, ...]) -> None:
+        """Allow liveness-based DCE for assignments from proven pure FX nodes.
+
+        Unlike removing their statements, this preserves any CSE temporary
+        still read by another node or by a replacement collective lowering.
+        The caller must prove that the supplied nodes have no side effects.
+        """
+        for node in nodes:
+            for _body, statement in self._statements_by_owner_node_id.get(id(node), ()):
+                for assignment in ast.walk(statement):
+                    if (
+                        isinstance(assignment, ast.Assign)
+                        and len(assignment.targets) == 1
+                        and isinstance(target := assignment.targets[0], ast.Name)
+                    ):
+                        self.device_function.dce_vars.append(target.id)
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -447,6 +510,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.device_function.cute_state.chunk_prepare_plan = None
         raise exc.BackendUnsupported("cute", "chunk prepare failed late validation")
 
+    def _try_codegen_block_scaled_root(self) -> bool:
+        if self.device_function.cute_state.block_scaled_plan is None:
+            return False
+        from .cute.block_scaled_mma import codegen_block_scaled
+
+        if codegen_block_scaled(self):
+            return True
+        raise exc.BackendUnsupported("cute", "block scaling failed late validation")
+
     def _try_codegen_chunk_recurrence_root(self) -> bool:
         plan = self.device_function.cute_state.chunk_recurrence_plan
         if plan is None:
@@ -665,6 +737,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         if key not in self._codegen_results_by_owner_node_id:
             return False, None
         return True, self._codegen_results_by_owner_node_id[key]
+
+    def _cute_has_complete_static_collectives(self) -> bool:
+        state = self.device_function.cute_state
+        return (
+            cast(
+                "bool",
+                self.device_function.config.get(
+                    "cute_collective_static_layouts", False
+                ),
+            )
+            and not self.cute_wrapper_plans
+            and state.collective_mma_static_layouts
+            and self._cute_matmul_declaration_count > 0
+            and self._cute_matmul_declaration_count == len(state.collective_mma_sites)
+        )
 
     def _record_tcgen05_owned_statement(self, stmt: ast.AST) -> None:
         owner_node = self._statement_owner_fx_node
@@ -1222,7 +1309,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
         if needs_barrier_before:
-            self.add_statement(statement_from_string("tl.debug_barrier()"))
+            for statement in self.device_function.cta_barrier():
+                self.add_statement(statement)
         self.statements_stack[-1].extend(device_loop.outer_prefix)
         self.add_statement(device_loop.for_node)
         self.statements_stack[-1].extend(device_loop.outer_suffix)
@@ -1405,7 +1493,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     root = root_graph_info.graph
                     if (
-                        not self._try_codegen_chunk_prepare_root()
+                        not self._try_codegen_block_scaled_root()
+                        and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
@@ -1506,17 +1595,151 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     )
                     from .tile_strategy import restore_unprocessed_lane_reduce_markers
                     from .tile_strategy import split_lane_loop_reductions
+                    from .tile_strategy import validate_lane_reduce_owners
 
                     # First interchange any ``for LANE: ... for MB: ...`` nest
                     # whose inner serial loop carries lane-reduce markers into a
                     # lane-outside-mb accumulator nest plus a lane-inside-mb
                     # reduction nest; then split the (now inner) lane loops into
                     # the two-pass accumulate/finalize/consume structure.
-                    self.device_function.body = (
-                        interchange_lane_outside_serial_reductions(
-                            list(self.device_function.body)
-                        )
+                    proven_disjoint_pairs = (
+                        self.device_function.proven_disjoint_tensor_pairs()
                     )
+                    if self.device_function.cute_state.resident_sequence_regions:
+                        from .cute.resident_sequence import (
+                            materialize_resident_sequences,
+                        )
+
+                        fn = self.device_function
+                        env = CompileEnvironment.current()
+                        fn.body = materialize_resident_sequences(
+                            list(fn.body),
+                            regions=fn.cute_state.resident_sequence_regions,
+                            tensor_dtypes={
+                                argument.name: env.backend.dtype_str(
+                                    argument.fake_value.dtype
+                                )
+                                for argument in fn.arguments
+                                if isinstance(argument, TensorArg)
+                            },
+                            rename_groups={
+                                name: aliases[0]
+                                for name, aliases in fn._variable_renames.items()
+                            },
+                            disjoint_pairs=proven_disjoint_pairs,
+                            boundary_names={argument.name for argument in fn.arguments}
+                            | set(self._extra_params),
+                            resident=fn.config.config.get("cute_reduction_sequence")
+                            == "resident",
+                            new_var=fn.new_var,
+                        )
+                    if self.device_function.cute_state.resident_reduction_layouts:
+                        from .cute.resident_reductions import (
+                            materialize_resident_reductions,
+                        )
+                        from .cute.resident_reductions import (
+                            proven_resident_tensor_alignments,
+                        )
+                        from .cute.resident_reductions import (
+                            proven_resident_tensor_strides,
+                        )
+                        from .reduction_strategy import _cute_shared_memory_budget_bytes
+
+                        fn = self.device_function
+                        env = CompileEnvironment.current()
+                        pipelined = (
+                            fn.config.config.get("cute_reduction_schedule")
+                            == "pipelined"
+                        )
+                        constexpr_values = {
+                            name: size
+                            for block_ids, name in fn.block_size_var_cache.items()
+                            if len(block_ids) == 1
+                            and isinstance(
+                                size := fn.resolved_block_size(block_ids[0]), int
+                            )
+                        }
+                        fn.body = materialize_resident_reductions(
+                            list(fn.body),
+                            layouts=fn.cute_state.resident_reduction_layouts,
+                            tensor_dtypes={
+                                argument.name: env.backend.dtype_str(
+                                    argument.fake_value.dtype
+                                )
+                                for argument in fn.arguments
+                                if isinstance(argument, TensorArg)
+                            },
+                            tensor_strides=proven_resident_tensor_strides(fn),
+                            tensor_alignments=proven_resident_tensor_alignments(fn),
+                            group_rows=cast(
+                                "int",
+                                fn.config.config.get("cute_reduction_group_rows", 1),
+                            ),
+                            pipelined=pipelined,
+                            pipeline_depth=fn.config.cute_reduction_pipeline_depth,
+                            row_schedule=cast(
+                                "str",
+                                fn.config.get("cute_reduction_row_schedule", "batched"),
+                            ),
+                            pack_output=cast(
+                                "bool",
+                                fn.config.get("cute_reduction_pack_output", False),
+                            ),
+                            local_tree=cast(
+                                "bool",
+                                fn.config.get("cute_reduction_local_tree", False),
+                            ),
+                            shared_memory_budget=_cute_shared_memory_budget_bytes()
+                            if pipelined
+                            else 0,
+                            disjoint_pairs=proven_disjoint_pairs,
+                            rename_groups={
+                                name: aliases[0]
+                                for name, aliases in fn._variable_renames.items()
+                            },
+                            new_var=fn.new_var,
+                            constexpr_values=constexpr_values,
+                            uniform_names={argument.name for argument in fn.arguments}
+                            | set(self._extra_params),
+                            require_proof=True,
+                        )
+                    from .cute.nested_lane_reductions import (
+                        normalize_nested_lane_reductions,
+                    )
+                    from .cute.nested_lane_reductions import resolve_pruned_lane_owners
+
+                    resolve_pruned_lane_owners(
+                        list(self.device_function.body),
+                        self.device_function.cute_state.reshape_lane_fallbacks,
+                    )
+                    self.device_function.body = normalize_nested_lane_reductions(
+                        list(self.device_function.body),
+                        uniform_names={
+                            *(
+                                argument.name
+                                for argument in self.device_function.arguments
+                            ),
+                            *self._extra_params,
+                        },
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                        proven_tensor_stride_values=self.device_function.proven_tensor_stride_values(),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                    )
+                    validate_lane_reduce_owners(list(self.device_function.body))
+                    self.device_function.body = interchange_lane_outside_serial_reductions(
+                        list(self.device_function.body),
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
+                        protected_names={
+                            alias
+                            for name, aliases in self.device_function._variable_renames.items()
+                            if any(alias != name for alias in aliases)
+                            for alias in (name, *aliases)
+                        },
+                    )
+                    validate_lane_reduce_owners(list(self.device_function.body))
                     self.device_function.body = split_lane_loop_reductions(
                         list(self.device_function.body),
                         uniform_names={
@@ -1526,16 +1749,18 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             ),
                             *self._extra_params,
                         },
-                        proven_disjoint_tensor_pairs=(
-                            self.device_function.proven_disjoint_tensor_pairs()
-                        ),
+                        proven_disjoint_tensor_pairs=proven_disjoint_pairs,
                         proven_tensor_stride_values=(
                             self.device_function.proven_tensor_stride_values()
                         ),
+                        rename_groups={
+                            name: aliases[0]
+                            for name, aliases in self.device_function._variable_renames.items()
+                        },
+                        running_sums=self.device_function.cute_matmul_running_sums,
                     )
-                    # Safety net: revert any lane-reduce marker that neither pass
-                    # rewrote so no ``_helion_lane_reduce`` call leaks into the
-                    # emitted kernel.
+                    # Reject any owned marker without a proved lowering, so an
+                    # incomplete per-lane input cannot stand in for a reduction.
                     self.device_function.body = restore_unprocessed_lane_reduce_markers(
                         list(self.device_function.body)
                     )
@@ -1737,9 +1962,200 @@ def generate_ast(
     store_transform: Callable[..., ast.AST] | None = None,
     load_transform: Callable[..., ast.AST] | None = None,
     extra_params: list[str] | None = None,
+    _codegen_graphs: list[GraphInfo] | None = None,
+    _memory_counters: dict[str, int] | None = None,
+    _host_prefix: list[ast.AST] | None = None,
+    _bounded_cache_request: BoundedCacheRequest | None = None,
 ) -> ast.Module:
     with func:
         env = CompileEnvironment.current()
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_materialized_operand_schedule", "off") != "off"
+        ):
+            from .cute.packed_operand_codegen import generate_packed_operand
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+                or config.get("cute_materialized_schedule", "off") != "off"
+            ):
+                raise exc.InvalidConfig(
+                    "packed-operand schedule requires complete ordinary codegen"
+                )
+            return generate_packed_operand(func, config, emit_repro_caller)
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_materialized_schedule", "off") != "off"
+        ):
+            from .cute.row_resident_codegen import generate_row_resident
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+                or _bounded_cache_request is not None
+            ):
+                raise exc.InvalidConfig(
+                    "row-resident schedule does not support external transforms or partial codegen"
+                )
+            return generate_row_resident(func, config, emit_repro_caller)
+        if (
+            env.backend.name == "cute"
+            and config.get("cute_mma_f32_conversion") == "warp_raw"
+        ):
+            from .cute.tcgen05_config import CuteTcgen05Config
+            from .cute.tcgen05_flat_grouped_codegen import (
+                generate_grouped_warp_tf32_candidate,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                CONFIG_KEYS as GROUPED_WARP_KEYS,
+            )
+
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+                and _bounded_cache_request is None
+            ):
+                return generate_grouped_warp_tf32_candidate(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    shared_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                        env.device
+                    ),
+                )
+            config = Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key not in GROUPED_WARP_KEYS
+                }
+            )
+        if env.backend.name == "cute" and (
+            config.get("cute_grouped_rna_warps", 0)
+            or config.get("cute_mma_f32_conversion") == "tma_rn"
+        ):
+            from .cute.tcgen05_config import CuteTcgen05Config
+            from .cute.tcgen05_flat_grouped_codegen import (
+                generate_flat_grouped_native_candidate,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                CONFIG_KEYS as GROUPED_RNA_KEYS,
+            )
+            from .cute.tcgen05_flat_grouped_config import K_KEY as GROUPED_RNA_K_KEY
+            from .cute.tcgen05_flat_grouped_config import K_STAGES
+            from .cute.tcgen05_flat_grouped_config import (
+                STAGES_KEY as GROUPED_RNA_STAGES_KEY,
+            )
+            from .cute.tcgen05_flat_grouped_config import (
+                WARPS_KEY as GROUPED_RNA_WARPS_KEY,
+            )
+
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+                and _bounded_cache_request is None
+            ):
+                block_k = config[GROUPED_RNA_K_KEY]
+                converter_warps = config.get(GROUPED_RNA_WARPS_KEY, 0)
+                assert isinstance(block_k, int)
+                assert isinstance(converter_warps, int)
+                return generate_flat_grouped_native_candidate(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    converter_warps=converter_warps,
+                    block_k=block_k,
+                    ab_stages=cast(
+                        "int", config.get(GROUPED_RNA_STAGES_KEY, K_STAGES[block_k])
+                    ),
+                    shared_capacity=CuteTcgen05Config.per_cta_smem_capacity_bytes(
+                        env.device
+                    ),
+                )
+            config = Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key not in GROUPED_RNA_KEYS
+                }
+            )
+        if env.backend.name == "cute" and config.get("cute_reduction_sequence") in {
+            "bounded",
+            "bounded_layout",
+        }:
+            if (
+                store_transform is None
+                and load_transform is None
+                and not extra_params
+                and _codegen_graphs is None
+                and _memory_counters is None
+                and _host_prefix is None
+            ):
+                from .cute.bounded_cache_codegen import generate_bounded_cache
+
+                return generate_bounded_cache(func, config, emit_repro_caller)
+            # Unsupported external transforms keep the ordinary lowering.
+            config = type(config).from_dict(
+                {**config.config, "cute_reduction_sequence": "scalar"}
+            )
+        if config.get("cute_split_k_schedule") == "cluster8_k4":
+            from .cute.split_k_cluster_codegen import generate_split_k_cluster
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+                or _codegen_graphs is not None
+                or _memory_counters is not None
+                or _host_prefix is not None
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "cluster split-K excludes external lowering transforms"
+                )
+            return generate_split_k_cluster(func, config, emit_repro_caller)
+        if config.get("cute_split_k_workspace", False) and _codegen_graphs is None:
+            from .cute.split_k_workspace_codegen import generate_split_k_workspace
+
+            if (
+                store_transform is not None
+                or load_transform is not None
+                or extra_params
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "split-K workspace does not support external memory transforms",
+                )
+            return generate_split_k_workspace(func, config, emit_repro_caller)
+        if env.cute_fission_plan is not None and len(func.device_ir.root_ids) > 1:
+            from .cute.materialized_fission_codegen import generate_materialized_fission
+
+            return generate_materialized_fission(
+                func,
+                config,
+                emit_repro_caller,
+                env.cute_fission_plan,
+                store_transform=store_transform,
+                load_transform=load_transform,
+                extra_params=extra_params,
+            )
         env.cute_resolved_wrapper_plans = []
         if len(func.device_ir.phases) > 1:
             if not str(config.pid_type).startswith("persistent"):
@@ -1750,7 +2166,11 @@ def generate_ast(
             store_transform=store_transform,
             load_transform=load_transform,
             extra_params=extra_params,
+            codegen_graphs=_codegen_graphs,
         )
+        if _memory_counters is not None:
+            for name, value in _memory_counters.items():
+                setattr(codegen.device_function, name, value)
         with codegen.device_function:
             CompileEnvironment.current().backend.pre_codegen(
                 graphs=codegen.codegen_graphs,
@@ -1763,10 +2183,38 @@ def generate_ast(
             # via build_launcher_args -- is generated during that visit).
             _maybe_emit_compact_worklist_builder(codegen)
 
+            prefix_recorded = False
             for stmt in func.body:
+                if (
+                    _host_prefix is not None
+                    and not prefix_recorded
+                    and isinstance(stmt, ExtendedAST)
+                    and stmt._loop_type is LoopType.GRID
+                ):
+                    _host_prefix.extend(codegen.host_statements)
+                    prefix_recorded = True
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
-            kernel_def = codegen.device_function.codegen_function_def()
+            if _bounded_cache_request is None:
+                kernel_def = codegen.device_function.codegen_function_def()
+            else:
+                kernel_def = codegen.device_function.codegen_function_def(
+                    bounded_cache_request=_bounded_cache_request
+                )
+            block_dims = (
+                codegen.device_function.cute_state.collective_register_chain_block_dims
+            )
+            if block_dims is not None:
+                from .cute.thread_block_projection import update_launch_block
+
+                assert (
+                    update_launch_block(
+                        codegen.host_statements,
+                        codegen.device_function.name,
+                        block_dims,
+                    )
+                    > 0
+                )
             codegen.host_dead_code_elimination()
 
             # Retarget output-only tensor allocations to ``device='meta'`` so
@@ -1831,20 +2279,11 @@ def generate_ast(
                 if codegen.device_function.has_rng_ops()
                 else []
             )
-            final_host_statements = rng_statements + codegen.host_statements
-            shape_bake_safe_wrapper_only = codegen.cute_wrapper_plans and all(
-                plan.get("kind")
-                in {
-                    "helion_small_biased_attention",
-                    "helion_flash",
-                    "chunk_prepare_tma",
-                    "chunk_recurrence_sm100",
-                    "chunk_recurrence_warp_dv4",
-                    "helion_flash_bwd",
-                }
-                for plan in codegen.cute_wrapper_plans
-            )
-            if codegen.cute_uses_matmul and not shape_bake_safe_wrapper_only:
+            final_host_statements: list[ast.AST] = [
+                *rng_statements,
+                *codegen.host_statements,
+            ]
+            if not codegen._cute_can_bake_tensor_shapes():
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"
@@ -1883,6 +2322,9 @@ def generate_ast(
                     for key in (
                         "lhs_name",
                         "rhs_name",
+                        "lhs_scale_name",
+                        "rhs_scale_name",
+                        "workspace_name",
                         "c_name",
                         "d_name",
                         "q_name",
@@ -1918,6 +2360,7 @@ def generate_ast(
                         "direct_pointers_name",
                         "direct_strides_name",
                         "scale_name",
+                        "m_extent_name",
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))
@@ -1958,6 +2401,26 @@ def generate_ast(
                 }
                 assert not remaining, (
                     f"sourceless prologue params not removed by DCE: {remaining}"
+                )
+
+            if env.backend_name == "cute":
+                from .cute.host_paired_sum import PAIRED_SUM_KEY
+                from .cute.host_paired_sum import lower_host_sum_pairs
+                from .cute.host_single_sum import lower_host_single_sum
+
+                final_host_statements = lower_host_sum_pairs(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
+                )
+                final_host_statements = lower_host_single_sum(
+                    func,
+                    final_host_statements,
+                    cast(
+                        "str", codegen.device_function.config.get(PAIRED_SUM_KEY, "off")
+                    ),
                 )
 
             host_def = func.codegen_function_def(
@@ -2005,6 +2468,9 @@ def generate_ast(
             result.body[insert_at:insert_at] = [
                 statement_from_string(line) for line in missing_imports
             ]
+            if _memory_counters is not None:
+                for name in _memory_counters:
+                    _memory_counters[name] = getattr(codegen.device_function, name)
             # break circular reference for better GC
             del codegen.device_function.codegen
             return result
