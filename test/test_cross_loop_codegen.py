@@ -679,17 +679,22 @@ def runtime_bound_loop_chain(
 )
 def guarded_prefix_chain(
     x: torch.Tensor, flags: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     rows, columns = x.size()
     tmp = torch.zeros_like(x)
     out = torch.empty_like(x)
+    side = torch.zeros_like(x)
     for tile_c, tile_r in hl.tile([columns, rows], block_size=[64, 1]):
         live = torch.sum((flags[:] > 0).to(torch.int32))
         if tile_r.begin < live:
             tmp[tile_r, tile_c] = x[tile_r, tile_c] + 1
     for tile_r in hl.tile(rows, block_size=4):
         out[tile_r, :] = tmp[tile_r, :] * 2 + tmp[0, :][None, :]
-    return tmp, out
+    for tile_s in hl.tile(rows, block_size=2):
+        side_live = torch.sum((flags[:] > 0).to(torch.int32))
+        if tile_s.begin < side_live:
+            side[tile_s, :] = x[tile_s, :] * 3
+    return tmp, out, side
 
 
 @helion.kernel(
@@ -1780,7 +1785,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         x = torch.randn((32, 256), device=DEVICE, dtype=torch.float32)
         for live in (0, 1, 5, 16):
             flags = (torch.arange(16, device=DEVICE) < live).to(torch.int32)
-            code, (tmp, out) = code_and_output(
+            code, (tmp, out, side) = code_and_output(
                 guarded_prefix_chain,
                 (x, flags),
                 pid_type="persistent_blocked",
@@ -1792,15 +1797,23 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             expected[:live] = x[:live] + 1
             torch.testing.assert_close(tmp, expected)
             torch.testing.assert_close(out, expected * 2 + expected[0][None, :])
+            side_rows = (live + 1) // 2 * 2
+            expected_side = torch.zeros_like(x)
+            expected_side[:side_rows] = x[:side_rows] * 3
+            torch.testing.assert_close(side, expected_side)
         kernel = _generated_function(code, "_helion_guarded_prefix_chain")
-        task_loop = next(
+        # The invariant bound is hoisted and caps the loop; tasks keep no guard.
+        # The last root rebases its PID first and tiles the bound by 2.
+        prologue = ast.unparse(kernel).split("for virtual_pid")[0]
+        bounded = [
             node
             for node in ast.walk(kernel)
-            if isinstance(node, ast.For) and ast.unparse(node.target) == "virtual_pid"
-        )
-        # The invariant bound is hoisted and caps the loop; tasks keep no guard.
-        prologue = ast.unparse(kernel).split("for virtual_pid")[0]
-        self.assertIn("tile_dependency_live_tasks", ast.unparse(task_loop.iter))
+            if isinstance(node, ast.For)
+            and ast.unparse(node.target) == "virtual_pid"
+            and "tile_dependency_live_tasks" in ast.unparse(node.iter)
+        ]
+        self.assertEqual(len(bounded), 2)
+        self.assertIn("tl.cdiv(side_live, 2)", ast.unparse(kernel))
         self.assertIn("redux.sync.min.s32", prologue)
         self.assertIn("tl.sum(", prologue)
         root = _generated_function(code, "tile_dependency_root_0")

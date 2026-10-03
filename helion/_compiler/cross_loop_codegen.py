@@ -775,8 +775,9 @@ def _guarded_extent(
 ) -> _GuardedExtent | None:
     """Turn a trailing ``if offset < bound`` on the slowest PID axis into a task count.
 
-    Every other top-level statement must be a pure single assignment, so tasks past
-    the bound are no-ops. Invariant loads and reductions are hoisted with the bound.
+    Every other top-level statement must be a pure single assignment (or a rebase of
+    a task-variant PID), so tasks past the bound are no-ops. Invariant loads and
+    reductions are hoisted with the bound.
     """
     if not body or not isinstance(guard := body[-1], ast.If):
         return None
@@ -785,10 +786,19 @@ def _guarded_extent(
         isinstance(statement, ast.Pass) for statement in guard.orelse
     ):
         return None
+
+    def target(statement: ast.stmt) -> str | None:
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+            node = statement.targets[0]
+        elif isinstance(statement, ast.AugAssign):
+            node = statement.target
+        else:
+            return None
+        return node.id if isinstance(node, ast.Name) else None
+
     if not all(
-        isinstance(statement, ast.Assign)
-        and len(statement.targets) == 1
-        and isinstance(statement.targets[0], ast.Name)
+        (name := target(statement)) is not None
+        and (isinstance(statement, ast.Assign) or name in variant_names)
         and all(
             _is_pure_call(node)
             for node in ast.walk(statement.value)
@@ -805,8 +815,9 @@ def _guarded_extent(
                 counts = stores if isinstance(node.ctx, ast.Store) else loads
                 counts[node.id] = counts.get(node.id, 0) + 1
     values = {
-        cast("ast.Name", statement.targets[0]).id: statement.value
-        for statement in cast("list[ast.Assign]", prefix)
+        cast("str", target(statement)): statement.value
+        for statement in prefix
+        if isinstance(statement, ast.Assign)
     }
     test = guard.test.id
     predicate = values.get(test)
@@ -885,21 +896,20 @@ def _guarded_extent(
         )
     hoisted_statements = [
         _clone_stmt(statement)
-        for statement in cast("list[ast.Assign]", prefix)
-        if cast("ast.Name", statement.targets[0]).id in hoisted
+        for statement in prefix
+        if isinstance(statement, ast.Assign) and target(statement) in hoisted
     ]
     remaining = [
         _clone_stmt(statement)
-        for statement in cast("list[ast.Assign]", prefix)
-        if cast("ast.Name", statement.targets[0]).id not in {*hoisted, test}
+        for statement in prefix
+        if target(statement) not in {*hoisted, test}
     ]
     tiles = bound.id if block_size == 1 else f"tl.cdiv({bound.id}, {block_size})"
     return _GuardedExtent(
         hoisted=hoisted_statements,
         body=[*remaining, *(_clone_stmt(statement) for statement in guard.body)],
         hoisted_names=tuple(
-            cast("ast.Name", statement.targets[0]).id
-            for statement in hoisted_statements
+            cast("str", target(statement)) for statement in hoisted_statements
         ),
         live_tasks=tiles if inner_tasks == 1 else f"{inner_tasks} * {tiles}",
     )
