@@ -553,19 +553,28 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skipIfNotCUDA()
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
-    @parametrize("moment_dtype", (torch.float32, torch.float64))
-    def test_chained_exchanges_replay(self, moment_dtype: torch.dtype) -> None:
+    @parametrize(
+        "dtypes",
+        (
+            (torch.float32, torch.float32),
+            (torch.float32, torch.float64),
+            (torch.float64, torch.float32),
+        ),
+    )
+    def test_chained_exchanges_replay(
+        self, dtypes: tuple[torch.dtype, torch.dtype]
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
-        # A float64 moment mixes in-band and peer-counter transports.
+        # An 8-byte buffer mixes in-band and peer-counter transports.
         symm, moment = (
-            symm_mem.empty(n, device=self.device),
-            symm_mem.empty(1, device=self.device, dtype=moment_dtype),
+            symm_mem.empty(n, device=self.device, dtype=dtypes[0]),
+            symm_mem.empty(1, device=self.device, dtype=dtypes[1]),
         )
         symm_mem.rendezvous(symm, group=group)
         symm_mem.rendezvous(moment, group=group)
-        x = torch.empty(n, device=self.device)
+        x = torch.empty(n, device=self.device, dtype=dtypes[0])
         args = (symm, moment, x, group.group_name)
         chained_exchange_kernel(*args)
         graph = torch.cuda.CUDAGraph()
@@ -1259,12 +1268,14 @@ class TestDistributedTileDependencies(TestCase):
                     }
                 )
             )
-            # Root 1 publishes to its slot and the done slot on every rank. Root 2
-            # waits for 256 / 64 tasks per rank, and the last ticket for roots 1, 2.
+            # Root 1 adds its task's key on every rank and root 2 waits for its key
+            # from each rank. Both roots' 4 + 4 workers publish to the done slot.
+            keys = "tile_dependency_peer_keys"
             for expected in (
-                f"_add_on_every_rank({state}_ptrs, 0, {world}, {world})",
+                f"_add_on_every_rank({keys}_ptrs, 0 + (",
+                f"{world}, {world}, 'release')",
+                f"tl.cast(tile_dependency_peer_epoch * {world}, tl.uint64)",
                 f"_add_on_every_rank({state}_ptrs, 16, {world}, {world})",
-                f"{state} + 0, tile_dependency_peer_epoch * {4 * world})",
                 f"{state} + 16, tile_dependency_peer_epoch * {8 * world})",
             ):
                 self.assertIn(expected, code)
@@ -1358,6 +1369,23 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
         self.assertEqual(code.count("_add_on_every_rank"), 3)
         self.assertIn(f"{done}, tile_dependency_peer_epoch * {9 * world})", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
+    def test_done_barrier_skips_ended_roots(self, world: int) -> None:
+        symm, x = torch.zeros(2, 4096, device=DEVICE, dtype=torch.float64)
+        moment = torch.zeros(1, device=DEVICE)
+        group = self._world(world, chained_exchange_kernel)
+        bound = chained_exchange_kernel.bind((symm, moment, x, group))
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code({**config, "block_sizes": [1024, 1024, 1, 512]})
+        # R2 rejects the 8-byte symm, so root 1 waits on root 0's keyed counters.
+        # A barrier orders root 1 before root 2, whose in-band moment every rank
+        # polls in full, so root 1 ends before any launch and no root needs done.
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
+        self.assertEqual(code.count("_add_on_every_rank"), 1)
+        self.assertIn("_add_on_every_rank(tile_dependency_peer_keys_ptrs", code)
+        self.assertNotIn("_wait_at_least", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))

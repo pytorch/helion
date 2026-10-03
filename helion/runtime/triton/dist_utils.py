@@ -201,10 +201,11 @@ def _add_on_every_rank(  # noqa: ANN202
     offset,  # noqa: ANN001
     world_size: tl.constexpr,
     lanes: tl.constexpr,
+    sem: tl.constexpr = "release",  # pyrefly: ignore[bad-function-definition]
 ):
-    """Add 1 with system-scope release to one uint64 word on every rank.
+    """Add 1 at system scope to one uint64 word on every rank.
 
-    The caller syncs the CTA first, so the release covers all of its stores.
+    The caller syncs the CTA first, so a release covers all of its stores.
     """
     ranks = tl.arange(0, lanes)
     bases = tl.load(
@@ -216,7 +217,7 @@ def _add_on_every_rank(  # noqa: ANN202
         bases.to(tl.pointer_type(tl.uint64)) + offset,
         tl.cast(1, tl.uint64),
         mask=ranks < world_size,
-        sem="release",
+        sem=sem,
         scope="sys",
     )
 
