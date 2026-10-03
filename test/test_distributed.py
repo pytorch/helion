@@ -529,13 +529,19 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skip_if_lt_x_gpu(4)
     @parametrize("variant", ("inband", "R1"))
     @parametrize("pipeline", ("static", "dynamic"))
-    def test_pipelined_allreduce_replays(self, variant: str, pipeline: str) -> None:
+    @parametrize("dtype", (torch.float32, torch.bfloat16))
+    def test_pipelined_allreduce_replays(
+        self, variant: str, pipeline: str, dtype: torch.dtype
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, n = self.world_size, 4096
-        symm = symm_mem.empty(n, device=self.device)
+        symm = symm_mem.empty(n, device=self.device, dtype=dtype)
         symm_mem.rendezvous(symm, group=group)
-        x = torch.empty(n, device=self.device)
+        x = torch.empty(n, device=self.device, dtype=dtype)
+        # Distinct small integers per element stay exact in bf16 and catch lane
+        # mixups in packed words.
+        lane = torch.arange(n, device=self.device, dtype=dtype) % 16
         args = (symm, x, group.group_name, variant, world)
         bound = _with_pipeline(pipelined_allreduce_kernel, args, pipeline)
         outs = []
@@ -544,7 +550,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             # Skewed ranks overwrite symm while peers may still read the last
             # launch's values, which the done barrier orders.
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))
-            x.fill_(n * step + self.rank)
+            x.copy_(lane + 4 * step + self.rank)
             if replay:
                 graph.replay()
                 outs.append(graph_out.clone())
@@ -561,8 +567,8 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             launch(step, replay=step % 2 == 0)
         torch.cuda.synchronize()
         for step, out in enumerate(outs):
-            expected = n * step * world + world * (world - 1) // 2
-            torch.testing.assert_close(out, torch.full_like(out, expected))
+            expected = world * (lane + 4 * step) + world * (world - 1) // 2
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
         self._cleanup_process()
 
     @skipIfNotCUDA()
@@ -1344,7 +1350,7 @@ class TestDistributedTileDependencies(TestCase):
         # A push may be the kernel's first tensor access.
         bound = pipelined_allreduce_kernel.bind((symm, x, group, "constant", world))
         code = bound.to_triton_code()
-        self.assertIn("st.relaxed.sys.global.u64", code)
+        self.assertIn("st.relaxed.sys.global", code)
         self.assertIn("tl.store(symm + ", code)
         # Debug output touches no memory, so it does not block the analysis.
         bound = pipelined_allreduce_kernel.bind((symm, x, group, "print", world))
@@ -1356,6 +1362,17 @@ class TestDistributedTileDependencies(TestCase):
         code = bound.to_triton_code({**config, "range_num_stages": [0, 0, 3]})
         self.assertIn("_BLOCK_SIZE_2, num_stages=1)", code)
         self.assertNotIn("num_stages=3", code)
+        # Aligned tiles pack two bf16 per word and push 16-byte word pairs; each
+        # reader polls the word holding its element and shifts it out.
+        symm, x = torch.zeros(2, 4096, device=DEVICE, dtype=torch.bfloat16)
+        code = pipelined_allreduce_kernel.bind(
+            (symm, x, group, "inband", world)
+        ).to_triton_code()
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertNotIn("st.relaxed.sys.global.u64", code)
+        self.assertIn("<< 16 | tile_dependency_peer_epoch << 32", code)
+        self.assertIn("% 2, tl.uint64) * 16, tl.uint16)", code)
+        self.assertIn(f"(x, {2 * world * 2048 + 2}, torch.uint64, True)", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1364,8 +1381,10 @@ class TestDistributedTileDependencies(TestCase):
         moment = torch.zeros(1, device=DEVICE)
         group = self._world(world, chained_exchange_kernel)
         code = chained_exchange_kernel.bind((symm, moment, x, group)).to_triton_code()
-        # Both buffers go in band, each with its own push and poll.
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), 2 * world)
+        # Both buffers go in band, each with its own push and poll. The even
+        # symm tiles push word pairs; the one-element moment pushes single words.
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
         self.assertEqual(code.count("@p bra SPIN"), 2)
         self.assertNotIn("_wait_at_least", code)
         self.assertNotIn("_add_on_every_rank", code)
@@ -1383,7 +1402,7 @@ class TestDistributedTileDependencies(TestCase):
         # Only roots 2 and 3 publish to the done slot, and the last ticket waits
         # for their 1 + 4096 / 512 tasks, not also the in-band roots' 4 + 4.
         done = f"tile_dependency_peer_state + {2 * world * 4096 + 16}"
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
         self.assertEqual(code.count("_add_on_every_rank"), 3)
         self.assertIn(f"{done}, tile_dependency_peer_epoch * {9 * world})", code)
 
@@ -1419,7 +1438,7 @@ class TestDistributedTileDependencies(TestCase):
         (line,) = logs.output
         self.assertIn("on peers/symm use inband", line)
         code = bound.to_triton_code()
-        self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
+        self.assertEqual(code.count("st.relaxed.sys.global"), world)
         self.assertNotIn("_wait_at_least", code)
         # In a [2, N] buffer the same store fills only row 0, which R2 rejects.
         symm = torch.zeros(2, 256, device=DEVICE)
