@@ -170,6 +170,13 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    Recover a measured ``(config, perf)`` sample by joining a CSV row to its record: ``meta[run_id]["configs"][row["config_id"]]``. ``run_id`` may recur (re-runs, processes, ``autotune_best_of_k``), but the ``configs`` maps are union-safe (same ``config_id`` implies the same config), so de-duplicating on ``run_id`` is lossless. Searches restricted to user-pinned ``configs`` (without ``force_autotune``) are excluded as a biased slice (``.csv``/``.log`` still written); setting this without ``autotune_log`` collects nothing and warns once.
    Controlled by ``HELION_AUTOTUNE_LOG_DETAILS``.
 
+   This flag also appends ``<autotune_log>.trace.jsonl`` with timestamped search
+   stages, config evaluations, rebenchmarks, selection, and exact LLM prompts
+   and responses. Recording is disabled by default; set
+   ``HELION_AUTOTUNE_LOG=/tmp/run`` and ``HELION_AUTOTUNE_LOG_DETAILS=1`` before
+   importing the kernel. Each trace uses a per-search ``run_id``, distinct from
+   the identity used by the CSV and metadata.
+
 .. autoattribute:: Settings.autotune_log_search_space
 
     Enable search space analysis logging after autotuning. When enabled, Helion logs:

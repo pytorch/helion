@@ -1315,6 +1315,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     == 0
                 )
                 self._record_compile_failure(config)
+                source_hash = None
                 if deduplicate_sources:
                     # No callable exists to carry generated-source identity, but
                     # strict source ledgers still need an auditable terminal row.
@@ -1322,19 +1323,23 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     if source_hash not in seen_sources:
                         seen_sources.add(source_hash)
                         self._autotune_metrics.num_unique_sources += 1
-                    config_id = self.log.register_config(config)
-                    if config_id is not None:
-                        self.log.record_autotune_entry(
-                            AutotuneLogEntry(
-                                generation=self._autotune_metrics.num_generations,
-                                status="error",
-                                perf_ms=None,
-                                compile_time=None,
-                                config_id=config_id,
-                                config=config,
-                                source_hash=source_hash,
-                            )
+                config_id = (
+                    self.log.register_config(config)
+                    if deduplicate_sources or self.log.trace_enabled
+                    else None
+                )
+                if config_id is not None:
+                    self.log.record_autotune_entry(
+                        AutotuneLogEntry(
+                            generation=self._autotune_metrics.num_generations,
+                            status="error",
+                            perf_ms=None,
+                            compile_time=None,
+                            config_id=config_id,
+                            config=config,
+                            source_hash=source_hash,
                         )
+                    )
                 maybe_dump_triton_failure(
                     self.kernel, config, e, captured_output=captured[0] or None
                 )
@@ -2210,6 +2215,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         self._effective_source_repairs: dict[Config, BenchmarkResult] = {}
         child_log = copy.copy(log)
         child_log._log_sink = None
+        child_log._trace_sink = None
         case_index = 0
         try:
             for index, (case_kernel, case_args) in enumerate(args.cases):
@@ -2674,6 +2680,8 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 compile_time=result.compile_time,
                 config_id=config_id,
                 config=config,
+                objective=result.perf,
+                objective_unit="ratio" if self.args.relative_to is not None else "ms",
             )
         )
 
@@ -2694,6 +2702,27 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         if summary is not None:
             self.log(summary)
 
+    def _record_rebenchmark_result(self, result: BenchmarkResult) -> None:
+        config_id = self.log.register_config(result.config)
+        assert config_id is not None
+        self.log.record_trace_entry(
+            AutotuneLogEntry(
+                generation=self._autotune_metrics.num_generations,
+                status=result.status,
+                perf_ms=(
+                    self.raw_latency(result.config)
+                    if math.isfinite(result.perf)
+                    else None
+                ),
+                compile_time=result.compile_time,
+                config_id=config_id,
+                config=result.config,
+                objective=result.perf,
+                objective_unit="ratio" if self.args.relative_to is not None else "ms",
+            ),
+            event="rebenchmark",
+        )
+
     def rebenchmark(
         self,
         configs: list[Config],
@@ -2709,4 +2738,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
             record_results=False,
             check_budget=False,
         )
+        if self.log.trace_enabled:
+            for result in results:
+                self._record_rebenchmark_result(result)
         return [result.perf for result in results]

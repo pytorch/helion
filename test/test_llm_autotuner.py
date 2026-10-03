@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,6 +21,7 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.llm.prompting import build_author_seed_section
 from helion.autotuner.llm.prompting import build_compiler_analysis_section
 from helion.autotuner.llm.workload import compute_workload_hints
+from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
@@ -67,6 +70,102 @@ class TestLLMGuidedSearch(TestCase):
         for name, value in overrides.items():
             setattr(search, name, value)
         return search
+
+    def test_trace_records_exact_async_llm_exchange_and_seed_measurements(self):
+        import tempfile
+
+        search = self._make_mock_search(
+            provider="openai_responses",
+            _llm_executor=None,
+            api_key="test-credential-not-for-trace",
+            api_base="https://test.invalid/?token=test-url-secret",
+        )
+        messages = [
+            {"role": "system", "content": "Return config proposals"},
+            {"role": "user", "content": 'Compiler seed: {"block_sizes":[64]}'},
+        ]
+        response = '{\n  "configs": [{"block_sizes": [64]}]\n}'
+        request_started = threading.Event()
+        seed_measured = threading.Event()
+
+        def provider(*args, **kwargs):
+            request_started.set()
+            self.assertTrue(seed_measured.wait(timeout=5))
+            return response
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.trace.jsonl"
+            search.log = AutotuningLogger(
+                Settings(
+                    autotune_log=str(Path(directory) / "run"), autotune_log_details=True
+                )
+            )
+            with (
+                search.log.autotune_tracing("LLMGuidedSearch"),
+                patch(
+                    "helion.autotuner.llm_search._call_provider", side_effect=provider
+                ),
+            ):
+                try:
+                    future = search._call_llm_async(messages)
+                    self.assertTrue(request_started.wait(timeout=5))
+                    # The complete request is on disk while the call is in flight.
+                    request = json.loads(path.read_text().splitlines()[-1])
+                    self.assertEqual(request["event"], "llm_request")
+                    self.assertEqual(request["messages"], messages)
+                    config = helion.Config(block_sizes=[64])
+                    config_id = search.log.register_config(config)
+                    self.assertIsNotNone(config_id)
+                    search.log.record_autotune_entry(
+                        AutotuneLogEntry(0, "ok", 1.25, None, config_id, config)
+                    )
+                    seed_measured.set()
+                    self.assertEqual(future.result(timeout=5), response)
+                finally:
+                    seed_measured.set()
+                    search._llm_executor.shutdown(wait=True)
+            text = path.read_text()
+            rows = [json.loads(line) for line in text.splitlines()]
+        exchange = [row for row in rows if row["event"].startswith("llm_")]
+        self.assertEqual(len(exchange), 2)
+        self.assertEqual(exchange[0]["request_id"], exchange[1]["request_id"])
+        self.assertEqual(exchange[1]["response"], response)
+        self.assertEqual(exchange[1]["status"], "ok")
+        self.assertEqual(exchange[0]["round"], 0)
+        self.assertEqual(len({row["run_id"] for row in rows}), 1)
+        elapsed = [row["elapsed_s"] for row in rows]
+        self.assertEqual(elapsed, sorted(elapsed))
+        self.assertNotIn("test-credential-not-for-trace", text)
+        self.assertNotIn("test-url-secret", text)
+
+    def test_trace_records_llm_failure_without_provider_error_body(self):
+        import tempfile
+
+        search = self._make_mock_search(provider="openai_responses")
+        error = RuntimeError("provider diagnostic with test-secret")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.trace.jsonl"
+            search.log = AutotuningLogger(
+                Settings(
+                    autotune_log=str(Path(directory) / "run"), autotune_log_details=True
+                )
+            )
+            with (
+                self.assertRaises(RuntimeError) as raised,
+                search.log.autotune_tracing("LLMGuidedSearch"),
+                patch("helion.autotuner.llm_search._call_provider", side_effect=error),
+            ):
+                search._call_llm([{"role": "user", "content": "Suggest configs"}])
+            text = path.read_text()
+            rows = [json.loads(line) for line in text.splitlines()]
+        self.assertIs(raised.exception, error)
+        response = next(row for row in rows if row["event"] == "llm_response")
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error_type"], "RuntimeError")
+        self.assertNotIn("test-secret", text)
+        self.assertNotIn("response", response)
+        self.assertEqual(rows[-1]["status"], "error")
+        self.assertEqual(len(search._llm_call_times), 1)
 
     def test_parse_configs_accepts_common_llm_outputs(self):
         """LLM config parsing accepts the response shapes we expect to see in practice."""

@@ -723,9 +723,11 @@ class Settings(_Settings):
             "/tmp/run.csv and /tmp/run.log with per-config metrics and debug logs."
         ),
         "autotune_log_details": (
-            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to also write the cost-model "
-            "dataset sidecar /tmp/run.meta.jsonl (per-run kernel identity + the "
-            "configs tested, keyed by config_id). Off by default; needs autotune_log."
+            "Opt-in (HELION_AUTOTUNE_LOG_DETAILS=1) to write /tmp/run.trace.jsonl "
+            "with config evaluations, rebenchmarks, selection, exact LLM prompts/"
+            "responses, and timestamps, plus the cost-model dataset sidecar "
+            "/tmp/run.meta.jsonl (kernel identity and configs keyed by config_id). "
+            "Off by default; needs autotune_log."
         ),
         "autotune_compile_timeout": "Timeout for Triton compilation in seconds used for autotuning. Default is 60 seconds.",
         "autotune_benchmark_subprocess": "Run the autotune benchmark phase in a long-lived spawn subprocess so a hung/slow kernel can be killed without losing autotune progress. Enabled by default. Set HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0 to disable.",
