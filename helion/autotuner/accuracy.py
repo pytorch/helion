@@ -86,6 +86,13 @@ def _assert_close(actual: object, expected: object, atol: float, rtol: float) ->
 
 
 _RMS_CACHE_ATTR = "_helion_accuracy_rms"
+_TPU_ACCURACY_CHUNK_ELEMENTS = 2**26
+
+
+def _accuracy_chunk_size(t: torch.Tensor, requested: int) -> int:
+    if t.device.type == "tpu":
+        return max(requested, _TPU_ACCURACY_CHUNK_ELEMENTS)
+    return requested
 
 
 def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
@@ -98,11 +105,18 @@ def _chunked_rms(t: torch.Tensor, chunk_size: int) -> float:
     flat = t.reshape(-1)
     if flat.numel() == 0:
         return 0.0
+    if t.device.type == "tpu":
+        # XLA fuses the conversion, square, and reduction. Keeping the whole
+        # reduction on device avoids one host synchronization per chunk.
+        rms = float(flat.to(torch.float32).square().mean().sqrt())
+        setattr(t, _RMS_CACHE_ATTR, (t._version, rms))
+        return rms
+    chunk_size = _accuracy_chunk_size(t, chunk_size)
     # Accumulate in float64 so large-magnitude outputs cannot overflow the
     # sum of squares. MPS has no float64; use float32 there — an overflow to
     # inf makes the RMS non-finite, and the caller then keeps the unscaled
     # atol floor.
-    acc_dtype = torch.float32 if t.device.type == "mps" else torch.float64
+    acc_dtype = torch.float32 if t.device.type in ("mps", "tpu") else torch.float64
     total = 0.0
     for start in range(0, flat.numel(), chunk_size):
         total += float(flat[start : start + chunk_size].to(acc_dtype).square().sum())
@@ -131,12 +145,38 @@ def _chunked_assert_close(
         # gate; keep the unscaled floor in that case.
         if math.isfinite(rms):
             atol = atol * max(1.0, rms)
+    if (
+        actual.device.type == "tpu"
+        and actual.dtype == expected.dtype
+        and actual.device == expected.device
+        and (
+            torch.allclose(actual, expected, atol=atol, rtol=rtol)
+            if actual.dtype.is_floating_point or actual.dtype.is_complex
+            else torch.equal(actual, expected)
+        )
+    ):
+        return
     if actual.numel() <= chunk_size:
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
         return
+    if actual.dtype != expected.dtype or actual.device != expected.device:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        return
+    if actual.device.type == "tpu":
+        # ``torch.testing.assert_close`` copies each TPU chunk to the host to
+        # construct its diagnostic. Compare on device first and transfer only
+        # the scalar result. A larger chunk amortizes TPU dispatch overhead while
+        # keeping temporary tensors bounded.
+        chunk_size = _accuracy_chunk_size(actual, chunk_size)
     actual_flat = actual.reshape(-1)
     expected_flat = expected.reshape(-1)
     for start in range(0, actual_flat.numel(), chunk_size):
         actual_chunk = actual_flat[start : start + chunk_size]
         expected_chunk = expected_flat[start : start + chunk_size]
+        if actual.device.type == "tpu":
+            if actual.dtype.is_floating_point or actual.dtype.is_complex:
+                if torch.allclose(actual_chunk, expected_chunk, atol=atol, rtol=rtol):
+                    continue
+            elif torch.equal(actual_chunk, expected_chunk):
+                continue
         torch.testing.assert_close(actual_chunk, expected_chunk, atol=atol, rtol=rtol)

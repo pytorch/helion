@@ -100,6 +100,20 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
    - On Triton: ``"default"`` maps to ``"tf32"``, ``"high"`` maps to ``"tf32x3"``, and ``"highest"`` maps to ``"ieee"``.
    - On Pallas/TPU: all values currently emit JAX default precision. JAX ``"high"``/``"highest"`` fp32 dot precision is not used because it is less compatible with PyTorch eager references on the supported TPU stack.
 
+.. autoattribute:: Settings.cute_rng_stream
+
+   CuTe defaults to ``"auto"``. Explicit ``hl.rand`` uses all four Philox outputs:
+   logical offset ``i`` selects word ``i % 4`` from counter ``i // 4``. The stream
+   depends on the seed and logical offset, independently of tile size or packet
+   vectorization. This changes the sequence from the earlier CuTe default.
+
+   Set ``cute_rng_stream="word0"`` or ``HELION_CUTE_RNG_STREAM=word0`` to retain
+   the previous sequence. Other backends still default to ``"word0"``.
+   Under ``"auto"``, implicit Torch random operations, ``hl.randint`` and
+   ``hl.rand4x`` retain their existing behavior. Explicit ``"philox4"`` selects
+   the same uniform stream but rejects these other RNG operations. The policy
+   is serialized with settings and emitted reproduction decorators.
+
 .. autoattribute:: Settings.static_shapes
 
    When enabled, tensor shapes are treated as compile-time constants for optimization. Default is ``True``.
@@ -381,6 +395,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_LOG_SEARCH_SPACE_PATH`` | ``autotune_log_search_space_path`` | Optional path to save search space analysis JSON files. |
 | ``HELION_AUTOTUNE_PRECOMPILE`` | ``autotune_precompile`` | Select the autotuner precompile mode (``"fork"`` (default), ``"spawn"``, or disable when empty). |
 | ``HELION_AUTOTUNE_PRECOMPILE_JOBS`` | ``autotune_precompile_jobs`` | Cap the number of concurrent Triton precompile subprocesses. |
+| ``HELION_CUTE_RNG_STREAM`` | ``cute_rng_stream`` | CuTe RNG policy: ``auto``, ``word0`` or ``philox4``. |
 | ``HELION_AUTOTUNE_RANDOM_SEED`` | ``autotune_random_seed`` | Seed used for randomized autotuning searches. |
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |

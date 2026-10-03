@@ -127,12 +127,14 @@ _CACHE_POLICY_BASELINE_SCALE = 1
 _CACHE_POLICY_DYNAMIC_HELPER: object = None
 _TEST_CUTE_FLASH_BACKEND = SimpleNamespace(
     generated_source_hash=lambda _fn: None,
+    autotune_config_is_viable=lambda _config_spec, _config: True,
 )
 
 
 def _cute_flash_test_config_spec() -> SimpleNamespace:
     return SimpleNamespace(
         cute_flash_search_enabled=True,
+        compiler_coverage_groups=(),
         backend=_TEST_CUTE_FLASH_BACKEND,
     )
 
@@ -409,9 +411,11 @@ class TestAutotuneIgnoreErrors(TestCase):
             cute_flash_search_enabled=False,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                autotune_config_is_viable=lambda _config_spec, _config: True,
                 should_deduplicate_generated_sources=lambda config_spec: False,
                 get_do_bench=lambda: None,
                 classify_autotune_exception=lambda error: None,
+                probe_long_autotune_kernels=lambda _config_spec: False,
             ),
         )
         kernel = SimpleNamespace(
@@ -2504,6 +2508,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         raw_flat = gen.default_flat()
         original_flat = copy.deepcopy(raw_flat)
         search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = spec
         search.config_gen = gen
 
         member = search.make_unbenchmarked(raw_flat)
@@ -2522,6 +2527,31 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         )
         self.assertEqual(seed_config.num_warps, 8)
         self.assertEqual(seed_flat, gen.flatten(seed_config))
+
+    def test_initial_population_refills_backend_rejections(self):
+        configs = {value: helion.Config(block_sizes=[value]) for value in range(1, 7)}
+        backend = SimpleNamespace(
+            autotune_config_is_viable=lambda _spec, config: (
+                config.config["block_sizes"][0] % 2 == 0
+            )
+        )
+        config_gen = SimpleNamespace(
+            config_spec=SimpleNamespace(backend=backend),
+            invalid_config_count=0,
+            canonicalize_flat=lambda flat: (flat, configs[flat[0]]),
+            random_flat=Mock(side_effect=([3], [4], [5], [6])),
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.config_spec = config_gen.config_spec
+        search.config_gen = config_gen
+        search.log = Mock()
+
+        population = search._pad_initial_population_with_unique_random(
+            [[1], [2]], target=3
+        )
+
+        self.assertEqual(population, [[2], [4], [6]])
+        self.assertEqual(config_gen.random_flat.call_count, 4)
 
     def test_scalar_list_override_has_encodable_flat_values(self):
         args = (
@@ -4338,6 +4368,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
         generation.flat_spec = [EnumFragment(tuple(range(7)))]
+        generation.compiler_coverage_enabled = True
         generation._override_values = {}
         generation.unflatten = lambda _flat: initial.config
         self.assertIsNone(generation.flash_exact_effective_search_space_configs(1))
@@ -8355,6 +8386,7 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
             random_flat=Mock(side_effect=([-1], [4])),
         )
         search = PatternSearch.__new__(PatternSearch)
+        search.config_spec = config_gen.config_spec
         search.config_gen = config_gen
         search.initial_population_strategy = (
             InitialPopulationStrategy.FROM_BEST_AVAILABLE
@@ -10748,9 +10780,10 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         search.args = (original,)
         search.log = AutotuningLogger(settings)
         search.best_perf_so_far = 100.0
+        benchmark_isolated = Mock(return_value=None)
         search.benchmark_provider = SimpleNamespace(
             mutated_arg_indices=[0],
-            benchmark_isolated=lambda _fns, *, warmup, rep, desc: None,
+            benchmark_isolated=benchmark_isolated,
         )
         search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
         observed_pointers: dict[str, list[int]] = {"a": [], "b": []}
@@ -10798,6 +10831,8 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
                 candidate_private_args=True,
             )
 
+        benchmark_isolated.assert_called_once()
+        self.assertTrue(benchmark_isolated.call_args.kwargs["fresh_process"])
         self.assertEqual(clone_args.call_count, 3)
         self.assertTrue(
             all(
@@ -10954,7 +10989,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         reps: list[int] = []
 
         def benchmark_isolated(
-            fns: list[Callable[[], object]], *, warmup: int, rep: int, desc: str
+            fns: list[Callable[[], object]],
+            *,
+            warmup: int,
+            rep: int,
+            desc: str,
+            fresh_process: bool = False,
         ) -> list[float]:
             reps.append(rep)
             return [0.05 for _ in fns]
@@ -11205,7 +11245,12 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         members = [initial_fast_final_slow, middle, initial_slow_final_fast]
 
         def benchmark_isolated(
-            fns: list[Callable[[], object]], *, warmup: int, rep: int, desc: str
+            fns: list[Callable[[], object]],
+            *,
+            warmup: int,
+            rep: int,
+            desc: str,
+            fresh_process: bool = False,
         ) -> list[float]:
             self.assertEqual(len(fns), 3)
             return [10.0, 5.0, 0.5]
@@ -11740,8 +11785,11 @@ class TestCuteAutotuner(TestCase):
         # ``load_eviction_policies`` carries per-load-site L1 eviction
         # hints (lowered on the vectorized load forms). ``flatten_loops``
         # selects the flattened multi-dim tile form (flat base-pointer
-        # vectorization). The set still excludes Triton-style knobs that
+        # vectorization). ``cute_proven_bounds`` selects proof-based mask
+        # elimination. The set still excludes Triton-style knobs that
         # the CuTe path does not consume.
+        # Resident packet controls are explicit CuTe config fields; unseeded
+        # configs retain their false-only search domains.
         self.assertEqual(
             flat_keys,
             {
@@ -11753,6 +11801,11 @@ class TestCuteAutotuner(TestCase):
                 "cute_lane_layouts",
                 "cute_cluster_n",
                 "cute_min_blocks_per_mp",
+                "cute_proven_bounds",
+                "cute_packet_prefetch",
+                "cute_independent_reduction",
+                "cute_replicated_reduction",
+                "cute_vector_packet_unroll",
                 "load_eviction_policies",
             },
         )
@@ -11777,6 +11830,11 @@ class TestCuteAutotuner(TestCase):
                     "cute_lane_layouts",
                     "cute_cluster_n",
                     "cute_min_blocks_per_mp",
+                    "cute_proven_bounds",
+                    "cute_packet_prefetch",
+                    "cute_independent_reduction",
+                    "cute_replicated_reduction",
+                    "cute_vector_packet_unroll",
                     "load_eviction_policies",
                 },
             )
@@ -11802,10 +11860,12 @@ class TestCuteAutotuner(TestCase):
                     block_sizes=[16, 64],
                     num_threads=[16, 64],
                     loop_orders=[[1, 0]],
+                    cute_proven_bounds=True,
                 )
             )
         )
         self.assertEqual(round_tripped.loop_orders, [[1, 0]])
+        self.assertTrue(round_tripped.config["cute_proven_bounds"])
 
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="tcgen05 requires CUDA capability >= 10.0"
@@ -12738,6 +12798,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search.settings = settings
         search.config_spec = SimpleNamespace(  # type: ignore[assignment]
             compiler_seed_configs=[],
+            compiler_coverage_groups=(),
             compiler_seed_timeout_retry_repetitions=(
                 compiler_seed_timeout_retry_repetitions
             ),
@@ -13178,6 +13239,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
                     if name not in {"self", "kernel", "args"}
                 }
                 search = object.__new__(search_cls)
+                search.config_spec = _cute_flash_test_config_spec()
                 for name in parameters | inherited_fields:
                     setattr(search, name, 1)
                 if hasattr(search, "flash_structural_search"):

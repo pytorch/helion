@@ -30,6 +30,8 @@ from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import LoopDimInfo
 from .tile_strategy import PersistentReductionState
+from .tile_strategy import PerThreadFlattenedTileStrategy
+from .tile_strategy import PerThreadNDTileStrategy
 from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
 from .tile_strategy import _to_sympy
@@ -462,6 +464,30 @@ class ReductionStrategy(TileStrategy):
           rolled loop carries its own accumulator (and vec-fold) for the lane
           reduction, so emitting a marker would double-handle it.
         """
+        from .generate_ast import GenerateAST
+
+        # A serial device loop may enclose the lane that owns this reduction.
+        # Its complete lane reduction then remains inside each serial iteration.
+        # Use the live statement-list frontier to establish this order; block
+        # numbers and insertion order do not describe lexical nesting.
+        scope_positions: dict[int, int] = {}
+        owner_scope: int | None = None
+        if isinstance(state.codegen, GenerateAST):
+            scope_positions = {
+                id(statements): index
+                for index, statements in enumerate(state.codegen.statements_stack)
+            }
+            owner_scopes = {
+                scope_positions[id(loop.inner_statements)]
+                for loops in state.codegen.active_device_loops.values()
+                for loop in loops
+                if isinstance(loop, DeviceLoopState)
+                and self.block_index in loop.lane_loop_blocks
+                and id(loop.inner_statements) in scope_positions
+            }
+            if len(owner_scopes) == 1:
+                owner_scope = next(iter(owner_scopes))
+
         for block_id, loops in state.codegen.active_device_loops.items():
             for loop_state in loops:
                 if not isinstance(loop_state, DeviceLoopState):
@@ -477,6 +503,13 @@ class ReductionStrategy(TileStrategy):
                     and block_id not in loop_state.block_thread_axes
                     and block_id not in loop_state.lane_loop_blocks
                 ):
+                    serial_scope = scope_positions.get(id(loop_state.inner_statements))
+                    if (
+                        owner_scope is not None
+                        and serial_scope is not None
+                        and serial_scope < owner_scope
+                    ):
+                        continue
                     # The reduction's lane loop is OUTSIDE this serial device
                     # loop. A synthetic-lane PersistentReductionStrategy can be
                     # repaired by the ``interchange_lane_outside_serial_reductions``
@@ -490,6 +523,99 @@ class ReductionStrategy(TileStrategy):
                         continue
                     return True
         return False
+
+    def _lane_reduce_owner(
+        self,
+        state: CodegenState,
+        *,
+        reshape_group: tuple[int, int, str] | None = None,
+    ) -> str:
+        """Return the actual serial lane that distributes this reduction axis."""
+        if isinstance(self, PersistentReductionStrategy):
+            if self._synthetic_cute_lane_var is not None:
+                # Reshape may merge existing tile axes without redistributing
+                # their values. In that case the synthetic index is unused
+                # and DeviceGridState drops its loop. Recover the one concrete
+                # serial lane from the merged dimension's source-block symbols.
+                env = CompileEnvironment.current()
+                numel = env.block_sizes[self.block_index].numel
+                source_blocks: set[int] = set()
+                if isinstance(numel, sympy.Expr) and numel == sympy.prod(
+                    numel.free_symbols
+                ):
+                    for symbol in numel.free_symbols:
+                        if not isinstance(symbol, sympy.Symbol):
+                            source_blocks.clear()
+                            break
+                        block_id = env.get_block_id(symbol)
+                        if block_id is None:
+                            source_blocks.clear()
+                            break
+                        source_blocks.add(env.canonical_block_id(block_id))
+                if len(source_blocks) >= 2:
+                    owners: set[str] = set()
+                    covered: set[int] = set()
+                    for block_id in source_blocks:
+                        active = {
+                            id(loop): loop
+                            for loop in state.codegen.active_device_loops.get(
+                                block_id, []
+                            )
+                            if isinstance(loop, DeviceLoopState)
+                            and isinstance(loop.strategy, PerThreadNDTileStrategy)
+                        }
+                        if len(active) != 1:
+                            continue
+                        loop = next(iter(active.values()))
+                        if block_id in loop.lane_loop_blocks:
+                            owner = cast(
+                                "PerThreadNDTileStrategy", loop.strategy
+                            )._lane_var_by_block.get(block_id)
+                            if owner is not None:
+                                owners.add(owner)
+                                covered.add(block_id)
+                        elif block_id in loop.block_thread_axes:
+                            covered.add(block_id)
+                    if (
+                        covered == source_blocks
+                        and len(owners) == 1
+                        and self.fn.cute_state.simt_cluster_n == 1
+                        and reshape_group is not None
+                    ):
+                        # Keep the synthetic owner for now: a value can still
+                        # use that coordinate despite having a merged shape.
+                        # Only the post-wrap body can prove its loop was dead.
+                        record = (next(iter(owners)), *reshape_group)
+                        previous = self.fn.cute_state.reshape_lane_fallbacks.setdefault(
+                            self._synthetic_cute_lane_var, record
+                        )
+                        if previous != record:
+                            raise exc.BackendUnsupported(
+                                "cute", "reshape reduction has conflicting lane owners"
+                            )
+                return self._synthetic_cute_lane_var
+        states = [
+            loop
+            for loops in state.codegen.active_device_loops.values()
+            for loop in loops
+        ]
+        if state.codegen.current_grid_state is not None:
+            states.append(state.codegen.current_grid_state)
+        for loop in states:
+            if (
+                not isinstance(loop, (DeviceGridState, DeviceLoopState))
+                or self.block_index not in loop.lane_loop_blocks
+            ):
+                continue
+            strategy = loop.strategy
+            if isinstance(strategy, PerThreadNDTileStrategy):
+                owner = strategy._lane_var_by_block.get(self.block_index)
+                if owner is not None:
+                    return owner
+            elif isinstance(strategy, PerThreadFlattenedTileStrategy):
+                if strategy._lane_var is not None:
+                    return strategy._lane_var
+        raise exc.BackendUnsupported("cute", "reduction lane owner is not proven")
 
     def _reduction_block_is_serial(self) -> bool:
         """Return True when this reduction block is being traversed by a
@@ -793,6 +919,11 @@ class PersistentReductionStrategy(ReductionStrategy):
         self._cute_lane_base_index_var: str | None = None
         self._cute_lane_body: list[ast.AST] | None = None
         self._cute_lane_vloop: ast.For | None = None
+        self._cute_resident_reduction = False
+        if env.backend.name == "cute":
+            from .cute.resident_reductions import supports_resident_threads
+
+            self._cute_resident_reduction = supports_resident_threads(fn, block_index)
         is_graph_reduction_dim = any(
             isinstance(graph, ReductionLoopGraphInfo) and block_index in graph.block_ids
             for graph in fn.codegen.codegen_graphs
@@ -800,16 +931,17 @@ class PersistentReductionStrategy(ReductionStrategy):
         if self._thread_count > 0:
             # For a non-graph-reduction dim we always try to recover the
             # full extent through a synthetic lane loop. For a graph
-            # reduction dim we only need the synthetic lane loop when
-            # ``adjust_reduction_thread_count`` shrank ``thread_count``
-            # below the (padded) reduction extent — otherwise every logical
-            # lane is already backed by a live thread and the warp/cross-warp
-            # reduction covers the whole axis. Without this, a shrunk
+            # reduction dim we need the synthetic lane loop whenever the
+            # live thread count is below the full padded reduction extent.
+            # This includes the backend's hardware thread cap, not just a
+            # later adjustment for competing tile axes. Only a live thread for
+            # every padded element makes the warp/cross-warp reduction cover
+            # the whole axis without a lane loop. Without this, a shrunk
             # graph-reduction dim only addresses the first ``thread_count``
             # elements (e.g. layer_norm_bwd's feature axis), leaving the
             # remaining columns/partial sums uncomputed.
             needs_synthetic = not is_graph_reduction_dim or (
-                self._thread_count < next_power_of_2(min(size_hint, max_threads))
+                self._thread_count < next_power_of_2(size_hint)
                 if max_threads is not None
                 else False
             )
@@ -826,6 +958,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                 if (
                     lane_extent is not None
                     and self._thread_count > _CUTE_WARP_REDUCTION_THREADS
+                    and not self._cute_resident_reduction
                 ):
                     self._thread_count = _CUTE_WARP_REDUCTION_THREADS
                     lane_extent = env.backend.create_synthetic_reduction_lanes(
@@ -837,6 +970,27 @@ class PersistentReductionStrategy(ReductionStrategy):
                         dce=False,
                     )
                     self._synthetic_cute_lane_extent = lane_extent
+                    if self._cute_resident_reduction:
+                        from .cute.resident_reductions import ResidentReductionLayout
+
+                        width = env.config_spec.cute_vector_widths.config_get(
+                            cast(
+                                "list[int]",
+                                fn.config.config.get("cute_vector_widths", []) or [],
+                            ),
+                            block_index,
+                            1,
+                        )
+                        fn.cute_state.resident_reduction_layouts[
+                            self._synthetic_cute_lane_var
+                        ] = ResidentReductionLayout(
+                            block_id=block_index,
+                            feature_extent=size_hint,
+                            threads=self._thread_count,
+                            lane_extent=lane_extent,
+                            vector_width=min(width, lane_extent),
+                            index_name=self.index_var(block_index),
+                        )
                     if mask_var is None:
                         cfg = fn.config.config
                         vec_width = env.config_spec.cute_vector_widths.config_get(
@@ -854,6 +1008,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                             isinstance(vec_width, int)
                             and vec_width > 1
                             and lane_extent == vec_width
+                            and not self._cute_resident_reduction
                         ):
                             self._cute_reduction_vec_width = vec_width
 
@@ -948,6 +1103,15 @@ class PersistentReductionStrategy(ReductionStrategy):
                     f"({self._index_init_expr(block_size_var, env.index_type(), block_idx)})"
                     f" + cutlass.Int32({synthetic_lane_var}) * {self._thread_count}"
                 )
+                if self._cute_resident_reduction:
+                    from .cute.resident_reductions import feature_index_expression
+
+                    index_expr = feature_index_expression(
+                        self.fn.cute_state.resident_reduction_layouts[
+                            synthetic_lane_var
+                        ],
+                        synthetic_lane_var,
+                    )
             current_grid.thread_axis_sizes[axis] = max(
                 current_grid.thread_axis_sizes.get(axis, 1),
                 self._thread_count,
@@ -1142,7 +1306,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         pre = 1
         for axis in range(reduce_axis):
             pre *= axis_sizes.get(axis, 1)
-        if pre <= 1:
+        if pre <= 1 and not (self._cute_resident_reduction and reduce_extent > 32):
             return None
         group_span = pre * reduce_extent
         if group_span > 32 and group_span % 32 != 0:
@@ -1152,6 +1316,12 @@ class PersistentReductionStrategy(ReductionStrategy):
             num_threads *= size
         if num_threads % group_span != 0:
             return None
+        if self._cute_resident_reduction and (
+            self._planned_thread_dims() != (reduce_extent, 1, 1) or reduce_axis != 0
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "resident reduction must own the whole physical CTA"
+            )
         lane_expr = backend.thread_linear_index_expr(axis_sizes)
         if lane_expr is None:
             return None
@@ -1203,6 +1373,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                 constant_repr(default), _dtype_str(acc_dtype)
             )
             group_params = self._reshape_merged_reduction_group_params()
+            owner_lane = self._lane_reduce_owner(state, reshape_group=group_params)
             if group_params is not None:
                 group_pre, group_span, group_lane_expr = group_params
                 expr = _lane_reduce_marker_expr(
@@ -1213,6 +1384,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     group_pre=group_pre,
                     group_span=group_span,
                     group_lane_expr=group_lane_expr,
+                    owner_lane=owner_lane,
                 )
             elif (sibling_params := self._sibling_axis_group_params(state)) is not None:
                 group_pre, group_span, group_lane_expr, group_count = sibling_params
@@ -1225,10 +1397,15 @@ class PersistentReductionStrategy(ReductionStrategy):
                     group_span=group_span,
                     group_lane_expr=group_lane_expr,
                     group_count=group_count,
+                    owner_lane=owner_lane,
                 )
             else:
                 expr = _lane_reduce_marker_expr(
-                    input_name, reduction_type, identity_expr, threads
+                    input_name,
+                    reduction_type,
+                    identity_expr,
+                    threads,
+                    owner_lane=owner_lane,
                 )
             return expr_from_string(
                 self.maybe_reshape(expr, dim, fake_input, fake_output)
@@ -2142,6 +2319,7 @@ class BlockReductionStrategy(ReductionStrategy):
         dim: int,
         fake_input: torch.Tensor,
         default_value: float | bool,
+        acc_dtype: torch.dtype,
     ) -> str | None:
         env = CompileEnvironment.current()
         backend = env.backend
@@ -2434,7 +2612,15 @@ class BlockReductionStrategy(ReductionStrategy):
         logical_axes.add(reduce_axis)
         logical_axis_sizes: dict[int, int] = {}
         for block_id, axis, extent, _info in active_thread_blocks:
-            if block_id in mapped_block_ids or block_id >= self.block_index:
+            if (
+                block_id in mapped_block_ids
+                or block_id >= self.block_index
+                or axis < reduce_axis
+            ):
+                # Even a broadcast input (for example a rank-one validity
+                # count) is executed by the physical row threads below this
+                # axis. Omitting their stride makes a consecutive-lane warp
+                # reduction combine different rows instead of this axis.
                 logical_axis_sizes[axis] = max(
                     logical_axis_sizes.get(axis, 1),
                     extent,
@@ -2475,8 +2661,16 @@ class BlockReductionStrategy(ReductionStrategy):
             debug("skip no lane expr", tuple(fake_input.size()), dim)
             return None
 
-        dtype = _dtype_str(fake_input.dtype)
+        # Inductor's scalar input has already applied reduction promotion (for
+        # example Int32 sum -> Int64). Shared selections and storage must use
+        # that same type, including when only the broadcast count is reduced.
+        dtype = _dtype_str(acc_dtype)
         identity_expr = backend.cast_expr(constant_repr(default_value), dtype)
+        input_expr = (
+            input_name
+            if acc_dtype == fake_input.dtype
+            else backend.cast_expr(input_name, dtype)
+        )
         num_threads = 1
         for size in logical_axis_sizes.values():
             num_threads *= size
@@ -2589,12 +2783,12 @@ class BlockReductionStrategy(ReductionStrategy):
                 partials_size = group_count * pre * warps_per_group
                 results_size = group_count * pre
                 if (
-                    _cute_reduction_smem_bytes(
-                        partials_size + results_size, fake_input.dtype
-                    )
+                    _cute_reduction_smem_bytes(partials_size + results_size, acc_dtype)
                     > smem_budget_bytes
                 ):
-                    return None
+                    raise exc.BackendUnsupported(
+                        "cute", "strided reduction exceeds the shared-memory budget"
+                    )
                 if self._lane_reduce_cluster_n() > 1 and (pre != 1 or group_count != 1):
                     # The cluster split covers the whole CTA; an
                     # interleaved / multi-group reduce cannot combine
@@ -2607,9 +2801,9 @@ class BlockReductionStrategy(ReductionStrategy):
                     )
                 return self._strided_thread_reduction_expr_shared_two_stage(
                     state=state,
-                    input_name=input_name,
+                    input_name=input_expr,
                     reduction_type=reduction_type,
-                    fake_input=fake_input,
+                    acc_dtype=acc_dtype,
                     identity_expr=identity_expr,
                     lane_var=lane_var,
                     lane_in_group_var=lane_in_group_var,
@@ -2619,12 +2813,12 @@ class BlockReductionStrategy(ReductionStrategy):
                     group_count=group_count,
                 )
             if (
-                _cute_reduction_smem_bytes(
-                    num_threads + group_count * pre, fake_input.dtype
-                )
+                _cute_reduction_smem_bytes(num_threads + group_count * pre, acc_dtype)
                 > smem_budget_bytes
             ):
-                return None
+                raise exc.BackendUnsupported(
+                    "cute", "strided reduction exceeds the shared-memory budget"
+                )
             if self._lane_reduce_cluster_n() > 1:
                 raise exc.BackendUnsupported(
                     "cute",
@@ -2633,7 +2827,7 @@ class BlockReductionStrategy(ReductionStrategy):
                 )
             return self._strided_thread_reduction_expr_shared_tree(
                 state=state,
-                input_name=input_name,
+                input_name=input_expr,
                 reduction_type=reduction_type,
                 fake_input=fake_input,
                 identity_expr=identity_expr,
@@ -2654,7 +2848,7 @@ class BlockReductionStrategy(ReductionStrategy):
             )
         return (
             "_cute_grouped_reduce_warp("
-            f"{input_name}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
+            f"{input_expr}, {reduction_type!r}, {identity_expr}, {lane_expr}, "
             f"pre={pre}, group_span={group_span})"
         )
 
@@ -2664,7 +2858,7 @@ class BlockReductionStrategy(ReductionStrategy):
         state: CodegenState,
         input_name: str,
         reduction_type: str,
-        fake_input: torch.Tensor,
+        acc_dtype: torch.dtype,
         identity_expr: str,
         lane_var: str,
         lane_in_group_var: str,
@@ -2679,7 +2873,6 @@ class BlockReductionStrategy(ReductionStrategy):
             # The reduced axis is additionally split across the CTAs of a
             # thread-block cluster (``cute_cluster_n``): combine within-CTA
             # warps and across the cluster with one DSM exchange.
-            acc_dtype = get_computation_dtype(fake_input.dtype)
             if acc_dtype != torch.float32:
                 # The cluster exchange buffers every partial as Float32
                 # (see _cute_grouped_reduce_cluster) — a wider accumulator
@@ -2772,9 +2965,28 @@ class BlockReductionStrategy(ReductionStrategy):
                 f"{reduction_type} reduction over an axis strided by a tile lane "
                 "loop; this backend does not support lane-loop reductions",
             )
+        sequence_expr = None
         if (
+            env.backend.name == "cute"
+            and self.fn.config.config.get("cute_reduction_sequence", "scalar")
+            != "scalar"
+        ):
+            from .cute.resident_sequence import sequence_reduction_expr
+
+            sequence_expr = sequence_reduction_expr(
+                self, state, input_name, reduction_type, fake_output, default
+            )
+        if sequence_expr is not None:
+            expr = sequence_expr
+        elif (
             strided_expr := self._strided_thread_reduction_expr(
-                state, input_name, reduction_type, dim, fake_input, default
+                state,
+                input_name,
+                reduction_type,
+                dim,
+                fake_input,
+                default,
+                get_computation_dtype(fake_output.dtype),
             )
         ) is not None:
             expr = strided_expr
@@ -2800,6 +3012,7 @@ class BlockReductionStrategy(ReductionStrategy):
                     constant_repr(default), _dtype_str(acc_dtype)
                 )
                 group_params = self._lane_loop_cross_warp_group_params()
+                owner_lane = self._lane_reduce_owner(state)
                 cluster_n = self._lane_reduce_cluster_n()
                 if cluster_n > 1 and group_params is None:
                     raise exc.BackendUnsupported(
@@ -2825,10 +3038,15 @@ class BlockReductionStrategy(ReductionStrategy):
                         group_lane_expr=group_lane_expr,
                         group_count=group_count,
                         group_cluster_n=cluster_n,
+                        owner_lane=owner_lane,
                     )
                 else:
                     expr = _lane_reduce_marker_expr(
-                        input_name, reduction_type, identity_expr, threads
+                        input_name,
+                        reduction_type,
+                        identity_expr,
+                        threads,
+                        owner_lane=owner_lane,
                     )
             else:
                 # A serial device loop (or no thread axis at all). A warp-level

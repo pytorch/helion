@@ -558,8 +558,13 @@ class BenchmarkProvider(abc.ABC):
         warmup: int,
         rep: int,
         desc: str = "Benchmarking",
+        fresh_process: bool = False,
     ) -> list[IsolatedBenchmarkTiming] | None:
         """Benchmark already-validated functions in an isolated subprocess.
+
+        With ``fresh_process``, discard earlier worker state and use one new
+        process per function. This isolates cached arguments and allocations
+        during final selection while retaining worker reuse during search.
 
         Return ``None`` when the provider cannot support the isolated path or
         per-function ``None`` when a timing could not be confirmed and callers
@@ -1113,12 +1118,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         custom_bench = backend.get_do_bench()
         return backend.name == "cute" and custom_bench is do_bench_generic
 
-    def _probe_long_cute_flash_kernel(self) -> bool:
-        # Flash attention candidates can run for multiple seconds per launch;
-        # probing from a single call (instead of the 5-call estimate loop)
-        # keeps those benchmarks to ~3 launches on both the event-timed and
-        # wall-clock paths.
-        return bool(self.config_spec.cute_flash_search_enabled)
+    def _probe_long_kernel(self) -> bool:
+        """Whether timing should stop its estimate after one long launch."""
+        if self.config_spec.cute_flash_search_enabled:
+            return True
+        return self.config_spec.backend.probe_long_autotune_kernels(self.config_spec)
 
     def _effective_source_dedup_enabled(self) -> bool:
         """Whether this provider may collapse source-identical candidates.
@@ -1757,22 +1761,25 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 benchmark_runner = (
                     _backend.get_do_bench() if _backend is not None else None
                 ) or do_bench
-                # Only the cute backend enables flash search, and it uses the
-                # default do_bench, which accepts probe_long_kernel.
-                if self._probe_long_cute_flash_kernel():
+                benchmark_callable = functools.partial(
+                    benchmark_function, *working_args
+                )
+                if benchmark_runner in (do_bench, do_bench_generic):
+                    # The exact callable ran immediately above.
                     res = benchmark_runner(
-                        functools.partial(benchmark_function, *working_args),
+                        benchmark_callable,
                         return_mode="median",
-                        warmup=1,  # we are already warmed up above
+                        warmup=1,
                         rep=50,
                         process_group_name=self.kernel.env.process_group_name,
-                        probe_long_kernel=True,
+                        probe_long_kernel=self._probe_long_kernel(),
+                        pre_warmed=True,
                     )
                 else:
                     res = benchmark_runner(
-                        functools.partial(benchmark_function, *working_args),
+                        benchmark_callable,
                         return_mode="median",
-                        warmup=1,  # we are already warmed up above
+                        warmup=1,
                         rep=50,
                         process_group_name=self.kernel.env.process_group_name,
                     )
@@ -2078,7 +2085,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             warmup=warmup,
             rep=rep,
             use_wall_clock=self._subprocess_benchmark_uses_wall_clock(),
-            probe_long_kernel=self._probe_long_cute_flash_kernel(),
+            probe_long_kernel=self._probe_long_kernel(),
             fixed_repetitions=fixed_repetitions,
         )
         try:
@@ -2116,6 +2123,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         warmup: int,
         rep: int,
         desc: str = "Benchmarking",
+        fresh_process: bool = False,
     ) -> list[IsolatedBenchmarkTiming] | None:
         if not self._subprocess_benchmark_enabled():
             return None
@@ -2124,41 +2132,49 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         timings: list[IsolatedBenchmarkTiming] = []
         for fn in fns:
+            if fresh_process and self._benchmark_worker is not None:
+                self._benchmark_worker.shutdown()
+                self._benchmark_worker = None
             try:
-                timing = self._run_subprocess_benchmark_job(
-                    cast("CompiledConfig", fn),
-                    warmup=warmup,
-                    rep=rep,
-                )
-            except BenchmarkWorkerUnkillable:
-                raise
-            except BenchmarkTimeout as e:
-                self.log.warning(f"{desc} subprocess failed: {e}")
-                self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
-                timings.append(IsolatedBenchmarkFailure("timeout"))
-                continue
-            except BenchmarkSubprocessError as e:
-                self.log.warning(f"{desc} subprocess failed: {e}")
-                timing = None
-            except Exception as e:
-                e.__traceback__ = None
-                if match_unrecoverable_runtime_error(e):
-                    self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
-                    # The confirmation re-ran a previously accepted candidate in
-                    # an isolated worker; a sticky CUDA error means that config is
-                    # still unsafe, so remove it from contention.
-                    timings.append(IsolatedBenchmarkFailure("error"))
+                try:
+                    timing = self._run_subprocess_benchmark_job(
+                        cast("CompiledConfig", fn),
+                        warmup=warmup,
+                        rep=rep,
+                    )
+                except BenchmarkWorkerUnkillable:
+                    raise
+                except BenchmarkTimeout as e:
+                    self.log.warning(f"{desc} subprocess failed: {e}")
+                    self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
+                    timings.append(IsolatedBenchmarkFailure("timeout"))
                     continue
-                self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
-                timing = None
-            # A wrapper-load failure disables the worker because later
-            # candidates may depend on the same unavailable source module.
-            # Treat the whole isolated batch as unavailable so the caller
-            # rebenchmarks every finalist in-process instead of mixing partial
-            # fresh timings with stale population measurements.
-            if self._subprocess_wrapper_unloadable:
-                return None
-            timings.append(None if timing is None else float(timing))
+                except BenchmarkSubprocessError as e:
+                    self.log.warning(f"{desc} subprocess failed: {e}")
+                    timing = None
+                except Exception as e:
+                    e.__traceback__ = None
+                    if match_unrecoverable_runtime_error(e):
+                        self.log.warning(f"{desc} sticky CUDA error skipped: {e}")
+                        # The confirmation re-ran a previously accepted candidate in
+                        # an isolated worker; a sticky CUDA error means that config is
+                        # still unsafe, so remove it from contention.
+                        timings.append(IsolatedBenchmarkFailure("error"))
+                        continue
+                    self.log.debug(f"{desc} subprocess raised: {type(e).__name__}: {e}")
+                    timing = None
+                # A wrapper-load failure disables the worker because later
+                # candidates may depend on the same unavailable source module.
+                # Treat the whole isolated batch as unavailable so the caller
+                # rebenchmarks every finalist in-process instead of mixing partial
+                # fresh timings with stale population measurements.
+                if self._subprocess_wrapper_unloadable:
+                    return None
+                timings.append(None if timing is None else float(timing))
+            finally:
+                if fresh_process and self._benchmark_worker is not None:
+                    self._benchmark_worker.shutdown()
+                    self._benchmark_worker = None
         return timings
 
 

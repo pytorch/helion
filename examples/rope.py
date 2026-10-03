@@ -210,13 +210,35 @@ def rope(
 
 def rope_tritonbench(
     tb_op: object,
-    hidden_size: int,
-    seq_length: int,
+    *args: Any,  # noqa: ANN401
 ) -> Callable[[], tuple[torch.Tensor, torch.Tensor]]:
-    """Wrapper for the TritonBench RoPE operator."""
-    # pyrefly: ignore [missing-attribute]
-    prepared_input = tb_op.prepare_input(hidden_size, seq_length)
-    q, k, cos, sin = prepared_input[:4]
+    """Wrapper for the TritonBench RoPE operator.
+
+    TritonBench changed the rope operator's input convention upstream
+    (meta-pytorch/tritonbench@3f34a4e): newer checkouts yield
+    ``(q, k, cos, sin, pos_ids)`` tensors directly from ``get_input_iter``,
+    while older ones yield ``(hidden_size, seq_length)`` and expect each
+    variant to call ``tb_op.prepare_input(...)`` itself. Support both so this
+    keeps working regardless of which TritonBench revision is checked out.
+    """
+    if len(args) == 2:
+        # Old TritonBench: args are (hidden_size, seq_length). `prepare_input`
+        # (patched onto Operator in benchmarks/run.py for old checkouts) also
+        # populates self.q/k/dq/dk for get_bwd_fn.
+        q, k, cos, sin, pos_ids = tb_op.prepare_input(*args)  # pyrefly: ignore [missing-attribute]
+    elif len(args) == 5:
+        # New TritonBench: args are the (q, k, cos, sin, pos_ids) tensors.
+        q, k, cos, sin, pos_ids = args
+        # TritonBench's own bwd variants populate self.q/k/dq/dk via
+        # _save_for_backward inside their @register_benchmark methods;
+        # replicate that here so Operator.get_bwd_fn works for this variant.
+        tb_op._save_for_backward(q, k)  # pyrefly: ignore [missing-attribute]
+    else:
+        raise ValueError(
+            f"rope_tritonbench got {len(args)} positional args, expected 2 "
+            "(old TritonBench: hidden_size, seq_length) or 5 (new TritonBench: "
+            "q, k, cos, sin, pos_ids)"
+        )
     return lambda: rope(q, k, cos, sin)
 
 

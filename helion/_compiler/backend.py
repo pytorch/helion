@@ -107,6 +107,21 @@ class LauncherInfo:
     runtime_helper_names: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class AutotuneGridPolicy:
+    """How a backend limits grid-shaped autotune candidates.
+
+    ``raise_independent_axis_block_size_minimums`` applies the legacy
+    search-space heuristic that limits each grid axis separately.
+    ``max_programs_per_root_grid`` enables a coupled candidate check on the
+    product of all axes in each root grid. Backends may select either policy or
+    both explicitly.
+    """
+
+    raise_independent_axis_block_size_minimums: bool = True
+    max_programs_per_root_grid: int | None = None
+
+
 def read_launcher_source(module_name: str) -> str:
     """Raw source of a dependency-free launcher module."""
     import importlib
@@ -260,6 +275,14 @@ class Backend(abc.ABC):
         """
         return None
 
+    def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
+        """Whether a typed physical collective owns an axis's element coordinates."""
+        return False
+
+    def codegen_config(self, config: Config) -> Config:
+        """Resolve a backend-owned physical schedule without mutating search input."""
+        return config
+
     def config_value_priors(self, config_spec: ConfigSpec) -> dict[str, ValuePrior]:
         """Per-config-key priors that bias the autotuner's random exploration.
 
@@ -273,6 +296,20 @@ class Backend(abc.ABC):
         uniformly. The default is no bias.
         """
         return {}
+
+    def autotune_config_is_viable(
+        self, config_spec: ConfigSpec, config: Config
+    ) -> bool:
+        """Return whether an automatically generated config is worth compiling.
+
+        This hook only screens candidates produced during autotuning. An explicit
+        fixed config still reaches normal backend validation and compilation.
+        """
+        return True
+
+    def autotune_grid_policy(self, config_spec: ConfigSpec) -> AutotuneGridPolicy:
+        """Return how autotuning should limit grid-shaped candidates."""
+        return AutotuneGridPolicy()
 
     @abc.abstractmethod
     def dtype_str(self, dtype: torch.dtype) -> str:
@@ -442,6 +479,16 @@ class Backend(abc.ABC):
         """Whether an axis may be launched wider than the tile it indexes."""
         return False
 
+    def reference_override(
+        self, function: object, args: tuple[object, ...]
+    ) -> tuple[bool, object]:
+        """Optional backend semantic policy for a public operation's reference."""
+        return False, None
+
+    def validate_implicit_rng_reference(self) -> None:
+        """Validate implicit RNG support under the selected semantic policy."""
+        return None
+
     def supports_config_key(self, key: str) -> bool:
         from ..autotuner.config_spec import BACKEND_SPECIFIC_KEYS
 
@@ -524,6 +571,14 @@ class Backend(abc.ABC):
         this to return their own function.
         """
         return None
+
+    def probe_long_autotune_kernels(self, config_spec: ConfigSpec) -> bool:
+        """Whether candidate timing should first probe for a long-running kernel.
+
+        The probe avoids repeatedly executing a candidate whose first measured
+        call already exceeds the benchmark's warmup and measurement windows.
+        """
+        return False
 
     def get_interleaved_bench(
         self,
@@ -3195,6 +3250,7 @@ def _grouped_rank3_specialized_mma_plan(
 ) -> _SpecializedMmaPlan | None:
     from .cute.cute_mma import _choose_mma_impl
     from .cute.cute_mma import _rank3_grouped_root_axes
+    from .cute.grouped_row_union import physical_schedule
     from .host_function import HostFunction
 
     if node.target is not torch.ops.aten.addmm.default:
@@ -3269,8 +3325,10 @@ def _grouped_rank3_specialized_mma_plan(
         and worklist_profile is None
     ):
         return None
-    if worklist_profile is not None:
-        mma_bm, mma_bn = worklist_profile.mma_m, worklist_profile.mma_n
+    row_profile = physical_schedule(config)
+    collective_profile = row_profile or worklist_profile
+    if collective_profile is not None:
+        mma_bm, mma_bn = collective_profile.mma_m, collective_profile.mma_n
     mma_impl = _choose_mma_impl(
         lhs_val.dtype,
         bm=mma_bm,
@@ -3278,7 +3336,7 @@ def _grouped_rank3_specialized_mma_plan(
         bk=bk,
         config=config,
         input_device=lhs_val.device,
-        defer_grouped_worklist_smem_check=worklist_profile is not None,
+        defer_grouped_worklist_smem_check=collective_profile is not None,
     )
     if mma_impl != "tcgen05":
         return None
@@ -3299,7 +3357,7 @@ def _analyzed_specialized_mma_plan(
     from .cute.cute_mma import analyze_cute_mma_node
     from .cute.cute_mma import ensure_tcgen05_fragment_epilogue_plan
 
-    candidate = analyze_cute_mma_node(node)
+    candidate = analyze_cute_mma_node(node, graphs=fn.codegen.codegen_graphs)
     if (
         candidate is None
         or candidate.requires_accumulator_seed

@@ -19,6 +19,10 @@ pytest.importorskip("cutlass")
 
 def _fake_cute_context() -> ExitStack:
     stack = ExitStack()
+    # Binding fake tensors only tests heuristic selection, not the CuTe runtime.
+    stack.enter_context(
+        patch("helion._compiler.cute.cutedsl_compat.check_cute_backend_requirements")
+    )
     stack.enter_context(
         patch("helion.runtime.kernel._find_device", return_value=torch.device("cuda"))
     )

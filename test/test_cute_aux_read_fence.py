@@ -15,6 +15,7 @@ import helion
 from helion._compiler.cute.mma_support import get_cute_mma_support
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
 pytestmark = skipUnlessBackends(["cute"])
@@ -148,6 +149,7 @@ def test_direct_aux_loads_do_not_gain_ring_fence(tails: bool) -> None:
     assert "tcgen05_aux_loaded_" in code
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe runtime")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("mode", ("tma", "simt"))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16))

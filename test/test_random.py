@@ -38,12 +38,13 @@ def _assert_uses_philox(testcase: TestCase, code: str) -> None:
         return
     testcase.assertTrue(
         ("3528531795" in code and "3449720151" in code)
-        or ("36183" in code and "52638" in code and "8019" in code and "53841" in code),
+        or ("36183" in code and "52638" in code and "8019" in code and "53841" in code)
+        or ("0xD2511F53" in code and "0xCD9E8D57" in code),
         "Philox round constants not found in generated code",
     )
     testcase.assertTrue(
-        ("2654435769" in code or "-1640531527" in code)
-        and ("3144134277" in code or "-1150833019" in code),
+        ("2654435769" in code or "-1640531527" in code or "0x9E3779B9" in code)
+        and ("3144134277" in code or "-1150833019" in code or "0xBB67AE85" in code),
         "Philox key schedule constants not found in generated code",
     )
 
@@ -602,7 +603,9 @@ class TestRandom(RefEagerTestBase, TestCase):
     def test_hl_rand_offsets_independence(self):
         """Two hl.rand calls with different offset expressions are different but deterministic."""
 
-        @helion.kernel(static_shapes=False, autotune_effort="none")
+        @helion.kernel(
+            static_shapes=False, autotune_effort="none", cute_rng_stream="word0"
+        )
         def rand_two_streams_kernel(
             x: torch.Tensor, seed: int
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -619,6 +622,7 @@ class TestRandom(RefEagerTestBase, TestCase):
             static_shapes=False,
             autotune_effort="none",
             ref_mode=helion.RefMode.EAGER,
+            cute_rng_stream="word0",
         )
         def rand_two_streams_kernel_ref(
             x: torch.Tensor, seed: int
@@ -769,7 +773,7 @@ class TestRandomPhiloxParity(TestCase):
         self.assertTrue(torch.equal(triton_randint.cpu(), ref_randint.cpu()))
 
     def test_hl_rand_randint_match_triton_reference(self):
-        @helion.kernel(static_shapes=False)
+        @helion.kernel(static_shapes=False, cute_rng_stream="word0")
         def rng_kernel(
             x: torch.Tensor, seed: int
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -803,7 +807,9 @@ class TestRandomPhiloxParity(TestCase):
         self.assertTrue(torch.equal(out_h[1].cpu(), expected_h.cpu()))
 
     def test_hl_rand_randint_outer_loop_offsets_match_triton_reference(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
+        @helion.kernel(
+            static_shapes=False, autotune_effort="none", cute_rng_stream="word0"
+        )
         def outer_loop_kernel(
             x: torch.Tensor, seed: int
         ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -819,6 +825,7 @@ class TestRandomPhiloxParity(TestCase):
             return out_f, out_i
 
         @helion.kernel(
+            cute_rng_stream="word0",
             static_shapes=False,
             autotune_effort="none",
             ref_mode=helion.RefMode.EAGER,
@@ -857,7 +864,9 @@ class TestRandomPhiloxParity(TestCase):
         self.assertTrue(torch.equal(out_i.cpu(), ref_i.cpu()))
 
     def test_hl_rand_repeated_callsites_reuse_explicit_seed_stream(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
+        @helion.kernel(
+            static_shapes=False, autotune_effort="none", cute_rng_stream="word0"
+        )
         def rand_callsites_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
             m, n = x.shape
             out = torch.zeros((3, m, n), device=x.device, dtype=x.dtype)
@@ -868,6 +877,7 @@ class TestRandomPhiloxParity(TestCase):
             return out
 
         @helion.kernel(
+            cute_rng_stream="word0",
             static_shapes=False,
             autotune_effort="none",
             ref_mode=helion.RefMode.EAGER,
@@ -898,7 +908,9 @@ class TestRandomPhiloxParity(TestCase):
         _assert_bitwise_equal_float(self, out, ref_out)
 
     def test_hl_rand_randint_sibling_loops_reuse_explicit_seed_stream(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
+        @helion.kernel(
+            static_shapes=False, autotune_effort="none", cute_rng_stream="word0"
+        )
         def sibling_loops_kernel(
             x: torch.Tensor, seed: int
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -940,7 +952,9 @@ class TestRandomPhiloxParity(TestCase):
         _assert_bitwise_equal_float(self, triton_out, ref_out)
 
     def test_hl_rand4x_matches_triton_reference(self):
-        @helion.kernel(static_shapes=False, autotune_effort="none")
+        @helion.kernel(
+            static_shapes=False, autotune_effort="none", cute_rng_stream="word0"
+        )
         def rand4x_kernel(x: torch.Tensor, seed: int) -> torch.Tensor:
             (m,) = x.shape
             out = torch.zeros((4, m), device=x.device, dtype=torch.float32)
@@ -954,6 +968,7 @@ class TestRandomPhiloxParity(TestCase):
             return out
 
         @helion.kernel(
+            cute_rng_stream="word0",
             static_shapes=False,
             autotune_effort="none",
             ref_mode=helion.RefMode.EAGER,

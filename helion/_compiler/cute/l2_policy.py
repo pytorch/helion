@@ -59,26 +59,24 @@ def fixed_l2_evict_last_store_policy_supported(
 
 
 @dsl_user_op
-def load_v16b_l2_evict_last(
+def _load_vector_with_policy(
     ptr: object,
     vec_type: ir.VectorType,
+    assembly: str,
     *,
+    words: int = 4,
     loc: ir.Location | None = None,
     ip: ir.InsertionPoint | None = None,
 ) -> ir.Value:
-    """16-byte vector load with an ``L2::evict_last`` cache-hint policy.
-
-    Returns a raw ``ir.Value`` of ``vec_type`` (any 16-byte vector shape),
-    matching what ``cute.arch.load`` returns for vector dtypes.
-    """
+    """Load aligned words and bitcast to the requested vector type."""
     addr = ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
     u32 = cutlass.Uint32.mlir_type
-    res_ty = llvm.StructType.get_literal([u32] * 4)
+    res_ty = llvm.StructType.get_literal([u32] * words)
     res = llvm.inline_asm(
         res_ty,
         [addr],
-        _ASM_V4_B32_L2_EVICT_LAST,
-        "=r,=r,=r,=r,l",
+        assembly,
+        ",".join(["=r"] * words + ["l"]),
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -87,13 +85,67 @@ def load_v16b_l2_evict_last(
     )
     vals = [
         llvm.extractvalue(u32, res, [i], loc=loc, ip=ip)  # pyrefly: ignore
-        for i in range(4)
+        for i in range(words)
     ]
-    v4_ty = ir.VectorType.get([4], u32)
+    v4_ty = ir.VectorType.get([words], u32)
     v4 = _vector_dialect.from_elements(v4_ty, vals, loc=loc, ip=ip)
     if str(vec_type) == str(v4_ty):
         return v4
     return _vector_dialect.bitcast(vec_type, v4, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def load_v16b_l2_evict_last(
+    ptr: object,
+    vec_type: ir.VectorType,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> ir.Value:
+    """16-byte vector load with an L2 retention hint."""
+    return _load_vector_with_policy(
+        ptr, vec_type, _ASM_V4_B32_L2_EVICT_LAST, loc=loc, ip=ip
+    )
+
+
+def _two_level_assembly(priority: str, words: int = 4) -> str:
+    registers = ",".join(f"${index}" for index in range(words))
+    return (
+        "{\n"
+        ".reg .b64 pol;\n"
+        f"createpolicy.fractional.L2::{priority}.b64 pol, 1.0;\n"
+        f"ld.global.L1::{priority}.L2::cache_hint.v{words}.b32 "
+        f"{{{registers}}}, [${words}], pol;\n"
+        "}"
+    )
+
+
+@dsl_user_op
+def load_v16b_l1_l2_evict_first(
+    ptr: object,
+    vec_type: ir.VectorType,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> ir.Value:
+    """16-byte vector load with matching L1 and L2 eviction hints."""
+    return _load_vector_with_policy(
+        ptr, vec_type, _two_level_assembly("evict_first"), loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def load_v16b_l1_l2_evict_last(
+    ptr: object,
+    vec_type: ir.VectorType,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> ir.Value:
+    """16-byte vector load with matching L1 and L2 retention hints."""
+    return _load_vector_with_policy(
+        ptr, vec_type, _two_level_assembly("evict_last"), loc=loc, ip=ip
+    )
 
 
 def _store_u32x4_l2_evict_last(ptr: object, values: list[object]) -> None:
@@ -130,3 +182,31 @@ def store_u32x4_l2_evict_last(ptr: object, values: list[object]) -> None:
     """Store one 16-byte Uint32 fragment with an L2 retention hint."""
 
     _store_u32x4_l2_evict_last(ptr, values)
+
+
+@dsl_user_op
+def load_v8b_l1_l2_evict_first(
+    ptr: object,
+    vec_type: ir.VectorType,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> ir.Value:
+    """8-byte vector load with matching L1 and L2 eviction hints."""
+    return _load_vector_with_policy(
+        ptr, vec_type, _two_level_assembly("evict_first", 2), words=2, loc=loc, ip=ip
+    )
+
+
+@dsl_user_op
+def load_v8b_l1_l2_evict_last(
+    ptr: object,
+    vec_type: ir.VectorType,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> ir.Value:
+    """8-byte vector load with matching L1 and L2 eviction hints."""
+    return _load_vector_with_policy(
+        ptr, vec_type, _two_level_assembly("evict_last", 2), words=2, loc=loc, ip=ip
+    )
