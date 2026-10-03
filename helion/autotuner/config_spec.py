@@ -4771,20 +4771,31 @@ class ConfigSpec:
         )
 
         if range_warp_specializes and any(range_warp_specializes):
-            # Only one range_warp_specializes is allowed, take the first one
+            # Only one range_warp_specializes per loop nest, take the first one
             # Prefer warp specialize on outermost loop
-            first_idx = range_warp_specializes.index(True)
-            for i in range(first_idx + 1, len(range_warp_specializes)):
-                range_warp_specializes[i] = None
-
+            nest_starts = [0]
+            if config.get("cross_loop_pipeline") == "static":
+                # Static cross-loop roots are sequential loop nests in one kernel.
+                grid_ids = {*self.grid_block_ids}
+                nest_starts = [
+                    i
+                    for i, spec in enumerate(self.range_warp_specialize)
+                    if i == 0 or spec.block_ids[0] in grid_ids
+                ]
+            nest_stops = [*nest_starts[1:], len(range_warp_specializes)]
             range_unroll_factors = cast(
                 "list[int]", config.get("range_unroll_factors", [])
             )
-            if range_unroll_factors and range_unroll_factors[first_idx] > 1:
-                if range_unroll_factors[first_idx]:
+            for start, stop in zip(nest_starts, nest_stops, strict=True):
+                nest = range_warp_specializes[start:stop]
+                if True not in nest:
+                    continue
+                first_idx = start + nest.index(True)
+                for i in range(first_idx + 1, stop):
+                    range_warp_specializes[i] = None
+                if range_unroll_factors and range_unroll_factors[first_idx] > 1:
                     range_unroll_factors[first_idx] = 0
-
-                config["range_unroll_factors"] = range_unroll_factors
+                    config["range_unroll_factors"] = range_unroll_factors
 
         if self.supports_config_key("range_warp_specializes"):
             config["range_warp_specializes"] = range_warp_specializes
