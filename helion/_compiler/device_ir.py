@@ -1827,6 +1827,8 @@ class WalkDeviceAST(NodeVisitor):
                 if k in writes
                 and (include_new or k in self.scope)
                 and self.scope.get(k) is not v
+                # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
+                and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
             }
         )
 
