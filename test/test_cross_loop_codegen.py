@@ -1695,6 +1695,26 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_static_root_loops_warp_specialize_each_root(self) -> None:
+        x = torch.arange(140, device=DEVICE, dtype=torch.float32).reshape(2, 70)
+        code, out = code_and_output(
+            cartesian_affine_chain,
+            (x,),
+            block_sizes=[1, 16, 1, 32],
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=4,
+            range_warp_specializes=[True, True],
+        )
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        roots = [line for line in code.splitlines() if "for virtual_pid in" in line]
+        self.assertEqual(len(roots), 2)
+        self.assertTrue(all("warp_specialize=True" in root for root in roots))
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_partial_prefix_uses_exact_readiness(self) -> None:
         x = torch.arange(96, device=DEVICE, dtype=torch.float32)
         for launch in range(2):
