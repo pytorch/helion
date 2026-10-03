@@ -719,6 +719,7 @@ def _triton_root_requires_kernel_scope(
 _PURE_TL_CALLS = frozenset(
     {
         "arange",
+        "associative_scan",
         "broadcast_to",
         "cast",
         "cdiv",
@@ -741,7 +742,9 @@ _PURE_TL_CALLS = frozenset(
     }
 )
 # Hoisting these from a persistent task loop saves memory traffic or a reduction.
-_HOIST_ANCHOR_CALLS = frozenset({"cumsum", "load", "max", "min", "reduce", "sum"})
+_HOIST_ANCHOR_CALLS = frozenset(
+    {"associative_scan", "cumsum", "load", "max", "min", "reduce", "sum"}
+)
 
 
 @dataclasses.dataclass(frozen=True)
