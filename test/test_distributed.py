@@ -1243,26 +1243,46 @@ class TestDistributedTileDependencies(TestCase):
         symm, x = torch.zeros(2, 256, device=DEVICE)
         group = self._world(world, inband_rule_kernel)
         bound = inband_rule_kernel.bind((symm, x, group, "R1", world))
-        # Only the dynamic pipeline carries cross-rank transports.
-        self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("dynamic",))
-        config = bound.config_spec.default_config()
-        with self.assertRaisesRegex(helion.exc.InvalidConfig, "cross_loop_pipeline"):
-            bound.config_spec.normalize(
-                {**config.config, "cross_loop_pipeline": "static"}
-            )
-        code = bound.to_triton_code(
-            helion.Config(**{**config.config, "block_sizes": [64, 64, 64]})
+        # Peer counters order either pipeline; inband data needs the dynamic one.
+        self.assertEqual(
+            bound.config_spec.cross_loop_pipeline.choices, ("static", "dynamic")
         )
-        # Root 1 publishes to its slot and the done slot on every rank. Root 2
-        # waits for 256 / 64 tasks per rank, and the last ticket for roots 1 and 2.
+        config = bound.config_spec.default_config().config
         state = "tile_dependency_peer_state"
-        for expected in (
-            f"_add_on_every_rank({state}_ptrs, 0, {world}, {world})",
-            f"_add_on_every_rank({state}_ptrs, 16, {world}, {world})",
-            f"{state} + 0, tile_dependency_peer_epoch * {4 * world})",
-            f"{state} + 16, tile_dependency_peer_epoch * {8 * world})",
-        ):
-            self.assertIn(expected, code)
+        for pipeline in ("static", "dynamic"):
+            code = bound.to_triton_code(
+                helion.Config(
+                    **{
+                        **config,
+                        "block_sizes": [64, 64, 64],
+                        "cross_loop_pipeline": pipeline,
+                    }
+                )
+            )
+            # Root 1 publishes to its slot and the done slot on every rank. Root 2
+            # waits for 256 / 64 tasks per rank, and the last ticket for roots 1, 2.
+            for expected in (
+                f"_add_on_every_rank({state}_ptrs, 0, {world}, {world})",
+                f"_add_on_every_rank({state}_ptrs, 16, {world}, {world})",
+                f"{state} + 0, tile_dependency_peer_epoch * {4 * world})",
+                f"{state} + 16, tile_dependency_peer_epoch * {8 * world})",
+            ):
+                self.assertIn(expected, code)
+            # A static launch takes its epoch from the slot after the done slot,
+            # which worker 0 advances once every rank is done with the launch.
+            launch = (
+                f"tile_dependency_peer_epoch = tl.load({state} + 17) + 1",
+                f"tl.store({state} + 17, tile_dependency_peer_epoch)",
+            )
+            for expected in launch:
+                if pipeline == "static":
+                    self.assertIn(expected, code)
+                else:
+                    self.assertNotIn(expected, code)
+        bound = inband_rule_kernel.bind((symm, x, group, "", world))
+        self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("dynamic",))
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "cross_loop_pipeline"):
+            bound.config_spec.normalize({**config, "cross_loop_pipeline": "static"})
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
@@ -1289,8 +1309,8 @@ class TestDistributedTileDependencies(TestCase):
             self.assertEqual(code.count("@p bra SPIN"), 1)
             words = ", ".join(["tl.uint64"] * world)
             self.assertIn(f"dtype=({words}), is_pure=False, pack={pack})", code)
-            # Two parities of a word per rank and element, then the done slot.
-            self.assertIn(f"(x, {2 * world * 4000 + 1}, torch.uint64, True)", code)
+            # Two parities of a word per rank and element, the done and launch slots.
+            self.assertIn(f"(x, {2 * world * 4000 + 2}, torch.uint64, True)", code)
             self.assertNotIn("_wait_at_least", code)
             self.assertNotIn("_add_on_every_rank", code)
         # A push may be the kernel's first tensor access.
