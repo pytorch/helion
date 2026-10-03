@@ -235,6 +235,19 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         :meth:`_run_autotune_trials` raises ``RuntimeError``.
         """
         self.autotuner = autotuner
+        autotuner._validate_timing_policy()
+        if autotuner.timing_policy is not None:
+            from . import cache_classes
+            from .search_timing import timing_error
+
+            if type(self) not in {
+                cache
+                for name, cache in cache_classes.items()
+                if name != "AOTAutotuneCache"
+            }:
+                timing_error(
+                    "Profiler search requires a domain-aware local/remote cache"
+                )
         self._autotuner_factory = autotuner_factory
         kernel = self.autotuner.kernel
         if not kernel.is_cacheable():
@@ -306,12 +319,14 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         ``skip_cache`` (set by HELION_FORCE_AUTOTUNE) skips reading but
         still writes back.  HELION_SKIP_CACHE skips both reading and writing.
         """
+        self.autotuner._validate_timing_policy()
         skip_cache_env = should_skip_cache()
         search_policy_cacheable = self._search_policy_allows_cache_io()
         skip_read = skip_cache or skip_cache_env or not search_policy_cacheable
 
         if not skip_read:
             if (config := self.get()) is not None:
+                self.autotuner._validate_timing_policy()
                 counters["autotune"]["cache_hit"] += 1
                 log.debug("cache hit: %s", str(config))
                 if self._should_report_cache_hit():
@@ -385,6 +400,7 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
                 self._log_selected_multi_shape(summary)
 
         if not skip_cache_env and self._search_policy_allows_cache_write():
+            self.autotuner._validate_timing_policy()
             self.put(config)
             counters["autotune"]["cache_put"] += 1
             log.debug("cache put: %s", str(config))
@@ -429,6 +445,12 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """
         assert self._autotuner_factory is not None
         trial_autotuner = self._autotuner_factory()
+        self.autotuner._validate_timing_policy()
+        trial_autotuner._validate_timing_policy()
+        if trial_autotuner.timing_policy != self.autotuner.timing_policy:
+            from .search_timing import timing_error
+
+            timing_error("Best-of-K trial changed its timing domain")
         # Swap so logging/error-reporting reflects the active trial.
         self.autotuner = trial_autotuner
         self.autotuner.log(f"Best-of-K trial {i + 1}/{k} starting (seed={trial_seed})")
@@ -635,6 +657,12 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """
         assert self._autotuner_factory is not None
         rebench_autotuner = self._autotuner_factory()
+        self.autotuner._validate_timing_policy()
+        rebench_autotuner._validate_timing_policy()
+        if rebench_autotuner.timing_policy != self.autotuner.timing_policy:
+            from .search_timing import timing_error
+
+            timing_error("Best-of-K rebenchmark changed its timing domain")
         # ``_prepare`` constructs the ``benchmark_provider``; ``setup`` /
         # ``cleanup`` bracket the provider's lifetime. Mirror the lifecycle
         # ``BaseSearch.autotune`` runs internally.

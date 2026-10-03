@@ -11262,7 +11262,7 @@ def codegen_attention_flash(cg: GenerateAST) -> bool:
         df.placeholder_args.add(alibi_arg.name)
     for document_arg in document_args:
         df.placeholder_args.add(document_arg.name)
-    cg.cute_uses_matmul = True
+    cg.record_cute_matmul_layout()
 
     if cfg.topology == "ws_overlap":
         df.cute_state.attention_flash_threads = 256 if cfg.s_stage == 2 else 128

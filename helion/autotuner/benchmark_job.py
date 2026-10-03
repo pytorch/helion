@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -13,6 +14,7 @@ from .accuracy import assert_close
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
+from .kernel_args import _clone_args
 from .kernel_args import load_trusted_kernel_args
 from .logger import capture_output
 from .precompile_future import _load_compiled_fn
@@ -21,6 +23,8 @@ from .precompile_future import _unload_compiled_fn
 if TYPE_CHECKING:
     from ..runtime.kernel import CompiledConfig
     from .precompile_future import SerializedCompiledFunction
+    from .search_timing import BenchmarkMeasurement
+    from .search_timing import SearchTimingPolicy
 
 
 class CompiledFunctionLoadError(Exception):
@@ -47,17 +51,39 @@ class BenchmarkJob:
     use_wall_clock: bool = False
     fixed_repetitions: int | None = None
     probe_long_kernel: bool = False
+    timing_policy: SearchTimingPolicy | None = None
 
-    def __call__(self) -> float:
+    def __call__(self) -> float | BenchmarkMeasurement:
         # Subprocess inherits parent stderr; capture so Triton runtime
         # diagnostics don't leak to the user's terminal.
         with capture_output():
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
-                args = load_trusted_kernel_args(self.args_path)
+                args = _clone_args(load_trusted_kernel_args(self.args_path), None)
                 bench = do_bench_generic if self.use_wall_clock else do_bench
                 # return_mode="median" guarantees a float return.
                 benchmark_fn = functools.partial(fn, *args)
+                if self.timing_policy is not None:
+                    from .profiler_timing import CallableIdentity
+                    from .search_timing import timing_error
+
+                    if self.use_wall_clock:
+                        timing_error("Profiler search cannot use a backend wall timer")
+                    return do_bench(
+                        benchmark_fn,
+                        return_mode="mean",
+                        warmup=self.warmup,
+                        rep=self.rep,
+                        fixed_repetitions=self.fixed_repetitions,
+                        probe_long_kernel=self.probe_long_kernel,
+                        timing_policy=self.timing_policy,
+                        identity=CallableIdentity(
+                            self.fn_spec.function_name,
+                            hashlib.sha256(
+                                self.fn_spec.source_code.encode()
+                            ).hexdigest(),
+                        ),
+                    )
                 result = bench(
                     benchmark_fn,
                     return_mode="median",
@@ -99,7 +125,7 @@ class AccuracyCheckJob:
         with capture_output():
             fn = _load_compiled_fn_for_worker(self.fn_spec)
             try:
-                args = load_trusted_kernel_args(self.args_path)
+                args = _clone_args(load_trusted_kernel_args(self.args_path), None)
                 baseline_output = _load_trusted_baseline_output(self.baseline_path)
                 output = fn(*args)
                 synchronize_device()

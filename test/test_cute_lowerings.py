@@ -13134,7 +13134,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=SimpleNamespace(block_ids=[7]),
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -13180,7 +13182,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=None,
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -13230,7 +13234,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=SimpleNamespace(block_ids=[11]),
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: CutePackedAffineLoad(
@@ -13279,7 +13285,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=None,
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),
@@ -13322,7 +13330,9 @@ class TestCuteLowerings(unittest.TestCase):
             cg=SimpleNamespace(
                 current_grid_state=None,
                 active_device_loops={},
-                device_function=SimpleNamespace(config={}),
+                device_function=SimpleNamespace(
+                    config={}, cute_state=CuteDeviceFunctionState()
+                ),
             ),
             env={
                 lhs: ast.Name(id="lhs_tile", ctx=ast.Load()),

@@ -23,6 +23,7 @@ from .effort_profile import FlashStructuralSearchConfig
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import PatternSearch
 from .search_space_logger import canonical_config_id
+from .search_timing import ProfilerSweepTrace
 from helion._dist_utils import sync_seed
 
 _CUTE_FLASH_LANE_POLICY_VERSION = 14
@@ -361,7 +362,21 @@ class LFBOPatternSearch(PatternSearch):
         rather than starting from scratch. Failed configs (perf=inf) are
         kept since the surrogate's binary classifier learns from negatives too.
         """
+        self._validate_timing_policy()
         for result in results:
+            if self.timing_policy is not None:
+                if result.timing_policy != self.timing_policy:
+                    from .search_timing import timing_error
+
+                    timing_error("Foreign external training timing domain")
+                if math.isfinite(result.perf):
+                    self._check_timing_measurement(result.measurement)
+                    assert result.measurement is not None
+                    result.measurement.validate_callable(self.timing_policy, result.fn)
+                    if result.perf != result.measurement.perf:
+                        from .search_timing import timing_error
+
+                        timing_error("External score differs from measurement")
             try:
                 flat_values = self.config_gen.flatten(result.config)
                 encoded = self.config_gen.encode_config(flat_values)
@@ -4276,8 +4291,26 @@ class LFBOPatternSearch(PatternSearch):
 
     @staticmethod
     def _flash_terminal_trace_metric(
-        member_ids: Sequence[str], trace: MirroredBenchmarkTrace
+        member_ids: Sequence[str], trace: MirroredBenchmarkTrace | ProfilerSweepTrace
     ) -> dict[str, object]:
+        if isinstance(trace, ProfilerSweepTrace):
+            return {
+                "base_order": list(member_ids),
+                "orders": trace.orders,
+                "target_ms": trace.target_ms,
+                "repeat_reference_perf_ms": trace.repeat_reference_perf_ms,
+                "sweep_count": trace.sweep_count,
+                "calls_per_sample": trace.calls_per_sample,
+                "total_calls": trace.total_calls,
+                "mean_kernel_work_ms": [
+                    {"config_id": name, "value": value}
+                    for name, value in zip(member_ids, trace.means_ms, strict=True)
+                ],
+                "observations": [
+                    [block.record() for block in blocks]
+                    for blocks in trace.observations
+                ],
+            }
         return {
             "base_order": list(member_ids),
             "target_ms": trace.target_ms,
@@ -4335,7 +4368,11 @@ class LFBOPatternSearch(PatternSearch):
             "policy_version": _FLASH_TERMINAL_REFINEMENT_POLICY_VERSION,
             "lane_policy_version": _CUTE_FLASH_LANE_POLICY_VERSION,
             "coordinate_policy": _FLASH_TERMINAL_COORDINATE_POLICY,
-            "measurement_policy": _FLASH_TERMINAL_MEASUREMENT_POLICY,
+            "measurement_policy": (
+                "mirrored_profiler_kernel_work_mean_v1"
+                if self.timing_policy is not None
+                else _FLASH_TERMINAL_MEASUREMENT_POLICY
+            ),
             "rounds_planned": policy.terminal_coordinate_rounds,
             "beam_width": policy.terminal_coordinate_beam_width,
             "maximum_projection_parent_count": 1

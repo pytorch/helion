@@ -468,6 +468,7 @@ class LLMGuidedSearch(PopulationBasedSearch):
                 config=result.config,
                 status=result.status,
                 compile_time=result.compile_time,
+                measurement=result.measurement,
             )
             for result in results
         ]
@@ -506,6 +507,8 @@ class LLMGuidedSearch(PopulationBasedSearch):
             perf=member.perf,
             status=status,
             compile_time=member.compile_time,
+            measurement=member.measurement,
+            timing_policy=self.timing_policy,
         )
 
     def _refresh_prompt_results_from_population(self) -> None:

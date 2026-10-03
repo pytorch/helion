@@ -185,8 +185,11 @@ class TestShapeKey:
         cache = object.__new__(AOTAutotuneCache)
         cache.mode = "evaluate"
         cache._verbose = False
+        validate_default_timing = Mock(return_value=None)
         cache.autotuner = SimpleNamespace(
             _search_policy_cacheable=False,
+            timing_policy=None,
+            _validate_timing_policy=validate_default_timing,
             log=Mock(),
         )
         cache.args = ()
@@ -197,6 +200,7 @@ class TestShapeKey:
         result = cache.autotune()
 
         assert result == selected
+        validate_default_timing.assert_called()
         cache.get.assert_called_once_with()
         cache._run_autotune_trials.assert_not_called()
 
@@ -206,6 +210,8 @@ class TestShapeKey:
         cache.mode = "collect"
         cache.autotuner = SimpleNamespace(
             _search_policy_cacheable=False,
+            timing_policy=None,
+            _validate_timing_policy=Mock(return_value=None),
             log=Mock(),
         )
         cache.args = ()
@@ -844,7 +850,12 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
         config_spec=SimpleNamespace(cute_flash_search_enabled=False),
         is_cacheable=lambda: True,
     )
-    autotuner = SimpleNamespace(kernel=bound_kernel, args=(tensor,))
+    autotuner = SimpleNamespace(
+        kernel=bound_kernel,
+        args=(tensor,),
+        timing_policy=None,
+        _validate_timing_policy=Mock(return_value=None),
+    )
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)
     monkeypatch.setattr(
@@ -854,6 +865,7 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
     )
 
     cache = AOTAutotuneCache(autotuner)
+    autotuner._validate_timing_policy.assert_called_once_with()
     assert cache.args == (tensor, (1, 2))
     compiled: list[bool] = []
     selected_args: list[tuple[object, ...]] = []

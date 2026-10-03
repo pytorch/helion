@@ -728,6 +728,8 @@ def test_grouped_worklist_nm_codegen_and_wrapper_plan() -> None:
     )
 
     assert "StaticPersistentGroupTileScheduler.create" not in code
+    assert "StaticPersistentTileScheduler.create" not in code
+    assert "while tcgen05_work_tile_valid" not in code
     assert "tcgen05_grouped_runtime_tile_records.iterator" in code
     assert "TensorMapManager" in code
     assert "update_tensormap" in code

@@ -334,6 +334,7 @@ else:
     def get_triton_iterable_path() -> Callable[..., object]:  # type: ignore[misc]
         raise RuntimeError("triton is not installed")
 
+    @functools.cache
     def _supports_tensor_descriptor() -> bool:  # type: ignore[misc]
         return False
 

@@ -768,7 +768,7 @@ class DirectAffineAsyncEntryReplay:
 @dataclasses.dataclass(frozen=True)
 class DirectAffineStepReplay:
     diagonal: DirectAffineValueReplay
-    prediction_vector: DirectAffineValueReplay
+    prediction_vector: DirectAffineValueReplay | None
     row_input: DirectAffineValueReplay
     update_scale: DirectAffineValueReplay
     update_vector: DirectAffineValueReplay
