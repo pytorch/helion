@@ -724,6 +724,41 @@ def guarded_scan_gather(
     static_shapes=True,
     autotune_effort="none",
 )
+def guarded_dot_pair(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, flags: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    experts, rows, k = w1.size()
+    tokens = x.size(0)
+    out1 = torch.zeros([experts, rows, tokens], dtype=torch.float32, device=x.device)
+    out2 = torch.zeros_like(out1)
+    total = torch.zeros([tokens], dtype=torch.float32, device=x.device)
+    for tile_q, tile_e in hl.tile([rows // 128, experts], block_size=[1, 1]):
+        live = torch.sum((flags[:] > 0).to(torch.int32))
+        if tile_e.begin < live:
+            r = tile_q.begin * 128 + hl.arange(128)
+            acc = hl.zeros([128, tokens], dtype=torch.float32)
+            for tile_k in hl.tile(k // 64, block_size=1):
+                kk = tile_k.begin * 64 + hl.arange(64)
+                acc = torch.addmm(acc, w1[tile_e.begin, r, kk], x[:, kk].T)
+            out1[tile_e.begin, r, :] = acc
+    for tile_q, tile_e in hl.tile([rows // 128, experts], block_size=[1, 1]):
+        live2 = torch.sum((flags[:] > 1).to(torch.int32))
+        if tile_e.begin < live2:
+            r = tile_q.begin * 128 + hl.arange(128)
+            acc = hl.zeros([128, tokens], dtype=torch.float32)
+            for tile_k in hl.tile(k // 64, block_size=1):
+                kk = tile_k.begin * 64 + hl.arange(64)
+                acc = torch.addmm(acc, w2[tile_e.begin, r, kk], x[:, kk].T)
+            out2[tile_e.begin, r, :] = acc * 2
+    for tile_t in hl.tile(tokens, block_size=1):
+        total[tile_t] = torch.sum(torch.sum(out2[:, :, tile_t], dim=0), dim=0)
+    return out1, out2, total
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def split_merge_chain(x: torch.Tensor) -> torch.Tensor:
     keys, splits = x.size()
     partial = torch.empty_like(x)
@@ -1887,6 +1922,55 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tl.associative_scan(", prologue)
         root = _generated_function(code, "tile_dependency_root_0")
         self.assertNotIn("tl.associative_scan", ast.unparse(root))
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_guarded_dot_roots_fuse_into_one_balanced_loop(self) -> None:
+        if torch.cuda.get_device_capability(DEVICE)[0] < 10:
+            self.skipTest("fusion applies to kernel-scope (Blackwell dot) roots")
+        x = torch.randn((16, 128), device=DEVICE, dtype=torch.float16)
+        w1 = torch.randn((64, 512, 128), device=DEVICE, dtype=torch.float16)
+        w2 = torch.randn((64, 512, 128), device=DEVICE, dtype=torch.float16)
+        experts = torch.arange(64, device=DEVICE)
+        for live, live2 in ((0, 0), (5, 0), (64, 3), (17, 17)):
+            with self.subTest(live=live, live2=live2):
+                flags = (experts < live).to(torch.int32) + (experts < live2).to(
+                    torch.int32
+                )
+                code, (out1, out2, total) = code_and_output(
+                    guarded_dot_pair,
+                    (x, w1, w2, flags),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                )
+                expected = torch.einsum("erk,tk->ert", w1.float(), x.float())
+                expected[live:] = 0
+                expected2 = torch.einsum("erk,tk->ert", w2.float(), x.float()) * 2
+                expected2[live2:] = 0
+                torch.testing.assert_close(out1, expected, rtol=1e-2, atol=1e-1)
+                torch.testing.assert_close(out2, expected2, rtol=1e-2, atol=1e-1)
+                torch.testing.assert_close(
+                    total, expected2.sum((0, 1)), rtol=1e-2, atol=1.0
+                )
+        kernel = _generated_function(code, "_helion_guarded_dot_pair")
+        loops = [
+            node
+            for node in ast.walk(kernel)
+            if isinstance(node, ast.For) and ast.unparse(node.target) == "virtual_pid"
+        ]
+        fused = [
+            loop
+            for loop in loops
+            if "tile_dependency_fused_stride" in ast.unparse(loop.iter)
+        ]
+        # One balanced loop for both producers, one shared K loop, weights selected.
+        self.assertEqual((len(loops), len(fused)), (2, 1))
+        self.assertEqual(
+            sum(isinstance(node, ast.For) for node in ast.walk(fused[0])), 2
+        )
+        self.assertIn("tl.where(tile_dependency_fused_is_a, w1, w2)", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

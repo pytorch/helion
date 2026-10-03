@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+from itertools import starmap
 import math
 from typing import TYPE_CHECKING
 from typing import cast
@@ -936,6 +937,139 @@ def _guarded_extent(
         ),
         live_tasks=tiles if inner_tasks == 1 else f"{inner_tasks} * {tiles}",
     )
+
+
+class _FusionMismatch(Exception):
+    pass
+
+
+def _stored_names(nodes: Iterable[ast.AST]) -> set[str]:
+    return {
+        node.id
+        for root in nodes
+        for node in ast.walk(root)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
+    }
+
+
+def _all_names(nodes: Iterable[ast.AST]) -> set[str]:
+    return {
+        node.id
+        for root in nodes
+        for node in ast.walk(root)
+        if isinstance(node, ast.Name)
+    }
+
+
+def _renamed(statements: list[ast.stmt], mapping: Mapping[str, str]) -> list[ast.stmt]:
+    cloned = [_clone_stmt(statement) for statement in statements]
+    for statement in cloned:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and node.id in mapping:
+                node.id = mapping[node.id]
+    return cloned
+
+
+def _hoistable(node: ast.expr, local_names: set[str]) -> bool:
+    """A loop-invariant expression that may run once before the loop."""
+    return not (_all_names([node]) & local_names) and all(
+        _is_pure_call(call)
+        and not any(keyword.arg == "volatile" for keyword in call.keywords)
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    )
+
+
+class _TaskLoopUnifier:
+    """Merge one task's K loop into another's: loop-local names pair up and
+    differing loop-invariant expressions become selects (never in a loop range)."""
+
+    def __init__(
+        self,
+        locals_a: set[str],
+        locals_b: set[str],
+        new_var: Callable[[str], str],
+    ) -> None:
+        self.locals_a = locals_a
+        self.locals_b = locals_b
+        self.new_var = new_var
+        self.rename: dict[str, str] = {}
+        self.selects: list[tuple[str, ast.expr, ast.expr]] = []
+        self.in_range = False
+
+    def select(self, a: ast.expr, b: ast.expr) -> ast.expr:
+        if self.in_range:
+            raise _FusionMismatch
+        key = (ast.dump(a), ast.dump(b))
+        name = next(
+            (n for n, sa, sb in self.selects if (ast.dump(sa), ast.dump(sb)) == key),
+            None,
+        )
+        if name is None:
+            name = self.new_var("tile_dependency_fused_select")
+            self.selects.append((name, a, b))
+        return create(ast.Name, id=name, ctx=ast.Load())
+
+    def unify(self, a: object, b: object) -> object:
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) != len(b):
+                raise _FusionMismatch
+            return list(starmap(self.unify, zip(a, b, strict=True)))
+        if not isinstance(a, ast.AST) or not isinstance(b, ast.AST):
+            if a != b:
+                raise _FusionMismatch
+            return a
+        if isinstance(a, ast.Name) and isinstance(b, ast.Name):
+            local_a, local_b = a.id in self.locals_a, b.id in self.locals_b
+            if local_a or local_b:
+                if not local_a or self.rename.setdefault(b.id, a.id) != a.id:
+                    raise _FusionMismatch
+                return _clone_ast_value(a)
+            if a.id == b.id:
+                return _clone_ast_value(a)
+            return self.select(a, b)
+        if type(a) is type(b):
+            mark, rename = len(self.selects), dict(self.rename)
+            try:
+                fields: dict[str, object] = {}
+                for field in a._fields:
+                    self.in_range, outer = (
+                        self.in_range or (isinstance(a, ast.For) and field == "iter"),
+                        self.in_range,
+                    )
+                    try:
+                        fields[field] = self.unify(getattr(a, field), getattr(b, field))
+                    finally:
+                        self.in_range = outer
+                return (
+                    a.copy(**fields)
+                    if isinstance(a, ExtendedAST)
+                    else ast.copy_location(type(a)(**fields), a)
+                )
+            except _FusionMismatch:
+                del self.selects[mark:]
+                self.rename = rename
+        if (
+            isinstance(a, ast.expr)
+            and isinstance(b, ast.expr)
+            and _hoistable(a, self.locals_a)
+            and _hoistable(b, self.locals_b)
+        ):
+            return self.select(a, b)
+        raise _FusionMismatch
+
+
+def _split_task_loop(
+    body: list[ast.stmt],
+) -> tuple[list[ast.stmt], ast.For, list[ast.stmt]] | None:
+    """Split a task body around its single top-level loop."""
+    loops = [
+        index for index, statement in enumerate(body) if isinstance(statement, ast.For)
+    ]
+    if len(loops) != 1:
+        return None
+    (index,) = loops
+    return body[:index], cast("ast.For", body[index]), body[index + 1 :]
 
 
 def emit_cross_loop_schedule(
@@ -2289,6 +2423,7 @@ def emit_cross_loop_schedule(
         extra_argument_names: tuple[str, ...],
         *,
         force_noinline: bool = False,
+        spin_guard: str | None = None,
     ) -> list[ast.stmt]:
         body: list[ast.stmt] = []
         extent = guarded_extents.get(root)
@@ -2351,7 +2486,20 @@ def emit_cross_loop_schedule(
         if peer_tokens:
             # Zero tokens make every PID-derived address depend on the spins.
             has_task_scheduling = True
-            body.extend(peer_counter_spins)
+            if spin_guard is None:
+                body.extend(peer_counter_spins)
+            else:
+                body.append(
+                    create(
+                        ast.If,
+                        test=expr_from_string(spin_guard),
+                        body=peer_counter_spins,
+                        orelse=[
+                            statement_from_string(f"{token} = tl.full([], 0, tl.int32)")
+                            for token in peer_tokens
+                        ],
+                    )
+                )
             scheduled_logical_pid = " + ".join([scheduled_logical_pid, *peer_tokens])
         nested_loop_consumers = nested_loop_counters_by_consumer.get(root, ())
         if nested_loop_consumers:
@@ -2448,17 +2596,67 @@ def emit_cross_loop_schedule(
             )
         ]
 
+    def root_lane(root: int) -> str:
+        # A trailing root may begin mid-wave: rotate workers onto its lanes.
+        rotation = -static_pipeline_plan.static_base(root) % launch_worker_count
+        return (
+            f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
+        )
+
+    def guarded_live_tasks(extent: _GuardedExtent) -> tuple[list[ast.stmt], str]:
+        live = device_function.new_var("tile_dependency_live_tasks", dce=False)
+        # redux.sync makes the bound provably warp-uniform, so tcgen05 issue
+        # inside the task loop stays a single elected thread.
+        return [
+            *extent.hoisted,
+            statement_from_string(
+                f"{live} = tl.inline_asm_elementwise('redux.sync.min.s32 $0, $1, "
+                f"0xffffffff;', '=r,r', [tl.cast({extent.live_tasks}, tl.int32)], "
+                "dtype=tl.int32, is_pure=True, pack=1)"
+            ),
+        ], live
+
+    def skipped_task_dispatch(root: int, live: str) -> list[ast.stmt]:
+        if not any(
+            plan.producers[0].producer_root == root for plan in peer_counter_plans
+        ):
+            return []
+        # Guard-skipped tasks still count once per launch for keyed peers.
+        segment_begin = static_pipeline_plan.static_base(root)
+        segment_end = (
+            segment_begin + static_pipeline_plan.execution_orders[root].task_count
+        )
+        lane = root_lane(root)
+        skipped = device_function.new_var("tile_dependency_skipped_task", dce=False)
+        first = (
+            f"{segment_begin} + ({lane}) + tl.maximum({live} - ({lane}) + "
+            f"{launch_worker_count - 1}, 0) // {launch_worker_count} * "
+            f"{launch_worker_count}"
+        )
+        return [
+            create(
+                ast.For,
+                target=create(ast.Name, id=skipped, ctx=ast.Store()),
+                iter=expr_from_string(
+                    f"range({first}, {segment_end}, {launch_worker_count})"
+                ),
+                body=peer_counter_publications(
+                    root,
+                    execution_coordinates(root, f"({skipped}) - {segment_begin}"),
+                    "relaxed",
+                ),
+                orelse=[],
+                type_comment=None,
+            )
+        ]
+
     def static_root_body(root: int) -> list[ast.stmt]:
         """Lower one resident root from its scalar ownership fold."""
         task_count_value = static_pipeline_plan.execution_orders[root].task_count
         active_worker_count = min(launch_worker_count, task_count_value)
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = segment_begin + task_count_value
-        # A trailing root may begin mid-wave: rotate workers onto its lanes.
-        rotation = -segment_begin % launch_worker_count
-        lane = (
-            f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
-        )
+        lane = root_lane(root)
         segment_membership = (
             f"({lane}) == 0"
             if active_worker_count == 1
@@ -2469,48 +2667,9 @@ def emit_cross_loop_schedule(
         skipped_dispatch: list[ast.stmt] = []
         segment_stop = f"({segment_end})"
         if extent is not None:
-            live = device_function.new_var("tile_dependency_live_tasks", dce=False)
-            # redux.sync makes the bound provably warp-uniform, so tcgen05 issue
-            # inside the task loop stays a single elected thread.
-            hoisted = [
-                *extent.hoisted,
-                statement_from_string(
-                    f"{live} = tl.inline_asm_elementwise('redux.sync.min.s32 $0, $1, "
-                    f"0xffffffff;', '=r,r', [tl.cast({extent.live_tasks}, tl.int32)], "
-                    "dtype=tl.int32, is_pure=True, pack=1)"
-                ),
-            ]
+            hoisted, live = guarded_live_tasks(extent)
             segment_stop = f"tl.minimum({segment_begin} + {live}, {segment_end})"
-            if any(
-                plan.producers[0].producer_root == root for plan in peer_counter_plans
-            ):
-                # Guard-skipped tasks still count once per launch for keyed peers.
-                skipped = device_function.new_var(
-                    "tile_dependency_skipped_task", dce=False
-                )
-                first = (
-                    f"{segment_begin} + ({lane}) + tl.maximum({live} - ({lane}) + "
-                    f"{launch_worker_count - 1}, 0) // {launch_worker_count} * "
-                    f"{launch_worker_count}"
-                )
-                skipped_dispatch.append(
-                    create(
-                        ast.For,
-                        target=create(ast.Name, id=skipped, ctx=ast.Store()),
-                        iter=expr_from_string(
-                            f"range({first}, {segment_end}, {launch_worker_count})"
-                        ),
-                        body=peer_counter_publications(
-                            root,
-                            execution_coordinates(
-                                root, f"({skipped}) - {segment_begin}"
-                            ),
-                            "relaxed",
-                        ),
-                        orelse=[],
-                        type_comment=None,
-                    )
-                )
+            skipped_dispatch = skipped_task_dispatch(root, live)
         task_dispatch: list[ast.stmt] = [
             *hoisted,
             create(
@@ -2577,10 +2736,207 @@ def emit_cross_loop_schedule(
             )
         ]
 
+    def fused_root_pair(a: int, b: int) -> list[ast.stmt] | None:
+        """Run two guarded WS roots as one balanced task loop sharing B's K loop.
+
+        Both prologues run with clamped task ids, the K loops unify, and each
+        epilogue runs under its own branch. B's root-level publications follow.
+        """
+        roots = (a, b)
+        if (
+            not all(
+                root in kernel_scope_roots
+                and root in guarded_extents
+                and root not in readiness_consumers_by_root
+                and not root_barrier_incoming.get(root)
+                and all(consumer != root for _producer, consumer in peer_edges)
+                and static_pipeline_plan.execution_orders[root].task_count
+                >= launch_worker_count
+                for root in roots
+            )
+            or a in root_barrier_indices
+            or a in done_roots
+            or any(producer == a for producer, _consumer in peer_edges)
+        ):
+            return None
+        block_ids = [info.block_id for info in _case_pid_info(owner.cases[a])]
+        if (
+            len(
+                {
+                    TileStrategy.get_range_call_str(
+                        device_function.config,
+                        [info.block_id for info in _case_pid_info(owner.cases[root])],
+                        begin=worker,
+                        end="0",
+                    )
+                    for root in roots
+                }
+            )
+            != 1
+        ):
+            return None
+        count_a, count_b = (
+            static_pipeline_plan.execution_orders[root].task_count for root in roots
+        )
+        vp = strategy.virtual_pid_var
+        live, total, stride, is_a = (
+            device_function.new_var(f"tile_dependency_fused_{name}", dce=False)
+            for name in ("live", "tasks", "stride", "is_a")
+        )
+        local_a = f"tl.minimum({vp}, {count_a - 1})"
+        local_b = f"tl.maximum({vp} - {live}, 0)"
+        body_a = scheduled_root_task_body(
+            a, local_a, f"{case_offsets[a]} + {local_a}", ()
+        )
+        body_b = scheduled_root_task_body(
+            b, local_b, f"{case_offsets[b]} + {local_b}", (), spin_guard=f"not {is_a}"
+        )
+        # Loop-carried phis share a name only after the final alias rename.
+        body_a, body_b = (
+            _renamed(
+                body,
+                {
+                    name: device_function.variable_aliases(name)[0]
+                    for name in _all_names(body)
+                },
+            )
+            for body in (body_a, body_b)
+        )
+        stored_b = _stored_names(body_b)
+        if _stored_names(body_a) & (_all_names(body_b) - stored_b):
+            return None
+        body_b = _renamed(
+            body_b,
+            {
+                name: device_function.new_var(name, dce=False)
+                for name in sorted(stored_b & _all_names(body_a))
+            },
+        )
+        split_a, split_b = _split_task_loop(body_a), _split_task_loop(body_b)
+        if split_a is None or split_b is None:
+            return None
+        (pre_a, loop_a, post_a), (pre_b, loop_b, post_b) = split_a, split_b
+        unifier = _TaskLoopUnifier(
+            _stored_names([loop_a]),
+            _stored_names([loop_b]),
+            lambda name: device_function.new_var(name, dce=False),
+        )
+        try:
+            loop = cast("ast.For", unifier.unify(loop_a, loop_b))
+        except _FusionMismatch:
+            return None
+        carried = _stored_names([loop_b]) & _all_names([*pre_b, *post_b])
+        if not carried <= unifier.rename.keys():
+            return None
+        carry = {name: unifier.rename[name] for name in carried}
+        pre_b, post_b = _renamed(pre_b, carry), _renamed(post_b, carry)
+
+        def initial_values(prologue: list[ast.stmt], name: str) -> list[str]:
+            return [
+                ast.dump(statement.value)
+                for statement in prologue
+                if isinstance(statement, ast.Assign)
+                and name in _stored_names(statement.targets)
+            ]
+
+        # B's prologue runs last, so carried loop state must start out equal.
+        if any(
+            initial_values(pre_a, name) != initial_values(pre_b, name)
+            for name in carry.values()
+        ):
+            return None
+        descriptors = {
+            arg.name for arg in device_function._tensor_descriptor_args.values()
+        }
+        selects: list[ast.stmt] = []
+        descriptor_selects: tuple[list[ast.stmt], list[ast.stmt]] = ([], [])
+        for name, value_a, value_b in unifier.selects:
+            if not (_all_names([value_a, value_b]) & descriptors):
+                selects.append(
+                    statement_from_string(
+                        f"{name} = tl.where({is_a}, {{a}}, {{b}})",
+                        a=value_a,
+                        b=value_b,
+                    )
+                )
+                continue
+            # A select of two descriptors would lose their layouts in Triton.
+            for branch, value in zip(
+                descriptor_selects, (value_a, value_b), strict=True
+            ):
+                if not isinstance(value, ast.Name):
+                    return None
+                branch.append(statement_from_string(f"{name} = {value.id}"))
+        hoisted_a, live_a = guarded_live_tasks(guarded_extents[a])
+        hoisted_b, live_b = guarded_live_tasks(guarded_extents[b])
+        # Balanced workers: as few rounds as the live tasks need, evenly spread.
+        workers = launch_worker_count
+        rounds = f"tl.maximum(({total} + {workers - 1}) // {workers}, 1)"
+        task_body = [
+            statement_from_string(f"{is_a} = {vp} < {live}"),
+            *pre_a,
+            *pre_b,
+            *selects,
+            *(
+                [
+                    create(
+                        ast.If,
+                        test=expr_from_string(is_a),
+                        body=descriptor_selects[0],
+                        orelse=descriptor_selects[1],
+                    )
+                ]
+                if descriptor_selects[0]
+                else []
+            ),
+            loop,
+            create(ast.If, test=expr_from_string(is_a), body=post_a, orelse=post_b),
+        ]
+        publications = peer_publications(b)
+        return [
+            *hoisted_a,
+            *hoisted_b,
+            statement_from_string(f"{live} = tl.minimum({live_a}, {count_a})"),
+            statement_from_string(
+                f"{total} = {live} + tl.minimum({live_b}, {count_b})"
+            ),
+            statement_from_string(
+                f"{stride} = tl.maximum(({total} + {rounds} - 1) // {rounds}, 1)"
+            ),
+            create(
+                ast.For,
+                target=create(ast.Name, id=vp, ctx=ast.Store()),
+                iter=expr_from_string(
+                    TileStrategy.get_range_call_str(
+                        device_function.config,
+                        block_ids,
+                        begin=worker,
+                        end=f"tl.where({worker} < {stride}, {total}, 0)",
+                        step=stride,
+                    )
+                ),
+                body=task_body,
+                orelse=[],
+                type_comment=None,
+            ),
+            *skipped_task_dispatch(a, live_a),
+            *skipped_task_dispatch(b, live_b),
+            *(_release_sync(device_function) if publications else []),
+            *root_barrier_publication(b, synced=bool(publications)),
+            *publications,
+        ]
+
     if not uses_packet_dispatch:
         assert state_arg is not None
-        for root in static_pipeline_plan.resident_roots:
-            result.extend(static_root_body(root))
+        resident_roots = list(static_pipeline_plan.resident_roots)
+        while resident_roots:
+            root = resident_roots.pop(0)
+            fused = fused_root_pair(root, resident_roots[0]) if resident_roots else None
+            if fused is None:
+                result.extend(static_root_body(root))
+            else:
+                result.extend(fused)
+                resident_roots.pop(0)
         result.append(
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
         )
