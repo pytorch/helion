@@ -40,6 +40,7 @@ from .tile_dependency import instantiate_coordinate_domains
 from .tile_dependency import nested_logical_axes
 from .tile_dependency import tile_dependency_site_id
 from .tile_strategy import L2GroupingProgramIDs
+from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2063,10 +2064,15 @@ def emit_cross_loop_schedule(
                     id=strategy.virtual_pid_var,
                     ctx=ast.Store(),
                 ),
+                # The root's range config (e.g. warp_specialize) applies here.
                 iter=expr_from_string(
-                    f"tl.range((({lane}) - 0) + ({segment_begin}), "
-                    f"({segment_end}), "
-                    f"{launch_worker_count})"
+                    TileStrategy.get_range_call_str(
+                        device_function.config,
+                        [info.block_id for info in _case_pid_info(owner.cases[root])],
+                        begin=f"(({lane}) - 0) + ({segment_begin})",
+                        end=f"({segment_end})",
+                        step=str(launch_worker_count),
+                    )
                 ),
                 body=scheduled_root_task_body(
                     root,
