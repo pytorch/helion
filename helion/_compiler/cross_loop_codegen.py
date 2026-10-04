@@ -2810,6 +2810,32 @@ def emit_cross_loop_schedule(
             ),
         ], live
 
+    def shared_captures(extent: _GuardedExtent, block_ids: list[int]) -> list[ast.stmt]:
+        specializes = CompileEnvironment.current().config_spec.range_warp_specialize
+        if not any(
+            specializes.config_get(
+                device_function.config.range_warp_specializes, block_id, None
+            )
+            for block_id in block_ids
+        ):
+            return []
+        # Partitions share hoisted reductions and loads instead of each
+        # recomputing them; cheap index math stays rematerialized.
+        costly: set[str] = set()
+        for statement in extent.hoisted:
+            if any(
+                _is_tl_call(node, _HOIST_ANCHOR_CALLS)
+                or (isinstance(node, ast.Name) and node.id in costly)
+                for node in ast.walk(statement)
+            ):
+                costly.update(_stored_names([statement]))
+        used = _all_names(extent.body)
+        return [
+            statement_from_string(f"{name} = helion_dist_utils._shared_capture({name})")
+            for name in extent.hoisted_names
+            if name in used and name in costly
+        ]
+
     def skipped_task_dispatch(root: int, live: str) -> list[ast.stmt]:
         scatter_root = None if peer is None else peer.scatter_roots.get(root)
         if scatter_root is None and not any(
@@ -2868,11 +2894,14 @@ def emit_cross_loop_schedule(
             else f"(({lane}) >= 0 and ({lane}) < {active_worker_count})"
         )
         extent = guarded_extents.get(root)
+        block_ids = [info.block_id for info in _case_pid_info(owner.cases[root])]
         hoisted: list[ast.stmt] = []
         skipped_dispatch: list[ast.stmt] = []
         segment_stop = f"({segment_end})"
         if extent is not None:
             hoisted, live = guarded_live_tasks(extent)
+            # Captures follow the whole hoisted block so MLIR CSE still sees it.
+            hoisted.extend(shared_captures(extent, block_ids))
             segment_stop = f"tl.minimum({segment_begin} + {live}, {segment_end})"
             skipped_dispatch = skipped_task_dispatch(root, live)
         task_dispatch: list[ast.stmt] = [
@@ -2888,7 +2917,7 @@ def emit_cross_loop_schedule(
                 iter=expr_from_string(
                     TileStrategy.get_range_call_str(
                         device_function.config,
-                        [info.block_id for info in _case_pid_info(owner.cases[root])],
+                        block_ids,
                         begin=f"(({lane}) - 0) + ({segment_begin})",
                         end=segment_stop,
                         step=str(launch_worker_count),
@@ -3101,6 +3130,9 @@ def emit_cross_loop_schedule(
         return [
             *hoisted_a,
             *hoisted_b,
+            # Opaque captures between the roots' hoists would block their CSE.
+            *shared_captures(guarded_extents[a], block_ids),
+            *shared_captures(guarded_extents[b], block_ids),
             statement_from_string(f"{live} = tl.minimum({live_a}, {count_a})"),
             statement_from_string(
                 f"{total} = {live} + tl.minimum({live_b}, {count_b})"

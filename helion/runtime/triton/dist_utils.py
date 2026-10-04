@@ -281,6 +281,32 @@ def _sync_threads(threads: tl.constexpr):  # noqa: ANN202
     )
 
 
+@triton.jit
+def _shared_capture(value):  # noqa: ANN001, ANN202
+    """Identity that a warp-specialized loop captures through shared memory; a pure
+    tensor capture is instead recomputed from its producers in every partition."""
+    if value.type.is_block() and not value.dtype.is_ptr():
+        if value.dtype.primitive_bitwidth == 64:
+            value = tl.inline_asm_elementwise(
+                "mov.b64 $0, $1;",
+                "=l,l",
+                [value.to(tl.int64, bitcast=True)],
+                dtype=tl.int64,
+                is_pure=False,
+                pack=1,
+            ).to(value.dtype, bitcast=True)
+        elif value.dtype.primitive_bitwidth == 32:
+            value = tl.inline_asm_elementwise(
+                "mov.b32 $0, $1;",
+                "=r,r",
+                [value.to(tl.int32, bitcast=True)],
+                dtype=tl.int32,
+                is_pure=False,
+                pack=1,
+            ).to(value.dtype, bitcast=True)
+    return value
+
+
 # Not inlined: eight inline copies in a poll loop cost ~0.6us even unexecuted.
 # No reductions: their full-CTA barriers deadlock on parked WS worker warps.
 @triton.jit(noinline=True)
