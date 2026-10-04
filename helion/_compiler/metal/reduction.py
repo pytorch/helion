@@ -18,11 +18,14 @@ span (reduction lanes)  emission                                    cost
 ``< 32``                ``helion_red::seg_*`` butterfly             shuffles only
 ``== 32``               ``helion_red::simd_*``                      shuffles only
 ``% 32 == 0``           ``helion_red::tg_*`` + threadgroup scratch  3 barriers
+strided group           ``helion_red::tg_strided_*`` + scratch      3 barriers +
+                                                                          serial fold
 ======================  ==========================================  =============
 
-Spans are always powers of two (``static_rdim_size`` rounds the reduction
-extent up), so a span above the SIMD width is automatically a whole number of
-SIMD groups.  Spans wider than one threadgroup never reach here: the config
+Shuffle-tier spans are always powers of two (``static_rdim_size`` rounds the
+reduction extent up), so a span above the SIMD width is automatically a whole
+number of SIMD groups.  The strided tier instead folds serially and accepts
+any span.  Spans wider than one threadgroup never reach here: the config
 spec rolls those into a ``for`` loop over the reduction dimension, and only the
 per-thread accumulator is combined across threads.
 """
@@ -72,13 +75,14 @@ def _metal_acc_dtype(dtype: torch.dtype) -> str:
     return CompileEnvironment.current().backend.acc_type(dtype)
 
 
-def alloc_threadgroup_buffer(metal_dtype: str) -> str:
+def alloc_threadgroup_buffer(metal_dtype: str, slots: int = MAX_SIMD_GROUPS) -> str:
     """Reserve a ``threadgroup`` scratch array and return its MSL name.
 
     Every reduction site gets its own buffer.  Sharing one buffer between two
     reductions in the same kernel (LayerNorm's mean and variance, say) races on
-    Apple GPUs even with barriers in between, and ``slots`` is only 32 entries,
-    so the isolation is cheap.
+    Apple GPUs even with barriers in between, and the default ``slots`` is
+    only 32 entries, so the isolation is cheap.  Strided reductions address
+    the buffer by linear lane index and need one slot per thread instead.
     """
     from ..device_function import DeviceFunction
 
@@ -86,8 +90,7 @@ def alloc_threadgroup_buffer(metal_dtype: str) -> str:
     name = device_fn.new_var("_red_scratch")
     device_fn.codegen.module_statements.append(
         statement_from_string(
-            f"{TG_BUFFER_GLOBAL_PREFIX}{name} = "
-            f"({name!r}, {metal_dtype!r}, {MAX_SIMD_GROUPS})"
+            f"{TG_BUFFER_GLOBAL_PREFIX}{name} = ({name!r}, {metal_dtype!r}, {slots})"
         )
     )
     return name
@@ -236,6 +239,8 @@ def reduction_expr(
         )
     if span <= 1:
         return value
+    if group is not None and group.stride != 1:
+        return _strided_reduction_expr(reduction_type, value, metal_type, group, span)
     if span & (span - 1):
         raise _unsupported_span(reduction_type, span)
     _reject_strided_group(reduction_type, group)
@@ -262,6 +267,59 @@ def reduction_expr(
     return (
         f"{NS}.tg_{reduction_type}("
         f"{buffer} + {_group_base_expr(span)}, {value}, {group.index_expr}, {span})"
+    )
+
+
+def _strided_reduction_expr(
+    reduction_type: str,
+    value: str,
+    metal_type: str,
+    group: ReductionGroup,
+    span: int,
+) -> str:
+    """Reduce a lane-strided group via a serial per-row second stage.
+
+    Members of one row sit ``stride`` lanes apart, so no shuffle butterfly
+    can fold them.  Every thread spills its value to scratch at its linear
+    lane index; each row's leader folds its own ``span`` strided members
+    serially (see ``tg_strided_*`` in :mod:`.msl_reduction`).  The serial
+    loop handles any span, so the power-of-two and SIMD-multiple checks of
+    the shuffle tiers do not apply; the span still cannot exceed the
+    threadgroup.
+    """
+    from ..device_function import DeviceFunction
+
+    if span > MAX_THREADS_PER_THREADGROUP:
+        raise _unsupported_span(reduction_type, span)
+    device_fn = DeviceFunction.current()
+    dims = device_fn.tile_strategy.thread_block_dims()
+    if group.axis >= len(dims) or span > dims[group.axis]:
+        # The leader loop reads buf[base + k * stride] for k < span; that is
+        # in-bounds only when every row actually owns span members, and
+        # tid[group.axis] must be a real thread axis.
+        raise exc.BackendUnsupported(
+            "metal",
+            f"{reduction_type} strided group over axis {group.axis} with span "
+            f"{span} exceeds the thread axes",
+        )
+    terms: list[str] = []
+    total = 1
+    for i, dim in enumerate(dims):
+        if dim > 1:
+            terms.append(f"(tid[{i}] * {total})")
+        total *= max(1, dim)
+    if total > MAX_THREADS_PER_THREADGROUP:
+        raise exc.BackendUnsupported(
+            "metal",
+            f"{reduction_type} strided reduction needs {total} scratch slots "
+            f"(max {MAX_THREADS_PER_THREADGROUP} threads per threadgroup)",
+        )
+    lane = " + ".join(terms) if terms else "0"
+    base = f"(({lane}) - (tid[{group.axis}] * {group.stride}))"
+    buffer = alloc_threadgroup_buffer(metal_type, total)
+    return (
+        f"{NS}.tg_strided_{reduction_type}({buffer}, {value}, ({lane}), "
+        f"{base}, {span}, {group.stride})"
     )
 
 
