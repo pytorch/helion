@@ -108,12 +108,13 @@ def _accessed_storages(
     return read, written, remote
 
 
-def plan_internal_remote_scratch() -> None:
-    """Place private, body-local remote-copy buffers in VMEM scratch.
+def plan_internal_scratch(*, include_local_temporaries: bool = False) -> None:
+    """Place private, body-local buffers in VMEM scratch.
 
-    The transformation is intentionally narrow. An allocation must be a
-    top-level ``torch.empty``-family call, have a fully static shape, be both
-    read and written, participate in remote DMA, and not feed the host return.
+    An allocation must be a top-level ``torch.empty``-family call, have a fully
+    static shape, be both read and written, and not feed the host return.
+    Remote-copy buffers are always eligible. Other local temporaries are
+    eligible only when ``include_local_temporaries`` is requested by the config.
     """
     host = HostFunction.current()
     device_fn = DeviceFunction.current()
@@ -122,7 +123,9 @@ def plan_internal_remote_scratch() -> None:
         return
 
     read, written, remote = _accessed_storages(device_fn)
-    eligible_storages = read & written & remote
+    eligible_storages = read & written
+    if not include_local_temporaries:
+        eligible_storages &= remote
     if not eligible_storages:
         return
 

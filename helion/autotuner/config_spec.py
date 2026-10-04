@@ -1015,6 +1015,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
+        "pallas_internal_scratch",
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
