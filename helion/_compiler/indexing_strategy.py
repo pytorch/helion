@@ -1688,6 +1688,8 @@ class SubscriptIndexing(NamedTuple):
     # a size-1 dimension, since those terms are dropped from the offset sum and
     # what remains is scalar.
     block_shaped_offset: bool = True
+    # Whether each dim_index_exprs entry is block shaped rather than scalar.
+    block_dims: tuple[bool, ...] = ()
 
     def has_mask(self) -> bool:
         return not (
@@ -2158,6 +2160,7 @@ class SubscriptIndexing(NamedTuple):
             per_dim.broadcast_dims,
             per_dim.dim_index_exprs,
             block_shaped,
+            per_dim.block_dims,
         )
 
 

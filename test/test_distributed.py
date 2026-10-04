@@ -324,6 +324,22 @@ def row_exchange_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def matrix_exchange_kernel(
+    symm: torch.Tensor, x: torch.Tensor, group_name: hl.ProcessGroupName
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        symm[tile_m, tile_n] = x[tile_m, tile_n]
+    for tile_m, tile_n in hl.tile(x.size()):
+        acc = hl.zeros([tile_m, tile_n], dtype=x.dtype)
+        for peer in peers:
+            acc = acc + peer[tile_m, tile_n]
+        out[tile_m, tile_n] = acc
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -569,6 +585,29 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         for step, out in enumerate(outs):
             expected = world * (lane + 4 * step) + world * (world - 1) // 2
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        self._cleanup_process()
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_matrix_exchange_masked_rows(self) -> None:
+        self._init_process()
+        group = dist.group.WORLD
+        # 20 rows in 8-row tiles: the last tile masks rows, pairs pack columns.
+        symm = symm_mem.empty(20, 256, device=self.device, dtype=torch.bfloat16)
+        symm_mem.rendezvous(symm, group=group)
+        x = torch.empty(20, 256, device=self.device, dtype=torch.bfloat16)
+        bound = matrix_exchange_kernel.bind((symm, x, group.group_name))
+        config = bound.config_spec.default_config().config
+        bound.set_config(helion.Config(**{**config, "block_sizes": [8, 64, 8, 64]}))
+        lane = torch.arange(20 * 256, device=self.device).view(20, 256) % 16
+        for step in range(4):
+            torch.cuda._sleep(100_000 * ((self.rank + step) % self.world_size))
+            x.copy_(lane + 4 * step + self.rank)
+            out = bound(symm, x, group.group_name)
+            world = self.world_size
+            expected = world * (lane + 4 * step) + world * (world - 1) // 2
+            torch.testing.assert_close(out, expected.to(out.dtype), rtol=0, atol=0)
         self._cleanup_process()
 
     @skipIfNotCUDA()
@@ -1391,6 +1430,23 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("@p bra SPIN"), 2)
         self.assertNotIn("_wait_at_least", code)
         self.assertNotIn("_add_on_every_rank", code)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
+    def test_inband_pair_address_from_axis_vectors(self, world: int) -> None:
+        symm = torch.zeros(20, 256, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.zeros_like(symm)
+        group = self._world(world, matrix_exchange_kernel)
+        bound = matrix_exchange_kernel.bind((symm, x, group))
+        config = bound.config_spec.default_config().config
+        code = bound.to_triton_code({**config, "block_sizes": [8, 64, 8, 64]})
+        # Pair addresses and the row mask come from per-axis vectors: only the
+        # column vector is split, never the full offset or mask tile.
+        self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
+        self.assertIn("tl.reshape(indices_1, [_BLOCK_SIZE_1 // 4, 2, 2])", code)
+        self.assertIn("(indices_0[:, None] * 256 + inband_lane_10[None, :] * 1", code)
+        self.assertIn("tl.cast(mask_0[:, None], tl.int32), [_BLOCK_SIZE_0, ", code)
+        self.assertNotIn("tl.reshape(inband_offset", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))
