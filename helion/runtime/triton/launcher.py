@@ -33,6 +33,7 @@ except ImportError:
 
 
 if triton is not None:
+    from . import ws_registers as ws_registers  # WS epilogue register budget hook
 
     def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
         # Dynamically get device from Triton backend
