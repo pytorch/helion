@@ -602,6 +602,8 @@ class PeerState:
     # Set by a consumer that read an unwritten row of this rank; launch starts.
     flag: int = 0
     started: int = 0
+    # One word per worker for CTA votes in noinline helpers.
+    votes: int = 0
 
     def mailbox(self, allocation_id: int, source: object) -> str:
         """Word offset of ``source``'s slot for this launch's parity."""
@@ -646,7 +648,8 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     scatters, scatter_roots, flag = _scatter_layout(
         graph, block_size, world_size, words
     )
-    words = flag + (1 + world_size if scatters else 0)
+    workers = _worker_count(device_function)
+    words = flag + (1 + world_size + workers if scatters else 0)
     words = -(-words // _PEER_SLOT_WORDS) * _PEER_SLOT_WORDS
     producers = sorted(
         {
@@ -697,8 +700,15 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
         scatter_roots=scatter_roots,
         flag=flag,
         started=flag + 1,
+        votes=flag + 1 + world_size,
     )
     return device_function.peer_state
+
+
+def _worker_count(device_function: DeviceFunction) -> int:
+    return CompileEnvironment.current().config_spec.num_sm * cast(
+        "int", device_function.config.get("num_sm_multiplier", 1)
+    )
 
 
 def _scatter_layout(
@@ -1296,9 +1306,7 @@ def emit_cross_loop_schedule(
         if unpublishable_site_ids
         else None
     )
-    configured_worker_count = CompileEnvironment.current().config_spec.num_sm * cast(
-        "int", device_function.config.get("num_sm_multiplier", 1)
-    )
+    configured_worker_count = _worker_count(device_function)
     root_axis_geometry: dict[int, tuple[int | sympy.Expr, int]] = {}
     for _axis_order, axis_counts, block_sizes in case_geometries:
         for block_id, task_count in axis_counts.items():
