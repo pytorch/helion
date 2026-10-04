@@ -1,0 +1,3905 @@
+{
+  "scope": "Historical accepted per-case scores; mixed sources, providers and GPU batches.",
+  "accepted_goal": {
+    "path": "/data/users/jansel/ws7/helion/artifacts/goal.json",
+    "sha256": "de3f8b3bf6b8cf02a771736aedee5aa20969b4a209ed042e73a6eb88c3a5ae82"
+  },
+  "chart_goal_snapshot": {
+    "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/all60-q-goal-publication-v1-review/root-proposal-v1/proposed-goal.json",
+    "sha256": "d9bbe7c1bc27121cad29b80d66487b171eddc425976bb7153de78d0a0760e6f0"
+  },
+  "original_inventory": {
+    "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/original-full-before-inventory-v1-review/inventory.json",
+    "sha256": "406d095ab32c4bbaa65571763fd8703eb736741d6806d209407d3ff9f469951c"
+  },
+  "rows": [
+    {
+      "index": 0,
+      "name": "squeeze_and_excitation_net/01_forward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/all60-retained-triton-runner-v1-review/row00-result-root-v1.json",
+          "sha256": "177e15e103e837c3a108f2e247e61081ba2be1f2624e5a6553c2b8464e1a817d"
+        },
+        "goal_pointer": "/shapes/0",
+        "qualification_review": {
+          "status": "accepted_complete_cold_FULL_post_search_and_stable_interleaved_measurement",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/all60-q-goal-publication-v1-review/root-row00-decision-v2.json",
+          "decision_sha256": "3c515d4a5acda43e44cb3c08a514b882370a2b7f34534288cc894e8cbf385945",
+          "source_manifest_sha256": "b2ad67586e96fe258b347b2dcc553d036687dcc9ed343fd0553ffc5f55088072",
+          "canonical_result": {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/all60-retained-triton-runner-v1-review/row00-result-root-v1.json",
+            "sha256": "177e15e103e837c3a108f2e247e61081ba2be1f2624e5a6553c2b8464e1a817d"
+          }
+        }
+      },
+      "original": {
+        "index": 0,
+        "target": "squeeze_and_excitation_net/01_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/se0-original-before-full-cold-v1-gpu3/raw/squeeze_and_excitation_net__0__cute.json",
+          "sha256": "9cddd52305ad6036d0ba17d678cc3fb9802f01c035d5f6cee6b2ed15d40a4751"
+        },
+        "raw_gpu": "3",
+        "resolution": "before artifact /provenance -> before audit /files_checked_twice",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/se0-row-matrix-qualified-gpu3-root-v1/result.json",
+          "sha256": "40c86f85650327d3799691a19c2ec5224d802264f1188acb8533102e419d351d"
+        },
+        "supporting_receipts": [
+          {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/se0-row-matrix-full-cold-gpu3-v1-grouped-native/root-before-audit-v1.json",
+            "sha256": "0c4fb511e47500fe6905ba3e5ea9c0d9b1bc6c08637ccb423bc1152c1d88bca8"
+          }
+        ],
+        "reported_before_ratio": 0.017113986324643688,
+        "reported_ratio_fields": [
+          "/before_ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026093032,
+        "autotune_config_counts": [
+          678
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.47305598855018616
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "squeeze_and_excitation_net/01_forward/shape0",
+        "before": 0.017113986324643688,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/se0-original-before-full-cold-v1-gpu3/raw/squeeze_and_excitation_net__0__cute.json",
+          "sha256": "9cddd52305ad6036d0ba17d678cc3fb9802f01c035d5f6cee6b2ed15d40a4751"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/se0-row-matrix-qualified-gpu3-root-v1/result.json",
+          "sha256": "40c86f85650327d3799691a19c2ec5224d802264f1188acb8533102e419d351d"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/restored-matrix-packed-all60-gpu6-v1-root/row00-root-qualified-result-v1.json"
+      }
+    },
+    {
+      "index": 1,
+      "name": "squeeze_and_excitation_net/01_forward/shape1",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/all60-post-search-runner-v1-progress/root-qualified-result-v1.json",
+          "sha256": "a3e4bae6b2e16b5f97db7bf544236a14bcd2db2a23e7a8204096c9152224e0f1"
+        },
+        "goal_pointer": "/shapes/1",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 1,
+        "target": "squeeze_and_excitation_net/01_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/squeeze_and_excitation_net__1__cute.json",
+          "sha256": "f3c1ac4ac5a672811889d188e095fa21707c7684d694e098672d81833b2a8398"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/squeeze_and_excitation_net__01_forward__1.json",
+          "sha256": "44367509843a3ac2a29ab7afd33e446d875539b0edbec45fbb7cf105af1b723b"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0005692456741051863,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          295
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 25.071775436401367
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "squeeze_and_excitation_net/01_forward/shape1",
+        "before": 0.0005692456741051863,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/squeeze_and_excitation_net__1__cute.json",
+          "sha256": "f3c1ac4ac5a672811889d188e095fa21707c7684d694e098672d81833b2a8398"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/squeeze_and_excitation_net__01_forward__1.json",
+          "sha256": "44367509843a3ac2a29ab7afd33e446d875539b0edbec45fbb7cf105af1b723b"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/all60-post-search-runner-v1-progress/root-qualified-result-v1.json"
+      }
+    },
+    {
+      "index": 2,
+      "name": "squeeze_and_excitation_net/01_forward/shape2",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/se2-cold-selected-fixed-gpu6-v2-splitk-child/root-qualified-decision-v1.json",
+          "sha256": "9a3fc921abc436986c6864dcffb65570be75ff6087b8015f56dcb28516f8b86a"
+        },
+        "goal_pointer": "/shapes/2",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 2,
+        "target": "squeeze_and_excitation_net/01_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/b-se2-v1/raw/squeeze_and_excitation_net__2__cute.json",
+          "sha256": "b3b92f29f0cb2f7ff05fce00cb0baed9b13ce271bfba5ca037ceb922f007242c"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/se2-paired-fanout-cold-pairs-root-v1/before-squeeze_and_excitation_net__01_forward__2.json",
+          "sha256": "35cfed652670cc46e8816e3fb11512da393c46b4bdbb5cd19a8c515d51a75ca4"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 3.129350840596724e-05,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 1230131352,
+        "autotune_config_counts": [
+          443
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 783.29345703125
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "squeeze_and_excitation_net/01_forward/shape2",
+        "before": 3.129350840596724e-05,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/b-se2-v1/raw/squeeze_and_excitation_net__2__cute.json",
+          "sha256": "b3b92f29f0cb2f7ff05fce00cb0baed9b13ce271bfba5ca037ceb922f007242c"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/se2-paired-fanout-cold-pairs-root-v1/before-squeeze_and_excitation_net__01_forward__2.json",
+          "sha256": "35cfed652670cc46e8816e3fb11512da393c46b4bdbb5cd19a8c515d51a75ca4"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/se2-cold-selected-fixed-gpu6-v2-splitk-child/root-qualified-decision-v1.json"
+      }
+    },
+    {
+      "index": 3,
+      "name": "moe_matmul_ogs/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.1693121509802025,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-collective-relocated-v8/paired/moe_matmul_ogs__00_forward__0.json",
+          "sha256": "cb3a6cd3523b37f3b7fb0d59e41e83c77caa34fc36758282d4f0a35f50a8bc3e"
+        },
+        "goal_pointer": "/shapes/3",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 3,
+        "target": "moe_matmul_ogs/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/moe_matmul_ogs__0__cute.json",
+          "sha256": "4daf623949117b516e31b5cf567072dbcede0ba57aa0b7b667ff43a2d79fd85d"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/moe_matmul_ogs__00_forward__0.json",
+          "sha256": "08fa56c9d13aedcccaf888f1908c86f1f86515a068f87b3712391ae29e2c4c9c"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.06709168155609473,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          955
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.21081599593162537
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "moe_matmul_ogs/00_forward/shape0",
+        "before": 0.06709168155609473,
+        "current": 1.1693121509802025,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/moe_matmul_ogs__0__cute.json",
+          "sha256": "4daf623949117b516e31b5cf567072dbcede0ba57aa0b7b667ff43a2d79fd85d"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/moe_matmul_ogs__00_forward__0.json",
+          "sha256": "08fa56c9d13aedcccaf888f1908c86f1f86515a068f87b3712391ae29e2c4c9c"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/paired/moe_matmul_ogs__00_forward__0.json"
+      }
+    },
+    {
+      "index": 4,
+      "name": "moe_matmul_ogs/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.4343891658947348,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-gathered-v8/paired/moe_matmul_ogs__00_forward__1.json",
+          "sha256": "a7453f7bcb86968046bdee5e6e0a7b6330fcfbda83f3e6aeeb37809e4455eb81"
+        },
+        "goal_pointer": "/shapes/4",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 4,
+        "target": "moe_matmul_ogs/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/moe_matmul_ogs__1__cute.json",
+          "sha256": "8ef4099b9e9586358be8057f78d2de0f31a1ade5bc0a9e0159dd8c85ea3fde64"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/moe_matmul_ogs__00_forward__1.json",
+          "sha256": "068984971541894e104b580e93c2e9234b542abbd6c981ee2f877afcbb08d096"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0038932249691562694,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          580
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 5.211103916168213
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "moe_matmul_ogs/00_forward/shape1",
+        "before": 0.0038932249691562694,
+        "current": 1.4343891658947348,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/moe_matmul_ogs__1__cute.json",
+          "sha256": "8ef4099b9e9586358be8057f78d2de0f31a1ade5bc0a9e0159dd8c85ea3fde64"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/moe_matmul_ogs__00_forward__1.json",
+          "sha256": "068984971541894e104b580e93c2e9234b542abbd6c981ee2f877afcbb08d096"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-gathered-v8/paired/moe_matmul_ogs__00_forward__1.json"
+      }
+    },
+    {
+      "index": 5,
+      "name": "moe_matmul_ogs/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.2212543142371983,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-gathered-v8/paired/moe_matmul_ogs__00_forward__2.json",
+          "sha256": "16d156529377c7a9380237ac7cbf97d62e935034b7d32a85eeeec74c5865863c"
+        },
+        "goal_pointer": "/shapes/5",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 5,
+        "target": "moe_matmul_ogs/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/moe_matmul_ogs__2__cute.json",
+          "sha256": "bb136032fded4f893866da9701edd567a5914ff28fb6f80999704ddb47ef3440"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/moe_matmul_ogs__00_forward__2.json",
+          "sha256": "2e23e69bb0b3c89709bfb5aad674832bf992f016f4f84db8759224ef7d5983c1"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0009993727274581266,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091203,
+        "autotune_config_counts": [
+          590
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 44.89215850830078
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "moe_matmul_ogs/00_forward/shape2",
+        "before": 0.0009993727274581266,
+        "current": 1.2212543142371983,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/moe_matmul_ogs__2__cute.json",
+          "sha256": "bb136032fded4f893866da9701edd567a5914ff28fb6f80999704ddb47ef3440"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/moe_matmul_ogs__00_forward__2.json",
+          "sha256": "2e23e69bb0b3c89709bfb5aad674832bf992f016f4f84db8759224ef7d5983c1"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-gathered-v8/paired/moe_matmul_ogs__00_forward__2.json"
+      }
+    },
+    {
+      "index": 6,
+      "name": "grouped_gemm/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0079365684319987,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/grouped-shape0-common-v3-selected-fixed-gpu2-v2-grouped-native/root-cold-fixed-qualified-v1.json",
+          "sha256": "f0d4063bd13294b4380c24646b8133fb197588bd418fe26985ce7e4da555ef1f"
+        },
+        "goal_pointer": "/shapes/6",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 6,
+        "target": "grouped_gemm/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-k128-0-gpu2-qualified-v1/raw/grouped_gemm__0__cute.json",
+          "sha256": "e22c8cf0f4f5f38537997ad7364b0cf0836d625ce6c44846b40ca63aaee4c5a0"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-k128-0-gpu2-qualified-v1/paired/grouped_gemm__00_forward__0.json",
+          "sha256": "bc35000d173dfe9cf69afe4bcf48f53b6ca217cfd9068c5ac0870b10a3d2dd3c"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.016817851393280875,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026093400,
+        "autotune_config_counts": [
+          649,
+          427
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:jagged",
+            "status": "ok",
+            "graph_ms": 0.5805119872093201
+          },
+          {
+            "impl": "helion-cute:persistent",
+            "status": "ok",
+            "graph_ms": 0.4832960069179535
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "grouped_gemm/00_forward/shape0",
+        "before": 0.016817851393280875,
+        "current": 1.0079365684319987,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-k128-0-gpu2-qualified-v1/raw/grouped_gemm__0__cute.json",
+          "sha256": "e22c8cf0f4f5f38537997ad7364b0cf0836d625ce6c44846b40ca63aaee4c5a0"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-k128-0-gpu2-qualified-v1/paired/grouped_gemm__00_forward__0.json",
+          "sha256": "bc35000d173dfe9cf69afe4bcf48f53b6ca217cfd9068c5ac0870b10a3d2dd3c"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/grouped-shape0-common-v3-selected-fixed-gpu2-v2-grouped-native/root-cold-fixed-qualified-v1.json"
+      }
+    },
+    {
+      "index": 7,
+      "name": "grouped_gemm/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/grouped-shape1-cold-selected-fixed-gpu2-v2-splitk/root-cold-fixed-qualified-v1.json",
+          "sha256": "795dbbf0c2f5fa3355282f77b56689d66e4ff0f2b029d850ad083fa8f7c32f41"
+        },
+        "goal_pointer": "/shapes/7",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 7,
+        "target": "grouped_gemm/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/grouped_gemm__1__cute.json",
+          "sha256": "3f2dab07e2ca8f306e2e9fa8928959d2ceb846bfa70208028269a9426b77e131"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/grouped_gemm__00_forward__1.json",
+          "sha256": "b449886e9458fda27c48c24f4b8370396d62ee38fba94c26bbb5dda762553c39"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0023584202097676524,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          776,
+          402
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:jagged",
+            "status": "ok",
+            "graph_ms": 18.02246379852295
+          },
+          {
+            "impl": "helion-cute:persistent",
+            "status": "ok",
+            "graph_ms": 4.287615776062012
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "grouped_gemm/00_forward/shape1",
+        "before": 0.0023584202097676524,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/grouped_gemm__1__cute.json",
+          "sha256": "3f2dab07e2ca8f306e2e9fa8928959d2ceb846bfa70208028269a9426b77e131"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/grouped_gemm__00_forward__1.json",
+          "sha256": "b449886e9458fda27c48c24f4b8370396d62ee38fba94c26bbb5dda762553c39"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/grouped-shape1-cold-selected-fixed-gpu2-v2-splitk/root-cold-fixed-qualified-v1.json"
+      }
+    },
+    {
+      "index": 8,
+      "name": "grouped_gemm/00_forward/shape2",
+      "accepted": {
+        "ratio": 0.9929278106477697,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/grouped-shape2-first-record-ab-prefill-cold-selected-fixed-gpu2-v1-splitk/root-cold-fixed-qualified-v1.json",
+          "sha256": "07f657595896e6ecf516f0d0e528d0c10247abd407ba45496f92a31224c2b6cf"
+        },
+        "goal_pointer": "/shapes/8",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 8,
+        "target": "grouped_gemm/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-absolute-b-2-gpu2-short-tmp-v1/raw/grouped_gemm__2__cute.json",
+          "sha256": "5420b5771e6f91e5150ca24738780211cd96111f61877fb02b79eda5052bcf84"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-absolute-b-2-gpu2-short-tmp-v1/paired/grouped_gemm__00_forward__2.json",
+          "sha256": "ef95376a058a09ae0d3a54921d6555794e829f1d8510201ef21852de2dd068ef"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0009878554526910324,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 735857487,
+        "autotune_config_counts": [
+          506,
+          373
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:jagged",
+            "status": "ok",
+            "graph_ms": 149.53782653808594
+          },
+          {
+            "impl": "helion-cute:persistent",
+            "status": "ok",
+            "graph_ms": 24.748559951782227
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "grouped_gemm/00_forward/shape2",
+        "before": 0.0009878554526910324,
+        "current": 0.9929278106477697,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-absolute-b-2-gpu2-short-tmp-v1/raw/grouped_gemm__2__cute.json",
+          "sha256": "5420b5771e6f91e5150ca24738780211cd96111f61877fb02b79eda5052bcf84"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-grouped-absolute-b-2-gpu2-short-tmp-v1/paired/grouped_gemm__00_forward__2.json",
+          "sha256": "ef95376a058a09ae0d3a54921d6555794e829f1d8510201ef21852de2dd068ef"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/grouped-shape2-first-record-ab-prefill-cold-selected-fixed-gpu2-v1-splitk/root-cold-fixed-qualified-v1.json"
+      }
+    },
+    {
+      "index": 9,
+      "name": "aot_example/05_forward/shape0",
+      "accepted": {
+        "ratio": 1.0079999441206482,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_example-05_forward-0-abab-v2/result.json",
+          "sha256": "6d5d79e193b9d87cc9a4ea40695f7f1e390571d30e504ccebe6012a3b2698ec1"
+        },
+        "goal_pointer": "/shapes/9",
+        "qualification_review": {
+          "name": "aot_example/05_forward/shape0",
+          "status": "current_ratio_retained",
+          "classification": "later_authoritative_ABAB",
+          "preserved_ratio": 1.0079999441206482,
+          "preserved_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_example-05_forward-0-abab-v2/result.json",
+          "event_lines": [
+            13852,
+            13873,
+            14164
+          ],
+          "requires_provenance_revalidation_before_final_report": true,
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/guard-current60-qualification-decision-root-v1.json",
+          "decision_sha256": "c55b5d5506bd0e667bc7c10258f58e31cab36176d4d1fba2011455968d4304b9"
+        }
+      },
+      "original": {
+        "index": 9,
+        "target": "aot_example/05_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/aot_example__0__cute.json",
+          "sha256": "d8fb379ec0bc298d87d4e385f914a398223c93d2ebcc6137d584d77a67fb70e5"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/aot_example__05_forward__0.json",
+          "sha256": "c82614b94f3fb778121dfb18f872e7c70fe60cff5ed1fddc0f916e8859a29d20"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.2087821037917348,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          362,
+          232,
+          393
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.03862399980425835
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/05_forward/shape0",
+        "before": 0.2087821037917348,
+        "current": 1.0079999441206482,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/aot_example__0__cute.json",
+          "sha256": "d8fb379ec0bc298d87d4e385f914a398223c93d2ebcc6137d584d77a67fb70e5"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/aot_example__05_forward__0.json",
+          "sha256": "c82614b94f3fb778121dfb18f872e7c70fe60cff5ed1fddc0f916e8859a29d20"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_example-05_forward-0-abab-v2/result.json"
+      }
+    },
+    {
+      "index": 10,
+      "name": "aot_example/05_forward/shape1",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/aot-matmul1-v35-managed-multibaseline-v1-gpu5/summary.json",
+          "sha256": "d04e557f4551ee09e501b14f32b47f0715a77469572b30a877d3f079c34ad187"
+        },
+        "goal_pointer": "/shapes/10",
+        "qualification_review": {
+          "name": "aot_example/05_forward/shape1",
+          "status": "qualified_fresh_cold_plus_ABAB",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/aot-matmul1-managed-multibaseline-qualified-root-v3.json",
+          "decision_sha256": "94c7c29916d951f74b6868cbc686bd437c5d0e8a29b22eedbe2adf8651f998d5",
+          "source_version": "v35",
+          "source_common_to_all60_not_yet_qualified": true,
+          "all_eighteen_workers_correct": true,
+          "baseline_providers": [
+            "quack",
+            "torch.compile",
+            "aten"
+          ],
+          "anchor_spreads": {
+            "A": 1.0063898250776087,
+            "quack": 1.0095846446329282,
+            "torch.compile": 1.0,
+            "aten": 1.0
+          },
+          "raw_result": "artifacts/worst20-2026-09-12/probes/aot-matmul1-v35-managed-multibaseline-v1-gpu5/summary.json",
+          "raw_result_sha256": "d04e557f4551ee09e501b14f32b47f0715a77469572b30a877d3f079c34ad187",
+          "auditor_seed_label_correction": "artifacts/worst20-2026-09-12/proposals/aot-matmul1-auditor-seed-label-correction-root-v1.json",
+          "corrected_actual_audit": "artifacts/worst20-2026-09-12/proposals/aot-matmul1-managed-multibaseline-actual-audit-root-v3/result.json",
+          "corrected_actual_audit_sha256": "88be32ec6a60d15bea0dbc4c3fec8e3a862001a03a593d7d646b50492f0b10eb"
+        }
+      },
+      "original": {
+        "index": 10,
+        "target": "aot_example/05_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/am1b35-g5v1/raw/aot_example__1__cute.json",
+          "sha256": "4b5ce68d5d101a8aaae323549f5a1803da02b8f1bb9ccc6547ff6595f995ff9a"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-matmul1-v35-gpu5-cold-pairs-root-v1/before-aot_example__05_forward__1.json",
+          "sha256": "69443aacbd3e6b1a011de58ce4c756344ed4ea926c627ab692d2d7bef9780b9c"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.010980529868811099,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026094751,
+        "autotune_config_counts": [
+          457
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.9121599793434143
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/05_forward/shape1",
+        "before": 0.010980529868811099,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/am1b35-g5v1/raw/aot_example__1__cute.json",
+          "sha256": "4b5ce68d5d101a8aaae323549f5a1803da02b8f1bb9ccc6547ff6595f995ff9a"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-matmul1-v35-gpu5-cold-pairs-root-v1/before-aot_example__05_forward__1.json",
+          "sha256": "69443aacbd3e6b1a011de58ce4c756344ed4ea926c627ab692d2d7bef9780b9c"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/aot-matmul1-v35-managed-multibaseline-v1-gpu5/summary.json"
+      }
+    },
+    {
+      "index": 11,
+      "name": "aot_example/05_forward/shape2",
+      "accepted": {
+        "ratio": 0.9991445330552075,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/aot-matmul2-v35-managed-multibaseline-v1-gpu5/summary.json",
+          "sha256": "585545621a97d7045deb18646183f6435b76fa26e2a114517014e16131daffec"
+        },
+        "goal_pointer": "/shapes/11",
+        "qualification_review": {
+          "name": "aot_example/05_forward/shape2",
+          "status": "qualified_fresh_cold_plus_ABAB",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/aot-matmul2-managed-multibaseline-qualified-root-v1.json",
+          "decision_sha256": "1ae76f7b1d1e3e1194358e542f6613c9e0f16c7051f58f6cad1fd77ad6eac39c",
+          "source_version": "v35",
+          "source_common_to_all60_not_yet_qualified": true,
+          "all_eighteen_workers_correct": true,
+          "baseline_providers": [
+            "quack",
+            "torch.compile",
+            "aten"
+          ],
+          "anchor_spreads": {
+            "A": 1.015655582872276,
+            "quack": 1.0173913204441378,
+            "torch.compile": 1.0009782416953943,
+            "aten": 1.0012231582657216
+          },
+          "raw_result": "artifacts/worst20-2026-09-12/probes/aot-matmul2-v35-managed-multibaseline-v1-gpu5/summary.json",
+          "raw_result_sha256": "585545621a97d7045deb18646183f6435b76fa26e2a114517014e16131daffec"
+        }
+      },
+      "original": {
+        "index": 11,
+        "target": "aot_example/05_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/am2b35-r2/raw/aot_example__2__cute.json",
+          "sha256": "dba56086a70bb9b2c2c796c2c0fbc40d37b54e018ebd35ec6e9e14e5834db437"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-matmul2-v35-gpu5-audited-pairs-root-v1/before-aot_example__05_forward__2.json",
+          "sha256": "5fd875aa3146dc811e59045ad780b8a603389aa3c80a4d31423e61d643c215ba"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0022084488032376357,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026094762,
+        "autotune_config_counts": [
+          401
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 55.568416595458984
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/05_forward/shape2",
+        "before": 0.0022084488032376357,
+        "current": 0.9991445330552075,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/am2b35-r2/raw/aot_example__2__cute.json",
+          "sha256": "dba56086a70bb9b2c2c796c2c0fbc40d37b54e018ebd35ec6e9e14e5834db437"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-matmul2-v35-gpu5-audited-pairs-root-v1/before-aot_example__05_forward__2.json",
+          "sha256": "5fd875aa3146dc811e59045ad780b8a603389aa3c80a4d31423e61d643c215ba"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/aot-matmul2-v35-managed-multibaseline-v1-gpu5/summary.json"
+      }
+    },
+    {
+      "index": 12,
+      "name": "mamba2_chunk_scan/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/mamba0-flat-block-qualified-gpu6-root-v1/result.json",
+          "sha256": "44e68efdb9bfff79d763a192b56e24d8bbc3c4f865b0dceabbd6c627a21fb266"
+        },
+        "goal_pointer": "/shapes/12",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 12,
+        "target": "mamba2_chunk_scan/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/mamba0-original-before-cold-v2-gpu6/raw/mamba2_chunk_scan__0__cute.json",
+          "sha256": "2478c28ff03a0597e17b1e96e51f79881f0698ce66301dd774a2d22382cfc3c4"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /before/artifact -> accepted original before /raws/c",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/mamba0-flat-block-qualified-gpu6-root-v1/result.json",
+          "sha256": "44e68efdb9bfff79d763a192b56e24d8bbc3c4f865b0dceabbd6c627a21fb266"
+        },
+        "supporting_receipts": [
+          {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/mamba0-original-before-cold-gpu6-v2-audit/root-original-before-acceptance-v1.json",
+            "sha256": "6cd002ea3a72c6c8879e95ed1a5d84446cadd6af7628122bdea4e0a6ed9688f1"
+          }
+        ],
+        "reported_before_ratio": 0.06864360520285066,
+        "reported_ratio_fields": [
+          "/before/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091873,
+        "autotune_config_counts": [
+          452
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.11654400080442429
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "mamba2_chunk_scan/00_forward/shape0",
+        "before": 0.06864360520285066,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/mamba0-original-before-cold-v2-gpu6/raw/mamba2_chunk_scan__0__cute.json",
+          "sha256": "2478c28ff03a0597e17b1e96e51f79881f0698ce66301dd774a2d22382cfc3c4"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/mamba0-flat-block-qualified-gpu6-root-v1/result.json",
+          "sha256": "44e68efdb9bfff79d763a192b56e24d8bbc3c4f865b0dceabbd6c627a21fb266"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/mamba0-flat-block-qualified-gpu6-root-v1/result.json"
+      }
+    },
+    {
+      "index": 13,
+      "name": "mamba2_chunk_scan/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/abab-mamba1-gpu2-v1/result.json",
+          "sha256": "eb11b5aec8e4b4cd6ec29782264f22ab908c489c222c545881ea97cf2cfa63c6"
+        },
+        "goal_pointer": "/shapes/13",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 13,
+        "target": "mamba2_chunk_scan/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/mamba2_chunk_scan__1__cute.json",
+          "sha256": "6d313d61c31f1d19809aa194cbb86e0563c4664bd03674157b2acf30176c9a65"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/mamba2_chunk_scan__00_forward__1.json",
+          "sha256": "e3599145c07c8d5e82a0d655a9f221dead422de4935e3f62aacfe80d970e2751"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0018027941158832372,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          686
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 6.798336029052734
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "mamba2_chunk_scan/00_forward/shape1",
+        "before": 0.0018027941158832372,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/mamba2_chunk_scan__1__cute.json",
+          "sha256": "6d313d61c31f1d19809aa194cbb86e0563c4664bd03674157b2acf30176c9a65"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/mamba2_chunk_scan__00_forward__1.json",
+          "sha256": "e3599145c07c8d5e82a0d655a9f221dead422de4935e3f62aacfe80d970e2751"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/abab-mamba1-gpu2-v1/result.json"
+      }
+    },
+    {
+      "index": 14,
+      "name": "mamba2_chunk_scan/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.0026143989773713,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/abab-mamba2-gpu3-v1/result.json",
+          "sha256": "f46f4030eee71173e762b22367086158865b74b9d514731bd56eb3983f43703e"
+        },
+        "goal_pointer": "/shapes/14",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 14,
+        "target": "mamba2_chunk_scan/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/mamba2_chunk_scan__2__cute.json",
+          "sha256": "edcb61ed868357c115d899d2998bd8f4a59168e2828c987e9d8a8af33911c008"
+        },
+        "raw_gpu": "3",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/mamba2_chunk_scan__00_forward__2.json",
+          "sha256": "99ba8763c61057acf619369ddbdf15f3e33f9bac57d871d10d4fa6fec00a9f76"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0003071341842563802,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091203,
+        "autotune_config_counts": [
+          708
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 79.91295623779297
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "mamba2_chunk_scan/00_forward/shape2",
+        "before": 0.0003071341842563802,
+        "current": 1.0026143989773713,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/mamba2_chunk_scan__2__cute.json",
+          "sha256": "edcb61ed868357c115d899d2998bd8f4a59168e2828c987e9d8a8af33911c008"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/mamba2_chunk_scan__00_forward__2.json",
+          "sha256": "99ba8763c61057acf619369ddbdf15f3e33f9bac57d871d10d4fa6fec00a9f76"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/abab-mamba2-gpu3-v1/result.json"
+      }
+    },
+    {
+      "index": 15,
+      "name": "jagged_layer_norm/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0079999441206482,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/jagged_layer_norm-00_forward-0-abab-v1/result.json",
+          "sha256": "b4ca4bd6e07ad644a5ba5dda10aa9f1c55a2ee045133b5c8fe241b45f11ad2eb"
+        },
+        "goal_pointer": "/shapes/15",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 15,
+        "target": "jagged_layer_norm/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/jagged_layer_norm__0__cute.json",
+          "sha256": "00903d9410616a322f30e30c389a07f009bf2c59f62650528bd2cc3378a6d430"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/jagged_layer_norm__00_forward__0.json",
+          "sha256": "f00698726c256d871a20c9684b47666342a13782a61a41ebb29d74de3481dbe5"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.4941176591434594,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          956
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.0163199994713068
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "jagged_layer_norm/00_forward/shape0",
+        "before": 0.4941176591434594,
+        "current": 1.0079999441206482,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/jagged_layer_norm__0__cute.json",
+          "sha256": "00903d9410616a322f30e30c389a07f009bf2c59f62650528bd2cc3378a6d430"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/jagged_layer_norm__00_forward__0.json",
+          "sha256": "f00698726c256d871a20c9684b47666342a13782a61a41ebb29d74de3481dbe5"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/jagged_layer_norm-00_forward-0-abab-v1/result.json"
+      }
+    },
+    {
+      "index": 16,
+      "name": "jagged_layer_norm/00_forward/shape1",
+      "accepted": {
+        "ratio": 0.9936709297946513,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-norm-flat-v6/verify/jagged_layer_norm__1__abab_v1/result.json",
+          "sha256": "a136245a54f1ddb1e0992f58f21cf3bdb788546fe710a8d13b1ac8f7819f7fde"
+        },
+        "goal_pointer": "/shapes/16",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 16,
+        "target": "jagged_layer_norm/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/jagged_layer_norm__1__cute.json",
+          "sha256": "2ce5b476fe7493d57b13117ba43f14ba6f2bf595ed2735da404e302480ba25ff"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/jagged_layer_norm__00_forward__1.json",
+          "sha256": "90c62a510d63ac93b08077cf3c92777b16674b6e18a5d3028f8a6db9c2a86cc2"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.19059106191553613,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          1406
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.05305600166320801
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "jagged_layer_norm/00_forward/shape1",
+        "before": 0.19059106191553613,
+        "current": 0.9936709297946513,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/jagged_layer_norm__1__cute.json",
+          "sha256": "2ce5b476fe7493d57b13117ba43f14ba6f2bf595ed2735da404e302480ba25ff"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/jagged_layer_norm__00_forward__1.json",
+          "sha256": "90c62a510d63ac93b08077cf3c92777b16674b6e18a5d3028f8a6db9c2a86cc2"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-norm-flat-v6/verify/jagged_layer_norm__1__abab_v1/result.json"
+      }
+    },
+    {
+      "index": 17,
+      "name": "jagged_layer_norm/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.1122807447517367,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-norm-flat-v6/paired/jagged_layer_norm__00_forward__2.json",
+          "sha256": "15e51c5edca59a15c2dda18f273b48c72156268310e2011eae4efc3020dc2e4a"
+        },
+        "goal_pointer": "/shapes/17",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 17,
+        "target": "jagged_layer_norm/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/jagged_layer_norm__2__cute.json",
+          "sha256": "299c4928f73813e72cbeba74e79a659931c800e72486a90460c925ded23c7b54"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/jagged_layer_norm__00_forward__2.json",
+          "sha256": "488c55ff8174ca54e36b21660ddb09ce13c57800ddee5805d1b7611cd76658fc"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.05599717300579383,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091203,
+        "autotune_config_counts": [
+          1544
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.3623040020465851
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "jagged_layer_norm/00_forward/shape2",
+        "before": 0.05599717300579383,
+        "current": 1.1122807447517367,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/jagged_layer_norm__2__cute.json",
+          "sha256": "299c4928f73813e72cbeba74e79a659931c800e72486a90460c925ded23c7b54"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/jagged_layer_norm__00_forward__2.json",
+          "sha256": "488c55ff8174ca54e36b21660ddb09ce13c57800ddee5805d1b7611cd76658fc"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-norm-flat-v6/paired/jagged_layer_norm__00_forward__2.json"
+      }
+    },
+    {
+      "index": 18,
+      "name": "jagged_dense_bmm/00_forward/shape0",
+      "accepted": {
+        "ratio": 0.996078515517421,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/abab-jbmm0-v28-gpu2-v1/result.json",
+          "sha256": "e98892a7db3f3727d9584980fa57942d308389af871f4bc38bdaa09a2a4ffa7d"
+        },
+        "goal_pointer": "/shapes/18",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 18,
+        "target": "jagged_dense_bmm/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v28-jagged_dense_bmm-0/raw/jagged_dense_bmm__0__cute.json",
+          "sha256": "30e726649f1bfdbb1077a9f1dbcae688879297815d1f38b27ef342a8fcd0f75b"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v28-jagged_dense_bmm-0/paired/jagged_dense_bmm__00_forward__0.json",
+          "sha256": "4bd61d24fa5e9b01430c6b5b03a2592a12577e86784c9cf75e4cbec833b5624f"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.442307709920285,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091510,
+        "autotune_config_counts": [
+          600
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.018303999677300453
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "jagged_dense_bmm/00_forward/shape0",
+        "before": 0.442307709920285,
+        "current": 0.996078515517421,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v28-jagged_dense_bmm-0/raw/jagged_dense_bmm__0__cute.json",
+          "sha256": "30e726649f1bfdbb1077a9f1dbcae688879297815d1f38b27ef342a8fcd0f75b"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v28-jagged_dense_bmm-0/paired/jagged_dense_bmm__00_forward__0.json",
+          "sha256": "4bd61d24fa5e9b01430c6b5b03a2592a12577e86784c9cf75e4cbec833b5624f"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/abab-jbmm0-v28-gpu2-v1/result.json"
+      }
+    },
+    {
+      "index": 19,
+      "name": "jagged_dense_bmm/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.0063291623060808,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/jbmm-shape1-warp-tf32-cold-selected-fixed-gpu2-v1-review/root-cold-fixed-qualified-v1.json",
+          "sha256": "f7816be2c8b478b26dec9d6a45bbde765dae9a53fb7461f2a70358c3596ddf1b"
+        },
+        "goal_pointer": "/shapes/19",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 19,
+        "target": "jagged_dense_bmm/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/jagged_dense_bmm__1__cute.json",
+          "sha256": "392ca42ff139204d2e7a1c39307349e8813de9bb8f80ac551f08a794d673b48e"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/jagged_dense_bmm__00_forward__1.json",
+          "sha256": "42ac7f8fd80e9582020f80d37ba871adbcb8f918cba3a17d3df93af59aef0f0a"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.1260811695161956,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          540
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.09619200229644775
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "jagged_dense_bmm/00_forward/shape1",
+        "before": 0.1260811695161956,
+        "current": 1.0063291623060808,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/jagged_dense_bmm__1__cute.json",
+          "sha256": "392ca42ff139204d2e7a1c39307349e8813de9bb8f80ac551f08a794d673b48e"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/jagged_dense_bmm__00_forward__1.json",
+          "sha256": "42ac7f8fd80e9582020f80d37ba871adbcb8f918cba3a17d3df93af59aef0f0a"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/jbmm-shape1-warp-tf32-cold-selected-fixed-gpu2-v1-review/root-cold-fixed-qualified-v1.json"
+      }
+    },
+    {
+      "index": 20,
+      "name": "jagged_dense_bmm/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.0047169254421198,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/jbmm-shape2-block-prefix-ordinary-fixed-gpu2-v1-splitk-child/root-qualified-decision-v1.json",
+          "sha256": "b9a0f936c1025fe7eeeaf5c92b65bef2cdb14d4c0509f5be1352206b7e5417c8"
+        },
+        "goal_pointer": "/shapes/20",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 20,
+        "target": "jagged_dense_bmm/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-jbmm2-gpu2/raw/jagged_dense_bmm__2__cute.json",
+          "sha256": "e22f8c5001a363be3e9c8f68ae06c9ec8da2f3b642f4c2d43146088cc06c9272"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-jbmm2-gpu2/paired/jagged_dense_bmm__00_forward__2.json",
+          "sha256": "da4093ea0efdc748b8c3599a55ce2ecfc620d9e98e6a292efa85c1182722a13d"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.0318950184278552,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091572,
+        "autotune_config_counts": [
+          837
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.7023040056228638
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "jagged_dense_bmm/00_forward/shape2",
+        "before": 0.0318950184278552,
+        "current": 1.0047169254421198,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-jbmm2-gpu2/raw/jagged_dense_bmm__2__cute.json",
+          "sha256": "e22f8c5001a363be3e9c8f68ae06c9ec8da2f3b642f4c2d43146088cc06c9272"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-jbmm2-gpu2/paired/jagged_dense_bmm__00_forward__2.json",
+          "sha256": "da4093ea0efdc748b8c3599a55ce2ecfc620d9e98e6a292efa85c1182722a13d"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/jbmm-shape2-block-prefix-ordinary-fixed-gpu2-v1-splitk-child/root-qualified-decision-v1.json"
+      }
+    },
+    {
+      "index": 21,
+      "name": "int4_gemm/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape0-packed-v7-qualified-gpu2-root-v1/result.json",
+          "sha256": "b8cc7bfc7623e47be62e655b3899166cd80162c58160b87bccd353f7f05b9797"
+        },
+        "goal_pointer": "/shapes/21",
+        "qualification_review": "artifacts/worst20-2026-09-12/proposals/int4-shape0-packed-v7-qualified-gpu2-root-v1/result.json"
+      },
+      "original": {
+        "index": 21,
+        "target": "int4_gemm/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/int4-packed-warp-before-full-cold-v2-gpu2/raw/int4_gemm__0__cute.json",
+          "sha256": "37557efc19f2b7632d1ed88e0a1f09223eab0b45d2fccef5f5663f2b7c5f499c"
+        },
+        "raw_gpu": "2",
+        "resolution": "chart additional_authority /shapes; exact raw is pinned by evidence and named by its generator",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape0-packed-v7-qualified-gpu2-root-v1/result.json",
+          "sha256": "b8cc7bfc7623e47be62e655b3899166cd80162c58160b87bccd353f7f05b9797"
+        },
+        "supporting_receipts": [
+          {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-packed-warp-full-cold-gpu2-v2-grouped-native/root-before-audit-v1.json",
+            "sha256": "35a9c298ffdc28441068e88f69988c6848af443ead145cb17567eacf32210534"
+          }
+        ],
+        "reported_before_ratio": 0.5662921145495342,
+        "reported_ratio_fields": [
+          "before_audit/shapes/0/speedup_vs_baseline"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026095860,
+        "autotune_config_counts": [
+          488
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.014240000396966934
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "int4_gemm/00_forward/shape0",
+        "before": 0.5662921145495342,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/int4-packed-warp-before-full-cold-v2-gpu2/raw/int4_gemm__0__cute.json",
+          "sha256": "37557efc19f2b7632d1ed88e0a1f09223eab0b45d2fccef5f5663f2b7c5f499c"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape0-packed-v7-qualified-gpu2-root-v1/result.json",
+          "sha256": "b8cc7bfc7623e47be62e655b3899166cd80162c58160b87bccd353f7f05b9797"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/int4-shape0-packed-v7-qualified-gpu2-root-v1/result.json"
+      }
+    },
+    {
+      "index": 22,
+      "name": "int4_gemm/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/all60-paired-roundtrip-refresh-v1-progress/gpu2_row22_then30_59/row22-result.json",
+          "sha256": "8c46284ea8af477bf064117e93dc30acf1c4bd2233390786f7d3367bc18208b6"
+        },
+        "goal_pointer": "/shapes/22",
+        "qualification_review": {
+          "status": "accepted_complete_cold_FULL_post_search_and_stable_interleaved_measurement",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/all60-q-goal-publication-v1-review/root-row22-decision-v1.json",
+          "decision_sha256": "f6bd14e1190abeb9cfc19076f59f54188b2206c00dd05292c21a49aa056fbcb1",
+          "source_manifest_sha256": "b2ad67586e96fe258b347b2dcc553d036687dcc9ed343fd0553ffc5f55088072",
+          "canonical_result": {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/all60-paired-roundtrip-refresh-v1-progress/gpu2_row22_then30_59/row22-result.json",
+            "sha256": "8c46284ea8af477bf064117e93dc30acf1c4bd2233390786f7d3367bc18208b6"
+          }
+        }
+      },
+      "original": {
+        "index": 22,
+        "target": "int4_gemm/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/int4-packed-warp-before-full-cold-v2-gpu2/raw/int4_gemm__1__cute.json",
+          "sha256": "a88349a437d69953a85e5eec1b4e6cf313d1fe1af52b1e2bc89687dc615dc486"
+        },
+        "raw_gpu": "2",
+        "resolution": "chart additional_authority /shapes; exact raw is pinned by evidence and named by its generator",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape1-packed-v7-cold-gpu2-root-v1/result.json",
+          "sha256": "6da6367285a1ba90ceb56bfb675f980bdc840c053cc4f70fac65a634b851d6b0"
+        },
+        "supporting_receipts": [
+          {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-packed-warp-full-cold-gpu2-v2-grouped-native/root-before-audit-v1.json",
+            "sha256": "35a9c298ffdc28441068e88f69988c6848af443ead145cb17567eacf32210534"
+          }
+        ],
+        "reported_before_ratio": 0.046430135069644544,
+        "reported_ratio_fields": [
+          "before_audit/shapes/1/speedup_vs_baseline"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026095861,
+        "autotune_config_counts": [
+          414
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.21916800737380981
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "int4_gemm/00_forward/shape1",
+        "before": 0.046430135069644544,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/int4-packed-warp-before-full-cold-v2-gpu2/raw/int4_gemm__1__cute.json",
+          "sha256": "a88349a437d69953a85e5eec1b4e6cf313d1fe1af52b1e2bc89687dc615dc486"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape1-packed-v7-cold-gpu2-root-v1/result.json",
+          "sha256": "6da6367285a1ba90ceb56bfb675f980bdc840c053cc4f70fac65a634b851d6b0"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/all60-paired-roundtrip-refresh-v1-progress/gpu2_row22_then30_59/row22-result.json"
+      }
+    },
+    {
+      "index": 23,
+      "name": "int4_gemm/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape2-cold-selected-fixed-gpu6-v1-review/root-cold-fixed-qualified-v1.json",
+          "sha256": "73e330d166def3d88a788926851fdde7e513756cee0b1e69f90e94dbe88ba590"
+        },
+        "goal_pointer": "/shapes/23",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 23,
+        "target": "int4_gemm/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/i42b35-g6v1/raw/int4_gemm__2__cute.json",
+          "sha256": "c29e92c088cfb3fd543476db28594e7c1bd1a5e9a8a301c9219b249f2d9992c0"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape2-v35-gpu6-audited-pairs-root-v1/before-int4_gemm__00_forward__2.json",
+          "sha256": "644c4ab395d233cdb3243a6dcb58aca4951681a68eebb2809dc9d471658d6e64"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.011074252212544378,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026098972,
+        "autotune_config_counts": [
+          467
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 1.2829760313034058
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "int4_gemm/00_forward/shape2",
+        "before": 0.011074252212544378,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/i42b35-g6v1/raw/int4_gemm__2__cute.json",
+          "sha256": "c29e92c088cfb3fd543476db28594e7c1bd1a5e9a8a301c9219b249f2d9992c0"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/int4-shape2-v35-gpu6-audited-pairs-root-v1/before-int4_gemm__00_forward__2.json",
+          "sha256": "644c4ab395d233cdb3243a6dcb58aca4951681a68eebb2809dc9d471658d6e64"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/int4-shape2-cold-selected-fixed-gpu6-v1-review/root-cold-fixed-qualified-v1.json"
+      }
+    },
+    {
+      "index": 24,
+      "name": "nvfp4_gemm/01_forward/shape0",
+      "accepted": {
+        "ratio": 0.9968152624192252,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/nvfp4-shape0-v35-managed-multibaseline-v2-gpu5/summary.json",
+          "sha256": "10e8808e234368e20b95f58dbd388b477ee47e5655d8dceb196479c9d89e0bb4"
+        },
+        "goal_pointer": "/shapes/24",
+        "qualification_review": {
+          "name": "nvfp4_gemm/01_forward/shape0",
+          "status": "qualified_fresh_cold_plus_ABAB",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/nvfp4-shape0-managed-multibaseline-qualified-root-v2.json",
+          "decision_sha256": "938a45e9c636db211751261d77d55f310a44d0cd154231338c6fbc72b2b30f0c",
+          "source_version": "v35",
+          "source_common_to_all60_not_yet_qualified": true,
+          "all_twelve_workers_correct": true,
+          "anchor_spreads": {
+            "A": 1.0031949125388044,
+            "aten.scaled_mm": 1.0095541200549674,
+            "helion-triton:helion": 1.0031949125388044
+          },
+          "raw_result": "artifacts/worst20-2026-09-12/probes/nvfp4-shape0-v35-managed-multibaseline-v2-gpu5/summary.json",
+          "raw_result_sha256": "10e8808e234368e20b95f58dbd388b477ee47e5655d8dceb196479c9d89e0bb4",
+          "audit": "artifacts/worst20-2026-09-12/proposals/nvfp4-shape0-multibaseline-actual-audit-root-v2/result.json",
+          "audit_sha256": "8374bcfda94ea64027080cd21983237e58e3e0c303328cd78a779cecdbf29e51"
+        }
+      },
+      "original": {
+        "index": 24,
+        "target": "nvfp4_gemm/01_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/nf0b35-g5v1/raw/nvfp4_gemm__0__cute.json",
+          "sha256": "14531a4c55bb7a81cdf711f7cdee9e5bd836eba97f7bd95a7d37347a3c1d226e"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/nvfp4-shape0-v35-gpu5-audited-pairs-root-v2/before-nvfp4_gemm__01_forward__0.json",
+          "sha256": "9b93c55cebfcd7f21e3b139e0196840bf037193ecc29e9000cc7ab611eae9ec9"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.4498567282675491,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026097960,
+        "autotune_config_counts": [
+          245
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.022336000576615334
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "nvfp4_gemm/01_forward/shape0",
+        "before": 0.4498567282675491,
+        "current": 0.9968152624192252,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/nf0b35-g5v1/raw/nvfp4_gemm__0__cute.json",
+          "sha256": "14531a4c55bb7a81cdf711f7cdee9e5bd836eba97f7bd95a7d37347a3c1d226e"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/nvfp4-shape0-v35-gpu5-audited-pairs-root-v2/before-nvfp4_gemm__01_forward__0.json",
+          "sha256": "9b93c55cebfcd7f21e3b139e0196840bf037193ecc29e9000cc7ab611eae9ec9"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/nvfp4-shape0-v35-managed-multibaseline-v2-gpu5/summary.json"
+      }
+    },
+    {
+      "index": 25,
+      "name": "nvfp4_gemm/01_forward/shape1",
+      "accepted": {
+        "ratio": 1.0263157592411742,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-native-block-scaled-v17/paired/nvfp4_gemm__01_forward__1.json",
+          "sha256": "7206bbc4101f3e8ae28939dff5d4eed95d81e40d833f806e24c0f037d2861471"
+        },
+        "goal_pointer": "/shapes/25",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 25,
+        "target": "nvfp4_gemm/01_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/nvfp4_gemm__1__cute.json",
+          "sha256": "b28ec1cb49abec344fb469fbac9c0513c7687744feff323de2e91a85c5cba674"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/nvfp4_gemm__01_forward__1.json",
+          "sha256": "32faac42bcd59c2e55572b514642f6f1307d427da1e65c98ad4f1c333bca3514"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.038209071603622115,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          230
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.3266240060329437
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "nvfp4_gemm/01_forward/shape1",
+        "before": 0.038209071603622115,
+        "current": 1.0263157592411742,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/nvfp4_gemm__1__cute.json",
+          "sha256": "b28ec1cb49abec344fb469fbac9c0513c7687744feff323de2e91a85c5cba674"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/nvfp4_gemm__01_forward__1.json",
+          "sha256": "32faac42bcd59c2e55572b514642f6f1307d427da1e65c98ad4f1c333bca3514"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-native-block-scaled-v17/paired/nvfp4_gemm__01_forward__1.json"
+      }
+    },
+    {
+      "index": 26,
+      "name": "nvfp4_gemm/01_forward/shape2",
+      "accepted": {
+        "ratio": 1.150900868421584,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-native-block-scaled-v17/paired/nvfp4_gemm__01_forward__2.json",
+          "sha256": "157c7e2162f1e5aaf405c95bfabb576bc5c2095892949aca5c6abcda93e2fadf"
+        },
+        "goal_pointer": "/shapes/26",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 26,
+        "target": "nvfp4_gemm/01_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-nvfp4-retry-v1/raw/nvfp4_gemm__2__cute.json",
+          "sha256": "0e66a1c5c29305e8261ed2ac6cd4e1fb9f2ea00785242b7efdffde9c7b7d6134"
+        },
+        "raw_gpu": "3",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-nvfp4-retry-v1/paired/nvfp4_gemm__01_forward__2.json",
+          "sha256": "afe8edd2b1887a74f46f73026d3182f5309c63b7ffe0afbb97473fa56af65f8f"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.026071429046593167,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091230,
+        "autotune_config_counts": [
+          307
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.6271999776363373
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "nvfp4_gemm/01_forward/shape2",
+        "before": 0.026071429046593167,
+        "current": 1.150900868421584,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-nvfp4-retry-v1/raw/nvfp4_gemm__2__cute.json",
+          "sha256": "0e66a1c5c29305e8261ed2ac6cd4e1fb9f2ea00785242b7efdffde9c7b7d6134"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-nvfp4-retry-v1/paired/nvfp4_gemm__01_forward__2.json",
+          "sha256": "afe8edd2b1887a74f46f73026d3182f5309c63b7ffe0afbb97473fa56af65f8f"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-native-block-scaled-v17/paired/nvfp4_gemm__01_forward__2.json"
+      }
+    },
+    {
+      "index": 27,
+      "name": "layer_norm/01_backward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/abab-layer-norm-0-paired-v3-gpu2-v1/result.json",
+          "sha256": "7384b6ece509ca161954c8690abff26bcab627fca75790a20bdf9d36dfa70369"
+        },
+        "goal_pointer": "/shapes/27",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 27,
+        "target": "layer_norm/01_backward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-paired-v3-layer-norm-0-gpu2-v1/raw/layer_norm__0__cute.json",
+          "sha256": "dc5db5e46026d6cbfeb61954cdee97d2d44e13f750e89f6924fc462ce45a06e1"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-paired-v3-layer-norm-0-gpu2-v1/paired/layer_norm__01_backward__0.json",
+          "sha256": "0fb1974bd77bcfec5fa014211aea5d2c7eb571831683aadb5c0b9bebd6574077"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.5946792274977737,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026092600,
+        "autotune_config_counts": [
+          293,
+          463
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.020447999238967896
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "layer_norm/01_backward/shape0",
+        "before": 0.5946792274977737,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-paired-v3-layer-norm-0-gpu2-v1/raw/layer_norm__0__cute.json",
+          "sha256": "dc5db5e46026d6cbfeb61954cdee97d2d44e13f750e89f6924fc462ce45a06e1"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-paired-v3-layer-norm-0-gpu2-v1/paired/layer_norm__01_backward__0.json",
+          "sha256": "0fb1974bd77bcfec5fa014211aea5d2c7eb571831683aadb5c0b9bebd6574077"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/abab-layer-norm-0-paired-v3-gpu2-v1/result.json"
+      }
+    },
+    {
+      "index": 28,
+      "name": "layer_norm/01_backward/shape1",
+      "accepted": {
+        "ratio": 1.1721918840308418,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/layernorm1-resident-depth-ABAB-root-acceptance-v1/result.json",
+          "sha256": "cad2ff880bfd95e032fb0a70fe7ff66a293c77558b3fe92400303fffbcccb248"
+        },
+        "goal_pointer": "/shapes/28",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 28,
+        "target": "layer_norm/01_backward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/ln1ob-g6c1/raw/layer_norm__1__cute.json",
+          "sha256": "97036e469b3ebd7bbdc9e070b7f329d09c37a4e10907bad5eb394ba9bfdf41c0"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/layernorm1-resident-depth-cold-pairs-root-v1/before-layer_norm__01_backward__1.json",
+          "sha256": "3340a99bf21a8a1bac128a59f18deab7acb13184b7d04be0890fcfcd55622221"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.20357084929180216,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026092911,
+        "autotune_config_counts": [
+          634,
+          729
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.20073600113391876
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "layer_norm/01_backward/shape1",
+        "before": 0.20357084929180216,
+        "current": 1.1721918840308418,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/ln1ob-g6c1/raw/layer_norm__1__cute.json",
+          "sha256": "97036e469b3ebd7bbdc9e070b7f329d09c37a4e10907bad5eb394ba9bfdf41c0"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/layernorm1-resident-depth-cold-pairs-root-v1/before-layer_norm__01_backward__1.json",
+          "sha256": "3340a99bf21a8a1bac128a59f18deab7acb13184b7d04be0890fcfcd55622221"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/layernorm1-resident-depth-ABAB-root-acceptance-v1/result.json"
+      }
+    },
+    {
+      "index": 29,
+      "name": "layer_norm/01_backward/shape2",
+      "accepted": {
+        "ratio": 1.0010434862043998,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/resident-serial-output-cold-selected-fixed-gpu1-v2-splitk/root-fixed-qualification-v1.json",
+          "sha256": "f1a4ba37ad6a845da13457857e80243f1803159e6bf28e455e2c6cfacffbb74c"
+        },
+        "goal_pointer": "/shapes/29",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 29,
+        "target": "layer_norm/01_backward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/ln2ob-g1c1/raw/layer_norm__2__cute.json",
+          "sha256": "af296087b1fe55459bf315994ea9b4c6e64d2e758619dec70820498b1eb2acd8"
+        },
+        "raw_gpu": "1",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/layernorm2-resident-depth-cold-pairs-root-v1/before-layer_norm__01_backward__2.json",
+          "sha256": "386abbfd99ce9d60f2acba490b25d359445d727708d9ba8ca1e0b2208f0d3d47"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.15593044854893512,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026092922,
+        "autotune_config_counts": [
+          1325,
+          460
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.6164799928665161
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "layer_norm/01_backward/shape2",
+        "before": 0.15593044854893512,
+        "current": 1.0010434862043998,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/ln2ob-g1c1/raw/layer_norm__2__cute.json",
+          "sha256": "af296087b1fe55459bf315994ea9b4c6e64d2e758619dec70820498b1eb2acd8"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/layernorm2-resident-depth-cold-pairs-root-v1/before-layer_norm__01_backward__2.json",
+          "sha256": "386abbfd99ce9d60f2acba490b25d359445d727708d9ba8ca1e0b2208f0d3d47"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/resident-serial-output-cold-selected-fixed-gpu1-v2-splitk/root-fixed-qualification-v1.json"
+      }
+    },
+    {
+      "index": 30,
+      "name": "matmul_split_k/01_forward/shape0",
+      "accepted": {
+        "ratio": 1.0119047371566066,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-bias0-a-copy-cold-selected-fixed-gpu3-v1-splitk/root-fixed-qualification-v1.json",
+          "sha256": "f107ecc240a926c55a1071fdae018a6585f2ff92dc2a4c291a0133e605d324f7"
+        },
+        "goal_pointer": "/shapes/30",
+        "qualification_review": {
+          "decision": {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-bias0-a-copy-cold-selected-fixed-gpu3-v1-splitk/root-fixed-qualification-v1.json",
+            "sha256": "f107ecc240a926c55a1071fdae018a6585f2ff92dc2a4c291a0133e605d324f7"
+          },
+          "within_goal_margin": true,
+          "full_combined_CuTe_verification_pending": true,
+          "main_integration_pending": true
+        }
+      },
+      "original": {
+        "index": 30,
+        "target": "matmul_split_k/01_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/skb0b35-g5v1/raw/matmul_split_k__0__cute.json",
+          "sha256": "c6741266e2ba5079dd41de4353ed05dde1472b682ff9883fb0d5f5ced0c0accc"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-bias0-v35-gpu5-cold-pairs-root-v1/before-matmul_split_k__01_forward__0.json",
+          "sha256": "c7742dc74c063f756c40ad9f85e3c8fba1313d07339b4d90bcddaadc84432780"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.560810814354009,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026096860,
+        "autotune_config_counts": [
+          1084
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.014208000153303146
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "matmul_split_k/01_forward/shape0",
+        "before": 0.560810814354009,
+        "current": 1.0119047371566066,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/skb0b35-g5v1/raw/matmul_split_k__0__cute.json",
+          "sha256": "c6741266e2ba5079dd41de4353ed05dde1472b682ff9883fb0d5f5ced0c0accc"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-bias0-v35-gpu5-cold-pairs-root-v1/before-matmul_split_k__01_forward__0.json",
+          "sha256": "c7742dc74c063f756c40ad9f85e3c8fba1313d07339b4d90bcddaadc84432780"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/splitk-bias0-a-copy-cold-selected-fixed-gpu3-v1-splitk/root-fixed-qualification-v1.json"
+      }
+    },
+    {
+      "index": 31,
+      "name": "matmul_split_k/01_forward/shape1",
+      "accepted": {
+        "ratio": 1.005249383930713,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/splitk-bias1-selected-fixed-v3-gpu3/summary.json",
+          "sha256": "fc8797108da4691a5e7ee2f64baf6301ca5b8eea7ed0e59ba9c12e986d8842c9"
+        },
+        "goal_pointer": "/shapes/31",
+        "qualification_review": {
+          "status": "qualified_fresh_cold_plus_same_GPU_interleaved_confirmation",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/splitk-bias1-selected-fixed-gpu3-v3-splitk/root-qualified-decision-v1.json",
+          "decision_sha256": "7683beb1e044d79e573d8d9f02d7259189464a5d296dee9e0f3d87237c9188fb",
+          "source_common_to_all60_not_yet_qualified": true
+        }
+      },
+      "original": {
+        "index": 31,
+        "target": "matmul_split_k/01_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/splitk-bias1-v35-before-full-refresh-v2-gpu3/raw/matmul_split_k__1__cute.json",
+          "sha256": "3c1882e0c3541233a3895a141aabc8c7e73450455df2dcc04715a9a4562e829c"
+        },
+        "raw_gpu": "3",
+        "resolution": "before artifact is audit; /files_checked_twice",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-bias1-v35-full-refresh-gpu3-v2-splitk/root-before-audit-v1.json",
+          "sha256": "0633371154712b409b231d78c872c778ae6d285ef7adc44f1120329ace8eca90"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.12373819593785977,
+        "reported_ratio_fields": [
+          "/baseline_over_cute"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026100302,
+        "autotune_config_counts": [
+          515
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.09827200323343277
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "matmul_split_k/01_forward/shape1",
+        "before": 0.12373819593785977,
+        "current": 1.005249383930713,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/splitk-bias1-v35-before-full-refresh-v2-gpu3/raw/matmul_split_k__1__cute.json",
+          "sha256": "3c1882e0c3541233a3895a141aabc8c7e73450455df2dcc04715a9a4562e829c"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-bias1-v35-full-refresh-gpu3-v2-splitk/root-before-audit-v1.json",
+          "sha256": "0633371154712b409b231d78c872c778ae6d285ef7adc44f1120329ace8eca90"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/splitk-bias1-selected-fixed-v3-gpu3/summary.json"
+      }
+    },
+    {
+      "index": 32,
+      "name": "matmul_split_k/01_forward/shape2",
+      "accepted": {
+        "ratio": 1.1191406230015986,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/verify-splitk2-v28-bias-v8-gpu3/result.json",
+          "sha256": "a0955712195638273a6ba12370769dce0bec203d42c61a01667328ad05f1794d"
+        },
+        "goal_pointer": "/shapes/32",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 32,
+        "target": "matmul_split_k/01_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/matmul_split_k__2__cute.json",
+          "sha256": "be4cf4b67791217fd5f48d765672d01ca94e48c6f81e0922e12b7f76be7ac944"
+        },
+        "raw_gpu": "3",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/matmul_split_k__01_forward__2.json",
+          "sha256": "799763724baabc3c46f80301de580cf3da83fc83704fc3b0de6e9fe0c3d33087"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.02337630501801702,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091203,
+        "autotune_config_counts": [
+          755,
+          913
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.78438401222229
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "matmul_split_k/01_forward/shape2",
+        "before": 0.02337630501801702,
+        "current": 1.1191406230015986,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/matmul_split_k__2__cute.json",
+          "sha256": "be4cf4b67791217fd5f48d765672d01ca94e48c6f81e0922e12b7f76be7ac944"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/matmul_split_k__01_forward__2.json",
+          "sha256": "799763724baabc3c46f80301de580cf3da83fc83704fc3b0de6e9fe0c3d33087"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/verify-splitk2-v28-bias-v8-gpu3/result.json"
+      }
+    },
+    {
+      "index": 33,
+      "name": "matmul_split_k/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-plain0-a-copy-cold-selected-fixed-gpu3-v1-splitk/root-fixed-qualification-v1.json",
+          "sha256": "e84f5565b0d65952484d4d8b9cb181ec39cc419d607e21a354003468db1216e8"
+        },
+        "goal_pointer": "/shapes/33",
+        "qualification_review": {
+          "decision": {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-plain0-a-copy-cold-selected-fixed-gpu3-v1-splitk/root-fixed-qualification-v1.json",
+            "sha256": "e84f5565b0d65952484d4d8b9cb181ec39cc419d607e21a354003468db1216e8"
+          },
+          "within_goal_margin": true,
+          "full_combined_CuTe_verification_pending": true,
+          "main_integration_pending": true
+        }
+      },
+      "original": {
+        "index": 33,
+        "target": "matmul_split_k/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/skp0b35-g5v1/raw/matmul_split_k__0__cute.json",
+          "sha256": "168393da534c8f1173f27e0ef74e831c6c06171d2a9f188d61e3cb370827e703"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-plain0-v35-gpu5-cold-pairs-root-v1/before-matmul_split_k__00_forward__0.json",
+          "sha256": "19b2f54fb70cefcdd30ee23ca5dd1c0b2aad4784232421f737cc2c8702b39192"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.5701357555446749,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026096880,
+        "autotune_config_counts": [
+          669
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.01414399966597557
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "matmul_split_k/00_forward/shape0",
+        "before": 0.5701357555446749,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/skp0b35-g5v1/raw/matmul_split_k__0__cute.json",
+          "sha256": "168393da534c8f1173f27e0ef74e831c6c06171d2a9f188d61e3cb370827e703"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-plain0-v35-gpu5-cold-pairs-root-v1/before-matmul_split_k__00_forward__0.json",
+          "sha256": "19b2f54fb70cefcdd30ee23ca5dd1c0b2aad4784232421f737cc2c8702b39192"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/splitk-plain0-a-copy-cold-selected-fixed-gpu3-v1-splitk/root-fixed-qualification-v1.json"
+      }
+    },
+    {
+      "index": 34,
+      "name": "matmul_split_k/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/splitk-plain1-v35-managed-multibaseline-v1-gpu6/summary.json",
+          "sha256": "c3f209e3361138bf00e5bb1dd88ceb337d5b8fa3981373573711df24b5f51912"
+        },
+        "goal_pointer": "/shapes/34",
+        "qualification_review": {
+          "name": "matmul_split_k/00_forward/shape1",
+          "status": "qualified_fresh_cold_plus_ABAB",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/splitk-plain1-managed-multibaseline-qualified-root-v1.json",
+          "decision_sha256": "3e5794931fde2b02862c0506158b08b6580681caef1657c88506bd2713ea9154",
+          "source_version": "v35_frozen_before_origin_main_rebase",
+          "source_common_to_all60_not_yet_qualified": true,
+          "all_twelve_workers_correct": true,
+          "anchor_spreads": {
+            "C": 1.0159151637986013,
+            "aten": 1.0079364914377378,
+            "torch.compile": 1.0079364914377378
+          },
+          "raw_result": "artifacts/worst20-2026-09-12/probes/splitk-plain1-v35-managed-multibaseline-v1-gpu6/summary.json",
+          "raw_result_sha256": "c3f209e3361138bf00e5bb1dd88ceb337d5b8fa3981373573711df24b5f51912",
+          "audit": "artifacts/worst20-2026-09-12/proposals/splitk-plain1-multibaseline-actual-audit-root-v1/result.json",
+          "audit_sha256": "300cbaf33140a0d3187400e250de09322ef69b58b88d59da9c541441a6ea58e9"
+        }
+      },
+      "original": {
+        "index": 34,
+        "target": "matmul_split_k/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/skp1b35-g6c3/raw/matmul_split_k__1__cute.json",
+          "sha256": "c5d2b4121db846b22d7b29de5e35ea057a9f8b8f4feae639963f952c7bd24269"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-plain1-v35-gpu6-c3-cold-pairs-root-v1/before-matmul_split_k__00_forward__1.json",
+          "sha256": "408cb085fd742d98659c04990f1016cff2167b7fbb98b0b0ffcbd1ca12738daf"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.12068965036599459,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026096871,
+        "autotune_config_counts": [
+          587
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.10022400319576263
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "matmul_split_k/00_forward/shape1",
+        "before": 0.12068965036599459,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/skp1b35-g6c3/raw/matmul_split_k__1__cute.json",
+          "sha256": "c5d2b4121db846b22d7b29de5e35ea057a9f8b8f4feae639963f952c7bd24269"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/splitk-plain1-v35-gpu6-c3-cold-pairs-root-v1/before-matmul_split_k__00_forward__1.json",
+          "sha256": "408cb085fd742d98659c04990f1016cff2167b7fbb98b0b0ffcbd1ca12738daf"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/splitk-plain1-v35-managed-multibaseline-v1-gpu6/summary.json"
+      }
+    },
+    {
+      "index": 35,
+      "name": "matmul_split_k/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.0019569620976994,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/verify-splitk2-v28-plain-v8-gpu3/result.json",
+          "sha256": "ad76e4372b5a1afef2c65329a752aea0915f566d914c37b70a6e800f5377c0b9"
+        },
+        "goal_pointer": "/shapes/35",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 35,
+        "target": "matmul_split_k/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/matmul_split_k__2__cute.json",
+          "sha256": "be4cf4b67791217fd5f48d765672d01ca94e48c6f81e0922e12b7f76be7ac944"
+        },
+        "raw_gpu": "3",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/matmul_split_k__00_forward__2.json",
+          "sha256": "ebb269db9c22f94368207b57c60ab3c8c04c5733fd2898070e800dfe04c65138"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.02067371864719219,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091203,
+        "autotune_config_counts": [
+          755,
+          913
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.7894080281257629
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "matmul_split_k/00_forward/shape2",
+        "before": 0.02067371864719219,
+        "current": 1.0019569620976994,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/matmul_split_k__2__cute.json",
+          "sha256": "be4cf4b67791217fd5f48d765672d01ca94e48c6f81e0922e12b7f76be7ac944"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/matmul_split_k__00_forward__2.json",
+          "sha256": "ebb269db9c22f94368207b57c60ab3c8c04c5733fd2898070e800dfe04c65138"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/verify-splitk2-v28-plain-v8-gpu3/result.json"
+      }
+    },
+    {
+      "index": 36,
+      "name": "welford/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/welford-00_forward-0-abab-v2/result.json",
+          "sha256": "908106c56f437138f409b2b59880ab5cd584c931780656fe0e8825e0ca65c465"
+        },
+        "goal_pointer": "/shapes/36",
+        "qualification_review": {
+          "name": "welford/00_forward/shape0",
+          "status": "current_ratio_retained",
+          "classification": "later_authoritative_ABAB",
+          "preserved_ratio": 1.0,
+          "preserved_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/welford-00_forward-0-abab-v2/result.json",
+          "event_lines": [
+            17964
+          ],
+          "requires_provenance_revalidation_before_final_report": true,
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/guard-current60-qualification-decision-root-v1.json",
+          "decision_sha256": "c55b5d5506bd0e667bc7c10258f58e31cab36176d4d1fba2011455968d4304b9"
+        }
+      },
+      "original": {
+        "index": 36,
+        "target": "welford/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/welford__0__cute.json",
+          "sha256": "7fa2e51ef150c3e4ddb929d4419ef5217615718ab5e3a982a8a3d96c03facd9b"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/welford__00_forward__0.json",
+          "sha256": "f31c2ea27a27b7ae3baac21e4c7f80b200fbab023cd7da3e937d2868b948d7ff"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.43531470043660836,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          609
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.018303999677300453
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "welford/00_forward/shape0",
+        "before": 0.43531470043660836,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/welford__0__cute.json",
+          "sha256": "7fa2e51ef150c3e4ddb929d4419ef5217615718ab5e3a982a8a3d96c03facd9b"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/welford__00_forward__0.json",
+          "sha256": "f31c2ea27a27b7ae3baac21e4c7f80b200fbab023cd7da3e937d2868b948d7ff"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/welford-00_forward-0-abab-v2/result.json"
+      }
+    },
+    {
+      "index": 37,
+      "name": "welford/00_forward/shape1",
+      "accepted": {
+        "ratio": 0.9944071813408897,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/welford1-v35-managed-multibaseline-v2-gpu6/summary.json",
+          "sha256": "65f060ee252b9d691a362e92cc221ee68138d1bf362afe4280c2a19b0f7952cc"
+        },
+        "goal_pointer": "/shapes/37",
+        "qualification_review": {
+          "name": "welford/00_forward/shape1",
+          "status": "qualified_fresh_cold_plus_ABAB",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/welford1-managed-multibaseline-qualified-root-v2.json",
+          "decision_sha256": "94820b195828b49746a133dc2d7a46ba0ef4710fbb2a8553d4d1cd6167dd5a22",
+          "source_version": "v35",
+          "source_common_to_all60_not_yet_qualified": true,
+          "all_twelve_workers_correct": true,
+          "anchor_spreads": {
+            "A": 1.0044793174750808,
+            "helion-triton:helion": 1.0,
+            "torch.compile": 1.0022471426579476
+          },
+          "raw_result": "artifacts/worst20-2026-09-12/probes/welford1-v35-managed-multibaseline-v2-gpu6/summary.json",
+          "raw_result_sha256": "65f060ee252b9d691a362e92cc221ee68138d1bf362afe4280c2a19b0f7952cc",
+          "audit": "artifacts/worst20-2026-09-12/proposals/welford1-multibaseline-actual-audit-root-v2/result.json",
+          "audit_sha256": "7a114428242911429f1d73f6a15afff569db402210d1f5f5bf77e433a984ab04"
+        }
+      },
+      "original": {
+        "index": 37,
+        "target": "welford/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/wf1b35-g6c3/raw/welford__1__cute.json",
+          "sha256": "7e65bcb611cf167bd03b2bf060b069b8814e9d89707caea778ea6460779297d2"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/welford1-v35-gpu6-c3-collected-pairs-root-v1/before-welford__00_forward__1.json",
+          "sha256": "c38266bcd9fefc68aaa60702b10abfef052734372fc8e1aa06de9d9a4579f3b4"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.7365813079294791,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091961,
+        "autotune_config_counts": [
+          994
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.0387520007789135
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "welford/00_forward/shape1",
+        "before": 0.7365813079294791,
+        "current": 0.9944071813408897,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/wf1b35-g6c3/raw/welford__1__cute.json",
+          "sha256": "7e65bcb611cf167bd03b2bf060b069b8814e9d89707caea778ea6460779297d2"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/welford1-v35-gpu6-c3-collected-pairs-root-v1/before-welford__00_forward__1.json",
+          "sha256": "c38266bcd9fefc68aaa60702b10abfef052734372fc8e1aa06de9d9a4579f3b4"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/welford1-v35-managed-multibaseline-v2-gpu6/summary.json"
+      }
+    },
+    {
+      "index": 38,
+      "name": "welford/00_forward/shape2",
+      "accepted": {
+        "ratio": 0.9931087733786553,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/welford2-current-control-refreshed-qualification-root-v1/result.json",
+          "sha256": "ebc8e0bba4c5b4cfe958230263d1cb249f8fe45455ab24e306cba5d209cb7905"
+        },
+        "goal_pointer": "/shapes/38",
+        "qualification_review": {
+          "status": "qualified_complete_cold_plus_interleaved_fixed",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/welford2-fixed-qualified-root-v1/result.json",
+          "decision_sha256": "5ea861cd8804843a1e7d025ddb7c17700909a033336118973c71eff5eb03207c",
+          "source_common_to_all60_not_yet_qualified": true
+        }
+      },
+      "original": {
+        "index": 38,
+        "target": "welford/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-welford-2/raw/welford__2__cute.json",
+          "sha256": "9e2291bc3aa197130c7b1ae2a94f111613e71e955d45c629868c16f06de1c840"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-welford-2/paired/welford__00_forward__2.json",
+          "sha256": "19ece3f9c0697dc50dc638f8482174c811dc99808ce01a6661104f88adbbf20a"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.2770873133032303,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091595,
+        "autotune_config_counts": [
+          793
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.6205120086669922
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "welford/00_forward/shape2",
+        "before": 0.2770873133032303,
+        "current": 0.9931087733786553,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-welford-2/raw/welford__2__cute.json",
+          "sha256": "9e2291bc3aa197130c7b1ae2a94f111613e71e955d45c629868c16f06de1c840"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v30-welford-2/paired/welford__00_forward__2.json",
+          "sha256": "19ece3f9c0697dc50dc638f8482174c811dc99808ce01a6661104f88adbbf20a"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/welford2-current-control-refreshed-qualification-root-v1/result.json"
+      }
+    },
+    {
+      "index": 39,
+      "name": "softmax/01_backward/shape0",
+      "accepted": {
+        "ratio": 0.9947090313729285,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/softmax-one-row-shape0-paired-fixed-gpu3-v4-root/root-fixed-decision-v1.json",
+          "sha256": "dda8f8ad1a4e88c89402e950591ef072d42bf9aea71f1324a81a9c8b96b53148"
+        },
+        "goal_pointer": "/shapes/39",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 39,
+        "target": "softmax/01_backward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/softmax__0__cute.json",
+          "sha256": "8ebf09bce37b4d7460e0d1793e8b92746dc11ed33686c1868d08915514bb57c9"
+        },
+        "raw_gpu": "1",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/softmax__01_backward__0.json",
+          "sha256": "9b287fe4764dc12281cdce77392c4b3999e4885f9406e026e8f9ef98df632395"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.7611336590527351,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          417,
+          540
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.007903999648988247
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "softmax/01_backward/shape0",
+        "before": 0.7611336590527351,
+        "current": 0.9947090313729285,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/softmax__0__cute.json",
+          "sha256": "8ebf09bce37b4d7460e0d1793e8b92746dc11ed33686c1868d08915514bb57c9"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/softmax__01_backward__0.json",
+          "sha256": "9b287fe4764dc12281cdce77392c4b3999e4885f9406e026e8f9ef98df632395"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/softmax-one-row-shape0-paired-fixed-gpu3-v4-root/root-fixed-decision-v1.json"
+      }
+    },
+    {
+      "index": 40,
+      "name": "softmax/01_backward/shape1",
+      "accepted": {
+        "ratio": 1.0047169254421198,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/softmax-shape1-fresh-finalist-selected-fixed-gpu0-v1-splitk-child/root-cold-fixed-qualified-v1.json",
+          "sha256": "98db879b32e487236bdce9803619f89214312098e6d9a58ad522fdf93d1b0910"
+        },
+        "goal_pointer": "/shapes/40",
+        "qualification_review": {
+          "status": "qualified_fresh_cold_FULL_plus_original_GPU0_fixed9",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/softmax-shape1-fresh-finalist-selected-fixed-gpu0-v1-splitk-child/root-cold-fixed-qualified-v1.json",
+          "decision_sha256": "98db879b32e487236bdce9803619f89214312098e6d9a58ad522fdf93d1b0910",
+          "source_version": "c81c60be3e8c53a14f8c5a16d542097a9204026f659d6e1300fe4eeabbe28beb",
+          "source_common_to_all60_not_yet_qualified": true
+        }
+      },
+      "original": {
+        "index": 40,
+        "target": "softmax/01_backward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/softmax-shape1-original-cute-recovery-v4-gpu0/raw/softmax__1__cute.json",
+          "sha256": "b31c902707dc2f53bfdac1df4881379750518b1452e09c5ee2d89cd4a7496d2b"
+        },
+        "raw_gpu": "0",
+        "resolution": "before artifact /before_authority/audit -> composed audit /files_checked_twice",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/softmax1-resident-cache-cold-qualified-root-v1/result.json",
+          "sha256": "bad1f2385b265a10c8e43f050e7e4554ac735d7277d849469f50d6009115d507"
+        },
+        "supporting_receipts": [
+          {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/softmax-shape1-original-cute-recovery-gpu0-v4-splitk/root-before-composed-audit-v1.json",
+            "sha256": "4d63b62168ba48e5335455fb381d108c03c2ab5d4ece9bf292c61a9dafbc9f59"
+          }
+        ],
+        "reported_before_ratio": 0.7195530848336656,
+        "reported_ratio_fields": [
+          "/before_ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026097622,
+        "autotune_config_counts": [
+          521,
+          1014
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.02864000014960766
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "softmax/01_backward/shape1",
+        "before": 0.7195530848336656,
+        "current": 1.0047169254421198,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/softmax-shape1-original-cute-recovery-v4-gpu0/raw/softmax__1__cute.json",
+          "sha256": "b31c902707dc2f53bfdac1df4881379750518b1452e09c5ee2d89cd4a7496d2b"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/softmax1-resident-cache-cold-qualified-root-v1/result.json",
+          "sha256": "bad1f2385b265a10c8e43f050e7e4554ac735d7277d849469f50d6009115d507"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/softmax-shape1-fresh-finalist-selected-fixed-gpu0-v1-splitk-child/root-cold-fixed-qualified-v1.json"
+      }
+    },
+    {
+      "index": 41,
+      "name": "softmax/01_backward/shape2",
+      "accepted": {
+        "ratio": 1.0002564122158004,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/softmax-two-level-cache-shape2-selected-fixed-v2-gpu2/summary.json",
+          "sha256": "fb7f2d08613460c477535ff07f669afb0050946cf3447821e98452c0e9e2c1b1"
+        },
+        "goal_pointer": "/shapes/41",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 41,
+        "target": "softmax/01_backward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/softmax__2__cute.json",
+          "sha256": "7de798a4bc21991468f50a8caa88d79e7932d91cf1bcfeb432c9eab9b96bc1a9"
+        },
+        "raw_gpu": "3",
+        "resolution": "evidence.softmax_missing_detail.raw",
+        "before_artifact": null,
+        "supporting_receipts": [],
+        "reported_before_ratio": null,
+        "reported_ratio_fields": [],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091203,
+        "autotune_config_counts": [
+          718,
+          860
+        ],
+        "validity": "completed_FULL_but_failed_correctness_no_valid_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "error"
+          }
+        ],
+        "failure": {
+          "graph_error": "AssertionError: Tensor-likes are not close!\n\nMismatched elements: 11569 / 134217728 (0.0%)\nGreatest absolute difference: 0.006504058837890625 at index (1155, 7247) (up to 0.001 allowed)\nGreatest relative difference: 1.0 at index (0, 4231) (up to 0.001 allowed)",
+          "post_measurement_error": "Traceback (most recent call last):\n  File \"/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/study.py\", line 1281, in worker\n    assert_correct(fn(), expected, case)\n  File \"/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/study.py\", line 891, in assert_correct\n    torch.testing.assert_close(\n  File \"/home/jansel/local/ws7/env/lib/python3.12/site-packages/torch/testing/_comparison.py\", line 1689, in assert_close\n    raise error_metas[0].to_error(msg)\nAssertionError: Tensor-likes are not close!\n\nMismatched elements: 75357398 / 134217728 (56.1%)\nGreatest absolute difference: 512.0026245117188 at index (3034, 13840) (up to 0.001 allowed)\nGreatest relative difference: inf at index (0, 511) (up to 0.001 allowed)\n",
+          "event_ms_diagnostic_only_not_a_graph_result": 0.09011200070381165
+        }
+      },
+      "chart_comparison": null
+    },
+    {
+      "index": 42,
+      "name": "rms_norm/01_backward/shape0",
+      "accepted": {
+        "ratio": 0.9937500432009995,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/abab-rms-resident-seed-gpu2-v1/result.json",
+          "sha256": "0dd8ce2c3c1e379f672852558599b523988355a619cbda6e83bfbe2b8c2c2d2f"
+        },
+        "goal_pointer": "/shapes/42",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 42,
+        "target": "rms_norm/01_backward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-single-v2-rms-0-gpu2-v1/raw/rms_norm__0__cute.json",
+          "sha256": "f03afc30e58d5c27c09b762695dadaaf6eedf4268716a08458b4c3ee442034c0"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-single-v2-rms-0-gpu2-v1/paired/rms_norm__01_backward__0.json",
+          "sha256": "6edb008df7234a6f653cdc71ae74acd0b2a4ad181e7c9b70b82f1a2373e90184"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.7069351042525905,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026092700,
+        "autotune_config_counts": [
+          479,
+          789
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion_autograd",
+            "status": "ok",
+            "graph_ms": 0.014303999952971935
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "rms_norm/01_backward/shape0",
+        "before": 0.7069351042525905,
+        "current": 0.9937500432009995,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-single-v2-rms-0-gpu2-v1/raw/rms_norm__0__cute.json",
+          "sha256": "f03afc30e58d5c27c09b762695dadaaf6eedf4268716a08458b4c3ee442034c0"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-single-v2-rms-0-gpu2-v1/paired/rms_norm__01_backward__0.json",
+          "sha256": "6edb008df7234a6f653cdc71ae74acd0b2a4ad181e7c9b70b82f1a2373e90184"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/abab-rms-resident-seed-gpu2-v1/result.json"
+      }
+    },
+    {
+      "index": 43,
+      "name": "rms_norm/01_backward/shape1",
+      "accepted": {
+        "ratio": 1.05226480023567,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-resident-v14/verify/rms_norm-01_backward-1-abab-v1/result.json",
+          "sha256": "23daf6652fa17a1b9df03a7cc2ab1ed998d7c7b7de3555985d0fa900fdf9cdc4"
+        },
+        "goal_pointer": "/shapes/43",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 43,
+        "target": "rms_norm/01_backward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/rms_norm__1__cute.json",
+          "sha256": "21c1338325beb6b19601bae6b9e5bbe08d7a6676f004538a5d543dd1fe9f764b"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/rms_norm__01_backward__1.json",
+          "sha256": "58d7b739225fd29b2d7e3c29f5a910b88041d8ca09ce4182736cb93a76a27c95"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.22979747142280485,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          703,
+          563
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion_autograd",
+            "status": "ok",
+            "graph_ms": 0.15958400070667267
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "rms_norm/01_backward/shape1",
+        "before": 0.22979747142280485,
+        "current": 1.05226480023567,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/rms_norm__1__cute.json",
+          "sha256": "21c1338325beb6b19601bae6b9e5bbe08d7a6676f004538a5d543dd1fe9f764b"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/rms_norm__01_backward__1.json",
+          "sha256": "58d7b739225fd29b2d7e3c29f5a910b88041d8ca09ce4182736cb93a76a27c95"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-resident-v14/verify/rms_norm-01_backward-1-abab-v1/result.json"
+      }
+    },
+    {
+      "index": 44,
+      "name": "rms_norm/01_backward/shape2",
+      "accepted": {
+        "ratio": 0.9996596298135437,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-resident-v14/verify/rms_norm-01_backward-2-abab-v1/result.json",
+          "sha256": "7b4a7ba89f9e864b4ef38a462a8d670ec3d39eb3289bab31984a6ca2ec61db09"
+        },
+        "goal_pointer": "/shapes/44",
+        "qualification_review": {
+          "name": "rms_norm/01_backward/shape2",
+          "status": "current_ratio_retained",
+          "classification": "later_authoritative_ABAB",
+          "preserved_ratio": 0.9996596298135437,
+          "preserved_artifact": "artifacts/worst20-2026-09-12/after-resident-v14/verify/rms_norm-01_backward-2-abab-v1/result.json",
+          "event_lines": [
+            13529
+          ],
+          "requires_provenance_revalidation_before_final_report": true,
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/guard-current60-qualification-decision-root-v1.json",
+          "decision_sha256": "c55b5d5506bd0e667bc7c10258f58e31cab36176d4d1fba2011455968d4304b9"
+        }
+      },
+      "original": {
+        "index": 44,
+        "target": "rms_norm/01_backward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/rms_norm__2__cute.json",
+          "sha256": "65ef76548c4a310ad0a3b501839bb11d7309fbb80887c42c92b4473050a53043"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/rms_norm__01_backward__2.json",
+          "sha256": "b938d8ca72d3dec47797fe45a55ff1a4f531db94791459ad1167aba608f00b9e"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.1673878353919747,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091203,
+        "autotune_config_counts": [
+          597,
+          616
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion_autograd",
+            "status": "ok",
+            "graph_ms": 0.5620480179786682
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "rms_norm/01_backward/shape2",
+        "before": 0.1673878353919747,
+        "current": 0.9996596298135437,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/rms_norm__2__cute.json",
+          "sha256": "65ef76548c4a310ad0a3b501839bb11d7309fbb80887c42c92b4473050a53043"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/rms_norm__01_backward__2.json",
+          "sha256": "b938d8ca72d3dec47797fe45a55ff1a4f531db94791459ad1167aba608f00b9e"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-resident-v14/verify/rms_norm-01_backward-2-abab-v1/result.json"
+      }
+    },
+    {
+      "index": 45,
+      "name": "aot_example/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_example-00_forward-0-abab-v2/result.json",
+          "sha256": "09fe97c1e82d4148d2aac8d6de9f10f12889fc9216c365db4a1b7d222d21f947"
+        },
+        "goal_pointer": "/shapes/45",
+        "qualification_review": {
+          "name": "aot_example/00_forward/shape0",
+          "status": "current_ratio_retained",
+          "classification": "later_authoritative_ABAB",
+          "preserved_ratio": 1.0,
+          "preserved_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_example-00_forward-0-abab-v2/result.json",
+          "event_lines": [
+            13852,
+            13873,
+            14164
+          ],
+          "requires_provenance_revalidation_before_final_report": true,
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/guard-current60-qualification-decision-root-v1.json",
+          "decision_sha256": "c55b5d5506bd0e667bc7c10258f58e31cab36176d4d1fba2011455968d4304b9"
+        }
+      },
+      "original": {
+        "index": 45,
+        "target": "aot_example/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/aot_example__0__cute.json",
+          "sha256": "d8fb379ec0bc298d87d4e385f914a398223c93d2ebcc6137d584d77a67fb70e5"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/aot_example__00_forward__0.json",
+          "sha256": "4e97ec42ca7c7f3dc8d07ac2bea46a63d5c08f31882d56b025bc96189f58f43d"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 1.0107526915370366,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          362,
+          232,
+          393
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.00595200015231967
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/00_forward/shape0",
+        "before": 1.0107526915370366,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/aot_example__0__cute.json",
+          "sha256": "d8fb379ec0bc298d87d4e385f914a398223c93d2ebcc6137d584d77a67fb70e5"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/aot_example__00_forward__0.json",
+          "sha256": "4e97ec42ca7c7f3dc8d07ac2bea46a63d5c08f31882d56b025bc96189f58f43d"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_example-00_forward-0-abab-v2/result.json"
+      }
+    },
+    {
+      "index": 46,
+      "name": "aot_example/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.0039840942342644,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/common9c-aot-vector1-fixed-gpu3-v2-review/root-fixed-acceptance-v1.json",
+          "sha256": "60bf1fff9227b22bd5d13fb01d6705ca430e46f66abefd2bd63cdf83206bad34"
+        },
+        "goal_pointer": "/shapes/46",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 46,
+        "target": "aot_example/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/aot_example__1__cute.json",
+          "sha256": "aa3357c4936339a8af01aa950ef9c1d7304efee22327a75e579a9e7c905eb4d2"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/aot_example__00_forward__1.json",
+          "sha256": "9e66dc37fbd657580d6ed31127794e12e4174d24f1c2b4f55a2f09c0357edb85"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.9920319274829916,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          252,
+          497,
+          418
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.008031999692320824
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/00_forward/shape1",
+        "before": 0.9920319274829916,
+        "current": 1.0039840942342644,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/aot_example__1__cute.json",
+          "sha256": "aa3357c4936339a8af01aa950ef9c1d7304efee22327a75e579a9e7c905eb4d2"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/aot_example__00_forward__1.json",
+          "sha256": "9e66dc37fbd657580d6ed31127794e12e4174d24f1c2b4f55a2f09c0357edb85"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/common9c-aot-vector1-fixed-gpu3-v2-review/root-fixed-acceptance-v1.json"
+      }
+    },
+    {
+      "index": 47,
+      "name": "aot_example/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.0009871743186658,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/aot-vector2-common-prefetch-anchored-v2-gpu6/summary.json",
+          "sha256": "695d3e575cff02d006057a0962d355497c7d225044343adc84a05d33ecebf7f5"
+        },
+        "goal_pointer": "/shapes/47",
+        "qualification_review": {
+          "name": "aot_example/00_forward/shape2",
+          "status": "qualified_fresh_full_cold_plus_anchored",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/aot-vector2-common-prefetch-qualified-root-v1.json",
+          "decision_sha256": "7613dfa54d9d99a2b4280d0c6083c5fad105dea8e9a4222bb83150712dec7991",
+          "source_version": "after-origin-main-integrated-source-v9",
+          "source_common_to_all60_not_yet_qualified": true,
+          "baseline_providers": [
+            "helion-triton:helion"
+          ],
+          "raw_result": "artifacts/worst20-2026-09-12/probes/aot-vector2-common-prefetch-anchored-v2-gpu6/summary.json",
+          "raw_result_sha256": "695d3e575cff02d006057a0962d355497c7d225044343adc84a05d33ecebf7f5",
+          "actual_audit": "artifacts/worst20-2026-09-12/proposals/aot-vector2-common-prefetch-anchored-actual-audit-root-v3/result.json",
+          "actual_audit_sha256": "bbabb414c81a47454d68d12ecaa3c214ddc8e4182c9e5283dd2b94d2f51fd856"
+        }
+      },
+      "original": {
+        "index": 47,
+        "target": "aot_example/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/av2bcp-g6c2/raw/aot_example__2__cute.json",
+          "sha256": "aff4843e73e2330638cfd7398d54252c153df87ffad57aa0b20de344ec429639"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-vector2-common-prefetch-cold-pairs-root-v1/before-aot_example__00_forward__2.json",
+          "sha256": "108d6ae1fd6bc182f42042b5a6ab646d03708211876b6bc1e4c5b770cdc5e81f"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.5672645981325389,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026112262,
+        "autotune_config_counts": [
+          398
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.028543999418616295
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/00_forward/shape2",
+        "before": 0.5672645981325389,
+        "current": 1.0009871743186658,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/av2bcp-g6c2/raw/aot_example__2__cute.json",
+          "sha256": "aff4843e73e2330638cfd7398d54252c153df87ffad57aa0b20de344ec429639"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-vector2-common-prefetch-cold-pairs-root-v1/before-aot_example__00_forward__2.json",
+          "sha256": "108d6ae1fd6bc182f42042b5a6ab646d03708211876b6bc1e4c5b770cdc5e81f"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/aot-vector2-common-prefetch-anchored-v2-gpu6/summary.json"
+      }
+    },
+    {
+      "index": 48,
+      "name": "aot_example/01_forward/shape0",
+      "accepted": {
+        "ratio": 0.994623615113431,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/aot-softmax0-v35-managed-abab-v1-gpu6/summary.json",
+          "sha256": "7b7cfb98a25a80c0fbde8969de65566065809b5b82e7231ff0d522ac9ac92124"
+        },
+        "goal_pointer": "/shapes/48",
+        "qualification_review": {
+          "name": "aot_example/01_forward/shape0",
+          "status": "qualified_fresh_cold_plus_ABAB",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/aot-softmax0-managed-abab-qualified-root-v1.json",
+          "decision_sha256": "02add33a0d191ec9f934f4e905797ee9784cc7f2334a9b4af06e4974889da637",
+          "source_version": "v35",
+          "source_common_to_all60_not_yet_qualified": true,
+          "all_six_workers_correct": true,
+          "anchor_spreads": {
+            "A": 1.0054054466482336,
+            "B": 1.0
+          },
+          "raw_result": "artifacts/worst20-2026-09-12/probes/aot-softmax0-v35-managed-abab-v1-gpu6/summary.json",
+          "raw_result_sha256": "7b7cfb98a25a80c0fbde8969de65566065809b5b82e7231ff0d522ac9ac92124"
+        }
+      },
+      "original": {
+        "index": 48,
+        "target": "aot_example/01_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/as0b35-g6v1/raw/aot_example__0__cute.json",
+          "sha256": "4356e982639c5a11668d84aace4480adee77864837af94c8701cab64b20c368d"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-softmax0-v35-gpu6-audited-pairs-root-v1/before-aot_example__01_forward__0.json",
+          "sha256": "0776e67beb346924411efccbbe3ae73cab323d59c9e3a8caf463326cdb48285c"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.7341269786273941,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026096660,
+        "autotune_config_counts": [
+          359
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.008063999935984612
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/01_forward/shape0",
+        "before": 0.7341269786273941,
+        "current": 0.994623615113431,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/as0b35-g6v1/raw/aot_example__0__cute.json",
+          "sha256": "4356e982639c5a11668d84aace4480adee77864837af94c8701cab64b20c368d"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-softmax0-v35-gpu6-audited-pairs-root-v1/before-aot_example__01_forward__0.json",
+          "sha256": "0776e67beb346924411efccbbe3ae73cab323d59c9e3a8caf463326cdb48285c"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/aot-softmax0-v35-managed-abab-v1-gpu6/summary.json"
+      }
+    },
+    {
+      "index": 49,
+      "name": "aot_example/01_forward/shape1",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/aot-softmax1-v35-managed-multibaseline-v1-gpu5/summary.json",
+          "sha256": "d71784011f52c71054dac5d8237ea1180122f12849965c13218bd7decb40d7ce"
+        },
+        "goal_pointer": "/shapes/49",
+        "qualification_review": {
+          "name": "aot_example/01_forward/shape1",
+          "status": "qualified_fresh_cold_plus_ABAB",
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/aot-softmax1-managed-multibaseline-qualified-root-v1.json",
+          "decision_sha256": "2719aabaee4054041f058be4327f1e61eb7610aa535baa32d6b82d5488a5069e",
+          "source_version": "v35",
+          "source_common_to_all60_not_yet_qualified": true,
+          "all_twenty_four_workers_correct": true,
+          "anchor_spreads": {
+            "A": 1.0040160947686159,
+            "quack": 1.0,
+            "torch.compile": 1.0040160947686159,
+            "quack-direct": 1.0,
+            "helion-triton:helion": 1.0040160947686159
+          },
+          "raw_result": "artifacts/worst20-2026-09-12/probes/aot-softmax1-v35-managed-multibaseline-v1-gpu5/summary.json",
+          "raw_result_sha256": "d71784011f52c71054dac5d8237ea1180122f12849965c13218bd7decb40d7ce",
+          "audit": "artifacts/worst20-2026-09-12/proposals/aot-softmax1-multibaseline-actual-audit-root-v2/result.json",
+          "audit_sha256": "b3180b6bc72a3baf779f2f7f02709e395178c9eebb55c4beafd5e32409f7e340"
+        }
+      },
+      "original": {
+        "index": 49,
+        "target": "aot_example/01_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/as1b35-g5v2/raw/aot_example__1__cute.json",
+          "sha256": "8a2f51df1a828d27fe8a67d1d2fdbd063867ed6845ef5b585a382a0071f0424d"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-softmax1-v35-gpu5-cold-pairs-root-v2/before-aot_example__01_forward__1.json",
+          "sha256": "ba0b3134b30427ec286811769d97fa22cc3b240793574d543f7627e0ffc99320"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.7879747205594714,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026101151,
+        "autotune_config_counts": [
+          345
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.010111999697983265
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/01_forward/shape1",
+        "before": 0.7879747205594714,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/as1b35-g5v2/raw/aot_example__1__cute.json",
+          "sha256": "8a2f51df1a828d27fe8a67d1d2fdbd063867ed6845ef5b585a382a0071f0424d"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/aot-softmax1-v35-gpu5-cold-pairs-root-v2/before-aot_example__01_forward__1.json",
+          "sha256": "ba0b3134b30427ec286811769d97fa22cc3b240793574d543f7627e0ffc99320"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/probes/aot-softmax1-v35-managed-multibaseline-v1-gpu5/summary.json"
+      }
+    },
+    {
+      "index": 50,
+      "name": "aot_example/01_forward/shape2",
+      "accepted": {
+        "ratio": 1.1206225773468246,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/abab-aot-softmax2-v29-quack-gpu3-v2/result.json",
+          "sha256": "fac4ba18e0304385549e3560bdccd1e99157a40062ec6c012885069cfe84492d"
+        },
+        "goal_pointer": "/shapes/50",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 50,
+        "target": "aot_example/01_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v27-aot2/raw/aot_example__2__cute.json",
+          "sha256": "61f15a081efa75c63ba4e36799c26b11590f8a31ae985030923a44a2f0d69bd1"
+        },
+        "raw_gpu": "3",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v27-aot2/paired/aot_example__01_forward__2.json",
+          "sha256": "2b717fd4083676e53cb9c7e2b18dcd5b3b651493ef3becf7196dfc9244f88ec7"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.3782576570163593,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091472,
+        "autotune_config_counts": [
+          330,
+          514,
+          547
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.04297599941492081
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_example/01_forward/shape2",
+        "before": 0.3782576570163593,
+        "current": 1.1206225773468246,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v27-aot2/raw/aot_example__2__cute.json",
+          "sha256": "61f15a081efa75c63ba4e36799c26b11590f8a31ae985030923a44a2f0d69bd1"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v27-aot2/paired/aot_example__01_forward__2.json",
+          "sha256": "2b717fd4083676e53cb9c7e2b18dcd5b3b651493ef3becf7196dfc9244f88ec7"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/abab-aot-softmax2-v29-quack-gpu3-v2/result.json"
+      }
+    },
+    {
+      "index": 51,
+      "name": "low_mem_dropout/01_forward/shape0",
+      "accepted": {
+        "ratio": 1.5261044406717257,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-simt-rng/verify/low_mem_dropout__01_forward__0-v1/result.json",
+          "sha256": "6bd3f7463e660e83a51d781aca34b47e6336edd51a3745a9ea4cd79e4dcdec1e"
+        },
+        "goal_pointer": "/shapes/51",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 51,
+        "target": "low_mem_dropout/01_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__0__cute.json",
+          "sha256": "766333d0f57d6cbb69005826e9bf8b1aab8b9287d71549130b0162ff62063d8c"
+        },
+        "raw_gpu": "7",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__01_forward__0.json",
+          "sha256": "8b1f33d2afab14ccd29988316d417e29211ae0d2a56b9544352beb26691164c5"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 1.0079576204985463,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          266,
+          235
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.01206399966031313
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "low_mem_dropout/01_forward/shape0",
+        "before": 1.0079576204985463,
+        "current": 1.5261044406717257,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__0__cute.json",
+          "sha256": "766333d0f57d6cbb69005826e9bf8b1aab8b9287d71549130b0162ff62063d8c"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__01_forward__0.json",
+          "sha256": "8b1f33d2afab14ccd29988316d417e29211ae0d2a56b9544352beb26691164c5"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-simt-rng/verify/low_mem_dropout__01_forward__0-v1/result.json"
+      }
+    },
+    {
+      "index": 52,
+      "name": "low_mem_dropout/01_forward/shape1",
+      "accepted": {
+        "ratio": 1.0664557437101878,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-simt-rng/paired/low_mem_dropout__01_forward__1.json",
+          "sha256": "df5d28ece01a17090606d4d0a6cf33eeb522fa9a2d067a9e866c1e9d39f0b686"
+        },
+        "goal_pointer": "/shapes/52",
+        "qualification_review": {
+          "name": "low_mem_dropout/01_forward/shape1",
+          "status": "current_ratio_retained",
+          "classification": "other_nonwinning_baseline_endpoint_gap",
+          "preserved_ratio": 1.0664557437101878,
+          "preserved_artifact": "artifacts/worst20-2026-09-12/after-simt-rng/paired/low_mem_dropout__01_forward__1.json",
+          "event_lines": [
+            18156
+          ],
+          "requires_provenance_revalidation_before_final_report": true,
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/guard-current60-qualification-decision-root-v1.json",
+          "decision_sha256": "c55b5d5506bd0e667bc7c10258f58e31cab36176d4d1fba2011455968d4304b9"
+        }
+      },
+      "original": {
+        "index": 52,
+        "target": "low_mem_dropout/01_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__1__cute.json",
+          "sha256": "5b1d4433cdcdc39d5ec6e635db03058f4f447b7983a50c91698468ea811c1e31"
+        },
+        "raw_gpu": "7",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__01_forward__1.json",
+          "sha256": "7e361a935d4bf172225956e19e71dff3c71e3993a87fdd6b3069f521b7092602"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.22459180350800753,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          287,
+          265
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.09603200107812881
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "low_mem_dropout/01_forward/shape1",
+        "before": 0.22459180350800753,
+        "current": 1.0664557437101878,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__1__cute.json",
+          "sha256": "5b1d4433cdcdc39d5ec6e635db03058f4f447b7983a50c91698468ea811c1e31"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__01_forward__1.json",
+          "sha256": "7e361a935d4bf172225956e19e71dff3c71e3993a87fdd6b3069f521b7092602"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-simt-rng/paired/low_mem_dropout__01_forward__1.json"
+      }
+    },
+    {
+      "index": 53,
+      "name": "low_mem_dropout/01_forward/shape2",
+      "accepted": {
+        "ratio": 1.0981928203863713,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json",
+          "sha256": "d8509e9eeb6fd549e85e09405f80ed3f7586f10f11731d51175180b0bfd70d98"
+        },
+        "goal_pointer": "/shapes/53",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 53,
+        "target": "low_mem_dropout/01_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/cute-philox4-adjacency-shape2-full-v1-gpu6/before/raw/low_mem_dropout__2__cute.json",
+          "sha256": "ec8ef7939196e0b7a5ce68b974b0ef95154931395e4ab019aaea02e679f79fb2"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /evidence/before -> before audit /files_checked_twice",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json",
+          "sha256": "d8509e9eeb6fd549e85e09405f80ed3f7586f10f11731d51175180b0bfd70d98"
+        },
+        "supporting_receipts": [
+          {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-four-adjacency-shape2-full-cold-gpu6-v1-diagnosis/root-before-audit-v1.json",
+            "sha256": "e6958caf2815f90ea44708ad84952ec6458b6b1ef098322b5271aa893a57c5d2"
+          }
+        ],
+        "reported_before_ratio": 0.08211342037479263,
+        "reported_ratio_fields": [
+          "/cases/01_forward/before_ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091933,
+        "autotune_config_counts": [
+          323,
+          275
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.7105280160903931
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "low_mem_dropout/01_forward/shape2",
+        "before": 0.08211342037479263,
+        "current": 1.0981928203863713,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/cute-philox4-adjacency-shape2-full-v1-gpu6/before/raw/low_mem_dropout__2__cute.json",
+          "sha256": "ec8ef7939196e0b7a5ce68b974b0ef95154931395e4ab019aaea02e679f79fb2"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json",
+          "sha256": "d8509e9eeb6fd549e85e09405f80ed3f7586f10f11731d51175180b0bfd70d98"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json"
+      }
+    },
+    {
+      "index": 54,
+      "name": "low_mem_dropout/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.50799988591299,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-simt-rng/verify/low_mem_dropout__00_forward__0-v1/result.json",
+          "sha256": "5519f2d1d0f2f24cdbfc639077b513cfd01aa800e0dd3339decfa5304eb12dfd"
+        },
+        "goal_pointer": "/shapes/54",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 54,
+        "target": "low_mem_dropout/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__0__cute.json",
+          "sha256": "766333d0f57d6cbb69005826e9bf8b1aab8b9287d71549130b0162ff62063d8c"
+        },
+        "raw_gpu": "7",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__00_forward__0.json",
+          "sha256": "2277c257844404225e54c2c51d925d1400208e6c388df91241e62ccfba5a3349"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 1.0079576204985463,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          266,
+          235
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.01206399966031313
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "low_mem_dropout/00_forward/shape0",
+        "before": 1.0079576204985463,
+        "current": 1.50799988591299,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__0__cute.json",
+          "sha256": "766333d0f57d6cbb69005826e9bf8b1aab8b9287d71549130b0162ff62063d8c"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__00_forward__0.json",
+          "sha256": "2277c257844404225e54c2c51d925d1400208e6c388df91241e62ccfba5a3349"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-simt-rng/verify/low_mem_dropout__00_forward__0-v1/result.json"
+      }
+    },
+    {
+      "index": 55,
+      "name": "low_mem_dropout/00_forward/shape1",
+      "accepted": {
+        "ratio": 1.0664557437101878,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-simt-rng/paired/low_mem_dropout__00_forward__1.json",
+          "sha256": "b557c47971b36e7126bd538fe502555194c0ab3204804c75aad9b6360b7e05a1"
+        },
+        "goal_pointer": "/shapes/55",
+        "qualification_review": {
+          "name": "low_mem_dropout/00_forward/shape1",
+          "status": "current_ratio_retained",
+          "classification": "other_nonwinning_baseline_endpoint_gap",
+          "preserved_ratio": 1.0664557437101878,
+          "preserved_artifact": "artifacts/worst20-2026-09-12/after-simt-rng/paired/low_mem_dropout__00_forward__1.json",
+          "event_lines": [
+            18156
+          ],
+          "requires_provenance_revalidation_before_final_report": true,
+          "decision_artifact": "artifacts/worst20-2026-09-12/proposals/guard-current60-qualification-decision-root-v1.json",
+          "decision_sha256": "c55b5d5506bd0e667bc7c10258f58e31cab36176d4d1fba2011455968d4304b9"
+        }
+      },
+      "original": {
+        "index": 55,
+        "target": "low_mem_dropout/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__1__cute.json",
+          "sha256": "5b1d4433cdcdc39d5ec6e635db03058f4f447b7983a50c91698468ea811c1e31"
+        },
+        "raw_gpu": "7",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__00_forward__1.json",
+          "sha256": "54d84e188f591937022688ef0ec93bbae6bd035295cc83ed14f7137c1ec73465"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.22459180350800753,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          287,
+          265
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.09603200107812881
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "low_mem_dropout/00_forward/shape1",
+        "before": 0.22459180350800753,
+        "current": 1.0664557437101878,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/raw/low_mem_dropout__1__cute.json",
+          "sha256": "5b1d4433cdcdc39d5ec6e635db03058f4f447b7983a50c91698468ea811c1e31"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-priority-rng/paired/low_mem_dropout__00_forward__1.json",
+          "sha256": "54d84e188f591937022688ef0ec93bbae6bd035295cc83ed14f7137c1ec73465"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-simt-rng/paired/low_mem_dropout__00_forward__1.json"
+      }
+    },
+    {
+      "index": 56,
+      "name": "low_mem_dropout/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.1031984915609783,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json",
+          "sha256": "d8509e9eeb6fd549e85e09405f80ed3f7586f10f11731d51175180b0bfd70d98"
+        },
+        "goal_pointer": "/shapes/56",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 56,
+        "target": "low_mem_dropout/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/cute-philox4-adjacency-shape2-full-v1-gpu6/before/raw/low_mem_dropout__2__cute.json",
+          "sha256": "ec8ef7939196e0b7a5ce68b974b0ef95154931395e4ab019aaea02e679f79fb2"
+        },
+        "raw_gpu": "6",
+        "resolution": "before artifact /evidence/before -> before audit /files_checked_twice",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json",
+          "sha256": "d8509e9eeb6fd549e85e09405f80ed3f7586f10f11731d51175180b0bfd70d98"
+        },
+        "supporting_receipts": [
+          {
+            "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-four-adjacency-shape2-full-cold-gpu6-v1-diagnosis/root-before-audit-v1.json",
+            "sha256": "e6958caf2815f90ea44708ad84952ec6458b6b1ef098322b5271aa893a57c5d2"
+          }
+        ],
+        "reported_before_ratio": 0.08232750441627416,
+        "reported_ratio_fields": [
+          "/cases/00_forward/before_ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091933,
+        "autotune_config_counts": [
+          323,
+          275
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.7105120122432709
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "low_mem_dropout/00_forward/shape2",
+        "before": 0.08232750441627416,
+        "current": 1.1031984915609783,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/probes/cute-philox4-adjacency-shape2-full-v1-gpu6/before/raw/low_mem_dropout__2__cute.json",
+          "sha256": "ec8ef7939196e0b7a5ce68b974b0ef95154931395e4ab019aaea02e679f79fb2"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json",
+          "sha256": "d8509e9eeb6fd549e85e09405f80ed3f7586f10f11731d51175180b0bfd70d98"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/proposals/cute-philox-refreshed-baseline-fixed-gpu6-v1-diagnosis/root-qualified-decision-v1.json"
+      }
+    },
+    {
+      "index": 57,
+      "name": "aot_compile_example/00_forward/shape0",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_compile_example-00_forward-0-abab-v1/result.json",
+          "sha256": "e159b1fb2ed3135944e0795cea8757d17793a1ab389cb99b4aab94d6da59cff0"
+        },
+        "goal_pointer": "/shapes/57",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 57,
+        "target": "aot_compile_example/00_forward/shape0",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/aot_compile_example__0__cute.json",
+          "sha256": "f434d6c02abdcf03e491b30365da2aac46a8c01c11996930e47dc836f2e40568"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/aot_compile_example__00_forward__0.json",
+          "sha256": "f7864877581312b846de6f1b9b0d3e4a61a4cdd281c9ed60b5ce9c40a5d02e6a"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 1.0,
+        "reported_ratio_fields": [
+          "/ratio",
+          "/cute_autotunes/0/selected_config/loop_orders/0/1",
+          "/cute_autotunes/0/selected_config/cute_vector_widths/0",
+          "/cute_autotunes/0/selected_config/cute_vector_widths/1"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091201,
+        "autotune_config_counts": [
+          456
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.006016000173985958
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_compile_example/00_forward/shape0",
+        "before": 1.0,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/raw/aot_compile_example__0__cute.json",
+          "sha256": "f434d6c02abdcf03e491b30365da2aac46a8c01c11996930e47dc836f2e40568"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v1/paired/aot_compile_example__00_forward__0.json",
+          "sha256": "f7864877581312b846de6f1b9b0d3e4a61a4cdd281c9ed60b5ce9c40a5d02e6a"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-collective-relocated-v8/verify/aot_compile_example-00_forward-0-abab-v1/result.json"
+      }
+    },
+    {
+      "index": 58,
+      "name": "aot_compile_example/00_forward/shape1",
+      "accepted": {
+        "ratio": 0.9920319274829916,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/after-simt-norms-v1/verify/aot_compile_example__1__abab_v1/result.json",
+          "sha256": "06c0bf5de42124ae1ecede0a6120e3a24dc306f2f2c3069aa80bbd56dfa6b665"
+        },
+        "goal_pointer": "/shapes/58",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 58,
+        "target": "aot_compile_example/00_forward/shape1",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/aot_compile_example__1__cute.json",
+          "sha256": "74277c1e68e0e97e095b0da0039c1f4c8a172f900700b4bd5d286e74f3a90cc6"
+        },
+        "raw_gpu": "5",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/aot_compile_example__00_forward__1.json",
+          "sha256": "0ab5fcce4866172ddfef495b0ad44a79689e1ed7357ee4f12e74201ecd0417a2"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 1.0,
+        "reported_ratio_fields": [
+          "/shape",
+          "/ratio",
+          "/cute_autotunes/0/num_accuracy_failures",
+          "/cute_autotunes/0/selected_config/block_sizes/0",
+          "/cute_autotunes/0/selected_config/loop_orders/0/0",
+          "/cute_autotunes/0/selected_config/cute_vector_widths/0",
+          "/cute_autotunes/0/selected_config/cute_cluster_n"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026091202,
+        "autotune_config_counts": [
+          643
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.007968000136315823
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_compile_example/00_forward/shape1",
+        "before": 1.0,
+        "current": 0.9920319274829916,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/raw/aot_compile_example__1__cute.json",
+          "sha256": "74277c1e68e0e97e095b0da0039c1f4c8a172f900700b4bd5d286e74f3a90cc6"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before/paired/aot_compile_example__00_forward__1.json",
+          "sha256": "0ab5fcce4866172ddfef495b0ad44a79689e1ed7357ee4f12e74201ecd0417a2"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/after-simt-norms-v1/verify/aot_compile_example__1__abab_v1/result.json"
+      }
+    },
+    {
+      "index": 59,
+      "name": "aot_compile_example/00_forward/shape2",
+      "accepted": {
+        "ratio": 1.0,
+        "artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/abab-aot-compile2-v31-gpu2-v1/result.json",
+          "sha256": "8dcb2781870637f547e06552c98a4fcfa841e76132f558aaf1d937f0ee364a18"
+        },
+        "goal_pointer": "/shapes/59",
+        "qualification_review": null
+      },
+      "original": {
+        "index": 59,
+        "target": "aot_compile_example/00_forward/shape2",
+        "raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v31-aot_compile_example-2-gpu2-four-v1/raw/aot_compile_example__2__cute.json",
+          "sha256": "d788001b665a2f2891167b54009e8bb6869e2f0e27fdad486809987491f836b5"
+        },
+        "raw_gpu": "2",
+        "resolution": "before artifact /sources/cute, pinned by evidence.raw_before_refs",
+        "before_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v31-aot_compile_example-2-gpu2-four-v1/paired/aot_compile_example__00_forward__2.json",
+          "sha256": "9713de5ee55be56cdb958ae150dc2657b5c5f49383a0239a35ba19355ffc5991"
+        },
+        "supporting_receipts": [],
+        "reported_before_ratio": 0.6430542946275776,
+        "reported_ratio_fields": [
+          "/ratio"
+        ],
+        "metadata_matches_required_fields": true,
+        "recorded_seed": 2026092922,
+        "autotune_config_counts": [
+          496
+        ],
+        "validity": "valid_original_FULL_graph_latency",
+        "target_rows": [
+          {
+            "impl": "helion-cute:helion",
+            "status": "ok",
+            "graph_ms": 0.03478400036692619
+          }
+        ]
+      },
+      "chart_comparison": {
+        "name": "aot_compile_example/00_forward/shape2",
+        "before": 0.6430542946275776,
+        "current": 1.0,
+        "before_raw": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v31-aot_compile_example-2-gpu2-four-v1/raw/aot_compile_example__2__cute.json",
+          "sha256": "d788001b665a2f2891167b54009e8bb6869e2f0e27fdad486809987491f836b5"
+        },
+        "before_ratio_artifact": {
+          "path": "/data/users/jansel/ws7/helion/artifacts/worst20-2026-09-12/before-relocated-v31-aot_compile_example-2-gpu2-four-v1/paired/aot_compile_example__00_forward__2.json",
+          "sha256": "9713de5ee55be56cdb958ae150dc2657b5c5f49383a0239a35ba19355ffc5991"
+        },
+        "current_artifact": "artifacts/worst20-2026-09-12/abab-aot-compile2-v31-gpu2-v1/result.json"
+      }
+    }
+  ],
+  "new_measurements": false,
+  "final_stack_runtime_comparison": false,
+  "completed_pre_cleanup_source_refresh_cases": 2,
+  "pre_cleanup_source_refresh_total": 60,
+  "source_refresh_status": "stopped_for_history_cleanup",
+  "raw_files_copied_into_payload": false
+}
