@@ -74,6 +74,17 @@ def pallas_relu(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_fixed_tile_mask(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_rows in hl.tile(x.size(0), block_size=128):
+        for tile_cols in hl.tile(x.size(1), block_size=128):
+            keep = tile_rows.index[:, None] >= tile_cols.index[None, :]
+            values = hl.full([128, 128], 1.0, dtype=x.dtype)
+            out[tile_rows, tile_cols] = torch.where(keep, values, 0.0)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sin(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -979,6 +990,17 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_fixed_integer_tile_extent(self) -> None:
+        x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
+        expected = torch.where(
+            torch.arange(256, device=DEVICE)[:, None]
+            >= torch.arange(256, device=DEVICE)[None, :],
+            torch.ones_like(x),
+            0.0,
+        )
+        _code, result = code_and_output(pallas_fixed_tile_mask, (x,))
+        torch.testing.assert_close(result.cpu(), expected.cpu())
+
     @skipIfPallasInterpret("device-side comparison requires a real TPU")
     def test_large_autotune_accuracy_check(self) -> None:
         x = torch.randn(256, 128, device=DEVICE, dtype=torch.float32)
