@@ -66,6 +66,7 @@ if TYPE_CHECKING:
     from helion._compiler.pallas.ordered_carry import CarryBoundaryTile
     from helion._compiler.pallas.ordered_carry import CarryScratchKey
     from helion._compiler.pallas.plan_tiling import DimensionTiling
+    from helion._compiler.pallas.plan_tiling import GridScalarIndex
 
     _P = TypeVar("_P", bound="TensorPropertyArg")
 
@@ -438,6 +439,10 @@ class DeviceFunction:
         self._flydsl_setup: dict[tuple[object, ...], dict[str, int | str]] = {}
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
+        # Pallas: tensor dimensions selected by scalar metadata indexed by one
+        # outer grid axis. The launcher scalar-prefetches the metadata and uses
+        # it directly in the selected tensor's BlockSpec index map.
+        self.pallas_grid_scalar_indices: dict[int, dict[int, GridScalarIndex]] = {}
         # Track Pallas remote-copy operands by tensor and storage identity. The
         # storage key keeps views of the same allocation consistent across
         # nested control-flow graphs.
