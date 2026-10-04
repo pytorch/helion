@@ -2539,6 +2539,44 @@ class TestMetalAutotune(unittest.TestCase):
 
         return matmul
 
+    def test_oversized_mpp_tiles_are_rejected(self) -> None:
+        """``matmul2d`` is silently wrong for large M/N tile extents.
+
+        Not a rounding problem: on a 512x512 fp32 product with values of order
+        1e2, the errors reach 1.8e29 and NaN, with no compile or runtime
+        diagnostic.  Reproduces in plain MSL with no Helion involved.
+
+        The predicate is the *extent*, not the aspect ratio: 128x16 (8:1) is
+        correct everywhere while 256x256 (1:1) is wrong at N=1 and N=2.  Nor
+        is it accumulator capacity -- 256x16 at 128 elements per thread fails
+        while 128x128 at 512 does not.  Past 256 there is often no N that
+        works at all: 512x512 is wrong at every N up to the 32 simdgroups a
+        threadgroup can hold.
+        """
+        x = torch.randn(512, 512, device=DEVICE)
+        y = torch.randn(512, 512, device=DEVICE)
+
+        for bm, bn, warps in [(256, 32, 1), (32, 256, 1), (256, 256, 1), (512, 512, 8)]:
+            with (
+                self.subTest(tile=(bm, bn), num_warps=warps),
+                self.assertRaisesRegex(
+                    exc.BackendUnsupported, "MPP matmul tile extent"
+                ),
+            ):
+                self._mpp_matmul(bm, bn, 64, warps)(x, y)
+
+        # Both extents <= 128 is the region that measured clean: 576 of 576
+        # across TILE_K in {16..512} and N in {1..32}.  K is not part of the
+        # predicate, so a large BK must still be accepted.
+        for bm, bn, bk, warps in [
+            (128, 128, 64, 1),
+            (64, 128, 256, 8),
+            (128, 64, 32, 2),
+        ]:
+            with self.subTest(tile=(bm, bn, bk), num_warps=warps):
+                out = self._mpp_matmul(bm, bn, bk, warps)(x, y)
+                torch.testing.assert_close(out, x @ y, rtol=1e-3, atol=1e-3)
+
     def test_strided_matmul_operands_are_correct(self) -> None:
         """Transposed and row-padded operands lower through MPP correctly.
 
@@ -2694,20 +2732,59 @@ class TestMetalAutotune(unittest.TestCase):
         self.assertIn("_ty = (offset_", msl)
         self.assertIn("_tx = (offset_", msl)
 
-    def test_accuracy_check_guards_the_mpp_matmul(self) -> None:
-        """Matmul autotuning depends on candidate validation being on.
+    def test_mpp_tile_guard_uses_resolved_axis(self) -> None:
+        """The cap validates M/N even with an unrelated leading grid axis."""
 
-        ``mpp::tensor_ops::matmul2d`` returns silently wrong results for
-        strongly asymmetric tiles at low ``execution_simdgroups<N>`` -- 8:1
-        needs N>=2 and 1:8 needs N>=4 on an M4 Pro -- with no compile or
-        runtime error.  That predates this backend and reproduces in plain MSL
-        with no Helion involved.  Those tile shapes are exactly what a tuner
-        reaches for on non-square problems, so the search relies on
-        ``autotune_accuracy_check`` rejecting them.
+        @helion.kernel(backend="metal", autotune_effort="none")
+        def three_axis(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            m, k = a.size()
+            _k, n = b.size()
+            out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+            for _tg, tm, tn in hl.tile([1, m, n]):
+                acc = hl.zeros([tm, tn], dtype=torch.float32)
+                for tk in hl.tile(k):
+                    acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+                out[tm, tn] = acc
+            return out
+
+        a = torch.randn(512, 512, device=DEVICE)
+        b = torch.randn(512, 512, device=DEVICE)
+        cfg = [1, 128, 256, 32]
+        with self.assertRaisesRegex(exc.BackendUnsupported, "tile extent 256"):
+            helion.kernel(
+                three_axis.fn,
+                backend="metal",
+                configs=[helion.Config(block_sizes=cfg, num_warps=2)],
+            )(a, b)
+
+        ok = helion.kernel(
+            three_axis.fn,
+            backend="metal",
+            configs=[helion.Config(block_sizes=[1, 128, 128, 32], num_warps=2)],
+        )
+        torch.testing.assert_close(ok(a, b), a @ b, rtol=1e-3, atol=1e-3)
+
+    def test_accuracy_check_is_a_second_line_not_the_only_one(self) -> None:
+        """Autotuning also validates candidates, but cannot be relied on alone.
+
+        It does reject these configs in practice, because they are wrong by
+        many orders of magnitude rather than subtly.  It is not sufficient on
+        its own for three reasons, which is why the codegen guard above
+        exists: it does nothing for a hand-written config, it can be disabled
+        with ``HELION_AUTOTUNE_ACCURACY_CHECK=0``, and it compares against the
+        default config run on the caller's own arguments -- so autotuning on
+        degenerate input (a zero-filled warm-up batch, say) makes the
+        comparison vacuous and it accepts them.
         """
         from helion.runtime.settings import Settings
 
         self.assertTrue(Settings().autotune_accuracy_check)
+
+        # The guard holds even where the accuracy check would not: zeros make
+        # every candidate agree with the baseline.
+        zeros = torch.zeros(512, 512, device=DEVICE)
+        with self.assertRaisesRegex(exc.BackendUnsupported, "MPP matmul tile extent"):
+            self._mpp_matmul(32, 256, 64, 1)(zeros, zeros)
 
     def test_effort_none_uses_the_default_config(self) -> None:
         @helion.kernel(backend="metal", autotune_effort="none")

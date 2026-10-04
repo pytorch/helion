@@ -60,6 +60,7 @@ KERNELS = [
     "silu_and_mul_per_block_quant",
     "fused_qk_norm_rope",
     # Fixed-shape model regions compiled as one Triton kernel.
+    "kda_decode",
     "qwen3_decode_layer",
     "gemma4_a4b_moe",
     "gpt_oss_moe",
