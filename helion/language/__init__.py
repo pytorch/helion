@@ -35,6 +35,7 @@ from .memory_ops import load as load
 from .memory_ops import store as store
 from .pdl_ops import pdl_launch_dependents as pdl_launch_dependents
 from .pdl_ops import pdl_wait as pdl_wait
+from .prefetch_ops import prefetch as prefetch
 from .quantized_ops import float4_e2m1fn_x2_to_float32 as float4_e2m1fn_x2_to_float32
 from .quantized_ops import load_bfloat16_x16_to_float16 as load_bfloat16_x16_to_float16
 from .quantized_ops import (
