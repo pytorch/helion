@@ -129,9 +129,11 @@ jobs:
             # --precision (see below), drop --cudagraph and
             # --latency-measure-mode triton_do_bench (CUDA/Triton-only; TPU uses
             # the wall-clock _do_bench_tpu path). Shapes are tritonbench's own,
-            # count-capped by --num-inputs; per-kernel shape args (e.g. embedding
-            # --B/--T/--D/--v-range) are supplied via inputs.env-vars / custom
-            # args where a default shape exceeds TPU vmem.
+            # sampled equally-spaced across the full range by --num-inputs /
+            # --input-sample-mode (not just the smallest first-k, so the
+            # dashboard covers small/mid/large); per-kernel shape args (e.g.
+            # embedding --B/--T/--D/--v-range) are supplied via inputs.env-vars /
+            # custom args where a default shape exceeds TPU vmem.
             #
             # Precision follows the canonical helion examples per kernel: bf16
             # for gemm/softmax/layer_norm and rms_norm forward, fp32 for kl_div
@@ -154,6 +156,33 @@ jobs:
             PRECISION=bf16
             case "$kernel" in
               kl_div|welford|rms_norm-bwd) PRECISION=fp32 ;;
+            esac
+            # Most kernels sample 6 shapes equally-spaced across their range.
+            # Two take the feasible low end via first-k instead, for unrelated
+            # reasons (measured on tpu7x 2026-09-14):
+            #
+            #   - kl_div: its reduction reaches V=131072 (2**17). At fp32 that
+            #     shape does not finish -- a single-shape run was still in
+            #     generation 0 of the autotune search after 45min. first-k 4
+            #     keeps V<=32768.
+            #
+            #   - rms_norm-bwd: at H=32768 (2**15) helion reports "Autotuning
+            #     reference config failed while computing baseline", so the
+            #     kernel yields no column at all. This is the missing
+            #     autotune_baseline_fn, not a vmem or search-space limit: it is
+            #     the single failing shape in the sweep, H=16384 gives helion
+            #     2.41x, and the error itself names autotune_baseline_fn as the
+            #     fix. first-k 5 keeps H<=16384 until that lands.
+            #
+            # rms_norm forward is NOT capped: H=32768 runs clean at 1.93x with
+            # accuracy 1, both in isolation and as the last shape of a full
+            # 6-shape sweep. (It was capped alongside -bwd when this was first
+            # written; the autotuner search-robustness fix has since landed.)
+            NUM_INPUTS=6
+            SAMPLE_MODE=equally-spaced-k
+            case "$kernel" in
+              kl_div) NUM_INPUTS=4; SAMPLE_MODE=first-k ;;
+              rms_norm-bwd) NUM_INPUTS=5; SAMPLE_MODE=first-k ;;
             esac
             # Cap each kernel at HELION_BENCHMARK_KERNEL_TIMEOUT. The bridge
             # shells out to tritonbench's runner, which never reads that
@@ -187,7 +216,8 @@ jobs:
                 --helion-backend pallas \
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
-                --num-inputs 2 \
+                --num-inputs $NUM_INPUTS \
+                --input-sample-mode $SAMPLE_MODE \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
                 --baseline $BASELINE \
