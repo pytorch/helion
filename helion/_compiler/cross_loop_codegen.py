@@ -33,6 +33,7 @@ from .host_function import HostFunction
 from .program_id import _clone_ast_value
 from .program_id import _clone_stmt
 from .program_id import typed_program_id
+from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from .program_id import PersistentProgramIDs
     from .program_id import PIDInfo
     from .program_id import ProgramIDs
+    from .tile_dependency import TileDependencyGraph
 
 
 # Independent readiness counters occupy distinct cache lines so polling one
@@ -539,6 +541,43 @@ def _register_cross_loop_state(
 
 
 @dataclasses.dataclass(frozen=True)
+class ScatterRoot:
+    """Tasks of a root with inband scatter stores, each owing one done word."""
+
+    axis_order: tuple[int, ...]
+    counts: dict[int, int]
+    tasks: int
+    # [parity][source][task] words, pushed by the root's last scatter store.
+    done: int
+    last: int
+
+    def task(self, coordinates: Mapping[int, str]) -> str:
+        """Flat task index of per-axis tile coordinates."""
+        terms, multiplier = [], 1
+        for block_id in self.axis_order:
+            if self.counts[block_id] != 1:
+                terms.append(f"({coordinates[block_id]}) * {multiplier}")
+            multiplier *= self.counts[block_id]
+        return " + ".join(terms) or "0"
+
+
+@dataclasses.dataclass(frozen=True)
+class Scatter:
+    """An inband row scatter: which keys (aligned row blocks) each task wrote."""
+
+    root: int
+    position: int
+    lanes: int
+    shape: tuple[int, ...]
+    extents: tuple[int, ...]
+    key_strides: tuple[int, ...]
+    keys: int
+    # Producer-local [parity][task][lane] records; consumer-local [source][key].
+    records: int
+    cover: int
+
+
+@dataclasses.dataclass(frozen=True)
 class PeerState:
     """Symmetric uint64 state: inband mailboxes, peer counters, a done slot and
     the static pipeline's launch epoch.
@@ -558,6 +597,11 @@ class PeerState:
     slots: dict[int, int]
     done: int
     launch: int
+    scatters: dict[int, Scatter] = dataclasses.field(default_factory=dict)
+    scatter_roots: dict[int, ScatterRoot] = dataclasses.field(default_factory=dict)
+    # Set by a consumer that read an unwritten row of this rank; launch starts.
+    flag: int = 0
+    started: int = 0
 
     def mailbox(self, allocation_id: int, source: object) -> str:
         """Word offset of ``source``'s slot for this launch's parity."""
@@ -599,6 +643,10 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
         pair = row % (2 * lanes) == 0 and size % 2 == 0
         mailboxes[allocation_id] = (words, size, lanes, pair)
         words += 2 * world_size * size
+    scatters, scatter_roots, flag = _scatter_layout(
+        graph, block_size, world_size, words
+    )
+    words = flag + (1 + world_size if scatters else 0)
     words = -(-words // _PEER_SLOT_WORDS) * _PEER_SLOT_WORDS
     producers = sorted(
         {
@@ -645,8 +693,103 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
         slots=slots,
         done=done,
         launch=done + 1,
+        scatters=scatters,
+        scatter_roots=scatter_roots,
+        flag=flag,
+        started=flag + 1,
     )
     return device_function.peer_state
+
+
+def _scatter_layout(
+    graph: TileDependencyGraph,
+    block_size: Callable[[int], int],
+    world_size: int,
+    words: int,
+) -> tuple[dict[int, Scatter], dict[int, ScatterRoot], int]:
+    """Records, cover tables and done words of the inband scatters from ``words``,
+    and the first word after them."""
+    env = CompileEnvironment.current()
+    device_ir = HostFunction.current().device_ir
+    stores = {
+        allocation_id: graph.inband_store(allocation_id)
+        for allocation_id in sorted(graph.inband_allocation_ids)
+        if graph.scatter_position(allocation_id) is not None
+    }
+    scatter_roots: dict[int, ScatterRoot] = {}
+    for root in sorted({store.root for store in stores.values()}):
+        family = graph.task_families[root]
+        counts = {
+            # The R1 scatter check admitted only integer extents.
+            axis.block_id: -(
+                -int(cast("sympy.Integer", axis.extent)) // block_size(axis.block_id)
+            )
+            for axis in family.axes
+        }
+        mine = [store for store in stores.values() if store.root == root]
+        if len({store.graph_id for store in mine}) != 1:
+            raise exc.CrossLoopSchedulingError(
+                "because a root's inband scatter stores must share one block"
+            )
+        last = max(mine, key=lambda store: store.graph_node_index)
+        scatter_roots[root] = ScatterRoot(
+            axis_order=family.logical_axis_order,
+            counts=counts,
+            tasks=math.prod(counts.values()),
+            done=0,
+            last=last.access_id,
+        )
+    scatters: dict[int, Scatter] = {}
+    for allocation_id, store in stores.items():
+        position = graph.scatter_position(allocation_id)
+        assert position is not None
+        node = next(
+            node
+            for node in device_ir.graphs[store.graph_id].graph.nodes
+            if store.access_id in node.meta.get(TILE_ACCESS_META, ())
+        )
+        index = node.args[1][position]
+        assert isinstance(index, torch.fx.Node)
+        rows = index.meta["val"]
+        if rows.ndim > 1:
+            raise exc.CrossLoopSchedulingError(
+                "because an inband scatter's row index must be a vector"
+            )
+        lanes = 1
+        if rows.ndim == 1:
+            size = rows.size(0)
+            block_id = None if isinstance(size, int) else env.get_block_id(size)
+            lanes = block_size(block_id) if block_id is not None else int(size)
+        shape = tuple(int(extent) for extent in store.tensor_shape)
+        extents = []
+        for dim in range(len(shape)):
+            extent = (
+                1 if dim == position else graph.inband_extent(store, dim, block_size)
+            )
+            if extent is None:
+                raise exc.CrossLoopSchedulingError(
+                    "because an inband scatter must write aligned row blocks"
+                )
+            extents.append(extent)
+        counts = [-(-n // extent) for n, extent in zip(shape, extents, strict=True)]
+        strides = [math.prod(counts[dim + 1 :]) for dim in range(len(shape))]
+        tasks = scatter_roots[store.root].tasks
+        scatters[allocation_id] = Scatter(
+            root=store.root,
+            position=position,
+            lanes=lanes,
+            shape=shape,
+            extents=tuple(extents),
+            key_strides=tuple(strides),
+            keys=math.prod(counts),
+            records=words,
+            cover=words + 2 * tasks * lanes,
+        )
+        words += 2 * tasks * lanes + world_size * math.prod(counts)
+    for root, layout in scatter_roots.items():
+        scatter_roots[root] = dataclasses.replace(layout, done=words)
+        words += 2 * world_size * layout.tasks
+    return scatters, scatter_roots, words
 
 
 def _outline_cross_loop_region(
@@ -1471,6 +1614,7 @@ def emit_cross_loop_schedule(
 
     dispatch_ticket: str | None = None
     peer_launch = ""
+    entry_gate: list[ast.stmt] = []
     if not uses_packet_dispatch:
         assert state_arg is not None
         result: list[ast.stmt] = [
@@ -1491,6 +1635,36 @@ def emit_cross_loop_schedule(
             result.append(
                 statement_from_string(f"{peer.epoch} = tl.load({peer_launch}) + 1")
             )
+            if peer.scatters:
+                # Read the hold flag now; its wait runs once the first loop's
+                # prologue loads are in flight.
+                held = device_function.new_var("tile_dependency_peer_held", dce=False)
+                result.append(
+                    statement_from_string(
+                        f"{held} = tl.load({peer.state} + {peer.flag}, volatile=True)"
+                        f" == {peer.epoch}"
+                    )
+                )
+                # Announce this launch, then wait out last launch's reads of rows
+                # no task wrote, which this launch may now overwrite.
+                entry_gate = [
+                    create(
+                        ast.If,
+                        test=expr_from_string(f"{worker} == 0"),
+                        body=[
+                            statement_from_string(
+                                "helion_dist_utils._store_on_every_rank("
+                                f"{peer.ptrs}, {peer.started} + {peer.rank}, "
+                                f"{peer.epoch}, {world_size}, {lanes})"
+                            )
+                        ],
+                        orelse=[],
+                    ),
+                    statement_from_string(
+                        f"helion_dist_utils._hold_after_fallback({peer.state}, "
+                        f"{peer.started}, {world_size}, {peer.epoch}, {held})"
+                    ),
+                ]
     else:
         assert dispatch_ticket_arg is not None
         raw_dispatch_ticket = device_function.new_var(
@@ -1681,6 +1855,18 @@ def emit_cross_loop_schedule(
         )
         if extent is not None:
             guarded_extents[root] = extent
+    # Consumers wait on one done word per scatter task (or skip mark) per launch.
+    for root in {} if peer is None else peer.scatter_roots:
+        extent = guarded_extents.get(root)
+        done = device_function.inband_scatter_done.get(root)
+        if done is None or done not in _stored_names(
+            statement
+            for statement in (case_bodies[root] if extent is None else extent.body)
+            if isinstance(statement, ast.Assign)
+        ):
+            raise exc.CrossLoopSchedulingError(
+                "because an inband scatter store must run once in every task"
+            )
 
     def flat_task_coordinates(
         task: str,
@@ -2617,11 +2803,13 @@ def emit_cross_loop_schedule(
         ], live
 
     def skipped_task_dispatch(root: int, live: str) -> list[ast.stmt]:
-        if not any(
+        scatter_root = None if peer is None else peer.scatter_roots.get(root)
+        if scatter_root is None and not any(
             plan.producers[0].producer_root == root for plan in peer_counter_plans
         ):
             return []
-        # Guard-skipped tasks still count once per launch for keyed peers.
+        # Guard-skipped tasks still count once per launch for keyed peers and
+        # mark their scatter done words.
         segment_begin = static_pipeline_plan.static_base(root)
         segment_end = (
             segment_begin + static_pipeline_plan.execution_orders[root].task_count
@@ -2633,6 +2821,19 @@ def emit_cross_loop_schedule(
             f"{launch_worker_count - 1}, 0) // {launch_worker_count} * "
             f"{launch_worker_count}"
         )
+        coordinates = execution_coordinates(root, f"({skipped}) - {segment_begin}")
+        body = peer_counter_publications(root, coordinates, "relaxed")
+        if scatter_root is not None:
+            assert peer is not None
+            body.append(
+                statement_from_string(
+                    f"helion_dist_utils._store_on_every_rank({peer.ptrs}, "
+                    f"{scatter_root.done} + tl.cast({peer.epoch} & 1, tl.int64) * "
+                    f"{world_size * scatter_root.tasks} + {peer.rank} * "
+                    f"{scatter_root.tasks} + {scatter_root.task(coordinates)}, "
+                    f"({peer.epoch} << 32) | 0xFFFFFFFF, {world_size}, {lanes})"
+                )
+            )
         return [
             create(
                 ast.For,
@@ -2640,11 +2841,7 @@ def emit_cross_loop_schedule(
                 iter=expr_from_string(
                     f"range({first}, {segment_end}, {launch_worker_count})"
                 ),
-                body=peer_counter_publications(
-                    root,
-                    execution_coordinates(root, f"({skipped}) - {segment_begin}"),
-                    "relaxed",
-                ),
+                body=body,
                 orelse=[],
                 type_comment=None,
             )
@@ -2932,11 +3129,16 @@ def emit_cross_loop_schedule(
         while resident_roots:
             root = resident_roots.pop(0)
             fused = fused_root_pair(root, resident_roots[0]) if resident_roots else None
-            if fused is None:
-                result.extend(static_root_body(root))
-            else:
-                result.extend(fused)
+            body = static_root_body(root) if fused is None else fused
+            if fused is not None:
                 resident_roots.pop(0)
+            # The gate precedes the first task loop, after its hoisted loads.
+            first = next(
+                (i for i, stmt in enumerate(body) if isinstance(stmt, ast.For)), 0
+            )
+            result.extend([*body[:first], *entry_gate, *body[first:]])
+            entry_gate = []
+        assert not entry_gate, "inband scatters need a resident root"
         result.append(
             statement_from_string(f"tl.store({state_arg} + {worker}, {epoch_var})")
         )

@@ -3657,11 +3657,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     "tile-dependency scheduling"
                 )
                 env.require_persistent_blocked(reason)
-                # Peer transports order static and dynamic schedules alike.
+                # Peer transports order static and dynamic schedules alike; only
+                # static ones mark guard-skipped tasks for inband scatters.
+                graph = device_ir.tile_dependency_graph
+                choices = ("static", "dynamic") if cross_rank else None
+                if any(
+                    graph.scatter_position(allocation_id) is not None
+                    for allocation_id in graph.inband_allocation_ids
+                ):
+                    choices = ("static",)
                 config_spec.enable_cross_loop_pipeline(
-                    choices=("static", "dynamic")
-                    if cross_rank
-                    else VALID_CROSS_LOOP_PIPELINES
+                    choices=choices or VALID_CROSS_LOOP_PIPELINES
                 )
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
