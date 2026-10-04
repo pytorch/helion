@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AsyncCopyDescriptor",
+    "all_reduce",
     "make_async_remote_copy",
     "remote_barrier",
 ]
@@ -104,6 +105,34 @@ def _(*args: object, origin: Origin, **kwargs: object) -> TypeInfo:
 @_decorators.register_fake(remote_barrier)
 def _(device_ids: int | torch.Tensor | list[int | torch.Tensor]) -> None:
     return None
+
+
+def all_reduce(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    peers: torch.Tensor,
+    rank: object,
+    *,
+    algorithm: str | None = None,
+) -> None:
+    """Set ``dst`` to the sum of ``src`` over all ranks, cast to ``dst.dtype``.
+
+    A statement of the kernel's host body, between device loops: the compiler
+    expands it into device loops that exchange ``src`` with the ``peers`` and
+    combine the partials, which it then schedules like the kernel's own.
+    ``src`` and ``dst`` are ``[rows, cols]`` tensors of the same shape,
+    ``peers`` a vector of the other ranks (it may be a full slice such as
+    ``peers[0, :]``) and ``rank`` this rank's ID as a scalar (``rank[0]``).
+
+    ``algorithm`` picks the exchange: ``"one_shot"`` (push ``src`` to every
+    peer, then sum: one round), ``"reduce_scatter"`` (reduce column chunks on
+    their owner ranks, then all-gather them in ``dst.dtype``: two rounds, about
+    ``2 / world`` of the bytes), or ``None`` to choose by payload size.  Both
+    sum the partials in rank order, so the results match bitwise on every rank.
+    Like hand-written exchanges, it relies on a ``hl.remote_barrier`` between
+    kernel invocations.
+    """
+    raise exc.NotInsideKernel
 
 
 @has_side_effect

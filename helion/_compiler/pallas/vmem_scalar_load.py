@@ -4,9 +4,12 @@ TPU VMEM is physically tiled in the two minor dimensions, and Mosaic cannot
 project a runtime scalar index out of either one directly. For 32-bit dtypes
 a dynamic index on the second-minor dimension is legal in the ref subscript
 itself (``ref[i, :]``); the lane dimension is then selected with a static
-index after the load. Packed dtypes and dynamic lane indices instead load
-the window, pad it to the physical tile, rotate the requested element to
-index zero, widen to a 32-bit register type, and extract statically.
+index after the load. A bfloat16 row with every lane kept reads the same
+way through the ref's 32-bit words (``packed_row_load``). Other packed
+dtypes and dynamic lane indices instead load the window, widen it to a
+32-bit register type (Mosaic only rotates 32-bit vectors), pad it to the
+physical tile, rotate the requested element to index zero, and extract
+statically.
 
 ``classify_vmem_scalar_load`` decides whether a load needs this lowering;
 ``emit_vmem_scalar_load`` generates it.
@@ -20,9 +23,12 @@ from typing import TYPE_CHECKING
 import torch
 
 from helion._compiler.ast_extension import expr_from_string
+from helion._compiler.pallas.lane_dense import packed_row_load
+from helion._compiler.pallas.lane_dense import row_packing
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Sequence
 
     from helion._compiler.inductor_lowering import CodegenState
 
@@ -38,12 +44,14 @@ class VmemScalarLoad:
         static_indices: Normalized literal index for each scalar dim, or
             ``None`` when the index is only known at runtime.
         patterns: Per-dim indexing pattern, one entry per tensor dim.
+        lanes: Extent of the minor dim in the resident VMEM window.
     """
 
     scalar_dims: list[int]
     extents: dict[int, int]
     static_indices: dict[int, int | None]
     patterns: tuple[object, ...]
+    lanes: int
 
     def has_runtime_index(self, dim: int) -> bool:
         """Whether ``dim`` (may be negative) has a runtime-only scalar index."""
@@ -103,11 +111,14 @@ def classify_vmem_scalar_load(
     tensor: torch.Tensor,
     index_parts: list[str],
     indexing_patterns: list[object],
+    perm: Sequence[int] | None = None,
 ) -> VmemScalarLoad | None:
     """Decide whether a load needs the VMEM scalar-load lowering.
 
     ``None`` means an ordinary load: no runtime scalar index on the two minor
-    dims, or a form Mosaic already lowers (static 32-bit extracts).
+    dims, or a form Mosaic already lowers (static 32-bit extracts).  The
+    ``index_parts`` of a tensor passed lane dense follow its dim order
+    ``perm``, and so do the dims of the result.
     """
     from helion._compiler.device_function import PallasMemorySpace
     from helion._compiler.pallas.plan_tiling import NonePattern
@@ -121,6 +132,8 @@ def classify_vmem_scalar_load(
     patterns = tuple(p for p in indexing_patterns if not isinstance(p, NonePattern))
     if len(patterns) != tensor.ndim:
         return None
+    dims = range(tensor.ndim) if perm is None else perm
+    patterns = tuple(patterns[d] for d in dims)
     scalar_dims = [
         d
         for d in range(max(0, tensor.ndim - 2), tensor.ndim)
@@ -128,7 +141,7 @@ def classify_vmem_scalar_load(
     ]
     if not scalar_dims:
         return None
-    extents = {d: _resident_extent(state, tensor, d) for d in scalar_dims}
+    extents = {d: _resident_extent(state, tensor, dims[d]) for d in scalar_dims}
     static_indices = {d: _static_index(index_parts[d], extents[d]) for d in scalar_dims}
     if _is_32bit(tensor.dtype) and all(
         index is not None for index in static_indices.values()
@@ -140,6 +153,7 @@ def classify_vmem_scalar_load(
         extents=extents,
         static_indices=static_indices,
         patterns=patterns,
+        lanes=_resident_extent(state, tensor, dims[tensor.ndim - 1]),
     )
 
 
@@ -153,6 +167,18 @@ def _sublane_load_applies(tensor: torch.Tensor, load: VmemScalarLoad) -> bool:
     # TODO(tcombes): when both indices are runtime values, compose the sublane
     # load with a lane roll instead of rolling both axes.
     return load.has_runtime_index(-2) and not load.has_runtime_index(-1)
+
+
+def _packed_row_load_applies(tensor: torch.Tensor, load: VmemScalarLoad) -> bool:
+    """A runtime row of a bfloat16 tensor with every lane kept reads through
+    the ref's 32-bit words, rather than widening and rotating every row."""
+    lane = tensor.ndim - 1
+    return (
+        tensor.ndim >= 2
+        and lane not in load.scalar_dims
+        and load.has_runtime_index(-2)
+        and row_packing(tensor.dtype, load.extents[lane - 1]) == 2
+    )
 
 
 def _sublane_load_expr(
@@ -201,12 +227,21 @@ def _roll_load_expr(
 
     env = CompileEnvironment.current()
     assert isinstance(env.backend, PallasBackend)
-    physical_dtype = torch.int32 if tensor.dtype == torch.bool else tensor.dtype
-    sublane_tiling = env.backend.sublane_tiling(physical_dtype)
-    # Predicates are physically int32 in Mosaic VMEM. Convert before layout
-    # operations instead of treating predicates as packed 8-bit values.
+    # Predicates are physically int32 in Mosaic VMEM, and Mosaic only rotates
+    # 32-bit vectors, so widen sub-32-bit windows before the layout operations.
+    physical_dtype = tensor.dtype
     if tensor.dtype == torch.bool:
-        value = f"lax.convert_element_type({value}, jnp.int32)"
+        physical_dtype = torch.int32
+    elif tensor.dtype.itemsize < 4:
+        physical_dtype = (
+            torch.float32 if tensor.dtype.is_floating_point else torch.int32
+        )
+    if physical_dtype != tensor.dtype:
+        value = (
+            f"lax.convert_element_type({value}, "
+            f"{env.backend.dtype_str(physical_dtype)})"
+        )
+    sublane_tiling = env.backend.sublane_tiling(physical_dtype)
 
     selectors = [":"] * (len(window_dims) + axis_offset)
     pads = [(0, 0)] * len(selectors)
@@ -231,9 +266,6 @@ def _roll_load_expr(
         value = f"jnp.pad({value}, {tuple(pads)!r})"
     for axis, shift in rolls:
         value = f"pltpu.roll({value}, {shift}, axis={axis})"
-    if tensor.dtype != torch.bool and tensor.dtype.itemsize < 4:
-        widen_dtype = "jnp.float32" if tensor.dtype.is_floating_point else "jnp.int32"
-        value = f"lax.convert_element_type({value}, {widen_dtype})"
 
     result = f"{value}[{', '.join(selectors)}]"
     if _is_32bit(tensor.dtype):
@@ -251,4 +283,9 @@ def emit_vmem_scalar_load(
 ) -> ast.AST:
     if _sublane_load_applies(tensor, load):
         return _sublane_load_expr(tensor, ref_name, index_parts, load)
+    if _packed_row_load_applies(tensor, load):
+        lane = tensor.ndim - 1
+        return packed_row_load(
+            ref_name, index_parts, tensor.dtype, load.extents[lane - 1], load.lanes
+        )
     return _roll_load_expr(tensor, ref_name, index_parts, load)

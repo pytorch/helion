@@ -221,6 +221,18 @@ class Backend(abc.ABC):
         return TRITON_MAX_TENSOR_NUMEL
 
     @property
+    def requires_power_of_two_block_sizes(self) -> bool:
+        """Whether every ``block_sizes`` entry must be a power of two.
+
+        Triton-style backends need this because ``tl.arange`` (and the layouts
+        derived from it) only accept power-of-two extents.  Backends that
+        return False accept any positive block size that passes
+        ``BlockSizeSpec.non_power_of_two_multiple`` / ``full_extent`` checks,
+        which they tighten in :meth:`adjust_block_size_constraints`.
+        """
+        return True
+
+    @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         """Whether on-device tensor factory ops (zeros/ones/empty/full/...) should
         have their integer dim sizes rounded up to the next power of 2.
@@ -230,6 +242,16 @@ class Backend(abc.ABC):
         against unpadded full-tensor loads.
         """
         return True
+
+    @property
+    def supports_folded_host_loops(self) -> bool:
+        """Whether a host ``for i in range(...)`` loop whose body contains
+        top-level device loops can be folded into a single device program.
+
+        Folding traces the body once and iterates it on the device, so this
+        requires a backend that runs every top-level loop in one program.
+        """
+        return False
 
     @property
     def requires_shape_specialized_module(self) -> bool:

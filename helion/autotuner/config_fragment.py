@@ -456,6 +456,89 @@ class BlockSizeFragment(PowerOfTwoFragment):
         return Category.BLOCK_SIZE
 
 
+@dataclasses.dataclass
+class BlockSizeChoicesFragment(BlockSizeFragment):
+    """Power-of-two block sizes plus extra (non-power-of-two) choices.
+
+    For backends that accept non-power-of-two block sizes (e.g. Pallas
+    full-extent blocks or tile-multiple divisors of the extent).  The search
+    steps through the sorted union instead of doubling/halving.  Without
+    ``powers`` it searches only the extra choices, which are then all kept.
+    """
+
+    extra_values: tuple[int, ...]
+    powers: bool = True
+
+    def __init__(
+        self,
+        low: int,
+        high: int,
+        default_val: int | None,
+        extra_values: Iterable[int],
+        powers: bool = True,
+    ) -> None:
+        super().__init__(low, high, default_val)
+        self.powers = powers
+        self.extra_values = tuple(
+            sorted(
+                {
+                    value
+                    for value in extra_values
+                    if not powers
+                    or (low <= value <= high and not integer_power_of_two(value))
+                }
+            )
+        )
+        assert self.extra_values or powers
+
+    def _power_values(self) -> list[int]:
+        if not self.powers:
+            return [*self.extra_values]
+        return sorted([*super()._power_values(), *self.extra_values])
+
+    def default(self) -> int:
+        if self.powers:
+            return super().default()
+        return min(
+            self.extra_values,
+            key=lambda value: (abs(value - self.default_val), value),
+        )
+
+    def get_minimum(self) -> int:
+        return self.low if self.powers else self.extra_values[0]
+
+    def random(self) -> int:
+        return random.choice(self._power_values())
+
+    def pattern_neighbors(self, current: object, radius: int = 1) -> list[object]:
+        choices = self._power_values()
+        if type(current) is not int or current not in choices:
+            return super().pattern_neighbors(current, radius)
+        if type(radius) is not int or radius < 1:
+            raise ValueError(f"Expected positive int radius, got {radius!r}")
+        index = choices.index(current)
+        return [
+            *choices[max(0, index - radius) : index],
+            *choices[index + 1 : index + 1 + radius],
+        ]
+
+    def differential_mutation(self, a: object, b: object, c: object) -> int:
+        choices = self._power_values()
+        if type(a) is not int or a not in choices:
+            return super().differential_mutation(a, b, c)
+        assert isinstance(b, int)
+        assert isinstance(c, int)
+        index = choices.index(a)
+        if b < c:
+            return choices[max(0, index - 1)]
+        if b > c:
+            return choices[min(len(choices) - 1, index + 1)]
+        return a
+
+    def cardinality(self) -> int | None:
+        return len(self._power_values())
+
+
 class NumWarpsFragment(PowerOfTwoFragment):
     def category(self) -> Category:
         return Category.NUM_WARPS

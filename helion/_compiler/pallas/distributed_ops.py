@@ -23,6 +23,7 @@ from ...language.distributed_ops import wait_send_async_remote_copy
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from . import codegen as pallas_codegen
+from .megakernel import logical_region_parts
 from .plan_tiling import REMOTE_DST_INDEXING_PATTERNS
 from .plan_tiling import REMOTE_SRC_INDEXING_PATTERNS
 
@@ -193,7 +194,7 @@ def _remote_ref_expr(
         == PallasMemorySpace.HBM
     ):
         if not proxy_index:
-            return expr_from_string(name)
+            return _region_expr(state, tensor, name, [])
         assert state.fx_node is not None
         patterns = state.fx_node.meta.get(metadata_key)
         assert isinstance(patterns, list)
@@ -208,10 +209,10 @@ def _remote_ref_expr(
             raw_hbm_ref=True,
         )
         assert not none_dims
-        return expr_from_string(f"{name}.at[{', '.join(parts)}]")
+        return _region_expr(state, tensor, name, parts)
     name = active_name
     if not proxy_index:
-        return expr_from_string(name)
+        return _region_expr(state, tensor, name, [])
 
     assert state.fx_node is not None
     patterns = state.fx_node.meta.get(metadata_key)
@@ -228,6 +229,19 @@ def _remote_ref_expr(
         tensor_indices_are_scalars=True,
     )
     assert not none_dims
+    return _region_expr(state, tensor, name, parts)
+
+
+def _region_expr(
+    state: CodegenState, tensor: torch.Tensor, name: str, parts: list[str]
+) -> ast.AST:
+    """``name`` indexed by ``parts``, then trimmed to the logical region."""
+    parts = [
+        *parts,
+        *logical_region_parts(state.device_function, tensor, len(parts)),
+    ]
+    if not parts:
+        return expr_from_string(name)
     return expr_from_string(f"{name}.at[{', '.join(parts)}]")
 
 
@@ -344,7 +358,10 @@ def _emit_wait(state: CodegenState, method: str) -> ast.AST:
 
 @_decorators.codegen(start_async_remote_copy_descriptor, "pallas")
 def _(state: CodegenState) -> ast.AST:
-    return _emit_wait(state, "start")
+    result = _emit_wait(state, "start")
+    if (plan := state.device_function.pallas_megakernel) is not None:
+        plan.remote_copy_started(state)
+    return result
 
 
 @_decorators.codegen(wait_async_remote_copy, "pallas")

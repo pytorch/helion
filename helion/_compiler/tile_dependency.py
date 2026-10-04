@@ -466,6 +466,18 @@ class TileDependencyKind(enum.Enum):
     WRITE_AFTER_WRITE = "write_after_write"
 
 
+class StorageRole(enum.Enum):
+    """How a host tensor is used by a sequential-roots (megakernel) program."""
+
+    # Allocated in the kernel body, read and written there, never returned.
+    # Lives in VMEM scratch instead of HBM.
+    INTERMEDIATE = "intermediate"
+    # Never stored to (activations in, weights).
+    READ_ONLY = "read_only"
+    # Stored to and visible to the host.
+    OUTPUT = "output"
+
+
 def tile_dependency_site_id(node: ast.AST) -> int | None:
     """Return the stable DeviceIR execution site attached to a lowered loop."""
     site_id = getattr(node, TILE_DEPENDENCY_SITE_ID_ATTR, None)

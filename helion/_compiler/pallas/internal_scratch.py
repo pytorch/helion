@@ -10,6 +10,8 @@ from ... import exc
 from ...language import distributed_ops
 from ...language import memory_ops
 from ...language.atomic_ops import ATOMIC_OPS
+from ..ast_extension import ExtendedAST
+from ..ast_extension import LoopType
 from ..compile_environment import CompileEnvironment
 from ..device_function import DeviceFunction
 from ..host_function import HostFunction
@@ -17,22 +19,40 @@ from ..host_function import HostFunction
 _EMPTY_FACTORIES = frozenset({"empty", "empty_like", "new_empty"})
 
 
-def _top_level_empty_names(host: HostFunction) -> set[str]:
+def is_empty_allocation(statement: ast.AST) -> bool:
+    """``name = <...>.empty(...)``-style allocation of uninitialized memory."""
+    return (
+        isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance(statement.targets[0], ast.Name)
+        and isinstance(statement.value, ast.Call)
+        and isinstance(statement.value.func, ast.Attribute)
+        and statement.value.func.attr in _EMPTY_FACTORIES
+    )
+
+
+def top_level_empty_names(host: HostFunction) -> set[str]:
+    """Names allocated by top-level ``empty`` calls, including those in the
+    bodies of folded host loops, which are hoisted to the top level."""
     names: set[str] = set()
-    for statement in host.body:
+    pending = list(host.body)
+    while pending:
+        statement = pending.pop()
         if (
-            isinstance(statement, ast.Assign)
-            and len(statement.targets) == 1
-            and isinstance(statement.targets[0], ast.Name)
-            and isinstance(statement.value, ast.Call)
-            and isinstance(statement.value.func, ast.Attribute)
-            and statement.value.func.attr in _EMPTY_FACTORIES
+            isinstance(statement, ExtendedAST)
+            and statement._loop_type == LoopType.FOLDED
         ):
+            assert isinstance(statement, ast.For)
+            pending.extend(statement.body)
+        elif is_empty_allocation(statement):
+            assert isinstance(statement, ast.Assign) and isinstance(
+                statement.targets[0], ast.Name
+            )
             names.add(statement.targets[0].id)
     return names
 
 
-def _returned_name_dependencies(host: HostFunction) -> set[str]:
+def returned_name_dependencies(host: HostFunction) -> set[str]:
     """Conservatively find every host name that can feed the return value."""
     escaped: set[str] = set()
     dependencies: dict[str, set[str]] = {}
@@ -65,14 +85,14 @@ def _returned_name_dependencies(host: HostFunction) -> set[str]:
     return escaped
 
 
-def _tensor_storage(node: object) -> int | None:
+def tensor_storage(node: object) -> int | None:
     if not isinstance(node, torch.fx.Node):
         return None
     value = node.meta.get("val")
     return id(value.untyped_storage()) if isinstance(value, torch.Tensor) else None
 
 
-def _accessed_storages(
+def accessed_storages(
     device_fn: DeviceFunction,
 ) -> tuple[set[int], set[int], set[int]]:
     read: set[int] = set()
@@ -83,13 +103,13 @@ def _accessed_storages(
             if node.op != "call_function":
                 continue
             if node.target is memory_ops.load:
-                if (storage := _tensor_storage(node.args[0])) is not None:
+                if (storage := tensor_storage(node.args[0])) is not None:
                     read.add(storage)
             elif node.target is memory_ops.store:
-                if (storage := _tensor_storage(node.args[0])) is not None:
+                if (storage := tensor_storage(node.args[0])) is not None:
                     written.add(storage)
             elif node.target in ATOMIC_OPS:
-                if (storage := _tensor_storage(node.args[0])) is not None:
+                if (storage := tensor_storage(node.args[0])) is not None:
                     read.add(storage)
                     written.add(storage)
             elif node.target is distributed_ops.make_async_remote_copy:
@@ -99,10 +119,10 @@ def _accessed_storages(
                             "remote copy was not normalized to its five-argument form"
                         )
                     )
-                if (storage := _tensor_storage(node.args[0])) is not None:
+                if (storage := tensor_storage(node.args[0])) is not None:
                     read.add(storage)
                     remote.add(storage)
-                if (storage := _tensor_storage(node.args[3])) is not None:
+                if (storage := tensor_storage(node.args[3])) is not None:
                     written.add(storage)
                     remote.add(storage)
     return read, written, remote
@@ -117,11 +137,11 @@ def plan_internal_remote_scratch() -> None:
     """
     host = HostFunction.current()
     device_fn = DeviceFunction.current()
-    allocation_names = _top_level_empty_names(host) - _returned_name_dependencies(host)
+    allocation_names = top_level_empty_names(host) - returned_name_dependencies(host)
     if not allocation_names:
         return
 
-    read, written, remote = _accessed_storages(device_fn)
+    read, written, remote = accessed_storages(device_fn)
     eligible_storages = read & written & remote
     if not eligible_storages:
         return

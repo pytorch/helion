@@ -147,6 +147,16 @@ def _static_index(
     """
     if isinstance(value, int) and not isinstance(value, bool):
         return value
+    if isinstance(value, slice):
+        start, stop = value.start, value.stop
+        if (
+            value.step in (None, 1)
+            and isinstance(start, int)
+            and isinstance(stop, int)
+            and 0 <= start < stop
+        ):
+            return _StaticIndexRange(start=start, length=stop - start)
+        return None
     if not isinstance(value, torch.fx.Node):
         return None
     seen = set() if seen is None else seen
@@ -242,9 +252,14 @@ def _is_static_basic_value_subscript(node: torch.fx.Node, config: Config) -> boo
             source = source.args[0]
             continue
         # An earlier narrowing subscript may still carry a resident Ref and its
-        # boundary-mask invariants. A root load, by contrast, can materialize as
-        # an ordinary value before applying this compile-time basic index.
-        return source.target is not subscript
+        # boundary-mask invariants, unless it is itself a value subscript. A root
+        # load, by contrast, can materialize as an ordinary value before applying
+        # this compile-time basic index.
+        if source.target is subscript:
+            return _resident_plan(source) is None and _is_static_basic_value_subscript(
+                source, config
+            )
+        return True
     return False
 
 

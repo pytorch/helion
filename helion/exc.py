@@ -130,6 +130,10 @@ class NestedGridLoop(BaseError):
     message = "Grid loops must be at the top level of a function."
 
 
+class UnsupportedFoldedHostLoop(BaseError):
+    message = "Cannot fold this host loop around top-level device loops: {0}"
+
+
 class RankMismatch(BaseError):
     message = "Expected ndim={expected_ndim}, but got ndim={actual_ndim}{shape_part}. You have {direction}."
 

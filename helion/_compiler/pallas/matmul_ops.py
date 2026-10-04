@@ -18,6 +18,7 @@ from ...language import _decorators
 from ...language.matmul_ops import dot
 from ..matmul_utils import _emit_pallas_matmul
 from ..matmul_utils import _needs_f32_accumulator
+from .aten_lowering import dot_rhs_is_transposed
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -52,6 +53,7 @@ def _(state: CodegenState) -> object:
     elif acc_proxy is not None and isinstance(acc_proxy, FakeTensor):
         out_dtype = acc_proxy.dtype
 
+    assert state.fx_node is not None
     return _emit_pallas_matmul(
         lhs_ast,
         rhs_ast,
@@ -59,4 +61,8 @@ def _(state: CodegenState) -> object:
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
         lhs_ndim=lhs_proxy.ndim,
+        # A folded ``w[tn, tk].T``, or a load of an input passed lane dense
+        # (``lane_dense.logical_load``).
+        rhs_transposed=dot_rhs_is_transposed(state.fx_node.args[1], rhs_ast, state.env)
+        or state.fx_node.args[1] in state.device_function.pallas_lane_dense_rhs_loads,
     )

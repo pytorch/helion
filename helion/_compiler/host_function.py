@@ -254,6 +254,10 @@ class HostFunction:
     def set_local_types(self, local_types: dict[str, TypeInfo]) -> None:
         self.local_types = local_types
         for name, type_info in local_types.items():
+            if type_info.origin.is_device():
+                # Assigned inside an earlier root loop: not a host value, so it
+                # must not become a host argument of later roots' symbols.
+                continue
             type_info.populate_symbol_origins(NameOrigin(name, self))
 
     def sympy_expr(self, expr: sympy.Expr) -> str:

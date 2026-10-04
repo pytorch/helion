@@ -306,6 +306,7 @@ def default_pallas_jax_launcher(
     _collective_id: int | None = None,
     _use_low_level_scheduler: bool = False,
     _uses_remote_copy: bool = False,
+    _lane_dense_perms: dict[int, tuple[int, ...]] | None = None,
     **kwargs: object,
 ) -> object:
     """Pallas launcher used when running a Helion kernel inside ``jax.jit``.
@@ -400,6 +401,7 @@ def default_pallas_jax_launcher(
         orig_shapes=orig_shapes,
         ds_pad_dims=_ds_pad_dims,
         return_all_outputs=True,
+        lane_dense_perms=_lane_dense_perms,
     )
 
     for output_result, arg_index in zip(output_results, output_indices, strict=True):

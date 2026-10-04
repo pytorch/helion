@@ -31,11 +31,13 @@ from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .device_function import TensorArg
+from .device_function import VarInfo
 from .helper_function import CodegenInterface
 from .inductor_lowering import CodegenState
 from .inductor_lowering import codegen_call_with_graph
 from .output_header import get_needed_import_lines
 from .program_id import ForEachProgramID
+from .program_id import SequentialRootsProgramIDs
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import EmitPipelineLoopState
@@ -50,6 +52,7 @@ if TYPE_CHECKING:
 
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import GraphInfo
+    from .device_ir import HostLoopInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import ResidentPrepHoist
     from .pallas.dma import DmaResources
@@ -180,6 +183,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # the same arange share one lane loop.
         self.cute_synthetic_arange_lane_exprs: dict[tuple[object, ...], str] = {}
         self.next_else_block: list[ast.AST] | None = None
+        # The open folded host loop (Pallas megakernel): the kernel body it is
+        # emitted into, and the loop itself with its pending body.
+        self.folded_loop: (
+            tuple[list[ast.AST], HostLoopInfo, str, list[ast.AST]] | None
+        ) = None
         self.store_transform = store_transform
         self.load_transform = load_transform
         self._statement_owner_fx_node: Node | None = None
@@ -1408,12 +1416,29 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
+        if node._loop_type == LoopType.FOLDED:
+            return self._codegen_folded_loop(node)
         if node._loop_type == LoopType.GRID:
             assert not node.orelse
 
             assert node._root_id is not None
-            if len(self.host_function.device_ir.root_ids) == 1:
+            if (
+                len(self.host_function.device_ir.root_ids) == 1
+                and not self.host_function.device_ir.sequential_roots
+            ):
                 body = self.device_function.body
+            elif self.host_function.device_ir.sequential_roots:
+                # Each root runs to completion before the next one starts, so
+                # every root gets its own loop index instead of a pid range.
+                body = []
+                pid_var = self.device_function.new_var("pid_shared", dce=True)
+                if node._root_id == 0:
+                    self.device_function.set_pid(SequentialRootsProgramIDs(pid_var))
+                else:
+                    assert isinstance(
+                        self.device_function.pid, SequentialRootsProgramIDs
+                    )
+                    self.device_function.pid.shared_pid_var = pid_var
             else:
                 assert len(self.host_function.device_ir.root_ids) > 1
                 # Multiple top level for loops
@@ -1547,9 +1572,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         self.host_function.device_ir.phase_for_root(node._root_id)
                     )
 
+                if isinstance(self.device_function.pid, SequentialRootsProgramIDs):
+                    self.device_function.body.extend(
+                        self.device_function.pid.codegen_root(
+                            self.device_function,
+                            body,
+                            None if self.folded_loop is None else self.folded_loop[0],
+                        )
+                    )
                 # If we are in a multi top level loop, for all loops except for the last one
                 # emit ifthenelse blocks
-                if node._root_id < len(self.host_function.device_ir.root_ids) - 1:
+                elif node._root_id < len(self.host_function.device_ir.root_ids) - 1:
                     block = (
                         self.device_function.body
                         if self.next_else_block is None
@@ -1566,6 +1599,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         )
                     )
             if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                self._close_folded_loop()
                 if self.device_function.pid is not None:
                     persistent_body = self.device_function.pid.setup_persistent_kernel(
                         self.device_function
@@ -1778,9 +1812,62 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
+                megakernel = self.device_function.pallas_megakernel
+                if megakernel is not None:
+                    megakernel.share_root_scratch(self.device_function)
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)
+
+    def _codegen_folded_loop(self, node: ast.For) -> ast.AST | None:
+        """Emit a host loop folded around roots as one device loop.
+
+        The body's roots are generated once into the loop, with the loop's
+        symbol bound to the device induction variable.  Its allocations stay on
+        the host, hoisted out of the loop.  Returns the launcher call when the
+        last root is in the body.
+        """
+        assert self.folded_loop is None and not self.on_device
+        first_root = next(
+            stmt._root_id
+            for stmt in node.body
+            if isinstance(stmt, ExtendedAST) and stmt._loop_type == LoopType.GRID
+        )
+        (loop,) = [
+            loop
+            for loop in self.host_function.device_ir.host_loops
+            if loop.first_root == first_root
+        ]
+        symbol = loop.symbol
+        var = self.device_function.new_var(loop.var)
+        self.folded_loop = (self.device_function.body, loop, var, [])
+        self.device_function.body = self.folded_loop[3]
+        expr_to_var_info = self.device_function.expr_to_var_info
+        expr_to_var_info[symbol] = VarInfo(var, None)
+        launch = None
+        try:
+            for stmt in node.body:
+                result = self.visit(stmt)
+                assert isinstance(stmt, ExtendedAST)
+                if stmt._loop_type == LoopType.GRID:
+                    launch = result
+                else:
+                    self.add_statement(result)
+            self._close_folded_loop()
+        finally:
+            expr_to_var_info.pop(symbol)
+        return launch
+
+    def _close_folded_loop(self) -> None:
+        """Wrap the open folded loop's body in its device loop."""
+        if self.folded_loop is None:
+            return
+        outer, loop, var, body = self.folded_loop
+        self.folded_loop = None
+        self.device_function.body = outer
+        pid = self.device_function.pid
+        assert isinstance(pid, SequentialRootsProgramIDs)
+        outer.extend(pid.codegen_folded_loop(self.device_function, loop, var, body))
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -2156,7 +2243,8 @@ def generate_ast(
                 extra_params=extra_params,
             )
         env.cute_resolved_wrapper_plans = []
-        if len(func.device_ir.phases) > 1:
+        # Sequential roots run in program order, which orders every phase.
+        if len(func.device_ir.phases) > 1 and not func.device_ir.sequential_roots:
             if not str(config.pid_type).startswith("persistent"):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
         codegen = GenerateAST(
@@ -2223,6 +2311,11 @@ def generate_ast(
             output_only_names = getattr(
                 CompileEnvironment.current().backend, "_output_only_names", []
             )
+            megakernel = codegen.device_function.pallas_megakernel
+            if megakernel is not None:
+                # Intermediates live in VMEM scratch, so their host allocations
+                # only carry metadata.
+                output_only_names = [*output_only_names, *megakernel.host_scratch_names]
             if output_only_names:
                 oo_set = set(output_only_names)
                 # ``static_shapes=True``: cache the output-only meta placeholder

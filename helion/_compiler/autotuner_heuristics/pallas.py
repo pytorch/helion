@@ -6,10 +6,12 @@ from typing import NamedTuple
 import torch
 
 from ...runtime.config import Config
+from ..pallas import megakernel
 from .common import clamp_block_size_targets
 from .registry import AutotunerHeuristic
 
 if TYPE_CHECKING:
+    from ...autotuner.config_spec import BlockSizeSpec
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
 
@@ -150,3 +152,129 @@ class PallasMatmulF32NoTilingSeedHeuristic(_PallasNoTilingSeedHeuristic):
     name = "pallas_matmul_f32_no_tiling_seed"
     _allowed_dtypes = _F32_DTYPES
     _dims = _PALLAS_F32_NO_TILING_DIMS
+
+
+def _searched_block_sizes(block: BlockSizeSpec) -> list[int]:
+    """The sizes the autotuner searches for ``block``."""
+    if block.search_extra_values_only:
+        return [*block.extra_search_values]
+    return [
+        *(
+            size
+            for size in (1 << i for i in range(block.max_size.bit_length()))
+            if size >= block.min_size
+        ),
+        *block.extra_search_values,
+    ]
+
+
+class PallasMegakernelStreamTileHeuristic(AutotunerHeuristic):
+    """Default the block sizes of a megakernel's streamed weight tiles to
+    the smallest contiguous tiles that divide their dims and still reach full
+    HBM bandwidth per copy (see ``StreamModel.seed_block_sizes``): the
+    generic reference sizes give smaller tiles, whose DMAs cannot.  With
+    ``megakernel._ARENA_BY_DEFAULT``, to an arena's tiles if they fit."""
+
+    name = "pallas_megakernel_stream_tiles"
+    backend = "pallas"
+    promote_seed_to_default = True
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.pallas_stream_model is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        model = spec.pallas_stream_model
+        assert model is not None
+        legal = {
+            block.block_id: _searched_block_sizes(block)
+            for block in spec.block_sizes
+            if block.block_id in model.min_block_sizes
+        }
+        keep_hbm = spec.pallas_keeps_hbm_resident({})
+        reference = spec.autotune_reference_config().config["block_sizes"]
+        assert isinstance(reference, list)
+        defaults = reference
+
+        def tuned_sizes(sizes: dict[int, int]) -> tuple[list[int], dict[int, int]]:
+            block_sizes = [
+                sizes.get(block.block_id, default)
+                for block, default in zip(spec.block_sizes, defaults, strict=True)
+            ]
+            tuned = {
+                block.block_id: size
+                for block, size in zip(spec.block_sizes, block_sizes, strict=True)
+            }
+            return block_sizes, tuned
+
+        if megakernel._ARENA_BY_DEFAULT:
+            block_sizes, tuned = tuned_sizes(
+                model.seed_block_sizes(legal, 0, arena=True)
+            )
+            if model.config_error(tuned, None, keep_hbm, arena=True) is None:
+                return Config(block_sizes=block_sizes, pallas_stream_arena=True)
+        # Each root sizes its tiles alone, so the rings of all the roots may
+        # not fit together, or only too shallow for the tiles: then halve
+        # every root's share until they do, or until the tiles stop shrinking
+        # (then the last that fit).
+        limit = model.seed_limit(keep_hbm)
+        previous = None
+        fallback = None
+        while (sizes := model.seed_block_sizes(legal, limit)) != previous:
+            block_sizes, tuned = tuned_sizes(sizes)
+            if model.config_error(tuned, None, keep_hbm) is None:
+                fallback = Config(block_sizes=block_sizes)
+                if not model.rings_shallow(tuned, keep_hbm):
+                    return fallback
+            limit //= 2
+            previous = sizes
+        return fallback
+
+
+class PallasMegakernelLoopTileHeuristic(AutotunerHeuristic):
+    """Default the block sizes of a megakernel's inner loops that the weight
+    ring does not stream (see ``LoopTileModel.seed_block_sizes``): the generic
+    reference sizes give many short iterations, whose DMAs cannot reach full
+    HBM bandwidth."""
+
+    name = "pallas_megakernel_loop_tiles"
+    backend = "pallas"
+    promote_seed_to_default = True
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.pallas_loop_tile_model is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        model = spec.pallas_loop_tile_model
+        assert model is not None
+        legal = {
+            block.block_id: _searched_block_sizes(block) for block in spec.block_sizes
+        }
+        # Over the default so far, which holds the weight ring's tiles.
+        default = spec.default_config().config["block_sizes"]
+        assert isinstance(default, list)
+        base = {
+            block.block_id: size
+            for block, size in zip(spec.block_sizes, default, strict=True)
+        }
+        sizes = model.seed_block_sizes(legal, base)
+        # Keep the other knobs of the default so far (``pallas_stream_arena``).
+        previous = spec.compiler_default_config
+        return Config.from_dict(
+            {
+                **(previous.config if previous is not None else {}),
+                "block_sizes": [
+                    sizes.get(block.block_id, size)
+                    for block, size in zip(spec.block_sizes, default, strict=True)
+                ],
+            }
+        )

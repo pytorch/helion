@@ -147,6 +147,7 @@ def _emit_pallas_matmul(
     need_f32_acc: bool = False,
     out_dtype: torch.dtype | None = None,
     lhs_ndim: int = 2,
+    rhs_transposed: bool = False,
 ) -> ast.AST:
     """Build a ``lax.dot_general`` AST node for the Pallas backend.
 
@@ -165,11 +166,15 @@ def _emit_pallas_matmul(
         decide whether a cast-back is required.
     lhs_ndim:
         Number of dimensions in the left operand (2 for mm, 3 for bmm).
+    rhs_transposed:
+        When True, *rhs* holds the right operand with its last two dims
+        swapped, so the dot contracts its minor dim.
     """
+    rhs_contract = lhs_ndim - 1 if rhs_transposed else lhs_ndim - 2
     if lhs_ndim == 3:
-        dim_numbers = "(((2,), (1,)), ((0,), (0,)))"
+        dim_numbers = f"(((2,), ({rhs_contract},)), ((0,), (0,)))"
     elif lhs_ndim == 2:
-        dim_numbers = "(((1,), (0,)), ((), ()))"
+        dim_numbers = f"(((1,), ({rhs_contract},)), ((), ()))"
     else:
         raise ValueError(f"lhs_ndim must be 2 or 3, got {lhs_ndim}")
 

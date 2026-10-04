@@ -9,6 +9,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 import unittest
+from unittest import mock
 
 from examples.geglu import _geglu_pallas as _geglu_pallas_example
 from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
@@ -33,6 +34,7 @@ from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+from helion.runtime.pallas import launcher as pallas_launcher
 
 if TYPE_CHECKING:
     from helion.autotuner.base_search import PopulationBasedSearch
@@ -63,6 +65,35 @@ def pallas_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile in hl.tile(out.size()):
         out[tile] = x[tile] * y[tile]
     return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_gelu_tanh(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(out.size()):
+        out[tile] = torch.nn.functional.gelu(x[tile], approximate="tanh") * y[tile]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
+def pallas_row_reshape(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Row 0 of ``x`` [16, 512] through [2, 1, 256] slabs and back, row 1
+    through [2, 256] rows that then gain a unit dim, and row 0 of ``y``
+    [16, 768] through [4, 192] rows and back."""
+    out_x = torch.empty_like(x)
+    out_y = torch.empty_like(y)
+    rows = torch.empty([4, 192], dtype=y.dtype, device=y.device)
+    for _ in hl.grid(1):
+        slabs = x[0, :].reshape(2, 1, 256)
+        out_x[0, :] = (slabs * 2.0).reshape(512)
+        x_rows = x[1, :].reshape(2, 256)
+        out_x[1, :] = (x_rows[:, None, :] * 3.0).reshape(512)
+        y_rows = y[0, :].reshape(4, 192)
+        rows[:, :] = y_rows
+        out_y[0, :] = (y_rows * 2.0).reshape(768)
+    return out_x, out_y, rows
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
@@ -1406,6 +1437,31 @@ class TestPallas(TestCase):
         expected = torch.nn.functional.gelu(a, approximate="tanh") * b
         torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
 
+    def test_gelu_tanh_approx(self) -> None:
+        # F.gelu(approximate="tanh") lowers to the tanh polynomial; bf16
+        # inputs are computed in f32 and rounded back.
+        for dtype, tol in ((torch.float32, 1e-5), (torch.bfloat16, 2e-2)):
+            x = torch.randn(64, 256, device=DEVICE, dtype=dtype) * 3
+            y = torch.randn(64, 256, device=DEVICE, dtype=dtype)
+            code, result = code_and_output(pallas_gelu_tanh, (x, y))
+            expected = torch.nn.functional.gelu(x, approximate="tanh") * y
+            torch.testing.assert_close(result, expected, rtol=tol, atol=tol)
+            self.assertIn("lax.tanh(", code)
+
+    def test_row_split_reshape(self) -> None:
+        # Reshapes between a vector and several rows go a row at a time:
+        # Mosaic rejects some whole (rows that are not 128 lanes wide, slabs
+        # of one row) and folds the rest into a later unit-dim reshape.
+        x = torch.randn(16, 512, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(16, 768, device=DEVICE, dtype=torch.bfloat16)
+        code, (out_x, out_y, rows) = code_and_output(pallas_row_reshape, (x, y))
+        torch.testing.assert_close(out_x[0], x[0] * 2)
+        torch.testing.assert_close(out_x[1], x[1] * 3)
+        torch.testing.assert_close(out_y[0], y[0] * 2)
+        torch.testing.assert_close(rows, y[0].view(4, 192))
+        self.assertEqual(code.count("jnp.stack(["), 3)
+        self.assertEqual(code.count("jnp.concatenate(["), 3)
+
     def test_swiglu_pallas_nd(self) -> None:
         # N-D-tiled SwiGLU (#2725): correctness on the pallas backend.
         a = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
@@ -1853,8 +1909,9 @@ class TestPallas(TestCase):
         ):
             code_and_output(reshape_then_narrow, (x, out), pallas_loop_type="fori_loop")
 
-    def test_resident_subview_recursive_failure_keeps_cause(self) -> None:
-        """A child failure invalidates every tentative ancestor with its cause."""
+    def test_resident_subview_padding_falls_back_to_values(self) -> None:
+        """A block that may contain padding cannot stay a resident Ref; nested
+        static narrowing then indexes the block's ordinary value."""
 
         @helion.kernel(backend="pallas", static_shapes=True)
         def nested_narrowing(x: torch.Tensor, out: torch.Tensor) -> None:
@@ -1877,15 +1934,14 @@ class TestPallas(TestCase):
             pallas_loop_type="fori_loop",
         )
         self.assertNarrowingIsResident(code)
-        with self.assertRaisesRegex(
-            helion.exc.BackendUnsupported, "may contain padding.*this config"
-        ):
-            code_and_output(
-                nested_narrowing,
-                (x, out),
-                block_sizes=[4],
-                pallas_loop_type="fori_loop",
-            )
+        code, _ = code_and_output(
+            nested_narrowing,
+            (x, out),
+            block_sizes=[4],
+            pallas_loop_type="fori_loop",
+        )
+        self.assertIn("head = group[:, 0, :]", code)
+        torch.testing.assert_close(out, torch.full_like(out, 6.0))
 
     def test_resident_subview_masked_boundary_is_structural(self) -> None:
         """A masked boundary outranks a simultaneous config-dependent failure."""
@@ -2798,6 +2854,26 @@ class TestPallas(TestCase):
         expected = torch.stack([values[start : start + 8] for start in starts.tolist()])
         torch.testing.assert_close(result, expected)
 
+    def test_static_range_slices_keep_their_length(self) -> None:
+        # Every fixed-point pass of type propagation must see the same
+        # induction variable, or ``v[j : j + rows]`` merges bounds from two
+        # passes and loses its static length.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def window_sum(x: torch.Tensor, taps: hl.constexpr) -> torch.Tensor:
+            rows = hl.specialize(x.size(0)) - (taps - 1)
+            out = torch.empty([rows, x.size(1)], dtype=torch.float32, device=x.device)
+            for _ in hl.grid(1):
+                v = x[:, :].float()
+                acc = hl.zeros([rows, x.size(1)], dtype=torch.float32)
+                for j in hl.static_range(taps):
+                    acc = acc + v[j : j + rows, :]
+                out[:, :] = acc
+            return out
+
+        x = torch.randn(11, 256, device=DEVICE)
+        _, result = code_and_output(window_sum, (x, 4))
+        torch.testing.assert_close(result, sum(x[j : j + 8] for j in range(4)))
+
     def test_computed_scalar_selects_staged_matmul_weight(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
         def dynamic_weight_matmul(
@@ -2932,6 +3008,66 @@ class TestPallas(TestCase):
         # x should be mutated in place
         torch.testing.assert_close(x, expected)
 
+    def test_whole_array_inplace_pair_shares_staged_buffer(self) -> None:
+        """Whole-array blocks are staged by the launcher with overlapped DMAs.
+
+        An in-place input and its aliased output share one staged buffer, so
+        the kernel's ``out_ref[...] = in_ref[...]`` copy is skipped.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def whole_array_update(
+            x: torch.Tensor, y: torch.Tensor, z: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(y)
+            for tile_m, tile_n in hl.tile(x.size()):
+                x[tile_m, tile_n] = (
+                    x[tile_m, tile_n] * y[tile_m, tile_n] + z[tile_m, tile_n]
+                )
+                out[tile_m, tile_n] = x[tile_m, tile_n] - y[tile_m, tile_n]
+            return out
+
+        x, y, z = (
+            torch.randn(16, 256, device=DEVICE, dtype=torch.float32) for _ in range(3)
+        )
+        expected_x = x * y + z
+        expected_out = expected_x - y
+        with mock.patch.object(
+            pallas_launcher,
+            "_pallas_inplace_copy",
+            wraps=pallas_launcher._pallas_inplace_copy,
+        ) as inplace_copy:
+            code, result = code_and_output(
+                whole_array_update, (x, y, z), block_sizes=[16, 256]
+            )
+        torch.testing.assert_close(x, expected_x)
+        torch.testing.assert_close(result, expected_out)
+        self.assertIn("_inplace_indices=[0]", code)
+        self.assertEqual(inplace_copy.call_count, 0)
+
+    def test_broadcast_operand_goes_second(self) -> None:
+        """Commutative broadcasts put the full-shape operand first.
+
+        Mosaic lays an elementwise op out like its first operand, so a small
+        broadcast first would relayout the full-shape operand.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def broadcast_update(k: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(state)
+            for tile_h in hl.tile(state.size(0)):
+                s = state[tile_h, :, :]
+                kh = k[tile_h, :]
+                out[tile_h, :, :] = kh[:, :, None] + kh[:, None, :] * s
+            return out
+
+        k = torch.randn(4, 128, device=DEVICE, dtype=torch.float32)
+        state = torch.randn(4, 128, 128, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(broadcast_update, (k, state), block_sizes=[4])
+        torch.testing.assert_close(result, k[:, :, None] + k[:, None, :] * state)
+        self.assertIn("v_0 = s * subscript_1", code)
+        self.assertIn("v_1 = v_0 + subscript", code)
+
     def test_shared_output_disjoint_rows(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True, autotune_effort="none")
         def pallas_shared_output_disjoint_rows(x: torch.Tensor) -> torch.Tensor:
@@ -3043,8 +3179,12 @@ class TestPallas(TestCase):
 
     def test_argmin_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
+        x[:, 3] = x[:, 50] = -10.0
         code, result = code_and_output(pallas_argmin_reduction, (x,), block_size=16)
-        self.assertIn("jnp.argmin", code)
+        # A tie takes the first index, as in torch; Mosaic's jnp.argmin may
+        # return any tied lane, so the index comes from an iota instead.
+        self.assertNotIn("jnp.argmin", code)
+        self.assertIn("lax.broadcasted_iota(jnp.int32", code)
         torch.testing.assert_close(result, torch.argmin(x, dim=-1).to(torch.int32))
 
     def test_tile_begin_end(self) -> None:
@@ -4023,6 +4163,91 @@ class TestPallas(TestCase):
                     pallas_loop_type=loop_type,
                 )
                 torch.testing.assert_close(result, expected, rtol=1e-2, atol=1e-2)
+
+    def test_transposed_rhs_dot_contracts_minor_dim(self) -> None:
+        """A dot rhs that only swaps its last two dims is contracted along
+        the untransposed operand's minor dim instead of being transposed."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def linear_nt(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            # w is stored [out_features, in_features], like nn.Linear.
+            m, k = x.size()
+            n = w.size(0)
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_n, tile_k].T)
+                out[tile_m, tile_n] = acc.to(out.dtype)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def linear_nt_hl_dot(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            n = w.size(0)
+            out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = hl.dot(x[tile_m, tile_k], w[tile_n, tile_k].T, acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def batched_scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+            b, m, _ = q.size()
+            n = k.size(1)
+            out = torch.empty([b, m, n], device=q.device, dtype=torch.float32)
+            for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+                out[tile_b, tile_m, tile_n] = torch.bmm(
+                    q[tile_b, tile_m, :], k[tile_b, tile_n, :].transpose(1, 2)
+                )
+            return out
+
+        x = torch.randn(128, 512, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(256, 512, device=DEVICE, dtype=torch.bfloat16)
+        q = torch.randn(2, 128, 128, device=DEVICE, dtype=torch.bfloat16)
+        k = torch.randn(2, 256, 128, device=DEVICE, dtype=torch.bfloat16)
+        nt = "dimension_numbers=(((1,), (1,)), ((), ()))"
+        linear_ref = x.float() @ w.float().T
+        cases = (
+            (linear_nt, (x, w), [128, 128, 256], nt, linear_ref.bfloat16()),
+            (linear_nt, (x, w), [16, 256, 512], nt, linear_ref.bfloat16()),
+            (linear_nt_hl_dot, (x, w), [128, 128, 256], nt, linear_ref),
+            (
+                batched_scores,
+                (q, k),
+                [2, 128, 128],
+                "dimension_numbers=(((2,), (2,)), ((0,), (0,)))",
+                torch.bmm(q.float(), k.float().transpose(1, 2)),
+            ),
+        )
+        for kernel, args, block_sizes, dims, expected in cases:
+            with self.subTest(kernel=kernel.name, block_sizes=block_sizes):
+                code, result = code_and_output(kernel, args, block_sizes=block_sizes)
+                self.assertIn(dims, code)
+                self.assertNotIn("jnp.transpose", code)
+                torch.testing.assert_close(result, expected, rtol=2e-2, atol=2e-1)
+
+    def test_transposed_rhs_with_other_users_stays_transposed(self) -> None:
+        """A transpose that also feeds a non-dot consumer is materialized."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def linear_plus_colsum(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            m = x.size(0)
+            n = w.size(0)
+            out = torch.empty([m, n], device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                wt = w[:, :].T
+                out[tile_m, :] = torch.mm(x[tile_m, :], wt) + wt.sum(0)
+            return out
+
+        x = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(128, 256, device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(linear_plus_colsum, (x, w), block_sizes=[64])
+        self.assertIn("jnp.transpose", code)
+        self.assertIn("dimension_numbers=(((1,), (0,)), ((), ()))", code)
+        torch.testing.assert_close(result, x @ w.T + w.T.sum(0), rtol=1e-2, atol=1e-1)
 
     def test_emit_pipeline_codegen(self) -> None:
         """Test that pallas_loop_type='emit_pipeline' generates correct emit_pipeline code."""
@@ -6677,7 +6902,6 @@ class TestPallas(TestCase):
         self.assertIn(nested_update, code)
         self.assertLess(code.index(load), code.index(nested_update))
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_dma_buffer_offset_nested_tile(self) -> None:
         """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
         outer_in_inner = self._dma_buffer_offset_nested_tile_kernel()
@@ -8441,6 +8665,94 @@ class TestPallasJaxFn(TestCase):
             self.assertTrue(bool(jnp.all(out == 2.0)))
         finally:
             sys.modules.pop(name, None)
+
+    def test_jax_standalone_scratch_and_smem(self) -> None:
+        """Standalone jax_fn code supports VMEM scratch accumulators, HBM inputs
+        and SMEM scalar args (an emit_pipeline matmul scaled by ``scale[0]``)."""
+        import sys
+        import types
+
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[128, 128]),
+        )
+        def gated_matmul(
+            x: torch.Tensor,
+            w_gate: torch.Tensor,
+            w_up: torch.Tensor,
+            scale: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n = w_gate.size(1)
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_n in hl.tile(n):
+                g = hl.zeros([m, tile_n], dtype=torch.float32)
+                u = hl.zeros([m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    xk = x[:, tile_k]
+                    g = hl.dot(xk, w_gate[tile_k, tile_n], acc=g)
+                    u = hl.dot(xk, w_up[tile_k, tile_n], acc=u)
+                out[:, tile_n] = torch.sigmoid(g) * u * scale[0]
+            return out
+
+        x = torch.randn(16, 256) * 0.1
+        w_gate = torch.randn(256, 256) * 0.1
+        w_up = torch.randn(256, 256) * 0.1
+        scale = torch.tensor([0.5])
+        args = (x, w_gate, w_up, scale)
+        bound = gated_matmul.bind(tuple(a.to(DEVICE) for a in args))
+        launch = bound.to_code()
+        self.assertIn("_scratch_shapes=", launch)
+        self.assertIn("_smem_arg_indices=", launch)
+        code = bound.to_code(
+            options=helion.OutputCodeOptions(allow_helion_deps=False, jax_fn=True)
+        )
+        name = "precompiled_scratch_smem_test"
+        module = types.ModuleType(name)
+        sys.modules[name] = module
+        try:
+            exec(compile(code, name, "exec"), module.__dict__)
+            out = jax.block_until_ready(
+                jax.jit(module.gated_matmul)(*(jnp.asarray(a.numpy()) for a in args))
+            )
+        finally:
+            sys.modules.pop(name, None)
+        expected = jnp.asarray((torch.sigmoid(x @ w_gate) * (x @ w_up) * 0.5).numpy())
+        self.assertTrue(bool(jnp.allclose(out, expected, atol=1e-2, rtol=1e-2)))
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasMultiRootCodegen(TestCase):
+    def test_device_scalar_from_earlier_root_stays_on_device(self) -> None:
+        """A scalar assigned inside one root loop must not become a host kernel
+        argument when a later root follows (it is undefined on the host)."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def two_roots(
+            q: torch.Tensor, state: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            k_heads, _ = q.shape
+            v_heads = state.size(0)
+            out = torch.empty_like(state)
+            doubled = torch.empty_like(state)
+            for head in hl.grid(v_heads):
+                k_head = head // (v_heads // k_heads)
+                out[head, :] = q[k_head, :] + state[head, :]
+            for _ in hl.grid(1):
+                doubled[:, :] = state[:, :] * 2.0
+            return out, doubled
+
+        q = torch.randn(2, 128, device=DEVICE)
+        state = torch.randn(6, 128, device=DEVICE)
+        bound = two_roots.bind((q, state))
+        code = bound.to_code(bound.config_spec.default_config())
+        self.assertIn("q[floordiv, :]", code)
+        (launch,) = [line for line in code.splitlines() if "_launcher(" in line]
+        self.assertNotIn("k_head", launch)
 
 
 class TestPallasPrinter(TestCase):

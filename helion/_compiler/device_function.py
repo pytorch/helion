@@ -50,11 +50,17 @@ from .variable_origin import TensorSizeOrigin
 from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from ..runtime.config import Config
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .device_ir import HelperFunctionGraphInfo
     from .generate_ast import GenerateAST
     from .indexing_strategy import IndexingStrategy
+    from .pallas.megakernel import MegakernelPlan
+    from .pallas.megakernel import RingWrite
+    from .pallas.megakernel import RowForward
+    from .pallas.megakernel import RowStoreRun
     from .program_id import ProgramIDs
     from .tile_dispatch import TileStrategyDispatch
     from helion._compiler.pallas.dma import DmaResources
@@ -92,7 +98,7 @@ class VarInfo(NamedTuple):
     """Information about a variable derived from a sympy expression."""
 
     name: str
-    fx_node: torch.fx.Node
+    fx_node: torch.fx.Node | None
 
 
 def find_block_size_symbols(
@@ -254,8 +260,8 @@ _sort_order: dict[type[Argument], int] = {
 class ScratchArg:
     """A scratch memory buffer allocated in device memory (e.g., VMEM on TPU).
 
-    scratch_type can be "vmem" (default) or "dma_semaphore" for Pallas
-    scratch.
+    scratch_type can be "vmem" (default), "smem" or "dma_semaphore" for
+    Pallas scratch.
     """
 
     name: str
@@ -431,6 +437,41 @@ class DeviceFunction:
         # not escape the kernel return can live entirely in compiler-managed
         # VMEM scratch instead of becoming hidden HBM in/out arguments.
         self.pallas_internal_scratch_storage_names: dict[int, str] = {}
+        # Per-config plan of a sequential-roots (megakernel) program.
+        self.pallas_megakernel: MegakernelPlan | None = None
+        # Megakernel: storage -> dim order of each input passed lane dense
+        # (``pallas_lane_dense``), and the loads of one whose value stays in
+        # that order because a dot takes it as its transposed right operand,
+        # or because permutes take it (or its dtype conversions) back to it.
+        self.pallas_lane_dense: dict[int, tuple[int, ...]] = {}
+        self.pallas_lane_dense_rhs_loads: set[torch.fx.Node] = set()
+        self.pallas_physical_values: set[torch.fx.Node] = set()
+        # Megakernel: storage -> waits of the DMA writes to it that a root
+        # has started and not yet waited for (``flush_pending_writes``),
+        # preceded by the starts of a write it has deferred.
+        self.pallas_pending_writes: dict[int, list[ast.stmt]] = {}
+        # The VMEM stages and DMA semaphores that stores to a tensor kept in
+        # HBM write rows of one shape through, by storage and stage shape: a
+        # ring of them (``hbm_store_rings``), and the slot the next store
+        # of the ring takes.
+        self.pallas_hbm_store_stages: dict[
+            tuple[int, tuple[int, ...]], list[tuple[str, str]]
+        ] = {}
+        self.pallas_store_ring_next: dict[tuple[int, tuple[int, ...]], int] = {}
+        self.pallas_store_rings: dict[torch.fx.Graph, dict[torch.fx.Node, int]] = {}
+        # Megakernel: storage -> the pending writes of its ring stores, whose
+        # waits ``pallas_pending_writes`` holds too.
+        self.pallas_ring_writes: dict[int, list[RingWrite]] = {}
+        # The runs of row stores to tensors kept in HBM (``row_store_runs``)
+        # by graph, and the first row of the window the open run of each
+        # storage writes.
+        self.pallas_row_store_runs: dict[
+            torch.fx.Graph, dict[torch.fx.Node, RowStoreRun]
+        ] = {}
+        self.pallas_row_windows: dict[int, str] = {}
+        # Megakernel: storage -> the row store deferred to the inner loop
+        # that reads it next (``row_forward_loop``).
+        self.pallas_row_forwards: dict[int, RowForward] = {}
         # Pallas: id(fake_tensor) → memory space, determined during
         # tracing (HBM for pipeline) and codegen (SMEM for scalar access).
         # NOTE: Currently each tensor can only have one memory space.
@@ -2238,6 +2279,21 @@ class DeviceFunction:
         return self.register_scratch(
             shape, None, name_hint=name_hint, scratch_type="dma_semaphore"
         )
+
+    def flush_pending_writes(
+        self, storages: Iterable[int] | None = None
+    ) -> list[ast.stmt]:
+        """Pop the statements that complete the pending DMA writes to
+        ``storages``, or to every storage.  Emit them before the next read
+        of the storage."""
+        flushed = list(self.pallas_pending_writes) if storages is None else storages
+        for storage in flushed:
+            self.pallas_ring_writes.pop(storage, None)
+        return [
+            statement
+            for storage in flushed
+            for statement in self.pallas_pending_writes.pop(storage, [])
+        ]
 
     def get_tensor_read_write_names(self) -> tuple[set[str], set[str]]:
         """Returns AST names of read and written tensors"""

@@ -2109,7 +2109,13 @@ class LoopSpecBlockSizeSource(BlockSizeSource):
     def from_config(self, config: Config, block_size_info: BlockSizeInfo) -> int:
         env = CompileEnvironment.current()
         size = block_size_info.size
-        if isinstance(size, (int, torch.SymInt)) and env.known_equal(size, 1):
+        if (
+            isinstance(size, (int, torch.SymInt))
+            and env.known_equal(size, 1)
+            # A megakernel tile is a pl.ds slice; it keeps its whole-sublane
+            # block even over a size-1 dim (the launcher pads the argument).
+            and not env.config_spec.pallas_sequential_roots
+        ):
             return 1
         index = env.config_spec.block_sizes.block_id_to_index(block_size_info.block_id)
         return config.block_sizes[index]

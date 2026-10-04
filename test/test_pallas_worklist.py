@@ -2904,21 +2904,21 @@ class TestResidentPrepHoistCodegen(unittest.TestCase):
     def test_resident_prep_zero_fill_load_mask_elided_from_reduction(self):
         # The prep-hoisted resident K load reads a zero-filled cache (the refill writes
         # tail_fill_value=0 once), so its per-tile fill-0 mask is redundant and dropped.
-        # Prove it by backtracking the q@kᵀ dot's K operand: dot -> permute (transpose)
-        # -> a _prep[...] cache read, with NO jnp.where anywhere on that chain.
+        # Prove it by backtracking the q@kᵀ dot's K operand (the dot contracts K's
+        # minor dim, so kᵀ is never materialized): dot -> a _prep[...] cache read,
+        # with NO jnp.where on that chain.
         import re
 
         code = _fully_jagged_kernel.bind(self._resident_args()).to_triton_code(
             _worklist_config([8, 8])
         )
         body = code[code.index("def _dynamic_unroll_body") :]
-        dot = re.search(r"dot_general\(\w+, (permute_\d+),", body)
-        self.assertIsNotNone(dot, "q@kᵀ dot should read a permute operand")
-        pvar = dot.group(1)
-        pdef = re.search(rf"\b{pvar} = jnp\.transpose\((\w+),", body)
-        self.assertIsNotNone(pdef, f"{pvar} should be a jnp.transpose")
-        src = pdef.group(1)
-        # the transposed operand is defined directly from the prep cache read, not a
+        dot = re.search(
+            r"dot_general\(\w+, (\w+), dimension_numbers=\(\(\(2,\), \(2,\)\)", body
+        )
+        self.assertIsNotNone(dot, "q@kᵀ dot should contract K's minor dim")
+        src = dot.group(1)
+        # the K operand is defined directly from the prep cache read, not a
         # jnp.where -- i.e. the fill-0 mask is gone from the K path.
         self.assertRegex(body, rf"\b{src} = \w+_prep\[")
         self.assertNotRegex(body, rf"\b{src} = jnp\.where")

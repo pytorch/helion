@@ -64,6 +64,10 @@ from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
 from .node_masking import defer_pallas_load_masks
 from .node_masking import remove_unnecessary_masking
+from .pallas.distribute_reductions import distribute_affine_reductions
+from .pallas.internal_scratch import is_empty_allocation
+from .pallas.megakernel import enter_sequential_roots_mode
+from .pallas.operand_order import put_full_operand_first
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
 from .type_info import CallableType
@@ -76,6 +80,7 @@ from .type_info import NestedFunctionType
 from .type_info import NumericType
 from .type_info import SequenceType
 from .type_info import StackTensorType
+from .type_info import SymIntType
 from .type_info import TensorType
 from .type_info import TileIndexType
 from .type_info import TypeInfo
@@ -90,12 +95,15 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    import sympy
+
     from ..autotuner.config_spec import AccumulatorFact
     from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
     from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
     from .cute.layout import CuTeGridExecutionPlan
     from .device_ir_analysis import DeviceIRAnalysis
+    from .tile_dependency import StorageRole
     from .tile_dependency import TaskFamily
     from .tile_dependency import TileDependencyGraph
 
@@ -704,6 +712,30 @@ class KernelPhase:
     root_nodes: list[ast.For]
 
 
+@dataclasses.dataclass(frozen=True)
+class HostLoopInfo:
+    """A host ``for var in range(start, stop)`` loop folded around roots.
+
+    The roots ``first_root .. end_root - 1`` (root indices, in program order)
+    are traced once with ``var`` as ``symbol`` and run once per iteration.
+    """
+
+    var: str
+    symbol: sympy.Expr
+    start: int
+    stop: int
+    first_root: int
+    end_root: int
+
+    @property
+    def trips(self) -> int:
+        return self.stop - self.start
+
+    @property
+    def roots(self) -> range:
+        return range(self.first_root, self.end_root)
+
+
 def _tensor_to_inter_loop_rw_name(host: HostFunction, t: torch.Tensor) -> str | None:
     o = host.tensor_to_origin.get(t)
     if o is None:
@@ -821,8 +853,14 @@ class DeviceIR:
         self.implicit_dependency_starts: frozenset[int] = frozenset()
         self.tile_dependency_graph: TileDependencyGraph | None = None
         self.task_families: list[TaskFamily] = []
+        # Pallas megakernel lowering: all roots run in program order inside one
+        # program, with storage roles keyed by storage.
+        self.sequential_roots: bool = False
+        self.storage_roles: dict[int, StorageRole] = {}
         self.grid_block_ids: list[list[int]] = []
         self.noncanonical_task_origin_block_ids: set[int] = set()
+        # Host loops folded around roots (Pallas megakernels), in program order.
+        self.host_loops: list[HostLoopInfo] = []
         # A CuTe codegen view can restrict reduction strategies to one launch.
         # Axis identities and configuration slots remain owned by the full IR.
         self.codegen_active_block_ids: frozenset[int] | None = None
@@ -1662,6 +1700,63 @@ class DeviceIR:
     @staticmethod
     def current() -> DeviceIR:
         return tls.device_irs[-1]
+
+
+def _close_open_slices(tensor: torch.Tensor, index: list[object]) -> list[object]:
+    """Give half-open unit-step slices (``x[:k]``, ``x[k:]``) of a device value
+    explicit integer bounds so they lower like ``x[a:b]``."""
+    result: list[object] = []
+    dim = 0
+    for item in index:
+        if item is None:
+            result.append(item)
+            continue
+        if (
+            isinstance(item, slice)
+            and item.step in (None, 1)
+            and (item.start is None) != (item.stop is None)
+            and dim < tensor.ndim
+        ):
+            size = tensor.size(dim)
+            start = 0 if item.start is None else item.start
+            stop = size if item.stop is None else item.stop
+            if isinstance(start, int) and isinstance(stop, int):
+                item = slice(start, stop, item.step)
+        result.append(item)
+        dim += 1
+    return result
+
+
+def _split_narrowing(tensor: torch.Tensor, index: list[object]) -> list[list[object]]:
+    """Split a device-value subscript into subscripts that narrow one dim each.
+
+    ``v[b, :, :k]`` becomes ``v[:, :, :k]`` then ``[b, :, :]``: the dims are
+    narrowed right to left, so each one keeps its source position, and a last
+    subscript inserts the ``None`` dims.  Indexing by tensors (gathers, whose
+    indices broadcast together) and subscripts that narrow at most one dim
+    are left whole.
+    """
+    full = slice(None)
+    sources = [item for item in index if item is not None]
+    narrowed = [d for d, item in enumerate(sources) if item != full]
+    if len(narrowed) < 2 or len(sources) > tensor.ndim:
+        return [index]
+    if not all(isinstance(sources[d], (int, torch.SymInt, slice)) for d in narrowed):
+        return [index]
+    rank = tensor.ndim
+    steps: list[list[object]] = []
+    for d in reversed(narrowed):
+        steps.append([full] * d + [sources[d]] + [full] * (rank - d - 1))
+        if not isinstance(sources[d], slice):
+            rank -= 1
+    kept: list[object] = [
+        item if item is None else full
+        for item in index
+        if item is None or isinstance(item, slice)
+    ]
+    if None in kept:
+        steps.append(kept + [full] * (rank - (len(kept) - kept.count(None))))
+    return steps
 
 
 def _is_static_slice_bound(bound: object) -> bool:
@@ -2635,8 +2730,15 @@ class WalkDeviceAST(NodeVisitor):
         if type_info is not None and type_info.origin.is_host():
             # pyrefly: ignore [bad-argument-type]
             return hl.load(self.visit(value), self._subscript_slice_proxy(node.slice))
+        tensor = self.visit(value)
+        index = self._subscript_slice_proxy(node.slice)
+        if isinstance(tensor, torch.Tensor):
+            index = _close_open_slices(tensor, index)
+            for step in _split_narrowing(tensor, index):
+                tensor = hl.subscript(tensor, step)
+            return tensor
         # pyrefly: ignore [bad-argument-type]
-        return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
+        return hl.subscript(tensor, index)
 
     def visit_Call(self, node: ast.Call) -> object:
         args = []
@@ -2870,8 +2972,51 @@ class WalkHostAST(NodeVisitor):
             self.root_nodes.append(node)
             self.current_phase_roots.append(len(self.device_ir.root_ids) - 1)
             self.root_index += 1
+        elif node._loop_type == LoopType.FOLDED:
+            self._visit_folded_loop(node)
         else:
             self.generic_visit(node)
+
+    def _visit_folded_loop(self, node: ast.For) -> None:
+        """Record a host loop whose body roots run once per iteration."""
+        assert isinstance(node, ExtendedAST)
+        assert isinstance(node.target, ExtendedAST) and isinstance(
+            node.target, ast.Name
+        )
+        target_type = node.target._type_info
+        assert isinstance(target_type, SymIntType)
+        # pyrefly: ignore [missing-attribute]
+        loop_range = node.iter._type_info.value
+        assert isinstance(loop_range, range)
+        var = node.target.id
+        for stmt in node.body:
+            if isinstance(stmt, ExtendedAST) and stmt._loop_type == LoopType.GRID:
+                continue
+            if isinstance(stmt, ExtendedAST) and stmt._loop_type == LoopType.FOLDED:
+                raise exc.UnsupportedFoldedHostLoop(
+                    "folded host loops cannot be nested"
+                )
+            if not is_empty_allocation(stmt) or any(
+                isinstance(child, ast.Name) and child.id == var
+                for child in ast.walk(stmt)
+            ):
+                raise exc.UnsupportedFoldedHostLoop(
+                    "its body may only hold top-level device loops and "
+                    "`torch.empty`-style allocations that do not depend on "
+                    f"{var!r} (got `{ast.unparse(stmt)}`)"
+                )
+        first_root = len(self.device_ir.root_ids)
+        self.generic_visit(node)
+        self.device_ir.host_loops.append(
+            HostLoopInfo(
+                var=var,
+                symbol=target_type.to_sympy(),
+                start=loop_range.start,
+                stop=loop_range.stop,
+                first_root=first_root,
+                end_root=len(self.device_ir.root_ids),
+            )
+        )
 
     def visit_Expr(self, node: ast.Expr) -> None:
         # Record barrier placement between top-level loops.
@@ -3213,6 +3358,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 env.cute_half_atomic_output_promotions = promotions
                 rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
                 promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
+        if CompileEnvironment.current().backend.name == "pallas":
+            fast_math = CompileEnvironment.current().settings.fast_math
+            for graph in device_ir.graphs:
+                distribute_affine_reductions(graph.graph, fast_math=fast_math)
+                put_full_operand_first(graph.graph)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
         if scaled_contractions:
@@ -3567,7 +3717,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         config_spec.memory_op_facts = memory_op_facts
         from .tile_dependency import build_tile_dependency_graph
 
-        if len(device_ir.task_families) > 1 and env.cute_fission_plan is None:
+        if (
+            len(device_ir.task_families) > 1 or device_ir.host_loops
+        ) and env.cute_fission_plan is None:
             device_ir.tile_dependency_graph = build_tile_dependency_graph(
                 tile_accesses,
                 device_ir=device_ir,
@@ -3579,7 +3731,13 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
             )
-            if device_ir.implicit_dependency_starts:
+            if env.backend.name == "pallas" and (
+                device_ir.implicit_dependency_starts
+                or source_phase_starts
+                or device_ir.host_loops
+            ):
+                enter_sequential_roots_mode(device_ir, config_spec, func, tile_accesses)
+            elif device_ir.implicit_dependency_starts:
                 if env.device.type != "cuda" or not config_spec.supports_config_key(
                     "cross_loop_pipeline"
                 ):
@@ -3598,7 +3756,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 )
                 env.require_persistent_blocked(reason)
                 config_spec.enable_cross_loop_pipeline()
-        if config_spec.supports_config_key("pallas_load_buffer_count"):
+        stream_model = config_spec.pallas_stream_model
+        if stream_model is not None and stream_model.streams_every_inner_load:
+            # The weight rings buffer every inner-loop load of an argument.
+            config_spec.pallas_load_buffer_count.length = 0
+        elif config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = len(
                 LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
             )

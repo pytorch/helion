@@ -411,6 +411,7 @@ _TCGEN05_GROUPED_SELECTED_MAILBOX_GLOBAL_M_START = 8
 if TYPE_CHECKING:
     from .cute.cute_mma import _Tcgen05SchedPipelinePlan
     from .cute.device_state import CuteTcgen05MatmulPlan
+    from .device_ir import HostLoopInfo
     from .inductor_lowering import CodegenState
 
 NUM_SM_VAR = "_NUM_SM"
@@ -746,6 +747,122 @@ class ForEachProgramID(ProgramIDs):
                 loops.append(statement_from_string(barrier_stmt))
             start_expr = boundary
         return loops
+
+
+@dataclasses.dataclass
+class SequentialRootsProgramIDs(ForEachProgramID):
+    """Run all top-level loops in program order inside one program.
+
+    Used by the Pallas megakernel lowering: the launch grid is ``(1,)`` and each
+    root walks its own tiles in a ``pl.loop``.  ``shared_pid_var`` is rebound to
+    a fresh loop index before each root is generated, so the per-root
+    ``FlatProgramIDs`` decode their tile coordinates from it unchanged.
+    """
+
+    def codegen_pid_init(self) -> list[ast.stmt]:
+        return []
+
+    def setup_persistent_kernel(
+        self, device_function: DeviceFunction, total_pids_expr: str | None = None
+    ) -> list[ast.stmt] | None:
+        return None
+
+    def codegen(self, state: CodegenState) -> None:
+        # Every root owns its loop index; there is no shared offset to subtract.
+        pass
+
+    def codegen_grid(self) -> ast.AST:
+        return expr_from_string("(1,)")
+
+    def codegen_root(
+        self,
+        device_function: DeviceFunction,
+        body: list[ast.AST],
+        prologue_body: list[ast.AST] | None = None,
+    ) -> list[ast.AST]:
+        """Wrap the latest root's body in a sequential loop over its tiles.
+
+        The kernel prologue goes before root 0, or into ``prologue_body`` when
+        given (root 0 is in a folded host loop that ``prologue_body`` holds).
+        """
+        pids = self.cases[-1]
+        prologue: list[ast.AST] = []
+        if len(self.cases) == 1 and device_function.pallas_megakernel is not None:
+            prologue = [
+                statement_from_string(statement)
+                for statement in device_function.pallas_megakernel.prologue(
+                    device_function
+                )
+            ]
+            if prologue_body is not None:
+                prologue_body.extend(prologue)
+                prologue = []
+        num_pids = _static_num_pids(pids, device_function)
+        plan = device_function.pallas_megakernel
+        after: list[ast.stmt] = []
+        if plan is not None:
+            root = len(self.cases) - 1
+            plan.check_root_decode(
+                device_function, root, self.shared_pid_var, body, num_pids
+            )
+            tile_end, after = plan.finish_root(device_function, root, num_pids == 1)
+            body = [*body, *plan.root_refills(device_function, root), *tile_end]
+        if num_pids == 1:
+            return [
+                *prologue,
+                statement_from_string(f"{self.shared_pid_var} = 0"),
+                *body,
+                *after,
+            ]
+        upper = (
+            str(num_pids)
+            if num_pids is not None
+            else pids.total_pids_expr(is_device=True)
+        )
+        loop_fn = statement_from_string(
+            f"@pl.loop(0, {upper})\n"
+            f"def {device_function.new_var('_root')}({self.shared_pid_var}):\n"
+            "    pass"
+        )
+        assert isinstance(loop_fn, ast.FunctionDef)
+        loop_fn.body = cast("list[ast.stmt]", body)
+        return [*prologue, loop_fn, *after]
+
+    def codegen_folded_loop(
+        self,
+        device_function: DeviceFunction,
+        loop: HostLoopInfo,
+        var: str,
+        body: list[ast.AST],
+    ) -> list[ast.AST]:
+        """Run the roots of a folded host loop once per iteration."""
+        loop_fn = statement_from_string(
+            f"@pl.loop({loop.start}, {loop.stop})\n"
+            f"def {device_function.new_var('_' + loop.var + '_loop')}({var}):\n"
+            "    pass"
+        )
+        assert isinstance(loop_fn, ast.FunctionDef)
+        loop_fn.body = cast("list[ast.stmt]", body)
+        return [loop_fn]
+
+
+def _static_num_pids(pids: ProgramIDs, device_function: DeviceFunction) -> int | None:
+    """Number of tiles a root iterates over, when it is a compile-time constant."""
+    env = CompileEnvironment.current()
+    num_pids = 1
+    for pid in pids.pid_info:
+        numel = pid.numel
+        if isinstance(numel, str) or not sympy.sympify(numel).is_Integer:
+            return None
+        block_size = (
+            1
+            if pid.block_size_var == "1"
+            else env.block_sizes[pid.block_id].from_config(device_function.config)
+        )
+        if not isinstance(block_size, int):
+            return None
+        num_pids *= -(-int(numel) // block_size)
+    return num_pids
 
 
 class XYZProgramIDs(ProgramIDs):

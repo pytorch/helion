@@ -296,7 +296,7 @@ class TestTileDependencyAnalysis(TestCase):
 
     @skipIfRefEager("Loop dependency checks are not performed in ref eager mode")
     def test_implicit_dependency_lowering_is_rejected_when_unsupported(self) -> None:
-        if _get_backend() == "triton" and is_cuda():
+        if (_get_backend() == "triton" and is_cuda()) or _get_backend() == "pallas":
             self.skipTest("implicit dependency lowering is supported")
 
         x = torch.arange(8, device=DEVICE, dtype=torch.float32)

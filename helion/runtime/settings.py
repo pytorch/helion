@@ -611,6 +611,11 @@ class _Settings:
         )
     )
     pallas_topk_recall_target: float = 0.99
+    pallas_non_power_of_two_block_search: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_PALLAS_NON_POWER_OF_TWO_BLOCK_SEARCH", False
+        )
+    )
     cute_region_fission: bool = dataclasses.field(
         default_factory=functools.partial(
             _env_get_bool, "HELION_CUTE_REGION_FISSION", False
@@ -777,6 +782,13 @@ class Settings(_Settings):
         "pallas_topk_recall_target": (
             "Recall target for the Pallas approximate top-k lowering. Must be in "
             "(0, 1]; use 1.0 when exact top-k results are required. Default 0.99."
+        ),
+        "pallas_non_power_of_two_block_search": (
+            "If True, the Pallas autotuner also searches non-power-of-two block "
+            "sizes that tile a whole tensor axis: the full extent and its divisors "
+            "that are multiples of the TPU tile (128 lanes, 8/16/32 sublanes). "
+            "Explicit configs accept these sizes regardless. "
+            "Defaults to HELION_PALLAS_NON_POWER_OF_TWO_BLOCK_SEARCH (False)."
         ),
         "cute_region_fission": (
             "If True, distribute proven row-independent materialized regions "

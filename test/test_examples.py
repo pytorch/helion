@@ -1922,7 +1922,6 @@ class TestExamples(RefEagerTestBase, TestCase):
         self._check_gather_gemv(torch.float32)
 
     @skipIfXPU("Timeout on XPU")
-    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_gather_gemv_half(self):
         self._check_gather_gemv(HALF_DTYPE, atol=0.2, rtol=0.2)
 

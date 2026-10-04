@@ -39,6 +39,9 @@ class LoopType(enum.Enum):
     HOST = enum.auto()
     GRID = enum.auto()
     DEVICE = enum.auto()
+    # Host ``range`` loop whose body holds top-level device loops; the body is
+    # traced once and iterated inside a single device program.
+    FOLDED = enum.auto()
 
 
 class ExtendedAST:

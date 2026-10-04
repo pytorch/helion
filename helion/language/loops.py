@@ -451,6 +451,8 @@ def _add_config_choices(
 
         if has_symbolic_bounds or has_data_dependent_bounds:
             config_spec.has_symbolic_or_data_dependent_bounds = True
+        if has_symbolic_bounds:
+            config_spec.has_symbolic_bounds = True
 
 
 def _add_config_range_choice(

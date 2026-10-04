@@ -20,6 +20,7 @@ from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from ...language._tracing_ops import _mask_to
+from ...language.matmul_ops import dot as hl_dot
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..aten_lowering import AtenLowering
@@ -49,6 +50,8 @@ from ..matmul_utils import _emit_pallas_matmul
 from ..matmul_utils import _needs_f32_accumulator
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..aten_lowering import LoweringContext
 
 
@@ -79,6 +82,59 @@ def _has_foldable_dot_lhs_cast(node: Node) -> bool:
         and lhs.args[1] == rhs.meta["val"].dtype
         and rhs.meta["val"].dtype in (torch.bfloat16, torch.float16)
     )
+
+
+def _dot_rhs_operand(node: Node) -> Node | None:
+    """The rhs operand of an mm/bmm/addmm/baddbmm/hl.dot ``node``."""
+    if node.target in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default, hl_dot):
+        rhs = node.args[1]
+    elif node.target in (
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.baddbmm.default,
+    ):
+        rhs = node.args[2]
+    else:
+        return None
+    return rhs if isinstance(rhs, Node) else None
+
+
+def _swaps_minor_dims(node: Node) -> bool:
+    """Whether ``node`` is a permute that only swaps the last two dims."""
+    if node.target is not torch.ops.aten.permute.default:
+        return False
+    dims = [*node.args[1]]  # pyrefly: ignore [not-iterable]
+    ndim = len(dims)
+    return ndim >= 2 and dims == [*range(ndim - 2), ndim - 1, ndim - 2]
+
+
+def _folds_into_dot_rhs(node: Node) -> bool:
+    """Whether every user of ``node`` contracts it as a transposed dot rhs.
+
+    The dots then contract the permute's input along its minor dim instead,
+    so the permute is not materialized as a separate value.
+    """
+    return (
+        _swaps_minor_dims(node)
+        and bool(node.users)
+        and all(
+            _dot_rhs_operand(user) is node and [*user.args].count(node) == 1
+            for user in node.users
+        )
+    )
+
+
+def dot_rhs_is_transposed(
+    rhs_node: object, rhs: ast.AST, env: Mapping[Node, object]
+) -> bool:
+    """Whether a dot's ``rhs`` value is its operand with the last two dims
+    swapped back: codegen_permute_pallas hands a folded permute's input
+    through unchanged (unless a resident prep cache already materialized the
+    transpose)."""
+    if not isinstance(rhs_node, Node) or not _folds_into_dot_rhs(rhs_node):
+        return False
+    source = env[cast("Node", rhs_node.args[0])]
+    assert isinstance(source, ast.AST)
+    return ast.dump(source) == ast.dump(rhs)
 
 
 @cat_lowering_pallas.register_codegen("pallas")
@@ -141,7 +197,60 @@ def codegen_view_pallas(ctx: LoweringContext, node: Node) -> object:
                 f"(jnp.reshape(({{tensor}}).astype(jnp.int32), {shape_str}) != 0)",
                 tensor=tensor,
             )
+        if isinstance(input_val, torch.Tensor):
+            output_val = node.meta["val"]
+            if (rows := _row_split(input_val, output_val)) is not None:
+                flat = ctx.cg.lift(tensor, prefix="flat")
+                return _stack_rows(flat, *rows, [*output_val.shape])
+            if (rows := _row_split(output_val, input_val)) is not None:
+                if input_val.ndim > 2:
+                    tensor = expr_from_string(
+                        f"jnp.reshape({{tensor}}, [{rows[0]}, {rows[1]}])",
+                        tensor=tensor,
+                    )
+                return expr_from_string(
+                    f"jnp.concatenate([{{rows}}[i] for i in range({rows[0]})])",
+                    rows=ctx.cg.lift(tensor, prefix="rows"),
+                )
     return expr_from_string(f"jnp.reshape({{tensor}}, {shape_str})", tensor=tensor)
+
+
+# Above this many rows a row-by-row reshape (``_row_split``) unrolls too far.
+_MAX_SPLIT_ROWS = 64
+
+
+def _row_split(flat: torch.Tensor, shaped: torch.Tensor) -> tuple[int, int] | None:
+    """``(rows, width)`` when a reshape between rank-1 ``flat`` and ``shaped``
+    has to go a row at a time, else None.
+
+    Mosaic lays a rank-1 vector out as one row of lanes and cannot reshape it
+    to (or from) rows of a width that is not a whole number of 128 lanes, nor
+    to more than one row with a unit second-minor dim (``[2, 1, 256]``).  It
+    also folds chained reshapes into one, so even a supported ``[rows, width]``
+    reshape breaks once a neighbor adds or drops a unit dim (a KV-cache row
+    write's ``expand_dims``).  A stack (concatenation) of the row slices never
+    folds, so every rank-1 reshape to or from several rows goes that way.
+    """
+    if flat.ndim != 1 or shaped.ndim < 2:
+        return None
+    sizes = [*shaped.shape]
+    if not all(isinstance(size, int) for size in sizes):
+        return None
+    rows = math.prod(sizes[:-1])
+    if not 1 < rows <= _MAX_SPLIT_ROWS:
+        return None
+    return rows, sizes[-1]
+
+
+def _stack_rows(flat: ast.Name, rows: int, width: int, shape: list[int]) -> ast.AST:
+    """``flat`` reshaped to ``shape`` as a stack of its ``rows`` row slices,
+    then a reshape that keeps the ``width`` minor dim."""
+    stacked = (
+        f"jnp.stack([{{flat}}[i * {width}:(i + 1) * {width}] for i in range({rows})])"
+    )
+    if shape != [rows, width]:
+        stacked = f"jnp.reshape({stacked}, {shape})"
+    return expr_from_string(stacked, flat=flat)
 
 
 def _pad_fill_literal(value: object) -> str:
@@ -220,6 +329,13 @@ def codegen_permute_pallas(ctx: LoweringContext, node: Node) -> object:
         return resident_prep_read
     tensor, dims = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
+    if _folds_into_dot_rhs(node):
+        # The consuming dots contract the untransposed tensor (see _pallas_dot).
+        return tensor
+    if node.args[0] in ctx.cg.device_function.pallas_physical_values:
+        # A lane-dense load left in the physical order this permute takes it
+        # back to (``lane_dense.logical_load``).
+        return tensor
     # pyrefly: ignore [not-iterable]
     dims = [*dims]
     return expr_from_string(
@@ -331,6 +447,7 @@ def _pallas_dot(ctx: LoweringContext, node: Node, with_acc: bool) -> ast.AST:
         need_f32_acc=need_f32_acc,
         out_dtype=out_dtype,
         lhs_ndim=lhs_ndim,
+        rhs_transposed=dot_rhs_is_transposed(rhs_node_arg, rhs, ctx.env),
     )
 
 

@@ -11,8 +11,19 @@ from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.pallas.dma import DmaTransfer
 from helion._compiler.pallas.dma import allocate_dma_resources
 from helion._compiler.pallas.dma import async_copy_statements
+from helion._compiler.pallas.lane_dense import logical_load
+from helion._compiler.pallas.lane_dense import packed_row
+from helion._compiler.pallas.lane_dense import packed_row_load
+from helion._compiler.pallas.lane_dense import physical_order
+from helion._compiler.pallas.megakernel import ring_window_parts
+from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
+from helion._compiler.pallas.plan_tiling import TensorIndexPattern
+from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
+from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
+from helion._compiler.pallas.plan_tiling import TilePattern
 from helion._compiler.pallas.vmem_scalar_load import classify_vmem_scalar_load
 from helion._compiler.pallas.vmem_scalar_load import emit_vmem_scalar_load
+from helion._utils import is_scalar_index
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -70,6 +81,14 @@ def load_expr(
 
     arg_name, active_name, patterns = _load_route(state, tensor)
     device_fn = state.device_function
+    megakernel = device_fn.pallas_megakernel
+    if megakernel is not None:
+        streamed = megakernel.root_stream_load(state, tensor, subscript)
+        if streamed is not None:
+            return streamed
+        copied = megakernel.root_slice_load(state, tensor, subscript)
+        if copied is not None:
+            return copied
     assert state.fx_node is not None
     plan = state.fx_node.meta.get(TENSORCORE_PLAN_META)
     if isinstance(plan, DmaGatherPlan):
@@ -105,12 +124,26 @@ def load_expr(
         indexing_patterns=patterns,
         tensor_name=arg_name,
     )
-    scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
-    if scalar_load is None:
-        result = expr_from_string(f"{active_name}[{', '.join(parts)}]")
-        result = _padded_value_for_load(state, tensor, subscript, parts, result)
-    else:
+    # An input passed lane dense is indexed in its physical dim order.
+    perm = device_fn.pallas_lane_dense.get(id(tensor.untyped_storage()))
+    if perm is not None:
+        parts = physical_order(parts, perm)
+    parts = ring_window_parts(device_fn, active_name, parts)
+    kept = [not is_scalar_index(idx) for idx in subscript]
+    if perm is not None and packed_row(tensor.dtype, perm, kept):
+        *_, rows, lanes = physical_order([int(size) for size in tensor.shape], perm)
+        result = packed_row_load(active_name, parts, tensor.dtype, rows, lanes)
+    elif (
+        scalar_load := classify_vmem_scalar_load(state, tensor, parts, patterns, perm)
+    ) is not None:
         result = emit_vmem_scalar_load(tensor, active_name, parts, scalar_load)
+    else:
+        result = expr_from_string(f"{active_name}[{', '.join(parts)}]")
+        if perm is None:
+            result = _padded_value_for_load(state, tensor, subscript, parts, result)
+    if perm is not None:
+        # A whole VMEM block (``_lane_dense_layouts``), so never clamped.
+        result = logical_load(state, result, perm, kept)
     mask_expr = _load_mask_expr(state, subscript, tensor)
     if mask_expr is not None:
         result = expr_from_string(
@@ -509,6 +542,75 @@ def sliced_value_for_store(
     return expr_from_string(
         f"{{value}}[{', '.join(slices)}]",
         value=value,
+    )
+
+
+def megakernel_scratch_store_value(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    ref: str,
+    index: str,
+    value: ast.AST,
+) -> ast.AST:
+    """Keep the padding of megakernel scratch zero under overhanging tiles.
+
+    Lowering relies on padded positions reading as zero, which the launcher
+    guarantees for arguments.  Scratch padding is zeroed at kernel start, so
+    a tile store that overhangs the tensor keeps the old contents there.
+    """
+    megakernel = state.device_function.pallas_megakernel
+    if (
+        megakernel is None
+        or state.device_function.pallas_internal_scratch_name(tensor) is None
+    ):
+        return value
+    storage = id(tensor.untyped_storage())
+    squeezing_patterns = (
+        ArbitraryIndexPattern,
+        TileIndexWithOffsetPattern,
+        TileBeginWithOffsetPattern,
+    )
+    masks: list[tuple[int, int, int, str]] = []
+    out_dim = 0
+    tensor_dim = 0
+    for idx, pattern in zip(
+        subscript, _get_indexing_patterns(state, tensor), strict=True
+    ):
+        if idx is None:
+            out_dim += 1
+            continue
+        if (
+            isinstance(pattern, TilePattern)
+            and (size := megakernel.padded_dims.get((storage, tensor_dim))) is not None
+            and (mask := state.codegen.mask_var(pattern.block_id)) is not None
+        ):
+            masks.append((out_dim, pattern.block_id, size, mask))
+        # A 0-d tensor index (e.g. a rank read from SMEM) selects one
+        # position, like an integer.
+        if not isinstance(pattern, squeezing_patterns) and not (
+            isinstance(pattern, TensorIndexPattern) and pattern.index_ndim == 0
+        ):
+            out_dim += 1
+        tensor_dim += 1
+    if not masks:
+        return value
+    # Mosaic cannot reshape a 1-D bool vector, so rank>1 stores rebuild the
+    # mask from a broadcasted iota along its own dim.
+    terms = []
+    for dim, block_id, size, mask in masks:
+        if out_dim == 1:
+            terms.append(mask)
+            continue
+        block_size = state.device_function.block_size_var(block_id)
+        assert block_size is not None
+        shape = ", ".join(block_size if d == dim else "1" for d in range(out_dim))
+        offset = state.codegen.offset_var(block_id)
+        terms.append(
+            f"({offset} + lax.broadcasted_iota(jnp.int32, ({shape}), {dim}) < {size})"
+        )
+    return expr_from_string(
+        f"jnp.where({' & '.join(terms)}, {{value}}, {ref}[{index}])", value=value
     )
 
 
@@ -981,6 +1083,13 @@ def _slice_code(
         if loops and any(isinstance(loop, DeviceLoopState) for loop in loops):
             return _ds_expr(state, block_id, tensor=tensor, tensor_dim=tensor_dim)
 
+    megakernel = state.device_function.pallas_megakernel
+    if megakernel is not None:
+        # The ref is padded past the tensor along this dim; read only the
+        # tensor itself.
+        size = megakernel.padded_dims.get((id(tensor.untyped_storage()), tensor_dim))
+        if size is not None:
+            return f"0:{size}"
     return ":"
 
 

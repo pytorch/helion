@@ -1624,7 +1624,7 @@ class DeviceIRAnalysis:
         from .tile_dependency import TileAccess
         from .tile_dependency import owner_roots_by_graph_id
 
-        if len(device_ir.root_ids) <= 1:
+        if len(device_ir.root_ids) <= 1 and not device_ir.host_loops:
             return ()
 
         graph_owners = owner_roots_by_graph_id(device_ir)

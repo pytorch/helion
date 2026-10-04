@@ -24,12 +24,8 @@ wrapper itself (the FX target). The template references the carrier
 local four times in the standard polynomial; the renderer keeps that
 carrier bound before formatting the template.
 
-Backend support: ``cute`` and ``triton`` only. The ``pallas`` backend
-raises :class:`exc.BackendUnsupported` because Mosaic does not have a
-direct ``cute.math.tanh`` analog and the polynomial would need a
-separate Pallas-flavoured lowering (the same primitive can be
-spelled directly with ``jax.nn.gelu(x, approximate=True)`` in user
-code today).
+Backend support: ``cute``, ``triton`` and ``pallas`` (the polynomial with
+``lax.tanh``, in fp32 for fp16 / bf16 inputs).
 """
 
 from __future__ import annotations
@@ -107,8 +103,7 @@ def _gelu_tanh_approx(x: torch.Tensor) -> torch.Tensor:
     runs in fp32 (Triton's ``libdevice.tanh`` is fp32-only) and the
     result is cast back to the input dtype.
 
-    Backend support: ``cute`` and ``triton``. ``pallas`` raises
-    :class:`exc.BackendUnsupported`.
+    Backend support: ``cute``, ``triton`` and ``pallas``.
     """
     raise exc.NotInsideKernel
 

@@ -90,6 +90,8 @@ def _config_not_viable_due_to_grid_size(
                 / block_size_by_id[block_id]
             )
             for block_id in root.block_ids
+            # hl.grid axes are not tuned: no config changes their programs.
+            if block_id in block_size_by_id
         )
         if programs > max_programs_per_root_grid:
             return True
@@ -158,6 +160,26 @@ def _config_not_viable_due_to_low_level_pipeline(
     )
 
 
+def _config_not_viable_due_to_weight_ring(
+    config_spec: ConfigSpec,
+    config: Config,
+    block_size_by_id: dict[int, int],
+) -> bool:
+    """Return whether a megakernel's weight ring cannot be laid out or fit."""
+    model = config_spec.pallas_stream_model_for(config)
+    depth = config.get("pallas_stream_depth")
+    return (
+        model is not None
+        and model.config_error(
+            block_size_by_id,
+            depth if isinstance(depth, int) else None,
+            config_spec.pallas_keeps_hbm_resident(config),
+            bool(config.get("pallas_stream_arena")),
+        )
+        is not None
+    )
+
+
 def _embedded_helper_source(body: str) -> str:
     """Source of the in-kernel Pallas helpers referenced by ``body`` (module-level
     so both ``PallasBackend.embedded_helper_source`` and the jax standalone builder
@@ -176,6 +198,15 @@ def _embedded_helper_source(body: str) -> str:
         from ...runtime.pallas import compact_worklist
 
         blocks.append(_embed_source(inspect.getsource(compact_worklist)))
+    if "_helion_ring_tile" in body:
+        from ...runtime.pallas import ring_view
+
+        blocks.extend(
+            [
+                _embed_source(inspect.getsource(ring_view)),
+                "_helion_ring_tile = ring_tile",
+            ]
+        )
     return "\n\n\n".join(blocks)
 
 
@@ -293,8 +324,18 @@ class PallasBackend(Backend):
         return None
 
     @property
+    def requires_power_of_two_block_sizes(self) -> bool:
+        # Mosaic tiles VMEM in (sublane, 128) units, not powers of two; legal
+        # non-power-of-two sizes are set in adjust_block_size_constraints.
+        return False
+
+    @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         return False
+
+    @property
+    def supports_folded_host_loops(self) -> bool:
+        return True
 
     @property
     def requires_shape_specialized_module(self) -> bool:
@@ -333,11 +374,13 @@ class PallasBackend(Backend):
             config_spec, config, block_size_by_id
         ):
             return False
-        if _config_not_viable_due_to_low_level_pipeline(  # noqa: SIM103
+        if _config_not_viable_due_to_low_level_pipeline(
             config_spec, config, block_size_by_id
         ):
             return False
-        return True
+        return not _config_not_viable_due_to_weight_ring(
+            config_spec, config, block_size_by_id
+        )
 
     def dtype_str(self, dtype: torch.dtype) -> str:
         key = str(dtype)
@@ -434,14 +477,15 @@ class PallasBackend(Backend):
             # (see ``embedded_helper_source`` / ``build_dependency_free_code``).
             "_helion_divide_filter_topk": "from helion._compiler.pallas.topk_impl import divide_filter_topk as _helion_divide_filter_topk",
             "flatten_worklist": "from helion.runtime.pallas.compact_worklist import flatten_worklist",
+            "_helion_ring_tile": "from helion.runtime.pallas.ring_view import ring_tile as _helion_ring_tile",
         }
 
     def embedded_helper_source(self, body: str) -> str:
         """Inline the in-kernel Pallas helpers referenced by ``body``.
 
-        ``divide_filter_topk`` (aten.topk lowering) and ``flatten_worklist``
-        (compact-worklist builder) are pure-``jax`` helpers the generated kernel
-        calls. Regular output imports them from helion (see ``library_imports``);
+        ``divide_filter_topk`` (aten.topk lowering), ``flatten_worklist``
+        (compact-worklist builder) and ``ring_tile`` (arena slot views) are
+        pure-``jax`` helpers the generated kernel calls. Regular output imports them from helion (see ``library_imports``);
         this embeds their source instead, so a dependency-free / jax standalone is
         self-contained. Called only by the standalone builders (never for regular
         ``to_code``), which drop the corresponding helion imports.
@@ -464,6 +508,12 @@ class PallasBackend(Backend):
             "pallas_load_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
+            "pallas_stream_depth",
+            "pallas_stream_unroll",
+            "pallas_stream_wait_group",
+            "pallas_stream_arena",
+            "pallas_hbm_resident",
+            "pallas_lane_dense",
         }
     )
 
@@ -627,11 +677,23 @@ class PallasBackend(Backend):
         threads_in_group: int | None = None,
         dtype: torch.dtype | None = None,
     ) -> str:
-        fn = "jnp.argmax" if reduction_type == "argmax" else "jnp.argmin"
-        return (
-            f"lax.convert_element_type("
-            f"{fn}({input_name}, axis={dim}), {self.dtype_str(output_dtype)})"
+        # torch returns the first index of the extreme, a NaN counting as the
+        # extreme.  Mosaic's jnp.argmax/argmin returns any one of tied lanes
+        # (an all-equal row gives 127), so take the smallest index whose value
+        # is the extreme.  Values compare in their computation dtype ``dtype``:
+        # Mosaic cannot relayout the compare masks of packed 16-bit values.
+        value = input_name
+        if dtype is not None:
+            value = f"{input_name}.astype({self.dtype_str(dtype)})"
+        extreme = "jnp.max" if reduction_type == "argmax" else "jnp.min"
+        hit = f"({value} == {extreme}({value}, axis={dim}, keepdims=True))"
+        if dtype is None or dtype.is_floating_point:
+            hit = f"{hit} | ({value} != {value})"
+        index = f"lax.broadcasted_iota(jnp.int32, {input_name}.shape, {dim})"
+        first = (
+            f"jnp.min(jnp.where({hit}, {index}, {input_name}.shape[{dim}]), axis={dim})"
         )
+        return f"lax.convert_element_type({first}, {self.dtype_str(output_dtype)})"
 
     def argreduce_loop_update_statements(
         self,
@@ -720,6 +782,29 @@ class PallasBackend(Backend):
         bitwidth = min(dtype.itemsize * 8, 32)
         return 8 * (32 // bitwidth)
 
+    def non_power_of_two_block_multiple(
+        self, tensor: torch.Tensor, dim_from_end: int
+    ) -> int:
+        """Multiple a non-power-of-two block must be on this tensor axis.
+
+        A block equal to the full axis extent is always legal.  Otherwise the
+        BlockSpec rule needs the last two block dims divisible by (8, 128),
+        but a block can also be sliced from a VMEM/HBM ref with ``pl.ds``
+        (``fori_loop``, resident operands), which Mosaic only accepts as whole
+        native tiles: 8/16/32 sublanes for 32/16/8-bit dtypes.  Since the loop
+        type is a separate config choice, use the native tile, which also
+        satisfies the BlockSpec rule.  Rank-1 blocks must cover whole
+        (8, 128) vregs (Mosaic's rank-1 BlockSpec rule for non-power-of-two
+        sizes).
+        """
+        if dim_from_end >= 2:
+            return 1
+        if tensor.ndim == 1:
+            return 8 * 128
+        if dim_from_end == 0:
+            return 128
+        return self.sublane_tiling(tensor.dtype)
+
     fake_tensor_loads: list[tuple[torch.Tensor, list[object]]]
 
     def process_fake_tensor_load(
@@ -769,6 +854,7 @@ class PallasBackend(Backend):
         from ...autotuner.config_spec import BlockSizeSpec
         from ..ast_extension import ExtendedAST
         from ..compile_environment import BlockSizeInfo
+        from ..compile_environment import CompileEnvironment
         from helion._compiler.compile_environment import _to_sympy
         from helion._compiler.host_function import HostFunction
         from helion._compiler.type_info import SequenceType
@@ -776,12 +862,17 @@ class PallasBackend(Backend):
         from helion._compiler.type_info import TileIndexType
 
         host_func = HostFunction.current()
+        env = CompileEnvironment.current()
 
         class TensorTiledAccessAnalyzer(ast.NodeVisitor):
             def __init__(self, backend: PallasBackend) -> None:
                 super().__init__()
                 self.backend = backend
                 self.required_alignments: dict[int, int] = {}
+                # Per canonical block_id: the multiple a non-power-of-two block
+                # size must satisfy, and the extents of the tensor axes it tiles.
+                self.non_power_of_two_multiples: dict[int, int] = {}
+                self.tiled_extents: dict[int, set[int | None]] = {}
                 self.update_requirements_from_fake_tensor_loads()
 
             def visit_Subscript(self, node: ast.Subscript) -> None:
@@ -834,6 +925,24 @@ class PallasBackend(Backend):
                         dim_from_end, tensor.ndim, bitwidth
                     )
                     self.maybe_update_required_alignment(bid, required_alignment)
+                    self.record_tiled_axis(bid, tensor, accessed_dim)
+
+            def record_tiled_axis(
+                self, bid: int, tensor: torch.Tensor, dim: int
+            ) -> None:
+                multiple = self.backend.non_power_of_two_block_multiple(
+                    tensor, tensor.ndim - 1 - dim
+                )
+                if multiple == 1:
+                    return
+                bid = env.canonical_block_id(bid)
+                self.non_power_of_two_multiples[bid] = math.lcm(
+                    self.non_power_of_two_multiples.get(bid, 1), multiple
+                )
+                extent = tensor.shape[dim]
+                self.tiled_extents.setdefault(bid, set()).add(
+                    extent if isinstance(extent, int) else None
+                )
 
             def maybe_update_required_alignment(
                 self, bid: int, required_alignment: int
@@ -870,6 +979,7 @@ class PallasBackend(Backend):
                                 self.maybe_update_required_alignment(
                                     info.block_id, required_alignment
                                 )
+                                self.record_tiled_axis(info.block_id, tensor, dim)
 
         analyzer = TensorTiledAccessAnalyzer(self)
         for stmt in host_func.body:
@@ -892,6 +1002,13 @@ class PallasBackend(Backend):
             if not isinstance(spec, BlockSizeSpec):
                 continue
             bid = spec.block_ids[0]
+            spec.non_power_of_two_multiple = analyzer.non_power_of_two_multiples.get(
+                bid, 1
+            )
+            extents = analyzer.tiled_extents.get(bid, set())
+            # A full-extent block is only exempt when every tiled axis has
+            # that same static extent (the block then is the whole array dim).
+            (spec.full_extent,) = extents if len(extents) == 1 else (None,)
             if bid not in analyzer.required_alignments:
                 continue
             requirement_alignment = analyzer.required_alignments[bid]
@@ -917,6 +1034,18 @@ class PallasBackend(Backend):
             outer_spec = block_specs_by_id.get(bounded_by)
             if outer_spec is not None:
                 outer_spec.update_min(spec.min_size)
+                # Keep inner tile begins aligned when the outer block is not a
+                # power of two (pow2 blocks get this from update_min).
+                outer_spec.non_power_of_two_multiple = math.lcm(
+                    outer_spec.non_power_of_two_multiple or 1,
+                    spec.non_power_of_two_multiple or 1,
+                )
+
+        # Opt-in; a megakernel that streams weights always searches them
+        # (see enter_sequential_roots_mode).
+        if env.settings.pallas_non_power_of_two_block_search:
+            for spec in block_specs_by_id.values():
+                spec.search_whole_axis_sizes()
 
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
@@ -998,6 +1127,7 @@ class PallasBackend(Backend):
         from ..device_function import TensorStrideArg
         from ..host_function import HostFunction
         from ..program_id import FlatProgramIDs
+        from .lane_dense import physical_order
 
         env = CompileEnvironment.current()
         device_fn = DeviceFunction.current()
@@ -1092,6 +1222,11 @@ class PallasBackend(Backend):
                         continue
                 block_shape.append(None)
                 grid_dims.append(None)
+            perm = device_fn.pallas_lane_dense.get(id(tensor.untyped_storage()))
+            if perm is not None:
+                # The launcher passes it in its physical dim order.
+                block_shape = physical_order(block_shape, perm)
+                grid_dims = physical_order(grid_dims, perm)
             result.append((tuple(block_shape), tuple(grid_dims)))
         return result
 
@@ -1099,12 +1234,15 @@ class PallasBackend(Backend):
         self,
         sorted_args: list[Argument] | None,
         config: Config,
+        output_indices: list[int],
     ) -> list[tuple[int, int, int, int]] | None:
         """Identify pl.ds() dims that may need padding and their block sizes.
 
         Uses ``pallas_pad_info`` recorded during codegen to identify which
         tensor dimensions use ``pl.ds()`` slicing, plus the one dummy row an
-        empty resident operand needs (see :meth:`_zero_row_resident_pad_info`).
+        empty resident operand needs (see :meth:`_zero_row_resident_pad_info`)
+        and the lane row a one-element output needs (see
+        :meth:`_one_element_output_pad_info`).
 
         Returns ``[(arg_index, tensor_dim, block_size, extra_pad), ...]``
         or ``None``.  The launcher computes the actual pad amount at runtime
@@ -1138,7 +1276,53 @@ class PallasBackend(Backend):
                             result.append((i, dim, bs, extra_pad))
 
         result.extend(self._zero_row_resident_pad_info(sorted_args))
+        result.extend(
+            self._one_element_output_pad_info(sorted_args, output_indices, result)
+        )
         return result or None
+
+    def _one_element_output_pad_info(
+        self,
+        sorted_args: list[Argument],
+        output_indices: list[int],
+        padded: list[tuple[int, int, int, int]],
+    ) -> list[tuple[int, int, int, int]]:
+        """Pad each one-element VMEM output to a lane row along its minor dim.
+
+        On TPU, a DMA out of a VMEM buffer of one element can read stale data
+        when the kernel has just written it with a vector store -- Mosaic does
+        not order the store before the copy (jax 0.10).  A decode step's top-1
+        is such an output: ``[m]`` with ``m = 1``.  A buffer padded along its
+        minor dim, of which only element 0 is written, copies out correctly in
+        every dtype, so the launcher pads such an output to ``_LANES`` elements
+        there and slices it back.  Only a minor dim the kernel slices with
+        ``pl.ds()`` is padded, so no access sees the padding; a block over
+        such a dim is the whole dim.
+        """
+        from ..device_function import DeviceFunction
+        from ..device_function import PallasMemorySpace
+        from ..device_function import TensorArg
+        from .lane_dense import _LANES
+
+        device_fn = DeviceFunction.current()
+        result: list[tuple[int, int, int, int]] = []
+        for i in output_indices:
+            arg = sorted_args[i]
+            assert isinstance(arg, TensorArg)
+            tensor = arg.fake_value
+            dim = tensor.ndim - 1
+            if (
+                tensor.ndim == 0
+                or not all(isinstance(size, int) and size == 1 for size in tensor.shape)
+                or any(entry[:2] == (i, dim) for entry in padded)
+                or device_fn.pallas_memory_space.get(id(tensor))
+                not in (None, PallasMemorySpace.VMEM)
+                or id(tensor.untyped_storage()) in device_fn.pallas_lane_dense
+                or dim not in device_fn.pallas_pad_info.get(id(tensor), {})
+            ):
+                continue
+            result.append((i, dim, _LANES, 0))
+        return result
 
     def _zero_row_resident_pad_info(
         self, sorted_args: list[Argument]
@@ -1381,7 +1565,13 @@ class PallasBackend(Backend):
                 ):
                     # Tensor created inside the function body (output)
                     output_indices.append(i)
-                    if arg_name in read_names or arg_name not in empty_vars:
+                    if arg_name not in empty_vars or (
+                        # A sequential-roots program keeps each whole output
+                        # block in VMEM for its single grid step, so reading
+                        # back an empty-allocated output needs no copy-in.
+                        arg_name in read_names
+                        and not host_fn.device_ir.sequential_roots
+                    ):
                         # Also read by the kernel (e.g. broadcast result)
                         inplace_indices.append(i)
                 elif arg_name in mutated_params:
@@ -1414,7 +1604,7 @@ class PallasBackend(Backend):
                 block_spec_info.append(None)  # RNG seed buffer is untiled
             launcher_args.append(f"_block_spec_info={block_spec_info!r}")
 
-        pad_info = self._compute_pad_info(sorted_args, config)
+        pad_info = self._compute_pad_info(sorted_args, config, output_indices)
         if pad_info:
             launcher_args.append(f"_ds_pad_dims={pad_info!r}")
 
@@ -1430,6 +1620,19 @@ class PallasBackend(Backend):
             ]
             if smem_arg_indices:
                 launcher_args.append(f"_smem_arg_indices={smem_arg_indices!r}")
+            lane_dense_perms = {
+                i: perm
+                for i, arg in enumerate(sorted_args)
+                if isinstance(arg, TensorArg)
+                and (
+                    perm := device_fn.pallas_lane_dense.get(
+                        id(arg.fake_value.untyped_storage())
+                    )
+                )
+                is not None
+            }
+            if lane_dense_perms:
+                launcher_args.append(f"_lane_dense_perms={lane_dense_perms!r}")
 
         # Pass scratch shapes for pipeline/fori_loop launcher
         scratch_shapes = device_fn._scratch_args
@@ -1706,8 +1909,16 @@ class PallasBackend(Backend):
 
         from .internal_scratch import plan_internal_remote_scratch
 
-        plan_internal_remote_scratch()
+        # Local: megakernel imports helion.language, which imports
+        # compile_environment, which imports this module.
+        from .megakernel import plan_megakernel
+
+        sequential_roots = env.config_spec.pallas_sequential_roots
+        if not sequential_roots:
+            plan_internal_remote_scratch()
         plan_tiling(graphs, config, tile_strategy)
+        if sequential_roots:
+            plan_megakernel(tile_strategy)
         build_tensorcore_plans(graphs, config)
 
         # compact_worklist_* is per-CONFIG state, but one CompileEnvironment is
@@ -1870,14 +2081,6 @@ _JAX_UNSUPPORTED_KWARGS = (
     "_matmul_dot_general",
 )
 
-_JAX_REMOTE_COPY_KWARGS = (
-    "_scratch_shapes",
-    "_scratch_shape_sources",
-    "_hbm_arg_indices",
-    "_smem_arg_indices",
-    "_ds_pad_dims",
-)
-
 # Dtypes the Pallas launcher rejects and that JAX would mishandle under x32
 # (int64/uint64 silently narrow to 32-bit; float64 is unsupported on TPU).
 _JAX_UNSUPPORTED_DTYPES = frozenset({torch.int64, torch.uint64, torch.float64})
@@ -1894,6 +2097,9 @@ class JaxLaunchMeta:
     kernel_name: str
     grid_exprs: list[str]
     output_indices: list[int]
+    # Result slot of each tensor the user returns, in the user's return order;
+    # None when that is already launch order.
+    return_order: list[int] | None
     inplace_indices: list[int]
     user_positions: list[int]
     const_slots: dict[int, str]
@@ -1901,6 +2107,7 @@ class JaxLaunchMeta:
     scratch_shape_exprs: list[tuple[list[str], str | None, str]]
     hbm_arg_indices: list[int]
     smem_arg_indices: list[int]
+    lane_dense_perms: dict[int, tuple[int, ...]]
     ds_pad_dims: list[tuple[int, int, int, int]]
     out_shape_exprs: list[list[str]]
     out_dtypes: list[str]
@@ -2076,6 +2283,41 @@ def _const_slot_expr(
     )
 
 
+def _user_return_order(
+    returned: object,
+    launch_args: tuple[object, ...],
+    output_indices: list[int],
+    inplace_indices: list[int],
+) -> list[int] | None:
+    """Result slot of each tensor in the host wrapper's return value.
+
+    ``_pallas_jax_call`` returns the output-only outputs (all outputs when there
+    are none) in launch-argument order.  When the user returns exactly those
+    outputs in another order, the entrypoint must permute them back.  Any other
+    return shape keeps the launch order (``None``).
+    """
+    positions = [p for p in output_indices if p not in inplace_indices]
+    positions = positions or output_indices
+    values = list(returned) if isinstance(returned, (tuple, list)) else [returned]
+    order: list[int] = []
+    for value in values:
+        slot = next(
+            (
+                slot
+                for slot, position in enumerate(positions)
+                if launch_args[position] is value
+            ),
+            None,
+        )
+        if slot is None:
+            return None
+        order.append(slot)
+    identity = list(range(len(positions)))
+    if order == identity or sorted(order) != identity:
+        return None
+    return order
+
+
 def capture_jax_launch_metadata(
     bound: BoundKernel[Any],
     config: Config | dict[str, object],
@@ -2091,9 +2333,9 @@ def capture_jax_launch_metadata(
     builder (:func:`build_jax_fn_ast`) turns this into the emitted entrypoint.
 
     Kernels using unsupported advanced Pallas features or int64/uint64/float64
-    args raise ``NotImplementedError``. Distributed remote-copy kernels capture
-    their scratch descriptors, HBM/SMEM placements, dynamic-shape padding, and
-    in-place aliases as static launch metadata.
+    args raise ``NotImplementedError``. Scratch descriptors, HBM/SMEM placements,
+    dynamic-shape padding, and in-place aliases are captured as static launch
+    metadata.
 
     Must be called *outside* the fake-tensor env (the capture materializes and runs
     on real tensors).
@@ -2146,13 +2388,10 @@ def capture_jax_launch_metadata(
         # reads those arguments directly when they are part of the user return.
         return _launcher_return(launch_args, kw)
 
-    compiled(*args, _launcher=_capture)
+    returned = compiled(*args, _launcher=_capture)
 
     kw = captured["kwargs"]
-    unsupported_kwargs = list(_JAX_UNSUPPORTED_KWARGS)
-    if not kw.get("_uses_remote_copy"):
-        unsupported_kwargs.extend(_JAX_REMOTE_COPY_KWARGS)
-    for name in unsupported_kwargs:
+    for name in _JAX_UNSUPPORTED_KWARGS:
         if kw.get(name):
             raise NotImplementedError(
                 f"to_code(jax_fn=True) does not support kernels using "
@@ -2316,6 +2555,9 @@ def capture_jax_launch_metadata(
         kernel_name=kernel.name,
         grid_exprs=grid_exprs,
         output_indices=output_indices,
+        return_order=_user_return_order(
+            returned, launch_args, output_indices, inplace_indices
+        ),
         inplace_indices=inplace_indices,
         user_positions=user_positions,
         const_slots=const_slots,
@@ -2326,6 +2568,9 @@ def capture_jax_launch_metadata(
         ),
         smem_arg_indices=list(
             cast("list[int] | None", kw.get("_smem_arg_indices")) or []
+        ),
+        lane_dense_perms=dict(
+            cast("dict[int, tuple[int, ...]] | None", kw.get("_lane_dense_perms")) or {}
         ),
         ds_pad_dims=list(
             cast(
@@ -2525,6 +2770,7 @@ def build_jax_fn_ast(
         ast.parse(f"_BLOCK_SPEC_INFO = {meta.block_spec_info!r}").body[0],
         ast.parse(f"_HBM_ARG_INDICES = {meta.hbm_arg_indices!r}").body[0],
         ast.parse(f"_SMEM_ARG_INDICES = {meta.smem_arg_indices!r}").body[0],
+        ast.parse(f"_LANE_DENSE_PERMS = {meta.lane_dense_perms!r}").body[0],
         ast.parse(f"_DS_PAD_DIMS = {meta.ds_pad_dims!r}").body[0],
         ast.parse(f"_OUTPUT_INDICES = {meta.output_indices!r}").body[0],
         ast.parse(f"_INPLACE_INDICES = {meta.inplace_indices!r}").body[0],
@@ -2610,8 +2856,15 @@ def _jax_entrypoint_source(meta: JaxLaunchMeta, device_kernel: str) -> str:
         "        use_low_level_scheduler=_USE_LOW_LEVEL_SCHEDULER,",
         "        compact=None,",
         "        orig_shapes=orig_shapes,",
+        "        lane_dense_perms=_LANE_DENSE_PERMS,",
         "        ds_pad_dims=_DS_PAD_DIMS,",
         "    )",
-        "    return results[0] if len(results) == 1 else tuple(results)",
+        (
+            "    return results[0] if len(results) == 1 else tuple(results)"
+            if meta.return_order is None
+            else "    return ("
+            + "".join(f"results[{slot}], " for slot in meta.return_order)
+            + ")"
+        ),
     ]
     return "\n".join(lines)

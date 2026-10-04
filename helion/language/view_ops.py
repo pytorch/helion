@@ -67,8 +67,9 @@ def subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor:
         - Supports None and : (slice(None)) indexing on every backend
         - Used for reshaping kernel tensors by adding dimensions
         - Prefer direct indexing syntax when possible: ``tensor[None, :]``
-        - Pallas also supports one contiguous narrowing index when compiler
-          planning can keep the source block resident in VMEM
+        - Pallas also supports contiguous narrowing indices (one subscript per
+          narrowed dim) when compiler planning can keep the source block
+          resident in VMEM
     """
     raise NotInsideKernel
 

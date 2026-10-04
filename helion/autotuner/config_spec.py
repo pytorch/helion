@@ -131,6 +131,7 @@ from .block_id_sequence import _BlockIdItem
 from .block_id_sequence import _PowerOfTwoBlockIdItem
 from .compiler_coverage import CompilerCoverageGroup
 from .compiler_coverage import coverage_policy
+from .config_fragment import BlockSizeChoicesFragment
 from .config_fragment import BlockSizeFragment
 from .config_fragment import BooleanFragment
 from .config_fragment import ConfigSpecFragment
@@ -142,6 +143,7 @@ from .config_fragment import NumWarpsFragment
 from .config_fragment import PermutationFragment
 from .config_fragment import PowerOfTwoFragment
 from .config_fragment import assert_integer_power_of_two
+from .config_fragment import integer_power_of_two
 import helion
 
 if TYPE_CHECKING:
@@ -154,6 +156,8 @@ if TYPE_CHECKING:
     from .._compiler.backend import Backend
     from .._compiler.cute.loop_nesting import TileLoopPath
     from .._compiler.cute.split_k_cluster import ClusterKFacts
+    from .._compiler.pallas.megakernel import LoopTileModel
+    from .._compiler.pallas.megakernel import StreamModel
     from ..runtime.config import IndexingLiteral
     from ..runtime.config import PidTypeLiteral
     from .config_generation import ConfigGeneration
@@ -957,6 +961,12 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
+        "pallas_stream_depth",
+        "pallas_stream_unroll",
+        "pallas_stream_wait_group",
+        "pallas_stream_arena",
+        "pallas_hbm_resident",
+        "pallas_lane_dense",
         "xcd_remap",
     }
 )
@@ -997,6 +1007,12 @@ VALID_KEYS: frozenset[str] = frozenset(
         "pallas_load_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
+        "pallas_stream_depth",
+        "pallas_stream_unroll",
+        "pallas_stream_wait_group",
+        "pallas_stream_arena",
+        "pallas_hbm_resident",
+        "pallas_lane_dense",
         "cute_vector_widths",
         "cute_lane_layouts",
         "cute_reduction_reloads",
@@ -1355,7 +1371,32 @@ class ConfigSpec:
         self.pallas_fold_dot_lhs_cast_search_enabled: bool = False
         self.pallas_indirect_access_modes: tuple[str, ...] = ()
         self.pallas_indirect_dma_requires_fori: bool = False
+        # Set when a multi-root Pallas kernel lowers to one sequential program.
+        self.pallas_sequential_roots: bool = False
+        # The weight stream of a sequential-roots program, if it streams any.
+        self.pallas_stream_model: StreamModel | None = None
+        # The inner loops of a sequential-roots program that the weight
+        # stream does not shape, if any.
+        self.pallas_loop_tile_model: LoopTileModel | None = None
+        # Whether the default config of a sequential-roots program keeps the
+        # written tensors it can keep in HBM (a KV cache) there; None when it
+        # has none.
+        self.pallas_hbm_resident_default: bool | None = None
+        # The inputs a sequential-roots program can pass lane dense
+        # (``pallas_lane_dense``), by storage: the permutation of each one's
+        # dims into its physical order; empty when it has none.  The models
+        # above are then those of a config that does, and
+        # ``pallas_lane_dense_off_models`` holds the stream model and
+        # ``pallas_hbm_resident_default`` of one that does not, or None when
+        # such a config does not fit (then every config passes them).
+        self.pallas_lane_dense_layouts: dict[int, tuple[int, ...]] = {}
+        self.pallas_lane_dense_off_models: (
+            tuple[StreamModel | None, bool | None] | None
+        ) = None
         self.has_symbolic_or_data_dependent_bounds: bool = False
+        # Set when an inner loop bound is a SymInt (a dynamic shape), as
+        # opposed to a value loaded at runtime.
+        self.has_symbolic_bounds: bool = False
         # Populated only after DeviceIR proves that this kernel contains an
         # implicit cross-root dependency supported by the CUDA Triton backend.
         self.cross_loop_pipeline: EnumFragment | None = None
@@ -2631,6 +2672,44 @@ class ConfigSpec:
             reason,
             self.log_restrictions_verbose,
         )
+
+    def pallas_keeps_hbm_resident(self, config: Mapping[str, object]) -> bool:
+        """Whether ``config`` keeps the written tensors a sequential-roots
+        program can keep in HBM there (``pallas_hbm_resident``, None for the
+        compiler's default)."""
+        default = self.pallas_hbm_resident_default
+        if self.pallas_lane_dense_off_models is not None and not (
+            self.pallas_lane_dense(config)
+        ):
+            _, default = self.pallas_lane_dense_off_models
+        if default is None:
+            return False
+        value = config.get("pallas_hbm_resident")
+        return default if value is None else bool(value)
+
+    def pallas_lane_dense(
+        self, config: Mapping[str, object]
+    ) -> Mapping[int, tuple[int, ...]]:
+        """The inputs ``config`` passes lane dense (``pallas_lane_dense``,
+        None for on): ``pallas_lane_dense_layouts``, or none."""
+        if (
+            config.get("pallas_lane_dense") is False
+            and self.pallas_lane_dense_off_models is not None
+        ):
+            return {}
+        return self.pallas_lane_dense_layouts
+
+    def pallas_stream_model_for(
+        self, config: Mapping[str, object]
+    ) -> StreamModel | None:
+        """The weight stream model of a sequential-roots program under
+        ``config``, which depends on the inputs it passes lane dense."""
+        if self.pallas_lane_dense_off_models is not None and not (
+            self.pallas_lane_dense(config)
+        ):
+            stream, _ = self.pallas_lane_dense_off_models
+            return stream
+        return self.pallas_stream_model
 
     def supports_config_key(self, key: str) -> bool:
         if key == "host_tensor_descriptors":
@@ -4043,7 +4122,19 @@ class ConfigSpec:
         else:
             config.pop("pallas_indirect_access_mode", None)
         if self.has_pallas_inner_loops:
-            if (
+            if self.pallas_sequential_roots:
+                # emit_pipeline derives its tiles from pl.program_id, which a
+                # sequential-roots program does not have.
+                loop_type = config.setdefault("pallas_loop_type", "fori_loop")
+                if loop_type != "fori_loop":
+                    if _fix_invalid:
+                        config["pallas_loop_type"] = "fori_loop"
+                    else:
+                        raise InvalidConfig(
+                            "Pallas kernels with multiple top-level loops "
+                            "require pallas_loop_type='fori_loop'"
+                        )
+            elif (
                 self.pallas_indirect_dma_requires_fori
                 and config.get("pallas_indirect_access_mode") == "dma"
             ):
@@ -4121,6 +4212,66 @@ class ConfigSpec:
             # jax.lax.fori_loop tuple and allocates no scratch to widen; pin the
             # flag off there so both settings do not autotune as distinct configs.
             config.pop("pallas_pre_broadcast", None)
+        off_stream, off_hbm_resident = self.pallas_lane_dense_off_models or (
+            None,
+            None,
+        )
+        depth = config.get("pallas_stream_depth")
+        if (self.pallas_stream_model or off_stream) is None or depth is None:
+            config.pop("pallas_stream_depth", None)
+        elif type(depth) is not int or depth < 1:
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"pallas_stream_depth must be a positive int, got {depth!r}"
+                )
+            config.pop("pallas_stream_depth")
+        unroll = config.get("pallas_stream_unroll")
+        if self.pallas_stream_model is None or unroll is None:
+            config.pop("pallas_stream_unroll", None)
+        elif type(unroll) is not int or unroll < 1:
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"pallas_stream_unroll must be a positive int, got {unroll!r}"
+                )
+            config.pop("pallas_stream_unroll")
+        group = config.get("pallas_stream_wait_group")
+        if self.pallas_stream_model is None or group is None:
+            config.pop("pallas_stream_wait_group", None)
+        elif type(group) is not int or group < 1:
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"pallas_stream_wait_group must be a positive int, got {group!r}"
+                )
+            config.pop("pallas_stream_wait_group")
+        arena = config.get("pallas_stream_arena")
+        if self.pallas_stream_model is None or arena is None:
+            config.pop("pallas_stream_arena", None)
+        elif type(arena) is not bool:
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"pallas_stream_arena must be a bool, got {arena!r}"
+                )
+            config.pop("pallas_stream_arena")
+        hbm_resident = config.get("pallas_hbm_resident")
+        if (
+            self.pallas_hbm_resident_default is None and off_hbm_resident is None
+        ) or hbm_resident is None:
+            config.pop("pallas_hbm_resident", None)
+        elif type(hbm_resident) is not bool:
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"pallas_hbm_resident must be a bool, got {hbm_resident!r}"
+                )
+            config.pop("pallas_hbm_resident")
+        lane_dense = config.get("pallas_lane_dense")
+        if self.pallas_lane_dense_off_models is None or lane_dense is None:
+            config.pop("pallas_lane_dense", None)
+        elif type(lane_dense) is not bool:
+            if not _fix_invalid:
+                raise InvalidConfig(
+                    f"pallas_lane_dense must be a bool, got {lane_dense!r}"
+                )
+            config.pop("pallas_lane_dense")
 
         if self.supports_config_key("pid_type"):
             if "pid_type" in config:
@@ -5190,7 +5341,7 @@ class ConfigSpec:
             fields.update(self.backend_tunable_fragments)
         if self.has_pallas_inner_loops:
             choices = AUTOTUNED_PALLAS_LOOP_TYPES
-            if (
+            if self.pallas_sequential_roots or (
                 self.pallas_indirect_dma_requires_fori
                 and self.pallas_indirect_access_modes == ("dma",)
             ):
@@ -5223,6 +5374,25 @@ class ConfigSpec:
                 and self.pallas_fold_dot_lhs_cast_search_enabled
             ):
                 fields["pallas_fold_dot_lhs_cast"] = BooleanFragment()
+        if self.pallas_stream_model is not None:
+            # Root-level streams need no inner loop.
+            fields["pallas_stream_depth"] = EnumFragment(
+                choices=self.pallas_stream_model.depth_choices()
+            )
+            # None: by streamed bytes per step (see ``stream_unroll``).
+            fields["pallas_stream_unroll"] = EnumFragment(choices=(None, 1, 2, 4, 8))
+            # None: one wait per iteration (see ``stream_wait_group``).
+            fields["pallas_stream_wait_group"] = EnumFragment(choices=(None, 2, 4, 8))
+            # None: a ring per tile shape (see ``_ring_layouts``).
+            fields["pallas_stream_arena"] = EnumFragment(choices=(None, True))
+        if self.pallas_hbm_resident_default is not None:
+            # The default, then the other placement.
+            fields["pallas_hbm_resident"] = EnumFragment(
+                choices=(None, not self.pallas_hbm_resident_default)
+            )
+        if self.pallas_lane_dense_off_models is not None:
+            # The default (lane dense), then as given.
+            fields["pallas_lane_dense"] = EnumFragment(choices=(None, False))
         # Only include maxnreg on CUDA devices (not supported on AMD and Intel GPU)
         if self.supports_config_key("maxnreg") and supports_maxnreg():
             fields["maxnreg"] = EnumFragment(AUTOTUNED_MAXNREG)
@@ -5507,9 +5677,20 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         min_size: int = 1,
         max_size: int | None = None,
         bounded_by_block_id: int | None = None,
+        non_power_of_two_multiple: int | None = None,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
+        # ``None``: block sizes must be powers of two (Triton-style backends).
+        # Otherwise a non-power-of-two size is legal if it is a multiple of
+        # this value or equals ``full_extent``; backends that allow
+        # non-power-of-two sizes refine both in adjust_block_size_constraints.
+        self.non_power_of_two_multiple: int | None = non_power_of_two_multiple
+        self.full_extent: int | None = None
+        # Legal non-power-of-two sizes the autotuner may also search (opt-in).
+        self.extra_search_values: tuple[int, ...] = ()
+        # Search only ``extra_search_values`` (``search_only``).
+        self.search_extra_values_only: bool = False
 
         # TODO(shunting): it's a bit conservative since not every block is split
         # for different ranks.
@@ -5549,10 +5730,68 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         return f"BlockSizeSpec({', '.join(fields)})"
 
     def _normalize(self, name: str, value: object) -> int | None:
-        result = super()._normalize(name, value)
+        if self.non_power_of_two_multiple is not None and not integer_power_of_two(
+            value
+        ):
+            result = self._normalize_non_power_of_two(
+                name, value, self.non_power_of_two_multiple
+            )
+        else:
+            result = super()._normalize(name, value)
         if isinstance(result, int) and result < self.min_size:
             result = self.min_size
         return result
+
+    def _normalize_non_power_of_two(
+        self, name: str, value: object, multiple: int
+    ) -> int:
+        if type(value) is not int or value <= 0:
+            raise InvalidConfig(f"{name} must be a positive integer, got {value!r}")
+        if value == self.full_extent or value % multiple == 0:
+            return value
+        full_extent = (
+            ""
+            if self.full_extent is None
+            else f"equal the full dimension extent ({self.full_extent}) or "
+        )
+        raise InvalidConfig(
+            f"{name} must be a power of two, {full_extent}a multiple of "
+            f"{multiple} (the hardware tile of the tensor axes it indexes), "
+            f"got {value!r}"
+        )
+
+    def search_whole_axis_sizes(self) -> None:
+        """Also search the non-power-of-two sizes that tile a whole axis: the
+        full extent and its divisors that are multiples of
+        ``non_power_of_two_multiple``."""
+        extent = self.full_extent
+        multiple = self.non_power_of_two_multiple
+        if extent is None or multiple is None:
+            return
+        self.extra_search_values = (
+            *(s for s in range(multiple, extent, multiple) if extent % s == 0),
+            extent,
+        )
+
+    def admits(self, value: int) -> bool:
+        """Whether ``value`` is a block size of this block as it stands:
+        ``normalize`` neither rejects it nor raises it to ``min_size``."""
+        if value < self.min_size:
+            return False
+        if integer_power_of_two(value):
+            return True
+        multiple = self.non_power_of_two_multiple
+        return multiple is not None and (
+            value == self.full_extent or value % multiple == 0
+        )
+
+    def search_only(self, values: tuple[int, ...]) -> None:
+        """Search only ``values``, sizes the block admits, when no other size
+        can work (e.g. a megakernel weight ring streams a tile no smaller
+        block copies in whole VMEM tiles only at the full size of its dim)."""
+        assert values and all(self.admits(value) for value in values)
+        self.extra_search_values = values
+        self.search_extra_values_only = True
 
     def update_min(self, value: int) -> None:
         self.min_size = assert_integer_power_of_two(max(value, self.min_size))
@@ -5615,6 +5854,14 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
             # Shared axes and hard layout/alignment minima remain unchanged.
             default = max(min(default, self.max_size), low)
             low = min(self.min_size, self.max_size)
+        if self.extra_search_values:
+            return BlockSizeChoicesFragment(
+                low,
+                self.max_size,
+                default,
+                self.extra_search_values,
+                powers=not self.search_extra_values_only,
+            )
         return BlockSizeFragment(
             low,
             self.max_size,

@@ -76,6 +76,8 @@ from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
 from .pallas import PallasMatmulF32NoTilingSeedHeuristic
 from .pallas import PallasMatmulNoTilingSeedHeuristic
+from .pallas import PallasMegakernelLoopTileHeuristic
+from .pallas import PallasMegakernelStreamTileHeuristic
 from .register_chain import CuteRegisterChainHeuristic
 from .triton import TritonB200FormulaMatmulHeuristic
 from .triton import TritonB200MultiMatmulHeuristic
@@ -160,6 +162,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "pallas": (
         PallasMatmulNoTilingSeedHeuristic,
         PallasMatmulF32NoTilingSeedHeuristic,
+        PallasMegakernelStreamTileHeuristic,
+        PallasMegakernelLoopTileHeuristic,
     ),
 }
 

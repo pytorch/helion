@@ -1044,6 +1044,74 @@ class TestPallasPartialSlice(TestCase):
         with self.assertRaisesRegex(exc.BackendUnsupported, "slice expr"):
             code_and_output(kernel, (src, dst), block_sizes=[16])
 
+    def test_half_open_slice_of_value(self) -> None:
+        # ``v[:n]`` / ``v[n:]`` on a loaded value (partial split-half RoPE).
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def rope_rows(
+            x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        ) -> torch.Tensor:
+            rows, _ = x.shape
+            half = cos.size(0)
+            out = torch.empty_like(x)
+            for row in hl.grid(rows):
+                v = x[row, :]
+                v1 = v[:half]
+                v2 = v[half : 2 * half]
+                out[row, :] = torch.cat(
+                    [
+                        v1 * cos[:] - v2 * sin[:],
+                        v2 * cos[:] + v1 * sin[:],
+                        v[2 * half :],
+                    ],
+                    dim=-1,
+                )
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def rope_tiles(
+            x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+        ) -> torch.Tensor:
+            rows, _ = x.shape
+            half = cos.size(0)
+            out = torch.empty_like(x)
+            for tile in hl.tile(rows):
+                v = x[tile, :]
+                v1 = v[:, :half]
+                v2 = v[:, half : 2 * half]
+                c = cos[None, :]
+                s = sin[None, :]
+                out[tile, :] = torch.cat(
+                    [v1 * c - v2 * s, v2 * c + v1 * s, v[:, 2 * half :]], dim=-1
+                )
+            return out
+
+        x = torch.randn((16, 256), device=DEVICE)
+        cos = torch.randn(32, device=DEVICE)
+        sin = torch.randn(32, device=DEVICE)
+        x1, x2, rest = x[:, :32], x[:, 32:64], x[:, 64:]
+        expected = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rest], dim=-1)
+        for kernel in (rope_rows, rope_tiles):
+            _code, out = code_and_output(kernel, (x, cos, sin))
+            torch.testing.assert_close(out, expected)
+
+    def test_multi_dim_narrowing_of_value(self) -> None:
+        # ``v[b, :, :k]``: a row and a lane range of a value in one subscript.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def halves(x: torch.Tensor) -> torch.Tensor:
+            m, n, d = x.shape
+            out = torch.empty([n, d // 2], dtype=x.dtype, device=x.device)
+            wide = torch.empty([1, n, d // 2], dtype=x.dtype, device=x.device)
+            for _ in hl.grid(1):
+                v = x[:, :, :] * 2.0
+                out[:, :] = v[1, :, : d // 2] + v[m - 1, :, d // 2 :]
+                wide[:, :, :] = v[0, None, :, d // 2 :]
+            return out, wide
+
+        x = torch.randn((4, 8, 256), device=DEVICE)
+        _code, (out, wide) = code_and_output(halves, (x,))
+        torch.testing.assert_close(out, 2 * x[1, :, :128] + 2 * x[3, :, 128:])
+        torch.testing.assert_close(wide, 2 * x[0, None, :, 128:])
+
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
@@ -1100,9 +1168,77 @@ class TestPallasVmemScalarLoad(TestCase):
 
         source = (torch.arange(4 * 64) % 53).reshape(4, 64).to(dtype)
         code, result = code_and_output(row_sum_plus_last, (source.to(DEVICE),))
-        self.assertIn("pltpu.roll", code)
+        # Mosaic only rotates 32-bit vectors: widen before the pad and roll.
+        self.assertRegex(code, r"pltpu\.roll\((jnp\.pad\()?lax\.convert_element_type\(")
         expected = (source.float().sum(-1) + source[:, -1].float()).to(DEVICE)
         torch.testing.assert_close(result, expected)
+
+    def test_runtime_row_gather_packed(self) -> None:
+        # Row index read from another tensor; the table spans several bf16 tiles.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_rows(table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            n = ids.size(0)
+            out = torch.empty(
+                [n, table.size(1)], dtype=table.dtype, device=table.device
+            )
+            for b in hl.grid(n):
+                out[b, :] = table[ids[b], :] * 2.0
+            return out
+
+        table = torch.randn((40, 128), device=DEVICE).to(torch.bfloat16)
+        ids = torch.tensor([3, 17, 0, 39, 22, 16], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(select_rows, (table, ids))
+        # A whole bf16 row reads through the 32-bit words holding it, not a
+        # widen and rotate of the whole table.
+        self.assertIn("table.bitcast(jnp.uint32)[load // 2, :]", code)
+        self.assertNotIn("pltpu.roll", code)
+        torch.testing.assert_close(result, table[ids.long()] * 2.0)
+
+    def test_runtime_row_gather_packed_narrow(self) -> None:
+        # Mosaic reads a 32-bit word row at a runtime index only from whole
+        # 128-lane rows: a narrow bf16 table is read whole and the row
+        # selected, at any row count.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def select_rows(table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            n = ids.size(0)
+            out = torch.empty(
+                [n, table.size(1)], dtype=torch.float32, device=table.device
+            )
+            for b in hl.grid(n):
+                out[b, :] = table[ids[b], :].float() * 2.0
+            return out
+
+        for rows in (6, 48):
+            with self.subTest(rows=rows):
+                table = torch.randn((rows, 6), device=DEVICE).to(torch.bfloat16)
+                ids = torch.tensor(
+                    [rows - 1, 0, 3, rows - 2], dtype=torch.int32, device=DEVICE
+                )
+                code, result = code_and_output(select_rows, (table, ids))
+                self.assertNotIn("bitcast(jnp.uint32)", code)
+                self.assertIn("jnp.sum(jnp.where(", code)
+                torch.testing.assert_close(result, table[ids.long()].float() * 2.0)
+
+    def test_runtime_row_packed_stacked(self) -> None:
+        # Runtime rows of a stacked bf16 table: odd and even rows, under a
+        # leading index, read through the 32-bit words holding them.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def stacked_rows(table: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            layers, _, cols = table.shape
+            n = ids.size(0)
+            out = torch.empty(
+                [layers, n, cols], dtype=torch.float32, device=table.device
+            )
+            for layer, b in hl.grid([layers, n]):
+                out[layer, b, :] = table[layer, ids[b], :].float() + 1.0
+            return out
+
+        table = torch.randn((3, 48, 256), device=DEVICE).to(torch.bfloat16)
+        ids = torch.tensor([0, 1, 31, 47, 16], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(stacked_rows, (table, ids))
+        self.assertIn("table.bitcast(jnp.uint32)[", code)
+        self.assertNotIn("pltpu.roll", code)
+        torch.testing.assert_close(result, table[:, ids.long()].float() + 1.0)
 
     def test_runtime_row_index_bool(self) -> None:
         @helion.kernel(backend="pallas", static_shapes=True)
@@ -1170,6 +1306,63 @@ class TestPallasVmemScalarLoad(TestCase):
         self.assertGreaterEqual(code.count("pltpu.roll"), 2)
         expected = source.float().sum(-1, keepdim=True) + source.float()
         torch.testing.assert_close(result, expected.to(DEVICE))
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasPackedRowStore(TestCase):
+    """Stores of one runtime-indexed row into a packed-dtype VMEM ref."""
+
+    @parametrize("rows,position", [(32, 21), (48, 47)])
+    def test_runtime_row_store_bf16(self, rows: int, position: int) -> None:
+        # KV-cache append at a decode position read from a tensor.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def append_rows(
+            cache: torch.Tensor, new: torch.Tensor, pos: torch.Tensor
+        ) -> torch.Tensor:
+            heads, _, _ = cache.shape
+            out = torch.empty_like(new)
+            for head in hl.grid(heads):
+                p = pos[0]
+                cache[head, p, :] = new[head, :]
+                out[head, :] = new[head, :] * 2.0
+            return out
+
+        cache = torch.randn((2, rows, 128), device=DEVICE).to(torch.bfloat16)
+        new = torch.randn((2, 128), device=DEVICE).to(torch.bfloat16)
+        pos = torch.tensor([position], dtype=torch.int32, device=DEVICE)
+        expected = cache.clone()
+        expected[:, position] = new
+        code, out = code_and_output(append_rows, (cache, new, pos))
+        # Mosaic needs packed stores to start on a sublane tile (16 bf16 rows):
+        # read-modify-write the aligned tile that holds the row.
+        self.assertIn("pl.ds(row_base", code)
+        self.assertIn("pl.multiple_of", code)
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+        torch.testing.assert_close(out, new * 2.0)
+
+    def test_runtime_row_store_bf16_short_dim(self) -> None:
+        # Fewer rows than one bf16 sublane tile: rewrite the whole dim.
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def put_row(
+            cache: torch.Tensor, row: torch.Tensor, pos: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty_like(row)
+            for _ in hl.grid(1):
+                p = pos[0]
+                cache[p, :] = row[:]
+                out[:] = row[:] * 2.0
+            return out
+
+        cache = torch.randn((6, 128), device=DEVICE).to(torch.bfloat16)
+        row = torch.randn(128, device=DEVICE).to(torch.bfloat16)
+        pos = torch.tensor([4], dtype=torch.int32, device=DEVICE)
+        expected = cache.clone()
+        expected[4] = row
+        code, out = code_and_output(put_row, (cache, row, pos))
+        self.assertIn("row_block_0 = cache[:, :]", code)
+        torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+        torch.testing.assert_close(out, row * 2.0)
 
 
 @onlyBackends(["pallas"])
@@ -1259,3 +1452,4 @@ instantiate_parametrized_tests(TestPallasJaggedIndexing)
 instantiate_parametrized_tests(TestPallasJaggedReductions)
 instantiate_parametrized_tests(TestPallasJaggedCarryRejects)
 instantiate_parametrized_tests(TestPallasVmemScalarLoad)
+instantiate_parametrized_tests(TestPallasPackedRowStore)

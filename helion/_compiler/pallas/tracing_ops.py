@@ -21,6 +21,7 @@ import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
 
+from ..._utils import is_scalar_index
 from ...exc import BackendUnsupported
 from ...exc import InvalidConfig
 from ...language import _decorators
@@ -52,6 +53,12 @@ from .dma import allocate_indirect_dma_resources
 from .dma import async_copy_statements
 from .dma import indirect_group_statements
 from .dma import is_tpu_dma_aligned_shape
+from .megakernel import emit_stream_site
+from .megakernel import flush_loop_reads
+from .megakernel import is_hbm_resident
+from .megakernel import is_indexed_weight_load
+from .megakernel import stream_unroll
+from .megakernel import stream_wait_group
 from .memory_access import MEMORY_ACCESS_META
 from .memory_access import MemoryAccess
 from .memory_access import MemoryAccessKind
@@ -2266,6 +2273,11 @@ def _setup_loop_carried_state(
             scratch_name = state.device_function.register_scratch(
                 shape, dtype, name_hint=f"scratch_{i}"
             )
+            plan = state.device_function.pallas_megakernel
+            if plan is not None:
+                root = state.codegen.current_root_graph_info
+                assert root is not None
+                plan.root_scratch[scratch_name] = root.graph_id
             # Initialize scratch with the arg value.
             state.add_statement(_scratch_write_stmt(state, scratch_name, arg_ast))
             scratch_names.append(scratch_name)
@@ -2278,6 +2290,79 @@ def _setup_loop_carried_state(
             result_vars.append(arg_ast)
 
     return scratch_names, result_vars, carried
+
+
+def _stream_step(
+    state: CodegenState,
+    loop_var: str,
+    body: list[ast.stmt],
+    head: list[ast.stmt],
+    group: int,
+) -> tuple[str, ast.FunctionDef, int]:
+    """The step function of a ring-consumer loop, called once per iteration,
+    and the number of iterations ``_stream_calls`` groups.
+
+    With ``group > 1`` it runs ``head``, the iteration's ring waits (after a
+    leading ``nonlocal``), and returns the rest of the iteration as a closure,
+    which ``_stream_calls`` runs after the waits of the whole group.
+    """
+    step_name = state.device_function.new_var("_fori_step")
+    step_fn = statement_from_string(f"def {step_name}({loop_var}): pass")
+    assert isinstance(step_fn, ast.FunctionDef)
+    declarations = [s for s in body[:1] if isinstance(s, ast.Nonlocal)]
+    split = len(declarations) + len(head)
+    if body[len(declarations) : split] != head:
+        # A later pass put another statement among the waits.
+        group = 1
+    if group == 1:
+        step_fn.body = body
+        return step_name, step_fn, group
+    run_name = state.device_function.new_var("_fori_run")
+    run_fn = statement_from_string(f"def {run_name}(): pass")
+    assert isinstance(run_fn, ast.FunctionDef)
+    run_fn.body = [
+        *(ast.Nonlocal(names=[*s.names]) for s in declarations),
+        *(body[split:] or [ast.Pass()]),
+    ]
+    step_fn.body = [
+        *body[:split],
+        run_fn,
+        statement_from_string(f"return {run_name}"),
+    ]
+    return step_name, step_fn, group
+
+
+def _stream_calls(
+    state: CodegenState,
+    step_name: str,
+    start: int,
+    stop: int,
+    group: int,
+    index: str = "{}",
+) -> list[ast.stmt]:
+    """Call step ``step_name`` for iterations ``index.format(u)``, ``u`` in
+    ``range(start, stop)``; with ``group > 1``, take each group's steps (its
+    ring waits) before running their bodies."""
+    var = state.device_function.new_var("_u")
+    if group == 1:
+        bounds = f"{start}, {stop}" if start else f"{stop}"
+        return [
+            statement_from_string(
+                f"for {var} in range({bounds}):\n    {step_name}({index.format(var)})"
+            )
+        ]
+    run = state.device_function.new_var("_run")
+    calls: list[ast.stmt] = []
+    for first in range(start, stop, group):
+        last = min(first + group, stop)
+        bounds = f"{first}, {last}" if first else f"{last}"
+        calls.append(
+            statement_from_string(
+                f"for {run} in [{step_name}({index.format(var)}) "
+                f"for {var} in range({bounds})]:\n    {run}()"
+            )
+        )
+    return calls
 
 
 def _emit_nonlocal_scratch_declarations(
@@ -4298,7 +4383,9 @@ def _classify_pipelined_tensors(
             fake, sub_meta, direction, block_ids, vmem_shape, env, state
         ):
             continue
-        if id(fake) in outer_access_tensor_ids:
+        if id(fake) in outer_access_tensor_ids and not is_hbm_resident(
+            state.device_function, fake
+        ):
             continue
         if id(fake.untyped_storage()) in atomic_storages:
             continue
@@ -4561,6 +4648,87 @@ def _last_buffer_use(inner_body: list[ast.AST], scratch_name: str) -> int | None
     return last_use
 
 
+def _forward_row_writes(
+    state: CodegenState,
+    graph_id: int,
+    prefetched_loads: list[ScheduledDmaTransfer],
+    loop_window: InnerLoopWindow,
+    loop_var: str,
+    num_iterations: str,
+) -> tuple[list[ast.stmt], list[ast.stmt]]:
+    """Forward the row stores deferred to inner loop ``graph_id``
+    (``row_forward_loop``) into the tiles it reads.
+
+    Returns the statements to emit ahead of the loop and those to emit in
+    its body once the current tile is in.  The iteration whose tile holds
+    the sublane tile of a stored row patches the row into it and writes the
+    sublane tile from there; a store whose sublane tile no iteration reads
+    writes it ahead of the loop.  Either way the write starts once, so its
+    waits stay pending.
+    """
+    device_fn = state.device_function
+    forwards = [
+        (storage, forward)
+        for storage, forward in device_fn.pallas_row_forwards.items()
+        if forward.graph_id == graph_id
+    ]
+    ahead: list[ast.stmt] = []
+    body: list[ast.stmt] = []
+    if not forwards:
+        return ahead, body
+    slots = {
+        id(transfer.transfer.tensor.untyped_storage()): transfer
+        for transfer in prefetched_loads
+    }
+    (begin,) = loop_window.begin_exprs
+    (step,) = loop_window.iter_step_exprs
+    for storage, forward in forwards:
+        device_fn.pallas_row_forwards.pop(storage)
+        transfer = slots.get(storage)
+        if transfer is None:
+            for statement in device_fn.flush_pending_writes([storage]):
+                state.add_statement(statement)
+            continue
+        pending = device_fn.pallas_pending_writes[storage]
+        device_fn.pallas_pending_writes[storage] = pending[len(forward.starts) :]
+        # The iteration whose tile holds the sublane tile, if any.
+        iteration = device_fn.new_var("_rows_iteration")
+        ahead.extend(
+            [
+                statement_from_string(
+                    f"{iteration} = ({forward.base} - ({begin})) // ({step})"
+                ),
+                _pl_when(
+                    state,
+                    f"({iteration} < 0) | ({iteration} >= {num_iterations})",
+                    "_write_rows",
+                    forward.starts,
+                ),
+            ]
+        )
+        tensor = transfer.transfer.tensor
+        # The tile keeps the integer-indexed dims, at size 1.
+        subscripts = _tensor_dim_subscripts(transfer.transfer.subscript)
+        parts = [
+            "0" if is_scalar_index(_subscript_at_dim(subscripts, dim)) else ":"
+            for dim in range(tensor.ndim)
+        ]
+        parts[tensor.ndim - 2] = (
+            f"pl.ds(pl.multiple_of({forward.base} - ({begin}) - "
+            f"{loop_var} * ({step}), {forward.tile}), {forward.tile})"
+        )
+        slot = transfer.resources.scratch_ref(f"{loop_var} % 2")
+        body.append(
+            _pl_when(
+                state,
+                f"{iteration} == {loop_var}",
+                "_forward_rows",
+                forward.forward(f"{slot}.at[{', '.join(parts)}]"),
+            )
+        )
+    return ahead, body
+
+
 def _hoist_nested_fori_prefetch(
     state: CodegenState,
     *,
@@ -4744,6 +4912,20 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
 
     loop_window = _build_inner_loop_window(state, graph_info, block_ids, env)
     grid_parts = loop_window.grid_parts
+    megakernel = state.device_function.pallas_megakernel
+    stream_sites = (
+        megakernel.stream_sites(graph_info.graph_id) if megakernel is not None else []
+    )
+    if megakernel is not None:
+        flush_loop_reads(state, graph_info.graph_id)
+    # Tiles streamed through the megakernel's weight ring bypass the per-loop
+    # DMA classification.
+    streamed = {id(load.fake) for _, site in stream_sites for load in site.loads}
+    pipelined_candidates = (
+        {key: value for key, value in loop_window.loaded.items() if key not in streamed}
+        if streamed
+        else loop_window.loaded
+    )
     placeholders = list(graph_info.graph.find_nodes(op="placeholder"))
     placeholder_exprs = {
         placeholder: ast.unparse(arg)
@@ -4794,7 +4976,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     # non-pipelined tensor is present (which would load full outer-block
     # tiles into VMEM and may OOM at large shapes).
     all_tensor_info, vmem_shapes, pipelined_tensor_ids = _classify_pipelined_tensors(
-        loop_window.loaded,
+        pipelined_candidates,
         loop_window.stored,
         block_ids,
         loop_window.slice_size_exprs,
@@ -4920,7 +5102,20 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             id(fake), input_slots_by_storage.get(storage_id)
         )
         load_buffer_count = (
-            state.config.pallas_load_buffer_count[input_slots[0]]
+            # Each tile of a tensor kept in HBM, or of a weight read at an
+            # index the kernel reads, is read once per loop.
+            2
+            if transfer.direction == "load"
+            and (
+                is_hbm_resident(state.device_function, fake)
+                or (
+                    not isinstance(transfer, IndirectDmaTransfer)
+                    and is_indexed_weight_load(
+                        state.device_function, fake, transfer.subscript
+                    )
+                )
+            )
+            else state.config.pallas_load_buffer_count[input_slots[0]]
             if load_buffer_counts_active
             and transfer.direction == "load"
             and not computed_indirect_index
@@ -4951,6 +5146,11 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         cached_resource = (
             resource_cache.get(resource_key) if resource_cache is not None else None
         )
+        loop_prime = (
+            megakernel.loop_primes.get((graph_info.graph_id, storage_id))
+            if megakernel is not None and transfer.direction == "load"
+            else None
+        )
         if isinstance(transfer, IndirectDmaTransfer):
             resources = allocate_indirect_dma_resources(
                 state.device_function,
@@ -4958,6 +5158,10 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                 buffer_count=load_buffer_count,
                 load_resources=indirect_load_resources_by_storage.get(storage_id),
             )
+        elif loop_prime is not None:
+            # The megakernel starts the first copy into these buffers early.
+            assert loop_prime.vmem_shape == vmem_shape and load_buffer_count == 2
+            resources = loop_prime.resources
         elif cached_resource is None:
             scratch_hint = hbm_name.replace("_hbm", "") + "_buf"
             sem_hint = hbm_name.replace("_hbm", "") + "_sem"
@@ -5039,6 +5243,14 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             state.device_function.new_var(f"_j{i}") for i in range(len(block_ids))
         ]
     dim_idx_exprs: list[str] = loop_vars
+    stream_routes: dict[str, str] = {}
+    stream_waits: list[ast.stmt] = []
+    stream_refills: list[ast.stmt] = []
+    if stream_sites:
+        assert not static_unroll and len(loop_vars) == 1
+        stream_routes, stream_waits, stream_refills = emit_stream_site(
+            state, graph_info.graph_id, loop_vars[-1]
+        )
 
     # Build block_id_to_info
     block_id_to_info = _loop_dim_infos(state, block_ids, env)
@@ -5075,7 +5287,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         iteration_count=grid_parts[0] if len(grid_parts) == 1 else None,
         static_unroll=static_unroll,
         inner_statements=body_stmts,
-        _tensor_to_dma_scratch=tensor_to_dma_scratch,
+        _tensor_to_dma_scratch={**tensor_to_dma_scratch, **stream_routes},
         _tensor_to_sem=tensor_to_sem,
         _prefetched_load_tensors=prefetched_load_tensors,
         _memory_op_to_dma_scratch=memory_op_to_dma_scratch,
@@ -5411,6 +5623,8 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         return _pl_when(state, condition, name_hint, statements)
 
     prime_statements: list[ast.stmt] = []
+    # The wait after the loop for first copies started even if it runs none.
+    prime_drain: list[ast.stmt] = []
     load_primes: list[tuple[str, list[ast.stmt]]] = []
     body_prefetch: ast.FunctionDef | None = None
     body_current_stage_waits: list[ast.stmt] = []
@@ -5423,15 +5637,47 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         prime_indices = [*loop_vars]
         prime_indices[-1] = "0"
         prime_starts: list[ast.stmt] = []
+        unguarded_starts: list[ast.stmt] = []
+        drain_waits: list[ast.stmt] = []
         for transfer in prefetched_loads:
             starts = _dma_transfer_statements(transfer, prime_indices, "0", ("start",))
-            prime_starts.extend(starts)
-            load_primes.append((transfer.resources.scratch, starts))
-        prime_statements.append(
-            _guarded_statements(
-                f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
+            loop_prime = (
+                megakernel.loop_primes.get(
+                    (
+                        graph_info.graph_id,
+                        id(transfer.transfer.tensor.untyped_storage()),
+                    )
+                )
+                if megakernel is not None
+                else None
             )
-        )
+            if loop_prime is not None:
+                # Only the iterations of the folded loop around the root
+                # that do not start the copy early start it here.
+                starts = loop_prime.copy.started(state.device_function, starts)
+            if loop_prime is not None and loop_prime.dynamic:
+                # The early copy starts whether or not the loop runs, so
+                # this one does too, and a loop of no iteration waits for it.
+                unguarded_starts.extend(starts)
+                drain_waits.extend(
+                    _dma_transfer_statements(transfer, prime_indices, "0", ("wait",))
+                )
+            else:
+                prime_starts.extend(starts)
+            load_primes.append((transfer.resources.scratch, starts))
+        prime_statements.extend(unguarded_starts)
+        if drain_waits:
+            prime_drain.append(
+                _guarded_statements(
+                    f"{num_iterations} == 0", "_drain_fori_primes", drain_waits
+                )
+            )
+        if prime_starts:
+            prime_statements.append(
+                _guarded_statements(
+                    f"{num_iterations} > 0", "_prime_fori_loads", prime_starts
+                )
+            )
 
         stage_loop_var = loop_vars[-1]
         next_iteration = f"({stage_loop_var} + 1)"
@@ -5454,6 +5700,18 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             body_current_stage_waits.extend(
                 _dma_transfer_statements(transfer, loop_vars, current_stage, ("wait",))
             )
+
+    if megakernel is not None:
+        rows_ahead, rows_forwards = _forward_row_writes(
+            state,
+            graph_info.graph_id,
+            prefetched_loads,
+            loop_window,
+            loop_vars[-1],
+            grid_parts[-1],
+        )
+        prime_statements.extend(rows_ahead)
+        body_current_stage_waits.extend(rows_forwards)
 
     # For loop-carried state, remap args to scratch reads inside the body
     body_args = (
@@ -5478,6 +5736,13 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
                     )
                 )
 
+        # The ring waits only read ring slots, so they go first: a grouped
+        # step (``_stream_step``) issues the statements up to here for several
+        # iterations before any of their bodies.
+        for statement in stream_waits:
+            state.codegen.add_statement(statement)
+        stream_head = cast("list[ast.stmt]", [*body_stmts])
+
         if body_prefetch is not None:
             state.codegen.add_statement(body_prefetch)
 
@@ -5497,6 +5762,10 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
 
         if has_loop_state:
             _write_back_loop_carried(state, scratch_names, carried, graph_results)
+
+        # Refill the ring slots this iteration consumed.
+        for statement in stream_refills:
+            state.codegen.add_statement(statement)
 
         for transfer in dma_stores:
             for statement in _dma_transfer_statements(
@@ -5530,7 +5799,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     # not for inner device loops.  For element-wise ops iteration order does
     # not affect correctness; for loop-carried state the user's source order
     # (block_ids order) is the correct semantic order.
-    current_body = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
+    current_body: list[ast.stmt] = body_stmts or [ast.Pass()]  # pyrefly: ignore[bad-assignment]
     if static_unroll:
         for dim in reversed(range(len(loop_vars))):
             loop = statement_from_string(
@@ -5558,23 +5827,73 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
             inner_body=body_stmts,
         )
 
+    # A ring-consumer loop traces ``unroll`` iterations per fori_loop step
+    # (Mosaic only supports ``unroll=1`` or a full unroll of fori_loop): the
+    # body becomes a step function of the loop index, called ``unroll`` times
+    # per step, then once per remaining iteration after the loop.  A loop of
+    # one step is unrolled in Python, so its ring slots are static.
+    unroll = (
+        stream_unroll(state.device_function, graph_info.graph_id) if stream_sites else 1
+    )
+    group = (
+        stream_wait_group(state.device_function, graph_info.graph_id, unroll)
+        if unroll > 1
+        else 1
+    )
+    if unroll > 1 and stream_sites[0][1].trips < 2 * unroll:
+        assert len(loop_vars) == 1
+        step_name, step_fn, group = _stream_step(
+            state, loop_vars[0], current_body, stream_head, group
+        )
+        calls = _stream_calls(state, step_name, 0, stream_sites[0][1].trips, group)
+        primes = [] if primes_hoisted else prime_statements
+        for statement in [step_fn, *primes, *calls]:
+            state.add_statement(statement)
+        if has_loop_state:
+            return _read_final_loop_state(state, result_vars)
+        return None
+    step_def: list[ast.stmt] = []
+    tail: list[ast.stmt] = []
     for dim in reversed(range(len(loop_vars))):
         fn_name = state.device_function.new_var(f"_fori_body_{dim}")
-        fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
+        trips = grid_parts[dim]
+        if unroll > 1:
+            step_name, step_fn, group = _stream_step(
+                state, loop_vars[dim], current_body, stream_head, group
+            )
+            step_def = [step_fn]
+            outer_var = state.device_function.new_var("_jo")
+            current_body = _stream_calls(
+                state, step_name, 0, unroll, group, f"{unroll} * {outer_var} + {{}}"
+            )
+            total = stream_sites[0][1].trips
+            trips = str(total // unroll)
+            if total % unroll:
+                tail = _stream_calls(
+                    state, step_name, total - total % unroll, total, group
+                )
+            fn_def = statement_from_string(f"def {fn_name}({outer_var}, _): pass")
+        else:
+            fn_def = statement_from_string(f"def {fn_name}({loop_vars[dim]}, _): pass")
         assert isinstance(fn_def, ast.FunctionDef)
         fn_def.body = current_body  # pyrefly: ignore[bad-assignment]
         fori_call = statement_from_string(
-            f"jax.lax.fori_loop(0, {grid_parts[dim]}, {fn_name}, None)"
+            f"jax.lax.fori_loop(0, {trips}, {fn_name}, None)"
         )
         call_prefix = (
             prime_statements if dim == len(loop_vars) - 1 and not primes_hoisted else []
         )
         if dim == 0:
             # Outermost: emit function def and fori_loop call into the kernel
-            state.add_statement(fn_def)
-            for statement in call_prefix:
+            for statement in [
+                *step_def,
+                fn_def,
+                *call_prefix,
+                fori_call,
+                *tail,
+                *prime_drain,
+            ]:
                 state.add_statement(statement)
-            state.add_statement(fori_call)
         else:
             # Inner: wrap in the next outer function's body
             current_body = [fn_def, *call_prefix, fori_call]

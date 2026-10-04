@@ -27,6 +27,7 @@ from .compile_environment import CompileEnvironment
 from .compile_environment import warning
 from .output_header import library_imports
 from .source_location import current_location
+from .static_loop_unroller import fold_static_host_ifs
 from .tensor_utils import patch_tensor_factories
 from .type_info import BarrierResultType
 from .type_info import CallableType
@@ -208,6 +209,17 @@ class TypePropagation(ast.NodeVisitor):
         self.scope = scope
         self.device_loop_depth = 0
         self.device_loop_count = 0
+        # Host ``range`` loops that may be folded around top-level device loops,
+        # mapped to their (single) induction-variable type, and host loops that
+        # cannot be folded, mapped to the reason.
+        self.foldable_loops: dict[ast.AST, SymIntType] = {}
+        self.unfoldable_loops: dict[ast.AST, str] = {}
+        # Host ``if``s with a static condition: only the taken branch is
+        # visited, and ``fold_static_host_ifs`` keeps only it.
+        self.static_ifs: set[ast.AST] = set()
+        # The induction variable of each loop over a sequence (``hl.static_range``),
+        # kept across fixed-point passes; see ``_sequence_loop_var``.
+        self.sequence_loop_vars: dict[ast.AST, TypeInfo] = {}
 
     def push_scope(self) -> None:
         self.scope = LocalScope(parent=self.scope)
@@ -1020,6 +1032,7 @@ class TypePropagation(ast.NodeVisitor):
             has_truth_val = False
         if has_truth_val:
             # For constant conditions, only type propagate one branch
+            self.static_ifs.add(node)
             self.scope.merge(self._body(node.body if truth_val else node.orelse))
         else:
             self.scope.merge_if_else(self._body(node.body), self._body(node.orelse))
@@ -1041,11 +1054,63 @@ class TypePropagation(ast.NodeVisitor):
         self.pop_scope()
         return functools.reduce(lambda x, y: x.merge(y), exit_scopes)
 
+    def _foldable_loop_var(self, node: ast.For, iter_type: TypeInfo) -> None:
+        """Classify a host loop that might hold top-level device loops.
+
+        Backends that run every top-level loop in one program can fold a host
+        ``for i in range(start, stop)`` loop around them: the body is traced
+        once with ``i`` as a single symbol constrained to ``[start, stop)``.
+        Whether the loop actually holds device loops is only known after its
+        body is visited, so both outcomes are recorded here.
+        """
+        if (
+            self.device_loop_depth != 0
+            or not CompileEnvironment.current().backend.supports_folded_host_loops
+            or node in self.foldable_loops
+        ):
+            return
+        if not isinstance(iter_type, LiteralType) or not isinstance(
+            loop_range := iter_type.value, range
+        ):
+            self.unfoldable_loops[node] = (
+                "only `for <name> in range(...)` with compile-time constant "
+                f"bounds can be folded (got {iter_type!s})"
+            )
+        elif loop_range.step != 1 or len(loop_range) == 0:
+            self.unfoldable_loops[node] = (
+                f"the range must be non-empty with step 1 (got {loop_range!r})"
+            )
+        elif node.orelse:
+            self.unfoldable_loops[node] = "for/else is not supported"
+        elif not isinstance(node.target, ast.Name):
+            self.unfoldable_loops[node] = "the loop target must be a single name"
+        else:
+            env = CompileEnvironment.current()
+            symint = env.create_unbacked_symint(hint=loop_range.start)
+            if len(loop_range) > 1:
+                env.shape_env.constrain_symbol_range(
+                    symint._sympy_(), loop_range.start, loop_range.stop - 1
+                )
+            self.foldable_loops[node] = SymIntType(self.origin(), symint)
+
+    def _check_root_parents(self) -> None:
+        """Top-level device loops may only nest inside foldable host loops."""
+        for parent in ExtendedAST.current()[:-1]:
+            if parent in self.foldable_loops or parent in self.static_ifs:
+                continue
+            if parent in self.unfoldable_loops:
+                raise exc.UnsupportedFoldedHostLoop(self.unfoldable_loops[parent])
+            raise exc.NestedGridLoop
+
     def visit_For(self, node: ast.For) -> TypeInfo:
         parent_scope = self.scope
         self.push_scope()
         iter_type = self.visit(node.iter)
-        self._assign(node.target, iter_type.propagate_iter(self.origin()))
+        self._foldable_loop_var(node, iter_type)
+        if node in self.foldable_loops:
+            self._assign(node.target, self.foldable_loops[node])
+        else:
+            self._assign(node.target, self._sequence_loop_var(node, iter_type))
         device_loop = (
             isinstance(call_node := node.iter, ast.Call)
             and isinstance(fn_node := call_node.func, ExtendedAST)
@@ -1055,9 +1120,11 @@ class TypePropagation(ast.NodeVisitor):
         )
 
         assert isinstance(node, ExtendedAST)
-        node._loop_type = (
-            LoopType.HOST if self.device_loop_depth == 0 else LoopType.DEVICE
-        )
+        if node._loop_type != LoopType.FOLDED:
+            node._loop_type = (
+                LoopType.HOST if self.device_loop_depth == 0 else LoopType.DEVICE
+            )
+        roots_before = self.device_loop_count
         if device_loop:
             if node.orelse:
                 raise exc.DeviceLoopElseBlock(fn.__qualname__)
@@ -1065,10 +1132,12 @@ class TypePropagation(ast.NodeVisitor):
             if self.device_loop_depth == 0:
                 self.func.set_local_types(parent_scope.extract_locals())
                 node._loop_type = LoopType.GRID
-                node._root_id = self.device_loop_count
-                self.device_loop_count += 1
-                if len(ExtendedAST.current()) != 1:
-                    raise exc.NestedGridLoop
+                if node._root_id is None:
+                    # Roots inside a folded host loop are visited once per
+                    # fixed-point pass; keep the first id.
+                    node._root_id = self.device_loop_count
+                    self.device_loop_count += 1
+                self._check_root_parents()
 
         self.device_loop_depth += device_loop
         _maybe_patch_tensor_factories = (
@@ -1087,7 +1156,28 @@ class TypePropagation(ast.NodeVisitor):
             orelse = self._body(node.orelse)
             self.scope.merge_if_else(body, orelse)
         self.device_loop_depth -= device_loop
+        if not device_loop and self.device_loop_count != roots_before:
+            # A host loop holding top-level device loops (validated by
+            # _check_root_parents) is folded into the device program.
+            node._loop_type = LoopType.FOLDED
+            assert isinstance(node.target, ExtendedAST)
+            node.target._type_info = self.foldable_loops[node]
         return NoType(origin=self.origin())
+
+    def _sequence_loop_var(self, node: ast.For, iter_type: TypeInfo) -> TypeInfo:
+        """The type of ``node``'s induction variable.
+
+        Iterating a sequence merges its elements, so the elements of a
+        ``hl.static_range`` become a fresh unbacked symbol on every visit of
+        the loop.  Every pass over the body must see the same symbol: AST
+        node types merge across passes, and the bounds of a slice
+        ``v[j : j + n]`` merged from two passes are two unrelated symbols
+        whose difference is no longer ``n``.
+        """
+        loop_var = iter_type.propagate_iter(self.origin())
+        if isinstance(iter_type, SequenceType) and isinstance(loop_var, SymIntType):
+            return self.sequence_loop_vars.setdefault(node, loop_var)
+        return loop_var
 
     def visit_While(self, node: ast.While) -> TypeInfo:
         self.visit(node.test)
@@ -1387,4 +1477,5 @@ def propagate_types(func: HostFunction) -> None:
         prop = _create_type_propagation(func)
         for stmt in func.body:
             prop.visit(stmt)
+        fold_static_host_ifs(func)
         _check_no_stmts_between_loops(func.body)

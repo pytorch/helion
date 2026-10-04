@@ -614,8 +614,10 @@ class TestToCodePallas(TestCase):
         ``NotImplementedError`` rather than emit a silently-wrong module."""
         x = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
         y = torch.randn([128, 128], device=DEVICE, dtype=torch.float32)
+        # Blocks covering every dim select the launcher's dot_general lowering.
+        config = helion.Config(block_sizes=[128, 128, 128])
         with self.assertRaises(NotImplementedError):
-            _pallas_to_code(pallas_matmul, (x, y), _JAX)
+            pallas_matmul.bind((x, y)).to_code(config, options=_JAX)
 
 
 if __name__ == "__main__":

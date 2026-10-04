@@ -1272,6 +1272,9 @@ class TileIndexType(TypeInfo):
                     size_hint=_get_hint(numel),
                     max_size=outer_max,
                     bounded_by_block_id=bounded_by,
+                    non_power_of_two_multiple=(
+                        None if env.backend.requires_power_of_two_block_sizes else 1
+                    ),
                 )
             )
             if env.config_spec.supports_config_key("num_threads"):

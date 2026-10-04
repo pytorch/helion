@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import functools
 import inspect
+from itertools import starmap
 import os
 from typing import TYPE_CHECKING
 from typing import Any
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     import jax
 
@@ -660,6 +662,7 @@ def _pallas_jnp_dtype_map() -> dict[str, object]:
         "jnp.int16": jnp.int16,
         "jnp.int8": jnp.int8,
         "jnp.uint8": jnp.uint8,
+        "jnp.uint32": jnp.uint32,
         "jnp.bool_": jnp.bool_,
         "jnp.float8_e4m3fn": jnp.float8_e4m3fn,
         "jnp.float4_e2m1fn": jnp.float4_e2m1fn,
@@ -1231,7 +1234,12 @@ def _pallas_make_reordered_kernel(
             original_order[orig_pos] = value
         for out_idx, orig_pos in enumerate(_output_indices):
             out_ref = refs[n_tensor_inputs + out_idx]
-            if orig_pos in inplace_positions and orig_pos not in _skip_copy:
+            if (
+                orig_pos in inplace_positions
+                and orig_pos not in _skip_copy
+                # The launcher stages a whole-array in-place pair in one buffer.
+                and refs[arg_to_tensor_pos[orig_pos]] is not out_ref
+            ):
                 in_ref = refs[arg_to_tensor_pos[orig_pos]]
                 is_smem = (
                     _smem_arg_indices is not None and orig_pos in _smem_arg_indices
@@ -1545,8 +1553,8 @@ def _pallas_build_scratch_shapes(
 
     Each entry is either ``(shape, dtype_str, scratch_type)`` or the
     legacy 2-tuple ``(shape, dtype_str)`` form (``scratch_type``
-    defaults to ``"vmem"``).  Supported scratch types: ``"vmem"`` and
-    ``"dma_semaphore"``.
+    defaults to ``"vmem"``).  Supported scratch types: ``"vmem"``,
+    ``"smem"`` and ``"dma_semaphore"``.
     """
     _jnp_dtype_map = _pallas_jnp_dtype_map()
     scratch_shapes: list[object] = []
@@ -1561,8 +1569,9 @@ def _pallas_build_scratch_shapes(
         else:
             assert dtype_str is not None
             jnp_dtype = _jnp_dtype_map.get(dtype_str, jnp.float32)  # type: ignore[union-attr]
+            memory = pltpu.SMEM if scratch_type == "smem" else pltpu.VMEM  # type: ignore[union-attr]
             scratch_shapes.append(
-                pltpu.VMEM(shape, jnp_dtype)  # type: ignore[union-attr]  # pyrefly: ignore[bad-argument-type]
+                memory(shape, jnp_dtype)  # pyrefly: ignore[bad-argument-type]
             )
     return scratch_shapes
 
@@ -1611,6 +1620,156 @@ def _pallas_kernel_scratch_kwarg(pl: object) -> str:
         if "scratch_types" in inspect.signature(pl.kernel).parameters  # type: ignore[union-attr]
         else "scratch_shapes"
     )
+
+
+def _pallas_whole_block_memory_space(
+    pltpu: object, spec: object, shape: tuple[int, ...]
+) -> object | None:
+    """On-chip memory space of a spec whose single block is the whole array.
+
+    Returns ``None`` for windowed, buffered or HBM specs.
+    """
+    if spec.pipeline_mode is not None or spec.block_shape is None or not shape:  # type: ignore[attr-defined]
+        return None
+    if tuple(spec.block_shape) != tuple(shape):  # type: ignore[attr-defined]
+        return None
+    memory_space = spec.memory_space  # type: ignore[attr-defined]
+    if memory_space is None:
+        return pltpu.VMEM  # type: ignore[attr-defined]
+    if memory_space is pltpu.VMEM or memory_space is pltpu.SMEM:  # type: ignore[attr-defined]
+        return memory_space
+    return None
+
+
+@dataclass(frozen=True, slots=True)
+class _PallasStaging:
+    """Pipeline positions whose single block is the whole array.
+
+    ``emit_pipeline`` copies such a buffer with a blocking DMA before (inputs)
+    or after (outputs) the grid loop, one buffer at a time.  The launcher
+    stages them in kernel scratch buffers instead and starts all input DMAs
+    before awaiting any, and likewise for outputs after the grid loop.  An
+    in-place output shares the buffer of its aliased input, so the kernel's
+    in-place copy is skipped.
+
+    Positions index ``[inputs..., outputs...]``.  *spaces* maps each staged
+    position to its memory space; *shared* maps an in-place output position
+    to its input position.
+    """
+
+    spaces: dict[int, object]
+    shared: dict[int, int]
+
+    @staticmethod
+    def plan(
+        pltpu: object,
+        pipe_positions: list[int],
+        all_specs: list[object],
+        avals: Sequence[object],
+        n_inputs: int,
+        input_by_output: Mapping[int, int],
+    ) -> _PallasStaging:
+        spaces: dict[int, object] = {}
+        for p in pipe_positions:
+            shape = tuple(avals[p].shape)  # type: ignore[attr-defined]
+            space = _pallas_whole_block_memory_space(pltpu, all_specs[p], shape)
+            if space is not None:
+                spaces[p] = space
+        shared: dict[int, int] = {}
+        for p in spaces:
+            source = input_by_output.get(p - n_inputs)
+            if (
+                p >= n_inputs
+                and source in spaces
+                and spaces[source] is spaces[p]
+                and avals[source].dtype == avals[p].dtype  # type: ignore[attr-defined]
+            ):
+                shared[p] = source
+        return _PallasStaging(spaces, shared)
+
+    @property
+    def owners(self) -> list[int]:
+        return [p for p in self.spaces if p not in self.shared]
+
+    def scratch_shapes(self, avals: Sequence[object]) -> list[object]:
+        """One kernel scratch buffer per owned position.
+
+        Kernel scratch rather than ``run_scoped``: interpret mode cannot
+        discharge an ``emit_pipeline`` body that reads an enclosing
+        ``run_scoped`` buffer.
+        """
+        return [
+            self.spaces[p](tuple(avals[p].shape), avals[p].dtype)  # type: ignore[attr-defined,operator]
+            for p in self.owners
+        ]
+
+
+def _pallas_run_pipeline(
+    pl: object,
+    pltpu: object,
+    reordered_kernel: object,
+    io_refs: list[object],
+    scratch_refs: Sequence[object],
+    staging_buffers: Sequence[object],
+    *,
+    staging: _PallasStaging,
+    pipe_positions: list[int],
+    all_specs: list[object],
+    n_inputs: int,
+    grid: tuple[int, ...],
+) -> None:
+    """Run the Helion kernel over ``grid`` with ``emit_pipeline``.
+
+    *io_refs* holds one ref per ``[inputs..., outputs...]`` position;
+    positions in *pipe_positions* are windowed by ``all_specs``, except the
+    *staging* positions, which are copied into *staging_buffers*
+    (``staging.scratch_shapes``) around the grid loop.  The DMA semaphores
+    are scoped here; as kernel scratch they cost ~0.1us per launch on TPU.
+    """
+    windowed = [p for p in pipe_positions if p not in staging.spaces]
+
+    def pipeline(refs: list[object]) -> None:
+        def pipeline_body(*block_refs: object) -> None:
+            merged = list(refs)
+            for p, block in zip(windowed, block_refs, strict=True):
+                merged[p] = block
+            reordered_kernel(*merged, *scratch_refs)  # type: ignore[operator]
+
+        pltpu.emit_pipeline(  # type: ignore[union-attr]
+            pipeline_body,
+            grid=grid,
+            in_specs=[all_specs[p] for p in windowed if p < n_inputs],
+            out_specs=[all_specs[p] for p in windowed if p >= n_inputs],
+        )(*[refs[p] for p in windowed])
+
+    if not staging.spaces:
+        pipeline(io_refs)
+        return
+
+    refs = list(io_refs)
+    for p, buffer in zip(staging.owners, staging_buffers, strict=True):
+        refs[p] = buffer
+    for p, source in staging.shared.items():
+        refs[p] = refs[source]
+    staged_in = [p for p in staging.spaces if p < n_inputs]
+    staged_out = [p for p in staging.spaces if p >= n_inputs]
+
+    def staged(semaphores: object) -> None:
+        def copy_all(pairs: list[tuple[object, object]], first_sem: int) -> None:
+            copies = [
+                pltpu.make_async_copy(src, dst, semaphores.at[first_sem + i])  # type: ignore[union-attr,attr-defined]
+                for i, (src, dst) in enumerate(pairs)
+            ]
+            for copy in copies:
+                copy.start()
+            for copy in copies:
+                copy.wait()
+
+        copy_all([(io_refs[p], refs[p]) for p in staged_in], 0)
+        pipeline(refs)
+        copy_all([(refs[p], io_refs[p]) for p in staged_out], len(staged_in))
+
+    pl.run_scoped(staged, pltpu.SemaphoreType.DMA((len(staging.spaces),)))  # type: ignore[union-attr]
 
 
 def _pallas_pl_kernel_jit_fn(
@@ -1675,8 +1834,35 @@ def _pallas_pl_kernel_jit_fn(
         n_inputs + i for i in range(n_outputs) if i not in hbm_out_positions
     ]
     all_specs = list(in_specs) + out_specs_seq
-    pipe_in_specs = [all_specs[p] for p in pipe_positions if p < n_inputs]
-    pipe_out_specs = [all_specs[p] for p in pipe_positions if p >= n_inputs]
+    input_by_output = {
+        out_pos: in_pos for in_pos, out_pos in input_output_aliases.items()
+    }
+    n_scratch = len(scratch_shapes)
+
+    def plan_staging(inputs: Sequence[object]) -> tuple[_PallasStaging, list[object]]:
+        """Staging plan for the given input arrays, and the kernel's scratch."""
+        io_avals = [*inputs, *out_shape_seq]
+        staging = _PallasStaging.plan(
+            pltpu, pipe_positions, all_specs, io_avals, n_inputs, input_by_output
+        )
+        return staging, [*scratch_shapes, *staging.scratch_shapes(io_avals)]
+
+    def run_pipeline(
+        staging: _PallasStaging, io_refs: list[object], all_scratch: Sequence[object]
+    ) -> None:
+        _pallas_run_pipeline(
+            pl,
+            pltpu,
+            reordered_kernel,
+            io_refs,
+            all_scratch[:n_scratch],
+            all_scratch[n_scratch:],
+            staging=staging,
+            pipe_positions=pipe_positions,
+            all_specs=all_specs,
+            n_inputs=n_inputs,
+            grid=pipeline_grid,
+        )
 
     mesh = pltpu.create_tensorcore_mesh("_helion_core", num_cores=1)  # type: ignore[union-attr]
     scratch_kw = _pallas_kernel_scratch_kwarg(pl)
@@ -1687,34 +1873,25 @@ def _pallas_pl_kernel_jit_fn(
     # used before HBM aliasing was added.
     if interpret:
 
-        def interpret_kernel_body(*refs: object) -> None:
-            io_any = refs[:n_io]
-            scratch_refs = refs[n_io:]
-            pipe_any = [io_any[p] for p in pipe_positions]
+        def interpret_jit_fn(*inputs: object) -> object:
+            staging, kernel_scratch = plan_staging(inputs)
 
-            def pipeline_body(*block_refs: object) -> None:
-                merged = list(io_any)
-                for p, block in zip(pipe_positions, block_refs, strict=True):
-                    merged[p] = block
-                reordered_kernel(*merged, *scratch_refs)  # type: ignore[operator]
+            def interpret_kernel_body(*refs: object) -> None:
+                # Without the aliases an HBM output starts uninitialized:
+                # seed each in-place one with its input.
+                for out_pos, in_pos in hbm_alias_input_by_output.items():
+                    pltpu.sync_copy(refs[in_pos], refs[n_inputs + out_pos])  # type: ignore[union-attr]
+                run_pipeline(staging, list(refs[:n_io]), refs[n_io:])
 
-            pltpu.emit_pipeline(  # type: ignore[union-attr]
-                pipeline_body,
-                grid=pipeline_grid,
-                in_specs=pipe_in_specs,
-                out_specs=pipe_out_specs,
-            )(*pipe_any)
-
-        return cast(
-            "Callable[..., object]",
-            pl.kernel(  # type: ignore[union-attr]
+            return pl.kernel(  # type: ignore[union-attr]
                 interpret_kernel_body,
                 out_shape_arg,
                 mesh=mesh,
                 interpret=True,
-                **{scratch_kw: scratch_shapes},
-            ),
-        )
+                **{scratch_kw: kernel_scratch},
+            )(*inputs)
+
+        return interpret_jit_fn
 
     kernel_out_shapes = [out_shape_seq[pos] for pos in kernel_output_positions]
     kernel_out_shape: object
@@ -1725,7 +1902,11 @@ def _pallas_pl_kernel_jit_fn(
     else:
         kernel_out_shape = tuple(kernel_out_shapes)
 
-    def make_kernel(alias_refs: Mapping[int, object]) -> Callable[..., object]:
+    def make_kernel(
+        alias_refs: Mapping[int, object], inputs: Sequence[object]
+    ) -> Callable[..., object]:
+        staging, kernel_scratch = plan_staging(inputs)
+
         def kernel_body(*refs: object) -> None:
             input_refs = iter(refs[: len(kernel_input_positions)])
             output_start = len(kernel_input_positions)
@@ -1748,24 +1929,9 @@ def _pallas_pl_kernel_jit_fn(
                     else next(output_refs)
                 )
             assert len(io_any) == n_io
-            pipe_any = [io_any[p] for p in pipe_positions]
+            run_pipeline(staging, io_any, scratch_refs)
 
-            # block_refs are the per-step windowed buffers (VMEM, or SMEM for
-            # SMEM-spec'd args), one per pipe_positions entry.
-            def pipeline_body(*block_refs: object) -> None:
-                merged = list(io_any)
-                for p, block in zip(pipe_positions, block_refs, strict=True):
-                    merged[p] = block
-                reordered_kernel(*merged, *scratch_refs)  # type: ignore[operator]
-
-            pltpu.emit_pipeline(  # type: ignore[union-attr]
-                pipeline_body,
-                grid=pipeline_grid,
-                in_specs=pipe_in_specs,
-                out_specs=pipe_out_specs,
-            )(*pipe_any)
-
-        kernel_kwargs: dict[str, object] = {scratch_kw: scratch_shapes}
+        kernel_kwargs: dict[str, object] = {scratch_kw: kernel_scratch}
         compiler_params: dict[str, object] = {
             "vmem_limit_bytes": _get_vmem_limit_bytes(pltpu, interpret)
         }
@@ -1788,7 +1954,11 @@ def _pallas_pl_kernel_jit_fn(
         )
 
     if not hbm_alias_input_positions:
-        return make_kernel({})
+
+        def jit_fn(*inputs: object) -> object:
+            return make_kernel({}, inputs)(*inputs)
+
+        return jit_fn
 
     import jax
 
@@ -1798,7 +1968,7 @@ def _pallas_pl_kernel_jit_fn(
             for position in hbm_alias_input_positions
         }
         kernel_inputs = [inputs[position] for position in kernel_input_positions]
-        kernel = make_kernel(alias_refs)
+        kernel = make_kernel(alias_refs, inputs)
         kernel_results = kernel(*kernel_inputs)
         if not kernel_output_positions:
             kernel_results_seq: list[object] = []
@@ -1841,6 +2011,48 @@ class _PallasCompileResult:
     pallas_aliases: dict[int, int]
 
 
+def _lane_dense_shape(arg: object, perm: Sequence[int]) -> tuple[int, ...]:
+    """The shape of kernel arg ``arg`` passed lane dense in dim order
+    ``perm``."""
+    shape = cast("_TorchTensorOrJaxArray", arg).shape
+    return tuple(int(shape[dim]) for dim in perm)
+
+
+def _lane_dense_jit_fn(
+    jit_fn: Callable[..., object],
+    input_perms: dict[int, tuple[int, ...]],
+    output_perms: dict[int, tuple[int, ...]],
+) -> Callable[..., object]:
+    """``jit_fn`` over the logical arrays of the inputs and outputs the
+    kernel takes lane dense, by position, in the dim orders ``input_perms``
+    and ``output_perms``: transpose them to those orders on the way in and
+    back on the way out, which XLA lowers to bitcasts of arrays laid out
+    that way."""
+    import jax.numpy as jnp
+
+    def to_physical(position: int, array: object) -> object:
+        perm = input_perms.get(position)
+        if perm is None:
+            return array
+        return jnp.transpose(cast("jax.Array", array), perm)
+
+    def to_logical(position: int, array: object) -> object:
+        perm = output_perms.get(position)
+        if perm is None:
+            return array
+        inverse = tuple(perm.index(dim) for dim in range(len(perm)))
+        return jnp.transpose(cast("jax.Array", array), inverse)
+
+    @functools.wraps(jit_fn)
+    def wrapper(*inputs: object) -> object:
+        results = jit_fn(*starmap(to_physical, enumerate(inputs)))
+        if not isinstance(results, (tuple, list)):
+            return to_logical(0, results)
+        return type(results)(starmap(to_logical, enumerate(results)))
+
+    return wrapper
+
+
 def _pallas_compile_jit_fn(
     pallas_kernel: object,
     grid: tuple[int, ...],
@@ -1857,6 +2069,7 @@ def _pallas_compile_jit_fn(
     _use_low_level_scheduler: bool,
     interpret: bool,
     placeholder_fn: Callable[[object], object] | None = None,
+    _lane_dense_perms: dict[int, tuple[int, ...]] | None = None,
 ) -> _PallasCompileResult:
     """Build the ``pl.kernel`` jit_fn used by the Pallas launcher.
 
@@ -1877,6 +2090,11 @@ def _pallas_compile_jit_fn(
     ``jax.jit(lax.dot_general)`` for the Pallas launch and skips the
     VMEM check; XLA's planner streams the contraction so the Pallas
     lowering's VMEM estimate doesn't apply.
+
+    The kernel takes the tensor at each index of ``_lane_dense_perms`` with
+    its dims in the order there (``pallas_lane_dense``): ``args`` holds
+    shape-only stand-ins of that shape (``_lane_dense_shape``) there, and the
+    jit_fn takes and returns the arrays themselves (``_lane_dense_jit_fn``).
 
     ``args`` must already have any ds-padding applied — this helper
     builds specs from the post-pad shapes.  Returns a
@@ -2047,6 +2265,20 @@ def _pallas_compile_jit_fn(
             use_low_level_scheduler=_use_low_level_scheduler,
         )
         jit_fn = _x64_scoped_jit_fn(jit_fn)
+        if _lane_dense_perms:
+            jit_fn = _lane_dense_jit_fn(
+                jit_fn,
+                {
+                    i: _lane_dense_perms[idx]
+                    for i, idx in enumerate(tensor_arg_indices)
+                    if idx in _lane_dense_perms
+                },
+                {
+                    j: _lane_dense_perms[idx]
+                    for j, idx in enumerate(_output_indices)
+                    if idx in _lane_dense_perms
+                },
+            )
 
     return _PallasCompileResult(
         jit_fn=jit_fn,
@@ -2080,6 +2312,7 @@ def _pallas_jax_call(
     orig_shapes: dict[int, tuple[int, ...]] | None = None,
     ds_pad_dims: list[tuple[int, int, int, int]] | None = None,
     return_all_outputs: bool = False,
+    lane_dense_perms: dict[int, tuple[int, ...]] | None = None,
 ) -> list[object]:
     """Drive the shared compile core (``pl.kernel``) + jit_fn on raw ``jax.Array``s
     and return the output JAX array(s).
@@ -2107,10 +2340,23 @@ def _pallas_jax_call(
             **cast("dict[str, Any]", compact),
         )
     else:
+        spec_args = jax_args
+        if lane_dense_perms:
+            import jax
+
+            spec_args = tuple(
+                jax.ShapeDtypeStruct(
+                    _lane_dense_shape(arg, lane_dense_perms[i]),
+                    cast("jax.Array", arg).dtype,
+                )
+                if i in lane_dense_perms
+                else arg
+                for i, arg in enumerate(jax_args)
+            )
         result = _pallas_compile_jit_fn(
             pallas_kernel,
             grid,
-            jax_args,
+            spec_args,
             _output_indices=output_indices,
             _inplace_indices=inplace_indices,
             _block_spec_info=block_spec_info,
@@ -2121,6 +2367,7 @@ def _pallas_jax_call(
             _collective_id=collective_id,
             _use_low_level_scheduler=use_low_level_scheduler,
             interpret=interpret,
+            _lane_dense_perms=lane_dense_perms,
         )
 
     jax_inputs = [jax_args[i] for i in result.tensor_arg_indices]
@@ -2178,6 +2425,7 @@ def _pallas_install_launcher_cache(
     _use_low_level_scheduler: bool,
     _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
+    _lane_dense_perms: dict[int, tuple[int, ...]] | None = None,
 ) -> tuple[object, ...]:
     """Cache-miss path shared by all Pallas launchers.
 
@@ -2207,6 +2455,15 @@ def _pallas_install_launcher_cache(
         spec_args, _ = _pallas_apply_ds_padding(args, output_indices, _ds_pad_dims)
 
     _pallas_check_dtypes(spec_args)
+    if _lane_dense_perms:
+        spec_args = tuple(
+            cast("torch.Tensor", arg).new_empty(
+                _lane_dense_shape(arg, _lane_dense_perms[i]), device="meta"
+            )
+            if i in _lane_dense_perms
+            else arg
+            for i, arg in enumerate(spec_args)
+        )
 
     result = _pallas_compile_jit_fn(
         pallas_kernel,
@@ -2225,6 +2482,7 @@ def _pallas_install_launcher_cache(
         placeholder_fn=functools.partial(
             _pallas_torch_placeholder, interpret=interpret
         ),
+        _lane_dense_perms=_lane_dense_perms,
     )
 
     jax_callable = _pallas_build_callable(
@@ -2317,6 +2575,7 @@ def default_pallas_launcher(
     _use_low_level_scheduler: bool = False,
     _uses_remote_copy: bool = False,
     _matmul_dot_general: dict[str, object] | None = None,
+    _lane_dense_perms: dict[int, tuple[int, ...]] | None = None,
     _compact_build_worklist: Callable[..., object] | None = None,
     _compact_offset_arg_indices: list[int] | None = None,
     _compact_metadata_fields: list[str] | None = None,
@@ -2424,6 +2683,7 @@ def default_pallas_launcher(
                 _use_low_level_scheduler=_use_low_level_scheduler,
                 _uses_remote_copy=_uses_remote_copy,
                 _matmul_dot_general=_matmul_dot_general,
+                _lane_dense_perms=_lane_dense_perms,
             )
         setattr(pallas_kernel, _PALLAS_SCRATCH_KEY_ATTR, scratch_key)
 

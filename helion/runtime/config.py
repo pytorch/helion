@@ -52,6 +52,12 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         pallas_load_buffer_count: list[int] | None = None,
+        pallas_stream_depth: int | None = None,
+        pallas_stream_unroll: int | None = None,
+        pallas_stream_wait_group: int | None = None,
+        pallas_stream_arena: bool | None = None,
+        pallas_hbm_resident: bool | None = None,
+        pallas_lane_dense: bool | None = None,
         load_eviction_policies: (
             EvictionPolicyLiteral | list[EvictionPolicyLiteral] | None
         ) = None,
@@ -106,6 +112,40 @@ class Config(Mapping[str, object]):
             pallas_load_buffer_count: Pallas-only load buffer count (1 or 2) for
                 each input tensor. Tensors without an existing DMA route use the
                 ordinary path.
+            pallas_stream_depth: Pallas-only number of slots in the weight DMA
+                ring that streams the most bytes, in a kernel with multiple
+                top-level loops (one ring per streamed tile shape).  Every
+                other ring gets about as many bytes in no more slots, at least
+                two loop iterations' tiles and at most its whole stream.  None
+                puts about 16 MiB in that ring.
+            pallas_stream_unroll: Pallas-only number of iterations of each
+                inner loop reading a weight DMA ring traced per
+                ``jax.lax.fori_loop`` step (at most its trip count).  None
+                picks the smallest power of two (at most 8) whose iterations
+                stream 2 MiB.
+            pallas_stream_wait_group: Pallas-only number of those iterations
+                whose ring waits run before their bodies (at most the unroll,
+                and at most as many as every ring they read holds).  A DMA
+                wait orders all later vector ops after it, so grouping the
+                waits speeds up compute-bound loops but leaves fewer copies in
+                flight.  None waits per iteration.
+            pallas_stream_arena: Pallas-only: stream the weight tiles of every
+                shape (of one dtype) through one ring of equal slots, each
+                slot viewed as whichever tile it holds, instead of a ring per
+                tile shape.  The ring then keeps all its slots in flight in
+                program order, whichever loop runs.  None is False.
+            pallas_hbm_resident: Pallas-only, in a kernel with multiple
+                top-level loops: keep the written tensors read only by inner
+                loops and written only a row at a time (a KV cache) in HBM,
+                streaming their tiles (True), or whole in VMEM (False).  None
+                keeps them in HBM only when they do not fit in VMEM next to
+                the weight rings.
+            pallas_lane_dense: Pallas-only, in a kernel with multiple
+                top-level loops: pass each input with a narrow minor dim that
+                XLA lays out in another dim order (e.g. a [5120, 6] weight, or
+                a [48, 5120, 6] stack of them) in that physical order, so the
+                call needs no layout copies and the kernel reads it lane dense
+                (True or None), or as given (False).
             load_eviction_policies: Eviction policies for load operations. A single
                 value applies to every load; a list specifies one value per load.
                 Valid values are "", "first", and "last".
@@ -205,6 +245,12 @@ class Config(Mapping[str, object]):
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
             "pallas_load_buffer_count": pallas_load_buffer_count,
+            "pallas_stream_depth": pallas_stream_depth,
+            "pallas_stream_unroll": pallas_stream_unroll,
+            "pallas_stream_wait_group": pallas_stream_wait_group,
+            "pallas_stream_arena": pallas_stream_arena,
+            "pallas_hbm_resident": pallas_hbm_resident,
+            "pallas_lane_dense": pallas_lane_dense,
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
@@ -438,6 +484,30 @@ class Config(Mapping[str, object]):
     @property
     def pallas_load_buffer_count(self) -> list[int]:
         return cast("list[int]", self.config.get("pallas_load_buffer_count", []))
+
+    @property
+    def pallas_stream_depth(self) -> int | None:
+        return cast("int | None", self.config.get("pallas_stream_depth"))
+
+    @property
+    def pallas_stream_unroll(self) -> int | None:
+        return cast("int | None", self.config.get("pallas_stream_unroll"))
+
+    @property
+    def pallas_stream_wait_group(self) -> int | None:
+        return cast("int | None", self.config.get("pallas_stream_wait_group"))
+
+    @property
+    def pallas_stream_arena(self) -> bool | None:
+        return cast("bool | None", self.config.get("pallas_stream_arena"))
+
+    @property
+    def pallas_hbm_resident(self) -> bool | None:
+        return cast("bool | None", self.config.get("pallas_hbm_resident"))
+
+    @property
+    def pallas_lane_dense(self) -> bool | None:
+        return cast("bool | None", self.config.get("pallas_lane_dense"))
 
     @property
     def load_eviction_policies(
