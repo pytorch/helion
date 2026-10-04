@@ -754,6 +754,22 @@ def pallas_private_local_scratch(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_scalar_selected_panels(
+    table: torch.Tensor,
+    panel_ids: torch.Tensor,
+) -> torch.Tensor:
+    out = torch.empty(
+        [panel_ids.size(0), table.size(1), table.size(2)],
+        dtype=table.dtype,
+        device=table.device,
+    )
+    for work in hl.grid(panel_ids.size(0)):
+        panel = panel_ids[work]
+        out[work, :, :] = table[panel, :, :] + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_aligned_dynamic_window(
     table: torch.Tensor, starts: torch.Tensor
 ) -> torch.Tensor:
@@ -1099,6 +1115,16 @@ class TestPallas(TestCase):
             pallas_internal_scratch=True,
         )
         torch.testing.assert_close(result.cpu(), (x * 2.0 + 1.0).cpu())
+
+    def test_scalar_selected_panels(self) -> None:
+        table = torch.randn(4, 128, 128, device=DEVICE, dtype=torch.float32)
+        panel_ids = torch.tensor([2, 0, 3], device=DEVICE, dtype=torch.int32)
+        _code, result = code_and_output(
+            pallas_scalar_selected_panels,
+            (table, panel_ids),
+            block_sizes=[],
+        )
+        torch.testing.assert_close(result.cpu(), (table[panel_ids] + 1.0).cpu())
 
     @skipIfPallasInterpret("packed FP4 execution requires a real TPU")
     def test_fp8_fp4_matmul(self) -> None:
