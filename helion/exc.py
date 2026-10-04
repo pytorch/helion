@@ -129,6 +129,10 @@ class PdlPlacement(BaseError):
     )
 
 
+class InvalidPrefetchRegion(BaseError):
+    message = "hl.prefetch: {0}."
+
+
 class PdlStateWithoutWait(BaseError):
     message = (
         "A PDL launch with cross-loop state needs hl.pdl_wait() before the first "

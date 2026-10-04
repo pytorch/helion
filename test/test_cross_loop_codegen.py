@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -761,7 +762,11 @@ def guarded_scan_gather(
     autotune_effort="none",
 )
 def guarded_dot_pair(
-    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, flags: torch.Tensor
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    flags: torch.Tensor,
+    prefetch: hl.constexpr,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     experts, rows, k = w1.size()
     tokens = x.size(0)
@@ -771,6 +776,8 @@ def guarded_dot_pair(
     for tile_q, tile_e in hl.tile([rows // 128, experts], block_size=[1, 1]):
         live = torch.sum((flags[:] > 0).to(torch.int32))
         if tile_e.begin < live:
+            if prefetch:
+                hl.prefetch(w1, [tile_e.begin])
             r = tile_q.begin * 128 + hl.arange(128)
             acc = hl.zeros([128, tokens], dtype=torch.float32)
             for tile_k in hl.tile(k // 64, block_size=1):
@@ -1996,14 +2003,17 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         w1 = torch.randn((64, 512, 128), device=DEVICE, dtype=torch.float16)
         w2 = torch.randn((64, 512, 128), device=DEVICE, dtype=torch.float16)
         experts = torch.arange(64, device=DEVICE)
-        for live, live2 in ((0, 0), (5, 0), (64, 3), (17, 17)):
-            with self.subTest(live=live, live2=live2):
+        codes = {}
+        for prefetch, (live, live2) in itertools.product(
+            (False, True), ((0, 0), (5, 0), (64, 3), (17, 17))
+        ):
+            with self.subTest(prefetch=prefetch, live=live, live2=live2):
                 flags = (experts < live).to(torch.int32) + (experts < live2).to(
                     torch.int32
                 )
                 code, (out1, out2, total) = code_and_output(
                     guarded_dot_pair,
-                    (x, w1, w2, flags),
+                    (x, w1, w2, flags, prefetch),
                     pid_type="persistent_blocked",
                     cross_loop_pipeline="static",
                     num_sm_multiplier=1,
@@ -2018,23 +2028,29 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(
                     total, expected2.sum((0, 1)), rtol=1e-2, atol=1.0
                 )
-        kernel = _generated_function(code, "_helion_guarded_dot_pair")
-        loops = [
-            node
-            for node in ast.walk(kernel)
-            if isinstance(node, ast.For) and ast.unparse(node.target) == "virtual_pid"
-        ]
-        fused = [
-            loop
-            for loop in loops
-            if "tile_dependency_fused_stride" in ast.unparse(loop.iter)
-        ]
-        # One balanced loop for both producers, one shared K loop, weights selected.
-        self.assertEqual((len(loops), len(fused)), (2, 1))
-        self.assertEqual(
-            sum(isinstance(node, ast.For) for node in ast.walk(fused[0])), 2
-        )
-        self.assertIn("tl.where(tile_dependency_fused_is_a, w1, w2)", code)
+                codes[prefetch] = code
+        for prefetch, code in codes.items():
+            kernel = _generated_function(code, "_helion_guarded_dot_pair")
+            loops = [
+                node
+                for node in ast.walk(kernel)
+                if isinstance(node, ast.For)
+                and ast.unparse(node.target) == "virtual_pid"
+            ]
+            fused = [
+                loop
+                for loop in loops
+                if "tile_dependency_fused_stride" in ast.unparse(loop.iter)
+            ]
+            # One balanced loop for both producers, one shared K loop, weights selected.
+            self.assertEqual((len(loops), len(fused)), (2, 1))
+            self.assertEqual(
+                sum(isinstance(node, ast.For) for node in ast.walk(fused[0])), 2
+            )
+            self.assertIn("tl.where(tile_dependency_fused_is_a, w1, w2)", code)
+            # The first task's prefetch runs once, outside the task loops.
+            self.assertEqual(ast.unparse(kernel).count("prefetch_l2("), prefetch)
+            self.assertFalse(any("prefetch_l2(" in ast.unparse(loop) for loop in loops))
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

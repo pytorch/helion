@@ -1212,6 +1212,63 @@ class _TaskLoopUnifier:
         raise _FusionMismatch
 
 
+def _is_prefetch(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(call := node.value, ast.Call)
+        and isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "helion_cache_hints"
+        and call.func.attr == "prefetch_l2"
+    )
+
+
+def _split_prefetches(
+    body: list[ast.stmt], needed: set[str]
+) -> tuple[list[ast.stmt], list[ast.stmt], set[str]]:
+    """Split a task body into its prefetches with the statements they read, and the
+    body without prefetches. ``needed`` is the names read after ``body``."""
+    kept: list[ast.stmt] = []
+    rest: list[ast.stmt] = []
+    for statement in reversed(body):
+        nested = any(_is_prefetch(node) for node in ast.walk(statement))
+        if _is_prefetch(statement):
+            kept.append(statement)
+            needed = needed | _all_names([statement])
+        elif nested and isinstance(statement, ast.If):
+            then = _split_prefetches(statement.body, needed)
+            other = _split_prefetches(statement.orelse, needed)
+            for target, (a, b) in (
+                (kept, (then[0], other[0])),
+                (rest, (then[1], other[1])),
+            ):
+                target.append(
+                    create(
+                        ast.If,
+                        test=statement.test,
+                        body=a or [create(ast.Pass)],
+                        orelse=b,
+                    )
+                )
+            needed = then[2] | other[2] | _all_names([statement.test])
+        elif nested:
+            raise exc.InvalidPrefetchRegion("a task's prefetch cannot sit in a loop")
+        else:
+            rest.append(statement)
+            if not _stored_names([statement]) & needed:
+                continue
+            if not isinstance(statement, (ast.Assign, ast.AugAssign)) or not all(
+                _is_pure_call(call)
+                and not any(keyword.arg == "volatile" for keyword in call.keywords)
+                for call in ast.walk(statement)
+                if isinstance(call, ast.Call)
+            ):
+                raise exc.InvalidPrefetchRegion("the index must be pure scalar math")
+            kept.append(statement)
+            needed = needed | _all_names([statement])
+    return kept[::-1], rest[::-1], needed
+
+
 def _split_task_loop(
     body: list[ast.stmt],
 ) -> tuple[list[ast.stmt], ast.For, list[ast.stmt]] | None:
@@ -2810,6 +2867,41 @@ def emit_cross_loop_schedule(
             ),
         ], live
 
+    def task_prefetches(
+        body: list[ast.stmt],
+    ) -> tuple[list[ast.stmt], list[ast.stmt]]:
+        """Split a task body's prefetches, with the scalar math they read, from it."""
+        kept, rest, _ = _split_prefetches(body, set())
+        vp = strategy.virtual_pid_var
+        if (_all_names(kept) - _stored_names(kept) - {vp}) & _stored_names(rest):
+            raise exc.InvalidPrefetchRegion(
+                "the index must not depend on earlier tasks"
+            )
+        return kept, rest if kept else body
+
+    def entry_prefetches(
+        kept: list[ast.stmt], first: str, guard: str
+    ) -> list[ast.stmt]:
+        """Issue a task loop's prefetches once, for task ``first``, before the loop;
+        an in-loop bulk prefetch would stall the TMA loads behind it."""
+        if not kept:
+            return []
+        vp = strategy.virtual_pid_var
+        task = device_function.new_var("prefetch_task", dce=False)
+        rename = {
+            name: device_function.new_var(name, dce=False)
+            for name in sorted(_stored_names(kept))
+        }
+        return [
+            statement_from_string(f"{task} = {first}"),
+            create(
+                ast.If,
+                test=expr_from_string(guard),
+                body=_renamed(kept, {vp: task, **rename}),
+                orelse=[],
+            ),
+        ]
+
     def shared_captures(extent: _GuardedExtent, block_ids: list[int]) -> list[ast.stmt]:
         specializes = CompileEnvironment.current().config_spec.range_warp_specialize
         if not any(
@@ -2904,8 +2996,22 @@ def emit_cross_loop_schedule(
             hoisted.extend(shared_captures(extent, block_ids))
             segment_stop = f"tl.minimum({segment_begin} + {live}, {segment_end})"
             skipped_dispatch = skipped_task_dispatch(root, live)
+        first = f"(({lane}) - 0) + ({segment_begin})"
+        prefetches, task_body = task_prefetches(
+            scheduled_root_task_body(
+                root,
+                f"({strategy.virtual_pid_var}) - {segment_begin}",
+                f"{case_offsets[root]} + "
+                f"(({strategy.virtual_pid_var}) - {segment_begin})",
+                (
+                    strategy.virtual_pid_var,
+                    *(() if extent is None else extent.hoisted_names),
+                ),
+            )
+        )
         task_dispatch: list[ast.stmt] = [
             *hoisted,
+            *entry_prefetches(prefetches, first, f"{first} < {segment_stop}"),
             create(
                 ast.For,
                 target=create(
@@ -2918,21 +3024,12 @@ def emit_cross_loop_schedule(
                     TileStrategy.get_range_call_str(
                         device_function.config,
                         block_ids,
-                        begin=f"(({lane}) - 0) + ({segment_begin})",
+                        begin=first,
                         end=segment_stop,
                         step=str(launch_worker_count),
                     )
                 ),
-                body=scheduled_root_task_body(
-                    root,
-                    f"({strategy.virtual_pid_var}) - {segment_begin}",
-                    f"{case_offsets[root]} + "
-                    f"(({strategy.virtual_pid_var}) - {segment_begin})",
-                    (
-                        strategy.virtual_pid_var,
-                        *(() if extent is None else extent.hoisted_names),
-                    ),
-                ),
+                body=task_body,
                 orelse=[],
                 type_comment=None,
             ),
@@ -3036,6 +3133,8 @@ def emit_cross_loop_schedule(
             )
             for body in (body_a, body_b)
         )
+        prefetch_a, body_a = task_prefetches(body_a)
+        prefetch_b, body_b = task_prefetches(body_b)
         stored_b = _stored_names(body_b)
         if _stored_names(body_a) & (_all_names(body_b) - stored_b):
             return None
@@ -3139,6 +3238,10 @@ def emit_cross_loop_schedule(
             ),
             statement_from_string(
                 f"{stride} = tl.maximum(({total} + {rounds} - 1) // {rounds}, 1)"
+            ),
+            *entry_prefetches(prefetch_a, worker, f"{worker} < {live}"),
+            *entry_prefetches(
+                prefetch_b, worker, f"({worker} >= {live}) & ({worker} < {total})"
             ),
             create(
                 ast.For,

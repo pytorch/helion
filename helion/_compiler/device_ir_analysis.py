@@ -219,6 +219,7 @@ _TENSOR_ROUTING_OPS = (
     torch.ops.aten.sym_size.int,
     torch.ops.aten.sym_stride.int,
     hl.device_print,
+    hl.prefetch,
     hl.breakpoint,
 )
 
