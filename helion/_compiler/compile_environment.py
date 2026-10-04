@@ -380,6 +380,10 @@ class CompileEnvironment:
         # view of a user input cannot acquire it merely because it has no direct
         # replayable input source.
         self._symbolically_exact_layout_storages: set[torch.UntypedStorage] = set()
+        self.fresh_allocation_storages: set[torch.UntypedStorage] = set()
+        # Value-initialized factories have disjoint storage but grant no layout
+        # proof to existing whole-root routes.
+        self.fresh_initialized_storages: set[torch.UntypedStorage] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -834,7 +838,15 @@ class CompileEnvironment:
         Other factories conservatively remain runtime-strided until their
         layout contracts are added here.
         """
-        if factory not in (torch.empty, torch.empty_like):
+        initialized = factory in (
+            torch.zeros,
+            torch.ones,
+            torch.full,
+            torch.zeros_like,
+            torch.ones_like,
+            torch.full_like,
+        )
+        if not initialized and factory not in (torch.empty, torch.empty_like):
             return
         if not isinstance(result, torch.Tensor) or result.layout != torch.strided:
             return
@@ -851,6 +863,10 @@ class CompileEnvironment:
         }
         if result_storage in argument_storages:
             return
+        if initialized:
+            self.fresh_initialized_storages.add(result_storage)
+            return
+        self.fresh_allocation_storages.add(result_storage)
         is_exact = False
         if factory is torch.empty:
             is_exact = True

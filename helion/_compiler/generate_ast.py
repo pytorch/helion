@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from torch.fx.node import Node
 
     from .cute.bounded_cache_codegen import BoundedCacheRequest
+    from .cute.native_matmul_metadata import MatmulLayouts
     from .device_ir import GraphInfo
     from .host_function import HostFunction
     from .pallas.compact_worklist import ResidentPrepHoist
@@ -133,6 +134,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.cute_wrapper_plans: list[dict[str, object]] = []
         self._cute_uses_matmul: bool = False
         self._cute_matmul_declaration_count = 0
+        self.cute_matmul_layouts: MatmulLayouts | None = None
         self.statements_stack: list[list[ast.AST]] = [self.host_statements]
         self.on_device = False
         self.active_device_loops: dict[int, list[DeviceLoopOrGridState]] = (
@@ -240,6 +242,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 in {
                     "helion_small_biased_attention",
                     "helion_flash",
+                    "chunk_prefill_sm100",
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
@@ -272,6 +275,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         and isinstance(target := assignment.targets[0], ast.Name)
                     ):
                         self.device_function.dce_vars.append(target.id)
+
+    def record_cute_matmul_layout(self) -> None:
+        from .cute.native_matmul_metadata import record_unknown
+
+        record_unknown(self)
 
     def get_graph(self, graph_id: int) -> GraphInfo:
         return self.codegen_graphs[graph_id]
@@ -454,6 +462,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self._clear_attention_flash_state()
         raise exc.BackendUnsupported("cute", "flash attention failed late validation")
 
+    def _try_codegen_chained_matmul_root(self) -> bool:
+        if self.device_function.cute_state.chained_matmul_plan is None:
+            return False
+        from .cute.chained_matmul import codegen_chained_matmul
+
+        if codegen_chained_matmul(self):
+            return True
+        self.device_function.cute_state.chained_matmul_plan = None
+        raise exc.BackendUnsupported("cute", "chained matmul failed late validation")
+
     def _try_codegen_single_token_rank1_root(self) -> bool:
         plan = self.device_function.cute_state.single_token_rank1_plan
         if plan is None:
@@ -498,6 +516,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         raise exc.BackendUnsupported(
             "cute", "fixed-token rank-1 recurrence failed late validation"
         )
+
+    def _try_codegen_chunk_prefill_root(self) -> bool:
+        from .cute.chunk_prefill import codegen_chunk_prefill
+
+        return codegen_chunk_prefill(self)
 
     def _try_codegen_chunk_prepare_root(self) -> bool:
         plan = self.device_function.cute_state.chunk_prepare_plan
@@ -1289,25 +1312,33 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             self.host_statements = prior
 
     @contextlib.contextmanager
+    def bind_device_loop(self, device_loop: DeviceLoopState) -> Iterator[None]:
+        """Make assigned loop coordinates available independently of emission."""
+        for idx in device_loop.block_ids:
+            active_loops = self.active_device_loops[idx]
+            active_loops.append(device_loop)
+            if len(active_loops) > 1:
+                raise exc.NestedDeviceLoopsConflict
+        self._record_active_thread_axis_sizes()
+        self._record_statement_thread_references(device_loop.inner_statements)
+        try:
+            yield
+        finally:
+            for idx in device_loop.block_ids:
+                self.active_device_loops[idx].pop()
+
+    @contextlib.contextmanager
     def add_device_loop(
         self,
         device_loop: DeviceLoopState,
         *,
         needs_barrier_before: bool = False,
     ) -> Iterator[None]:
-        with self.set_statements(device_loop.inner_statements):
-            for idx in device_loop.block_ids:
-                active_loops = self.active_device_loops[idx]
-                active_loops.append(device_loop)
-                if len(active_loops) > 1:
-                    raise exc.NestedDeviceLoopsConflict
-            self._record_active_thread_axis_sizes()
-            self._record_statement_thread_references(device_loop.inner_statements)
-            try:
-                yield
-            finally:
-                for idx in device_loop.block_ids:
-                    self.active_device_loops[idx].pop()
+        with (
+            self.set_statements(device_loop.inner_statements),
+            self.bind_device_loop(device_loop),
+        ):
+            yield
         if needs_barrier_before:
             for statement in self.device_function.cta_barrier():
                 self.add_statement(statement)
@@ -1407,6 +1438,34 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # pyrefly: ignore[bad-return, bad-argument-type]
         return node.new(fields)
 
+    def _try_codegen_positional_root(self) -> bool:
+        plan = self.device_function.cute_state.positional_root_plan
+        if plan is None:
+            return False
+        root = self.current_root_graph_info
+        if root is None or root.graph_id != plan.root_graph_id:
+            raise exc.BackendUnsupported(
+                "cute", "positional root plan does not own the emitted root"
+            )
+        from .cute.positional_root import codegen_positional_root
+
+        codegen_positional_root(self, plan)
+        return True
+
+    def _try_codegen_tile_loop_root(self) -> bool:
+        if CompileEnvironment.current().backend_name != "cute":
+            return False
+        from .cute.loop_state import codegen_root
+        from .device_ir import RootGraphInfo
+
+        grid = self.current_grid_state
+        root = self.current_root_graph_info
+        return (
+            isinstance(grid, DeviceGridState)
+            and isinstance(root, RootGraphInfo)
+            and codegen_root(self, root, grid)
+        )
+
     def visit_For(self, node: ast.For) -> ast.AST | None:
         assert isinstance(node, ExtendedAST)
         if node._loop_type == LoopType.GRID:
@@ -1494,12 +1553,16 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     root = root_graph_info.graph
                     if (
                         not self._try_codegen_block_scaled_root()
+                        and not self._try_codegen_chunk_prefill_root()
+                        and not self._try_codegen_chained_matmul_root()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
                         and not self._try_codegen_attention_flash_root()
+                        and not self._try_codegen_positional_root()
+                        and not self._try_codegen_tile_loop_root()
                     ):
                         grid_state = self.current_grid_state
                         if isinstance(grid_state, DeviceGridState):
@@ -1509,6 +1572,15 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             wrapped_body: list[ast.AST] = []
                             with self.set_statements(wrapped_body):
                                 codegen_call_with_graph(self, root, [])
+                            if (
+                                self.device_function.config.get("cute_grid_work_order")
+                                is not None
+                            ):
+                                from .cute.work_order import install_ordinary_work_order
+
+                                self.statements_stack[-1].extend(
+                                    install_ordinary_work_order(self)
+                                )
                             if self._try_lower_direct_affine_root(
                                 grid_state, wrapped_body
                             ):
@@ -2283,7 +2355,19 @@ def generate_ast(
                 *rng_statements,
                 *codegen.host_statements,
             ]
-            if not codegen._cute_can_bake_tensor_shapes():
+            from .cute.native_matmul_metadata import validate_native_metadata
+
+            if validate_native_metadata(codegen):
+                final_host_statements = [
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = False"
+                    ),
+                    statement_from_string(
+                        f"{codegen.device_function.name}._helion_cute_native_metadata_specialization = True"
+                    ),
+                    *final_host_statements,
+                ]
+            elif not codegen._cute_can_bake_tensor_shapes():
                 final_host_statements = [
                     statement_from_string(
                         f"{codegen.device_function.name}._helion_cute_disable_bake_tensor_shapes = True"
@@ -2320,6 +2404,7 @@ def generate_ast(
                     # device function's sorted-arg ordering so the runtime
                     # launcher can identify the tensor args.
                     for key in (
+                        "source_name",
                         "lhs_name",
                         "rhs_name",
                         "lhs_scale_name",
@@ -2345,6 +2430,9 @@ def generate_ast(
                         "o_name",
                         "out_name",
                         "state_name",
+                        "initial_state_name",
+                        "final_state_name",
+                        "gate_scale_name",
                         "do_name",
                         "delta_name",
                         "dq_name",
@@ -2373,6 +2461,11 @@ def generate_ast(
                                 resolved[key[:-5] + "_bind_idx"] = host_arg_positions[
                                     arg_name
                                 ]
+                    if "write_names" in resolved:
+                        resolved["write_indices"] = [
+                            launcher_arg_positions[name]
+                            for name in cast("list[str]", resolved.pop("write_names"))
+                        ]
                     resolved_plans.append(resolved)
                 return resolved_plans
 
@@ -2388,6 +2481,19 @@ def generate_ast(
                         f"{codegen.device_function.name}._helion_cute_wrapper_plans = {resolved_wrapper_plans!r}"
                     )
                 )
+                epoch_names = [
+                    plan["epoch_kernel"]
+                    for plan in resolved_wrapper_plans
+                    if "epoch_kernel" in plan
+                ]
+                if epoch_names:
+                    assert len(epoch_names) == len(resolved_wrapper_plans) == 1
+                    assert epoch_names == ["_helion_epoch_kernel"]
+                    post_kernel_metadata_statements.append(
+                        statement_from_string(
+                            f"{codegen.device_function.name}._helion_cute_epoch_kernel = _helion_epoch_kernel"
+                        )
+                    )
             if codegen.device_function.cute_state.cluster_shape is not None:
                 post_kernel_metadata_statements.append(
                     statement_from_string(

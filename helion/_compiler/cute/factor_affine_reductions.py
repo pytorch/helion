@@ -1504,16 +1504,21 @@ def _single_use_product(
     expression: ast.expr,
     definitions: dict[str, ast.expr],
     reads: dict[str, int],
-) -> tuple[str | None, ast.BinOp] | None:
+) -> tuple[str | None, ast.BinOp, frozenset[str]] | None:
     expression = _unwrap_fp32(expression)
     if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Mult):
-        return None, expression
-    if not isinstance(expression, ast.Name) or reads.get(expression.id) != 1:
-        return None
-    definition = _unwrap_fp32(definitions.get(expression.id, expression))
-    if not isinstance(definition, ast.BinOp) or not isinstance(definition.op, ast.Mult):
-        return None
-    return expression.id, definition
+        return None, expression, frozenset()
+    aliases: set[str] = set()
+    while isinstance(expression, ast.Name):
+        name = expression.id
+        if name in aliases or reads.get(name) != 1:
+            return None
+        definition = _unwrap_fp32(definitions.get(name, expression))
+        if isinstance(definition, ast.BinOp) and isinstance(definition.op, ast.Mult):
+            return name, definition, frozenset(aliases)
+        aliases.add(name)
+        expression = definition
+    return None
 
 
 class _InlineSingleUseProducts(ast.NodeTransformer):
@@ -1565,7 +1570,7 @@ class _InlineSingleUseProducts(ast.NodeTransformer):
 
 
 def _prepare_packed_product(
-    matched: tuple[str | None, ast.BinOp],
+    matched: tuple[str | None, ast.BinOp, frozenset[str]],
     *,
     definitions: dict[str, ast.expr],
     reads: dict[str, int],
@@ -1573,7 +1578,7 @@ def _prepare_packed_product(
     fp32_rmem: set[str],
     fp32_names: set[str],
 ) -> tuple[ast.BinOp, set[str]]:
-    name, product = matched
+    name, product, aliases = matched
     inliner = _InlineSingleUseProducts(
         definitions,
         reads,
@@ -1585,7 +1590,7 @@ def _prepare_packed_product(
         "ast.BinOp",
         inliner.visit(cast("ast.BinOp", _clone_extended_ast(product))),
     )
-    skipped = set(inliner.inlined)
+    skipped = set(inliner.inlined) | set(aliases)
     if name is not None:
         skipped.add(name)
     return prepared, skipped
@@ -1698,6 +1703,8 @@ def _pair_arithmetic_assignment(
     function = (
         "cute.arch.mul_packed_f32x2"
         if isinstance(expression.op, ast.Mult)
+        else "cute.arch.sub_packed_f32x2"
+        if isinstance(expression.op, ast.Sub)
         else "cute.arch.add_packed_f32x2"
     )
     return _packed_pair_assignment(
@@ -1868,7 +1875,7 @@ def _pair_constexpr_loop(
         expression = _unwrap_fp32(definitions.get(name, ast.Name(id=name)))
         if (
             not isinstance(expression, ast.BinOp)
-            or not isinstance(expression.op, ast.Add)
+            or not isinstance(expression.op, (ast.Add, ast.Sub))
             or not _is_fp32_expression(expression, definitions, fp32_rmem, fp32_names)
         ):
             continue
@@ -1891,6 +1898,15 @@ def _pair_constexpr_loop(
                     fp32_rmem=fp32_rmem,
                     fp32_names=fp32_names,
                 )
+                if isinstance(expression.op, ast.Sub):
+                    if operand is expression.right:
+                        prepared = ast.BinOp(
+                            left=prepared.left,
+                            op=ast.Mult(),
+                            right=ast.UnaryOp(op=ast.USub(), operand=prepared.right),
+                        )
+                    else:
+                        other = ast.UnaryOp(op=ast.USub(), operand=other)
                 candidates.append((len(skipped), prepared, other, skipped))
         if candidates:
             best = candidates[0]
@@ -1995,7 +2011,7 @@ def _pair_constexpr_loop(
             if (
                 assigned in value_dependencies - index_dependencies
                 and isinstance(expression, ast.BinOp)
-                and isinstance(expression.op, (ast.Add, ast.Mult))
+                and isinstance(expression.op, (ast.Add, ast.Sub, ast.Mult))
                 and _is_fp32_expression(expression, definitions, fp32_rmem, fp32_names)
             ):
                 result.append(

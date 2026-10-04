@@ -116,6 +116,9 @@ class _CoordinateCodegen:
     def codegen_result_for_node(self, node: torch.fx.Node) -> tuple[bool, object]:
         return (node in self.results), self.results.get(node)
 
+    def statements_owned_by_node(self, node: torch.fx.Node) -> list[object]:
+        return []
+
 
 def _coordinate_case() -> tuple[Any, Any, torch.fx.Node, torch.fx.Node]:
     graph = torch.fx.Graph()
@@ -197,6 +200,7 @@ def _axis_source_case(*, free_feature: bool = False) -> tuple[Any, Any, Any, Any
         )
     codegen = SimpleNamespace(
         device_function=device_function,
+        statements_owned_by_node=lambda node: [],
         cute_synthetic_arange_axis_sizes={0: 32} if free_feature else {},
         codegen_result_for_node=lambda node: (
             True,
@@ -214,6 +218,34 @@ def _axis_source_case(*, free_feature: bool = False) -> tuple[Any, Any, Any, Any
         size_hint=int,
     )
     return candidate, codegen, grid, env
+
+
+@pytest.mark.parametrize(
+    ("expression", "accepted"),
+    (
+        ("ordinary_feature - 0", True),
+        ("ordinary_feature + 0", True),
+        ("ordinary_feature + 0.0", False),
+        ("ordinary_feature - 1", False),
+        ("opaque(ordinary_feature)", False),
+    ),
+)
+def test_generated_feature_alias_requires_exact_identity(
+    expression: str, accepted: bool
+) -> None:
+    source = torch.fx.Graph().placeholder("source")
+    codegen = SimpleNamespace(
+        codegen_result_for_node=lambda node: (True, _expression("feature")),
+        statements_owned_by_node=lambda node: [
+            (0, _statements(f"feature = {expression}")[0])
+        ],
+    )
+    assert (
+        lowering._generated_axis_is_identity(
+            cast("Any", codegen), source, "ordinary_feature"
+        )
+        is accepted
+    )
 
 
 def test_axis_sources_are_derived_by_access_identity_not_names() -> None:

@@ -22,6 +22,10 @@ LoadCacheModifierLiteral = Literal["", ".cg"]
 StoreCacheModifierLiteral = Literal["", ".cs", ".wt"]
 CuteAsyncLoadCacheLiteral = Literal["cg", "ca"]
 CuteAsyncStorePolicyLiteral = Literal["default", "l2_evict_last"]
+CuteStateTransferMaxBitsLiteral = Literal[256, 128]
+CuteStateTransferTransportLiteral = Literal[
+    "register", "tma", "tma_pipelined", "tma_planar"
+]
 CuteAffineScanScheduleLiteral = Literal[
     "ordinary",
     "direct_m16n8_v1",
@@ -62,6 +66,8 @@ class Config(Mapping[str, object]):
         cute_async_load_group_rows: int | None = None,
         cute_async_load_cache: CuteAsyncLoadCacheLiteral | None = None,
         cute_async_store_policy: CuteAsyncStorePolicyLiteral | None = None,
+        cute_state_transfer_max_bits: CuteStateTransferMaxBitsLiteral | None = None,
+        cute_state_transfer_transport: CuteStateTransferTransportLiteral | None = None,
         cute_bf16x2_recurrence: bool | None = None,
         cute_signed_bitfield_bf16: bool | None = None,
         cute_proven_bounds: bool | None = None,
@@ -118,6 +124,14 @@ class Config(Mapping[str, object]):
             cute_async_load_cache: PTX cp.async cache policy ("cg" or "ca").
             cute_async_store_policy: Cache policy for the matching in-place
                 16-byte state store ("default" or "l2_evict_last").
+            cute_state_transfer_max_bits: Maximum external-state transfer width
+                for a bound CuTe state ABI: 256 (default) or 128 bits. Alignment
+                and validity checks may still select narrower transfers.
+            cute_state_transfer_transport: Initialization transport for a bound
+                CuTe state ABI: "register" (default), "tma", "tma_pipelined", or
+                "tma_planar" (two raw32 planes per transfer).
+                TMA requires a
+                compatible state graph and shared-memory binding.
             cute_bf16x2_recurrence: Pack a structurally proven BF16 rank-one
                 recurrence into native BF16x2 operations.
             cute_signed_bitfield_bf16: Convert proved signed byte fields to BF16
@@ -213,6 +227,8 @@ class Config(Mapping[str, object]):
             "cute_async_load_group_rows": cute_async_load_group_rows,
             "cute_async_load_cache": cute_async_load_cache,
             "cute_async_store_policy": cute_async_store_policy,
+            "cute_state_transfer_max_bits": cute_state_transfer_max_bits,
+            "cute_state_transfer_transport": cute_state_transfer_transport,
             "cute_bf16x2_recurrence": cute_bf16x2_recurrence,
             "cute_signed_bitfield_bf16": cute_signed_bitfield_bf16,
             "cute_proven_bounds": cute_proven_bounds,
@@ -486,6 +502,20 @@ class Config(Mapping[str, object]):
         return cast(
             "CuteAsyncStorePolicyLiteral",
             self.config.get("cute_async_store_policy", "default"),
+        )
+
+    @property
+    def cute_state_transfer_max_bits(self) -> CuteStateTransferMaxBitsLiteral:
+        return cast(
+            "CuteStateTransferMaxBitsLiteral",
+            self.config.get("cute_state_transfer_max_bits", 256),
+        )
+
+    @property
+    def cute_state_transfer_transport(self) -> CuteStateTransferTransportLiteral:
+        return cast(
+            "CuteStateTransferTransportLiteral",
+            self.config.get("cute_state_transfer_transport", "register"),
         )
 
     @property

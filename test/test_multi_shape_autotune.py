@@ -40,6 +40,7 @@ from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.llm_seeded_lfbo import LLMSeededSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.metrics import AutotuneMetrics
+from helion.autotuner.search_timing import validate_timing_policy
 import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.kernel import Kernel
@@ -278,6 +279,7 @@ def _runtime_settings(**overrides: object) -> SimpleNamespace:
         "autotune_baseline_fn": None,
         "autotune_baseline_accuracy_check_fn": None,
         "autotune_benchmark_fn": None,
+        "autotune_timing_method": "default",
         "autotune_config_filter": None,
         "autotune_config_overrides": {},
         "autotune_search_acf": [],
@@ -320,7 +322,9 @@ class TestMultiShapeRuntime(unittest.TestCase):
             workload_key=workload_key,
         )
         cache.autotuner = SimpleNamespace(  # pyrefly: ignore [bad-assignment]
-            settings=settings
+            settings=settings,
+            timing_policy=None,
+            _validate_timing_policy=Mock(return_value=None),
         )
 
         key = cache._generate_key()
@@ -1413,6 +1417,8 @@ class TestMultiShapeCacheBoundary(unittest.TestCase):
             log=Mock(),
             config_spec=_make_config_spec(),
             settings=SimpleNamespace(autotune_log=None),
+            timing_policy=None,
+            _validate_timing_policy=Mock(return_value=None),
         )
         cache._run_autotune_trials = Mock(  # type: ignore[method-assign]
             return_value=Config(block_size=64)
@@ -1461,14 +1467,20 @@ class TestMultiShapeBestOfK(unittest.TestCase):
     def _make_cache(
         outcomes: list[tuple[Config, float] | type[exc.NoConfigFound]],
     ) -> LocalAutotuneCache:
-        settings = SimpleNamespace(
+        settings = Settings(
             autotune_best_of_k=len(outcomes),
+            autotune_timing_method="default",
             autotune_random_seed=20,
             autotune_compile_timeout=60,
         )
         outcome_iter = iter(outcomes)
 
         class _Search:
+            timing_policy = None
+
+            def _validate_timing_policy(self) -> None:
+                validate_timing_policy(self.timing_policy, None, self.settings)
+
             def __init__(self) -> None:
                 self.settings = settings
                 self.log = _TrialLog()

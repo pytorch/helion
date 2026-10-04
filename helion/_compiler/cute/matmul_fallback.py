@@ -587,7 +587,7 @@ def _emit_cute_matmul_n_collapse(
 
     assert isinstance(cg, GenerateAST)
     if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+        cg.record_cute_matmul_layout()
 
     reduction_dtype: torch.dtype | None = acc_dtype
     if (
@@ -754,7 +754,7 @@ def _emit_cute_matmul(
 ) -> ast.AST:
     """Build a CuTe matmul fallback using a cross-thread reduction over K."""
     if hasattr(cg, "cute_uses_matmul"):
-        cg.cute_uses_matmul = True  # type: ignore[attr-defined]
+        cg.record_cute_matmul_layout()  # type: ignore[attr-defined]
     reduction_dtype: torch.dtype | None = acc_dtype or out_dtype
     lhs_terms: tuple[ast.AST, ...]
     if isinstance(lhs, (CutePackedAffineLoad, CutePackedTerms)):

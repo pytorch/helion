@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 from typing import AbstractSet
 from typing import cast
 
-from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .direct_affine_plan import DirectAffineMma
 from .direct_affine_plan import DirectAffinePhaseOrder
 from .direct_affine_plan import DirectAffinePlan
@@ -33,18 +32,22 @@ from .direct_affine_replay_core import DirectAffineStepReplay
 from .direct_affine_replay_core import DirectAffineValueReplay
 from .direct_affine_replay_core import _ast_identity_set
 from .direct_affine_replay_core import _AsyncStateEmission
-from .direct_affine_replay_core import _bound_names
 from .direct_affine_replay_core import _clone_ast
 from .direct_affine_replay_core import _dump
 from .direct_affine_replay_core import _instantiate_bound_nodes
-from .direct_affine_replay_core import _qualified_name
 from .direct_affine_replay_core import _result_snapshots_are_intact
 from .direct_affine_replay_core import instantiate_direct_affine_value
 from .direct_affine_replay_core import resolve_direct_affine_coordinates
-from .direct_affine_templates import _has_lane_reduce_marker
 from .direct_affine_templates import _template_components
 from .direct_affine_templates import _validate_direct_affine_templates
 from .direct_affine_templates import resolve_direct_affine_templates
+from .producer_phase import LaneProducer
+from .producer_phase import PointStore
+from .producer_phase import PointValue
+from .producer_phase import emit_producer_phase
+from .producer_phase import split_producer_reductions
+from .warp_specialized_plan import SharedBufferRequest
+from .warp_specialized_plan import allocate_shared_regions
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -106,10 +109,6 @@ def _store(pointer: ast.expr, index: ast.expr, value: ast.expr) -> ast.Expr:
     return ast.Expr(value=_call(_attr(address, "store"), value))
 
 
-def _align(value: int, alignment: int = _SMEM_ALIGNMENT) -> int:
-    return (value + alignment - 1) // alignment * alignment
-
-
 def _shared_layout(
     plan: DirectAffinePlan, prefix: str
 ) -> tuple[tuple[DirectAffineSharedBuffer, ...], int]:
@@ -125,21 +124,24 @@ def _shared_layout(
         ("update_scale", "Float32", plan.step_count, 4),
         ("residual", "Float32", plan.step_count * plan.row_extent, 4),
     )
-    offset = 0
-    buffers: list[DirectAffineSharedBuffer] = []
-    for role, dtype_name, count, item_size in sizes:
-        offset = _align(offset)
-        buffers.append(
-            DirectAffineSharedBuffer(
-                role=role,
-                name=f"{prefix}_{role}",
-                dtype_name=dtype_name,
-                element_count=count,
-                byte_offset=offset,
-            )
+    layout = allocate_shared_regions(
+        tuple(
+            SharedBufferRequest(role, count * item_size, _SMEM_ALIGNMENT)
+            for role, _dtype_name, count, item_size in sizes
+        ),
+        final_alignment=_SMEM_ALIGNMENT,
+    )
+    buffers = tuple(
+        DirectAffineSharedBuffer(
+            role=role,
+            name=f"{prefix}_{role}",
+            dtype_name=dtype_name,
+            element_count=count,
+            byte_offset=layout.region(role).byte_offset,
         )
-        offset += count * item_size
-    return tuple(buffers), _align(offset)
+        for role, dtype_name, count, _item_size in sizes
+    )
+    return buffers, layout.allocated_bytes
 
 
 def _buffer_setup(
@@ -469,7 +471,7 @@ def _emit_async_state_materialization(
     )
 
 
-def _materialized_vector(
+def _coefficient_point(
     replay: DirectAffineValueReplay,
     *,
     step: int,
@@ -480,7 +482,7 @@ def _materialized_vector(
     feature_extent: int,
     prefix: str,
     reserved_names: AbstractSet[str],
-) -> tuple[ast.stmt, ...] | None:
+) -> PointValue | None:
     instantiated = instantiate_direct_affine_value(
         replay,
         row=global_row_zero,
@@ -497,12 +499,13 @@ def _materialized_vector(
         ast.Constant(value=step * feature_extent),
         _clone_ast(feature),
     )
-    return (
-        *statements,
-        _store(
-            _pointer(destination.name),
-            index,
-            _call(_qualified("cutlass.Float32"), value),
+    return PointValue(
+        statements,
+        value,
+        PointStore(
+            _add(_pointer(destination.name), _cast_i32(index)),
+            pointer=True,
+            cast_to=_qualified("cutlass.Float32"),
         ),
     )
 
@@ -515,82 +518,14 @@ def _split_feature_reduction_loop(
     *,
     source_lane: str | None = None,
 ) -> tuple[ast.stmt, ...] | None:
-    """Finalize captured feature reductions before their vector consumers."""
-
-    from ... import exc
-    from ..tile_strategy import _find_lane_reduce_call
-    from ..tile_strategy import _is_lane_reduce_marker_assign
-    from ..tile_strategy import split_lane_loop_reductions
-
-    loop = _clone_ast(loop)
-    if source_lane is not None:
-        destination_lane = getattr(loop, HELION_LANE_LOOP_VAR_ATTR, None)
-        if not isinstance(destination_lane, str):
-            return None
-        # The validated replay replaces the complete ordinary feature axis.
-        # Its owner is a marker string, not an expression substitution; rebind
-        # exactly that proved owner on this detached materialization loop.
-        for statement in loop.body:
-            marker = _is_lane_reduce_marker_assign(statement)
-            if marker is None or marker.owner_lane is None:
-                continue
-            if marker.owner_lane != source_lane:
-                return None
-            call = _find_lane_reduce_call(statement)
-            assert call is not None
-            call.args[9] = ast.copy_location(
-                ast.Constant(value=destination_lane), call.args[9]
-            )
-    markers = tuple(
-        marker
-        for statement in loop.body
-        if (marker := _is_lane_reduce_marker_assign(statement)) is not None
+    """Compatibility entry point for the shared typed marker finalization."""
+    return split_producer_reductions(
+        loop,
+        frozenset(buffer.name for buffer in buffers.values()),
+        lane_name,
+        reserved_names,
+        source_lane=source_lane,
     )
-    tensor_names = {
-        node.value.id
-        for node in ast.walk(loop)
-        if isinstance(node, ast.Attribute)
-        and node.attr == "iterator"
-        and isinstance(node.value, ast.Name)
-    }
-    shared_names = {buffer.name for buffer in buffers.values()}
-    disjoint_pairs = {
-        frozenset((shared, other))
-        for shared in shared_names
-        for other in tensor_names
-        if shared != other
-    }
-    try:
-        result = split_lane_loop_reductions(
-            [ast.fix_missing_locations(loop)],
-            proven_disjoint_tensor_pairs=disjoint_pairs,
-            thread_axis_names={lane_name: frozenset((0,))},
-        )
-    except exc.BackendUnsupported:
-        return None
-    detached = tuple(_clone_ast(statement) for statement in result)
-    original_bound = _bound_names(cast("tuple[ast.stmt, ...]", tuple(loop.body)))
-    result_bound = _bound_names(cast("tuple[ast.stmt, ...]", detached))
-    if (result_bound - original_bound).intersection(reserved_names):
-        return None
-    expected_reductions: dict[str, int] = {}
-    for marker in markers:
-        expected_reductions[marker.reduction_type] = (
-            expected_reductions.get(marker.reduction_type, 0) + 1
-        )
-    actual_reductions: dict[str, int] = {}
-    for statement in detached:
-        for node in ast.walk(statement):
-            if not isinstance(node, ast.Call):
-                continue
-            name = _qualified_name(node.func)
-            prefix = "cute.arch.warp_reduction_"
-            if name is not None and name.startswith(prefix):
-                kind = name.removeprefix(prefix)
-                actual_reductions[kind] = actual_reductions.get(kind, 0) + 1
-    if _has_lane_reduce_marker(detached) or actual_reductions != expected_reductions:
-        return None
-    return cast("tuple[ast.stmt, ...]", detached)
 
 
 def _emit_coefficient_materialization(
@@ -612,16 +547,18 @@ def _emit_coefficient_materialization(
     )
     global_feature = _global_coordinate(coordinates.feature, local_feature)
     global_row_zero = _global_coordinate(coordinates.row, ast.Constant(value=0))
-    result: list[ast.stmt] = []
+    programs: list[LaneProducer] = []
     for step_index, step in enumerate(steps):
-        feature_body: list[ast.stmt] = []
+        values: list[PointValue] = []
         for role, value_replay in (
             ("diagonal", step.diagonal),
             ("prediction", step.prediction_vector),
             ("update", step.update_vector),
             ("observation", step.observation_vector),
         ):
-            materialized = _materialized_vector(
+            if value_replay is None:
+                continue
+            materialized = _coefficient_point(
                 value_replay,
                 step=step_index,
                 feature=local_feature,
@@ -634,7 +571,7 @@ def _emit_coefficient_materialization(
             )
             if materialized is None:
                 return None
-            feature_body.extend(materialized)
+            values.append(materialized)
         scale = instantiate_direct_affine_value(
             step.update_scale,
             row=_clone_ast(global_row_zero),
@@ -647,54 +584,91 @@ def _emit_coefficient_materialization(
         if scale is None:
             return None
         scale_statements, scale_value = scale
-        feature_loop = ast.For(
-            target=_name(element_name, ast.Store()),
-            iter=_call(_qualified("cutlass.range_constexpr"), ast.Constant(value=4)),
-            body=feature_body,
-            orelse=[],
-        )
-        setattr(feature_loop, HELION_LANE_LOOP_VAR_ATTR, element_name)
-        split_feature_loop = _split_feature_reduction_loop(
-            feature_loop,
-            buffers,
-            lane_name,
-            reserved_names,
-            source_lane=coordinates.feature.lane_name,
-        )
-        if split_feature_loop is None:
-            return None
-        guarded_body: list[ast.stmt] = [
-            *split_feature_loop,
-            *scale_statements,
-            ast.If(
-                test=ast.Compare(
-                    left=_name(lane_name),
-                    ops=[ast.Eq()],
-                    comparators=[ast.Constant(value=0)],
-                ),
-                body=[
-                    _store(
-                        _pointer(buffers["update_scale"].name),
-                        ast.Constant(value=step_index),
-                        _call(_qualified("cutlass.Float32"), scale_value),
-                    )
-                ],
-                orelse=[],
-            ),
-        ]
-        result.append(
-            ast.If(
-                test=ast.Compare(
+        programs.append(
+            LaneProducer(
+                owner=ast.Compare(
                     left=_name(warp_name),
                     ops=[ast.Eq()],
                     comparators=[ast.Constant(value=step_index)],
                 ),
-                body=guarded_body,
-                orelse=[],
+                lane=lane_name,
+                element=element_name,
+                elements=4,
+                values=tuple(values),
+                scalars=(
+                    (
+                        ast.Compare(
+                            left=_name(lane_name),
+                            ops=[ast.Eq()],
+                            comparators=[ast.Constant(value=0)],
+                        ),
+                        PointValue(
+                            scale_statements,
+                            scale_value,
+                            PointStore(
+                                _add(
+                                    _pointer(buffers["update_scale"].name),
+                                    _cast_i32(ast.Constant(value=step_index)),
+                                ),
+                                pointer=True,
+                                cast_to=_qualified("cutlass.Float32"),
+                            ),
+                        ),
+                    ),
+                ),
+                shared_names=frozenset(buffer.name for buffer in buffers.values()),
+                reserved_names=frozenset(reserved_names),
+                source_lane=coordinates.feature.lane_name,
             )
         )
-    result.append(_sync_threads())
+    phase = emit_producer_phase(tuple(programs), _sync_threads())
+    if phase is None:
+        return None
+    result = list(phase)
     columns = plan.columns
+    precompute = _call(
+        _attr(_name(helper_alias), "precompute_affine_from_buffers_bf16"),
+        _pointer(buffers["prediction"].name),
+        _pointer(buffers["observation"].name),
+        _pointer(buffers["diagonal"].name),
+        _pointer(buffers["update"].name),
+        _pointer(buffers["update_scale"].name),
+        _pointer(buffers["factor"].name),
+        _pointer(buffers["coefficient"].name),
+        _name(lane_name),
+        _name(warp_name),
+        ast.Constant(value=plan.step_count),
+        ast.Constant(value=plan.feature_extent),
+        ast.Constant(value=columns.factor_column_extent),
+        ast.Constant(value=columns.factor_target_stride),
+        ast.Constant(value=columns.factor_role_stride),
+        ast.Constant(value=columns.coefficient_row_stride),
+        ast.Constant(value=columns.coefficient_source_stride),
+        ast.Constant(value=columns.coefficient_role_stride),
+    )
+    precompute_body: list[ast.stmt] = [ast.Expr(value=precompute)]
+    if any(step.prediction_vector is None for step in steps):
+        precompute_body = []
+        for step_index, step in enumerate(steps):
+            step_call = _clone_ast(precompute)
+            step_call.args[8] = ast.Constant(value=step_index)
+            step_call.keywords.append(
+                ast.keyword(
+                    arg="HAS_FEEDBACK",
+                    value=ast.Constant(value=step.prediction_vector is not None),
+                )
+            )
+            precompute_body.append(
+                ast.If(
+                    test=ast.Compare(
+                        left=_name(warp_name),
+                        ops=[ast.Eq()],
+                        comparators=[ast.Constant(value=step_index)],
+                    ),
+                    body=[ast.Expr(value=step_call)],
+                    orelse=[],
+                )
+            )
     result.extend(
         (
             ast.If(
@@ -703,33 +677,7 @@ def _emit_coefficient_materialization(
                     ops=[ast.Lt()],
                     comparators=[ast.Constant(value=plan.step_count)],
                 ),
-                body=[
-                    ast.Expr(
-                        value=_call(
-                            _attr(
-                                _name(helper_alias),
-                                "precompute_affine_from_buffers_bf16",
-                            ),
-                            _pointer(buffers["prediction"].name),
-                            _pointer(buffers["observation"].name),
-                            _pointer(buffers["diagonal"].name),
-                            _pointer(buffers["update"].name),
-                            _pointer(buffers["update_scale"].name),
-                            _pointer(buffers["factor"].name),
-                            _pointer(buffers["coefficient"].name),
-                            _name(lane_name),
-                            _name(warp_name),
-                            ast.Constant(value=plan.step_count),
-                            ast.Constant(value=plan.feature_extent),
-                            ast.Constant(value=columns.factor_column_extent),
-                            ast.Constant(value=columns.factor_target_stride),
-                            ast.Constant(value=columns.factor_role_stride),
-                            ast.Constant(value=columns.coefficient_row_stride),
-                            ast.Constant(value=columns.coefficient_source_stride),
-                            ast.Constant(value=columns.coefficient_role_stride),
-                        )
-                    )
-                ],
+                body=precompute_body,
                 orelse=[],
             ),
             _sync_threads(),
@@ -1093,6 +1041,21 @@ def _emit_consume(
             ),
         )
     )
+    if any(step.prediction_vector is None for step in steps):
+        consume_statement = cast("ast.Assign", body[-1])
+        consume_call = cast("ast.Call", consume_statement.value)
+        consume_call.keywords.append(
+            ast.keyword(
+                arg="FEEDBACK_MASK",
+                value=ast.Constant(
+                    value=sum(
+                        1 << index
+                        for index, step in enumerate(steps)
+                        if step.prediction_vector is not None
+                    )
+                ),
+            )
+        )
     for step_index, step in enumerate(steps):
         output = _emit_output_effects(
             step,

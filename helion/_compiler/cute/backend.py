@@ -1097,6 +1097,13 @@ class CuteBackend(Backend):
         from ..device_function import DeviceFunction
         from ..device_ir import RootGraphInfo
         from .block_scaled_mma import plan_block_scaled
+        from .chained_collectives import validate_scan_schedule
+        from .chained_matmul import plan_chained_matmul
+        from .chained_mma_selection import validate_warp_mma_selection
+        from .chained_pointwise_residency import validate_pointwise_cache
+        from .chained_preparation_pipeline import validate_preparation_pipeline
+        from .chained_scan_export import requests_scan_export
+        from .chunk_prefill import plan_chunk_prefill
         from .chunk_prepare import plan_chunk_prepare
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
@@ -1113,6 +1120,26 @@ class CuteBackend(Backend):
             config.cute_affine_scan_schedule != DIRECT_AFFINE_ORDINARY_SCHEDULE
         )
         if direct_affine_requested:
+            validate_preparation_pipeline(
+                None, config.config.get("cute_chained_preparation_pipeline", False)
+            )
+            validate_warp_mma_selection(
+                None, config.config.get("cute_chained_warp_mma_rows", 0)
+            )
+            validate_pointwise_cache(
+                None, config.config.get("cute_chained_pointwise_cache_bytes", 0)
+            )
+            validate_scan_schedule(
+                None, config.config.get("cute_chained_scan_schedule", "serial")
+            )
+            if (
+                config.config.get("cute_chained_scratch_layout", "row_major")
+                != "row_major"
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "XOR scratch layout requires the common contraction lowering",
+                )
             direct_affine_candidates = discover_direct_affine_candidates(graphs)
             device_function.cute_state.direct_affine_candidates = (
                 direct_affine_candidates
@@ -1141,9 +1168,126 @@ class CuteBackend(Backend):
         plan_block_scaled(graphs)
         if DeviceFunction.current().cute_state.block_scaled_plan is not None:
             return
+        if not config.config.get(
+            "cute_chained_group_contractions"
+        ) and not config.config.get("cute_chained_preparation_pipeline"):
+            plan_chunk_prefill()
+        if DeviceFunction.current().cute_state.chunk_prefill_plan is not None:
+            validate_preparation_pipeline(
+                None, config.config.get("cute_chained_preparation_pipeline", False)
+            )
+            validate_warp_mma_selection(
+                None, config.config.get("cute_chained_warp_mma_rows", 0)
+            )
+            validate_pointwise_cache(
+                None, config.config.get("cute_chained_pointwise_cache_bytes", 0)
+            )
+            validate_scan_schedule(
+                None, config.config.get("cute_chained_scan_schedule", "serial")
+            )
+            if (
+                config.config.get("cute_chained_scratch_layout", "row_major")
+                != "row_major"
+            ):
+                raise exc.BackendUnsupported(
+                    "cute",
+                    "XOR scratch layout requires the explicit shared prefill family",
+                )
+            return
+        chained_plan = plan_chained_matmul(graphs)
+        device_function.cute_state.chained_matmul_plan = chained_plan
+        if (
+            config.config.get("cute_chained_fragment_epilogues") is True
+            and chained_plan is None
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "fragment epilogues require an admitted common region"
+            )
+        if (
+            config.num_warps == 20
+            or config.config.get("cute_chained_compact_preparation") is True
+            or config.config.get("cute_chained_leaf_issue_batching") is True
+            or config.config.get("cute_chained_broadcast_retention") is True
+            or config.config.get("cute_chained_island_consumers") is True
+            or config.config.get("cute_chained_completed_member_store") is True
+        ) and (
+            chained_plan is None
+            or chained_plan.loop is None
+            or chained_plan.preparation_pipeline is None
+        ):
+            # Generic SIMT layout rules assume power-of-two thread counts.
+            # A provisional compact request must never escape into that route.
+            raise exc.BackendUnsupported(
+                "cute", "compact preparation requires an admitted common loop pipeline"
+            )
+        validate_preparation_pipeline(
+            chained_plan, config.config.get("cute_chained_preparation_pipeline", False)
+        )
+        validate_warp_mma_selection(
+            chained_plan, config.config.get("cute_chained_warp_mma_rows", 0)
+        )
+        validate_pointwise_cache(
+            chained_plan, config.config.get("cute_chained_pointwise_cache_bytes", 0)
+        )
+        validate_scan_schedule(
+            chained_plan, config.config.get("cute_chained_scan_schedule", "serial")
+        )
+        if chained_plan is not None:
+            return
+        if config.config.get("cute_chained_scratch_layout", "row_major") != "row_major":
+            raise exc.BackendUnsupported(
+                "cute", "XOR scratch layout requires a supported contraction DAG"
+            )
+        if config.config.get("cute_chained_group_contractions"):
+            raise exc.BackendUnsupported(
+                "cute", "contraction grouping requires a supported resident DAG"
+            )
+        if config.config.get("cute_chained_leaf_pipeline", "legacy") != "legacy":
+            raise exc.BackendUnsupported(
+                "cute", "paired leaf pipeline requires a resident K128 pair"
+            )
+        if config.config.get("cute_chained_k_schedule", "full") != "full":
+            raise exc.BackendUnsupported(
+                "cute", "K64 scheduling requires a supported initialized K128 pair"
+            )
+        if config.config.get("cute_chained_direct_output"):
+            raise exc.BackendUnsupported(
+                "cute", "direct output requires a supported resident one-dot M64 plan"
+            )
+        if config.config.get("cute_chained_tmem_early_release"):
+            raise exc.BackendUnsupported(
+                "cute", "early TMEM release requires a supported resident chained plan"
+            )
+        if config.config.get("cute_chained_late_rhs_reuse"):
+            raise exc.BackendUnsupported(
+                "cute",
+                "late RHS reuse requires a supported initialized direct-RHS pair",
+            )
+        if config.config.get("cute_chained_initialized_accumulator"):
+            raise exc.BackendUnsupported(
+                "cute", "initialized accumulator requires a supported independent pair"
+            )
+        scan_export_requested = any(
+            requests_scan_export(tuple(graph.graph.nodes)) for graph in graphs
+        )
+        if (
+            scan_export_requested
+            and config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem"
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "unsupported chained scan export ownership or layout"
+            )
+        if config.config.get("cute_chained_mma_schedule") == "tcgen05_tmem":
+            raise exc.BackendUnsupported(
+                "cute", "tcgen05_tmem requires a supported full-tile contraction DAG"
+            )
         plan_chunk_prepare(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_prepare_plan is not None:
             return
+        if scan_export_requested:
+            raise exc.BackendUnsupported(
+                "cute", "unsupported chained scan export ownership or layout"
+            )
         plan_chunk_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
             return
@@ -1159,6 +1303,14 @@ class CuteBackend(Backend):
 
         plan_fixed_token_rank1_recurrence(graphs, tile_strategy)
         if device_function.cute_state.fixed_token_rank1_plan is not None:
+            return
+        # Ordinary layouts bind one coordinate per canonical block id. Preserve
+        # distinct tensor axes after the native whole-root routes decline.
+        from .positional_root import plan_positional_root
+
+        positional = plan_positional_root(graphs, device_function)
+        device_function.cute_state.positional_root_plan = positional
+        if positional is not None:
             return
         annotate_view_subtiles(graphs, config)
         plan_layouts(graphs, config, tile_strategy)
@@ -1182,9 +1334,27 @@ class CuteBackend(Backend):
                 "cute", "philox4 supports explicit uniform hl.rand only"
             )
 
+    def fake_subscript_shape(
+        self, tensor: torch.Tensor, index: list[object]
+    ) -> list[int | torch.SymInt]:
+        from ..backend import _validate_subscript_indices
+        from ..indexing_strategy import SubscriptIndexing
+
+        # Whole-root contraction DAGs evaluate resident kernel tensors at
+        # arbitrary coordinates. Other lowering paths still reject narrowing
+        # during code generation when they cannot preserve residency.
+        if not _validate_subscript_indices(index):
+            # Shape-only views must retain their existing dimensions. The
+            # general indexing path allocates reduction dimensions for slices,
+            # which changes symbolic axis identity and can leave dead host
+            # reduction-size bindings after a whole-root lowering.
+            return super().fake_subscript_shape(tensor, index)
+        return SubscriptIndexing.compute_shape(tensor, index)
+
     def supports_config_key(self, key: str) -> bool:
         if (
             key == "num_threads"
+            or key == "cute_grid_work_order"
             or key == "cute_vector_widths"
             or key == "cute_lane_layouts"
             or key == "cute_reduction_reloads"
@@ -1244,8 +1414,65 @@ class CuteBackend(Backend):
             )
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
+            or key == "cute_chunk_recurrence_pipeline"
             or key == "cute_chunk_prepare_schedule"
+            or key
+            in (
+                "cute_chunk_prefill_task_order",
+                "cute_chunk_prefill_schedule",
+                "cute_state_transfer_max_bits",
+                "cute_state_transfer_transport",
+            )
             or key == "cute_affine_scan_schedule"
+            or key == "cute_chained_mma_schedule"
+            or key == "cute_chained_warp_mma_rows"
+            or key == "cute_chained_preparation_pipeline"
+            or key == "cute_chained_pipeline_consumer_warps"
+            or key == "cute_chained_preparation_cohorts"
+            or key == "cute_chained_preparation_unroll"
+            or key == "cute_chained_register_islands"
+            or key == "cute_chained_leaf_count"
+            or key == "cute_chained_collective_retention"
+            or key == "cute_chained_operand_retention"
+            or key == "cute_chained_frontier_tile_columns"
+            or key == "cute_chained_native_vector_reads"
+            or key == "cute_chained_output_lease_snapshot"
+            or key == "cute_chained_scan_producer_retention"
+            or key == "cute_chained_frontier_stmatrix"
+            or key == "cute_chained_snapshot_tile_columns"
+            or key == "cute_chained_drain_tile_columns"
+            or key == "cute_chained_compact_preparation"
+            or key == "cute_chained_leaf_issue_batching"
+            or key == "cute_chained_broadcast_retention"
+            or key == "cute_chained_island_consumers"
+            or key == "cute_chained_fragment_epilogues"
+            or key == "cute_chained_completed_member_store"
+            or key == "cute_native_matmul_metadata"
+            or key == "cute_chained_group_contractions"
+            or key == "cute_chained_scratch_layout"
+            or key == "cute_chained_scan_schedule"
+            or key == "cute_chained_pointwise_cache_bytes"
+            or key == "cute_chained_pointwise_cache_entries"
+            or key == "cute_chained_pointwise_cache_nested"
+            or key == "cute_chained_pointwise_cache_layout"
+            or key == "cute_chained_seed_tile_columns"
+            or key == "cute_chained_pointwise_vectorize"
+            or key == "cute_chained_async_vector_store"
+            or key == "cute_chained_vector_group"
+            or key == "cute_chained_startup_transfer"
+            or key == "cute_chained_tmem_free"
+            or key == "cute_chained_pointwise_unroll"
+            or key == "cute_chained_pointwise_read_cache"
+            or key == "cute_chained_pointwise_inplace_async"
+            or key == "cute_loop_vectorize"
+            or key == "cute_loop_load_schedule"
+            or key == "cute_chained_initialized_accumulator"
+            or key == "cute_chained_late_rhs_reuse"
+            or key == "cute_chained_k_schedule"
+            or key == "cute_chained_leaf_pipeline"
+            or key == "cute_chained_tmem_early_release"
+            or key == "cute_chained_direct_output"
+            or key == "cute_chained_auxiliary_cache"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
             or key.startswith(
@@ -1429,7 +1656,12 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        return (
+            config_spec.cute_flash_search_enabled
+            or config_spec.cute_chunk_prepare_schedule is not None
+            or config_spec.cute_chunk_recurrence_dv_partitions is not None
+            or config_spec.cute_chained_matmul_search_enabled
+        )
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or
@@ -2235,6 +2467,13 @@ class CuteBackend(Backend):
         }
 
         def launcher_args_with_compile_options(block_arg: str) -> list[str]:
+            if (
+                config.get("cute_grid_work_order") is not None
+                or device_function.cute_state.work_order_plan is not None
+            ):
+                from .work_order import validate_work_order_launch
+
+                validate_work_order_launch(codegen, block_arg)
             launcher_args = [block_arg]
             compile_options: list[str] = []
             recurrence_register_cap = config.get(CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY)
@@ -2309,6 +2548,17 @@ class CuteBackend(Backend):
         # The single-token rank-1 path owns the complete physical body.  The
         # original B1 schedule uses 256 threads while its batched schedule uses
         # one warp; the structural plan proves which topology was emitted.
+        chained_plan = device_function.cute_state.chained_matmul_plan
+        if chained_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({chained_plan.threads}, 1, 1)"
+            )
+        positional_plan = device_function.cute_state.positional_root_plan
+        if positional_plan is not None:
+            check_thread_limit(positional_plan.threads, context="positional root")
+            return launcher_args_with_compile_options(
+                f"block=({positional_plan.threads}, 1, 1)"
+            )
         single_rank1_plan = device_function.cute_state.single_token_rank1_plan
         if single_rank1_plan is not None:
             return launcher_args_with_compile_options(
@@ -2332,6 +2582,8 @@ class CuteBackend(Backend):
 
         # The exact chunk-prepare and chunk-recurrence lowerings own their physical
         # launch topology rather than the carrier's logical tile axes.
+        if device_function.cute_state.chunk_prefill_plan is not None:
+            return launcher_args_with_compile_options("block=(512, 1, 1)")
         if device_function.cute_state.chunk_prepare_plan is not None:
             return launcher_args_with_compile_options("block=(128, 1, 1)")
         if device_function.cute_state.block_scaled_plan is not None:

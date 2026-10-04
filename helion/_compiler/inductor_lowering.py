@@ -119,16 +119,26 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
 def prepare_node_lowering(
     graph_lowering: GraphLowering,
     node: Node,
-) -> None:
+    *,
+    preserve_pointwise: bool = False,
+) -> tuple[PointwiseLowering, tuple[Node, ...]] | None:
+    if preserve_pointwise and (
+        is_api_func(node.target)
+        or node.target in aten_lowering_dispatch
+        or not isinstance(node.meta["val"], torch.Tensor)
+    ):
+        raise InductorLoweringError("expected an ordinary tensor pointwise lowering")
     if is_api_func(api := node.target):
         APIFuncLowering.normalize_args_kwargs(api, node)
         node.meta["lowering"] = APIFuncLowering(api)
-        return
+        return None
 
     backend_lowering = CompileEnvironment.current().backend.pre_inductor_lowering(node)
     if backend_lowering is not None:
+        if preserve_pointwise:
+            raise InductorLoweringError("expected an Inductor pointwise lowering")
         node.meta["lowering"] = backend_lowering
-        return
+        return None
 
     if node.target in aten_lowering_dispatch:
         if node.target in {
@@ -138,7 +148,7 @@ def prepare_node_lowering(
             pass
         else:
             node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
-            return
+            return None
 
     if isinstance(
         val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
@@ -146,7 +156,7 @@ def prepare_node_lowering(
         # SymBool's `_sympy_()` is a boolean rather than the Expr the field holds.
         # pyrefly: ignore [bad-argument-type]
         node.meta["lowering"] = SympyExprLowering(val._sympy_())
-        return
+        return None
 
     # Track arguments to reuse names for duplicates
     arg_to_name: dict[Node, str] = {}
@@ -228,6 +238,26 @@ def prepare_node_lowering(
             buffer_name_to_output_index[buffer.get_name()] = i
 
     new_buffers = graph_lowering.buffers[prior_buffers:]
+    if preserve_pointwise:
+        # The semantic graph is already bound. Return the same ordinary lowering
+        # and its used original inputs without stripping args or writing metadata.
+        if len(new_buffers) != 1:
+            raise InductorLoweringError("register view requires one pointwise buffer")
+        pointwise_buffer = new_buffers[0]
+        if not isinstance(pointwise_buffer, ComputedBuffer) or not isinstance(
+            pointwise_buffer.data, Pointwise
+        ):
+            raise InductorLoweringError("register view requires a pointwise buffer")
+        used_names = pointwise_buffer.get_read_names()
+        pairs = tuple(
+            (input_node, name)
+            for input_node, name in arg_to_name.items()
+            if name in used_names
+        )
+        pointwise_buffer.freeze_layout()
+        return PointwiseLowering(pointwise_buffer, [name for _, name in pairs]), tuple(
+            input_node for input_node, _ in pairs
+        )
     # pyrefly: ignore [unbound-name]
     assert buffer in new_buffers
     nodes = []
@@ -301,6 +331,22 @@ def prepare_node_lowering(
         if extra_deps:
             # Need to ensure that the last node depends on all output nodes to prevent DCE issues
             last_node.kwargs = {**last_node.kwargs, "_extra_deps": extra_deps}
+    return None
+
+
+def prepare_pointwise_view(node: Node) -> tuple[PointwiseLowering, tuple[Node, ...]]:
+    """Prepare original pointwise IR without changing the bound FX graph."""
+    with compile_lock:
+        graph_lowering = GraphLowering(
+            dummy_gm(),
+            shape_env=CompileEnvironment.current().shape_env,
+        )
+        with V.set_graph_handler(graph_lowering):
+            result = prepare_node_lowering(
+                graph_lowering, node, preserve_pointwise=True
+            )
+    assert result is not None
+    return result
 
 
 def strip_unused_inputs(
@@ -461,9 +507,22 @@ class InductorLowering(Lowering):
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class PointwiseCodegenPolicy:
+    """Explicit local numerical choices for a native register expression."""
+
+    reciprocal_ftz: str | None = None
+    sigmoid_tanh: bool = False
+    minmax_ftz: bool | None = None
+    minmax_propagate_nan: bool | None = None
+
+
 @contextlib.contextmanager
 def install_inductor_kernel_handlers(
-    cg: CodegenInterface, args: dict[str, ast.AST]
+    cg: CodegenInterface,
+    args: dict[str, ast.AST],
+    *,
+    policy: PointwiseCodegenPolicy | None = None,
 ) -> Iterator[None]:
     with (
         _patched_inductor_config(),
@@ -472,6 +531,7 @@ def install_inductor_kernel_handlers(
             GenerateASTFromInductor(
                 cg,
                 args,
+                policy=policy,
             )
         ),
         V.set_kernel_handler(
@@ -511,13 +571,17 @@ class PointwiseLowering(InductorLowering):
         ctx: LoweringContext,
         node: torch.fx.Node,
         input_asts: list[ast.AST],
+        *,
+        policy: PointwiseCodegenPolicy | None = None,
     ) -> object:
         """Lower this pointwise node with explicitly supplied tensor values."""
         # Validate broadcasting of tile block dimensions to catch shape mismatches
         self._check_block_broadcast_compatibility(ctx, node)
         assert len(input_asts) == len(self.input_names)
         with install_inductor_kernel_handlers(
-            ctx.cg, dict(zip(self.input_names, input_asts, strict=True))
+            ctx.cg,
+            dict(zip(self.input_names, input_asts, strict=True)),
+            policy=policy,
         ):
             indices = [
                 sympy.Symbol(f"i{n}") for n in range(len(self.buffer.data.ranges))
@@ -1107,7 +1171,11 @@ class SympyExprLowering(Lowering):
 
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
-        self, cg: CodegenInterface, input_name_lookup: dict[str, ast.AST]
+        self,
+        cg: CodegenInterface,
+        input_name_lookup: dict[str, ast.AST],
+        *,
+        policy: PointwiseCodegenPolicy | None = None,
     ) -> None:
         super().__init__()
         self.parent_handler: InductorOpOverrides = (
@@ -1115,6 +1183,7 @@ class GenerateASTFromInductor(DefaultHandler):
         )
         self.cg = cg
         self.input_name_lookup = input_name_lookup
+        self.policy = policy
 
     def _cast_ast(self, x: ast.AST, target_dtype: torch.dtype) -> ast.AST:
         backend = CompileEnvironment.current().backend
@@ -1210,7 +1279,27 @@ class GenerateASTFromInductor(DefaultHandler):
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 
+    def reciprocal(self, x: object) -> str:  # type: ignore[override]
+        if self.policy is not None and self.policy.reciprocal_ftz is not None:
+            assert CompileEnvironment.current().backend_name == "cute"
+            return self._lift(
+                expr_from_string(
+                    "cute.math.rcp({x}, approx=True, ftz={ftz})",
+                    x=self._to_ast(x),
+                    ftz=expr_from_string(self.policy.reciprocal_ftz),
+                )
+            )
+        return self._default("reciprocal", (x,), {})
+
     def sigmoid(self, x: object) -> str:  # type: ignore[override]
+        if self.policy is not None and self.policy.sigmoid_tanh:
+            assert CompileEnvironment.current().backend_name == "cute"
+            return self._lift(
+                expr_from_string(
+                    "cute.math.tanh({x} * cutlass.Float32(0.5), approx=True) * cutlass.Float32(0.5) + cutlass.Float32(0.5)",
+                    x=self._to_ast(x),
+                )
+            )
         if CompileEnvironment.current().backend.codegen_name != "triton":
             return self._default("sigmoid", (x,), {})
 
@@ -1268,9 +1357,15 @@ class GenerateASTFromInductor(DefaultHandler):
         if dtype is not None:
             a = self._create_cast_expr(a, dtype)
             b = self._create_cast_expr(b, dtype)
+        keywords = "propagate_nan=True"
+        if self.policy is not None:
+            if self.policy.minmax_propagate_nan is not None:
+                keywords = f"propagate_nan={self.policy.minmax_propagate_nan}"
+            if self.policy.minmax_ftz is not None:
+                keywords += f", ftz={self.policy.minmax_ftz}"
         return self._lift(
             expr_from_string(
-                "cute.math.max({a}, {b}, propagate_nan=True)",
+                f"cute.math.max({{a}}, {{b}}, {keywords})",
                 a=self._to_ast(a),
                 b=self._to_ast(b),
             )
@@ -1283,9 +1378,15 @@ class GenerateASTFromInductor(DefaultHandler):
         if dtype is not None:
             a = self._create_cast_expr(a, dtype)
             b = self._create_cast_expr(b, dtype)
+        keywords = "propagate_nan=True"
+        if self.policy is not None:
+            if self.policy.minmax_propagate_nan is not None:
+                keywords = f"propagate_nan={self.policy.minmax_propagate_nan}"
+            if self.policy.minmax_ftz is not None:
+                keywords += f", ftz={self.policy.minmax_ftz}"
         return self._lift(
             expr_from_string(
-                "cute.math.min({a}, {b}, propagate_nan=True)",
+                f"cute.math.min({{a}}, {{b}}, {keywords})",
                 a=self._to_ast(a),
                 b=self._to_ast(b),
             )
@@ -1628,7 +1729,28 @@ def codegen_call_with_graph(
         prepare_cute_collective_lane_loop_suppression(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
-        for arg, placeholder in zip(args, placeholders, strict=True):
+        original_args = args
+        if copy_named_args and len(args) > 1:
+            # Phi nodes may merge a placeholder copy with a different incoming
+            # name (e.g. ``a, b = b, a + x``). Snapshot all inputs before any
+            # such merged assignment can overwrite another incoming value.
+            # These names are not exposed to phi merging themselves.
+            snapshots = []
+            for arg, placeholder in zip(args, placeholders, strict=True):
+                if isinstance(arg, ast.Name):
+                    snapshot = cg.device_function.new_var(arg.id + "_incoming")
+                    cg.device_function.cute_state.phi_snapshot_names.add(snapshot)
+                    with cg.statement_owner_node(placeholder):
+                        cg.add_statement(
+                            statement_from_string(f"{snapshot} = {{arg}}", arg=arg)
+                        )
+                    snapshots.append(expr_from_string(snapshot))
+                else:
+                    snapshots.append(arg)
+            args = snapshots
+        for original_arg, arg, placeholder in zip(
+            original_args, args, placeholders, strict=True
+        ):
             if all(
                 user.target == torch.ops.aten.sym_size.int for user in placeholder.users
             ):
@@ -1638,7 +1760,9 @@ def codegen_call_with_graph(
                 # We need to copy the inputs to a loop so that phi nodes are handled properly.
                 # Phi nodes will merge variable names from outside the loop, but the old value
                 # of those variables could have usages.
-                copy_name = cg.device_function.new_var(arg.id + "_copy")
+                assert isinstance(original_arg, ast.Name)
+                copy_name = cg.device_function.new_var(original_arg.id + "_copy")
+                cg.device_function.cute_state.phi_snapshot_names.add(copy_name)
                 with cg.statement_owner_node(placeholder):
                     cg.add_statement(
                         statement_from_string(f"{copy_name} = {{arg}}", arg=arg)

@@ -16,16 +16,23 @@ from typing import Any
 from typing import Callable
 from typing import TypeVar
 from typing import cast
+from typing import overload
 
 import torch
 
 from ..runtime.settings import _env_get_bool
 from ..runtime.settings import is_pallas_interpret
 from .progress_bar import iter_with_progress
+from .search_timing import timing_error
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from .logger import AutotuningLogger
+    from .profiler_timing import CallableIdentity
+    from .search_timing import BenchmarkMeasurement
+    from .search_timing import SearchTimingPolicy
 
 T = TypeVar("T")
 
@@ -670,11 +677,12 @@ def _estimate_runtime_and_warmup(
 # This function is copied from triton._testing.do_bench with modification
 # to make sure different ranks run the benchmark for the same number
 # of times.
+@overload
 def do_bench(
     fn: Callable[[], Any],
     warmup: int = 25,
     rep: int = 100,
-    grad_to_none: torch.Tensor | None = None,
+    grad_to_none: Sequence[torch.Tensor] | torch.Tensor | None = None,
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
     process_group_name: str | None = None,
@@ -683,7 +691,46 @@ def do_bench(
     fixed_repetitions: int | None = None,
     probe_long_kernel: bool = False,
     pre_warmed: bool = False,
-) -> float | tuple[float, ...]:
+    timing_policy: None = None,
+    identity: CallableIdentity | None = None,
+) -> float | tuple[float, ...]: ...
+
+
+@overload
+def do_bench(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: Sequence[torch.Tensor] | torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+    process_group_name: str | None = None,
+    *,
+    default_cudagraph: bool = False,
+    fixed_repetitions: int | None = None,
+    probe_long_kernel: bool = False,
+    pre_warmed: bool = False,
+    timing_policy: SearchTimingPolicy,
+    identity: CallableIdentity | None = None,
+) -> BenchmarkMeasurement: ...
+
+
+def do_bench(
+    fn: Callable[[], Any],
+    warmup: int = 25,
+    rep: int = 100,
+    grad_to_none: Sequence[torch.Tensor] | torch.Tensor | None = None,
+    quantiles: list[float] | None = None,
+    return_mode: str = "mean",
+    process_group_name: str | None = None,
+    *,
+    default_cudagraph: bool = False,
+    fixed_repetitions: int | None = None,
+    probe_long_kernel: bool = False,
+    pre_warmed: bool = False,
+    timing_policy: SearchTimingPolicy | None = None,
+    identity: CallableIdentity | None = None,
+) -> float | tuple[float, ...] | BenchmarkMeasurement:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
     the 20-th and 80-th performance percentile.
@@ -694,8 +741,8 @@ def do_bench(
     :type warmup: int
     :param rep: Repetition time (in ms)
     :type rep: int
-    :param grad_to_none: Reset the gradient of the provided tensor to None
-    :type grad_to_none: torch.tensor, optional
+    :param grad_to_none: Reset the gradient of each provided tensor to None
+    :type grad_to_none: Sequence[torch.Tensor], optional
     :param quantiles: Performance percentile to return in addition to the median.
     :type quantiles: list[float], optional
     :param return_mode: The statistical measure to return. Options are "min", "max", "mean", "median", or "all". Default is "mean".
@@ -713,6 +760,20 @@ def do_bench(
 
     assert return_mode in ["min", "max", "mean", "median", "all"]
 
+    if timing_policy is not None:
+        timing_policy.validate()
+        if (
+            identity is None
+            or return_mode != "mean"
+            or quantiles is not None
+            or grad_to_none is not None
+            or process_group_name is not None
+            or default_cudagraph
+        ):
+            timing_error(
+                "Profiler search requires mean, identity and nonmutating local work"
+            )
+
     di = runtime.driver.active.get_device_interface()  # pyrefly: ignore
 
     if not pre_warmed:
@@ -720,13 +781,29 @@ def do_bench(
     di.synchronize()
     # Backward benchmarks mutate grad fields between iterations, so keep their
     # existing launch path.
-    benchmark_function = (
-        fn
-        if grad_to_none is not None
-        else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
-    )
+    if timing_policy is not None:
+        benchmark_function = fn
+        if timing_policy.graph_enabled:
+            reason = _cudagraph_unavailable_reason()
+            if reason is not None:
+                timing_error(reason)
+            try:
+                benchmark_function = _make_cudagraph_replay(fn)
+            except Exception as error:
+                timing_error(f"Requested profiler graph capture failed: {error}")
+    else:
+        benchmark_function = (
+            fn
+            if grad_to_none is not None
+            else _maybe_cudagraph_replay(fn, default_enabled=default_cudagraph)
+        )
 
     cache = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
+    if (
+        timing_policy is not None
+        and cache.numel() * cache.element_size() != timing_policy.clear_bytes
+    ):
+        timing_error("Unexpected profiler search cache-clear allocation")
 
     if fixed_repetitions is None and probe_long_kernel:
 
@@ -747,7 +824,9 @@ def do_bench(
             rep=rep,
             process_group_name=process_group_name,
         )
-        if probe_is_sample:
+        # Event timing may reuse the long probe directly. Profiler timing
+        # still needs one attributed sample in its own measurement domain.
+        if probe_is_sample and timing_policy is None:
             return cast(
                 "float | tuple[float, ...]",
                 _summarize_statistics([estimate_ms], quantiles, return_mode),
@@ -776,11 +855,28 @@ def do_bench(
             raise ValueError("fixed_repetitions must be at least 1")
         n_warmup = 0
         n_repeat = fixed_repetitions
-    start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+    start_event = []
+    end_event = []
+    if timing_policy is None:
+        start_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
+        end_event = [di.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
     for _ in range(n_warmup):
         benchmark_function()
+    if timing_policy is not None:
+        from .search_timing import collect_search_measurement
+
+        assert identity is not None
+        return collect_search_measurement(
+            benchmark_function,
+            policy=timing_policy,
+            identity=identity,
+            sample_count=n_repeat,
+            clear=functools.partial(runtime.driver.active.clear_cache, cache),  # pyrefly: ignore[missing-attribute]
+            synchronize=di.synchronize,
+            warmup_calls=n_warmup,
+            fixed_repetitions=fixed_repetitions,
+        )
     # Benchmark
     for i in range(n_repeat):
         # we don't want `fn` to accumulate gradient values
@@ -805,7 +901,7 @@ def do_bench_generic(
     fn: Callable[[], Any],
     warmup: int = 25,
     rep: int = 100,
-    grad_to_none: torch.Tensor | None = None,
+    grad_to_none: Sequence[torch.Tensor] | torch.Tensor | None = None,
     quantiles: list[float] | None = None,
     return_mode: str = "mean",
     process_group_name: str | None = None,

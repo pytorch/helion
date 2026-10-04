@@ -49,6 +49,9 @@ def _triton_jit_supports_do_not_specialize() -> bool:
 class TritonBackend(Backend):
     """Triton code generation backend."""
 
+    def supports_inductor_pointwise_fusion(self) -> bool:
+        return True
+
     @property
     def name(self) -> str:
         return "triton"

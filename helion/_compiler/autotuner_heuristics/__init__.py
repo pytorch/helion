@@ -22,6 +22,8 @@ from .common import dedupe_configs
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
+from .cute import CuteChainedMatmulHeuristic
+from .cute import CuteChunkPrefillHeuristic
 from .cute import CuteChunkPrepareHeuristic
 from .cute import CuteChunkRecurrenceHeuristic
 from .cute import CuteCollectiveMatmulHeuristic
@@ -99,10 +101,12 @@ if TYPE_CHECKING:
 # All active heuristics by backend
 HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
     "cute": (
+        CuteChainedMatmulHeuristic,
         CuteAsyncStateLoadHeuristic,
         CuteFp8GemmSkinnyMHeuristic,
         CuteChunkRecurrenceHeuristic,
         CuteChunkPrepareHeuristic,
+        CuteChunkPrefillHeuristic,
         CuteAffineScanHeuristic,
         CuteFlashAttentionHeuristic,
         CutePackedSingleTokenRank1Heuristic,
@@ -362,6 +366,15 @@ def compiler_seed_configs(
             configs.append(
                 Config.from_dict(paired.config | {STARTUP_PREFILL_KEY: True})
             )
+    if env.backend_name == "cute" and env.config_spec.cute_loop_schedule_enabled:
+        from .loop_schedule import loop_schedule_seeds
+
+        siblings = loop_schedule_seeds(env, device_ir)
+        if siblings:
+            # Keep every legacy parent's order and multiplicity, the promoted
+            # default and caller-owned seeds. Only enabled siblings are new.
+            configs[1:1] = siblings
+            env.config_spec.autotuner_heuristics.append("cute_loop_schedule")
     return dedupe_configs(configs)
 
 
