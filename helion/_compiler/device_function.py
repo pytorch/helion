@@ -1225,13 +1225,23 @@ class DeviceFunction:
                 statement_from_string("cute.arch.cluster_arrive_relaxed()"),
                 statement_from_string("cute.arch.cluster_wait()"),
             ]
+        pdl_wait: list[ast.stmt] = []
+        pdl_launch: list[ast.stmt] = []
+        if self.triton_persistent_state_specs:
+            # The previous launch writes the state, so overlap only its launch tail.
+            pdl_wait = [statement_from_string("tl.extra.cuda.gdc_wait()")]
+            pdl_launch = [
+                statement_from_string("tl.extra.cuda.gdc_launch_dependents()")
+            ]
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
+                *pdl_wait,
                 *scalar_preamble,
                 *self.preamble,
                 *cluster_sync,
                 *self.body,
+                *pdl_launch,
             ],
         )
         if backend.name == "cute":

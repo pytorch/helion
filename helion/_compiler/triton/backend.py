@@ -596,7 +596,7 @@ class TritonBackend(Backend):
                     device_fn.triton_persistent_state_specs
                 )
             )
-            out.append(f"_persistent_state_specs=({specs},)")
+            out.extend([f"_persistent_state_specs=({specs},)", "launch_pdl=True"])
             if any(spec[3] for spec in device_fn.triton_persistent_state_specs):
                 process_group_name = CompileEnvironment.current().process_group_name
                 if process_group_name is None:

@@ -1054,6 +1054,16 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("_minimum_resident_programs=", code)
+        # PDL overlaps launches; the state reads still wait for the previous launch.
+        self.assertIn("launch_pdl=True", code)
+        kernel = code[code.index("def _helion_") : code.index("\ndef nested_load")]
+        statements = [
+            line.strip()
+            for line in kernel.splitlines()[1:]
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertEqual(statements[0], "tl.extra.cuda.gdc_wait()")
+        self.assertEqual(statements[-1], "tl.extra.cuda.gdc_launch_dependents()")
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
