@@ -85,6 +85,23 @@ def pallas_fixed_tile_mask(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_static_conditional_expression(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(
+        [x.size(0), x.size(1) * 2],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for tile_rows in hl.tile(x.size(0)):
+        out[tile_rows, :] = torch.cat(
+            tuple(
+                x[tile_rows, :] if keep else -x[tile_rows, :] for keep in (True, False)
+            ),
+            dim=-1,
+        )
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_sin(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(out.size()):
@@ -1046,6 +1063,15 @@ def _constant_pad_neg_inf_pallas_kernel(x: torch.Tensor) -> torch.Tensor:
 @onlyBackends(["triton", "pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallas(TestCase):
+    def test_static_conditional_expression(self) -> None:
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_static_conditional_expression,
+            (x,),
+            block_sizes=[128],
+        )
+        torch.testing.assert_close(result.cpu(), torch.cat((x, -x), dim=-1).cpu())
+
     def test_fixed_integer_tile_extent(self) -> None:
         x = torch.randn(256, 256, device=DEVICE, dtype=torch.float32)
         expected = torch.where(
