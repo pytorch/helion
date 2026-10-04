@@ -596,7 +596,7 @@ class TritonBackend(Backend):
                     device_fn.triton_persistent_state_specs
                 )
             )
-            out.extend([f"_persistent_state_specs=({specs},)", "launch_pdl=True"])
+            out.append(f"_persistent_state_specs=({specs},)")
             if any(spec[3] for spec in device_fn.triton_persistent_state_specs):
                 process_group_name = CompileEnvironment.current().process_group_name
                 if process_group_name is None:
@@ -610,6 +610,9 @@ class TritonBackend(Backend):
                 graph = HostFunction.current().device_ir.tile_dependency_graph
                 assert graph is not None
                 out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
+        env = CompileEnvironment.current()
+        if env.pdl_entry or env.pdl_exit:
+            out.append("launch_pdl=True")
         if device_fn.triton_minimum_resident_programs is not None:
             out.append(
                 "_minimum_resident_programs="

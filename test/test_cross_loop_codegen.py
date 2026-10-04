@@ -440,6 +440,42 @@ def nested_load_store_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def pdl_store_chain(x: torch.Tensor) -> torch.Tensor:
+    """Launch a cross-loop chain with PDL."""
+    batch, width = x.size()
+    first = torch.empty_like(x)
+    out = torch.empty_like(x)
+
+    hl.pdl_wait()
+    for producer_batch, producer_width in hl.tile([batch, width]):
+        first[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch, consumer_width in hl.tile([batch, width], block_size=[1, 16]):
+        out[consumer_batch, consumer_width] = first[consumer_batch, consumer_width] * 2
+    hl.pdl_launch_dependents()
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def pdl_unwaited_chain(x: torch.Tensor) -> torch.Tensor:
+    """Trigger PDL without waiting, which races the cross-loop state."""
+    first = torch.empty_like(x)
+    out = torch.empty_like(x)
+
+    hl.pdl_launch_dependents()
+    for producer_batch, producer_width in hl.tile(x.size()):
+        first[producer_batch, producer_width] = x[producer_batch, producer_width] + 1
+    for consumer_batch, consumer_width in hl.tile(x.size(), block_size=[1, 16]):
+        out[consumer_batch, consumer_width] = first[consumer_batch, consumer_width] * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def nested_two_axis_consumer(x: torch.Tensor) -> torch.Tensor:
     """Exercise conservative fallback for an unrendered two-axis action scope."""
     rows, columns = x.size()
@@ -1054,9 +1090,25 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertIn("tile_dependency_nested_loop_wait", code)
         self.assertIn("tile_dependency_readiness_wait", code)
         self.assertNotIn("_minimum_resident_programs=", code)
-        # PDL overlaps launches; the state reads still wait for the previous launch.
+        self.assertNotIn("launch_pdl", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_pdl_launch_waits_before_state_reads(self) -> None:
+        x = torch.arange(4096, device=DEVICE, dtype=torch.float32).reshape(1, 4096)
+        config = {
+            "block_sizes": [1, 16],
+            "pid_type": "persistent_blocked",
+            "cross_loop_pipeline": "dynamic",
+            "num_sm_multiplier": 1,
+            "num_warps": 1,
+        }
+        code, out = code_and_output(pdl_store_chain, (x,), **config)
+
+        torch.testing.assert_close(out, (x + 1) * 2)
+        torch.testing.assert_close(pdl_store_chain(x), (x + 1) * 2)
         self.assertIn("launch_pdl=True", code)
-        kernel = code[code.index("def _helion_") : code.index("\ndef nested_load")]
+        kernel = code[code.index("def _helion_") : code.index("\ndef pdl_store")]
         statements = [
             line.strip()
             for line in kernel.splitlines()[1:]
@@ -1064,6 +1116,8 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         ]
         self.assertEqual(statements[0], "tl.extra.cuda.gdc_wait()")
         self.assertEqual(statements[-1], "tl.extra.cuda.gdc_launch_dependents()")
+        with self.assertRaises(helion.exc.PdlStateWithoutWait):
+            code_and_output(pdl_unwaited_chain, (x,), **config)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
