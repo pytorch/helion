@@ -4874,6 +4874,31 @@ class TestPallas(TestCase):
         ).to(device=DEVICE)
         torch.testing.assert_close(result, ref, rtol=1e-2, atol=1e-2)
 
+    def test_attention_static_unroll_scheduler_options(self) -> None:
+        """Pallas scheduling options also preserve static-unroll results."""
+        generator = torch.Generator().manual_seed(0)
+        query_cpu = torch.randn(
+            1, 1, 128, 128, dtype=torch.bfloat16, generator=generator
+        )
+        key_cpu = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, generator=generator)
+        val_cpu = torch.randn(1, 1, 256, 128, dtype=torch.bfloat16, generator=generator)
+        query = query_cpu.to(DEVICE)
+        key = key_cpu.to(DEVICE)
+        val = val_cpu.to(DEVICE)
+        _, result = code_and_output(
+            pallas_attention,
+            (query, key, val),
+            block_sizes=[1, 128, 128],
+            pallas_loop_type="unroll",
+            pallas_pre_broadcast=False,
+            pallas_use_low_level_scheduler=True,
+            pallas_fold_dot_lhs_cast=True,
+        )
+        expected = torch.nn.functional.scaled_dot_product_attention(
+            query_cpu.float(), key_cpu.float(), val_cpu.float()
+        ).to(device=DEVICE, dtype=query.dtype)
+        torch.testing.assert_close(result.cpu(), expected.cpu(), rtol=1e-2, atol=1e-2)
+
     def test_attention_folded_dot_lhs_cast_correctness(self) -> None:
         """Folding an f32-to-bf16 dot cast preserves attention results."""
         query = torch.randn(1, 1, 128, 128, dtype=torch.bfloat16, device=DEVICE)
