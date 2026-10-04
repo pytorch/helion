@@ -268,7 +268,21 @@ def _hold_after_fallback(  # noqa: ANN202
             _wait_at_least(state + started + rank, epoch)
 
 
+@triton.jit
+def _sync_threads(threads: tl.constexpr):  # noqa: ANN202
+    """Barrier 0 over the first ``threads`` threads, ordering their memory ops."""
+    tl.inline_asm_elementwise(
+        f"bar.sync 0, {threads}; mov.u32 $0, 0;",
+        "=r",
+        [],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
 # Not inlined: eight inline copies in a poll loop cost ~0.6us even unexecuted.
+# No reductions: their full-CTA barriers deadlock on parked WS worker warps.
 @triton.jit(noinline=True)
 def _scatter_cover(  # noqa: ANN202
     state,  # noqa: ANN001
@@ -278,6 +292,7 @@ def _scatter_cover(  # noqa: ANN202
     records,  # noqa: ANN001
     done,  # noqa: ANN001
     cover,  # noqa: ANN001
+    votes,  # noqa: ANN001
     tasks: tl.constexpr,
     lanes: tl.constexpr,
     keys: tl.constexpr,
@@ -292,8 +307,11 @@ def _scatter_cover(  # noqa: ANN202
     remote = tl.load(ptrs.to(tl.pointer_type(tl.uint64)) + source)
     remote = remote.to(tl.pointer_type(tl.uint64)) + records + parity * tasks * lanes
     marks = state + done + parity * world_size * tasks + source * tasks
+    # Lanes that see a missing task bump this CTA's vote word past ``seen``.
+    vote = state + votes + tl.program_id(0)
+    seen = tl.load(vote, volatile=True)
+    _sync_threads(threads)
     block: tl.constexpr = 8 * threads
-    missing = tl.zeros([block], tl.int32)
     for start in range(0, tasks * lanes, block):
         index = start + tl.arange(0, block)
         valid = index < tasks * lanes
@@ -302,23 +320,16 @@ def _scatter_cover(  # noqa: ANN202
         live = tl.cast(mark >> 32, tl.uint32) == tag
         skipped = (mark & 0xFFFFFFFF) == 0xFFFFFFFF
         written = tl.cast(record >> 32, tl.uint32) == tag
-        missing += (valid & ~(live & (skipped | written))).to(tl.int32)
+        tl.store(vote + index * 0, seen + 1, mask=valid & ~(live & (skipped | written)))
         key = tl.cast((record >> 1) & 0x7FFFFFFF, tl.int64)
         tl.store(
             state + cover + source * keys + key,
             epoch,
             mask=valid & written & ((record & 1) != 0) & (key < keys),
         )
-    # bar.red orders the cover stores before every thread's reads, CTA-wide.
-    return tl.inline_asm_elementwise(
-        "{ .reg .pred p, q; setp.ne.s32 p, $1, 0; "
-        f"bar.red.or.pred q, 0, {threads}, p; selp.s32 $0, 0, 1, q; }}",
-        "=r,r",
-        [tl.sum(missing)],
-        dtype=tl.int32,
-        is_pure=False,
-        pack=1,
-    )
+    # Also orders the cover stores before every thread's reads.
+    _sync_threads(threads)
+    return (tl.load(vote, volatile=True) == seen).to(tl.int32)
 
 
 @triton.jit

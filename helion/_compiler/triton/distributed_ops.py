@@ -1271,8 +1271,9 @@ def _scatter_fallback(
                 statement_from_string(
                     f"{flag} = helion_dist_utils._scatter_cover({peer.state}, "
                     f"{peer.ptrs}, {source}, {peer.epoch}, {scatter.records}, "
-                    f"{root.done}, {scatter.cover}, {root.tasks}, {scatter.lanes}, "
-                    f"{scatter.keys}, {len(peer.bases)}, {poll.threads})"
+                    f"{root.done}, {scatter.cover}, {peer.votes}, {root.tasks}, "
+                    f"{scatter.lanes}, {scatter.keys}, {len(peer.bases)}, "
+                    f"{poll.threads})"
                 )
             )
         key = poll.scatter.key

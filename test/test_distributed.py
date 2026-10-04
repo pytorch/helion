@@ -370,6 +370,36 @@ def scatter_exchange_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def scatter_matmul_exchange_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    w: torch.Tensor,
+    rows: torch.Tensor,
+    count: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty(symm.size(), dtype=torch.float32, device=symm.device)
+    half = symm.size(1) // 2
+    for tile_h, tile_t in hl.tile([2, x.size(0)], block_size=[1, 1]):
+        if tile_t.begin < count[0]:
+            row = rows[tile_t.begin, :]
+            cols = tile_h.begin * half + hl.arange(half)
+            acc = hl.zeros([row.size(0), half], dtype=torch.float32)
+            for tile_k in hl.tile(x.size(2)):
+                acc = hl.dot(x[tile_t.begin, :, tile_k], w[tile_k, cols], acc=acc)
+            hl.store(
+                symm, [row, cols], acc.to(symm.dtype), extra_mask=(row >= 0)[:, None]
+            )
+    for tile_m, tile_c in hl.tile(symm.size(), block_size=[128, 32]):
+        total = hl.zeros([tile_m, tile_c], dtype=torch.float32)
+        for peer in peers:
+            total = total + peer[tile_m, tile_c].to(torch.float32)
+        out[tile_m, tile_c] = total
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -685,6 +715,48 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             out = bound(*args)
             expected = mirror.sum(0).to(self.device)
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        self._cleanup_process()
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_inband_scatter_fallback_with_warp_specialized_producer(self) -> None:
+        # Reading unwritten rows must not hang while WS worker warps are parked.
+        self._init_process()
+        group = dist.group.WORLD
+        world, tasks, lanes, cols, k = self.world_size, 2, 128, 64, 64
+        dtype = torch.bfloat16
+        symm = symm_mem.empty(tasks * lanes, cols, device=self.device, dtype=dtype)
+        symm_mem.rendezvous(symm, group=group)
+        symm.fill_(self.rank + 1)
+        torch.cuda.synchronize()
+        dist.barrier()
+        x = torch.arange(tasks * lanes * k, device=self.device) % 2
+        x = x.view(tasks, lanes, k).to(dtype)
+        w = torch.ones(k, cols, device=self.device, dtype=dtype)
+        # Only task 0 runs, and every third of its lanes writes nothing.
+        rows = torch.arange(tasks * lanes, device=self.device, dtype=torch.int32)
+        rows = rows.view(tasks, lanes)
+        rows[:, ::3] = -1
+        count = torch.ones(1, device=self.device, dtype=torch.int32)
+        args = (symm, x, w, rows, count, group.group_name)
+        bound = scatter_matmul_exchange_kernel.bind(args)
+        config = bound.config_spec.default_config().config
+        ws = {"block_sizes": [32], "range_warp_specializes": [None, True, None]}
+        bound.set_config(helion.Config(**{**config, **ws}))
+        code = bound.to_triton_code()
+        self.assertIn("warp_specialize=True", code)
+        self.assertIn("_scatter_cover(", code)
+        written = torch.zeros(tasks * lanes, 1, device=self.device, dtype=torch.bool)
+        written[rows[0][rows[0] >= 0].long()] = True
+        # Each written element sums k // 2 ones; unwritten rows keep rank + 1.
+        expected = torch.where(
+            written, world * k // 2, world * (world + 1) // 2
+        ).expand(tasks * lanes, cols)
+        for step in range(3):
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            out = bound(*args)
+            torch.testing.assert_close(out, expected.float(), rtol=0, atol=0)
         self._cleanup_process()
 
     @skipIfNotCUDA()
