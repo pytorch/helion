@@ -340,6 +340,36 @@ def matrix_exchange_kernel(
     return out
 
 
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def scatter_exchange_kernel(
+    symm: torch.Tensor,
+    x: torch.Tensor,
+    rows: torch.Tensor,
+    count: torch.Tensor,
+    group_name: hl.ProcessGroupName,
+) -> torch.Tensor:
+    peers = _remote_views(symm, group_name)
+    out = torch.empty(symm.size(), dtype=torch.float32, device=symm.device)
+    half = symm.size(1) // 2
+    for tile_h, tile_t in hl.tile([2, x.size(0)], block_size=[1, 1]):
+        # Tasks past the count skip; a negative row writes nothing.
+        if tile_t.begin < count[0]:
+            row = rows[tile_t.begin, :]
+            cols = tile_h.begin * half + hl.arange(half)
+            hl.store(
+                symm,
+                [row, cols],
+                x[tile_t.begin, :, cols],
+                extra_mask=(row >= 0)[:, None],
+            )
+    for tile_m, tile_c in hl.tile(symm.size(), block_size=[8, 32]):
+        acc = hl.zeros([tile_m, tile_c], dtype=torch.float32)
+        for peer in peers:
+            acc = acc + peer[tile_m, tile_c].to(torch.float32)
+        out[tile_m, tile_c] = acc
+    return out
+
+
 # make it easy to use a 'smaller' profile than 'quick' in unit test
 pattern_search_config = PatternSearchConfig(
     initial_population=6,
@@ -608,6 +638,53 @@ class TestDistributed(TestCase, MultiProcessTestCase):
             world = self.world_size
             expected = world * (lane + 4 * step) + world * (world - 1) // 2
             torch.testing.assert_close(out, expected.to(out.dtype), rtol=0, atol=0)
+        self._cleanup_process()
+
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    @parametrize("dtype", (torch.bfloat16, torch.float32))
+    def test_inband_scatter_reads_unwritten_rows(self, dtype: torch.dtype) -> None:
+        self._init_process()
+        group = dist.group.WORLD
+        world, tasks, lanes, cols = self.world_size, 4, 8, 64
+        symm = symm_mem.empty(tasks * lanes, cols, device=self.device, dtype=dtype)
+        symm_mem.rendezvous(symm, group=group)
+        # Every rank mirrors each rank's buffer; rows no task writes keep values.
+        index = torch.arange(tasks * lanes * cols).view(tasks, lanes, cols)
+        init = index.view(tasks * lanes, cols) % 5
+        mirror = torch.stack([200 + r + init for r in range(world)]).float()
+        symm.copy_(mirror[self.rank])
+        torch.cuda.synchronize()
+        dist.barrier()
+        x = torch.empty(tasks, lanes, cols, device=self.device, dtype=dtype)
+        rows = torch.empty(tasks, lanes, device=self.device, dtype=torch.int32)
+        count = torch.empty(1, device=self.device, dtype=torch.int32)
+        args = (symm, x, rows, count, group.group_name)
+        bound = scatter_exchange_kernel.bind(args)
+        for step in range(6):
+            generator = torch.Generator().manual_seed(step)
+            plans = []
+            for r in range(world):
+                # Odd steps skip the last task and every third lane of the rest.
+                row = torch.randperm(tasks * lanes, generator=generator)
+                row = row.view(tasks, lanes).to(torch.int32)
+                live = tasks - step % 2
+                if step % 2:
+                    row[:, ::3] = -1
+                values = ((index * (r + 1) + 3 * step) % 128).float()
+                for t in range(live):
+                    written = row[t] >= 0
+                    mirror[r, row[t][written].long()] = values[t][written]
+                plans.append((values, row, live))
+            values, row, live = plans[self.rank]
+            torch.cuda._sleep(100_000 * ((self.rank + step) % world))
+            x.copy_(values)
+            rows.copy_(row)
+            count.fill_(live)
+            out = bound(*args)
+            expected = mirror.sum(0).to(self.device)
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
         self._cleanup_process()
 
     @skipIfNotCUDA()
@@ -1289,11 +1366,11 @@ class TestDistributedTileDependencies(TestCase):
             ("R3", torch.float32, "use peer_counter (R3:"),
             ("R4", torch.float32, "use peer_counter (R4:"),
             ("R6", torch.float32, "use peer_counter (R6:"),
-            # Exactly 1 MiB per rank stays inband; 2 ranks * 2**17 words does not.
+            # Exactly 4 MiB per rank stays inband; 2 ranks * 2**19 words does not.
             ("cap", torch.float32, "use inband"),
             ("R7", torch.float32, "use peer_counter (R7:"),
         ):
-            n = {"cap": (1 << 20) // (8 * world), "R7": 1 << 17}.get(broken_rule, 256)
+            n = {"cap": (1 << 22) // (8 * world), "R7": 1 << 19}.get(broken_rule, 256)
             symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
             with (
                 self.subTest(broken_rule=broken_rule, dtype=dtype),
@@ -1505,6 +1582,36 @@ class TestDistributedTileDependencies(TestCase):
             row_exchange_kernel.bind((symm, x, dist.group.WORLD.group_name))
         (line,) = logs.output
         self.assertIn("on peers/symm use peer_counter (R2:", line)
+
+    @skipIfRefEager("tile dependencies are built only in compiled mode")
+    @parametrize("world", (2, 4, 8))
+    def test_inband_scatter_records_rows(self, world: int) -> None:
+        symm = torch.zeros(32, 64, device=DEVICE, dtype=torch.bfloat16)
+        x = torch.zeros(4, 8, 64, device=DEVICE, dtype=torch.bfloat16)
+        rows = torch.zeros(4, 8, device=DEVICE, dtype=torch.int32)
+        count = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        group = self._world(world, scatter_exchange_kernel)
+        with self.assertLogs(tile_dependency.log, "INFO") as logs:
+            bound = scatter_exchange_kernel.bind((symm, x, rows, count, group))
+        (line,) = logs.output
+        self.assertIn("on peers/symm use inband", line)
+        # Only a static launch marks the guard-skipped tasks.
+        self.assertEqual(bound.config_spec.cross_loop_pipeline.choices, ("static",))
+        code = bound.to_triton_code()
+        # Each task records one tagged key per row, then pushes a done word to
+        # every rank; skipped tasks push all-ones done words instead.
+        self.assertEqual(code.count("inband_record = "), 1)
+        self.assertEqual(code.count("inband_done = "), 1)
+        self.assertIn("tl.cast(tl.sum(inband_record), tl.uint64)", code)
+        self.assertIn("tile_dependency_peer_epoch << 32 | 4294967295", code)
+        # After a long spin, readers scan each source's records and done words and
+        # copy rows no task wrote from the peer's buffer into the mailbox.
+        self.assertEqual(code.count("_scatter_cover("), world)
+        self.assertIn("tl.pointer_type(tl.uint32)) + inband_offset_", code)
+        self.assertIn("tl.store(inband_address_", code)
+        self.assertIn("_hold_after_fallback(tile_dependency_peer_state", code)
+        # The record key must index the row block the reader computes.
+        self.assertIn("% 64 // 32 * 1 + inband_offset_1 // 64 * 2", code)
 
     @skipIfRefEager("peer views are recorded only in compiled mode")
     def test_peer_views_require_allocation_base(self) -> None:
