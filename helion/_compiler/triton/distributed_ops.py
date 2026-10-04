@@ -694,6 +694,80 @@ def _interleaved(
     return [parts[int(f"{i:0{levels}b}"[::-1], 2)] for i in range(count)]
 
 
+def _group_start(
+    state: CodegenState, term: str, output_size: list[int | torch.SymInt], count: int
+) -> str | None:
+    """A per-dim index or mask ``term`` at every ``count``-th last-axis element.
+
+    Splitting only the last axis' vector skips the layout conversions Triton
+    emits when it splits a full tile. None when ``term``'s shape is unknown.
+    """
+    tile_strategy = state.tile_strategy
+    dims = tile_strategy.shape_dims(output_size)
+    last = tile_strategy.expand_str(output_size, len(output_size) - 1)
+    if len(dims) != len(output_size) or len(dims) < 2:
+        return None
+    if term.endswith("None]"):
+        return term
+    if not term.endswith(last):
+        return None
+    return f"({_interleaved(state, term[: -len(last)], dims[-1:], count)[0]}){last}"
+
+
+def _start_offset(
+    state: CodegenState,
+    fake_tensor: torch.Tensor,
+    indexing: SubscriptIndexing,
+    output_size: list[int | torch.SymInt],
+    count: int,
+) -> str | None:
+    """The offset of every ``count``-th last-axis element, or None."""
+    terms = []
+    for dim, (term, block) in enumerate(
+        zip(indexing.dim_index_exprs, indexing.block_dims, strict=True)
+    ):
+        if CompileEnvironment.current().known_equal(fake_tensor.size(dim), 1):
+            continue
+        start = _group_start(state, term, output_size, count) if block else term
+        if start is None:
+            return None
+        stride = state.device_function.tensor_stride(fake_tensor, dim).name
+        terms.append(f"{start} * {stride}")
+    return " + ".join(terms) or None
+
+
+def _start_mask(
+    state: CodegenState,
+    indexing: SubscriptIndexing,
+    extra_mask: ast.AST | None,
+    output_size: list[int | torch.SymInt],
+    count: int,
+) -> str | None:
+    """The mask of every ``count``-th last-axis element, or None."""
+    assert state.fx_node is not None
+    terms, pending = [], [indexing.mask_expr]
+    while pending:
+        node = pending.pop()
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
+            pending += [node.left, node.right]
+            continue
+        term = ast.unparse(node)
+        if extra_mask is not None and term == ast.unparse(extra_mask):
+            # The extra mask broadcasts unchanged if it is constant on the last axis.
+            mask_node = state.fx_node.args[3]
+            assert isinstance(mask_node, torch.fx.Node)
+            fake = mask_node.meta["val"]
+            env = CompileEnvironment.current()
+            if fake.ndim and not env.known_equal(fake.size(-1), 1):
+                return None
+        else:
+            term = _group_start(state, term, output_size, count)
+            if term is None:
+                return None
+        terms.append(f"({term})")
+    return " & ".join(terms)
+
+
 def inband_store_codegen(
     state: CodegenState, codegen_store: StoreCodegen
 ) -> StoreCodegen:
@@ -773,10 +847,27 @@ def inband_store_codegen(
             word = _lift(state, f"{{x}} | {epoch}", expr_from_string(payload))
             row = [*dims[:-1], f"{dims[-1]} // {lanes}"]
             words = _interleaved(state, word, row, 2) if pair else [word]
-            first = _interleaved(state, offset.id, dims, group)[0]
+            stored = f"[{', '.join([*row[:-1], f'{dims[-1]} // {group}'])}]"
+            first = _start_offset(state, fake_tensor, indexing, output_size, group)
+            if first is None:
+                first = _interleaved(state, offset.id, dims, group)[0]
+            else:
+                first = backend.broadcast_to_expr(f"({first})", stored)
             address = _lift(state, f"{{x}} // {lanes}", expr_from_string(first))
             masks = []
+            start_mask = None
             if mask is not None:
+                start_mask = _start_mask(
+                    state, indexing, extra_mask, output_size, group
+                )
+            if start_mask is not None:
+                cast = f"tl.cast({start_mask}, tl.int32)"
+                cast = backend.broadcast_to_expr(cast, stored)
+                lifted = state.codegen.lift(
+                    expr_from_string(cast), dce=True, prefix="inband_mask"
+                )
+                masks = [lifted.id]
+            elif mask is not None:
                 cast = backend.broadcast_to_expr("tl.cast({x}, tl.int32)", shape)
                 masks = _interleaved(state, _lift(state, cast, mask), dims, group)[:1]
         store = (
