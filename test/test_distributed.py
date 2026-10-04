@@ -1341,6 +1341,9 @@ class TestDistributedTileDependencies(TestCase):
             self.assertEqual(code.count("st.relaxed.sys.global.u64"), world)
             self.assertIn("tl.store(symm + ", code)
             self.assertEqual(code.count("@p bra SPIN"), 1)
+            # Outside WS loops, every rank's words reload together on a CTA vote.
+            self.assertEqual(code.count("while inband_stale != 0:"), 1)
+            self.assertIn(f"bar.red.or.pred q, 0, {32 * num_warps}, p;", code)
             words = ", ".join(["tl.uint64"] * world)
             self.assertIn(f"dtype=({words}), is_pure=False, pack={pack})", code)
             # Two parities of a word per rank and element, the done and launch slots.
