@@ -730,6 +730,19 @@ def pallas_cat_columns(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_repeat_columns(x: torch.Tensor) -> torch.Tensor:
+    rows, columns = x.size()
+    out = torch.empty(
+        [rows, columns * 4],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for tile_rows in hl.tile(rows):
+        out[tile_rows, :] = torch.cat([x[tile_rows, :]] * 4, dim=-1)
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_aligned_dynamic_window(
     table: torch.Tensor, starts: torch.Tensor
 ) -> torch.Tensor:
@@ -1056,6 +1069,15 @@ class TestPallas(TestCase):
         )
         self.assertIn("jnp.concatenate((", code)
         torch.testing.assert_close(result.cpu(), torch.cat((x, y), dim=1).cpu())
+
+    def test_repeat_columns(self) -> None:
+        x = torch.randn(128, 32, device=DEVICE, dtype=torch.bfloat16)
+        _code, result = code_and_output(
+            pallas_repeat_columns,
+            (x,),
+            block_sizes=[128],
+        )
+        torch.testing.assert_close(result.cpu(), torch.cat([x] * 4, dim=-1).cpu())
 
     @skipIfPallasInterpret("packed FP4 execution requires a real TPU")
     def test_fp8_fp4_matmul(self) -> None:
