@@ -26,6 +26,7 @@ from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import peer_state
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
+from ..indexing_strategy import _in_warp_specialized_loop
 from ..tile_dependency import TILE_ACCESS_META
 from ..tile_strategy import DeviceLoopState
 
@@ -620,8 +621,17 @@ class InbandPoll:
     # Polls of one address shape share an asm; None polls alone.
     group: str | None
     pack: int
+    # Threads that may wait together on a CTA barrier; None in WS loops.
+    threads: int | None
     word: str
     result: ast.stmt
+
+    def load(self, epoch: str) -> ast.stmt:
+        # A plain volatile load vectorizes; masked lanes read as current.
+        mask = "" if self.mask is None else f", {self.mask}, {epoch} << 32"
+        return statement_from_string(
+            f"{self.word} = tl.load({self.address}{mask}, volatile=True)"
+        )
 
 
 def _inband_access(state: CodegenState) -> tuple[TileAccess, tuple[int, ...]] | None:
@@ -881,13 +891,15 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                         *(kw for kw in call.keywords if kw.arg != "num_stages"),
                         create(ast.keyword, arg="num_stages", value=ast.Constant(1)),
                     ]
-        group, pack = None, 1
+        group, pack, threads = None, 1, None
         if indexing.needs_broadcast():
             result = expr_from_string(
                 backend.broadcast_to_expr("{value}", shape), value=result
             )
         elif indexing.block_shaped_offset or mask is not None:
             group, pack = shape, _poll_pack(state, output_size)
+            if not _in_warp_specialized_loop(state):
+                threads = 32 * state.config.num_warps
         else:
             group = "scalar"
         value = device_function.new_var("inband_value", dce=True)
@@ -898,6 +910,7 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 mask=mask,
                 group=group,
                 pack=pack,
+                threads=threads,
                 word=word,
                 result=statement_from_string(f"{value} = {{result}}", result=result),
             )
@@ -932,10 +945,39 @@ def _poll_asm(polls: int, pack: int) -> tuple[str, str]:
     return asm, ",".join(["=l"] * count + ["l"] * 2 * count + ["r"] * pack)
 
 
+def _stale(peer_epoch: str, polls: list[InbandPoll]) -> str:
+    """Whether any thread of the CTA holds a stale word of a block poll."""
+    tag = f"tl.cast({peer_epoch}, tl.uint32)"
+    flags = " + ".join(
+        "tl.sum(("
+        + " | ".join(
+            f"((({poll.word} >> 32).to(tl.uint32)) != {tag})" for poll in group
+        )
+        + ").to(tl.int32))"
+        for group in _by_group(polls).values()
+    )
+    asm = (
+        "{ .reg .pred p, q; setp.ne.s32 p, $1, 0; "
+        f"bar.red.or.pred q, 0, {polls[0].threads}, p; selp.s32 $0, 1, 0, q; }}"
+    )
+    return (
+        f"tl.inline_asm_elementwise(asm={asm!r}, constraints='=r,r', args=[{flags}], "
+        "dtype=tl.int32, is_pure=False, pack=1)"
+    )
+
+
+def _by_group(polls: list[InbandPoll]) -> dict[str, list[InbandPoll]]:
+    groups: dict[str, list[InbandPoll]] = {}
+    for poll in polls:
+        groups.setdefault(poll.group or poll.word, []).append(poll)
+    return groups
+
+
 def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     """Wait on the pending polls of ``node``'s graph once ``node`` reads one.
 
-    The wait is per thread: a CTA-wide reduction would skip replicated lanes.
+    Outside WS loops, block polls first reload together until a CTA vote finds
+    them current. The per-thread spin then covers replicas the vote may skip.
     """
     device_function = cg.device_function
     polls = [
@@ -951,18 +993,24 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     ]
     peer = device_function.peer_state
     assert peer is not None
-    groups: dict[str, list[InbandPoll]] = {}
+    # Issue every group's first loads before any spin so their latencies overlap.
     for poll in polls:
-        groups.setdefault(poll.group or poll.word, []).append(poll)
-    for group in groups.values():
-        # A plain volatile load vectorizes; masked lanes read as current.
-        for poll in group:
-            mask = "" if poll.mask is None else f", {poll.mask}, {peer.epoch} << 32"
-            cg.add_statement(
-                statement_from_string(
-                    f"{poll.word} = tl.load({poll.address}{mask}, volatile=True)"
-                )
-            )
+        cg.add_statement(poll.load(peer.epoch))
+    voting = [poll for poll in polls if poll.threads is not None]
+    if voting:
+        # A per-thread spin reloads one asm's words at a time; this reloads all.
+        stale = device_function.new_var("inband_stale", dce=False)
+        cg.add_statement(
+            statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}")
+        )
+        loop = statement_from_string(f"while {stale} != 0: pass")
+        assert isinstance(loop, ast.While)
+        loop.body = [
+            *(poll.load(peer.epoch) for poll in voting),
+            statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}"),
+        ]
+        cg.add_statement(loop)
+    for group in _by_group(polls).values():
         words = [poll.word for poll in group]
         asm, constraints = _poll_asm(len(words), group[0].pack)
         cg.add_statement(
