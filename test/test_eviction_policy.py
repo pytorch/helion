@@ -8,6 +8,8 @@ from unittest import mock
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
+import triton
+import triton.language as tl
 
 import helion
 import helion._compat as _compat
@@ -21,6 +23,24 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 import helion.language as hl
+from helion.runtime.triton import cache_hints
+
+
+@triton.jit
+def _select_copy(a_desc, b_desc, out_ptr, BLOCK: tl.constexpr, HINT: tl.constexpr):
+    pid = tl.program_id(0)
+    if pid % 2 == 0:
+        desc = a_desc
+    else:
+        desc = b_desc
+    if HINT:
+        x = cache_hints.descriptor_load(
+            desc, [pid * BLOCK, 0], eviction_policy="evict_first"
+        )
+    else:
+        x = desc.load([pid * BLOCK, 0])
+    rows = pid * BLOCK + tl.arange(0, BLOCK)[:, None]
+    tl.store(out_ptr + rows * BLOCK + tl.arange(0, BLOCK)[None, :], x)
 
 
 @onlyBackends(["triton"])
@@ -231,6 +251,58 @@ class TestEvictionPolicy(RefEagerTestBase, TestCase):
 
             self.assertIn("evict_first", code)
             self.assertIn("evict_last", code)
+
+    @skipIfRefEager("Generated code inspection not applicable in ref eager mode")
+    @skipIfTileIR("tileir backend will ignore `eviction_policy` hint")
+    @skipIfRocm("ROCm does not support eviction policy")
+    def test_tensor_descriptor_load_keeps_eviction_policy(self) -> None:
+        if not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
+
+        @helion.kernel(
+            config={"block_sizes": [32, 32], "indexing": "tensor_descriptor"}
+        )
+        def copy_first(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = hl.load(
+                    x, [tile_m, tile_n], eviction_policy="evict_first"
+                )
+            return out
+
+        x = torch.randn([128, 64], device=DEVICE, dtype=torch.float32)
+        code, result = code_and_output(copy_first, (x,))
+        torch.testing.assert_close(result, x)
+        self.assertIn(
+            "helion_cache_hints.descriptor_load(x_desc, [offset_0, offset_1], "
+            "eviction_policy='evict_first')",
+            code,
+        )
+
+    @skipIfRefEager("PTX inspection not applicable in ref eager mode")
+    @skipIfRocm("ROCm does not support eviction policy")
+    def test_cache_hint_reaches_tma_through_descriptor_select(self) -> None:
+        if not supports_tensor_descriptor():
+            self.skipTest("Tensor descriptor support is required")
+        from triton.tools.tensor_descriptor import TensorDescriptor
+
+        a = torch.randn([128, 32], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([128, 32], device=DEVICE, dtype=torch.float16)
+        da, db = (TensorDescriptor.from_tensor(t, [32, 32]) for t in (a, b))
+        expected = torch.cat(
+            [
+                a[i * 32 : i * 32 + 32] if i % 2 == 0 else b[i * 32 : i * 32 + 32]
+                for i in range(4)
+            ]
+        )
+        for hint in (False, True):
+            out = torch.empty_like(a)
+            ptx = _select_copy[(4,)](da, db, out, BLOCK=32, HINT=hint).asm["ptx"]
+            torch.testing.assert_close(out, expected)
+            self.assertEqual(
+                ptx.count("createpolicy.fractional.L2::evict_first"), int(hint)
+            )
+            self.assertEqual(".L2::cache_hint" in ptx, hint)
 
 
 instantiate_parametrized_tests(TestEvictionPolicy)

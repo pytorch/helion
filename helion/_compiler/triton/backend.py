@@ -406,6 +406,7 @@ class TritonBackend(Backend):
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
+            "helion_cache_hints": "from helion.runtime.triton import cache_hints as helion_cache_hints",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
             "_default_launcher": "from helion.runtime import default_launcher as _default_launcher",
