@@ -743,6 +743,17 @@ def pallas_repeat_columns(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_private_local_scratch(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    scratch = torch.empty([128, 128], dtype=x.dtype, device=x.device)
+    for _program in hl.grid(1):
+        scratch[:, :] = x[:, :]
+        scratch[:, :] = scratch[:, :] * 2.0 + 1.0
+        out[:, :] = scratch[:, :]
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_aligned_dynamic_window(
     table: torch.Tensor, starts: torch.Tensor
 ) -> torch.Tensor:
@@ -1078,6 +1089,16 @@ class TestPallas(TestCase):
             block_sizes=[128],
         )
         torch.testing.assert_close(result.cpu(), torch.cat([x] * 4, dim=-1).cpu())
+
+    def test_private_local_scratch(self) -> None:
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_private_local_scratch,
+            (x,),
+            block_sizes=[],
+            pallas_internal_scratch=True,
+        )
+        torch.testing.assert_close(result.cpu(), (x * 2.0 + 1.0).cpu())
 
     @skipIfPallasInterpret("packed FP4 execution requires a real TPU")
     def test_fp8_fp4_matmul(self) -> None:
