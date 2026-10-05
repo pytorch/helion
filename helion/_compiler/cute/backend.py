@@ -1101,6 +1101,7 @@ class CuteBackend(Backend):
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
+        from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
@@ -1146,6 +1147,9 @@ class CuteBackend(Backend):
             return
         plan_chunk_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
+            return
+        plan_gdn_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.gdn_recurrence_plan is not None:
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
@@ -1247,6 +1251,10 @@ class CuteBackend(Backend):
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
+            or key == "cute_gdn_recurrence_stages"
+            or key == "cute_gdn_recurrence_epilogue_warps"
+            or key == "cute_gdn_recurrence_token_groups"
+            or key == "cute_gdn_recurrence_mma_m"
             or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
@@ -2344,6 +2352,11 @@ class CuteBackend(Backend):
         if recurrence_plan is not None:
             return launcher_args_with_compile_options(
                 f"block=({recurrence_plan.threads}, 1, 1)"
+            )
+        gdn_plan = device_function.cute_state.gdn_recurrence_plan
+        if gdn_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({gdn_plan.threads}, 1, 1)"
             )
 
         # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)

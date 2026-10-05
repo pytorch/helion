@@ -80,6 +80,11 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",
         "_compiler/cute/kda_device_primitives.py",
     ),
+    "gdn_recurrence_sm100": (
+        "_compiler/cute/gdn_recurrence_sm100.py",
+        "_compiler/cute/gdn_recurrence_geometry.py",
+        "_compiler/cute/affine_recurrence_primitives.py",
+    ),
 }
 
 

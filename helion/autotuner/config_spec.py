@@ -827,6 +827,10 @@ VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
+CUTE_GDN_RECURRENCE_STAGES_KEY = "cute_gdn_recurrence_stages"
+CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY = "cute_gdn_recurrence_epilogue_warps"
+CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY = "cute_gdn_recurrence_token_groups"
+CUTE_GDN_RECURRENCE_MMA_M_KEY = "cute_gdn_recurrence_mma_m"
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
 VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc1",
@@ -905,6 +909,10 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_flash_bwd_exp2_f32",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_GDN_RECURRENCE_STAGES_KEY,
+        CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+        CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+        CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_threads",
@@ -983,6 +991,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_GDN_RECURRENCE_STAGES_KEY,
+        CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+        CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+        CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_warps",
@@ -1382,6 +1394,28 @@ class ConfigSpec:
         # selected value into a ptxas max-register constraint; unrelated CuTe
         # kernels never see this search dimension.
         self.cute_chunk_recurrence_register_cap: EnumFragment | None = None
+        # Enabled only when the gated-delta-rule chunk recurrence (gdn_fwd_h)
+        # is matched. Choices are derived from the matched geometry (shared
+        # memory ring budget and TMEM column slicing); first choice is default.
+        self.cute_gdn_recurrence_stages: EnumFragment | None = None
+        self.cute_gdn_recurrence_epilogue_warps: EnumFragment | None = None
+        self.cute_gdn_recurrence_token_groups: EnumFragment | None = None
+        self.cute_gdn_recurrence_mma_m: EnumFragment | None = None
+        # Each fragment is the union over the admitted dstate tiles;
+        # ``normalize`` re-validates a config's values against the tile its
+        # ``block_sizes`` entry for ``value_block_id`` selects: the tcgen05 M
+        # per (tile, epilogue warps), the ring depth per (tile, M) and the
+        # token groups per (tile, epilogue warps, M).
+        self.cute_gdn_recurrence_value_block_id: int | None = None
+        self.cute_gdn_recurrence_mma_m_choices_by_tile: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
+        self.cute_gdn_recurrence_stage_choices_by_tile: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
+        self.cute_gdn_recurrence_token_group_choices_by_tile: dict[
+            tuple[int, int, int], tuple[int, ...]
+        ] = {}
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
@@ -2223,6 +2257,133 @@ class ConfigSpec:
         )
         self.cute_chunk_recurrence_register_cap = EnumFragment(
             choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
+        )
+
+    def enable_cute_gdn_recurrence_search(
+        self,
+        *,
+        value_block_id: int,
+        stage_choices_by_tile: Mapping[tuple[int, int], Sequence[int]],
+        epilogue_warp_choices: Sequence[int],
+        mma_m_choices_by_tile: Mapping[tuple[int, int], Sequence[int]],
+        token_group_choices_by_tile: Mapping[tuple[int, int, int], Sequence[int]],
+    ) -> None:
+        """Expose the gdn recurrence TMA ring depth, epilogue warp count,
+        tcgen05 M and token group count.
+
+        ``mma_m_choices_by_tile`` maps every (dstate tile, epilogue warps)
+        pair the planner lowers (the candidate tiles first, then the wider
+        admitted tiles the ``block_sizes`` search reaches for a
+        non-power-of-two dstate) to its legal MMA heights, preferred first;
+        ``stage_choices_by_tile`` maps every (tile, M) pair to its legal ring
+        depths and ``token_group_choices_by_tile`` every (tile, warps, M)
+        triple to its pipelined token groups.  Each search domain is the
+        union of its map's values so each per-tile seed is legal as written,
+        and :meth:`normalize` re-validates the values against the selected
+        tile: a defaulted value follows the tile, an explicit value the tile
+        cannot take is rejected.
+        """
+
+        mma_m_choices: list[int] = []
+        for choices in mma_m_choices_by_tile.values():
+            for mma_m in choices:
+                if mma_m not in mma_m_choices:
+                    mma_m_choices.append(mma_m)
+        stage_choices: list[int] = []
+        for choices in stage_choices_by_tile.values():
+            for stages in choices:
+                if stages not in stage_choices:
+                    stage_choices.append(stages)
+        group_choices: list[int] = []
+        for choices in token_group_choices_by_tile.values():
+            for groups in choices:
+                if groups not in group_choices:
+                    group_choices.append(groups)
+        if (
+            not stage_choices
+            or not epilogue_warp_choices
+            or not mma_m_choices
+            or not group_choices
+        ):
+            raise ValueError("gdn recurrence search requires at least one choice")
+        self.cute_gdn_recurrence_value_block_id = value_block_id
+        self.cute_gdn_recurrence_mma_m_choices_by_tile = {
+            tile: tuple(choices) for tile, choices in mma_m_choices_by_tile.items()
+        }
+        # The full 128-row tile leads the domain: it is legal for every
+        # tile, so a config that leaves the knob out keeps the full MMA.
+        self.cute_gdn_recurrence_mma_m = EnumFragment(
+            choices=tuple(sorted(mma_m_choices, reverse=True))
+        )
+        self.cute_gdn_recurrence_stage_choices_by_tile = {
+            tile: tuple(choices) for tile, choices in stage_choices_by_tile.items()
+        }
+        self.cute_gdn_recurrence_stages = EnumFragment(choices=tuple(stage_choices))
+        self.cute_gdn_recurrence_epilogue_warps = EnumFragment(
+            choices=tuple(epilogue_warp_choices)
+        )
+        self.cute_gdn_recurrence_token_group_choices_by_tile = {
+            tile: tuple(choices)
+            for tile, choices in token_group_choices_by_tile.items()
+        }
+        self.cute_gdn_recurrence_token_groups = EnumFragment(
+            choices=tuple(group_choices)
+        )
+
+    def _cute_gdn_recurrence_tile_of(self, config: dict[str, object]) -> int | None:
+        """The dstate tile ``config`` selects, or ``None`` when the gdn knobs
+        are off or ``config`` carries no dstate tile."""
+
+        block_id = self.cute_gdn_recurrence_value_block_id
+        if self.cute_gdn_recurrence_stages is None or block_id is None:
+            return None
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            return None
+        return self.block_sizes.config_get(cast("list[int]", block_sizes), block_id)
+
+    def _cute_gdn_recurrence_mma_m_choices_for(
+        self, config: dict[str, object]
+    ) -> tuple[int, ...] | None:
+        """Legal gdn tcgen05 M values for the dstate tile and epilogue warp
+        count ``config`` selects; ``None`` when the knob is off or the pair
+        is one the planner declines (the kernel then takes the SIMT lowering
+        and the knob is inert)."""
+
+        block_size = self._cute_gdn_recurrence_tile_of(config)
+        warps = config.get(CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY)
+        if block_size is None or type(warps) is not int:
+            return None
+        return self.cute_gdn_recurrence_mma_m_choices_by_tile.get((block_size, warps))
+
+    def _cute_gdn_recurrence_stage_choices_for(
+        self, config: dict[str, object]
+    ) -> tuple[int, ...] | None:
+        """Legal gdn ring depths for the dstate tile and tcgen05 M ``config``
+        selects; ``None`` when the knob is off or the pair is one the planner
+        declines.  Every pair the planner lowers has an entry, so a depth
+        accepted here never fails at codegen."""
+
+        block_size = self._cute_gdn_recurrence_tile_of(config)
+        mma_m = config.get(CUTE_GDN_RECURRENCE_MMA_M_KEY)
+        if block_size is None or type(mma_m) is not int:
+            return None
+        return self.cute_gdn_recurrence_stage_choices_by_tile.get((block_size, mma_m))
+
+    def _cute_gdn_recurrence_token_group_choices_for(
+        self, config: dict[str, object]
+    ) -> tuple[int, ...] | None:
+        """Legal gdn token groups for the dstate tile, epilogue warp count and
+        tcgen05 M ``config`` selects; ``None`` when the knob is off or the
+        triple is one the planner declines."""
+
+        block_size = self._cute_gdn_recurrence_tile_of(config)
+        warps = config.get(CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY)
+        mma_m = config.get(CUTE_GDN_RECURRENCE_MMA_M_KEY)
+        if block_size is None or type(warps) is not int or type(mma_m) is not int:
+            return None
+        return self.cute_gdn_recurrence_token_group_choices_by_tile.get(
+            (block_size, warps, mma_m)
         )
 
     def enable_cute_flash_bwd_search(
@@ -3488,6 +3649,31 @@ class ConfigSpec:
                     "for matched BT16 chunk-recurrence kernels"
                 )
 
+        for gdn_key, gdn_fragment in (
+            (CUTE_GDN_RECURRENCE_STAGES_KEY, self.cute_gdn_recurrence_stages),
+            (
+                CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+                self.cute_gdn_recurrence_epilogue_warps,
+            ),
+            (
+                CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+                self.cute_gdn_recurrence_token_groups,
+            ),
+            (CUTE_GDN_RECURRENCE_MMA_M_KEY, self.cute_gdn_recurrence_mma_m),
+        ):
+            if (
+                gdn_key in config
+                and gdn_fragment is None
+                and self.supports_config_key(gdn_key)
+            ):
+                if _fix_invalid:
+                    config.pop(gdn_key)
+                else:
+                    raise InvalidConfig(
+                        f"{gdn_key} is available only for matched gated-delta-rule "
+                        "chunk-recurrence kernels"
+                    )
+
         if (
             CUTE_CHUNK_PREPARE_SCHEDULE_KEY in config
             and self.cute_chunk_prepare_schedule is None
@@ -4136,6 +4322,80 @@ class ConfigSpec:
                         f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} must be None for "
                         f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY}=2 because the "
                         "TMEM schedule dynamically reallocates registers"
+                    )
+        gdn_stages_supplied = CUTE_GDN_RECURRENCE_STAGES_KEY in config
+        gdn_groups_supplied = CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY in config
+        gdn_mma_m_supplied = CUTE_GDN_RECURRENCE_MMA_M_KEY in config
+        for gdn_key, gdn_fragment in (
+            (CUTE_GDN_RECURRENCE_STAGES_KEY, self.cute_gdn_recurrence_stages),
+            (
+                CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+                self.cute_gdn_recurrence_epilogue_warps,
+            ),
+            (
+                CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+                self.cute_gdn_recurrence_token_groups,
+            ),
+            (CUTE_GDN_RECURRENCE_MMA_M_KEY, self.cute_gdn_recurrence_mma_m),
+        ):
+            if gdn_fragment is None:
+                continue
+            gdn_value = config.setdefault(gdn_key, gdn_fragment.default())
+            if type(gdn_value) is not int or gdn_value not in gdn_fragment.choices:
+                if _fix_invalid:
+                    config[gdn_key] = gdn_fragment.default()
+                else:
+                    raise InvalidConfig(
+                        f"{gdn_key} must be one of {gdn_fragment.choices!r}, got "
+                        f"{gdn_value!r}"
+                    )
+        # The tcgen05 M follows the tile and warps, the ring depth the tile
+        # and M, the token groups all three: validate in that order.
+        gdn_tile_mma_m_choices = self._cute_gdn_recurrence_mma_m_choices_for(config)
+        if gdn_tile_mma_m_choices is not None:
+            gdn_mma_m = config[CUTE_GDN_RECURRENCE_MMA_M_KEY]
+            if gdn_mma_m not in gdn_tile_mma_m_choices:
+                # A defaulted MMA height follows the selected tile and warps;
+                # only an explicit height they cannot take is an error.
+                if _fix_invalid or not gdn_mma_m_supplied:
+                    config[CUTE_GDN_RECURRENCE_MMA_M_KEY] = gdn_tile_mma_m_choices[0]
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_GDN_RECURRENCE_MMA_M_KEY} must be one of "
+                        f"{gdn_tile_mma_m_choices!r} for the selected dstate "
+                        f"tile and epilogue warps, got {gdn_mma_m!r}"
+                    )
+        gdn_tile_stage_choices = self._cute_gdn_recurrence_stage_choices_for(config)
+        if gdn_tile_stage_choices is not None:
+            gdn_stages = config[CUTE_GDN_RECURRENCE_STAGES_KEY]
+            if gdn_stages not in gdn_tile_stage_choices:
+                # A depth left to the default follows the selected tile; only
+                # an explicit depth the tile cannot hold is an error.
+                if _fix_invalid or not gdn_stages_supplied:
+                    config[CUTE_GDN_RECURRENCE_STAGES_KEY] = gdn_tile_stage_choices[0]
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_GDN_RECURRENCE_STAGES_KEY} must be one of "
+                        f"{gdn_tile_stage_choices!r} for the selected dstate "
+                        f"tile, got {gdn_stages!r}"
+                    )
+        gdn_tile_group_choices = self._cute_gdn_recurrence_token_group_choices_for(
+            config
+        )
+        if gdn_tile_group_choices is not None:
+            gdn_groups = config[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY]
+            if gdn_groups not in gdn_tile_group_choices:
+                # A defaulted group count follows the selected tile and warps;
+                # only an explicit count they cannot split is an error.
+                if _fix_invalid or not gdn_groups_supplied:
+                    config[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY] = (
+                        gdn_tile_group_choices[0]
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY} must be one of "
+                        f"{gdn_tile_group_choices!r} for the selected dstate "
+                        f"tile and epilogue warps, got {gdn_groups!r}"
                     )
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
@@ -5230,6 +5490,18 @@ class ConfigSpec:
                 fields[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = (
                     self.cute_chunk_recurrence_register_cap
                 )
+            if self.cute_gdn_recurrence_stages is not None:
+                fields[CUTE_GDN_RECURRENCE_STAGES_KEY] = self.cute_gdn_recurrence_stages
+            if self.cute_gdn_recurrence_epilogue_warps is not None:
+                fields[CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY] = (
+                    self.cute_gdn_recurrence_epilogue_warps
+                )
+            if self.cute_gdn_recurrence_token_groups is not None:
+                fields[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY] = (
+                    self.cute_gdn_recurrence_token_groups
+                )
+            if self.cute_gdn_recurrence_mma_m is not None:
+                fields[CUTE_GDN_RECURRENCE_MMA_M_KEY] = self.cute_gdn_recurrence_mma_m
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
