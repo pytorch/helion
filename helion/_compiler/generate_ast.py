@@ -2361,6 +2361,10 @@ def generate_ast(
                         "direct_strides_name",
                         "scale_name",
                         "m_extent_name",
+                        "epi_aux0_name",
+                        "epi_aux1_name",
+                        "epi_aux2_name",
+                        "epi_aux3_name",
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))

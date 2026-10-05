@@ -834,6 +834,14 @@ def _append_cute_wrapper_plan(
                     ),
                 ]
             )
+        # Fused row-epilogue inputs share O's (S, D, B) view so the device body
+        # can partition them exactly like the O store.
+        epi_aux_count = plan_int("epi_aux_count", default=0)
+        for index in range(epi_aux_count):
+            aux_idx = plan_int(f"epi_aux{index}_idx")
+            flash_lines.append(
+                f"_flash_mEpiAux{index} = cute.make_tensor(arg{aux_idx}.iterator, {sdb})"
+            )
         if pass_dynamic_tile_counts:
             flash_lines.extend(
                 [
@@ -944,6 +952,7 @@ def _append_cute_wrapper_plan(
             call_args.extend(["_flash_tma_o", "_flash_osl"])
         elif epi_stg:
             call_args.append("_flash_osl")
+        call_args.extend(f"_flash_mEpiAux{index}" for index in range(epi_aux_count))
         return
     if kind == "helion_flash_bwd" and plan.get("two_cta"):
         # 2-CTA cluster variant (FA4 SM100 backward layout): all M-widened

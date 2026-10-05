@@ -12574,9 +12574,12 @@ class TestCuteAutotuner(TestCase):
         self.assertTrue(set(cute_flash.FLASH_CONFIG_KEYS).isdisjoint(mm_keys))
 
     def test_cute_flash_two_cta_uses_general_softmax_register_search(self) -> None:
+        from helion._compiler.cute.cute_flash import _FLASH_SOFTMAX_REGS_VALUES
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
         from helion._compiler.cute.cute_flash import flash_autotune_fragments
 
+        general = set(_FLASH_SOFTMAX_REGS_VALUES)
+        self.assertLessEqual({176, 184, 192, 200}, general)
         for num_kv in (512, 1536, 2048):
             with self.subTest(num_kv=num_kv):
                 fragment = flash_autotune_fragments(
@@ -12587,10 +12590,8 @@ class TestCuteAutotuner(TestCase):
                     standard_dense_output=True,
                     pipeline_family_override="fa4_2cta",
                 )[FLASH_SOFTMAX_REGS_KEY]
-                self.assertEqual(
-                    set(fragment.search_choices or ()), {176, 184, 192, 200}
-                )
-                self.assertLessEqual({176, 184, 192, 200}, set(fragment.choices))
+                self.assertEqual(set(fragment.search_choices or ()), general)
+                self.assertLessEqual(general, set(fragment.choices))
 
 
 @onlyBackends(["triton"])

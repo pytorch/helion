@@ -325,9 +325,10 @@ def _emit_output_epilogue_route_source(route: str, output_epilogue: str | None) 
     (
         ("identity", True),
         ("relu", True),
-        ("relu_to_fp16", False),
-        ("relu_after_bf16", False),
-        ("abs", False),
+        # Row-local programs (casts, abs) lower through the fused row epilogue.
+        ("relu_to_fp16", True),
+        ("relu_after_bf16", True),
+        ("abs", True),
     ),
 )
 def test_bfloat16_output_epilogue_flash_matcher(
