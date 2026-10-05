@@ -162,7 +162,7 @@ jobs:
       # Not cached: ~/.triton/{llvm,json,nvidia} is ~1.5GB, and restoring it
       # from the GitHub cache on linux.dgx.b200 stalls at 120MiB every time,
       # so the job paid for a failed download and a rejected re-upload and
-      # rebuilt Triton anyway. See #3878 before adding actions/cache back.
+      # rebuilt Triton anyway. See #3799 before adding actions/cache back.
       - name: Install Triton from source
         if: matrix.triton-pin != ''
         run: |
