@@ -1177,6 +1177,61 @@ def _tcgen05_tma_destination_is_legal(
     ) == expected_major and _tcgen05_tma_tensor_is_aligned(env, tensor)
 
 
+def host_function_matmul_operands_tma_provable(
+    env: CompileEnvironment, host_function: HostFunction
+) -> bool:
+    """Return False when any MMA candidate operand fails the TMA alignment proof.
+
+    The tcgen05 flat-role / TVM-FFI direct-entry seed hard-requires the TMA
+    A/B pipeline, which ``_emit_mma_pipeline`` only enables when both operands
+    pass ``_tcgen05_tma_operand_is_aligned``. The matmul plan facts alone
+    cannot see this: an input whose base pointer or outer byte stride is not a
+    16-byte multiple keeps the scalar SMEM producers, so the seed config would
+    be rejected at codegen. ``CuteTcgen05ClusterM2FfiHeuristic.register_facts``
+    evaluates the same operand proof at bind time so the seed stays ineligible
+    for such kernels.
+
+    The proof reads the immutable bound alignment facts, which the runtime
+    records only after seed registration. While the bound kernel's runtime
+    argument values are active, classify them into a temporary snapshot and
+    restore the prior one afterwards (the cache-managed binding records its
+    facts on the first call and must find them empty); a later regeneration
+    without active values reads the recorded facts. Pointer-preserving host
+    views are thereby proven exactly as codegen proves them, through their
+    input's recorded base alignment.
+
+    The facts hooks run both under the binding's active environment and
+    outside any (``compiler_seed_configs`` called directly), while the MMA
+    analysis reads the current one, so ``env`` is entered when none is active.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    device_ir = host_function.device_ir
+    saved = env.bound_runtime_input_specialization_results
+    with contextlib.ExitStack() as stack:
+        if CompileEnvironment.has_current():
+            assert CompileEnvironment.current() is env
+        else:
+            stack.enter_context(env)
+        try:
+            if env.runtime_arg_values_by_name:
+                env.snapshot_runtime_input_specialization_results(
+                    env.runtime_arg_values_by_name
+                )
+            with host_function:
+                for graph_info in device_ir.graphs:
+                    for node in graph_info.graph.nodes:
+                        candidate = analyze_cute_mma_node(node, device_ir=device_ir)
+                        if candidate is None:
+                            continue
+                        for operand in (candidate.operands.lhs, candidate.operands.rhs):
+                            if not _tcgen05_tma_operand_is_aligned(env, operand):
+                                return False
+        finally:
+            env.bound_runtime_input_specialization_results = saved
+        return True
+
+
 def _compose_axis_orders(
     source_to_logical: tuple[int, ...],
     logical_to_target: tuple[int, ...],
@@ -6050,6 +6105,9 @@ def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
             )
             + "\n"
         )
+    # The try token is only pre-initialised on the pipelined branch, so this
+    # builder must bind it itself (mirroring the pipelined consumer) or the
+    # generated kernel hits a NameError on consumer_wait.
     full_body = (
         f"{scalar_tma_src}"
         f"if {args.exec_active}:\n"
