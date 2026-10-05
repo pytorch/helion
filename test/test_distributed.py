@@ -1438,11 +1438,11 @@ class TestDistributedTileDependencies(TestCase):
             ("R3", torch.float32, "use peer_counter (R3:"),
             ("R4", torch.float32, "use peer_counter (R4:"),
             ("R6", torch.float32, "use peer_counter (R6:"),
-            # Exactly 4 MiB per rank stays inband; 2 ranks * 2**19 words does not.
+            # Exactly 32 MiB per rank stays inband; 2 ranks * 2**22 words does not.
             ("cap", torch.float32, "use inband"),
             ("R7", torch.float32, "use peer_counter (R7:"),
         ):
-            n = {"cap": (1 << 22) // (8 * world), "R7": 1 << 19}.get(broken_rule, 256)
+            n = {"cap": (1 << 25) // (8 * world), "R7": 1 << 22}.get(broken_rule, 256)
             symm, x = torch.zeros(2, n, device=DEVICE, dtype=dtype)
             with (
                 self.subTest(broken_rule=broken_rule, dtype=dtype),
