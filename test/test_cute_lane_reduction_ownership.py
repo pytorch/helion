@@ -482,6 +482,32 @@ def test_owned_marker_cannot_use_an_unproved_direct_restore() -> None:
         lanes._restore_per_lane_markers(loop, [(1, marker)])
 
 
+def test_strided_restore_marker_is_finalized_per_lane() -> None:
+    # A device-lane-loop marker whose body kept the per-element strided
+    # semantics is finalized across the thread group in place when the
+    # two-pass split is refused, instead of rejecting the config.
+    text = lanes._lane_reduce_marker_expr(
+        "partial",
+        "sum",
+        "cutlass.Float32(0)",
+        32,
+        owner_lane="lane",
+        strided_restore=True,
+    )
+    loop = lanes._create_lane_loop(
+        "lane", 8, _body(f"partial = lane + 1\nreduced = {text}")
+    )
+    marker = lanes._is_lane_reduce_marker_assign(loop.body[1])
+    assert marker is not None
+    assert marker.owner_lane == "lane"
+    assert marker.strided_restore
+    restored = lanes._restore_per_lane_markers(loop, [(1, marker)])
+    source = _source(list(restored.body))
+    assert "_helion_lane_reduce" not in source
+    assert "warp_reduction_sum" in source
+    assert "reduced = " in source
+
+
 @pytest.mark.parametrize("guarded", [False, True])
 @pytest.mark.parametrize("dependent", [False, True])
 def test_ordinary_owner_proof_does_not_change_supported_split(

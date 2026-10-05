@@ -712,9 +712,16 @@ def _cute_seed_vec_width(
         # Reduction extent barely fits in one wide chunk; vec wouldn't
         # remove enough loop iters to matter.
         return 1
-    # Find the dtype of the reduction-source tensor by walking nodes
-    # that have a fake-tensor value matching the reduction extent.
-    dtype: torch.dtype | None = None
+    return _cute_tile_seed_vec_width_for_dtype(
+        _cute_seed_reduction_dtype(rl_spec, device_ir)
+    )
+
+
+def _cute_seed_reduction_dtype(
+    rl_spec: ReductionLoopSpec, device_ir: DeviceIR
+) -> torch.dtype | None:
+    """Find the dtype of the reduction-source tensor by walking nodes that
+    have a fake-tensor value matching the reduction extent."""
     rdim_size = rl_spec.size_hint
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
@@ -722,15 +729,8 @@ def _cute_seed_vec_width(
             if isinstance(val, torch.Tensor) and val.ndim >= 1:
                 last = val.shape[-1]
                 if isinstance(last, int) and last == rdim_size:
-                    dtype = val.dtype
-                    break
-        if dtype is not None:
-            break
-    if dtype is torch.float32:
-        return 4
-    if dtype in (torch.float16, torch.bfloat16):
-        return 8
-    return 1
+                    return val.dtype
+    return None
 
 
 class CuteReductionTileHeuristic(AutotunerHeuristic):
@@ -743,6 +743,13 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
     row per block so the reduction recruits all available threads, and
     the two-pass load fusion (helion/_compiler/cute/fuse_two_pass_loads.py)
     eliminates the redundant gmem reload of x in the post-reduction sweep.
+
+    A persistent row whose static extent is a power of two additionally
+    seeds the one-vector-per-thread layout: ``N / V`` threads (a multiple of
+    32) each own one 16-byte fragment and the per-thread V-folds are combined
+    once with the cross-warp two-stage shared reduce.  For a 1024-wide bf16
+    row that is a 128-thread CTA issuing one LDG.128 per thread (the Triton
+    kernel's shape) instead of 1024 threads loading one scalar each.
     """
 
     name = "cute_reduction_tile"
@@ -777,6 +784,64 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
                 spec.cute_vector_widths, {rl_spec.block_id: vec}
             )
         return Config(**seed)
+
+    @classmethod
+    def multiwarp_vector_row_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        """One 16-byte vector per thread across a warp-aligned CTA.
+
+        ``PersistentReductionStrategy`` applies ``cute_vector_widths`` only when
+        V exactly covers each thread's slice, so the layout needs
+        ``num_threads = N / V`` on the reduction block.  Requires a persistent
+        (unrolled) static power-of-two extent -- a dynamic extent is masked and
+        never vectorized, whatever its size hint -- and at least one full warp
+        of threads.
+        """
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        block_id = rl_spec.block_id
+        numel = env.block_sizes[block_id].numel
+        if not numel.is_Integer:
+            return None
+        extent = int(numel)
+        if (
+            extent > max_threads
+            or extent & (extent - 1)
+            or block_id not in spec.num_threads.valid_block_ids()
+            or block_id not in spec.cute_vector_widths.valid_block_ids()
+        ):
+            return None
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_seed_reduction_dtype(rl_spec, device_ir)
+        )
+        if vec <= 1 or extent % vec:
+            return None
+        threads = extent // vec
+        if threads < 32 or threads % 32:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": _seq_config_list(spec.num_threads, {block_id: threads}),
+            "reduction_loops": [None],
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {block_id: vec}
+            ),
+        }
+        return Config(**seed)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        alternate = cls.multiwarp_vector_row_seed_config(env, device_ir)
+        if alternate is None or alternate == primary:
+            return [primary]
+        return [primary, alternate]
 
 
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:

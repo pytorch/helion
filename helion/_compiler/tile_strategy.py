@@ -186,6 +186,8 @@ def _lane_reduce_marker_expr(
     group_cluster_n: int = 1,
     owner_lane: str | None = None,
     matmul_contribution: bool = False,
+    strided_restore: bool = False,
+    shared_lane_expr: str = "",
 ) -> str:
     # ``group_*`` (optional) carry the parameters of a strided grouped
     # reduction. They are required when the reduction's live thread axis is
@@ -197,12 +199,32 @@ def _lane_reduce_marker_expr(
     # the finalize uses ``_cute_grouped_reduce_warp``. When ``group_span > 32``
     # (and a multiple of 32) the reduction group is spread across warps, so the
     # finalize uses the cross-warp ``_cute_grouped_reduce_shared_two_stage``;
-    # ``group_count`` (the number of independent groups in the CTA) is needed
-    # only by that two-stage helper.
+    # ``group_count`` (the number of independent groups) is needed only by
+    # that two-stage helper.
+    #
+    # ``group_lane_expr`` must stay a static linear combination of
+    # ``thread_idx()`` coordinates: the post-pass parses it to recover the
+    # reduce axis and to decide which consume stores need an owner predicate.
+    # ``shared_lane_expr`` (optional) is a different lane expression that only
+    # keys the two-stage helper's shared memory, e.g. the full runtime thread
+    # id when a redundant thread axis may still be mapped later in codegen;
+    # ``group_count`` then counts the groups of that keying.
+    # Trailing positional arguments, each filled when a later one is present:
+    # owner_lane, matmul_contribution, strided_restore, shared_lane_expr.
     owner = f", {owner_lane!r}" if owner_lane is not None else ""
     if matmul_contribution:
         assert owner_lane is not None and reduction_type == "sum"
-        owner += ", True"
+    if matmul_contribution or strided_restore or shared_lane_expr:
+        assert owner_lane is not None
+        owner += f", {matmul_contribution!s}"
+    if strided_restore or shared_lane_expr:
+        # strided_restore: the consumers keep the per-element strided semantics
+        # (their own carries accumulate the lanes), so an unsplittable loop may
+        # finalize this lane's raw input across the thread group instead of
+        # failing.
+        owner += f", {strided_restore!s}"
+    if shared_lane_expr:
+        owner += f", {shared_lane_expr!r}"
     return (
         f"{_HELION_LANE_REDUCE_MARKER}({input_name}, {reduction_type!r}, "
         f"{identity_expr}, {threads_in_group}, {group_pre}, {group_span}, "
@@ -242,6 +264,16 @@ class _LaneReduceMarker:
     # Emitted only for the product side of a scalar matmul contraction. The
     # accumulator/rescale is deliberately outside this complete sum.
     matmul_contribution: bool = False
+    # True when the loop body still carries the per-element strided semantics
+    # (the reduction's consumers accumulate the lanes themselves), so a lane
+    # loop that cannot be split may finalize this lane's raw input across the
+    # thread group in place instead of rejecting the config.
+    strided_restore: bool = False
+    # Optional lane expression that keys the cross-warp two-stage helper's
+    # shared memory instead of ``group_lane_expr`` (which stays the static
+    # expression the ownership analysis parses). Used to key on the full
+    # runtime thread id so redundant thread axes get their own slots.
+    shared_lane_expr: str = ""
 
     def finalize_expr(self, reduced: str) -> str:
         return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
@@ -286,7 +318,7 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
     if not isinstance(target, ast.Name):
         return None
     call = _find_lane_reduce_call(stmt.value)
-    if call is None or len(call.args) not in (8, 9, 10, 11):
+    if call is None or len(call.args) not in (8, 9, 10, 11, 12, 13):
         return None
     (
         input_node,
@@ -305,11 +337,17 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         raise exc.BackendUnsupported("cute", "invalid reduction lane owner")
     input_name = ast.unparse(input_node)
     reduction_type = ast.literal_eval(type_node)
-    matmul_contribution = ast.literal_eval(rest[2]) if len(rest) == 3 else False
+    matmul_contribution = ast.literal_eval(rest[2]) if len(rest) >= 3 else False
     if type(matmul_contribution) is not bool or (
         matmul_contribution and (owner_lane is None or reduction_type != "sum")
     ):
         raise exc.BackendUnsupported("cute", "invalid matmul contribution marker")
+    strided_restore = ast.literal_eval(rest[3]) if len(rest) >= 4 else False
+    if type(strided_restore) is not bool or (strided_restore and owner_lane is None):
+        raise exc.BackendUnsupported("cute", "invalid strided restore marker")
+    shared_lane_expr = ast.literal_eval(rest[4]) if len(rest) == 5 else ""
+    if not isinstance(shared_lane_expr, str):
+        raise exc.BackendUnsupported("cute", "invalid reduction shared lane")
     identity_expr = ast.unparse(identity_node)
     threads_in_group = int(ast.literal_eval(threads_node))
     group_pre = int(ast.literal_eval(group_pre_node))
@@ -334,6 +372,8 @@ def _is_lane_reduce_marker_assign(stmt: ast.AST) -> _LaneReduceMarker | None:
         group_cluster_n=group_cluster_n,
         owner_lane=owner_lane,
         matmul_contribution=matmul_contribution,
+        strided_restore=strided_restore,
+        shared_lane_expr=shared_lane_expr,
     )
 
 
@@ -488,12 +528,15 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
     if m.group_span > 32 and m.group_span % 32 == 0 and m.group_lane_expr:
         # Cross-warp: the reduce group is spread across warps, so fold the
         # per-lane accumulator with the two-stage shared-memory reduction.
+        # The helper keys its shared memory on ``shared_lane_expr`` when the
+        # emitter provided one (the full runtime thread id); the ownership
+        # analysis above kept using the static ``group_lane_expr``.
         stmts = _grouped_two_stage_reduce_stmts(
             f"{acc_var}_reduced",
             m.reduction_type,
             acc_var,
             m.identity_expr,
-            m.group_lane_expr,
+            m.shared_lane_expr or m.group_lane_expr,
             pre=m.group_pre,
             group_span=m.group_span,
             group_count=m.group_count,
@@ -517,6 +560,18 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
             group_span=m.group_span,
         )
     elif m.threads_in_group > 1:
+        if m.threads_in_group > 32:
+            # ``warp_reduction_*`` shuffles within one warp only; a wider
+            # consecutive-lane group must arrive here with cross-warp group
+            # params (``group_span`` a multiple of 32) instead of silently
+            # summing only the first warp.
+            from .. import exc
+
+            raise exc.BackendUnsupported(
+                "cute",
+                "lane reduction across more than one warp requires the "
+                f"cross-warp grouped finalize (threads={m.threads_in_group})",
+            )
         reduced = _warp_reduce_expr(m.reduction_type, acc_var, m.threads_in_group)
     else:
         reduced = acc_var
@@ -3189,22 +3244,36 @@ def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
 def _restore_per_lane_markers(
     loop: ast.For, markers: list[tuple[int, _LaneReduceMarker]]
 ) -> ast.For:
-    """Restore legacy markers only; raw inputs do not complete owned reductions.
+    """Keep the lane loop whole when a two-pass split is unsafe.
 
     A carry or unduplicatable producer explains why a split is unsafe, not why
-    its reduction can be omitted. Production markers denote a full reduction
-    over the owning serial lane and physical thread group. The interchange
-    proof removes its already-materialized marker consumers separately.
+    its reduction can be omitted. A legacy marker's input is finalized in
+    place. A production marker denotes a full reduction over the owning serial
+    lane and physical thread group, which a raw per-lane input cannot complete
+    -- except for ``strided_restore`` markers, whose loop body kept the
+    per-element strided semantics: their consumers accumulate the lanes
+    themselves, so finalizing this lane's raw input across the thread group
+    (the strided form the split was going to replace) is a complete lowering.
+    The interchange proof removes its already-materialized marker consumers
+    separately.
     """
-    if any(marker.owner_lane is not None for _, marker in markers):
+    if any(
+        marker.owner_lane is not None and not marker.strided_restore
+        for _, marker in markers
+    ):
         raise exc.BackendUnsupported(
             "cute", "owned lane reduction has no proved complete per-lane restore"
         )
     body = list(loop.body)
-    for idx, m in markers:
-        body[idx] = statement_from_string(
-            f"{m.result_var} = {m.finalize_expr(m.input_name)}"
-        )
+    for idx, m in sorted(markers, key=operator.itemgetter(0), reverse=True):
+        if m.owner_lane is None:
+            body[idx] = statement_from_string(
+                f"{m.result_var} = {m.finalize_expr(m.input_name)}"
+            )
+        else:
+            body[idx : idx + 1] = cast(
+                "list[ast.stmt]", _finalize_lane_reduce_marker(m, m.input_name)
+            )
     loop.body = body
     return loop
 
