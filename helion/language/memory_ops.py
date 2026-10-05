@@ -339,6 +339,42 @@ def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
     return None
 
 
+def _cute_resolve_active_slice_block_id(
+    state: CodegenState, size: object, used_block_ids: set[int]
+) -> int | None:
+    """Resolve the same slice axis for pointer arithmetic and atomic ownership."""
+    env = CompileEnvironment.current()
+    active_candidates = [
+        block_id
+        for block_id in _matching_block_ids(env, size)
+        if _cute_active_index_var(state, block_id) is not None
+    ]
+    active_unused_candidates = [
+        block_id for block_id in active_candidates if block_id not in used_block_ids
+    ]
+    if len(active_unused_candidates) == 1:
+        return active_unused_candidates[0]
+    if len(active_candidates) == 1:
+        return active_candidates[0]
+    if len(active_unused_candidates) > 1:
+        reduction_unused = [
+            block_id
+            for block_id in active_unused_candidates
+            if env.block_sizes[block_id].reduction
+        ]
+        if len(reduction_unused) == 1:
+            return reduction_unused[0]
+    if len(active_candidates) > 1:
+        reduction_active = [
+            block_id
+            for block_id in active_candidates
+            if env.block_sizes[block_id].reduction
+        ]
+        if len(reduction_active) == 1:
+            return reduction_active[0]
+    return None
+
+
 def _cute_active_mask_var(state: CodegenState, block_id: int) -> str | None:
     if _cute_index_override(state, block_id) is not None:
         return None
@@ -580,41 +616,6 @@ def _cute_index_exprs(
             return grid_state.strategy.index_var(block_id)
         return None
 
-    def resolve_active_slice_block_id(
-        size: object,
-        used_block_ids: set[int],
-    ) -> int | None:
-        candidates = _matching_block_ids(env, size)
-        active_candidates = [
-            block_id
-            for block_id in candidates
-            if active_index_var(block_id) is not None
-        ]
-        active_unused_candidates = [
-            block_id for block_id in active_candidates if block_id not in used_block_ids
-        ]
-        if len(active_unused_candidates) == 1:
-            return active_unused_candidates[0]
-        if len(active_candidates) == 1:
-            return active_candidates[0]
-        if len(active_unused_candidates) > 1:
-            reduction_unused = [
-                block_id
-                for block_id in active_unused_candidates
-                if env.block_sizes[block_id].reduction
-            ]
-            if len(reduction_unused) == 1:
-                return reduction_unused[0]
-        if len(active_candidates) > 1:
-            reduction_active = [
-                block_id
-                for block_id in active_candidates
-                if env.block_sizes[block_id].reduction
-            ]
-            if len(reduction_active) == 1:
-                return reduction_active[0]
-        return None
-
     def index_var_for_block_id(block_id: int, size: object) -> str:
         if (idx_var := active_index_var(block_id)) is not None:
             return idx_var
@@ -707,7 +708,9 @@ def _cute_index_exprs(
             if tensor is None:
                 raise exc.BackendUnsupported("cute", "slice indexing without tensor")
             dim_size = tensor.shape[tensor_dim]
-            block_id = resolve_active_slice_block_id(dim_size, used_block_ids)
+            block_id = _cute_resolve_active_slice_block_id(
+                state, dim_size, used_block_ids
+            )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
                 assert idx_var is not None
@@ -740,7 +743,9 @@ def _cute_index_exprs(
             dim_size = tensor.shape[tensor_dim]
             slice_size = compute_slice_size(idx, dim_size)
             start = idx.start if idx.start is not None else 0
-            block_id = resolve_active_slice_block_id(slice_size, used_block_ids)
+            block_id = _cute_resolve_active_slice_block_id(
+                state, slice_size, used_block_ids
+            )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
                 assert idx_var is not None
@@ -750,6 +755,13 @@ def _cute_index_exprs(
                 else:
                     start_expr = state.device_function.literal_expr(start)
                     result.append(f"({start_expr} + {idx_var})")
+                tensor_dim += 1
+                continue
+            if inactive_singleton_slice_expr is not None and env.known_equal(
+                slice_size, 1
+            ):
+                start_expr = state.device_function.literal_expr(start)
+                result.append(f"({start_expr} + {inactive_singleton_slice_expr})")
                 tensor_dim += 1
                 continue
             raise exc.BackendUnsupported(

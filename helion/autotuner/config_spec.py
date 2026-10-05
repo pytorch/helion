@@ -899,6 +899,9 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_pipeline",
+        "cute_flash_bwd_persistent",
+        "cute_flash_bwd_two_cta",
+        "cute_flash_bwd_exp2_f32",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
@@ -5100,6 +5103,15 @@ class ConfigSpec:
                 )
             if self.cute_matmul_min_blocks_search_enabled:
                 fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))
+            if (
+                self.supports_config_key("pid_type")
+                and "pid_type" not in fields
+                and "flat" not in self.allowed_pid_types
+            ):
+                # SIMT normally omits this coordinate and defaults to flat.
+                # Barriers require a persistent launch in the reference and in
+                # every candidate, including after a flatten/unflatten round trip.
+                fields["pid_type"] = EnumFragment(self.allowed_pid_types)
             fields.update(self.user_defined_tunables)
             return fields
 

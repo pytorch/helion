@@ -143,6 +143,25 @@ def _scan_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("static_shapes", [False, True])
+def test_grid_writing_container_input_view_registers_alias_guard(
+    static_shapes: bool,
+) -> None:
+    @helion.kernel(backend="cute", static_shapes=static_shapes)
+    def write_view(xs: list[torch.Tensor]) -> torch.Tensor:
+        out = xs[1].view_as(xs[0])
+        for tile in hl.tile(xs[0].numel()):
+            out[tile] = xs[0][tile] + 1
+        return out
+
+    x, y = torch.empty(64), torch.empty(64)
+    bound = write_view.bind(([x, y],))
+    assert _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY in (
+        bound.env.runtime_input_specializations
+    )
+    assert write_view.bind(([x, x.view_as(x)],)) is not bound
+
+
+@pytest.mark.parametrize("static_shapes", [False, True])
 def test_scan_preserves_alias_specialization_and_serial_codegen(
     static_shapes: bool,
 ) -> None:

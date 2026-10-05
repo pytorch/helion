@@ -5611,11 +5611,8 @@ class BlockSizeTileStrategy(TileStrategy):
         reserved_reduction_axes = max(planned_reduction_axes, active_reduction_axes)
         offset = reserved_reduction_axes + active_non_reduction_axes
         tile_axes = set(range(offset, offset + self.thread_axes_used()))
-        executable_reductions = self.fn.tile_strategy.executable_reduction_block_ids()
         for strategy in self.fn.tile_strategy.strategies:
             if not isinstance(strategy, ReductionStrategy):
-                continue
-            if strategy.block_index not in executable_reductions:
                 continue
             if not self.fn.tile_strategy.strategies_can_coexecute(self, strategy):
                 continue
@@ -5632,7 +5629,7 @@ class BlockSizeTileStrategy(TileStrategy):
                 raise exc.BackendUnsupported(
                     env.backend.name,
                     "thread-axis collision: tile blocks "
-                    f"{self.block_ids} and executable reduction block "
+                    f"{self.block_ids} and reduction/slice block "
                     f"{strategy.block_index} both require axis {axes}",
                 )
         return offset

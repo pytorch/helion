@@ -1124,6 +1124,7 @@ def _tcgen05_tma_operand_is_aligned(
     key, including every stride's byte residue. Unproved layouts retain the
     scalar shared-memory producer while keeping native MMA.
     """
+    from .input_view_layout import input_view_copy_facts
     from .memory_ops import tensor_has_specialized_tma_alignment
     from .promote_output_axis import _fresh_tensors
 
@@ -1135,15 +1136,20 @@ def _tcgen05_tma_operand_is_aligned(
         return True
     if env.tensor_input_source(tensor) is not None:
         return tensor_has_specialized_tma_alignment(env, tensor)
-    # Kernel-owned allocations have aligned storage. Neither an unknown
-    # host view nor an ambiguous input can establish that guarantee.
-    if tensor not in _fresh_tensors(HostFunction.current()):
-        return False
-    storage_offset = tensor.storage_offset()
-    if not isinstance(storage_offset, int) or storage_offset != 0:
-        return False
+    if tensor in _fresh_tensors(HostFunction.current()):
+        storage_offset = tensor.storage_offset()
+        if not isinstance(storage_offset, int) or storage_offset != 0:
+            return False
+        strides = tensor.stride()
+    else:
+        # Pointer-preserving host views inherit their input's guarded base
+        # alignment. Their own outer strides must still satisfy TensorMap.
+        facts = input_view_copy_facts(env, tensor)
+        if facts is None:
+            return False
+        strides = facts.strides
     unit_strides = 0
-    for stride in tensor.stride():
+    for stride in strides:
         if isinstance(stride, torch.SymInt):
             expression = env.specialize_expr(env.shape_env.replace(stride._sympy_()))
             if expression.free_symbols:
@@ -6037,6 +6043,8 @@ def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
             "    pass\n"
             if args.skip_consumer_wait
             else (
+                f"    {args.tma_consumer_try_token} = "
+                f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
                 f"    {args.tma_pipeline}.consumer_wait("
                 f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
             )
@@ -7602,19 +7610,35 @@ def _emit_mma_pipeline(
     m_size = int(lhs_m_size)
     n_size = int(rhs_n_size)
 
+    def _operand_gmem_access(
+        operand: _MmaOperandInfo, arg_name: str, logical_indices: tuple[str, ...]
+    ) -> str:
+        source_indices = logical_indices
+        if (order := operand.source_to_logical_order) is not None:
+            # Scalar SMEM producers address the source tensor directly. Undo
+            # the logical permutation just as the TMA descriptor setup does.
+            source_indices = tuple(
+                logical_indices[order.index(dim)] for dim in range(len(order))
+            )
+        return f"{arg_name}[{', '.join(source_indices)}]"
+
     def _lhs_gmem_access(m_expr: str, k_expr: str) -> str:
         if lhs_operand.is_leading_passthrough:
             assert leading_global is not None
-            return f"{lhs_arg_name}[{leading_global}, {m_expr}, {k_expr}]"
-        return f"{lhs_arg_name}[{m_expr}, {k_expr}]"
+            return _operand_gmem_access(
+                lhs_operand, lhs_arg_name, (leading_global, m_expr, k_expr)
+            )
+        return _operand_gmem_access(lhs_operand, lhs_arg_name, (m_expr, k_expr))
 
     def _rhs_gmem_access(k_expr: str, n_expr: str) -> str:
         if rhs_rank3_group_expr is not None:
             return f"{rhs_arg_name}[{rhs_rank3_group_expr}, {n_expr}, {k_expr}]"
         if rhs_operand.is_leading_passthrough:
             assert leading_global is not None
-            return f"{rhs_arg_name}[{leading_global}, {k_expr}, {n_expr}]"
-        return f"{rhs_arg_name}[{k_expr}, {n_expr}]"
+            return _operand_gmem_access(
+                rhs_operand, rhs_arg_name, (leading_global, k_expr, n_expr)
+            )
+        return _operand_gmem_access(rhs_operand, rhs_arg_name, (k_expr, n_expr))
 
     tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
     row_profile = row_union_plan.schedule if row_union_plan is not None else None
@@ -9971,6 +9995,10 @@ def _emit_mma_pipeline(
     mma_phys_n = _mma_active_n_threads(mma_impl)
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
+    if mma_impl == "warp" and tcgen05_cta_thread_count < bm * mma_phys_n:
+        raise exc.BackendUnsupported(
+            "cute", "warp MMA requires enough physical threads for every MMA warp"
+        )
     if tcgen05_grouped_static_persistent and (
         tcgen05_is_two_cta or tcgen05_nm_orientation
     ):
@@ -10609,40 +10637,42 @@ def _emit_mma_pipeline(
             )
         )
         prefix.append(statement_from_string(f"{lane_idx} = cute.arch.lane_idx()"))
-        if tcgen05_use_flat_role_coordinates:
-            mma_role_coordinates = _flat_mma_role_coordinate_plan(
-                lane_idx=lane_idx,
-                warp_idx=warp_idx,
-                mma_active_n_threads=mma_phys_n,
+        if mma_impl == "warp":
+            # Warp MMA instructions require complete physical CUDA warps.
+            # Logical M/N coordinates can permute lanes or include serial
+            # elements, so use the same physical prefix for copies and MMA.
+            mma_tidx_expr = f"{warp_idx} * cutlass.Int32(32) + {lane_idx}"
+            mma_active_expr = (
+                f"{mma_participant_linear} < cutlass.Int32({bm * mma_phys_n})"
             )
+            mma_copy_expr = mma_participant_linear
         else:
-            mma_role_coordinates = _block_axis_mma_role_coordinate_plan(
-                cg,
-                m_block_id=m_block_id,
-                n_block_id=n_block_id,
-                mma_m_thread_extent=mma_physical_m_threads,
-                mma_active_n_threads=mma_phys_n,
-            )
-        prefix.append(
-            statement_from_string(
-                f"{mma_participant_linear} = {mma_role_coordinates.mma_tidx_expr()}"
-            )
-        )
-        prefix.append(
-            statement_from_string(
-                f"{mma_copy_linear} = "
-                + (
-                    mma_participant_linear
-                    if tcgen05_collective_handles_operand_loads
-                    else f"{m_local} + ({n_local}) * cutlass.Int32({bm})"
+            if tcgen05_use_flat_role_coordinates:
+                mma_role_coordinates = _flat_mma_role_coordinate_plan(
+                    lane_idx=lane_idx,
+                    warp_idx=warp_idx,
+                    mma_active_n_threads=mma_phys_n,
                 )
+            else:
+                mma_role_coordinates = _block_axis_mma_role_coordinate_plan(
+                    cg,
+                    m_block_id=m_block_id,
+                    n_block_id=n_block_id,
+                    mma_m_thread_extent=mma_physical_m_threads,
+                    mma_active_n_threads=mma_phys_n,
+                )
+            mma_tidx_expr = mma_role_coordinates.mma_tidx_expr()
+            mma_active_expr = mma_role_coordinates.mma_active_expr()
+            mma_copy_expr = (
+                mma_participant_linear
+                if tcgen05_collective_handles_operand_loads
+                else f"{m_local} + ({n_local}) * cutlass.Int32({bm})"
             )
-        )
         prefix.append(
-            statement_from_string(
-                f"{mma_active} = {mma_role_coordinates.mma_active_expr()}"
-            )
+            statement_from_string(f"{mma_participant_linear} = {mma_tidx_expr}")
         )
+        prefix.append(statement_from_string(f"{mma_copy_linear} = {mma_copy_expr}"))
+        prefix.append(statement_from_string(f"{mma_active} = {mma_active_expr}"))
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
             assert tcgen05_matmul_plan is not None
@@ -13542,10 +13572,8 @@ def _emit_mma_pipeline(
         # sA / sB while a sibling in another warp is still reading the
         # current K tile -- a cross-warp write-after-read hazard that yields
         # nondeterministic wrong values (confirmed via compute-sanitizer
-        # racecheck). The ``warp`` and ``tcgen05`` paths gate both the loads
-        # and the MMA over the same active-thread set (and tcgen05 adds
-        # pipeline/mbarrier ordering), so they never open this cross-warp
-        # window and do not need the barrier here.
+        # racecheck). Warp MMA orders this boundary with a CTA barrier
+        # below; tcgen05 uses its pipeline/mbarrier protocol.
         cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
     else:
         assert mma_active is not None
@@ -13564,6 +13592,9 @@ def _emit_mma_pipeline(
                     f"    cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
                 )
             )
+            # Every participating warp must finish reading this tile before
+            # any warp overwrites shared operands for the next K iteration.
+            cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
         else:
             assert tcgen05_plan is not None
             if not tcgen05_use_separate_mma_exec:

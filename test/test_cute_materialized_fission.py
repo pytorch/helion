@@ -87,6 +87,23 @@ def _pointwise_pair(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _pointwise_pair_with_store_cast(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    rows, columns = x.shape
+    first = torch.empty_like(x)
+    middle = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for row in hl.tile(rows):
+        for column in hl.tile(columns):
+            first[row, column] = x[row, column] + 1
+        for column in hl.tile(columns):
+            middle[row, column] = torch.sigmoid(first[row, column].float())
+            out[row, column] = middle[row, column] * x[row, column]
+    return out, first, middle
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _reload_feeds_dot(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     rows, columns = x.shape
     middle = torch.empty_like(x)
@@ -932,24 +949,42 @@ def test_tcgen05_codegen_preserves_second_stage_wrapper_metadata(
 
 @skipUnlessBackends(["cute"])
 def test_forwarding_keeps_the_materialized_cast_and_store() -> None:
-    bound = _bind(squeeze_and_excitation_net_fwd, *_se_args())
-    ir = bound.host_function.device_ir
-    root = ir.graphs[ir.root_ids[1]].graph
-    stores = [node for node in root.nodes if node.target is memory_ops.store]
-    assert len(stores) == 2
-    materialized, output = stores
-    rounded = materialized.args[2]
-    assert isinstance(rounded, torch.fx.Node)
-    assert rounded.target is torch.ops.prims.convert_element_type.default
-    assert rounded.args[1] is torch.bfloat16
-    product = output.args[2]
-    assert isinstance(product, torch.fx.Node)
-    assert rounded in product.all_input_nodes
-    stored_tensor = _access_tensor(materialized)
-    assert not any(
-        node.target is memory_ops.load and _access_tensor(node) is stored_tensor
-        for node in root.nodes
+    cases = (
+        (squeeze_and_excitation_net_fwd, _se_args()),
+        (
+            _pointwise_pair_with_store_cast,
+            (torch.empty((32, 64), dtype=torch.bfloat16),),
+        ),
     )
+    for kernel, args in cases:
+        bound = _bind(kernel, *args)
+        ir = bound.host_function.device_ir
+        assert len(ir.root_ids) == 2
+        root = ir.graphs[ir.root_ids[1]].graph
+        stores = [node for node in root.nodes if node.target is memory_ops.store]
+        assert len(stores) == 2
+        materialized, output = stores
+        rounded = materialized.args[2]
+        assert isinstance(rounded, torch.fx.Node)
+        assert rounded.meta["val"].dtype is torch.bfloat16
+        if kernel is squeeze_and_excitation_net_fwd:
+            # S&E now rounds the matmul before its low-precision sigmoid.
+            assert rounded.target is torch.ops.aten.sigmoid.default
+            conversion = rounded.args[0]
+            assert isinstance(conversion, torch.fx.Node)
+        else:
+            # Keep coverage for forwarding an explicit terminal store cast.
+            conversion = rounded
+        assert conversion.target is torch.ops.prims.convert_element_type.default
+        assert conversion.args[1] is torch.bfloat16
+        product = output.args[2]
+        assert isinstance(product, torch.fx.Node)
+        assert rounded in product.all_input_nodes
+        stored_tensor = _access_tensor(materialized)
+        assert not any(
+            node.target is memory_ops.load and _access_tensor(node) is stored_tensor
+            for node in root.nodes
+        )
 
 
 @skipUnlessBackends(["cute"])
