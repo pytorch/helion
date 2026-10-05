@@ -20,6 +20,49 @@ runs on the same machine can reuse prior configs.  For more on
 caching see {py:class}`~helion.autotuner.local_cache.LocalAutotuneCache`
 and {py:class}`~helion.autotuner.local_cache.StrictLocalAutotuneCache`.
 
+### Generated Triton source cache
+
+For Triton kernels, opt in to caching the selected configuration's
+generated source with `generated_code_cache=True` or
+`HELION_GENERATED_CODE_CACHE=1`:
+
+```python
+@helion.kernel(
+    config=helion.Config(block_sizes=[64]),
+    generated_code_cache=True,
+)
+def my_kernel(x: torch.Tensor) -> torch.Tensor:
+    ...
+```
+
+Entries live under `HELION_CACHE_DIR/generated_code` (or the default Helion
+cache directory). A binding index records the selected config and its generated
+source. A later process with the same kernel, supported Python dependencies,
+input signature, hardware, compilation settings and library versions can load
+that source without running `KernelCompiler.compile` or source generation.
+Triton's binary cache remains independent; a source hit can still require
+Triton's first binary compilation.
+
+The input signature includes exact tensor shapes, strides, dtypes, devices,
+alignment and aliases, together with scalar values. This also works with
+`static_shapes=False`, but uses separate bindings for exact signatures rather
+than reusing a dynamic-shape binding across different sizes. Custom config
+selectors still run. Selecting a different config, requesting frontend IR or
+changing inputs restores normal frontend compilation on demand.
+
+The cache is disabled by default. Distributed kernels, tensor-descriptor configs
+and kernels with runtime input specializations retain normal compilation.
+Unsupported Python dependencies, forced autotuning and printing code or repro
+callers disable the pre-frontend lookup. Reference mode and TorchDynamo tracing
+retain normal compilation. Autotuning candidates are not written to this cache;
+`set_config` persists only the chosen config, including a winner already compiled
+during autotuning.
+
+`HELION_SKIP_CACHE=1` skips both reads and writes. Entries are checksummed and
+published with atomic renames. Missing, corrupt or unreadable entries fall back
+to compilation; failed writes leave the compiled kernel usable. Remove the
+`generated_code` directory to clear it.
+
 The rest of this document covers strategies for pre-tuning and deploying
 tuned configs, which is the recommended approach for production workloads.
 

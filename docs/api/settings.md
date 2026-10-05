@@ -76,6 +76,12 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 ### Core Compilation Settings
 
+`generated_code_cache=True` (or `HELION_GENERATED_CODE_CACHE=1`) enables the
+opt-in persistent source cache for selected Triton configs. Repeated exact input
+signatures can skip frontend compilation and source generation, including with
+dynamic shapes. See {doc}`../deployment_autotuning` for its scope and
+cache controls.
+
 ```{eval-rst}
 .. currentmodule:: helion
 
