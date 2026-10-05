@@ -586,7 +586,7 @@ def _chain_key(chain: Tcgen05UnaryEpilogueChain) -> tuple[object, ...]:
         if isinstance(expr, _CurrentTensorExpr):
             return ("current",)
         if isinstance(expr, _RuntimeScalarExpr):
-            return ("runtime_scalar", expr.expr)
+            return ("runtime_scalar", expr.source)
         if isinstance(expr, _AuxiliaryTensorLoadExpr):
             return ("aux", expr.load_node, expr.broadcast_axis, expr.template)
         if isinstance(expr, _UnaryTensorExpr):

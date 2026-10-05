@@ -20,6 +20,7 @@ from test.test_cute_warp_mma_gemm import _extra_root_store_before
 from test.test_cute_warp_mma_gemm import _f32_out_gemm
 from test.test_cute_warp_mma_gemm import _fp8_gemm
 from test.test_cute_warp_mma_gemm import _inplace_residual
+from test.test_cute_warp_mma_gemm import _rank0_scaled_gemm
 from test.test_cute_warp_mma_gemm import _relu_residual_gemm
 from test.test_cute_warp_mma_gemm import _sliced_output
 
@@ -183,6 +184,23 @@ def test_relu_residual_epilogue() -> None:
     out, _ = _run(_relu_residual_gemm, (a, b, residual), _config([16, 16, 128], 1))
     ref = torch.relu(torch.matmul(a.float(), b.float()) + residual.float())
     _check(out, ref)
+
+
+def test_rank0_scale_epilogue() -> None:
+    # The fp8_gemm dequantization scales: rank-0 loads are tile-uniform
+    # scalar leaves rendered inline on the fragments, and the launcher
+    # marshals the 0-d tensors as one-element views.
+    torch.manual_seed(0)
+    a = _randn(128, 64, dtype=torch.bfloat16)
+    b = _randn(64, 128, dtype=torch.bfloat16)
+    scale_a = torch.tensor(0.5, device=DEVICE)
+    scale_b = torch.tensor(3.0, device=DEVICE)
+    out, source = _run(
+        _rank0_scaled_gemm, (a, b, scale_a, scale_b), _config([32, 32, 64], 4)
+    )
+    assert "* cutlass.Float32(scale_a.iterator.load())" in source
+    assert "* cutlass.Float32(scale_b.iterator.load())" in source
+    _check(out, torch.matmul(a.float(), b.float()) * 1.5)
 
 
 def test_two_outputs() -> None:
