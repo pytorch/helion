@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import cast
 
+from ..ast_extension import clone_ast
 from .proven_loop_bounds import _Context
 from .proven_loop_bounds import _Form
 from .proven_loop_bounds import _Proof
@@ -392,8 +393,6 @@ def specialize_full_tile_bounds(
     packet_prefetch: int = 0,
     proven_disjoint_tensor_pairs: AbstractSet[frozenset[str]] = frozenset(),
 ) -> list[ast.stmt]:
-    from ..device_function import _clone_extended_ast
-
     module = ast.Module(body=body, type_ignores=[])
     nodes = list(ast.walk(module))
     if len(nodes) > 32768 or not _supported(body):
@@ -441,7 +440,7 @@ def specialize_full_tile_bounds(
         proof.maximum_blocks * plan.block_size,
         quotient.scale(plan.block_size),
     )
-    optimized = proof.block(cast("list[ast.stmt]", _clone_extended_ast(body)), context)
+    optimized = proof.block(cast("list[ast.stmt]", clone_ast(body)), context)
     if proof.changed == 0:
         return body
     if packet_prefetch:

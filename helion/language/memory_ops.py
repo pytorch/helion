@@ -1109,9 +1109,10 @@ def _cute_register_reduction_unroll_vec_store(
     single ``_cute_store_u16_vec`` after the V-loop (ST.64/ST.128 instead
     of V scalar 2-byte stores).
 
-    Same mask precondition as the tile variant: the caller only reaches
-    this when ``strategy._mask_var is None`` (uniform, mask-free lanes), so
-    ``mask_expr`` can wrap the flush as a whole.
+    ``mask_expr`` predicates the whole flush, so the caller passes only terms
+    that are uniform across the V lanes: an outer row mask, the chunk-level
+    bounds mask of a roll whose extent is a multiple of V, or the whole-chunk
+    predicate of a roll whose straddling tail chunk is stored per element.
     """
     base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
     lane_body = getattr(strategy, "_cute_lane_body", None)

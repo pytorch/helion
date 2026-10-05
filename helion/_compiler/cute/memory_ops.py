@@ -20,6 +20,7 @@ from typing import Any
 from typing import Callable
 from typing import cast
 
+import sympy
 import torch
 from torch._dynamo.source import LocalSource
 from torch._subclasses import FakeTensor
@@ -77,6 +78,7 @@ if TYPE_CHECKING:
 
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
+    from ..reduction_strategy import LoopedReductionStrategy
     from ..tile_strategy import DeviceGridState
     from ..tile_strategy import DeviceLoopOrGridState
 
@@ -226,13 +228,16 @@ def tensor_has_specialized_tma_alignment(
     )
 
 
-def tensor_has_specialized_base_alignment(
-    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
-) -> bool:
-    """Read a cache-key-backed pointer residue without retaining example inputs."""
-    if alignment <= 0 or _CUTE_VECTOR_MAX_BYTES % alignment:
-        return False
-    source = env.tensor_input_source(tensor)
+def _bound_vec_alignment_signature(
+    env: CompileEnvironment, source: Source | None
+) -> tuple[int, tuple[int, ...], tuple[tuple[bool, int], ...]] | None:
+    """The bound alignment signature of an input source, if it was specialized.
+
+    ``_persistent_vec_alignment_signature`` records ``(data_ptr % 16,
+    size % max_vector_elements per dim, (stride == 1, stride_bytes % 16) per
+    dim)``; the readers below each derive one cache-key-backed fact from it
+    without retaining the example inputs.
+    """
     specialization = env.runtime_input_specializations.get(
         _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
     )
@@ -245,13 +250,147 @@ def tensor_has_specialized_base_alignment(
         or facts is None
         or source not in specialization.sources
     ):
-        return False
+        return None
     signatures = cast(
         "tuple[tuple[int, tuple[int, ...], tuple[tuple[bool, int], ...]] | None, ...]",
         facts,
     )
-    signature = signatures[specialization.sources.index(source)]
+    return signatures[specialization.sources.index(source)]
+
+
+def tensor_has_specialized_base_alignment(
+    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
+) -> bool:
+    """Read a cache-key-backed pointer residue without retaining example inputs."""
+    if alignment <= 0 or _CUTE_VECTOR_MAX_BYTES % alignment:
+        return False
+    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
     return signature is not None and signature[0] % alignment == 0
+
+
+def tensor_has_specialized_dim_multiple(
+    env: CompileEnvironment, tensor: torch.Tensor, dim: int, multiple: int
+) -> bool:
+    """Read a cache-key-backed proof that ``tensor.shape[dim] % multiple == 0``.
+
+    The signature records every input size modulo the widest vector of the
+    tensor's dtype (8 bf16/fp16 lanes, 4 fp32 lanes), so any vector width up
+    to that maximum is decidable.  The bound kernel is keyed on that residue:
+    a later call whose size has a different residue binds separately and
+    never reuses this code.
+    """
+    if multiple <= 0 or dim < 0 or dim >= tensor.ndim:
+        return False
+    max_vector_elements = max(_CUTE_VECTOR_MAX_BYTES // tensor.dtype.itemsize, 1)
+    if max_vector_elements % multiple:
+        return False
+    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
+    return (
+        signature is not None
+        and dim < len(signature[1])
+        and signature[1][dim] % multiple == 0
+    )
+
+
+def tensor_has_specialized_stride_multiple(
+    env: CompileEnvironment, tensor: torch.Tensor, dim: int, multiple: int
+) -> bool:
+    """Read a cache-key-backed proof that ``tensor.stride(dim) % multiple == 0``.
+
+    The signature records each stride in bytes modulo the widest vector
+    transaction, so any vector width of the tensor's dtype is decidable.
+    """
+    if multiple <= 0 or dim < 0 or dim >= tensor.ndim:
+        return False
+    vector_bytes = multiple * tensor.dtype.itemsize
+    if _CUTE_VECTOR_MAX_BYTES % vector_bytes:
+        return False
+    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
+    return (
+        signature is not None
+        and dim < len(signature[2])
+        and signature[2][dim][1] % vector_bytes == 0
+    )
+
+
+def cute_reduction_vector_layout_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, lane_dim: int, vec_width: int
+) -> bool:
+    """Whether every V-wide chunk along ``lane_dim`` is naturally aligned.
+
+    A chunk base is a multiple of V along the lane dim, so the packet is
+    aligned exactly when the tensor's base is and every other stride is a
+    multiple of V elements: a 4100-wide bf16 row is only 8-byte aligned, and
+    an LDG.128 at the start of its second row faults.  Static strides are
+    checked directly; a symbolic stride is proven either as a multiple of V
+    through the size residues (the contiguous ``stride == extent`` case) or
+    through the bound stride residue of an input tensor.  The base is proven
+    by provenance, as for tensor descriptors: an input, or a zero-offset
+    statically exact view that exactly one input owns, reads that input's
+    bound pointer residue, and a fresh wrapper allocation is aligned to the
+    allocator granularity less its static storage offset.  Anything else (a
+    dtype-punning view of an input, say) is refused rather than trusted.
+    """
+    if vec_width <= 1:
+        return True
+    vector_bytes = vec_width * tensor.dtype.itemsize
+    source = env.tensor_descriptor_alignment_source(tensor)
+    if source is not None:
+        signature = _bound_vec_alignment_signature(env, source)
+        if signature is None or signature[0] % vector_bytes:
+            return False
+    elif env.tensor_storage_is_compiler_allocated(tensor):
+        offset = tensor.storage_offset()
+        if (
+            not isinstance(offset, int)
+            or (offset * tensor.dtype.itemsize) % vector_bytes
+        ):
+            return False
+    else:
+        return False
+    for dim in range(tensor.ndim):
+        if dim == lane_dim:
+            continue
+        stride = tensor.stride(dim)
+        if isinstance(stride, int):
+            if stride % vec_width:
+                return False
+            continue
+        if cute_known_multiple(env, stride, vec_width):
+            continue
+        if not tensor_has_specialized_stride_multiple(env, tensor, dim, vec_width):
+            return False
+    return True
+
+
+def cute_known_multiple(env: CompileEnvironment, extent: object, multiple: int) -> bool:
+    """``extent % multiple == 0`` for a static or cache-key-specialized extent.
+
+    Static extents use the shape environment.  A symbolic extent is matched
+    against the symbolic sizes of the kernel's input tensors and proven from
+    their bound residues (``tensor_has_specialized_dim_multiple``); the
+    dispatch cache key already separates inputs whose residues differ.
+    """
+    if multiple <= 0:
+        return False
+    if multiple == 1:
+        return True
+    if isinstance(extent, torch.SymInt):
+        extent = extent._sympy_()
+    if isinstance(extent, (int, sympy.Integer)):
+        return int(extent) % multiple == 0
+    if not isinstance(extent, sympy.Expr):
+        return False
+    target = env.shape_env.replace(extent)
+    for tensor in env.input_sources:
+        for dim, size in enumerate(tensor.shape):
+            if not isinstance(size, torch.SymInt):
+                continue
+            if env.shape_env.replace(size._sympy_()) != target:
+                continue
+            if tensor_has_specialized_dim_multiple(env, tensor, dim, multiple):
+                return True
+    return False
 
 
 def _tensor_storage_disjoint_matrix_signature(
@@ -652,12 +791,36 @@ def _cute_register_unroll_vec_hoist(
         # caller leaves an exact-fragment marker for the late pass instead of
         # installing a wrapper-global hoist that could cross a later write.
         return None
+    from ..reduction_strategy import LoopedReductionStrategy
+
+    assert isinstance(strategy, LoopedReductionStrategy)
     # Looped reductions expose their reduction index directly in the last
     # position, so replacing that component is sufficient.
     base_exprs = list(index_exprs)
     base_exprs[-1] = base_index_var
     base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
-    cache_key = (tensor_name, base_ptr_expr)
+    # A mask predicates the whole packet.  Outer terms such as the row mask
+    # (proven uniform across the chunk by the caller) apply whether or not
+    # the roll itself is masked: a partially filled row tile must not read
+    # rows past the tensor even when its extent divides the block.  A masked
+    # roll adds the chunk term spelled on the chunk base (the chunk decides
+    # every lane when ``numel % V == 0``, otherwise its last lane must be in
+    # bounds); the compare is inlined rather than read through the mask
+    # variable so a later software pipelining pass that rebases the packet
+    # address rebases its guard too.  A masked-off thread reads the tensor's
+    # first element instead; the per-element mask gate discards those bytes.
+    guard_terms: list[str] = []
+    non_lane = (
+        _cute_vector_load_non_lane_mask(mask_expr, strategy._mask_var)
+        if mask_expr is not None
+        else None
+    )
+    if non_lane is not None:
+        guard_terms.append(non_lane)
+    if strategy._mask_var is not None:
+        guard_terms.append(strategy.cute_chunk_in_bounds_expr(state))
+    guard = " and ".join(f"({term})" for term in guard_terms) or None
+    cache_key = (tensor_name, base_ptr_expr, guard)
     cache = getattr(strategy, "_cute_lane_vec_loads", None)
     if cache is None:
         cache = {}
@@ -674,9 +837,15 @@ def _cute_register_unroll_vec_hoist(
             f"_unroll_vec_{len(cache)}", dce=False
         )
         cache[cache_key] = (hoist_var, tensor.dtype)
+        load_ptr_expr = base_ptr_expr
+        if guard is not None:
+            anchor_ptr_expr = _cute_scalar_pointer_expr(
+                tensor_name, ["0"] * len(index_exprs)
+            )
+            load_ptr_expr = f"({base_ptr_expr} if {guard} else {anchor_ptr_expr})"
         hoist_stmt = statement_from_string(
             f"{hoist_var} = "
-            f"{_cute_unroll_vec_load_expr(base_ptr_expr, tensor.dtype, vec_width, eviction_suffix)}"
+            f"{_cute_unroll_vec_load_expr(load_ptr_expr, tensor.dtype, vec_width, eviction_suffix)}"
         )
         # Insert the hoist just BEFORE the constexpr V-loop.
         lane_body.insert(lane_body.index(constexpr_loop), hoist_stmt)
@@ -685,7 +854,16 @@ def _cute_register_unroll_vec_hoist(
     assert isinstance(constexpr_loop, ast.For)
     assert isinstance(constexpr_loop.target, ast.Name)
     vec_lane_var = constexpr_loop.target.id
-    return f"{carrier}({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
+    extract = f"{carrier}({hoist_var}[{vec_lane_var}]).bitcast({elem_dtype})"
+    chunk_full_var = strategy._cute_reduction_chunk_full_var
+    if strategy._mask_var is not None and chunk_full_var is not None:
+        # The straddling tail chunk holds anchor bytes: its in-bounds lanes
+        # re-read their element individually (at most one chunk per row).
+        scalar_load = _cute_scalar_load_expr(
+            tensor_name, index_exprs, tensor.dtype, eviction_suffix=eviction_suffix
+        )
+        return f"({extract} if {chunk_full_var} else {scalar_load})"
+    return extract
 
 
 def _persistent_assignment_definitions(state: CodegenState) -> dict[str, ast.expr]:
@@ -2847,6 +3025,49 @@ def _(state: CodegenState) -> ast.AST:
                         _vec_width,
                     ):
                         branch_vec_store_candidate = (vec_block_id, _vec_width)
+                tail_store: ast.stmt | None = None
+                flush_mask = mask_expr
+                if can_vectorize:
+                    assert isinstance(red_strategy, LoopedReductionStrategy)
+                    mask_var = red_strategy._mask_var
+                    if mask_var is not None and not _cute_looped_vec_mask_is_uniform(
+                        red_strategy, mask_expr, mask_var
+                    ):
+                        # A per-element outer term cannot predicate the
+                        # whole flush; keep the scalar stores.
+                        can_vectorize = False
+                    elif (
+                        mask_var is not None
+                        and red_strategy._cute_reduction_chunk_full_var is not None
+                    ):
+                        # Unknown ``numel % V``: full chunks flush one vector,
+                        # the straddling tail chunk stores its in-bounds
+                        # elements individually.
+                        chunk_full = red_strategy._cute_reduction_chunk_full_var
+                        non_lane = (
+                            _cute_vector_load_non_lane_mask(mask_expr, mask_var)
+                            if mask_expr is not None
+                            else None
+                        )
+                        flush_mask = (
+                            f"({non_lane}) and ({chunk_full})"
+                            if non_lane is not None
+                            else chunk_full
+                        )
+                        tail_predicate = (
+                            f"not {chunk_full} and ({mask_expr})"
+                            if mask_expr is not None
+                            else f"not {chunk_full}"
+                        )
+                        tail_store = statement_from_string(
+                            f"if {tail_predicate}:\n    {{store}}",
+                            store=statement_from_string(
+                                _cute_scalar_store_expr(
+                                    tensor_name, index_exprs, "{value}"
+                                ),
+                                value=value,
+                            ),
+                        )
                 if can_vectorize:
                     assert isinstance(red_strategy, LoopedReductionStrategy)
                     append_stmt = _cute_register_reduction_unroll_vec_store(
@@ -2855,11 +3076,13 @@ def _(state: CodegenState) -> ast.AST:
                         tensor_name,
                         index_exprs,
                         ast.unparse(value),
-                        mask_expr,
+                        flush_mask,
                         tensor.dtype,
                     )
                 if append_stmt is not None:
                     state.add_statement(append_stmt)
+                    if tail_store is not None:
+                        state.add_statement(tail_store)
                     return ast.Constant(value=None)
 
     if branch_vec_store_candidate is not None:
@@ -3079,6 +3302,55 @@ def _cute_vector_load_mask_is_lane_only(
         )
 
     return lane_only(ast.parse(mask_expr, mode="eval").body)
+
+
+def _cute_reduction_masked_vec_ok(strategy: object, tensor: torch.Tensor) -> bool:
+    """Whether a masked rolled-reduction lattice may still emit vector packets.
+
+    Only the ``unroll`` protocol of ``LoopedReductionStrategy`` knows how to
+    predicate a packet on its chunk (``codegen_device_loop`` placed either a
+    chunk-level mask or the whole-chunk predicates in the lane body).  The
+    persistent strategy keeps its own late branch-local vectorizer.
+    """
+    from ..reduction_strategy import LoopedReductionStrategy
+
+    if not isinstance(strategy, LoopedReductionStrategy):
+        return False
+    if strategy._cute_reduction_vec_mode != "unroll":
+        return False
+    if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+        return False
+    if strategy._cute_lane_base_index_var is None:
+        return False
+    return (
+        strategy._cute_reduction_chunk_uniform_mask
+        or strategy._cute_reduction_chunk_full_var is not None
+    )
+
+
+def _cute_looped_vec_mask_is_uniform(
+    strategy: LoopedReductionStrategy, mask_expr: str | None, lane_mask: str | None
+) -> bool:
+    """Whether the non-lane mask terms hold one value for the whole V-chunk.
+
+    An outer row mask is defined by the grid prefix and is uniform across the
+    chunk, so it may predicate the packet pointer and the vector flush.  A
+    term reading a value defined inside the lane body (a per-element gather
+    bound) is not, and such a site keeps its scalar accesses.
+    """
+    if mask_expr is None:
+        return True
+    non_lane = _cute_vector_load_non_lane_mask(mask_expr, lane_mask)
+    if non_lane is None:
+        return True
+    lane_body = strategy._cute_lane_body
+    if lane_body is None:
+        return False
+    written: set[str] = set()
+    for stmt in lane_body:
+        written.update(ReadWrites.from_ast(stmt).writes)
+    reads = set(ReadWrites.from_ast(expr_from_string(non_lane)).reads)
+    return not (reads & written)
 
 
 def _cute_vector_load_non_lane_mask(
@@ -3739,17 +4011,7 @@ def _cute_signed_byte_packet_is_aligned(
         env, tensor, vec_width
     ):
         return False
-    source = env.tensor_input_source(tensor)
-    specialization = env.runtime_input_specializations[
-        _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-    ]
-    signatures = cast(
-        "tuple[tuple[int, tuple[int, ...], tuple[tuple[bool, int], ...]] | None, ...]",
-        env.bound_runtime_input_specialization_results[
-            _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-        ],
-    )
-    signature = signatures[specialization.sources.index(source)]
+    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
     assert signature is not None  # The base-alignment proof checked this entry.
     return all(
         unit_stride if axis == lane_axis else residue % vec_width == 0
@@ -3952,41 +4214,15 @@ def _cute_vector_load_ctx(
                     lane_on_stride1 = tensor_dim == stride1_tensor_dim
         elif isinstance(idx, slice) and idx == slice(None):
             if tensor_dim < tensor.ndim:
-                dim_size = tensor.shape[tensor_dim]
-                matches: list[int] = []
-                for cand_bid, bs in enumerate(env.block_sizes):
-                    if not isinstance(bs.size, (int, torch.SymInt)):
-                        continue
-                    bs_numel = bs.numel
-                    # Try a few candidate forms for the size equality
-                    # check: sympy.Integer (most common via specialize()),
-                    # int, and torch.SymInt all flow through known_equal
-                    # after we coerce to plain int when possible.
-                    bs_int: int | torch.SymInt | None
-                    if isinstance(bs_numel, (int, torch.SymInt)):
-                        bs_int = bs_numel
-                    else:
-                        try:
-                            bs_int = int(bs_numel)
-                        except (TypeError, ValueError):
-                            bs_int = None
-                    if bs_int is None:
-                        continue
-                    dim_int: int | torch.SymInt | None
-                    if isinstance(dim_size, (int, torch.SymInt)):
-                        dim_int = dim_size
-                    else:
-                        try:
-                            dim_int = int(dim_size)
-                        except (TypeError, ValueError):
-                            dim_int = None
-                    if dim_int is None:
-                        continue
-                    if (
-                        env.known_equal(bs_int, dim_int)
-                        and _cute_lane_strategy(state, cand_bid) is not None
-                    ):
-                        matches.append(cand_bid)
+                # Same extent matching as the mask builder: ``known_equal``
+                # on the block's size handles static and symbolic extents
+                # alike (a symbolic reduction extent has a sympy ``numel``
+                # that no ``int()`` coercion could compare).
+                matches: list[int] = [
+                    cand_bid
+                    for cand_bid in _matching_block_ids(env, tensor.shape[tensor_dim])
+                    if _cute_lane_strategy(state, cand_bid) is not None
+                ]
                 if matches:
                     # Matching by extent alone is ambiguous when a
                     # non-reduction tile dim happens to have the same
@@ -4025,7 +4261,17 @@ def _cute_vector_load_ctx(
         vec_width = getattr(strategy, "_cute_reduction_vec_width", 1)
         if vec_width <= 1:
             return None
-        if strategy._mask_var is not None:
+        if strategy._mask_var is not None and not _cute_reduction_masked_vec_ok(
+            strategy, tensor
+        ):
+            return None
+        if isinstance(
+            strategy, LoopedReductionStrategy
+        ) and not cute_reduction_vector_layout_aligned(
+            env, tensor, stride1_tensor_dim, vec_width
+        ):
+            # The rolled hoist addresses each packet from the row start; a
+            # V-misaligned base or row stride would fault the vector access.
             return None
         if strategy._cute_reduction_lane_extent <= 0:
             return None
@@ -4401,6 +4647,7 @@ def _(state: CodegenState) -> object:
     if vec_ctx is not None and not _cute_vector_load_mask_is_lane_only(
         mask_expr, _cute_active_mask_var(state, vec_ctx[1])
     ):
+        from ..reduction_strategy import LoopedReductionStrategy
         from ..reduction_strategy import PersistentReductionStrategy
 
         vec_width, vec_block_id, vec_mode = vec_ctx
@@ -4431,6 +4678,16 @@ def _(state: CodegenState) -> object:
             ):
                 uniform_mask = None
                 vec_ctx = None
+        elif (
+            vec_mode == "unroll"
+            and isinstance(strategy, LoopedReductionStrategy)
+            and _cute_looped_vec_mask_is_uniform(
+                strategy, mask_expr, _cute_active_mask_var(state, vec_block_id)
+            )
+        ):
+            # The outer terms (a row mask) are defined above the lane body, so
+            # the rolled hoist folds them into its packet guard.
+            pass
         else:
             if (
                 vec_mode == "unroll"
