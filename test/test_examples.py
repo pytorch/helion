@@ -1052,31 +1052,39 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     def test_sparse_attn_indexer(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        torch.manual_seed(0)
         args = mod.indexer_inputs(num_tokens=128, kv_len=512)
-        # The reference einsum runs in bf16, so kernel-vs-reference diffs are
-        # pure schedule noise: one head's O(11) score rounds by ~11*2^-8 and
-        # the 32-head sum random-walks to ~sqrt(32) of that (~0.25 abs).
+        # Kernel and reference both round each head's bf16 score before the
+        # weighted sum, so they agree exactly except where a different fp32
+        # accumulation order lands a score on the other side of a bf16 rounding
+        # boundary; see MAX_MISMATCH_PCT in the example. Positions outside the
+        # window are -inf on both sides and compare equal.
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits",
             block_sizes=[16, 128],
-            atol=0.3,
+            atol=1e-2,
+            max_mismatch_pct=mod.MAX_MISMATCH_PCT,
+            max_mismatched_abs_diff=mod.MAX_MISMATCHED_ABS_DIFF,
         )
 
     @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_sparse_attn_indexer_decode(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
+        torch.manual_seed(0)
         args = mod.indexer_inputs(num_tokens=1, kv_len=512)
-        # Same schedule-noise bound as test_sparse_attn_indexer above.
+        # Same rounding-boundary budget as test_sparse_attn_indexer above.
         check_example(
             "sparse_attn_indexer",
             args,
             mod.ref_mqa_logits(*args),
             fn_name="mqa_logits_decode",
             block_sizes=[1, 128],
-            atol=0.3,
+            atol=1e-2,
+            max_mismatch_pct=mod.MAX_MISMATCH_PCT,
+            max_mismatched_abs_diff=mod.MAX_MISMATCHED_ABS_DIFF,
         )
 
     @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
