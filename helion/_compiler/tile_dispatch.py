@@ -496,12 +496,37 @@ class TileStrategyDispatch:
         warp-per-row layout would assign one axis per inner tile loop
         and bury M on axis 2 or 3.
         """
+        reserved_axes = self._multi_phase_reserved_reduction_axes()
         for branch in self._strategy_branches():
             if target not in branch:
                 continue
             axis = 0
             seen_block_id_sets: dict[tuple[int, ...], int] = {}
+            plan = (
+                self.current_cute_grid_execution_plan(
+                    block_ids=tuple(b for s in branch for b in s.block_ids)
+                )
+                if reserved_axes
+                else None
+            )
             for strategy in self._ordered_strategies_for_branch(branch):
+                if (
+                    reserved_axes
+                    and not isinstance(strategy, ReductionStrategy)
+                    and not (
+                        plan is not None
+                        and any(
+                            plan.disables_reduction_axis_reservation(block_id)
+                            for block_id in strategy.block_ids
+                        )
+                    )
+                ):
+                    # Mirror ``BlockSizeTileStrategy._compute_thread_axis_offset``:
+                    # the body keeps the kernel-wide reduction axes reserved in
+                    # every ``hl.barrier()`` phase, so a phase without its own
+                    # reduction must place its tiles above them too or the
+                    # launch block dims would disagree with the body's axes.
+                    axis = max(axis, reserved_axes)
                 key = tuple(sorted(strategy.block_ids))
                 cached = seen_block_id_sets.get(key)
                 if cached is not None:
@@ -516,6 +541,24 @@ class TileStrategyDispatch:
                 seen_block_id_sets[key] = axis
                 axis += strategy.thread_axes_used()
         return None
+
+    def _multi_phase_reserved_reduction_axes(self) -> int:
+        """Reduction axes every ``hl.barrier()`` phase keeps reserved.
+
+        Same count as ``BlockSizeTileStrategy._compute_thread_axis_offset``
+        plans: one axis per reduction that spreads across threads, at least one
+        when any reduction claims an axis.  ``0`` for single-phase kernels,
+        whose branches already agree with the body's bookkeeping.
+        """
+        if len(HostFunction.current().device_ir.phases) <= 1:
+            return 0
+        if not CompileEnvironment.current().backend.reduction_axis_first():
+            return 0
+        reductions = [s for s in self.strategies if isinstance(s, ReductionStrategy)]
+        return max(
+            sum(1 for s in reductions if s._reduction_thread_count() > 1),
+            1 if any(s.thread_axes_used() > 0 for s in reductions) else 0,
+        )
 
     def strategies_can_coexecute(
         self, first: TileStrategy, second: TileStrategy

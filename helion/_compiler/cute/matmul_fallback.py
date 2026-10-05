@@ -10,6 +10,7 @@ from ... import exc
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..device_function import DeviceFunction
 from ..dtype_utils import cast_ast
 from ..generate_ast import GenerateAST
 from ..matmul_utils import _needs_f32_accumulator
@@ -421,6 +422,37 @@ def _emit_cute_grouped_sum_reduction_shared_tree(
     return result_var
 
 
+def _widen_lane_layout_for_barrier_phases(
+    cg: CodegenInterface, axis_sizes: dict[int, int], *, subject: str
+) -> None:
+    """Widen a cross-lane reduce's thread layout to the ``hl.barrier()`` launch.
+
+    The phases of a barrier kernel share one launch block (the elementwise
+    max of their thread extents), so another phase may run more lanes on the
+    axes around this reduce.  Surplus lanes on the reduce axis load the
+    identity through the tile/K bounds masks, so folding them in keeps every
+    lane's result complete; surplus rows on the other axes form extra
+    (redundant) groups.  ``axis_sizes`` is widened in place on all three axes
+    so the linear lane index and group count cover the whole launch, and the
+    assumed layout is recorded under ``subject`` so the launcher
+    (``backend._multi_phase_block_dims``) rejects a final block shape that
+    differs from it on any axis.  Single-phase kernels are left alone.
+    """
+    # Unit tests drive these emitters with a bare namespace; only a real
+    # ``GenerateAST`` carries the host function whose phases matter here.
+    host_function = getattr(cg, "host_function", None)
+    if host_function is None or len(host_function.device_ir.phases) <= 1:
+        return
+    device_function = DeviceFunction.current()
+    launch_dims = device_function.tile_strategy.thread_block_dims()
+    for axis in range(3):
+        if launch_dims[axis] > axis_sizes.get(axis, 1):
+            axis_sizes[axis] = launch_dims[axis]
+    device_function.cute_state.multi_phase_lane_reduce_layouts.append(
+        (subject, {axis: axis_sizes.get(axis, 1) for axis in range(3)})
+    )
+
+
 def _emit_cute_grouped_sum_reduction(
     cg: CodegenInterface,
     input_name: str,
@@ -440,6 +472,9 @@ def _emit_cute_grouped_sum_reduction(
         thread_axis = loop_block_axes.get(k_block_id)
     if thread_axis is None:
         return input_name
+    _widen_lane_layout_for_barrier_phases(
+        cg, axis_sizes, subject="staged matmul product sum"
+    )
 
     reduce_extent = axis_sizes.get(thread_axis, 1)
     if reduce_extent <= 1:
@@ -561,6 +596,10 @@ def _emit_cute_owned_product_sum(
     thread_axis = block_axes.get(k_block_id)
     if thread_axis is None and isinstance(loop_block_axes, dict):
         thread_axis = loop_block_axes.get(k_block_id)
+    if thread_axis is not None:
+        _widen_lane_layout_for_barrier_phases(
+            cg, axis_sizes, subject="staged matmul product sum"
+        )
     reduce_extent, pre, group_span, group_count, lane_expr = (
         _cute_lane_reduce_thread_group(
             cg,

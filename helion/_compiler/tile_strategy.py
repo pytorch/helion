@@ -7816,6 +7816,10 @@ class BlockSizeTileStrategy(TileStrategy):
         # more elements than the tile holds. Reserve one axis per reduction
         # that actually spreads across threads; single-thread reductions
         # (thread_idx is constant 0 on their axis) may share an axis safely.
+        # The reservation is kernel-wide (it also counts reductions of other
+        # ``hl.barrier()`` phases); ``TileStrategyDispatch.thread_axis_for_strategy``
+        # mirrors it for multi-phase kernels so the launch block dims agree
+        # with the axes the body indexes.
         reduction_strategies = [
             strategy
             for strategy in self.fn.tile_strategy.strategies

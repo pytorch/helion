@@ -22,6 +22,7 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.layout import LayoutTag as _CuteLayoutTag
 from .cute.layout_propagation import META_KEY as _CUTE_LAYOUT_META_KEY
+from .cute.matmul_fallback import _widen_lane_layout_for_barrier_phases
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .device_function import find_block_size_symbols
@@ -1467,6 +1468,15 @@ class PersistentReductionStrategy(ReductionStrategy):
             planned_dims = self._planned_thread_dims()
             planned_block_threads = planned_dims[0] * planned_dims[1] * planned_dims[2]
             if num_threads != planned_block_threads:
+                if len(HostFunction.current().device_ir.phases) > 1:
+                    # The warp-level fallback shuffles at most 32 lanes, so for
+                    # a >32-thread reduce it would silently drop lanes.
+                    raise exc.BackendUnsupported(
+                        "cute",
+                        f"persistent reduction over {group_span} lanes cannot "
+                        "prove its thread group under the hl.barrier() launch "
+                        f"{planned_dims}",
+                    )
                 return None
             lane_expr = backend.thread_linear_index_expr(axis_sizes)
             if lane_expr is None:
@@ -2633,6 +2643,14 @@ class BlockReductionStrategy(ReductionStrategy):
             reduce_axis = self._aliased_active_thread_axis(block_axes)
         if reduce_axis is None:
             return None
+        # Under an ``hl.barrier()`` launch another phase may run more lanes on
+        # the sibling axes than this phase's loops; the finalize must stride
+        # by the shared launch, and the launcher checks the assumed layout.
+        _widen_lane_layout_for_barrier_phases(
+            self._codegen,
+            axis_sizes,
+            subject=f"lane-loop reduction over tile block {self.block_index}",
+        )
         # Live thread extents per axis (sibling axes included) so the linear
         # lane index strides are computed correctly.
         logical_axis_sizes = {
