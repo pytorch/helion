@@ -3381,6 +3381,8 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             detect_flash_bwd_search_surface(device_ir)
             flash_shape = detect_flash_search_surface(device_ir)
             if flash_shape is not None:
+                from ..language.matmul_ops import _cuda_num_sms_or_zero
+
                 config_spec.enable_cute_flash_search(
                     head_dim=flash_shape.head_dim,
                     num_kv=flash_shape.num_kv,
@@ -3396,6 +3398,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                     standard_causal_output=flash_shape.standard_causal_output,
                     output_requires_tma=flash_shape.output_requires_tma,
                     supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
+                    has_row_epilogue=flash_shape.has_row_epilogue,
+                    plain_row_body=flash_shape.plain_row_body,
+                    device_sm_count=_cuda_num_sms_or_zero(
+                        CompileEnvironment.current().device
+                    ),
                 )
             else:
                 from ..language.matmul_ops import _plan_cute_tcgen05_search_candidate

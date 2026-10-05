@@ -2559,6 +2559,15 @@ class TestCuteBackend(TestCase):
         self.assertEqual(order(2), ["Q0", "Q1", "K0", "V0"])
         self.assertEqual(order(3), ["K0", "Q0", "V0", "Q1"])
         self.assertEqual(order(4), ["K0", "Q0", "Q1", "V0"])
+        # The staged order issues the first score tile's operands, then the
+        # caller's first-work-item wait, then the rest.
+        self.assertEqual(order(5), ["K0", "Q0", "Q1", "V0"])
+        staged = _cute_flash._flash_fa4_load_prologue_for_order(
+            5, "Q0", "K0", "Q1", "V0", "WAIT\n"
+        ).splitlines()
+        self.assertEqual(staged, ["K0", "Q0", "WAIT", "Q1", "V0"])
+        self.assertEqual(_cute_flash.FLASH_FIRST_LOAD_ORDER_STAGED, 5)
+        self.assertEqual(_cute_flash.FLASH_FIRST_LOAD_ORDER_CHOICES, (0, 1, 2, 3, 4, 5))
 
     def test_flash_attention_fires_and_matches_sdpa(self) -> None:
         """With the gate default-on, square fp16 attention at [1,128,128] lowers
@@ -3864,6 +3873,7 @@ class TestCuteBackend(TestCase):
                     score_plan=SimpleNamespace(
                         has_kv_tile_pruning=False,
                         requires_ws_overlap=requires_ws,
+                        modifiers=(),
                     ),
                 )
                 for requires_ws in requires_ws_order
