@@ -27,6 +27,7 @@ from .host_function import HostFunction
 from .inductor_lowering import ReductionLowering
 from .inductor_lowering import install_inductor_kernel_handlers
 from .tile_strategy import CompactedShape
+from .tile_strategy import CuteLaneAxis
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
 from .tile_strategy import LoopDimInfo
@@ -1036,6 +1037,40 @@ class PersistentReductionStrategy(ReductionStrategy):
 
     def _reduction_thread_count(self) -> int:
         return self._thread_count
+
+    def cute_tile_base_expr(self, block_id: int) -> str | None:
+        """The persistent axis covers its whole extent: the tile base is 0."""
+        if block_id != self.block_index:
+            return None
+        return self.offset_var(block_id)
+
+    def cute_lane_axis(self, block_id: int) -> CuteLaneAxis | None:
+        """Thread / synthetic-lane distribution of the persistent axis.
+
+        ``None`` for another block, for a vectorised or resident row (their
+        per-thread values are not one scalar per lane step) and when no live
+        thread count is known.  Each synthetic lane step is one
+        ``threads``-wide chunk of consecutive elements
+        (``index = thread + step * threads``).
+        """
+        if (
+            block_id != self.block_index
+            or self._thread_count <= 0
+            or self._cute_reduction_vec_width > 1
+            or self._cute_resident_reduction
+        ):
+            return None
+        lane_var = self._synthetic_cute_lane_var
+        lane_steps = self._synthetic_cute_lane_extent if lane_var is not None else 1
+        return CuteLaneAxis(
+            extent=self._thread_count * lane_steps,
+            threads=self._thread_count,
+            lane_var=lane_var,
+            lane_steps=lane_steps,
+            vec_lane_var=None,
+            vec_width=1,
+            strided=lane_var is not None,
+        )
 
     def _cute_runtime_lane_group_params(self, group_span: int) -> tuple[str, int]:
         """Lane expression and group count that key a two-stage shared reduce's

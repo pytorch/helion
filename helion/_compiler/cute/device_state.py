@@ -602,6 +602,11 @@ class CuteDeviceFunctionState:
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        # Lane loops claimed by a register/shuffle ``hl.associative_scan``
+        # lowering, mapped to the direction (``True`` = reverse) their lanes
+        # are visited in.  A second scan over the same lane loop must agree
+        # or it falls back to the serial lowering (see ``cute/scan_ops.py``).
+        self.scan_lane_directions: dict[str, bool] = {}
         self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
