@@ -2076,11 +2076,18 @@ class CuteBackend(Backend):
         # ``.iterator`` is the underlying ``cute.Pointer`` to the semaphore.
         return f"_cute_grid_barrier({sem_arg}.iterator)"
 
+    def _check_thread_axis(self, axis: int) -> None:
+        # ``cute.arch.thread_idx()`` is an (x, y, z) triple; indexing it with
+        # a fourth axis fails deep inside DSL tracing with an IndexError.
+        if axis >= 3:
+            raise exc.BackendUnsupported(self.name, f"thread axis {axis}")
+
     def lane_index_expr(
         self, offset_var: str, elements_per_thread: int, *, axis: int
     ) -> str:
         from ..compile_environment import CompileEnvironment
 
+        self._check_thread_axis(axis)
         index_dtype = CompileEnvironment.current().index_type()
         return (
             f"{offset_var} + {index_dtype}(cute.arch.thread_idx()[{axis}])"
@@ -2093,6 +2100,7 @@ class CuteBackend(Backend):
     def thread_index_expr(self, *, axis: int) -> str:
         from ..compile_environment import CompileEnvironment
 
+        self._check_thread_axis(axis)
         index_dtype = CompileEnvironment.current().index_type()
         return f"{index_dtype}(cute.arch.thread_idx()[{axis}])"
 
@@ -2124,6 +2132,7 @@ class CuteBackend(Backend):
         *,
         axis: int = 0,
     ) -> str:
+        self._check_thread_axis(axis)
         return (
             f"{offsets_var} = ({lid}) * ({block_size_var})"
             f" + {dtype}(cute.arch.thread_idx()[{axis}])"
@@ -2132,10 +2141,9 @@ class CuteBackend(Backend):
     def grid_index_expr(
         self, offset_var: str, block_size_var: str, dtype: str, *, axis: int
     ) -> str:
-        if axis >= 3 and block_size_var != "1":
-            raise exc.BackendUnsupported(self.name, f"thread axis {axis}")
         if block_size_var == "1":
             return offset_var
+        self._check_thread_axis(axis)
         return f"{offset_var} + {dtype}(cute.arch.thread_idx()[{axis}])"
 
     def loop_index_expr(
@@ -2204,6 +2212,7 @@ class CuteBackend(Backend):
     def thread_in_tile_mask_expr(
         self, block_size_var: str, *, axis: int = 0
     ) -> str | None:
+        self._check_thread_axis(axis)
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}]) < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
@@ -2248,6 +2257,7 @@ class CuteBackend(Backend):
     def reduction_index_expr(
         self, block_size_var: str, dtype: str, block_idx: int, *, axis: int
     ) -> str:
+        self._check_thread_axis(axis)
         return f"cutlass.Int32(cute.arch.thread_idx()[{axis}])"
 
     def reduction_index_zero_expr(self, dtype: str) -> str:
@@ -2366,6 +2376,8 @@ class CuteBackend(Backend):
     def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
         from ..compile_environment import CompileEnvironment
 
+        for axis in axis_sizes:
+            self._check_thread_axis(axis)
         index_dtype = CompileEnvironment.current().index_dtype
         index_type = self.index_type_str(index_dtype)
         if not axis_sizes:

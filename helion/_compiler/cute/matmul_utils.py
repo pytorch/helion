@@ -999,9 +999,10 @@ class CuteFoldLoad:
     The contraction (K) axis is always the load's last dimension and
     ``free_sizes`` are the symbolic sizes of the load's leading dimensions in
     storage order. ``scale`` folds in any scalar multipliers seen on the way to
-    the load. A ``permute`` that only swaps the trailing two dims (turning a
-    ``[..., n, k]`` load into the ``[..., k, n]`` view a bmm contracts) is a
-    no-op for the underlying load, so it is accepted and ignored.
+    the load. Any ``permute`` chain is accepted as long as the matmul's
+    contraction axis maps back to the load's trailing dimension: the fold
+    re-reads each free dimension through its own block index variable, so the
+    order the operand presents those free dimensions in is irrelevant.
     """
 
     load_node: torch.fx.Node
@@ -1014,14 +1015,17 @@ class CuteFoldLoad:
 def _cute_trace_matmul_operand_load(
     cg: CodegenInterface,
     node: torch.fx.Node,
+    *,
+    contraction_dim: int,
 ) -> CuteFoldLoad | None:
     """Trace a matmul operand back to a single direct ``load``.
 
-    Follows ``mul``-by-scalar (scaling), a trailing-dim ``permute`` (the
-    transpose a bmm contracts over), element-type conversions and
+    ``contraction_dim`` is the operand's K axis (``-1`` for the lhs, ``-2`` for
+    the rhs). Follows ``mul``-by-scalar (scaling), ``permute`` (tracking which
+    source dim the contraction axis comes from), element-type conversions and
     ``_new_var``/placeholder pass-throughs, crossing subgraph boundaries via
     ``placeholder_to_outer_arg``. Returns None when the operand is not a simple
-    scaled/transposed direct load whose contraction axis is the load's trailing
+    scaled/permuted direct load whose contraction axis is the load's trailing
     dimension.
     """
     from ...language._tracing_ops import _new_var
@@ -1033,6 +1037,11 @@ def _cute_trace_matmul_operand_load(
                 return graph_info
         return None
 
+    operand_val = node.meta.get("val")
+    if not isinstance(operand_val, torch.Tensor) or operand_val.ndim < 2:
+        return None
+    # Source dim of the operand's contraction axis, updated through permutes.
+    k_dim = contraction_dim % operand_val.ndim
     scale = 1.0
     current: object = node
     seen: set[int] = set()
@@ -1050,6 +1059,11 @@ def _cute_trace_matmul_operand_load(
             ):
                 return None
             if val.ndim < 2 or val.ndim != source_val.ndim:
+                return None
+            # ``load_expr`` walks the free dims in storage order and reads K
+            # along the tensor's last stride, so K must be the load's trailing
+            # dim.
+            if k_dim != val.ndim - 1:
                 return None
             return CuteFoldLoad(
                 load_node=current,
@@ -1072,14 +1086,13 @@ def _cute_trace_matmul_operand_load(
         if target is torch.ops.aten.permute.default and len(current.args) == 2:
             order = current.args[1]
             ndim = current.meta["val"].ndim
-            if not isinstance(order, (list, tuple)):
+            if not isinstance(order, (list, tuple)) or len(order) != ndim:
                 return None
-            normalized = [o % ndim for o in order]
-            # Only a trailing-dim swap (the bmm's K/N transpose) leaves the
-            # underlying load's storage order — and thus its trailing K axis —
-            # untouched. Anything else would move the contraction axis.
-            if normalized != [*range(ndim - 2), ndim - 1, ndim - 2]:
-                return None
+            # Output dim ``i`` of a permute is input dim ``order[i]``: follow
+            # the contraction axis back to the permute's source. Free dims may
+            # land anywhere (e.g. ``q[tile, :, :].transpose(0, 1)``) since the
+            # fold indexes each by its own block variable.
+            k_dim = order[k_dim] % ndim
             current = current.args[0]
             continue
         if target is torch.ops.prims.convert_element_type.default or target is _new_var:
@@ -1142,6 +1155,7 @@ def emit_cute_synthetic_lane_fold_mm(
     lhs_node: torch.fx.Node,
     rhs_node: torch.fx.Node,
     *,
+    k_block_id: int,
     k_extent: int,
     acc: ast.AST | None,
     out_dtype: torch.dtype | None,
@@ -1157,16 +1171,23 @@ def emit_cute_synthetic_lane_fold_mm(
     self-contained serial loop over the full K extent that re-reads both
     operands directly from their tensors, so each (free-dim) thread computes the
     complete dot product. Returns None when either operand is not a simple
-    scaled/transposed direct load that can be re-read this way.
+    scaled/permuted direct load that can be re-read this way.
     """
     cg = ctx.cg
-    lhs_fold = _cute_trace_matmul_operand_load(cg, lhs_node)
-    rhs_fold = _cute_trace_matmul_operand_load(cg, rhs_node)
+    lhs_fold = _cute_trace_matmul_operand_load(cg, lhs_node, contraction_dim=-1)
+    rhs_fold = _cute_trace_matmul_operand_load(cg, rhs_node, contraction_dim=-2)
     if lhs_fold is None or rhs_fold is None:
         return None
-    if _cute_static_int_extent(lhs_fold.k_size) != k_extent:
-        return None
-    if _cute_static_int_extent(rhs_fold.k_size) != k_extent:
+
+    def k_size_matches(fold: CuteFoldLoad) -> bool:
+        static_k = _cute_static_int_extent(fold.k_size)
+        if static_k is not None:
+            return static_k == k_extent
+        # A full-slice load over the rdim may carry the reduction block's size
+        # symbol rather than the static dim; it must then be the K block.
+        return cute_resolve_active_block_id(cg, fold.k_size) == k_block_id
+
+    if not (k_size_matches(lhs_fold) and k_size_matches(rhs_fold)):
         return None
 
     def free_index_and_mask(

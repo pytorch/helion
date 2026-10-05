@@ -9024,6 +9024,41 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             return min(thread_extent, size)
         return thread_extent
 
+    def _demote_blocks_beyond_thread_axes(self, state: CodegenState) -> None:
+        """Serve blocks that would land on CUDA thread axis >= 3 with lanes.
+
+        A launch only has x/y/z thread axes. Once the enclosing loops and
+        reductions have claimed them (``_thread_axis_offset``), every further
+        block of this strategy is demoted to what ``num_threads=1`` means:
+        thread extent 1 and a single thread's lane loop walking the whole
+        tile. This only changes the thread layout, never the elements the tile
+        covers, so it is safe to decide per call site at codegen time.
+        """
+        if self.mma_mode or CompileEnvironment.current().backend.name != "cute":
+            return
+        axis = self._thread_axis_offset(state)
+        block_size_by_id = dict(zip(self.block_ids, self.block_size, strict=True))
+        for block_id in (self.block_ids[i] for i in self.loop_order):
+            block_size = block_size_by_id[block_id]
+            if not self._uses_thread_axis_for_block(block_id, block_size):
+                continue
+            if axis < 3:
+                axis += 1
+                continue
+            size = self._configured_block_size_int(block_size)
+            if size is None:
+                raise exc.BackendUnsupported(
+                    "cute",
+                    f"thread axis {axis}: block {block_id} needs a static block "
+                    "size to run as a lane loop",
+                )
+            self._shared_thread_extents[block_id] = 1
+            if size > 1 and block_id not in self._lane_var_by_block:
+                self._lane_var_by_block[block_id] = self.fn.new_var(f"lane_{block_id}")
+            vec = self._cute_lane_vec_width_by_block.get(block_id, 1)
+            if size % vec:
+                self._cute_lane_vec_width_by_block.pop(block_id, None)
+
     def _maybe_apply_cute_cluster(
         self, env: CompileEnvironment, state: CodegenState
     ) -> None:
@@ -9283,6 +9318,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         return exprs
 
     def codegen_grid(self, state: CodegenState) -> DeviceGridState:
+        self._demote_blocks_beyond_thread_axes(state)
         if not self._lane_var_by_block and not self._shared_thread_extents:
             return super().codegen_grid(state)
 
@@ -9598,6 +9634,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         )
 
     def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        self._demote_blocks_beyond_thread_axes(state)
         if (
             not self._lane_var_by_block
             and not self._shared_thread_extents

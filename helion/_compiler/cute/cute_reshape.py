@@ -23,6 +23,8 @@ from torch.fx.node import map_arg
 from torch.utils._sympy.functions import FloorDiv
 
 from ... import exc
+from ...language._tracing_ops import _for_loop
+from ...language._tracing_ops import _for_loop_step
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -374,10 +376,46 @@ _LAYOUT_PRESERVING_SHAPE_TARGETS = frozenset(
     }
 )
 
+# Transpose-like shape ops: a chain of them feeding a matmul relabels the
+# operand layout as a whole (``k[tile, :, :].transpose(0, 1).transpose(-2, -1)``
+# in the HSTU examples), so none of them needs a shuffle.
+_PERMUTE_TARGETS = frozenset(
+    {
+        torch.ops.aten.permute.default,
+        torch.ops.aten.transpose.int,
+        torch.ops.aten.t.default,
+    }
+)
+
+# Device loops whose arguments (``args[3]``) become the placeholders of the
+# loop body graph (``args[0]``).
+_LOOP_TARGETS = frozenset({_for_loop, _for_loop_step})
+
+
+def _loop_body_placeholders_for(value: Node, loop: Node) -> list[Node]:
+    """The body placeholders ``value`` binds to as an argument of ``loop``.
+
+    Matched through the loop node's own argument list, not the body's recorded
+    ``node_args``: the graph under codegen may be a copy whose nodes are not
+    the traced ones.
+    """
+    from ..host_function import HostFunction
+
+    graph_id = loop.args[0]
+    args = loop.args[3]
+    assert isinstance(graph_id, int) and isinstance(args, (list, tuple))
+    placeholders = (
+        HostFunction.current()
+        .device_ir.graphs[graph_id]
+        .graph.find_nodes(op="placeholder")
+    )
+    return [placeholders[index] for index, arg in enumerate(args) if arg is value]
+
 
 def _shape_op_needs_materialization(node: Node) -> bool:
     """Return True when non-store consumers need values, not just metadata."""
     from ...language import memory_ops
+    from ...language._tracing_ops import _new_var
     from ...language.matmul_ops import dot as hl_dot
     from ...language.matmul_ops import dot_scaled as hl_dot_scaled
 
@@ -391,7 +429,43 @@ def _shape_op_needs_materialization(node: Node) -> bool:
     }
     reduction_names = ("sum", "amax", "amin", "prod", "mean")
 
-    def _consumer_needs_materialization(user: Node, visited: set[Node]) -> bool:
+    def _feeds_only_matmuls(value: Node, visited: set[Node]) -> bool:
+        """Whether every value flowing out of ``value`` ends in a matmul.
+
+        Follows further transposes, ``_new_var`` copies and the placeholders
+        of the device loop bodies ``value`` is passed to (a transpose hoisted
+        out of the KV loop reaches its bmm that way); a shape query needs no
+        values.
+        """
+        if value in visited:
+            return True
+        visited.add(value)
+        if not value.users:
+            return False
+        for downstream in value.users:
+            if downstream.op != "call_function":
+                return False
+            target = downstream.target
+            if target in matmul_targets or target is torch.ops.aten.sym_size.int:
+                continue
+            if target in _PERMUTE_TARGETS or target is _new_var:
+                if not _feeds_only_matmuls(downstream, visited):
+                    return False
+                continue
+            if target in _LOOP_TARGETS:
+                placeholders = _loop_body_placeholders_for(value, downstream)
+                if not placeholders or not all(
+                    _feeds_only_matmuls(placeholder, visited)
+                    for placeholder in placeholders
+                ):
+                    return False
+                continue
+            return False
+        return True
+
+    def _consumer_needs_materialization(
+        value: Node, user: Node, visited: set[Node]
+    ) -> bool:
         if user.op != "call_function":
             return True
         if user.target is memory_ops.store:
@@ -401,6 +475,21 @@ def _shape_op_needs_materialization(node: Node) -> bool:
         # scalar value held by the current thread.
         if user.target in matmul_targets:
             return False
+        # The same holds when the value reaches its matmuls through further
+        # transposes, ``_new_var`` copies or a device loop argument: the
+        # matmul reads one scalar per thread (or re-reads the operand loads
+        # in the synthetic-lane K fold), so the chain relabels the layout as
+        # a whole. Any other consumer on the way reads this op's value at its
+        # own position, which the store-side permute folding only tracks one
+        # transpose deep, so this op then materializes as before.
+        if user.target in _PERMUTE_TARGETS or user.target is _new_var:
+            return not _feeds_only_matmuls(user, visited)
+        if user.target in _LOOP_TARGETS:
+            placeholders = _loop_body_placeholders_for(value, user)
+            return not placeholders or not all(
+                _feeds_only_matmuls(placeholder, visited)
+                for placeholder in placeholders
+            )
         target_name = str(user.target)
         if any(name in target_name for name in reduction_names):
             return False
@@ -420,13 +509,15 @@ def _shape_op_needs_materialization(node: Node) -> bool:
             if not user.users:
                 return True
             return any(
-                _consumer_needs_materialization(downstream, visited)
+                _consumer_needs_materialization(user, downstream, visited)
                 for downstream in user.users
             )
         return True
 
     visited: set[Node] = set()
-    return any(_consumer_needs_materialization(user, visited) for user in node.users)
+    return any(
+        _consumer_needs_materialization(node, user, visited) for user in node.users
+    )
 
 
 def _flat_index_from_coords(

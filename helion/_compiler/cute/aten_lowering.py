@@ -81,6 +81,11 @@ from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
 
+_SYNTHETIC_LANE_FOLD_UNSUPPORTED = (
+    "CuTe synthetic-lane K matmul fold only supports direct-load "
+    "operands whose contraction axis is the load's trailing dim"
+)
+
 
 def _requested_pure_matmul_role_lifecycle(ctx: LoweringContext) -> bool:
     return is_pure_matmul_role_lifecycle_config(ctx.cg.device_function.config)
@@ -469,10 +474,12 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         _reject_tcgen05_flat_role_coordinates_fallback()
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
+        assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
             ctx,
             lhs_node,
             rhs_node,
+            k_block_id=k_block_id,
             k_extent=lane_fold_k,
             acc=None,
             out_dtype=effective_out_dtype,
@@ -482,10 +489,7 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
         if fold_result is not None:
             return fold_result
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
-        )
+        raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -576,10 +580,12 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
+        assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
             ctx,
             lhs_node,
             rhs_node,
+            k_block_id=k_block_id,
             k_extent=lane_fold_k,
             acc=acc,
             out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
@@ -589,10 +595,7 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
         if fold_result is not None:
             return fold_result
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
-        )
+        raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
@@ -847,10 +850,12 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         return n_collapse_result
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
+        assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
             ctx,
             lhs_node,
             rhs_node,
+            k_block_id=k_block_id,
             k_extent=lane_fold_k,
             acc=acc,
             out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
@@ -860,10 +865,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         )
         if fold_result is not None:
             return fold_result
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe synthetic-lane K matmul fold only supports direct-load operands",
-        )
+        raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
     return _emit_cute_matmul(
         ctx.cg,
         lhs,
