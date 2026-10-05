@@ -1,0 +1,1864 @@
+{
+  "metadata": {
+    "causal_calls_per_sample": 50,
+    "causal_shape": [
+      1,
+      8,
+      "S",
+      "D"
+    ],
+    "dense_shape": [
+      8,
+      32,
+      "S",
+      "D"
+    ],
+    "libtpu_init_args": "--xla_tpu_dvfs_p_state=7 --xla_tpu_scoped_vmem_limit_kib=65536",
+    "samples": 20,
+    "warmups": 3
+  },
+  "results": {
+    "causal/d128/s1024/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 0.029176329262554646,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 73.67550525825762
+    },
+    "causal/d128/s1024/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 0.029555209912359715,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 72.73102801076926
+    },
+    "causal/d128/s16384/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 1.3749546301551163,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 399.86000720472873
+    },
+    "causal/d128/s16384/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 1.5358584211207926,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 357.968781991501
+    },
+    "causal/d128/s2048/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 0.03347059711813927,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 256.76652453094255
+    },
+    "causal/d128/s2048/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 0.04455921007320285,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 192.8698664514334
+    },
+    "causal/d128/s32768/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 5.187845730688423,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 423.89278297297835
+    },
+    "causal/d128/s32768/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 5.700796768069267,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 385.7514052655455
+    },
+    "causal/d128/s4096/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 0.1107048918493092,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 310.44813288631974
+    },
+    "causal/d128/s4096/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 0.1252354891039431,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 274.42801734478877
+    },
+    "causal/d128/s65536/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 20.14185327105224,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 436.7138972548216
+    },
+    "causal/d128/s65536/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 21.2464821501635,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 414.0086428316468
+    },
+    "causal/d128/s8192/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 0.37242979276925325,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 369.0782352988704
+    },
+    "causal/d128/s8192/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 0.41919573908671737,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 327.90345385539587
+    },
+    "causal/d256/s1024/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 0.030812188051640987,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 139.52795539202342
+    },
+    "causal/d256/s1024/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 0.034253657795488834,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 125.50956238507744
+    },
+    "causal/d256/s16384/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 1.4732785196974876,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 746.3481764912854
+    },
+    "causal/d256/s16384/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 1.7333687096834183,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 634.359401146007
+    },
+    "causal/d256/s2048/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 0.035181730054318905,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 488.55635483138985
+    },
+    "causal/d256/s2048/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 0.04714228911325336,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 364.6038008614175
+    },
+    "causal/d256/s32768/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 5.5910332896746695,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 786.6489968776275
+    },
+    "causal/d256/s32768/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 5.99746375111863,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 733.3401103110732
+    },
+    "causal/d256/s4096/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 0.11967186816036701,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 574.3726993539498
+    },
+    "causal/d256/s4096/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 0.15783532056957483,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 435.49348589373955
+    },
+    "causal/d256/s65536/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 21.78647755878046,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 807.4942097641584
+    },
+    "causal/d256/s65536/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 22.141296132467687,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 794.5539581160594
+    },
+    "causal/d256/s8192/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 0.40935616241768,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 671.570350260169
+    },
+    "causal/d256/s8192/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 0.47915772069245577,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 573.7389788454439
+    },
+    "causal/d64/s1024/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 0.03135569160804152,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 34.277362254843645
+    },
+    "causal/d64/s1024/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 0.03089758101850748,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 34.7855840027155
+    },
+    "causal/d64/s16384/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 1.478477248456329,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 185.93095324734702
+    },
+    "causal/d64/s16384/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 1.6636512102559209,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 165.23576724817983
+    },
+    "causal/d64/s2048/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 0.05308907013386488,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 80.94066136711169
+    },
+    "causal/d64/s2048/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 0.06370215909555554,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 67.45555423881706
+    },
+    "causal/d64/s32768/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 5.317364807706326,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 206.78385289917597
+    },
+    "causal/d64/s32768/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 5.947621199302375,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 184.8714209198412
+    },
+    "causal/d64/s4096/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 0.1612323010340333,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 106.5795338638301
+    },
+    "causal/d64/s4096/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 0.16138572944328186,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 106.47820936385361
+    },
+    "causal/d64/s65536/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 20.327856310177594,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 216.3589486691711
+    },
+    "causal/d64/s65536/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 21.73480849014595,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 202.35345629854527
+    },
+    "causal/d64/s8192/helion": {
+      "calls_per_sample": 50,
+      "config": {
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_internal_scratch": true,
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false,
+        "pallas_use_low_level_scheduler": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 0.44076773105189204,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 155.9276246924451
+    },
+    "causal/d64/s8192/tokamax": {
+      "calls_per_sample": 50,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 2048,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "qk_diag_grid": 4,
+        "qk_diag_skip": true,
+        "sv_diag_skip": true,
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 0.48603256000205874,
+      "mode": "causal",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 141.4058871770008
+    },
+    "dense/d128/s1024/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          8,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 0.6044600158929825,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 227.37476401802743
+    },
+    "dense/d128/s1024/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 1024,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 0.49912394024431705,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 275.3603712230769
+    },
+    "dense/d128/s16384/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 74.22085397411138,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 474.0496801762008
+    },
+    "dense/d128/s16384/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 75.13689750339836,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 468.270227516922
+    },
+    "dense/d128/s2048/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 1.4984169974923134,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 366.8910689134252
+    },
+    "dense/d128/s2048/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 1.4190796064212918,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 387.40308253347575
+    },
+    "dense/d128/s32768/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 290.666576474905,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 484.1887569673106
+    },
+    "dense/d128/s32768/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 297.84321051556617,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 472.5220632416351
+    },
+    "dense/d128/s4096/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 5.079771508462727,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 432.89806478273715
+    },
+    "dense/d128/s4096/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 4.820876056328416,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 456.1459846422143
+    },
+    "dense/d128/s65536/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 1149.3313160026446,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 489.8065036453046
+    },
+    "dense/d128/s65536/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 8192,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 1186.4576333900914,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 474.47960852405896
+    },
+    "dense/d128/s8192/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false
+      },
+      "head_dim": 128,
+      "implementation": "helion",
+      "median_ms": 18.93871510401368,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 464.45035863831356
+    },
+    "dense/d128/s8192/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 128,
+      "implementation": "tokamax",
+      "median_ms": 19.150504958815873,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 459.31389491423033
+    },
+    "dense/d256/s1024/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 0.6143884966149926,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 447.40080333283424
+    },
+    "dense/d256/s1024/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 256,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 0.5872648907825351,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 468.06460127000446
+    },
+    "dense/d256/s16384/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          512,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 78.44530837610364,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 897.042100214371
+    },
+    "dense/d256/s16384/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 8192,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 80.24516957812011,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 876.9218701589105
+    },
+    "dense/d256/s2048/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 1.5622349455952644,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 703.8068319212056
+    },
+    "dense/d256/s2048/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 1.6269631450995803,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 675.806106049626
+    },
+    "dense/d256/s32768/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          8192,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 8,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 309.29783661849797,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 910.0450872465689
+    },
+    "dense/d256/s32768/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 321.9515545060858,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 874.2774270572293
+    },
+    "dense/d256/s4096/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          1024,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 5.301785888150334,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 829.5405744192308
+    },
+    "dense/d256/s4096/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 5.2470340160652995,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 838.196683619378
+    },
+    "dense/d256/s65536/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 1240.7509655458853,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 907.4342378990364
+    },
+    "dense/d256/s65536/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 256,
+        "block_q": 8192,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 1264.6348264534026,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 890.2964581484341
+    },
+    "dense/d256/s8192/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false
+      },
+      "head_dim": 256,
+      "implementation": "helion",
+      "median_ms": 18.82613997440785,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 934.4552876123686
+    },
+    "dense/d256/s8192/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 8192,
+        "block_kv_compute": 512,
+        "block_q": 2048,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 256,
+      "implementation": "tokamax",
+      "median_ms": 20.70231456309557,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 849.7690434950806
+    },
+    "dense/d64/s1024/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          8,
+          1024,
+          512
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 0.7464934606105089,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 92.05636802203031
+    },
+    "dense/d64/s1024/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 1024,
+        "block_kv_compute": 512,
+        "block_q": 1024,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 0.6118620513007045,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 1024,
+      "tflops": 112.31204254278431
+    },
+    "dense/d64/s16384/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 76.51911757420748,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 229.9057621431046
+    },
+    "dense/d64/s16384/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 79.11269902251661,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 16384,
+      "tflops": 222.36867483700703
+    },
+    "dense/d64/s2048/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          4,
+          1024,
+          1024
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 1.803460530936718,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 152.41692414595198
+    },
+    "dense/d64/s2048/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 2048,
+        "block_kv_compute": 1024,
+        "block_q": 2048,
+        "k_layout": "SEQ_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 1.657872460782528,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 2048,
+      "tflops": 165.80160021130675
+    },
+    "dense/d64/s32768/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 295.09614151902497,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 238.46040078815227
+    },
+    "dense/d64/s32768/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 306.06646998785436,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 32768,
+      "tflops": 229.91327400370398
+    },
+    "dense/d64/s4096/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          1024,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll"
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 5.729590426199138,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 191.9005628654311
+    },
+    "dense/d64/s4096/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 1024,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 5.34614606294781,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 4096,
+      "tflops": 205.6643449000233
+    },
+    "dense/d64/s65536/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          1,
+          4096,
+          256
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_emit_pipeline_group_size": 16,
+        "pallas_fold_dot_lhs_cast": true,
+        "pallas_loop_type": "emit_pipeline",
+        "pallas_pre_broadcast": true,
+        "pallas_use_low_level_scheduler": true
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 1158.3329815184698,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 243.0000536992979
+    },
+    "dense/d64/s65536/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 256,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "HEAD_DIM_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": true,
+        "v_layout": "HEAD_DIM_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 1204.1542454389855,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 65536,
+      "tflops": 233.7532569243583
+    },
+    "dense/d64/s8192/helion": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_sizes": [
+          2,
+          512,
+          2048
+        ],
+        "loop_orders": [
+          [
+            0,
+            1
+          ]
+        ],
+        "pallas_load_buffer_count": [
+          1,
+          1,
+          1
+        ],
+        "pallas_loop_type": "unroll",
+        "pallas_pre_broadcast": false
+      },
+      "head_dim": 64,
+      "implementation": "helion",
+      "median_ms": 20.194700337015092,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 217.78221205108804
+    },
+    "dense/d64/s8192/tokamax": {
+      "calls_per_sample": 1,
+      "config": {
+        "block_kv": 4096,
+        "block_kv_compute": 1024,
+        "block_q": 4096,
+        "k_layout": "HEAD_DIM_MINOR",
+        "q_layout": "SEQ_MINOR",
+        "use_base2_exp": true,
+        "use_experimental_scheduler": false,
+        "v_layout": "SEQ_MINOR"
+      },
+      "head_dim": 64,
+      "implementation": "tokamax",
+      "median_ms": 20.620855502784252,
+      "mode": "dense",
+      "samples": 20,
+      "sequence_length": 8192,
+      "tflops": 213.2814766346707
+    }
+  }
+}
