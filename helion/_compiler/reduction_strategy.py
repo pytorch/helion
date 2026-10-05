@@ -828,6 +828,16 @@ class ReductionStrategy(TileStrategy):
             return backend.reduction_index_zero_expr(dtype)
         if isinstance(size, torch.SymInt) and env.known_equal(size, 0):
             return backend.reduction_index_zero_expr(dtype)
+        if self._reduction_thread_count() == 1:
+            # A reduction shrunk to one live thread (``adjust_reduction_thread_count``)
+            # still reserves a thread axis (``thread_axes_used() == 1``).  Alone,
+            # that axis is one thread wide and ``thread_idx()[axis]`` is always 0.
+            # Beside a sibling reduction with more threads the reductions share
+            # one reservation and ``TileStrategy._compute_thread_axis_offset``
+            # lets a tile strategy take this axis, so ``thread_idx()[axis]``
+            # would alias the tile's thread id.  The constant 0 is the lane
+            # index in both cases.
+            return backend.reduction_index_zero_expr(dtype)
         return backend.reduction_index_expr(
             block_size_var, dtype, block_idx, axis=self._get_thread_axis()
         )
