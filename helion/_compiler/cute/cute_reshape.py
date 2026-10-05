@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 import contextlib
 from typing import TYPE_CHECKING
+from typing import Callable
 from typing import cast
 
 import sympy
@@ -37,6 +38,9 @@ if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import TileStrategy
+
+    # Resolves a non-shape-chain leaf at a row-major flat index of its tile.
+    LeafResolver = Callable[[LoweringContext, Node, str], "ast.AST | None"]
 
 CUTE_DIM_LOCAL_COORD_META = "cute_dim_local_coords"
 
@@ -156,10 +160,37 @@ def _strategy_aliases_index_and_offset(strategy: object, block_id: int) -> bool:
     return strategy.block_ids[0] == block_id
 
 
+def _unowned_dim_coord(
+    cg: GenerateAST,
+    fake_tensor: torch.Tensor,
+    dim: int,
+    strict: bool,
+) -> str:
+    """Coordinate for a dim that no thread axis or lane loop distributes.
+
+    Shape chains that merely relabel a per-thread scalar never consume this
+    value, so a zero placeholder is harmless there. ``strict`` callers
+    (``hl.split``/``hl.join``) select data with it and must fail loudly
+    rather than silently read the wrong element.
+    """
+    size = fake_tensor.shape[dim]
+    if strict:
+        env = CompileEnvironment.current()
+        extent = _resolve_tile_extent(size, env, cg.device_function.config)
+        if extent != 1:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"tile dimension {dim} (size {size}) has no thread or lane owner",
+            )
+    return "cutlass.Int32(0)"
+
+
 def _get_dim_local_coord(
     cg: GenerateAST,
     fake_tensor: torch.Tensor,
     dim: int,
+    *,
+    strict: bool = False,
 ) -> str:
     """Get the current local coordinate expression for a tile dimension.
 
@@ -187,9 +218,11 @@ def _get_dim_local_coord(
                     and coord is not None
                 ):
                     return f"({coord}) // cutlass.Int32({int(divisor)})"
-        return "cutlass.Int32(0)"
+        return _unowned_dim_coord(cg, fake_tensor, dim, strict)
     coord = _get_block_local_coord(cg, block_id)
-    return coord if coord is not None else "cutlass.Int32(0)"
+    if coord is None:
+        return _unowned_dim_coord(cg, fake_tensor, dim, strict)
+    return coord
 
 
 def _get_node_dim_local_coord(
@@ -197,6 +230,8 @@ def _get_node_dim_local_coord(
     node: Node,
     fake_tensor: torch.Tensor,
     dim: int,
+    *,
+    strict: bool = False,
 ) -> str:
     """Get a local coordinate, honoring explicit metadata on shape-chain nodes."""
     coord_meta = node.meta.get(CUTE_DIM_LOCAL_COORD_META)
@@ -206,7 +241,7 @@ def _get_node_dim_local_coord(
             coord = _subtile_coord_expr(cg, info)
             if coord is not None:
                 return coord
-    return _get_dim_local_coord(cg, fake_tensor, dim)
+    return _get_dim_local_coord(cg, fake_tensor, dim, strict=strict)
 
 
 def _subtile_coord_expr(cg: GenerateAST, info: dict[object, object]) -> str | None:
@@ -728,6 +763,7 @@ def _resolve_shape_chain_expr(
     ctx: LoweringContext,
     node: Node,
     flat_index: str,
+    leaf_resolver: LeafResolver | None = None,
 ) -> ast.AST | None:
     env = CompileEnvironment.current()
     df = ctx.cg.device_function
@@ -745,7 +781,9 @@ def _resolve_shape_chain_expr(
     # return it directly as a chain leaf.
     materialized = _materialized_permute_value(ctx, node, value)
     if materialized is not None:
-        return materialized
+        # A shuffled permute holds only this thread's own element, so it
+        # cannot be re-read at another coordinate.
+        return None if leaf_resolver is not None else materialized
 
     if node.target in (
         torch.ops.aten.reshape.default,
@@ -755,7 +793,7 @@ def _resolve_shape_chain_expr(
         source = node.args[0]
         if not isinstance(source, Node):
             return None
-        return _resolve_shape_chain_expr(ctx, source, flat_index)
+        return _resolve_shape_chain_expr(ctx, source, flat_index, leaf_resolver)
 
     def _recurse(source: Node, source_coords: list[str]) -> ast.AST | None:
         source_val = source.meta.get("val")
@@ -764,7 +802,7 @@ def _resolve_shape_chain_expr(
         source_flat = _flat_index_from_coords(
             source_coords, _get_tile_shape(source_val, env, config)
         )
-        return _resolve_shape_chain_expr(ctx, source, source_flat)
+        return _resolve_shape_chain_expr(ctx, source, source_flat, leaf_resolver)
 
     def _coords() -> list[str]:
         return _coords_from_flat_index(flat_index, _get_tile_shape(value, env, config))
@@ -797,7 +835,7 @@ def _resolve_shape_chain_expr(
         if source_coords is None:
             return None
         source_flat = _flat_index_from_coords(source_coords, source_shape)
-        return _resolve_shape_chain_expr(ctx, source, source_flat)
+        return _resolve_shape_chain_expr(ctx, source, source_flat, leaf_resolver)
 
     if node.target is torch.ops.aten.transpose.int:
         source = node.args[0]
@@ -869,7 +907,9 @@ def _resolve_shape_chain_expr(
                 input_coords,
                 _get_tile_shape(input_val, env, config),
             )
-            input_expr = _resolve_shape_chain_expr(ctx, tensor, input_flat)
+            input_expr = _resolve_shape_chain_expr(
+                ctx, tensor, input_flat, leaf_resolver
+            )
             if input_expr is None:
                 return None
             input_exprs.append(input_expr)
@@ -880,7 +920,9 @@ def _resolve_shape_chain_expr(
 
     resolved = ctx.env.get(node)
     if isinstance(resolved, CuteShapeChainView):
-        return _resolve_shape_chain_expr(ctx, resolved.node, flat_index)
+        return _resolve_shape_chain_expr(ctx, resolved.node, flat_index, leaf_resolver)
+    if leaf_resolver is not None:
+        return leaf_resolver(ctx, node, flat_index)
     return resolved if isinstance(resolved, ast.AST) else None
 
 
@@ -910,6 +952,7 @@ def resolve_cute_shape_chain_value_at(
     state: CodegenState,
     node: Node,
     flat_index: str,
+    leaf_resolver: LeafResolver | None = None,
 ) -> ast.AST | None:
     """Resolve a shape-chain value (reshape/stack/...) at an explicit flat index.
 
@@ -923,7 +966,7 @@ def resolve_cute_shape_chain_value_at(
     ctx = LoweringContext.__new__(LoweringContext)
     ctx.cg = state.codegen
     ctx.env = state.env
-    return _resolve_shape_chain_expr(ctx, node, flat_index)
+    return _resolve_shape_chain_expr(ctx, node, flat_index, leaf_resolver)
 
 
 def codegen_cute_virtual_clone(

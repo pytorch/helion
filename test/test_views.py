@@ -13,6 +13,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotTriton
+from helion._testing import skipIfPallas
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
@@ -466,6 +467,167 @@ class TestViews(RefEagerTestBase, TestCase):
                     fn, (x, weight, use_unbind), block_sizes=[32]
                 )
                 torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_split_join_halves_permute(self):
+        # The rope pattern: a full-slice dim viewed as (2, half), transposed so
+        # the pair dim is last, split, recombined and transposed back.
+        @helion.kernel(config={"block_size": 64}, static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n, d = x.size()
+            half = d // 2
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                pair = (
+                    x[tile, :]
+                    .to(torch.float32)
+                    .reshape([tile, 2, half])
+                    .permute(0, 2, 1)
+                )
+                lo, hi = hl.split(pair)
+                out[tile, :] = (
+                    hl.join(hi * 2.0, lo * 3.0)
+                    .permute(0, 2, 1)
+                    .reshape([tile, d])
+                    .to(x.dtype)
+                )
+            return out
+
+        x = torch.randn([256, 64], device=DEVICE)
+        _code, result = code_and_output(fn, (x,))
+        expected = torch.cat((x[:, 32:] * 2.0, x[:, :32] * 3.0), dim=-1)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    def test_split_full_slice_store(self):
+        # Split halves stored through full slices of their own extent.
+        @helion.kernel(config={"block_size": 64}, static_shapes=True)
+        def fn(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            n, d = x.size()
+            half = d // 2
+            lo_out = torch.empty([n, half], dtype=x.dtype, device=x.device)
+            hi_out = torch.empty([n, half], dtype=x.dtype, device=x.device)
+            for tile in hl.tile(n):
+                pair = x[tile, :].reshape([tile, 2, half]).permute(0, 2, 1)
+                lo, hi = hl.split(pair)
+                lo_out[tile, :] = lo
+                hi_out[tile, :] = hi + 1.0
+            return lo_out, hi_out
+
+        x = torch.randn([256, 64], device=DEVICE)
+        _code, (lo, hi) = code_and_output(fn, (x,))
+        torch.testing.assert_close(lo, x[:, :32])
+        torch.testing.assert_close(hi, x[:, 32:] + 1.0)
+
+    @skipIfPallas("hl.split/hl.join over permuted pair views is not verified on Pallas")
+    @skipIfRefEager("block-local halves depend on the tile block size")
+    def test_split_join_tiled_halves(self):
+        # Same pattern on a real tile of d (block-local halves).
+        @helion.kernel(config={"block_sizes": [32, 16]}, static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n, d = x.size()
+            out = torch.empty_like(x)
+            for tile_n, tile_d in hl.tile([n, d]):
+                pair = (
+                    x[tile_n, tile_d]
+                    .reshape([tile_n, 2, tile_d.block_size // 2])
+                    .permute(0, 2, 1)
+                )
+                lo, hi = hl.split(pair)
+                out[tile_n, tile_d] = (
+                    hl.join(lo * 2.0, hi * 3.0)
+                    .permute(0, 2, 1)
+                    .reshape([tile_n, tile_d])
+                )
+            return out
+
+        x = torch.randn([128, 64], device=DEVICE)
+        _code, result = code_and_output(fn, (x,))
+        blocks = x.view(128, 4, 2, 8)
+        expected = torch.cat(
+            (blocks[:, :, :1] * 2.0, blocks[:, :, 1:] * 3.0), dim=2
+        ).view(128, 64)
+        torch.testing.assert_close(result, expected)
+
+    @skipIfPallas("hl.split/hl.join over pair views is not verified on Pallas")
+    @skipIfRefEager("checks the backend lowering of hl.split over a masked load")
+    def test_split_join_masked_load(self):
+        # The pair tile comes from a load with ``extra_mask``: positions where
+        # the mask is false are zero-filled and hl.split must see those zeros
+        # for both pair elements, not the raw memory behind them.
+        @helion.kernel(config={"block_size": 64}, static_shapes=True)
+        def fn(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            n, d = x.size()
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                v = hl.load(x, [tile, slice(None)], extra_mask=mask[tile, :])
+                lo, hi = hl.split(v.reshape([tile, d // 2, 2]))
+                out[tile, :] = hl.join(hi * 2.0, lo * 3.0).reshape([tile, d])
+            return out
+
+        x = torch.randn([256, 64], device=DEVICE)
+        mask = torch.rand([256, 64], device=DEVICE) < 0.5
+        code, result = code_and_output(fn, (x, mask))
+        masked = torch.where(mask, x, torch.zeros_like(x)).view(256, 32, 2)
+        expected = torch.stack((masked[..., 1] * 2.0, masked[..., 0] * 3.0), -1)
+        torch.testing.assert_close(result, expected.view(256, 64))
+        if _get_backend() == "cute":
+            # The masked load cannot be re-read element-wise; the tile goes
+            # through the verified shared-memory exchange instead.
+            self.assertIn("split_smem", code)
+
+    @skipIfPallas("hl.split/hl.join over pair views is not verified on Pallas")
+    @skipIfRefEager(
+        "an eager view aliases the loaded tile; checks the device load copy"
+    )
+    def test_split_after_store_through_host_view(self):
+        # ``y`` is a host-side view of ``x``; the store through it must not be
+        # observed by hl.split of the tile loaded from ``x`` before it.
+        @helion.kernel(config={"block_size": 64}, static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            n, d = x.size()
+            y = x.view(n, d)
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                v = x[tile, :]
+                y[tile, :] = torch.zeros_like(v)
+                lo, hi = hl.split(v.reshape([tile, d // 2, 2]))
+                out[tile, :] = hl.join(hi, lo).reshape([tile, d])
+            return out
+
+        x = torch.randn([256, 64], device=DEVICE)
+        pairs = x.view(256, 32, 2)
+        expected = torch.stack((pairs[..., 1], pairs[..., 0]), dim=-1).view(256, 64)
+        code, result = code_and_output(fn, (x.clone(),))
+        torch.testing.assert_close(result, expected)
+        if _get_backend() == "cute":
+            self.assertIn("split_smem", code)
+
+    @skipIfPallas("hl.split/hl.join over pair views is not verified on Pallas")
+    @skipIfRefEager(
+        "an eager view aliases the loaded tile; checks the device load copy"
+    )
+    def test_split_after_store_to_aliased_arg(self):
+        # Two kernel arguments may be the same tensor at call time.
+        @helion.kernel(config={"block_size": 64}, static_shapes=True)
+        def fn(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+            n, d = x.size()
+            out = torch.empty_like(x)
+            for tile in hl.tile(n):
+                v = x[tile, :]
+                w[tile, :] = torch.zeros_like(v)
+                lo, hi = hl.split(v.reshape([tile, d // 2, 2]))
+                out[tile, :] = hl.join(hi, lo).reshape([tile, d])
+            return out
+
+        x = torch.randn([256, 64], device=DEVICE)
+        pairs = x.view(256, 32, 2)
+        expected = torch.stack((pairs[..., 1], pairs[..., 0]), dim=-1).view(256, 64)
+        x = x.clone()
+        code, result = code_and_output(fn, (x, x))
+        torch.testing.assert_close(result, expected)
+        if _get_backend() == "cute":
+            self.assertIn("split_smem", code)
 
     def test_join_broadcast_scalar(self):
         @helion.kernel(config={"block_size": 64})

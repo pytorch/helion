@@ -242,7 +242,10 @@ from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreBodyCorePar
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStorePipelineParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreSubtileLoopParams
 from helion._compiler.cute.tcgen05_pure_matmul import Tcgen05TmaStoreTailParams
+from helion._compiler.cute.view_subtile import _feeds_split
+from helion._compiler.cute.view_subtile import _propagated_coord_meta
 from helion._compiler.cute.view_subtile import _split_minor_coord_meta
+from helion._compiler.cute.view_subtile import _split_output_coord_meta
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._compiler.device_ir import GraphInfo
@@ -16922,6 +16925,29 @@ class TestCuteLowerings(unittest.TestCase):
 
         self.assertEqual(_split_minor_coord_meta(projected), coordinate)
         self.assertIsNone(_split_minor_coord_meta(opaque))
+
+    def test_split_coord_meta_propagates_through_permute(self) -> None:
+        graph = Graph()
+        source = graph.placeholder("source")
+        source.meta["val"] = torch.empty([8, 2, 4])
+        outer = {"block_id": 2, "divisor": 4, "modulus": 2}
+        inner = {"block_id": 2, "divisor": 1, "modulus": 4}
+        source.meta[CUTE_DIM_LOCAL_COORD_META] = [None, outer, inner]
+        permuted = graph.call_function(
+            torch.ops.aten.permute.default, (source, [0, 2, 1])
+        )
+        permuted.meta["val"] = torch.empty([8, 4, 2])
+        split = graph.call_function(hl.split, (permuted,))
+        projected = graph.call_function(operator.getitem, (split, 0))
+        projected.meta["val"] = torch.empty([8, 4])
+
+        # The split view is detected through the intervening permute, which
+        # reorders the coordinates so the pair dim becomes the minor one.
+        self.assertTrue(_feeds_split(source))
+        permuted.meta[CUTE_DIM_LOCAL_COORD_META] = _propagated_coord_meta(permuted)
+        self.assertEqual(permuted.meta[CUTE_DIM_LOCAL_COORD_META], [None, inner, outer])
+        self.assertEqual(_split_minor_coord_meta(projected), outer)
+        self.assertEqual(_split_output_coord_meta(projected), [None, inner])
 
     def test_tcgen05_fragment_index_compiler_matches_sympy(self) -> None:
         row = _Index.variable("row", 3)
