@@ -36,8 +36,8 @@ _ALLOCATION_ADDRESS_AXIS = -1
 _MAX_RELATION_PIECES = 4_096
 _MAX_RELATION_PRODUCT_STATES = 65_536
 # Caps the tagged words each rank pushes per buffer, which bounds its mailbox (two
-# parities per rank). A size bound, not a measured crossover.
-_INBAND_PUSH_BYTES = 1 << 22
+# parities per rank). Inband still beat peer counters at 26 MB (16-token TP4 logits).
+_INBAND_PUSH_BYTES = 1 << 25
 DependencyObligation = tuple[int, int | None, int | None]
 # Local counters, tagged data pushed to every rank, or counters every rank sees.
 Transport = Literal["counter", "inband", "peer_counter"]
@@ -6467,7 +6467,7 @@ def _inband_failure(
         if _subtract_regions(region, covers):
             return "R6: peer loads read the whole buffer of each polled rank"
     if 8 * world_size * numel > _INBAND_PUSH_BYTES:
-        return "R7: each rank pushes at most 4 MiB of tagged words"
+        return "R7: each rank pushes at most 32 MiB of tagged words"
     # Every rank then reads each scatter row it may have to fetch from the owner.
     if scatter and not all(
         runs_at_root(load) and not load.has_explicit_mask for load in peer_loads
