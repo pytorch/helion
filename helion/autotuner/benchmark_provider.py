@@ -530,6 +530,14 @@ class BenchmarkProvider(abc.ABC):
         """Return and clear source-equivalent repairs discovered since last read."""
         return {}
 
+    def take_no_viable_config_error(self) -> Exception | None:
+        """Return and clear the compile error deferred by the last batch.
+
+        A ``raise_if_no_viable_config=False`` batch that would otherwise have
+        re-raised its compile error keeps it here (see :meth:`benchmark`).
+        """
+        return None
+
     def invalidate_effective_source_hash(self, source_hash: str) -> None:
         """Prevent a failed rebenchmark source from being reused as an alias."""
         return None
@@ -540,12 +548,21 @@ class BenchmarkProvider(abc.ABC):
         configs: list[Config],
         *,
         desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
         """Compile, precompile, validate, and time a batch of configs.
 
         Handles the full benchmark flow: compilation, optional subprocess
         precompilation, accuracy validation, timing, error classification,
         and progress reporting.
+
+        When nothing has been measured yet and every config in the batch
+        fails to compile, the compile error is re-raised so a broken kernel
+        surfaces its real cause instead of ``NoConfigFound``. Callers that
+        hold a fallback population (a seed-only initial batch) pass
+        ``raise_if_no_viable_config=False`` to receive ``perf=inf`` rows
+        instead; the error is kept for :meth:`take_no_viable_config_error` so
+        the caller can still raise it when its fallback turns out empty.
 
         Returns one ``BenchmarkResult`` per input config, in the same order.
         """
@@ -628,6 +645,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self._precompile_result_counter: count[int] = count()
         self._benchmark_worker: BenchmarkWorker | None = None
         self._last_benchmark_failure_status: Literal["error", "timeout"] | None = None
+        self._no_viable_config_error: Exception | None = None
         self._effective_source_hashes: set[str] = set()
         self._effective_source_results: dict[str, BenchmarkResult] = {}
         self._invalid_effective_source_hashes: set[str] = set()
@@ -675,6 +693,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         repairs = self._effective_source_repairs
         self._effective_source_repairs = {}
         return repairs
+
+    def take_no_viable_config_error(self) -> Exception | None:
+        error = self._no_viable_config_error
+        self._no_viable_config_error = None
+        return error
 
     def invalidate_effective_source_hash(self, source_hash: str) -> None:
         self._invalid_effective_source_hashes.add(source_hash)
@@ -1260,6 +1283,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         configs: list[Config],
         *,
         desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
         """Compile, precompile, validate, and time a batch of configs.
 
@@ -1279,6 +1303,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         that disable ``autotune_precompile`` (e.g. cute) skip that
         wait entirely.
         """
+        self._no_viable_config_error = None
         all_configs = configs
         compiled: dict[int, Callable[..., object]] = {}
         futures: list[PrecompileFuture] | None = None
@@ -1308,7 +1333,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 with capture_output() as captured:
                     compiled[i] = self.kernel.compile_config(config, allow_print=False)
             except Exception as e:
-                raise_if_no_viable_config = (
+                no_viable_config = (
                     not compiled
                     and i == len(all_configs) - 1
                     and self._autotune_metrics.num_successful_candidate_measurements
@@ -1343,8 +1368,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     f"{self.kernel.format_kernel_decorator(config, self.settings)}",
                     exc_info=True,
                 )
-                if raise_if_no_viable_config:
-                    raise
+                if no_viable_config:
+                    if raise_if_no_viable_config:
+                        raise
+                    self._no_viable_config_error = e
 
         deduplicated_indices: set[int] = set()
         recorded_deduplicated_indices: set[int] = set()
@@ -2261,6 +2288,20 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         self._effective_source_repairs = {}
         return repairs
 
+    def take_no_viable_config_error(self) -> Exception | None:
+        # Mirror _benchmark_child: a failure that would have been skipped for
+        # its shape must not surface as the search's fatal compile error.
+        result: Exception | None = None
+        for child in self.children:
+            error = child.take_no_viable_config_error()
+            if (
+                result is None
+                and error is not None
+                and not self._is_skippable_child_failure(child, error)
+            ):
+                result = error
+        return result
+
     def setup(self) -> None:
         case_index = 0
         try:
@@ -2377,8 +2418,14 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         configs: list[Config],
         *,
         desc: str = "Benchmarking",
+        raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
-        return self._benchmark(configs, desc=desc, record_results=True)
+        return self._benchmark(
+            configs,
+            desc=desc,
+            record_results=True,
+            raise_if_no_viable_config=raise_if_no_viable_config,
+        )
 
     def _benchmark(
         self,
@@ -2387,6 +2434,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         desc: str,
         record_results: bool,
         check_budget: bool = True,
+        raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
         if not configs:
             return []
@@ -2435,6 +2483,7 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 materialized,
                 desc=f"{desc} shape {index + 1}",
                 case_index=index,
+                raise_if_no_viable_config=raise_if_no_viable_config,
             )
             for index, child in enumerate(self.children)
         ]
@@ -2630,9 +2679,14 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
         *,
         desc: str,
         case_index: int,
+        raise_if_no_viable_config: bool = True,
     ) -> list[BenchmarkResult]:
         try:
-            return child.benchmark(configs, desc=desc)
+            return child.benchmark(
+                configs,
+                desc=desc,
+                raise_if_no_viable_config=raise_if_no_viable_config,
+            )
         except Exception as error:
             if not self._is_skippable_child_failure(child, error):
                 raise
