@@ -1554,7 +1554,7 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("_BLOCK_SIZE_2, num_stages=1)", code)
         self.assertNotIn("num_stages=3", code)
         # Aligned tiles pack two bf16 per word and push 16-byte word pairs; each
-        # reader polls the word holding its element and shifts it out.
+        # reader polls whole words and unpacks both lanes in-thread.
         symm, x = torch.zeros(2, 4096, device=DEVICE, dtype=torch.bfloat16)
         code = pipelined_allreduce_kernel.bind(
             (symm, x, group, "inband", world)
@@ -1562,7 +1562,8 @@ class TestDistributedTileDependencies(TestCase):
         self.assertEqual(code.count("st.relaxed.sys.global.v2.u64"), world)
         self.assertNotIn("st.relaxed.sys.global.u64", code)
         self.assertIn("<< 16 | tile_dependency_peer_epoch << 32", code)
-        self.assertIn("% 2, tl.uint64) * 16, tl.uint16)", code)
+        self.assertIn("tl.reshape(tl.join(tl.cast(tl.cast(inband_word", code)
+        self.assertNotIn("% 2, tl.uint64) * 16", code)
         self.assertIn(f"(x, {2 * world * 2048 + 2}, torch.uint64, True)", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
@@ -1596,6 +1597,9 @@ class TestDistributedTileDependencies(TestCase):
         self.assertIn("(indices_0[:, None] * 256 + inband_lane_10[None, :] * 1", code)
         self.assertIn("tl.cast(mask_0[:, None], tl.int32), [_BLOCK_SIZE_0, ", code)
         self.assertNotIn("tl.reshape(inband_offset", code)
+        # The masked poll reads the same words and unpacks them in-thread.
+        self.assertIn("tl.reshape(tl.join(", code)
+        self.assertNotIn("% 2, tl.uint64) * 16", code)
 
     @skipIfRefEager("tile dependencies are built only in compiled mode")
     @parametrize("world", (2, 4, 8))

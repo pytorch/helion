@@ -4809,8 +4809,17 @@ class TileDependencyGraph:
             and not store.subscript_is_scalar[position]
         ):
             return block_size(axis.block_id)
+        offset = store.subscript_offsets[position]
         if block_id is None and store.subscript_is_scalar[position]:
-            return None if store.subscript_offsets[position] is None else 1
+            return None if offset is None else 1
+        static = (
+            store.subscript_static_extents[position]
+            if position < len(store.subscript_static_extents)
+            else None
+        )
+        # A proved contiguous static vector, like hl.arange(n), from its offset.
+        if block_id is None and offset is not None and static:
+            return None if offset % static else static
         return None
 
     def inband_row(self, store: TileAccess, block_size: Callable[[int], int]) -> int:
