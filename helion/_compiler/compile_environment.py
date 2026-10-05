@@ -6,6 +6,7 @@ import contextlib
 import contextvars
 import dataclasses
 import logging
+import math
 import sys
 import threading
 import types
@@ -180,6 +181,39 @@ _FRESH_ALLOCATION_FACTORIES: tuple[object, ...] = (
     torch.Tensor.new_ones,
     torch.Tensor.new_full,
 )
+# Factories whose fresh storage starts as positive zeros, and the ``full``
+# family with the positional slot of its fill value (``fill_value=`` otherwise).
+_ZERO_FILLED_FACTORIES: tuple[object, ...] = (
+    torch.zeros,
+    torch.zeros_like,
+    torch.Tensor.new_zeros,
+)
+_FILL_VALUE_FACTORIES: dict[object, int] = {
+    torch.full: 1,
+    torch.full_like: 1,
+    torch.Tensor.new_full: 2,
+}
+
+
+def _factory_fills_positive_zero(
+    factory: object,
+    args: typing.Sequence[object],
+    kwargs: typing.Mapping[str, object],
+) -> bool:
+    """Whether the wrapper factory call fills its allocation with ``+0``.
+
+    Only a literal Python zero counts: ``-0.0`` is a different value for the
+    sign-of-zero reasoning this feeds, and a traced scalar is unknown.
+    """
+    if factory in _ZERO_FILLED_FACTORIES:
+        return True
+    position = _FILL_VALUE_FACTORIES.get(factory)
+    if position is None:
+        return False
+    fill = kwargs.get("fill_value", args[position] if len(args) > position else None)
+    if isinstance(fill, bool) or not isinstance(fill, (int, float)):
+        return False
+    return fill == 0 and math.copysign(1.0, float(fill)) > 0
 
 
 def _replay_tensor_input_source(
@@ -407,6 +441,7 @@ class CompileEnvironment:
         # its base is allocator-aligned, so a static storage offset decides the
         # base alignment of any view of it.
         self._fresh_allocation_storages: set[torch.UntypedStorage] = set()
+        self._zero_filled_allocation_storages: set[torch.UntypedStorage] = set()
         self._runtime_arg_values_by_name: contextvars.ContextVar[
             dict[str, object] | None
         ] = contextvars.ContextVar(
@@ -861,6 +896,18 @@ class CompileEnvironment:
         """
         return fake_tensor.untyped_storage() in self._fresh_allocation_storages
 
+    def tensor_storage_is_zero_filled_allocation(
+        self, fake_tensor: torch.Tensor
+    ) -> bool:
+        """Whether ``fake_tensor`` views fresh wrapper storage filled with ``+0``.
+
+        ``torch.zeros`` and friends, or a ``full`` with a literal positive
+        zero, recorded by ``register_tensor_factory_layout``.  The zeros are
+        the storage's initial contents only; what the host and the kernel do
+        to it afterwards is the caller's proof.
+        """
+        return fake_tensor.untyped_storage() in self._zero_filled_allocation_storages
+
     def register_tensor_factory_layout(
         self,
         factory: object,
@@ -898,6 +945,8 @@ class CompileEnvironment:
         if result_storage in argument_storages:
             return
         self._fresh_allocation_storages.add(result_storage)
+        if _factory_fills_positive_zero(factory, args, kwargs):
+            self._zero_filled_allocation_storages.add(result_storage)
         is_exact = False
         if factory is torch.empty:
             is_exact = True

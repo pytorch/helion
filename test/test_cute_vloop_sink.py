@@ -590,7 +590,15 @@ def test_a_gathered_value_is_not_recomputed_after_the_atomic(cpu_only: None) -> 
     x = torch.empty(1024, 1024, dtype=torch.bfloat16)
     count = torch.empty(1024, dtype=torch.float32)
     config = _sink_config(block_sizes=[1024, 16], num_threads=[1, 4], vec=[1, 4])
-    code = _cpu_code(col_reduce_sum_gather_then_atomic_static, (x, count), **config)
+    # The vector atomic flush is an sm_90+ form (``cute/atomic_ops.py``).
+    with (
+        patch("helion.runtime.kernel.target_device_capability", return_value=(10, 0)),
+        patch(
+            "helion._compiler.compile_environment.target_device_capability",
+            return_value=(10, 0),
+        ),
+    ):
+        code = _cpu_code(col_reduce_sum_gather_then_atomic_static, (x, count), **config)
     _assert_defined_before_use(code)
     assert "_vsink_vec" in code
     kernel = _kernel_def(code)
@@ -611,19 +619,23 @@ def test_a_gathered_value_is_not_recomputed_after_the_atomic(cpu_only: None) -> 
     ]
     gather_text = ast.unparse(gather)
     assert gather_text.startswith("before_frag[vec_lane_1] = count[")
-    # ... which sits in the V-loop holding the atomic, ahead of it, ...
-    (prologue,) = [
+    # ... in the first V-loop of the lane body, ahead of the atomic: the
+    # per-lane adds of ``count`` are collected in that V-loop and flushed as
+    # one vector atomic after it (``cute/atomic_ops.py``).
+    (lane_loop,) = [
         loop
         for loop in ast.walk(kernel)
-        if isinstance(loop, ast.For)
-        and "range_constexpr" in ast.unparse(loop.iter)
-        and "cute.arch.atomic_add(" in ast.unparse(loop)
+        if isinstance(loop, ast.For) and ast.unparse(loop.iter) == "range(1)"
     ]
-    statements = [ast.unparse(stmt) for stmt in prologue.body]
+    statements = [ast.unparse(stmt) for stmt in lane_loop.body]
+    prologue = next(text for text in statements if text.startswith("for vec_lane_1 in"))
+    assert gather_text in prologue
+    assert "_tile_atomic_vals_1_0.append(" in prologue
     (atomic,) = [
-        text for text in statements if text.startswith("cute.arch.atomic_add(")
+        text for text in statements if text.startswith("_cute_red_add_f32_vec(")
     ]
-    assert statements.index(gather_text) < statements.index(atomic)
+    assert statements.index(prologue) < statements.index(atomic)
+    assert "cute.arch.atomic_add(" not in ast.unparse(kernel)
     # ... and the value read there is what the epilogue adds.
     every_statement = [
         ast.unparse(stmt) for stmt in ast.walk(kernel) if isinstance(stmt, ast.stmt)
@@ -796,19 +808,27 @@ def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> 
 
 
 @skipUnlessBackends(["cute"])
-def test_lane_unroll_requires_sinking(cpu_only: None) -> None:
+def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     bound = _cpu_bind(col_reduce_sum_static, (x,))
-    config = bound.config_spec.normalized_config(
-        helion.Config(
-            block_sizes=[4096, 16],
-            num_threads=[128, 4],
-            cute_vector_widths=[1, 4],
-            cute_vloop_sink=False,
-            cute_lane_unroll=8,
+
+    def normalized_unroll(num_threads: list[int]) -> int:
+        config = bound.config_spec.normalized_config(
+            helion.Config(
+                block_sizes=[4096, 16],
+                num_threads=num_threads,
+                cute_vector_widths=[1, 4],
+                cute_vloop_sink=False,
+                cute_lane_unroll=8,
+            )
         )
-    )
-    assert config.config["cute_lane_unroll"] == 1
+        return config.config["cute_lane_unroll"]
+
+    # Without sinking the unroll belongs to the loads-first lane unroll
+    # (``cute/unroll_lane_loads.py``), which needs a grid lane loop: four
+    # threads over 16 columns form one, sixteen do not.
+    assert normalized_unroll([128, 4]) == 8
+    assert normalized_unroll([128, 16]) == 1
     with pytest.raises(helion.exc.InvalidConfig):
         bound.config_spec.normalize(
             helion.Config(

@@ -1376,6 +1376,18 @@ def _cute_register_tile_unroll_vec_hoist(
     return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
 
 
+def _cute_is_tile_scalar(
+    env: CompileEnvironment, idx: torch.SymInt, block_id: int
+) -> bool:
+    """Whether ``idx``, mapped to ``block_id``, is a tile attribute or grid index.
+
+    ``CompileEnvironment.get_block_id`` answers for the block's own size
+    symbol, the tile, and for the symbols derived from it (``tile.begin``,
+    ``tile.id``, a grid index), which are scalars.
+    """
+    return _symint_expr(idx) != _symint_expr(env.block_sizes[block_id].var)
+
+
 def _cute_combined_mask(
     state: CodegenState,
     subscript: list[object] | tuple[object, ...],
@@ -1518,6 +1530,15 @@ def _cute_combined_mask(
             continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
+            if block_id is not None and _cute_is_tile_scalar(env, idx, block_id):
+                # A tile attribute (``tile.begin``, ``tile.id``) or a grid
+                # index is one address for the whole tile, in range whenever
+                # the tile is, and drops the dimension: no lane mask applies
+                # to it, as in the Triton lowering.  The axis's mask here
+                # would gate a value to its default in lanes past the tile's
+                # end, which a store of a tensor lacking the axis (guarded by
+                # fewer masks) then writes.
+                block_id = None
         elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
             for bid in _matching_block_ids(env, tensor.shape[tensor_dim]):
                 if bid not in seen and mask_var_for_block_id(bid) is not None:

@@ -159,22 +159,25 @@ def test_loaded_flag_mask_matches_reference() -> None:
 def _atomic_flag_columns(x: torch.Tensor, counter: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile0, tile1 in hl.tile(out.size()):
-        old = hl.atomic_add(counter, [tile0], 1)
+        # One atomic per element: a leader-issued atomic's result is not
+        # shared with the other threads, so a per-row one could not feed the
+        # mask of every column.
+        old = hl.atomic_add(counter, [tile0, tile1], 1)
         out[tile0, tile1] = hl.load(
             x,
             [tile0, tile1],
-            extra_mask=(old >= 0)[:, None] & (tile1.index < 512)[None, :],
+            extra_mask=(old >= 0) & (tile1.index < 512)[None, :],
         )
     return out
 
 
 def test_atomic_result_mask_matches_reference() -> None:
     x = torch.randn((8, 1024), device=CUDA_DEVICE)
-    counter = torch.zeros((8,), dtype=torch.int32, device=CUDA_DEVICE)
+    counter = torch.zeros((8, 1024), dtype=torch.int32, device=CUDA_DEVICE)
     out = _run(_atomic_flag_columns, (x, counter), **_ROW_CONFIG)
     keep = (torch.arange(1024, device=CUDA_DEVICE) < 512)[None, :]
     torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
-    assert bool((counter > 0).all())
+    assert bool((counter == 1).all())
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

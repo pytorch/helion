@@ -6,7 +6,26 @@ from examples.concatenate import concat2d_dim1_simple
 import pytest
 import torch
 
+from test.test_cute_lane_loop_distribution import _INNER_LANES_CONFIG
+from test.test_cute_lane_loop_distribution import _NESTED_CONFIG
+from test.test_cute_lane_loop_distribution import _NESTED_SCALAR_CONFIG
+from test.test_cute_lane_loop_distribution import (
+    _copy_then_zero_first_column_in_inner_tile,
+)
+from test.test_cute_lane_loop_distribution import _copy_then_zero_first_row
+from test.test_cute_lane_loop_distribution import _first_row_increment_beside_copy
+from test.test_cute_lane_loop_distribution import _first_row_scaled_beside_copy
+from test.test_cute_lane_loop_distribution import _first_row_then_update_all
+from test.test_cute_lane_loop_distribution import _first_row_then_update_all_plus_one
+from test.test_cute_lane_loop_distribution import _first_row_to_vector
+from test.test_cute_lane_loop_distribution import (
+    _zero_first_column_then_copy_in_inner_tile,
+)
+from test.test_cute_lane_loop_distribution import _zero_first_row_then_copy
+from test.test_cute_lane_loop_distribution import _zero_first_row_then_copy_plus_one
+
 import helion
+from helion import exc
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -88,12 +107,6 @@ def test_concat_simple_matches_torch_cat(
 _ROW_CONFIG = {
     "block_sizes": [1, 1024],
     "num_threads": [0, 256],
-    "cute_vector_widths": [1, 4],
-}
-# Four rows per thread around the vector lane loop: two live lane loops.
-_NESTED_CONFIG = {
-    "block_sizes": [4, 256],
-    "num_threads": [1, 64],
     "cute_vector_widths": [1, 4],
 }
 # A thread-owned leading axis, a plain lane loop and the vector lane loop.
@@ -304,13 +317,16 @@ def test_store_between_a_byte_conversion_and_its_flush_matches_reference(
 def _copy_zero_copy(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     # Each program's tile spans its whole row, so the element it zeroes was
     # written by its own tile store; the result does not depend on
-    # cross-program timing.
+    # cross-program timing.  The last column belongs to the last lane
+    # iteration of the last thread: a zeroing store left inside the loop is
+    # overwritten by that iteration's flush, whereas the first column is
+    # flushed in the first iteration and re-zeroed by the second.
     out = torch.empty(packed.shape, dtype=torch.bfloat16, device=packed.device)
     out2 = torch.empty(packed.shape, dtype=torch.bfloat16, device=packed.device)
     for tile0, tile1 in hl.tile(packed.shape):
         y = packed[tile0, tile1].to(torch.bfloat16)
         out[tile0, tile1] = y
-        out[tile0.begin, 0] = 0.0
+        out[tile0.begin, 255] = 0.0
         out2[tile0, tile1] = y
     return out, out2
 
@@ -320,10 +336,10 @@ def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
     packet_flush: bool,
 ) -> None:
     # The zeroing store follows the loop (see the GPU-free companion): the
-    # copy's element is zero and the second copy is untouched, over two lane
-    # iterations per thread.
+    # copy's last element is zero and the second copy is untouched, over two
+    # lane iterations per thread.
     packed = torch.randint(-128, 128, (8, 256), dtype=torch.int8, device=CUDA_DEVICE)
-    packed[:, 0] = -3
+    packed[:, 255] = -3
     config = helion.Config(
         block_sizes=[1, 256],
         num_threads=[0, 32],
@@ -333,7 +349,7 @@ def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
     out, out2 = _copy_zero_copy.bind((packed,)).compile_config(config)(packed)
     expected = packed.to(torch.bfloat16)
     torch.testing.assert_close(out2, expected, rtol=0, atol=0)
-    expected[:, 0] = 0.0
+    expected[:, 255] = 0.0
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
@@ -355,3 +371,126 @@ def test_read_before_a_flushed_store_matches_reference() -> None:
     out, first = bound.compile_config(helion.Config.from_dict(_ROW_CONFIG))(x)
     torch.testing.assert_close(out, x, rtol=0, atol=0)
     torch.testing.assert_close(first, torch.zeros_like(first), rtol=0, atol=0)
+
+
+def _small_integers(shape: tuple[int, ...]) -> torch.Tensor:
+    return torch.randint(0, 5, shape, device=CUDA_DEVICE).float()
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+def test_masked_tile_uniform_accesses_around_per_lane_stores_reject_the_config(
+    config: dict[str, object],
+) -> None:
+    # On a partial tile the first row's load and the zeroing store read the
+    # row mask and stay inside the row loop, where they would repeat around
+    # the other rows' stores (see the GPU-free companion).
+    x = _small_integers((6, 250))
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant load of x would repeat"
+    ):
+        _run(_first_row_then_update_all, (x,), **config)
+    out = torch.full((6, 250), -7.0, device=CUDA_DEVICE)
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
+    ):
+        _run(_zero_first_row_then_copy, (x, out), **config)
+
+
+@pytest.mark.parametrize(
+    "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
+)
+def test_masked_tile_uniform_store_after_per_lane_stores_matches_reference(
+    config: dict[str, object],
+) -> None:
+    x = _small_integers((6, 250))
+    out = torch.full((6, 250), -7.0, device=CUDA_DEVICE)
+    result = _run(_copy_then_zero_first_row, (x, out), **config)
+    expected = x.clone()
+    expected[::4] = 0.0
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_tile_uniform_store_in_an_inner_tile_loop_matches_reference() -> None:
+    x = _small_integers((8, 512))
+    out = torch.full((8, 512), -7.0, device=CUDA_DEVICE)
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
+    ):
+        _run(
+            _zero_first_column_then_copy_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
+        )
+    result = _run(
+        _copy_then_zero_first_column_in_inner_tile, (x, out), **_INNER_LANES_CONFIG
+    )
+    expected = x.clone()
+    expected[:, ::256] = 0.0
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
+def test_placed_nest_repeating_a_tile_uniform_access_rejects_the_config(
+    shape: tuple[int, int],
+) -> None:
+    # A loop-invariant constant leaves the lane loops, so these bodies are
+    # emitted as placements; the first row's access still runs once per row
+    # iteration of the loop the copy's packet nests it in (see the GPU-free
+    # companion).
+    x = _small_integers(shape)
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant load of x would repeat"
+    ):
+        _run(_first_row_then_update_all_plus_one, (x,), **_NESTED_CONFIG)
+    out = torch.full(shape, -7.0, device=CUDA_DEVICE)
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant store to out would repeat"
+    ):
+        _run(_zero_first_row_then_copy_plus_one, (x, out), **_NESTED_CONFIG)
+    with pytest.raises(
+        exc.BackendUnsupported, match="lane-invariant load of x would repeat"
+    ):
+        args = (x, _small_integers(shape), out)
+        _run(_first_row_increment_beside_copy, args, **_NESTED_CONFIG)
+
+
+@pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
+def test_scaled_first_row_beside_a_copy_matches_reference(
+    shape: tuple[int, int],
+) -> None:
+    x = _small_integers(shape)
+    out = torch.full(shape, -7.0, device=CUDA_DEVICE)
+    y = torch.full(shape, -7.0, device=CUDA_DEVICE)
+    _run(_first_row_scaled_beside_copy, (x, out, y), **_NESTED_CONFIG)
+    expected = torch.full(shape, -7.0, device=CUDA_DEVICE)
+    expected[::4] = 2 * x[::4]
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(y, x, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        _NESTED_CONFIG,
+        _NESTED_SCALAR_CONFIG,
+        {**_NESTED_SCALAR_CONFIG, "num_threads": [2, 64]},
+        {
+            **_NESTED_CONFIG,
+            "num_threads": [2, 64],
+            "cute_lane_layouts": ["strided", "strided"],
+        },
+    ],
+    ids=["vector", "scalar", "two_row_threads", "strided"],
+)
+def test_first_row_to_vector_stores_a_first_row_value_in_every_column(
+    config: dict[str, object],
+) -> None:
+    # Guarded by the row mask as well, the first row's load was zero in the
+    # lanes past the last row, and the store of ``first`` (guarded by the
+    # column mask only) raced that zero in.
+    x = torch.randint(1, 6, (6, 250), device=CUDA_DEVICE).float()
+    first = torch.full((250,), -7.0, device=CUDA_DEVICE)
+    out = torch.full((6, 250), -7.0, device=CUDA_DEVICE)
+    result = _run(_first_row_to_vector, (x, first, out), **config)
+    torch.testing.assert_close(result, x, rtol=0, atol=0)
+    assert bool(((first == x[0]) | (first == x[4])).all()), first

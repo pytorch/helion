@@ -1501,7 +1501,23 @@ class DeviceFunction:
             # flight per thread; the triton backend and handwritten CuTe
             # kernels both load the whole tile fragment first).
             from .cute.split_lane_loads import split_lane_loads
+            from .cute.unroll_lane_loads import LaneUnrollNotApplied
+            from .cute.unroll_lane_loads import unroll_lane_loads
 
+            # ``cute_lane_unroll`` without vector-loop sinking: unroll the
+            # grid lane loops at trace time with every unrolled lane's
+            # loads (packets and scalars alike) issued before the first
+            # lane's compute.  The knob-off code is regenerated when no
+            # loop takes the unroll.
+            lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
+            if lane_unroll > 1 and not self.config.config.get("cute_vloop_sink"):
+                kernel_body, unrolled = unroll_lane_loads(
+                    kernel_body,
+                    lane_unroll,
+                    lambda name: self.new_var(name, dce=False),
+                )
+                if not unrolled:
+                    raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
             # P18: software-pipeline the per-iteration vec load by one
             # stage.  Pre-issue iter 0's load above the loop and, inside

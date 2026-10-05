@@ -30,6 +30,8 @@ from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.unroll_lane_loads import LaneUnrollNotApplied
+from .cute.unroll_lane_loads import lane_unroll_off_config
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -1364,6 +1366,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
+        # The body is complete: the CuTe per-thread lane loops nested around
+        # it must be the tile program (or pin their uniform atomics).
+        device_loop.check_lane_loop_nest()
         if needs_barrier_before:
             for statement in self.device_function.cta_barrier():
                 self.add_statement(statement)
@@ -2085,6 +2090,10 @@ def generate_ast(
       when no vector loop is sunk after all (``VloopSinkNotApplied``), the
       kernel is generated again with the knob off (``vloop_sink_off_config``)
       so the knob alone never changes the code.
+    - ``cute_lane_unroll`` without sinking asks the last kernel-body pass to
+      unroll the grid lane loops loads-first; when no loop takes it
+      (``LaneUnrollNotApplied``) the kernel is generated again with the
+      unroll off (``lane_unroll_off_config``), for the same reason.
 
     The two compose: the register tile is admitted afresh on the knob-off
     pass, and the sink pass runs on the rolled body of a rejected register
@@ -2137,6 +2146,12 @@ def generate_ast(
                     # the caller rebuilds them for the knob-off run.
                     raise
                 config = vloop_sink_off_config(config)
+            except LaneUnrollNotApplied:
+                # The unroll is a late AST pass that touches no graph, so
+                # the knob-off run reuses the caller's graphs as they are.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = lane_unroll_off_config(config)
     finally:
         env.cute_register_tile_disabled = register_tiles_disabled
 

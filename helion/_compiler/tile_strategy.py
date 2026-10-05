@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from ..runtime.config import Config
+    from .cute.lane_loop_distribution import LaneScope
     from .cute.memory_ops import CuteLaneRelocation
     from .inductor_lowering import CodegenState
     from .pallas.dma import DmaResources
@@ -1022,6 +1023,84 @@ def _certify_lane_running_sum(
     )
 
 
+def _lane_invariant_tail_after_consume(
+    statements: list[ast.AST],
+    *,
+    invariant: set[int],
+    accumulated: set[int],
+    consumed: set[int],
+    rename_groups: dict[str, str],
+) -> set[int]:
+    """The lane-invariant tail statements that must follow the consume pass.
+
+    A lane split runs the lane-varying statements of ``statements`` inside
+    its passes (``accumulated`` in an accumulate pass, ``consumed`` in the
+    final consume pass) and each ``invariant`` statement once, between the
+    passes.  That keeps the body's order only where the passes' accesses are
+    independent of the invariant statement.  One that must stay after a
+    consumed statement (a store into the tensor a per-lane store fills, a
+    load or an atomic of that tensor) is emitted after the consume pass
+    instead, together with every later invariant statement ordered after
+    it; one that must also stay before a consumed statement, or before an
+    accumulated one, has no position and the split is rejected.  The order
+    is the lane-loop distribution's (``cute/lane_loop_distribution.py``):
+    register and tensor dependencies, with unknown effects and non-relaxed
+    atomics ordered against every memory access.
+    """
+    from .ast_read_writes import ReadWrites
+    from .cute.lane_loop_distribution import _analyze
+    from .cute.lane_loop_distribution import _depends
+
+    analyzed = {
+        index: _analyze(index, statements[index], rename_groups)
+        for index in invariant | accumulated | consumed
+    }
+    # A statement with unknown effects may mutate in place any local name it
+    # reads or writes; a register statement sharing such a name with it keeps
+    # its side of it (``_prepare`` of the distribution does the same).
+    defined = {
+        rename_groups.get(name, name)
+        for statement in statements
+        for name in ReadWrites.from_ast(statement).writes
+    }
+    for statement in analyzed.values():
+        if statement.pinned:
+            statement.touched = (statement.reads | statement.writes) & defined
+    after: set[int] = set()
+    for index in sorted(invariant):
+        statement = analyzed[index]
+        source = ast.unparse(statements[index]).partition("\n")[0]
+        # A statement the accumulate pass re-runs is ordered inside that pass;
+        # only its tail copy is placed here.
+        if index not in accumulated and any(
+            _depends(statement, analyzed[later])
+            for later in accumulated
+            if later > index
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "a lane-invariant statement is ordered before the accumulate pass "
+                f"of a lane reduction: {source}",
+            )
+        follows = any(
+            _depends(analyzed[earlier], statement)
+            for earlier in consumed | after
+            if earlier < index
+        )
+        precedes = any(
+            _depends(statement, analyzed[later]) for later in consumed if later > index
+        )
+        if follows and precedes:
+            raise exc.BackendUnsupported(
+                "cute",
+                "a lane-invariant statement is ordered between per-lane statements "
+                f"of a lane reduction's consume pass: {source}",
+            )
+        if follows:
+            after.add(index)
+    return after
+
+
 def _split_one_lane_loop(
     loop: ast.For,
     lane_var: str,
@@ -1154,6 +1233,7 @@ def _split_one_lane_loop(
             markers,
             thread_axis_names=thread_axis_names,
             scalar_definitions=scalar_definitions,
+            rename_groups=rename_groups,
         )
         if staged is None:
             raise exc.BackendUnsupported(
@@ -1237,6 +1317,7 @@ def _split_one_lane_loop(
             markers,
             thread_axis_names=thread_axis_names,
             scalar_definitions=scalar_definitions,
+            rename_groups=rename_groups,
         )
         if dependent is not None:
             _validate_owned_lane_carry_schedule(
@@ -1283,14 +1364,17 @@ def _split_one_lane_loop(
 
     # Phase 2: everything except the marker assignments themselves; the
     # reduced scalar is already finalized so consumers read it directly.
-    phase2_body = [body[index] for index in tail_indices if index not in marker_indices]
+    phase2_indices = [index for index in tail_indices if index not in marker_indices]
+    phase2_body = [body[index] for index in phase2_indices]
 
     # A statement is lane-varying if it (transitively) reads the lane var.
     # Statements that only depend on the finalized scalar(s) are lane-invariant
     # and run once after the lane loops; lane-varying consumers run in a second
     # lane loop, but only those that contribute to a side effect (a store, an
     # if-with-store, an in-place write). Pure lane-varying producers that fed
-    # only the (now-removed) reduction markers are dropped.
+    # only the (now-removed) reduction markers are dropped.  A lane-invariant
+    # statement runs between the two loops unless the consume loop's accesses
+    # order it after them (``_lane_invariant_tail_after_consume``).
     lane_varying_names = _lane_varying_names(phase2_body, lane_var)
     marker_dependencies = [
         (marker, _forward_live_names(body, {marker.result_var}))
@@ -1330,7 +1414,18 @@ def _split_one_lane_loop(
             )
 
     keep_indices = _live_phase2_indices(phase2_body)
+    varying_indices = {i for i, s in enumerate(phase2_body) if is_lane_varying(s)}
+    after_consume = _lane_invariant_tail_after_consume(
+        phase2_body,
+        invariant=set(range(len(phase2_body))) - varying_indices,
+        accumulated={
+            i for i, index in enumerate(phase2_indices) if index in phase1_index_set
+        },
+        consumed=varying_indices & keep_indices,
+        rename_groups=rename_groups,
+    )
     lane_invariant_tail: list[ast.AST] = []
+    lane_invariant_after_consume: list[ast.AST] = []
     lane_varying_tail: list[ast.AST] = []
     for i, s in enumerate(phase2_body):
         owner_exprs = _lane_reduction_owner_exprs_for_statement(
@@ -1340,7 +1435,7 @@ def _split_one_lane_loop(
             thread_axes_before.get(id(s), thread_axis_names),
             scalar_defs_before.get(id(s), {}),
         )
-        if is_lane_varying(s):
+        if i in varying_indices:
             if i in keep_indices:
                 lane_varying_tail.append(
                     _guard_stmt_with_owner(s, owner_exprs) if owner_exprs else s
@@ -1350,7 +1445,9 @@ def _split_one_lane_loop(
                 predicate = " and ".join(
                     f"({owner_expr})" for owner_expr in owner_exprs
                 )
-                lane_invariant_tail.append(_guard_stmt_with_owner(s, [predicate]))
+                s = _guard_stmt_with_owner(s, [predicate])
+            if i in after_consume:
+                lane_invariant_after_consume.append(s)
             else:
                 lane_invariant_tail.append(s)
 
@@ -1361,6 +1458,7 @@ def _split_one_lane_loop(
     result.extend(lane_invariant_tail)
     if lane_varying_tail:
         result.append(_clone_lane_loop_with_body(loop, lane_varying_tail))
+    result.extend(lane_invariant_after_consume)
     _validate_owned_lane_carry_schedule(
         body,
         result,
@@ -1835,6 +1933,7 @@ def _split_staged_matmul_lane_reductions(
     *,
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: dict[str, str],
 ) -> list[ast.AST] | None:
     """Stash a collective prefix, then finalize proved product reductions.
 
@@ -1906,6 +2005,7 @@ def _split_staged_matmul_lane_reductions(
         markers,
         thread_axis_names=thread_axis_names,
         scalar_definitions=scalar_definitions,
+        rename_groups=rename_groups,
     )
     return [*prefix, *scheduled] if scheduled is not None else None
 
@@ -1917,6 +2017,7 @@ def _split_dependent_lane_reductions(
     *,
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: dict[str, str],
 ) -> list[ast.AST] | None:
     """Split an ordered chain of lane reductions into multiple passes.
 
@@ -1942,6 +2043,8 @@ def _split_dependent_lane_reductions(
         scalar_definitions,
     )
 
+    # Every stage indexes a prefix of the marker-free body below.
+    accumulated: set[int] = set()
     for marker_index, marker in markers:
         available_body: list[ast.AST] = [
             stmt
@@ -1950,6 +2053,7 @@ def _split_dependent_lane_reductions(
         ]
         stage_indices, _ = _backward_slice(available_body, {marker.input_name})
         stage = [available_body[idx] for idx in stage_indices]
+        accumulated.update(stage_indices)
         stage_reads = {
             name for stmt in stage for name in ReadWrites.from_ast(stmt).reads
         }
@@ -1993,10 +2097,21 @@ def _split_dependent_lane_reductions(
         reads = set(ReadWrites.from_ast(stmt).reads)
         return lane_var in reads or bool(reads & lane_varying)
 
+    varying_indices = {
+        idx for idx, stmt in enumerate(consume_candidates) if reads_lane(stmt)
+    }
+    after_consume = _lane_invariant_tail_after_consume(
+        consume_candidates,
+        invariant=set(range(len(consume_candidates))) - varying_indices,
+        accumulated=accumulated,
+        consumed=varying_indices & keep_indices,
+        rename_groups=rename_groups,
+    )
     invariant: list[ast.AST] = []
+    invariant_after_consume: list[ast.AST] = []
     varying: list[ast.AST] = []
     for idx, stmt in enumerate(consume_candidates):
-        lane_varying_stmt = reads_lane(stmt)
+        lane_varying_stmt = idx in varying_indices
         if lane_varying_stmt and idx not in keep_indices:
             continue
         owner_exprs = _lane_reduction_owner_exprs_for_statement(
@@ -2009,10 +2124,16 @@ def _split_dependent_lane_reductions(
         cloned = _clone_stmt(stmt)
         if owner_exprs:
             cloned = _guard_stmt_with_owner(cloned, owner_exprs)
-        (varying if lane_varying_stmt else invariant).append(cloned)
+        if lane_varying_stmt:
+            varying.append(cloned)
+        elif idx in after_consume:
+            invariant_after_consume.append(cloned)
+        else:
+            invariant.append(cloned)
     result.extend(invariant)
     if varying:
         result.append(_clone_lane_loop_with_body(loop, varying))
+    result.extend(invariant_after_consume)
     return result
 
 
@@ -2872,7 +2993,11 @@ def _memory_write_calls(stmt: ast.AST) -> list[ast.Call]:
         "_cute_store_u32_vec",
         "_helion_persistent_branch_vec_store",
     }
-    helper_atomics = {"_cute_atomic_max_float32", "_cute_atomic_min_float32"}
+    helper_atomics = {
+        "_cute_atomic_max_float32",
+        "_cute_atomic_min_float32",
+        "_cute_red_add_f32_vec",
+    }
     result: list[ast.Call] = []
     for node in ast.walk(stmt):
         if not isinstance(node, ast.Call):
@@ -2920,7 +3045,12 @@ def _is_vector_flush_store(call: ast.Call) -> bool:
 def _atomic_pointer_and_value(call: ast.Call) -> tuple[ast.AST, ast.AST] | None:
     if isinstance(call.func, ast.Name) and (
         call.func.id.startswith("atomic_")
-        or call.func.id in ("_cute_atomic_max_float32", "_cute_atomic_min_float32")
+        or call.func.id
+        in (
+            "_cute_atomic_max_float32",
+            "_cute_atomic_min_float32",
+            "_cute_red_add_f32_vec",
+        )
     ):
         return (call.args[0], call.args[1]) if len(call.args) >= 2 else None
     if not (
@@ -4091,7 +4221,9 @@ def _is_proven_relocatable_call(
     if name.startswith("operator."):
         return name.rsplit(".", 1)[-1] in _PURE_OPERATOR_CALLS
     if name in {
+        "cute.arch.block_dim",
         "cute.arch.block_idx",
+        "cute.arch.grid_dim",
         "cute.arch.lane_idx",
         "cute.arch.thread_idx",
         "cute.arch.warp_idx",
@@ -5007,6 +5139,89 @@ class DeviceLoopState(DeviceLoopOrGridState):
     # loop (CuTe only). A reduction over one of these blocks needs the
     # two-pass lane structure (see ``split_lane_loop_reductions``).
     lane_loop_blocks: set[int] = dataclasses.field(default_factory=set)
+    # The lane loops themselves (CuTe per-thread strategies), outermost first:
+    # the blocks each distributes, the vec partitions among them and the
+    # per-lane index / mask definitions at the top of the innermost body.
+    # Unlike a grid's (``DeviceGridState.wrap_body``) the nest is built
+    # around the body before the body exists and is never redistributed;
+    # ``check_lane_loop_nest`` rejects it unless it is the tile program.
+    lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
+    lane_loop_block_ids: dict[str, frozenset[int]] = dataclasses.field(
+        default_factory=dict
+    )
+    vec_lane_wrappers: dict[str, VecLaneWrapper] = dataclasses.field(
+        default_factory=dict
+    )
+    lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    # The tile masks among those definitions (``LaneScope.masks``).
+    tile_masks: frozenset[str] = frozenset()
+
+    def check_lane_loop_nest(self) -> None:
+        """Reject the lane loop nest around the body unless it is the tile program.
+
+        Every statement of the body runs inside every lane loop, so one whose
+        values ignore a loop repeats once per iteration.  The full-nest check
+        of the lane-loop distribution accepts the nest when every repetition
+        is idempotent, pins an atomic that is uniform along a loop's tile axis
+        to the loop's first lane and rejects the rest
+        (``cute/lane_loop_distribution.py``).  Only the live loops are
+        checked: a loop none of whose names the body reads (a tile indexed
+        only by its ``begin``) is spliced away by the dead-code elimination
+        and repeats nothing, as in ``DeviceGridState.wrap_body``, and a pin
+        reading its lane variable would keep it alive.
+        """
+        if not self.lane_loops:
+            return
+        from .cute.lane_loop_distribution import check_full_nest
+
+        setup = {id(statement) for statement in self.lane_setup_statements}
+        body = [
+            statement
+            for statement in self.inner_statements
+            if id(statement) not in setup
+        ]
+        needed, kept_setup, spliced_wrappers = _live_lane_setup(
+            body, self.lane_setup_statements, self.vec_lane_wrappers
+        )
+        live_loops = [
+            (lane_var, extent)
+            for lane_var, extent in self.lane_loops
+            if _lane_loop_is_live(
+                lane_var, self.vec_lane_wrappers.get(lane_var), needed, spliced_wrappers
+            )
+        ]
+        if not live_loops:
+            return
+        coordinates = {
+            lane_var: _cute_lane_coordinates(
+                lane_var, self.vec_lane_wrappers.get(lane_var)
+            )
+            for lane_var, _extent in live_loops
+        }
+        setup_by_lane, _ = _assign_lane_setup(live_loops, coordinates, kept_setup)
+        scopes = _cute_lane_scopes(
+            live_loops,
+            setup_by_lane,
+            coordinates,
+            {
+                lane_var: _vec_wrapper_statements(self.vec_lane_wrappers.get(lane_var))
+                for lane_var, _extent in live_loops
+            },
+            self.vec_lane_wrappers,
+            self.tile_masks,
+        )
+        originals = list(body)
+        check_full_nest(body, scopes, rename_groups=_current_rename_groups())
+        pinned = {
+            id(old): new
+            for old, new in zip(originals, body, strict=True)
+            if old is not new
+        }
+        if pinned:
+            self.inner_statements[:] = [
+                pinned.get(id(statement), statement)
+                for statement in self.inner_statements
+            ]
 
 
 @dataclasses.dataclass
@@ -5085,6 +5300,206 @@ class VecLaneWrapper:
     elide_outer_loop: bool = False
 
 
+def _cute_lane_coordinates(lane_var: str, wrapper: VecLaneWrapper | None) -> set[str]:
+    """A lane loop's own coordinates: its lane variable and, when vectorized,
+    its constexpr V-loop variable and per-thread lane base."""
+    names = {lane_var}
+    if wrapper is not None:
+        names.update((wrapper.vec_lane_var, wrapper.base_index_var))
+    return names
+
+
+def _cute_first_lane_predicate(lane_var: str, wrapper: VecLaneWrapper | None) -> str:
+    """The first iteration of ``lane_var``'s loop, and of its constexpr V-loop."""
+    if wrapper is None or wrapper.vec_lane_var == lane_var:
+        return f"{lane_var} == 0"
+    return f"{lane_var} == 0 and {wrapper.vec_lane_var} == 0"
+
+
+def _vec_wrapper_statements(wrapper: VecLaneWrapper | None) -> list[ast.AST]:
+    """The statements a vec wrapper emits besides its V-loop: the per-thread
+    lane base, the packet loads hoisted above the V-loop, the store flushes
+    after it."""
+    if wrapper is None:
+        return []
+    return [stmt for stmt in wrapper.outer_for.body if stmt is not wrapper.vloop]
+
+
+def _live_lane_setup(
+    body: list[ast.AST],
+    setup: list[ast.AST],
+    wrappers: dict[str, VecLaneWrapper],
+) -> tuple[set[str], list[ast.AST], set[str]]:
+    """The names ``body`` needs, the lane setup statements defining them and
+    the vec wrappers whose lane bodies received splices.
+
+    Setup statements (per-lane index / mask definitions) whose results the
+    body never reads are dropped, and a lane loop whose variable is then left
+    unreferenced is dead (``_lane_loop_is_live``).  An unused rdim block
+    (e.g. one allocated for a ``tile.index`` that codegen serves from the
+    tile's own block) would otherwise wrap the whole body in a dead innermost
+    loop, and the lane-reduce split pass would then try to split reductions
+    on that loop's lane var instead of the loop that actually distributes
+    them.
+    """
+    from .ast_read_writes import ReadWrites
+
+    needed: set[str] = set()
+    for stmt in body:
+        needed |= set(ReadWrites.from_ast(stmt).reads)
+    # A vec wrapper whose lane body received memory_ops splices (hoisted vec
+    # loads before the V-loop, store flushes after it) must be kept
+    # regardless of what the inner body reads: the flush IS the store.  Its
+    # splices also read setup vars (masks, sibling index vars), so fold those
+    # reads in before selecting the kept setup.
+    spliced_wrappers: set[str] = set()
+    for lane_var, wrapper in wrappers.items():
+        if len(wrapper.outer_for.body) > 2:  # more than [base, vloop]
+            spliced_wrappers.add(lane_var)
+            needed |= set(ReadWrites.from_ast(wrapper.outer_for).reads)
+    kept_setup: list[ast.AST] = []
+    for stmt in reversed(setup):
+        rw = ReadWrites.from_ast(stmt)
+        if not rw.writes or set(rw.writes) & needed:
+            kept_setup.append(stmt)
+            needed |= set(rw.reads)
+    kept_setup.reverse()
+    return needed, kept_setup, spliced_wrappers
+
+
+def _lane_loop_is_live(
+    lane_var: str,
+    wrapper: VecLaneWrapper | None,
+    needed: set[str],
+    spliced_wrappers: set[str],
+) -> bool:
+    """Whether the lane loop of ``lane_var`` survives the dead-code elimination."""
+    if wrapper is None:
+        return lane_var in needed
+    # The per-element index var reads ``base_index_var`` + ``vec_lane_var``
+    # (not ``lane_var`` directly), so test all three before dropping the
+    # structure as dead.
+    return lane_var in spliced_wrappers or bool(
+        {lane_var, wrapper.vec_lane_var, wrapper.base_index_var} & needed
+    )
+
+
+def _current_rename_groups() -> dict[str, str]:
+    """Every alias the device function will rename, mapped to its canonical name."""
+    try:
+        renames = DeviceFunction.current()._variable_renames
+    except NoCurrentFunction:
+        # Unit tests build the loop states outside a device function.
+        return {}
+    return {name: aliases[0] for name, aliases in renames.items()}
+
+
+def _assign_lane_setup(
+    lane_loops: list[tuple[str, int]],
+    coordinates: dict[str, set[str]],
+    setup: list[ast.AST],
+) -> tuple[dict[str, list[ast.AST]], list[ast.AST]]:
+    """Place each setup statement at the shallowest lane scope that defines
+    every lane / base variable it reads.
+
+    Historically all setup statements were placed in the innermost lane loop.
+    That is semantically correct for scalar loops, but strands an outer-axis
+    index definition *inside* an inner persistent vec loop while that vec
+    loop's hoisted load needs the index outside its constexpr V loop.
+    Explicit scope placement keeps outer tile coordinates available to nested
+    reduction vec hoists and avoids redundantly recomputing them for every
+    inner lane.  A statement reading no lane coordinate keeps the old
+    innermost placement rather than speculatively widening its scope (a later
+    setup statement reading its value must remain at least as deep), or is
+    returned separately when there are no lane loops.
+    """
+    from .ast_read_writes import ReadWrites
+
+    setup_by_lane: dict[str, list[ast.AST]] = {
+        lane_var: [] for lane_var, _extent in lane_loops
+    }
+    fallback: list[ast.AST] = []
+    setup_name_scopes: dict[str, int] = {}
+    for stmt in setup:
+        rw = ReadWrites.from_ast(stmt)
+        reads = set(rw.reads)
+        matching_depths = [
+            depth
+            for depth, (lane_var, _extent) in enumerate(lane_loops)
+            if reads & coordinates[lane_var]
+        ]
+        matching_depths.extend(
+            setup_name_scopes[name] for name in reads if name in setup_name_scopes
+        )
+        if matching_depths:
+            # A statement depending on multiple lane coordinates belongs to
+            # the deepest of those nested scopes.
+            depth = max(matching_depths)
+        elif lane_loops:
+            depth = len(lane_loops) - 1
+        else:
+            fallback.append(stmt)
+            continue
+        setup_by_lane[lane_loops[depth][0]].append(stmt)
+        for name in rw.writes:
+            setup_name_scopes[name] = depth
+    return setup_by_lane, fallback
+
+
+def _cute_lane_scopes(
+    live_loops: list[tuple[str, int]],
+    setup_by_lane: dict[str, list[ast.AST]],
+    coordinates: dict[str, set[str]],
+    attached: dict[str, list[ast.AST]],
+    wrappers: dict[str, VecLaneWrapper],
+    masks: frozenset[str],
+) -> list[LaneScope]:
+    """The ``LaneScope`` of every live lane loop, outermost first, for the
+    lane-loop distribution (``cute/lane_loop_distribution.py``).
+
+    A loop's names are its coordinates and the definitions of its setup and
+    attached statements; it requires the loops whose names its setup reads;
+    its masks are the tile masks its setup defines.
+    """
+    from .ast_read_writes import ReadWrites
+    from .cute.lane_loop_distribution import LaneScope
+
+    setup_writes = {
+        lane_var: frozenset().union(
+            *(ReadWrites.from_ast(stmt).writes for stmt in setup_by_lane[lane_var])
+        )
+        for lane_var, _extent in live_loops
+    }
+    scope_names = {
+        lane_var: frozenset(coordinates[lane_var]).union(
+            setup_writes[lane_var],
+            *(ReadWrites.from_ast(stmt).writes for stmt in attached[lane_var]),
+        )
+        for lane_var, _extent in live_loops
+    }
+    return [
+        LaneScope(
+            lane_var,
+            scope_names[lane_var],
+            frozenset(
+                other
+                for other, names in scope_names.items()
+                if other != lane_var
+                and any(
+                    set(ReadWrites.from_ast(stmt).reads) & names
+                    for stmt in setup_by_lane[lane_var]
+                )
+            ),
+            tuple(attached[lane_var]),
+            frozenset(coordinates[lane_var]),
+            tuple(setup_by_lane[lane_var]),
+            _cute_first_lane_predicate(lane_var, wrappers.get(lane_var)),
+            masks & setup_writes[lane_var],
+        )
+        for lane_var, _extent in live_loops
+    ]
+
+
 @dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
@@ -5097,6 +5512,8 @@ class DeviceGridState(DeviceLoopOrGridState):
         default_factory=dict
     )
     lane_setup_statements: list[ast.AST] = dataclasses.field(default_factory=list)
+    # The tile masks among the lane setup's definitions (``LaneScope.masks``).
+    tile_masks: frozenset[str] = frozenset()
     outer_prefix: list[ast.AST] = dataclasses.field(default_factory=list)
     outer_suffix: list[ast.AST] = dataclasses.field(default_factory=list)
     # Statement list that will receive ``wrap_body(...)``.  Definitions
@@ -5209,39 +5626,11 @@ class DeviceGridState(DeviceLoopOrGridState):
     def _live_lane_setup(
         self, body: list[ast.AST]
     ) -> tuple[set[str], list[ast.AST], set[str]]:
-        from .ast_read_writes import ReadWrites
-
-        # Drop setup statements (per-lane index/mask defs) whose results the
-        # body never reads, then skip any lane loop whose variable is left
-        # unreferenced. An unused rdim block (e.g. one allocated for a
-        # ``tile.index`` that codegen serves from the tile's own block) would
-        # otherwise wrap the whole body in a dead innermost loop, and the
-        # lane-reduce split pass would then try to split reductions on that
-        # loop's lane var instead of the loop that actually distributes them.
-        needed: set[str] = set()
-        for stmt in body:
-            needed |= set(ReadWrites.from_ast(stmt).reads)
-        # A vec wrapper whose lane body received memory_ops splices (hoisted
-        # vec loads before the V-loop, store flushes after it) must be kept
-        # regardless of what the inner body reads: the flush IS the store.
-        # Its splices also read setup vars (masks, sibling index vars), so
-        # fold those reads in before selecting kept_setup.
-        spliced_wrappers: set[str] = set()
-        for lane_var, wrapper in self.vec_lane_wrappers.items():
-            if len(wrapper.outer_for.body) > 2:  # more than [base, vloop]
-                spliced_wrappers.add(lane_var)
-                needed |= set(ReadWrites.from_ast(wrapper.outer_for).reads)
-        kept_setup: list[ast.AST] = []
-        for stmt in reversed(self.lane_setup_statements):
-            rw = ReadWrites.from_ast(stmt)
-            if not rw.writes or set(rw.writes) & needed:
-                kept_setup.append(stmt)
-                needed |= set(rw.reads)
-        kept_setup.reverse()
-        return needed, kept_setup, spliced_wrappers
+        return _live_lane_setup(
+            body, self.lane_setup_statements, self.vec_lane_wrappers
+        )
 
     def wrap_body(self, body: list[ast.AST]) -> list[ast.AST]:
-        from .ast_read_writes import ReadWrites
 
         needed, kept_setup, spliced_wrappers = self._live_lane_setup(body)
         if self.deferred_vector_ops:
@@ -5288,57 +5677,16 @@ class DeviceGridState(DeviceLoopOrGridState):
             # address and mask setup must participate in final liveness too.
             needed, kept_setup, spliced_wrappers = self._live_lane_setup(body)
         # Place each setup at the shallowest lane scope that defines every
-        # lane/base variable it reads.  Historically all setup statements were
-        # placed in the innermost lane loop.  That is semantically correct for
-        # scalar loops, but strands an outer-axis index definition *inside* an
-        # inner persistent vec loop while that vec loop's hoisted load needs the
-        # index outside its constexpr V loop.  Explicit scope placement keeps
-        # outer tile coordinates available to nested reduction vec hoists and
-        # avoids redundantly recomputing them for every inner lane.
-        setup_by_lane: dict[str, list[ast.AST]] = {
-            lane_var: [] for lane_var, _extent in self.lane_loops
-        }
-        fallback_setup: list[ast.AST] = []
-        lane_scope_names: dict[str, set[str]] = {}
-        for lane_var, _extent in self.lane_loops:
-            names = {lane_var}
-            wrapper = self.vec_lane_wrappers.get(lane_var)
-            if wrapper is not None:
-                names.update((wrapper.vec_lane_var, wrapper.base_index_var))
-            lane_scope_names[lane_var] = names
-        setup_name_scopes: dict[str, int] = {}
-        for stmt in kept_setup:
-            rw = ReadWrites.from_ast(stmt)
-            reads = set(rw.reads)
-            matching_depths = [
-                depth
-                for depth, (lane_var, _extent) in enumerate(self.lane_loops)
-                if reads & lane_scope_names[lane_var]
-            ]
-            matching_depths.extend(
-                setup_name_scopes[name] for name in reads if name in setup_name_scopes
+        # lane/base variable it reads (``_assign_lane_setup``).
+        lane_scope_names: dict[str, set[str]] = {
+            lane_var: _cute_lane_coordinates(
+                lane_var, self.vec_lane_wrappers.get(lane_var)
             )
-            if matching_depths:
-                # A statement depending on multiple lane coordinates belongs
-                # to the deepest of those nested scopes.
-                depth = max(matching_depths)
-                lane_var = self.lane_loops[depth][0]
-                setup_by_lane[lane_var].append(stmt)
-                for name in rw.writes:
-                    setup_name_scopes[name] = depth
-            else:
-                # Preserve the old innermost placement for an unfamiliar
-                # setup form rather than speculatively widening its scope.
-                # Record that placement as well: a later setup statement that
-                # reads this value must remain at least as deep, even if it
-                # also reads an outer lane coordinate.
-                if self.lane_loops:
-                    depth = len(self.lane_loops) - 1
-                    setup_by_lane[self.lane_loops[depth][0]].append(stmt)
-                    for name in rw.writes:
-                        setup_name_scopes[name] = depth
-                else:
-                    fallback_setup.append(stmt)
+            for lane_var, _extent in self.lane_loops
+        }
+        setup_by_lane, fallback_setup = _assign_lane_setup(
+            self.lane_loops, lane_scope_names, kept_setup
+        )
 
         live_loops = [
             (lane_var, extent)
@@ -5362,7 +5710,6 @@ class DeviceGridState(DeviceLoopOrGridState):
                 if lane_var not in dict(live_loops)
             )
         ):
-            from .cute.lane_loop_distribution import LaneScope
             from .cute.lane_loop_distribution import check_full_nest
             from .cute.lane_loop_distribution import definitions_precede_loop
             from .cute.lane_loop_distribution import distribute_lane_loops
@@ -5373,42 +5720,18 @@ class DeviceGridState(DeviceLoopOrGridState):
             # definitions are the loop's, and the body statements that move
             # past the loop are ordered against their memory accesses.
             attached = {
-                lane_var: self._vec_wrapper_statements(lane_var)
+                lane_var: _vec_wrapper_statements(self.vec_lane_wrappers.get(lane_var))
                 for lane_var, _extent in live_loops
             }
-            scope_names = {
-                lane_var: frozenset(lane_scope_names[lane_var]).union(
-                    *(
-                        ReadWrites.from_ast(stmt).writes
-                        for stmt in [*setup_by_lane[lane_var], *attached[lane_var]]
-                    )
-                )
-                for lane_var, _extent in live_loops
-            }
-            scopes = [
-                LaneScope(
-                    lane_var,
-                    scope_names[lane_var],
-                    frozenset(
-                        other
-                        for other, names in scope_names.items()
-                        if other != lane_var
-                        and any(
-                            set(ReadWrites.from_ast(stmt).reads) & names
-                            for stmt in setup_by_lane[lane_var]
-                        )
-                    ),
-                    tuple(attached[lane_var]),
-                    frozenset(lane_scope_names[lane_var]),
-                )
-                for lane_var, _extent in live_loops
-            ]
-            try:
-                renames = DeviceFunction.current()._variable_renames
-            except NoCurrentFunction:
-                # Unit tests build the grid state outside a device function.
-                renames = {}
-            rename_groups = {name: aliases[0] for name, aliases in renames.items()}
+            scopes = _cute_lane_scopes(
+                live_loops,
+                setup_by_lane,
+                lane_scope_names,
+                attached,
+                self.vec_lane_wrappers,
+                self.tile_masks,
+            )
+            rename_groups = _current_rename_groups()
             placement = distribute_lane_loops(body, scopes, rename_groups=rename_groups)
             # The definitions a hoisted packet load reads stay body statements
             # here; they must come out before the loop that hoisted the load.
@@ -5458,13 +5781,6 @@ class DeviceGridState(DeviceLoopOrGridState):
             wrapped = self._materialize_lane_loop(lane_var, extent, wrapped)
         return wrapped
 
-    def _vec_wrapper_statements(self, lane_var: str) -> list[ast.AST]:
-        """Statements ``lane_var``'s vec wrapper emits besides its V-loop."""
-        wrapper = self.vec_lane_wrappers.get(lane_var)
-        if wrapper is None:
-            return []
-        return [stmt for stmt in wrapper.outer_for.body if stmt is not wrapper.vloop]
-
     def _vec_wrapper_lane_var(self, vloop: ast.For) -> str:
         """The lane var whose vec wrapper owns the constexpr V-loop ``vloop``."""
         for lane_var, wrapper in self.vec_lane_wrappers.items():
@@ -5475,14 +5791,8 @@ class DeviceGridState(DeviceLoopOrGridState):
     def _lane_loop_is_live(
         self, lane_var: str, needed: set[str], spliced_wrappers: set[str]
     ) -> bool:
-        wrapper = self.vec_lane_wrappers.get(lane_var)
-        if wrapper is None:
-            return lane_var in needed
-        # The per-element index var reads ``base_index_var`` +
-        # ``vec_lane_var`` (not ``lane_var`` directly), so test all three
-        # before dropping the structure as dead.
-        return lane_var in spliced_wrappers or bool(
-            {lane_var, wrapper.vec_lane_var, wrapper.base_index_var} & needed
+        return _lane_loop_is_live(
+            lane_var, self.vec_lane_wrappers.get(lane_var), needed, spliced_wrappers
         )
 
     def _materialize_lane_loop(
@@ -8090,6 +8400,11 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 for lane_var, _extent in lane_loops
             },
             lane_setup_statements=lane_setup_statements,
+            tile_masks=frozenset(
+                mask
+                for block_id in block_ids
+                if (mask := self.mask_vars.get(block_id)) is not None
+            ),
             outer_prefix=outer_setup_statements,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
@@ -8126,6 +8441,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             extent = self._elements_per_thread_for_block(block_id)
             vec_width = self._cute_lane_vec_width_by_block.get(block_id, 1)
             lane_loops_meta.append((block_id, lane_var, extent, vec_width))
+        outer_for_by_block: dict[int, ast.For] = {}
         for block_id, lane_var, extent, vec_width in reversed(lane_loops_meta):
             if vec_width > 1 and extent > 0 and extent % vec_width == 0:
                 # Partition the lane loop into outer x inner constexpr V.
@@ -8157,6 +8473,7 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 # references ``lane_var``, which must be defined in scope.
                 # The CuTe DSL constant-folds the 1-iter loop away.
                 outer_for = _create_lane_loop(lane_var, outer_extent, lane_body)
+                outer_for_by_block[block_id] = outer_for
                 body = [outer_for]
             else:
                 lane_for = _create_lane_loop(lane_var, extent, body)
@@ -8179,7 +8496,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
         tracker = ThreadAxisTracker()
         thread_axis_offset = self._thread_axis_offset(state)
         thread_axis_map = self._thread_axis_map()
-        index_setup: list[ast.stmt] = []
+        index_setup: list[ast.AST] = []
+        vec_wrappers: dict[str, VecLaneWrapper] = {}
         for block_idx, block_size, begin, end, step, proxy_end in self._reorder(
             [*zip(block_ids, block_sizes, begins, ends, steps, proxy_ends, strict=True)]
         ):
@@ -8324,6 +8642,12 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                             0,
                             statement_from_string(f"{base_index_var} = {base_expr}"),
                         )
+                        vec_wrappers[lane_var] = VecLaneWrapper(
+                            outer_for=outer_for_by_block[block_idx],
+                            vloop=self._cute_lane_vloop_by_block[block_idx],
+                            vec_lane_var=vec_lane_var,
+                            base_index_var=base_index_var,
+                        )
                     # The user-body's per-element index uses the base +
                     # the inner constexpr-V var so the existing scalar
                     # pipeline (mask + cast + reduce-or-store) keeps
@@ -8368,6 +8692,21 @@ class PerThreadNDTileStrategy(NDTileStrategy):
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
             lane_loop_blocks=set(self._lane_var_by_block),
+            lane_loops=[
+                (lane_var, extent)
+                for _block_id, lane_var, extent, _vec_width in lane_loops_meta
+            ],
+            lane_loop_block_ids={
+                lane_var: frozenset({block_id})
+                for block_id, lane_var, _extent, _vec_width in lane_loops_meta
+            },
+            vec_lane_wrappers=vec_wrappers,
+            lane_setup_statements=index_setup,
+            tile_masks=frozenset(
+                mask
+                for block_id in block_ids
+                if (mask := self.mask_vars.get(block_id)) is not None
+            ),
         )
 
     def supports_index_rank_expansion(self) -> bool:
@@ -8754,6 +9093,7 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
                 else {}
             ),
             lane_setup_statements=lane_setup_statements,
+            tile_masks=frozenset() if mask_var is None else frozenset({mask_var}),
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
             vec_lane_wrappers=vec_wrappers,
@@ -8840,6 +9180,10 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
             block_id_to_info=block_id_to_info,
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
+            lane_loops=[(self._lane_var, self._elements_per_thread)],
+            lane_loop_block_ids={self._lane_var: frozenset(self.block_ids)},
+            lane_setup_statements=lane_setup_statements,
+            tile_masks=frozenset() if mask_var is None else frozenset({mask_var}),
         )
 
     def offset_var(self, block_idx: int) -> str:
