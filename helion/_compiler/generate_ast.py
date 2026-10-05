@@ -57,6 +57,25 @@ if TYPE_CHECKING:
     from .type_info import TensorType
 
 
+class VloopSinkNotApplied(exc.Base):
+    """``cute_vloop_sink`` shaped the thread layout but sank no vector loop.
+
+    The knob must not change the code by itself, so the kernel is regenerated
+    with the knob off (``vloop_sink_off_config``): by ``generate_ast`` for the
+    codegen graphs it builds, and by a caller that supplied its own graphs
+    (materialized fission), which layout planning has annotated in place and
+    which therefore have to be rebuilt.  An ``exc.Base`` so the statement
+    visitor propagates it instead of wrapping it.
+    """
+
+
+def vloop_sink_off_config(config: Config) -> Config:
+    """``config`` with vector-loop sinking (and its lane unroll) off."""
+    return Config.from_dict(
+        {**config.config, "cute_vloop_sink": False, "cute_lane_unroll": 1}
+    )
+
+
 def _flatten_starred_args(args: list[ast.expr]) -> list[ast.expr]:
     """Expand ``f(*xs)`` into per-element nodes (``xs[0]``, ``xs[1]``, ...).
 
@@ -304,6 +323,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
+
+    def tile_begin_var(self, block_idx: int) -> str:
+        """Uniform first index of the current tile along ``block_idx``.
+
+        ``tile.begin`` / ``tile.end`` / ``tile.id`` and their symbols render
+        through this; the CuTe backend derives it from the owning strategy's
+        thread / lane partition (see ``cute_tile_begin_expr``).
+        """
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.tile_ops import cute_tile_begin_expr
+
+            return cute_tile_begin_expr(self, block_idx)
+        return self.active_device_loops[block_idx][-1].strategy.tile_begin_var(
+            block_idx
+        )
 
     def index_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
@@ -1776,12 +1810,52 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         },
                         running_sums=self.device_function.cute_matmul_running_sums,
                     )
+                    # Interchange a grid constexpr vector loop into the serial
+                    # reduction nest it wraps (column sums): one vector load
+                    # per row, V register accumulators, one grouped combine.
+                    if (
+                        self.device_function.config.config.get("cute_vloop_sink")
+                        is True
+                    ):
+                        self._sink_grid_vector_loops()
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)
+
+    def _sink_grid_vector_loops(self) -> None:
+        cute_state = self.device_function.cute_state
+        fired = False
+        if cute_state.vloop_sink_wrappers:
+            from .cute.sink_vector_loops import sink_grid_vector_loops
+
+            self.device_function.body, fired = sink_grid_vector_loops(
+                list(self.device_function.body),
+                wrappers=cute_state.vloop_sink_wrappers,
+                loads=cute_state.vloop_sink_loads,
+                rename_groups={
+                    name: aliases[0]
+                    for name, aliases in self.device_function._variable_renames.items()
+                },
+                lane_unroll=cast(
+                    "int",
+                    self.device_function.config.config.get("cute_lane_unroll", 1),
+                ),
+                new_var=self.device_function.new_var,
+                tensor_dtypes={
+                    arg.name: arg.fake_value.dtype
+                    for arg in self.device_function.arguments
+                    if isinstance(arg, TensorArg)
+                },
+            )
+        if not fired and cute_state.vloop_sink_layout_applied:
+            # The knob shaped the thread layout but nothing was sunk.  The
+            # knob must not change the code by itself, so start over with it
+            # off (``generate_ast`` or the owner of the codegen graphs
+            # regenerates the knob-off code).
+            raise VloopSinkNotApplied
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -1955,6 +2029,58 @@ def _maybe_emit_compact_worklist_builder(codegen: GenerateAST) -> None:
 
 
 def generate_ast(
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+    _codegen_graphs: list[GraphInfo] | None = None,
+    _memory_counters: dict[str, int] | None = None,
+    _host_prefix: list[ast.AST] | None = None,
+    _bounded_cache_request: BoundedCacheRequest | None = None,
+) -> ast.Module:
+    prefix_length = len(_host_prefix) if _host_prefix is not None else 0
+    try:
+        return _generate_ast(
+            func,
+            config,
+            emit_repro_caller,
+            store_transform=store_transform,
+            load_transform=load_transform,
+            extra_params=extra_params,
+            _codegen_graphs=_codegen_graphs,
+            _memory_counters=_memory_counters,
+            _host_prefix=_host_prefix,
+            _bounded_cache_request=_bounded_cache_request,
+        )
+    except VloopSinkNotApplied:
+        # ``cute_vloop_sink`` chose the thread layout but no vector loop was
+        # sunk: the knob must not change the code by itself, so generate
+        # exactly the knob-off code.  The abandoned run has left nothing
+        # behind but its host prefix.
+        if _host_prefix is not None:
+            del _host_prefix[prefix_length:]
+        if _codegen_graphs is not None:
+            # Layout planning annotated the caller's graphs in place; the
+            # caller rebuilds them for the knob-off run.
+            raise
+    return _generate_ast(
+        func,
+        vloop_sink_off_config(config),
+        emit_repro_caller,
+        store_transform=store_transform,
+        load_transform=load_transform,
+        extra_params=extra_params,
+        _codegen_graphs=_codegen_graphs,
+        _memory_counters=_memory_counters,
+        _host_prefix=_host_prefix,
+        _bounded_cache_request=_bounded_cache_request,
+    )
+
+
+def _generate_ast(
     func: HostFunction,
     config: Config,
     emit_repro_caller: bool,

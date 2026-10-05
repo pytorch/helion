@@ -102,3 +102,100 @@ def test_inclusive_bound_matches_reference(last: int) -> None:
     )
     keep = (torch.arange(1024, device=CUDA_DEVICE) <= last)[None, :]
     torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+
+
+_ROW_CONFIG = {
+    "block_sizes": [1, 1024],
+    "num_threads": [0, 256],
+    "cute_vector_widths": [1, 4],
+}
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _window_columns(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(out.size()):
+        out[tile0, tile1] = hl.load(
+            x,
+            [tile0, tile1],
+            extra_mask=((tile1.index >= 256) & (tile1.index < 512))[None, :],
+        )
+    return out
+
+
+def test_bitwise_and_mask_matches_reference() -> None:
+    x = torch.randn((5, 1024), device=CUDA_DEVICE)
+    out = _run(_window_columns, (x,), **_ROW_CONFIG)
+    columns = torch.arange(1024, device=CUDA_DEVICE)
+    keep = ((columns >= 256) & (columns < 512))[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_flag_columns(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(out.size()):
+        f = flags[tile0]
+        out[tile0, tile1] = hl.load(
+            x,
+            [tile0, tile1],
+            extra_mask=torch.logical_and(
+                (f > 0)[:, None], (tile1.index < 512)[None, :]
+            ),
+        )
+    return out
+
+
+def test_loaded_flag_mask_matches_reference() -> None:
+    x = torch.randn((8, 1024), device=CUDA_DEVICE)
+    flags = torch.randint(-1, 2, (8,), dtype=torch.int32, device=CUDA_DEVICE)
+    out = _run(_row_flag_columns, (x, flags), **_ROW_CONFIG)
+    columns = torch.arange(1024, device=CUDA_DEVICE)
+    keep = (flags > 0)[:, None] & (columns < 512)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _atomic_flag_columns(x: torch.Tensor, counter: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(out.size()):
+        old = hl.atomic_add(counter, [tile0], 1)
+        out[tile0, tile1] = hl.load(
+            x,
+            [tile0, tile1],
+            extra_mask=(old >= 0)[:, None] & (tile1.index < 512)[None, :],
+        )
+    return out
+
+
+def test_atomic_result_mask_matches_reference() -> None:
+    x = torch.randn((8, 1024), device=CUDA_DEVICE)
+    counter = torch.zeros((8,), dtype=torch.int32, device=CUDA_DEVICE)
+    out = _run(_atomic_flag_columns, (x, counter), **_ROW_CONFIG)
+    keep = (torch.arange(1024, device=CUDA_DEVICE) < 512)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)
+    assert bool((counter > 0).all())
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _prefix_columns_device_loop(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0 in hl.tile(x.size(0)):
+        for tile1 in hl.tile(x.size(1)):
+            out[tile0, tile1] = hl.load(
+                x, [tile0, tile1], extra_mask=(tile1.index < 512)[None, :]
+            )
+    return out
+
+
+def test_device_loop_extra_mask_matches_reference() -> None:
+    x = torch.randn((8, 1024), device=CUDA_DEVICE)
+    out = _run(
+        _prefix_columns_device_loop,
+        (x,),
+        block_sizes=[1, 128],
+        num_threads=[0, 32],
+        cute_vector_widths=[1, 4],
+    )
+    keep = (torch.arange(1024, device=CUDA_DEVICE) < 512)[None, :]
+    torch.testing.assert_close(out, torch.where(keep, x, 0.0), rtol=0, atol=0)

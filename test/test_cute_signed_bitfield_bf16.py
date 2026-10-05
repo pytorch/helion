@@ -370,8 +370,13 @@ def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
         ["different_row", "column"],
         "row_ok and lane_ok",
     )
-    assert value == "_cute_signed_bitfield_to_bf16_packed(packet, 0, 4, 8)"
+    assert value is not None and value.carrier == "packet"
+    assert (
+        value.flush_operand("packet")
+        == "_cute_signed_bitfield_to_bf16_packed(packet, 0, 4, 8)"
+    )
     original_scalar = deepcopy(state.env[case.value])
+    sites = []
     for row in ("row*2", "row*2+1"):
         statement = memory_ops._cute_register_tile_unroll_vec_store(
             state,
@@ -382,13 +387,21 @@ def test_actual_store_protocol_preserves_order_and_scalar_fanout(monkeypatch):
             "scalar",
             "row_ok and lane_ok",
             torch.bfloat16,
-            packed_values_expr=value,
+            packed_values=value,
         )
-        assert isinstance(statement, ast.Pass)
+        # The store site binds the packet under its flush operand's name.
+        assert isinstance(statement, ast.Assign)
+        (target,) = statement.targets
+        assert isinstance(target, ast.Name)
+        assert ast.unparse(statement) == f"{target.id} = packet"
+        sites.append(target.id)
     body = strategy._cute_lane_body_by_block[1]
     assert ast.dump(state.env[case.value]) == ast.dump(original_scalar)
     assert len(body) == 4 and body[1] is strategy._cute_lane_vloop_by_block[1]
     assert "row * 2" in ast.unparse(body[2]) and "row * 2 + 1" in ast.unparse(body[3])
+    for site, flush in zip(sites, body[2:], strict=True):
+        operand = f"_cute_signed_bitfield_to_bf16_packed({site}, 0, 4, 8)"
+        assert operand in ast.unparse(flush)
     assert not any(
         isinstance(node, ast.List) for stmt in body for node in ast.walk(stmt)
     )

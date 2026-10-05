@@ -1746,6 +1746,40 @@ class CompileEnvironment:
             return (int(a) % b) == 0
         return False
 
+    def specialized_multiple(self, value: object, divisor: int) -> bool:
+        """Whether ``value`` (an int, SymInt or sympy expression) is a
+        multiple of ``divisor`` for every input this bound kernel may see.
+
+        A static value proves it directly.  A dynamic value is proven through
+        the ``input_tensor_metadata`` specialization fact: the bound kernel is
+        then keyed on the exact input sizes and strides, so the traced hint
+        is the runtime value.  Unbacked symbols have no such hint.
+        """
+        if divisor <= 1:
+            return True
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value % divisor == 0
+        expr: sympy.Expr
+        if isinstance(value, torch.SymInt):
+            expr = typing.cast("sympy.Expr", value._sympy_())
+        elif isinstance(value, sympy.Expr):
+            expr = value
+        else:
+            return False
+        if isinstance(expr, sympy.Integer):
+            return int(expr) % divisor == 0
+        if "input_tensor_metadata" not in self.compiler_fact_specialization_facts:
+            return False
+        if _has_unbacked(expr):
+            return False
+        try:
+            hint = int(shape_env_size_hint(self.shape_env, expr))
+        except (RuntimeError, TypeError, ValueError):
+            return False
+        return hint % divisor == 0
+
     @property
     def backend(self) -> Backend:
         return self._backend

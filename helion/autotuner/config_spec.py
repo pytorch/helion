@@ -947,6 +947,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_independent_reduction",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1040,6 +1042,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_independent_reduction",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1142,6 +1146,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_independent_reduction",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -3046,6 +3052,30 @@ class ConfigSpec:
                 else:
                     raise InvalidConfig(f"{key} must be a boolean")
 
+    def _normalize_cute_vloop_sink(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_vloop_sink`` is a boolean; ``cute_lane_unroll`` only applies
+        to the lane loops of a sunk vector nest and is 1 otherwise."""
+        sink = config.get("cute_vloop_sink", False)
+        if type(sink) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig("cute_vloop_sink must be a boolean")
+            sink = False
+        if "cute_vloop_sink" in config or sink:
+            config["cute_vloop_sink"] = sink
+        unroll = config.get("cute_lane_unroll", 1)
+        if type(unroll) is not int or unroll not in _CUTE_LANE_UNROLL_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_lane_unroll must be one of {_CUTE_LANE_UNROLL_CHOICES}"
+                )
+            unroll = 1
+        if not sink:
+            unroll = 1
+        if "cute_lane_unroll" in config or unroll != 1:
+            config["cute_lane_unroll"] = unroll
+
     def _normalize_cute_register_chain(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3448,6 +3478,7 @@ class ConfigSpec:
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
             if self.matmul_facts:
@@ -5007,6 +5038,21 @@ class ConfigSpec:
                             (False, True),
                             search_choices=(False, True) if seeded else (False,),
                         )
+                if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
+                    sink_seeded = any(
+                        seed.config.get("cute_vloop_sink") is True
+                        for seed in self.compiler_seed_configs
+                    )
+                    fields["cute_vloop_sink"] = EnumFragment(
+                        (False, True),
+                        search_choices=(False, True) if sink_seeded else (False,),
+                    )
+                    fields["cute_lane_unroll"] = EnumFragment(
+                        _CUTE_LANE_UNROLL_CHOICES,
+                        search_choices=_CUTE_LANE_UNROLL_CHOICES
+                        if sink_seeded
+                        else (1,),
+                    )
                 if self.cute_rng_packet_enabled:
                     fields["cute_rng_packet"] = BooleanFragment()
                 if self.cute_packet_prefetch_enabled:
@@ -5762,6 +5808,8 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
 _CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
+# Manual unroll of the row lane loop of a sunk vector nest (``cute_vloop_sink``).
+_CUTE_LANE_UNROLL_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
 
 
 class CuteReductionReloadSpec(_BlockIdItem):

@@ -191,3 +191,141 @@ def test_inclusive_bound_uniformity(last: int, packets: int) -> None:
     vloop = _vector_loop(code)
     assert len(_packet_loads(_lane_body(code, vloop))) == packets, code
     assert len(_scalar_loads(vloop)) == 1 - packets, ast.unparse(vloop)
+
+
+_ROW_CONFIG = {
+    "block_sizes": [1, 1024],
+    "num_threads": [0, 256],
+    "cute_vector_widths": [1, 4],
+}
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _window_columns(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(out.size()):
+        out[tile0, tile1] = hl.load(
+            x,
+            [tile0, tile1],
+            extra_mask=((tile1.index >= 256) & (tile1.index < 512))[None, :],
+        )
+    return out
+
+
+def test_bitwise_and_of_uniform_terms_hoists_as_a_packet() -> None:
+    # ``&`` lowers to a bitwise ``BinOp``; both bounds are multiples of 4.
+    code = _generate(_window_columns, (torch.empty((8, 1024)),), **_ROW_CONFIG)
+    vloop = _vector_loop(code)
+    (packet,) = _packet_loads(_lane_body(code, vloop))
+    guard = ast.unparse(packet.value)
+    assert "operator.ge(lane_base_1, 256) & operator.lt(lane_base_1, 512)" in guard
+    assert not _scalar_loads(vloop), ast.unparse(vloop)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_flag_columns(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(out.size()):
+        f = flags[tile0]
+        out[tile0, tile1] = hl.load(
+            x,
+            [tile0, tile1],
+            extra_mask=torch.logical_and(
+                (f > 0)[:, None], (tile1.index < 512)[None, :]
+            ),
+        )
+    return out
+
+
+def test_loaded_flag_in_the_mask_is_relocated_not_inlined() -> None:
+    # The flag comparison is uniform (it does not read the lane index) and
+    # the loaded flag stays a name: its load runs once, before the packet,
+    # instead of being duplicated into the guard.
+    args = (torch.empty((8, 1024)), torch.zeros((8,), dtype=torch.int32))
+    code = _generate(_row_flag_columns, args, **_ROW_CONFIG)
+    vloop = _vector_loop(code)
+    (packet,) = _packet_loads(_lane_body(code, vloop))
+    guard = ast.unparse(packet.value)
+    assert "operator.gt(f, 0) & operator.lt(lane_base_1, 512)" in guard, guard
+    assert "flags.iterator" not in guard
+    assert code.count("flags.iterator") == 1, code
+    assert code.index("flags.iterator") < code.index("_tile_unroll_vec_1_0 =")
+    assert not _scalar_loads(vloop), ast.unparse(vloop)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _atomic_flag_columns(x: torch.Tensor, counter: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0, tile1 in hl.tile(out.size()):
+        old = hl.atomic_add(counter, [tile0], 1)
+        out[tile0, tile1] = hl.load(
+            x,
+            [tile0, tile1],
+            extra_mask=(old >= 0)[:, None] & (tile1.index < 512)[None, :],
+        )
+    return out
+
+
+def test_atomic_result_in_the_mask_keeps_scalar_loads() -> None:
+    # An atomic's result cannot move above the V-loop and is never inlined
+    # into a guard: the site keeps its scalar loads and the single atomic.
+    args = (torch.empty((8, 1024)), torch.zeros((8,), dtype=torch.int32))
+    code = _generate(_atomic_flag_columns, args, **_ROW_CONFIG)
+    vloop = _vector_loop(code)
+    assert not _packet_loads(_lane_body(code, vloop)), code
+    assert len(_scalar_loads(vloop)) == 1, ast.unparse(vloop)
+    assert code.count("cute.arch.atomic_add(") == 1, code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _prefix_columns_device_loop(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile0 in hl.tile(x.size(0)):
+        for tile1 in hl.tile(x.size(1)):
+            out[tile0, tile1] = hl.load(
+                x, [tile0, tile1], extra_mask=(tile1.index < 512)[None, :]
+            )
+    return out
+
+
+def test_device_loop_extra_mask_hoists_as_a_packet() -> None:
+    # A device loop defines the per-element index in the V-loop body; the
+    # proof still sees it and the (pipelined) packet is guarded at the base.
+    code = _generate(
+        _prefix_columns_device_loop,
+        (torch.empty((8, 1024)),),
+        block_sizes=[1, 128],
+        num_threads=[0, 32],
+        cute_vector_widths=[1, 4],
+    )
+    vloop = _vector_loop(code)
+    assert not _scalar_loads(vloop), ast.unparse(vloop)
+    packets = [
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "cute.arch.load"
+    ]
+    assert packets, code
+    for packet in packets:
+        pointer = packet.args[0]
+        assert isinstance(pointer, ast.IfExp), ast.unparse(packet)
+        assert ", 512)" in ast.unparse(pointer.test), ast.unparse(pointer.test)
+
+
+def test_dynamic_shapes_keep_scalar_loads() -> None:
+    # Without static shapes the mask bounds are symbolic: the uniformity
+    # proof needs literal bounds and the site keeps its scalar loads.
+    kernel = helion.kernel(
+        concat2d_dim1.fn, backend="cute", static_shapes=False, autotune_effort="none"
+    )
+    args = (torch.empty((8, 512)), torch.empty((8, 768)))
+    code = _generate(
+        kernel,
+        args,
+        block_sizes=[1, 2048],
+        num_threads=[0, 512],
+        cute_vector_widths=[1, 4],
+    )
+    vloop = _vector_loop(code)
+    assert not _packet_loads(_lane_body(code, vloop)), code
+    assert len(_scalar_loads(vloop)) == 2, ast.unparse(vloop)

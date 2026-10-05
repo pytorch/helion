@@ -1207,6 +1207,10 @@ class PersistentReductionStrategy(ReductionStrategy):
                 self._thread_count,
             )
             current_grid.block_thread_axes[block_idx] = axis
+            if self._cute_resident_reduction:
+                # ``materialize_resident_reductions`` rewrites this loop and
+                # its prelude as a unit.
+                current_grid.undistributable_lane_vars.add(synthetic_lane_var)
             current_grid.lane_setup_statements.append(
                 statement_from_string(f"{index_var} = {index_expr}")
             )
