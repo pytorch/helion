@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+import sympy
 import torch
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.runtime.triton_heuristics import (
     get_max_y_grid,  # type: ignore[import-untyped]
 )
@@ -89,6 +91,7 @@ from ..cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
 from ..cute.tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
 from ..cute.tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ..cute.tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
+from ..cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .common import dedupe_configs
 from .common import is_canonical_row_reduction
 from .registry import AutotunerHeuristic
@@ -843,6 +846,125 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         if alternate is None or alternate == primary:
             return [primary]
         return [primary, alternate]
+
+
+class CuteRegisterTileHeuristic(AutotunerHeuristic):
+    """Seed a per-thread register tile for a reduction over a vectorized tile.
+
+    Kernels that reduce a 2-D tile along its strided axis while the stride-1
+    axis stays a free tile (the fused linear-attention state update,
+    ``sum(q[:, None] * state, 0)``) get one 16-byte fragment of the stride-1
+    axis per thread and a trace-time reduction lane loop outside that vector
+    loop (``cute/register_tile_reductions.py``): eight vector threads cover a
+    128-byte row segment per warp row, every lane's packet load issues before
+    the first store, and each tile column is combined once with the
+    shared-memory column reduce.  The seed sizes the reduction thread count so
+    the unrolled register tile holds ``CUTE_REGISTER_TILE_MAX_ELEMENTS`` per
+    thread.
+
+    Disjoint from ``CuteColumnReductionHeuristic``, which seeds the reduction
+    over a serial device-loop axis of a kernel without reduction loops (for
+    ``cute_vloop_sink``): this seed needs exactly one reduction loop, so no
+    kernel is eligible for both and the seeds need no precedence.
+    """
+
+    name = "cute_register_tile"
+    backend = "cute"
+    VECTOR_THREADS = 8
+
+    @classmethod
+    def _geometry(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int, int, int] | None:
+        """``(tile_block_id, tile_block, tile_threads, reduction_block_id,
+        reduction_threads, vec)``, or ``None`` when the kernel lacks the shape."""
+        spec = env.config_spec
+        if spec.matmul_facts or len(spec.reduction_loops) != 1:
+            return None
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        if rl_spec.block_id not in spec.cute_register_tile_reduction_blocks:
+            return None
+        max_threads = spec.max_reduction_threads
+        size_hint = rl_spec.size_hint
+        if max_threads is None or size_hint > max_threads or size_hint < 2:
+            return None
+        tile_block_ids = [
+            block_id
+            for block_id in spec.block_sizes.valid_block_ids()
+            if block_id in spec.cute_vector_widths.valid_block_ids()
+            and block_id in spec.num_threads.valid_block_ids()
+        ]
+        if len(tile_block_ids) != 1:
+            return None
+        (tile_block_id,) = tile_block_ids
+        if rl_spec.block_id not in spec.num_threads.valid_block_ids():
+            return None
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_tile_inner_block_dtype(env, device_ir, tile_block_id)
+        )
+        if vec <= 1:
+            return None
+        numel = env.block_sizes[tile_block_id].numel
+        if not isinstance(numel, (int, sympy.Integer)):
+            return None
+        tile_block = min(int(numel), cls.VECTOR_THREADS * vec)
+        if tile_block % vec or (int(numel) % tile_block):
+            return None
+        tile_threads = tile_block // vec
+        lanes = max(1, CUTE_REGISTER_TILE_MAX_ELEMENTS // vec)
+        reduction_threads = next_power_of_2(max(1, -(-size_hint // lanes)))
+        if size_hint % reduction_threads or tile_threads * reduction_threads > (
+            spec.max_reduction_threads or 1024
+        ):
+            return None
+        if size_hint // reduction_threads < 2:
+            # One row per thread needs no lane loop; the persistent
+            # one-vector layouts cover that shape.
+            return None
+        return (
+            tile_block_id,
+            tile_block,
+            tile_threads,
+            rl_spec.block_id,
+            reduction_threads,
+            vec,
+        )
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._geometry(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        geometry = cls._geometry(env, device_ir)
+        if geometry is None:
+            return None
+        (
+            tile_block_id,
+            tile_block,
+            tile_threads,
+            reduction_block_id,
+            reduction_threads,
+            vec,
+        ) = geometry
+        spec = env.config_spec
+        seed: dict[str, Any] = {
+            "block_sizes": [
+                tile_block if block_id == tile_block_id else 1
+                for block_id in spec.block_sizes.valid_block_ids()
+            ],
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {tile_block_id: tile_threads, reduction_block_id: reduction_threads},
+            ),
+            "reduction_loops": [None],
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {tile_block_id: vec}
+            ),
+        }
+        return Config(**seed)
 
 
 def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:

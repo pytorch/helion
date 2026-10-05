@@ -22,6 +22,8 @@ from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .cute.layout import LayoutTag as _CuteLayoutTag
 from .cute.layout_propagation import META_KEY as _CUTE_LAYOUT_META_KEY
+from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import ReductionLowering
@@ -100,6 +102,58 @@ def _cute_reduction_smem_bytes(num_elements: int, dtype: torch.dtype) -> int:
 
 _CUTE_LOOPED_REDUCTION_MAX_ELEMENTS_PER_THREAD = 256
 _CUTE_WARP_REDUCTION_THREADS = 32
+
+
+def _cute_register_tile_shape(
+    fn: DeviceFunction, block_index: int, lane_extent: int
+) -> bool:
+    """Whether a scalar synthetic reduction lane of ``lane_extent`` over
+    reduction block ``block_index`` can nest outside the tile lane loops of
+    ``fn`` as a per-thread register tile.
+
+    Mirrors ``DeviceGridState.nest_reduction_lane_outside_vector_tiles`` from
+    the tile strategies' construction-time state: every tile block that has a
+    lane loop must be vectorized with one V-wide fragment per thread (elements
+    per thread == V), at least one such block must exist, no matmul lowering
+    may replace the lane bodies, the unrolled per-thread element count stays
+    within ``CUTE_REGISTER_TILE_MAX_ELEMENTS``, the device IR admits the
+    reduction block (``ConfigSpec.cute_register_tile_reduction_blocks``) and no
+    earlier pass over this kernel rejected the register tile
+    (``CompileEnvironment.cute_register_tile_disabled``).
+    """
+    env = CompileEnvironment.current()
+    if (
+        env.cute_register_tile_disabled
+        or env.config_spec.matmul_facts
+        or block_index not in env.config_spec.cute_register_tile_reduction_blocks
+    ):
+        return False
+    unrolled = lane_extent
+    found = False
+    for strategy in fn.tile_strategy.strategies:
+        if isinstance(strategy, PerThreadFlattenedTileStrategy):
+            if strategy._lane_var is None:
+                continue
+            vec_width = strategy._cute_lane_vec_width_by_block.get(
+                strategy.block_ids[-1], 1
+            )
+            if vec_width <= 1 or strategy._elements_per_thread != vec_width:
+                return False
+            unrolled *= vec_width
+            found = True
+            continue
+        if not isinstance(strategy, PerThreadNDTileStrategy):
+            continue
+        for block_id in strategy._lane_var_by_block:
+            vec_width = strategy._cute_lane_vec_width_by_block.get(block_id, 1)
+            if (
+                vec_width <= 1
+                or strategy._elements_per_thread_for_block(block_id) != vec_width
+            ):
+                return False
+            unrolled *= vec_width
+            found = True
+    return found and unrolled <= CUTE_REGISTER_TILE_MAX_ELEMENTS
 
 
 def cute_looped_reduction_block_size(size_hint: int, max_threads: int) -> int:
@@ -926,6 +980,7 @@ class PersistentReductionStrategy(ReductionStrategy):
         self._cute_lane_body: list[ast.AST] | None = None
         self._cute_lane_vloop: ast.For | None = None
         self._cute_resident_reduction = False
+        self._cute_register_tile_predicted = False
         if env.backend.name == "cute":
             from .cute.resident_reductions import supports_resident_threads
 
@@ -985,10 +1040,33 @@ class PersistentReductionStrategy(ReductionStrategy):
                 # ``_sibling_axis_group_params``), matching the one-LDG.128
                 # -per-thread shape of the Triton kernel instead of a 32-thread
                 # CTA looping over scalar lanes.
-                multiwarp_vector_row = (
+                vector_row = (
                     lane_extent is not None
                     and requested_vec > 1
                     and lane_extent == requested_vec
+                )
+                multiwarp_vector_row = (
+                    vector_row
+                    and self._thread_count % _CUTE_WARP_REDUCTION_THREADS == 0
+                )
+                # A scalar lane over one-vector tile wrappers nests OUTSIDE
+                # them as a trace-time register tile (see
+                # ``DeviceGridState.nest_reduction_lane_outside_vector_tiles``)
+                # whose finalize combines each tile element across the group
+                # with the cross-warp column reduce, so it keeps a multi-warp
+                # thread count too.  The prediction mirrors the grid-time
+                # check; ``codegen_preamble`` rejects the config if the grid
+                # turns out not to match.
+                self._cute_register_tile_predicted = (
+                    not vector_row
+                    and mask_var is None
+                    and lane_extent is not None
+                    and lane_extent > 1
+                    and not self._cute_resident_reduction
+                    and _cute_register_tile_shape(fn, block_index, lane_extent)
+                )
+                multiwarp_register_tile = (
+                    self._cute_register_tile_predicted
                     and self._thread_count % _CUTE_WARP_REDUCTION_THREADS == 0
                 )
                 if (
@@ -996,6 +1074,7 @@ class PersistentReductionStrategy(ReductionStrategy):
                     and self._thread_count > _CUTE_WARP_REDUCTION_THREADS
                     and not self._cute_resident_reduction
                     and not multiwarp_vector_row
+                    and not multiwarp_register_tile
                 ):
                     self._thread_count = _CUTE_WARP_REDUCTION_THREADS
                     lane_extent = env.backend.create_synthetic_reduction_lanes(
@@ -1184,11 +1263,39 @@ class PersistentReductionStrategy(ReductionStrategy):
                 )
                 index_expr = f"{base_index_var} + cutlass.Int32({synthetic_lane_var})"
             else:
-                current_grid.add_lane_loop(
-                    block_idx,
-                    synthetic_lane_var,
-                    self._synthetic_cute_lane_extent,
+                # A scalar synthetic lane over a grid of one-vector tile
+                # wrappers becomes a trace-time loop OUTSIDE those wrappers
+                # (a per-thread register tile: one vector transaction per
+                # lane, every lane's loads issued before the first store).
+                # Otherwise the lane keeps its rolled innermost position.
+                register_tile = (
+                    self._cute_register_tile_predicted
+                    and current_grid.nest_reduction_lane_outside_vector_tiles(
+                        block_idx,
+                        synthetic_lane_var,
+                        self._synthetic_cute_lane_extent,
+                        max_unrolled_elements=CUTE_REGISTER_TILE_MAX_ELEMENTS,
+                    )
                 )
+                if not register_tile:
+                    if (
+                        self._cute_register_tile_predicted
+                        and self._thread_count > _CUTE_WARP_REDUCTION_THREADS
+                    ):
+                        # The multi-warp thread count was kept for a register
+                        # tile that the grid does not provide; a rolled
+                        # multi-warp lane loop would drop lanes (#2643), so
+                        # ``generate_ast`` regenerates the kernel with the
+                        # rolled nesting and its warp-capped thread count.
+                        raise RegisterTileUnsupported(
+                            "the grid does not provide one-vector tile "
+                            "wrappers for the reduction lane"
+                        )
+                    current_grid.add_lane_loop(
+                        block_idx,
+                        synthetic_lane_var,
+                        self._synthetic_cute_lane_extent,
+                    )
                 index_expr = (
                     f"({self._index_init_expr(block_size_var, env.index_type(), block_idx)})"
                     f" + cutlass.Int32({synthetic_lane_var}) * {self._thread_count}"
@@ -1408,9 +1515,11 @@ class PersistentReductionStrategy(ReductionStrategy):
         if lane_expr is None:
             return None
         if pre <= 1 and not self._cute_resident_reduction:
-            # A one-vector-per-thread multi-warp row: the only other way a
-            # synthetic-lane reduction keeps more than one warp.  Its finalize
-            # is the two-stage shared reduce, which keys its per-group shared
+            # A one-vector-per-thread multi-warp row or a register tile
+            # (``_cute_register_tile_predicted``): the only other ways a
+            # synthetic-lane reduction keeps more than one warp.  Their
+            # finalize is the two-stage shared reduce (per tile element or
+            # column for the register tile), which keys its per-group shared
             # memory on the linear thread index across ALL launch-block
             # threads.  Like the non-synthetic cross-warp path, key that shared
             # memory on the full runtime thread id: a redundant thread axis can

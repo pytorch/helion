@@ -20,6 +20,7 @@ from typing import Protocol
 from typing import cast
 from unittest.mock import patch
 
+import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
 from torch._inductor.decomposition import select_decomp_table
@@ -56,6 +57,7 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_read_writes import ReadWrites
 from .compile_environment import CompileEnvironment
+from .cute.register_tile_admission import register_tile_body_admitted
 from .host_function import HostFunction
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
@@ -1167,6 +1169,9 @@ class DeviceIR:
                     reload_blocks.add(rdim.block_id)
 
         graphs_with_rolled_rdim: set[int] = set()
+        register_tile_body = env.backend_name == "cute" and register_tile_body_admitted(
+            self.graphs
+        )
         for rdim, allow_loop, used_graphs in rdim_results:
             if not allow_loop:
                 continue
@@ -1182,6 +1187,21 @@ class DeviceIR:
                 env.backend.register_reduction_loop_config_slots(
                     env, rdim.block_id, rdim.size_hint()
                 )
+            if register_tile_body:
+                # A persistent reduction lane may nest outside one-vector tile
+                # wrappers as a register tile only over a static, unmasked
+                # extent (the lane count is a trace-time constant) and a body
+                # the two-pass schedule can lower.  A CuTe-only decision: no
+                # other backend reads the extent here.
+                numel = rdim.numel
+                if (
+                    isinstance(numel, (int, sympy.Integer))
+                    and int(numel) > 0
+                    and env.backend.static_rdim_size(int(numel)) == int(numel)
+                ):
+                    env.config_spec.cute_register_tile_reduction_blocks.add(
+                        rdim.block_id
+                    )
             graphs_with_rolled_rdim |= used_graphs
 
         # Track which rdims appear as the reduction axis of an indexed

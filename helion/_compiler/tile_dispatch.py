@@ -272,12 +272,20 @@ class TileStrategyDispatch:
     def current_cute_grid_execution_plans(self) -> tuple[CuTeGridExecutionPlan, ...]:
         if not self.strategies:
             return ()
-        graph_info = getattr(
-            self.strategies[0].fn.codegen, "current_root_graph_info", None
+        codegen = self.strategies[0].fn.codegen
+        graph_info = getattr(codegen, "current_root_graph_info", None)
+        if isinstance(graph_info, RootGraphInfo):
+            return graph_info.cute_grid_execution_plans
+        # Outside root codegen (launch-shape recovery after the body is
+        # generated) every root's plans stay visible so the launch block dims
+        # follow the same thread-axis order as the generated body.  Lookups
+        # are scoped by block id, so the roots of a ForEach kernel never mix.
+        return tuple(
+            plan
+            for graph in codegen.codegen_graphs
+            if isinstance(graph, RootGraphInfo)
+            for plan in graph.cute_grid_execution_plans
         )
-        if not isinstance(graph_info, RootGraphInfo):
-            return ()
-        return graph_info.cute_grid_execution_plans
 
     def current_cute_grid_execution_plan(
         self,

@@ -73,6 +73,7 @@ def plan_layouts(
         _seed_constraints(graph_info, tile_strategy)
         _plan_matmul_execution(graph_info, tile_strategy)
         _plan_warp_per_row_execution(graph_info, tile_strategy)
+        _plan_register_tile_execution(graph_info, tile_strategy)
         _forward_propagate(graph_info)
         _backward_propagate(graph_info)
         _resolve_layouts(graph_info)
@@ -364,6 +365,94 @@ def _plan_warp_per_row_execution(
                 m_block_id: 1,
             },
             disable_reduction_axis_reservation_for=scoped_block_ids,
+        ),
+    )
+
+
+def _plan_register_tile_execution(
+    graph_info: GraphInfo,
+    tile_strategy: TileStrategyDispatch,
+) -> None:
+    """Lay the vectorized tile axes below a register-tile reduction lane.
+
+    A persistent reduction whose scalar synthetic lane nests outside the
+    one-vector tile wrappers (``_cute_register_tile_predicted``) gives every
+    thread V contiguous elements of the stride-1 tile axis per lane.  With the
+    reduction threads on ``thread_idx[0]`` (the CuTe default, so a warp
+    shuffle can combine them) the 32 lanes of a warp hold 32 different rows,
+    and every V-wide load instruction touches 32 cache lines for 16 bytes
+    each: the L1/TEX wavefront rate, not DRAM, bounds the kernel.  Putting the
+    vectorized tile blocks on the lowest thread axes makes consecutive lanes
+    cover consecutive fragments of one row (``T * V`` contiguous elements per
+    warp row), so each instruction touches a few full lines.  The reduction
+    threads then sit above ``pre`` sibling coordinates and the register-tile
+    finalize combines every tile element with the strided shared-memory
+    column reduce (``_cute_grouped_reduce_shared_columns``).
+
+    Emits a ``CuTeGridExecutionPlan`` ranking vectorized tile blocks first,
+    other threaded tile blocks next and the reduction last, and disables the
+    reduction-axis reservation for the tile blocks.
+    """
+    from ..reduction_strategy import PersistentReductionStrategy
+    from ..reduction_strategy import ReductionStrategy
+    from ..tile_strategy import PerThreadFlattenedTileStrategy
+    from ..tile_strategy import PerThreadNDTileStrategy
+
+    if not isinstance(graph_info, RootGraphInfo):
+        return
+    if graph_info.cute_grid_execution_plans:
+        return
+    reductions = [
+        strategy
+        for strategy in tile_strategy.strategies
+        if isinstance(strategy, ReductionStrategy) and strategy.thread_axes_used() > 0
+    ]
+    if len(reductions) != 1:
+        return
+    reduction = reductions[0]
+    if (
+        not isinstance(reduction, PersistentReductionStrategy)
+        or not reduction._cute_register_tile_predicted
+    ):
+        return
+    vector_blocks: list[int] = []
+    other_blocks: list[int] = []
+    for strategy in tile_strategy.strategies:
+        if isinstance(strategy, ReductionStrategy):
+            continue
+        if isinstance(strategy, PerThreadFlattenedTileStrategy):
+            # One flattened axis for every block of the strategy.
+            if strategy._uses_thread_axis():
+                target = vector_blocks if strategy._lane_var else other_blocks
+                target.extend(strategy.block_ids)
+            continue
+        if not isinstance(strategy, PerThreadNDTileStrategy):
+            return
+        assert isinstance(strategy.block_size, list)
+        for block_id, block_size in zip(
+            strategy.block_ids, strategy.block_size, strict=True
+        ):
+            if not strategy._uses_thread_axis_for_block(block_id, block_size):
+                continue
+            if block_id in strategy._lane_var_by_block:
+                vector_blocks.append(block_id)
+            else:
+                other_blocks.append(block_id)
+    if not vector_blocks:
+        return
+    priority = {
+        **dict.fromkeys(vector_blocks, 0),
+        **dict.fromkeys(other_blocks, 1),
+        reduction.block_index: 2,
+    }
+    graph_info.cute_grid_execution_plans = (
+        *graph_info.cute_grid_execution_plans,
+        CuTeGridExecutionPlan(
+            scoped_block_ids=frozenset(priority),
+            block_axis_priority=priority,
+            disable_reduction_axis_reservation_for=frozenset(
+                [*vector_blocks, *other_blocks]
+            ),
         ),
     )
 

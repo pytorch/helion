@@ -4,6 +4,7 @@ import ast
 import collections
 import contextlib
 import dataclasses
+import logging
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -28,6 +29,7 @@ from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .cute.register_tile_admission import RegisterTileUnsupported
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -55,6 +57,8 @@ if TYPE_CHECKING:
     from .pallas.dma import DmaResources
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
+
+log = logging.getLogger(__name__)
 
 
 class VloopSinkNotApplied(exc.Base):
@@ -201,6 +205,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
+        # Per-pass state of ``load_transform``: the fused inputs whose prologue
+        # placeholder this pass has emitted, mapped to their first dim-index
+        # expressions (``HelionTemplateBuffer._codegen_prologue_fusion``).  It
+        # lives on the pass rather than on the transform so the register-tile
+        # retry in ``generate_ast`` emits every placeholder again.
+        self.prologue_first_indexing: dict[str, str] = {}
         self._statement_owner_fx_node: Node | None = None
         self._codegen_results_by_owner_node_id: dict[int, object] = {}
         self.resident_prep_lowering_stack: list[
@@ -2041,43 +2051,81 @@ def generate_ast(
     _host_prefix: list[ast.AST] | None = None,
     _bounded_cache_request: BoundedCacheRequest | None = None,
 ) -> ast.Module:
+    """Generate the kernel module for ``config``.
+
+    Two CuTe decisions are made before the tile body exists and are revisited
+    once it does, each by generating the kernel again:
+
+    - A persistent reduction chooses its register-tile lane nesting from the
+      device IR; when the generated body then holds a statement the two-pass
+      register-tile schedule cannot place (``cute/register_tile_admission.py``,
+      ``RegisterTileUnsupported``), the kernel is generated again without the
+      register tile.  The register tile was the only reason normalization kept
+      a reduction thread count below the extent persistent, so the retry
+      re-normalizes ``config`` with register tiles withheld: the looped
+      reduction when the remaining threads cannot cover the extent, otherwise
+      the same config with the rolled lane nesting the strategy used before
+      register tiles existed.  Caller-built codegen graphs
+      (``_codegen_graphs``) were rolled for ``config`` as given, so that retry
+      keeps the config and only the lane nesting changes.
+    - ``cute_vloop_sink`` shapes the thread layout during layout planning;
+      when no vector loop is sunk after all (``VloopSinkNotApplied``), the
+      kernel is generated again with the knob off (``vloop_sink_off_config``)
+      so the knob alone never changes the code.
+
+    The two compose: the register tile is admitted afresh on the knob-off
+    pass, and the sink pass runs on the rolled body of a rejected register
+    tile.  Each retry fires at most once per call (its handler switches off
+    what raised it), so a call generates the kernel at most three times.  The
+    abandoned passes leave nothing behind but their host prefix; per-pass
+    state of the memory transforms lives on the pass's ``GenerateAST``
+    (``prologue_first_indexing``), so a retry starts it afresh.
+    """
     prefix_length = len(_host_prefix) if _host_prefix is not None else 0
+    env = CompileEnvironment.current()
+    register_tiles_disabled = env.cute_register_tile_disabled
     try:
-        return _generate_ast(
-            func,
-            config,
-            emit_repro_caller,
-            store_transform=store_transform,
-            load_transform=load_transform,
-            extra_params=extra_params,
-            _codegen_graphs=_codegen_graphs,
-            _memory_counters=_memory_counters,
-            _host_prefix=_host_prefix,
-            _bounded_cache_request=_bounded_cache_request,
-        )
-    except VloopSinkNotApplied:
-        # ``cute_vloop_sink`` chose the thread layout but no vector loop was
-        # sunk: the knob must not change the code by itself, so generate
-        # exactly the knob-off code.  The abandoned run has left nothing
-        # behind but its host prefix.
-        if _host_prefix is not None:
-            del _host_prefix[prefix_length:]
-        if _codegen_graphs is not None:
-            # Layout planning annotated the caller's graphs in place; the
-            # caller rebuilds them for the knob-off run.
-            raise
-    return _generate_ast(
-        func,
-        vloop_sink_off_config(config),
-        emit_repro_caller,
-        store_transform=store_transform,
-        load_transform=load_transform,
-        extra_params=extra_params,
-        _codegen_graphs=_codegen_graphs,
-        _memory_counters=_memory_counters,
-        _host_prefix=_host_prefix,
-        _bounded_cache_request=_bounded_cache_request,
-    )
+        while True:
+            try:
+                return _generate_ast(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    store_transform=store_transform,
+                    load_transform=load_transform,
+                    extra_params=extra_params,
+                    _codegen_graphs=_codegen_graphs,
+                    _memory_counters=_memory_counters,
+                    _host_prefix=_host_prefix,
+                    _bounded_cache_request=_bounded_cache_request,
+                )
+            except RegisterTileUnsupported as failure:
+                if env.cute_register_tile_disabled:
+                    raise
+                log.debug("regenerating with the rolled reduction lane: %s", failure)
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                if _codegen_graphs is None:
+                    retried = env.config_spec.normalized_config(
+                        config, _cute_register_tiles=False
+                    )
+                    if retried.config != config.config:
+                        log.debug(
+                            "the retry loops the reduction: reduction_loops=%s",
+                            retried.reduction_loops,
+                        )
+                        config = retried
+                env.cute_register_tile_disabled = True
+            except VloopSinkNotApplied:
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                if _codegen_graphs is not None:
+                    # Layout planning annotated the caller's graphs in place;
+                    # the caller rebuilds them for the knob-off run.
+                    raise
+                config = vloop_sink_off_config(config)
+    finally:
+        env.cute_register_tile_disabled = register_tiles_disabled
 
 
 def _generate_ast(

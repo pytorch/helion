@@ -420,6 +420,11 @@ class CompileEnvironment:
         # of an owning kernel input. Only the stage builder populates this set;
         # ordinary input tensors still require their runtime cache-key proof.
         self.cute_proven_tma_inputs: set[torch.Tensor] = set()
+        # Set by ``generate_ast`` while it regenerates a kernel whose
+        # register-tile lane nesting the split-time lowering rejected
+        # (``cute/register_tile_admission.py``); the persistent reduction
+        # strategy then keeps its rolled lane nesting.
+        self.cute_register_tile_disabled: bool = False
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still

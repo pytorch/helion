@@ -123,6 +123,7 @@ from .._compiler.cute.tcgen05_tma_rn import (
 )
 from .._compiler.cute.tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
 from .._compiler.cute.tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
+from .._compiler.cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .._utils import indexing_uses_tensor_descriptor
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
@@ -1298,6 +1299,11 @@ class ConfigSpec:
         # updates. Generated-AST matching is stricter and remains authoritative.
         self.cute_resident_reduction_blocks: set[int] = set()
         self.cute_sequence_reduction_blocks: set[int] = set()
+        # Persistent reduction blocks whose device IR admits the register-tile
+        # lane nesting and whose extent is static (``DeviceIR`` fills this in;
+        # see ``cute/register_tile_admission.py``).  Only these may keep a
+        # thread count below their extent persistent.
+        self.cute_register_tile_reduction_blocks: set[int] = set()
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
@@ -2701,6 +2707,70 @@ class ConfigSpec:
             raise InvalidConfig("packet prefetch requires CuTe")
         self.cute_packet_prefetch_enabled = True
 
+    def _cute_config_forms_register_tile(
+        self,
+        config: dict[str, object],
+        rl_spec: ReductionLoopSpec,
+        available: int,
+    ) -> bool:
+        """Whether ``config`` spells out a per-thread register tile for the
+        persistent reduction ``rl_spec`` (see
+        ``DeviceGridState.nest_reduction_lane_outside_vector_tiles``).
+
+        The reduction block must admit the register tile (a static extent and
+        a body the two-pass schedule can lower,
+        ``cute_register_tile_reduction_blocks``); the reduction thread count
+        must be explicit, divide the extent and fit the remaining budget; every
+        lane-looped tile block must hold exactly one vector per thread
+        (elements per thread == its ``cute_vector_widths`` entry > 1), at least
+        one such block must exist, and the unrolled per-thread element count
+        stays within ``CUTE_REGISTER_TILE_MAX_ELEMENTS``.  Anything else keeps
+        the looped reduction a shrunk thread count always meant.
+        """
+        if rl_spec.block_id not in self.cute_register_tile_reduction_blocks:
+            return False
+        nt_list = cast("list[int]", config.get("num_threads", []) or [])
+        bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+        vec_list = cast("list[int]", config.get("cute_vector_widths", []) or [])
+        requested = self.num_threads.config_get(nt_list, rl_spec.block_id, 0)
+        if (
+            not isinstance(requested, int)
+            or requested <= 0
+            or requested > available
+            or rl_spec.size_hint % requested
+        ):
+            return False
+        unrolled = rl_spec.size_hint // requested
+        reduction_block_ids = self.reduction_block_ids | {
+            spec.block_id for spec in self.reduction_loops
+        }
+        vector_block_ids = self.cute_vector_widths.valid_block_ids()
+        vector_blocks = 0
+        for nt_spec in self.num_threads:
+            block_id = nt_spec.block_id
+            if block_id in reduction_block_ids:
+                continue
+            nt = self.num_threads.config_get(nt_list, block_id, 0)
+            bs = self.block_sizes.config_get(bs_list, block_id, 1)
+            if (
+                not isinstance(nt, int)
+                or not isinstance(bs, int)
+                or nt <= 0
+                or nt >= bs
+            ):
+                # No lane loop on this block.
+                continue
+            vec = (
+                self.cute_vector_widths.config_get(vec_list, block_id, 1)
+                if block_id in vector_block_ids
+                else 1
+            )
+            if bs % nt or not isinstance(vec, int) or vec <= 1 or bs // nt != vec:
+                return False
+            unrolled *= vec
+            vector_blocks += 1
+        return vector_blocks > 0 and unrolled <= CUTE_REGISTER_TILE_MAX_ELEMENTS
+
     def _normalize_cute_pointwise_pid_type(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3248,6 +3318,8 @@ class ConfigSpec:
     def normalized_config(
         self,
         config: helion.Config | Mapping[str, object],
+        *,
+        _cute_register_tiles: bool = True,
     ) -> helion.Config:
         """Return a normalized copy without mutating the requested config."""
         values = config.config if isinstance(config, helion.Config) else config
@@ -3257,7 +3329,7 @@ class ConfigSpec:
         normalized = helion.Config(
             **copied_values  # pyrefly: ignore[bad-argument-type]
         )
-        self.normalize(normalized)
+        self.normalize(normalized, _cute_register_tiles=_cute_register_tiles)
         return normalized
 
     def _normalize_amd_mfma(
@@ -3297,7 +3369,11 @@ class ConfigSpec:
             )
 
     def normalize(
-        self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
+        self,
+        config: helion.Config | dict[str, object],
+        *,
+        _fix_invalid: bool = False,
+        _cute_register_tiles: bool = True,
     ) -> None:
         """Normalize the config to match the block_sizes and validate the config.
 
@@ -3305,9 +3381,19 @@ class ConfigSpec:
             config: The config to normalize (modified in place).
             _fix_invalid: If True, silently fix invalid combinations instead of raising
                 errors. Used internally during autotuning config generation.
+            _cute_register_tiles: If False, a CuTe persistent reduction whose
+                threads cannot cover its extent is looped even when the config
+                spells out a per-thread register tile
+                (``_cute_config_forms_register_tile``).  ``generate_ast`` uses
+                it to regenerate a kernel whose register tile the lowering
+                rejected as the config without the register tile.
         """
         if isinstance(config, helion.Config):
-            self.normalize(config.config, _fix_invalid=_fix_invalid)
+            self.normalize(
+                config.config,
+                _fix_invalid=_fix_invalid,
+                _cute_register_tiles=_cute_register_tiles,
+            )
             return
 
         # ``cross_loop_schedule`` was the former public name. Accept old configs
@@ -3783,14 +3869,19 @@ class ConfigSpec:
                 if changed:
                     config["reduction_loops"] = new_loops
 
-        # CuTe-specific: persistent reduction whose thread count is shrunk
-        # below the reduction extent by adjust_reduction_thread_count would
-        # wrap the kernel body in a synthetic lane loop. The lane loop
-        # carries the body-level reduction's accumulator across iterations,
-        # so the reduction result would only reflect the last lane iter.
-        # Force a looped reduction whenever the available reduction threads
-        # (max_reduction_threads // product_of_non_reduction_thread_axes)
-        # cannot cover the full reduction extent.
+        # CuTe-specific: a persistent reduction whose thread count is shrunk
+        # below the reduction extent by adjust_reduction_thread_count wraps
+        # the kernel body in a synthetic lane loop.  Force a looped reduction
+        # whenever the available reduction threads (max_reduction_threads //
+        # product_of_non_reduction_thread_axes) cannot cover the full
+        # reduction extent, unless the config spells out a per-thread
+        # register tile over a reduction block that admits one
+        # (``_cute_config_forms_register_tile``): that lane loop is the
+        # requested geometry and its lane reductions are lowered by
+        # ``split_lane_loop_reductions``; a body that lowering cannot place
+        # is regenerated with ``_cute_register_tiles=False`` (the looped
+        # reduction this branch chooses without the register tile), and an
+        # unproved reordering rejects the config instead of miscompiling.
         if (
             self.backend_name == "cute"
             and self.max_reduction_threads is not None
@@ -3830,8 +3921,8 @@ class ConfigSpec:
                         # budget there is no thread budget left for the reduction
                         # axis. A chunk of 1 is invalid (LoopedReductionStrategy
                         # requires block_size > 1) and a persistent reduction
-                        # would hit the synthetic-lane-loop bug described above.
-                        # Reject the config so the autotuner skips it.
+                        # could not place a single reduction thread.  Reject
+                        # the config so the autotuner skips it.
                         if available < 2:
                             raise InvalidConfig(
                                 f"cute backend: reduction axis {i} has no thread "
@@ -3839,6 +3930,13 @@ class ConfigSpec:
                                 f"{other_threads} of {self.max_reduction_threads} "
                                 f"threads)."
                             )
+                        if (
+                            _cute_register_tiles
+                            and self._cute_config_forms_register_tile(
+                                config, spec, available
+                            )
+                        ):
+                            continue
                         chunk = min(spec.size_hint, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)

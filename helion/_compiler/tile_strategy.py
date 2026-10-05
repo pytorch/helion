@@ -27,6 +27,8 @@ from .ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .compile_environment import CompileEnvironment
 from .compile_environment import _has_unbacked
 from .compile_environment import _to_sympy
+from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .cute.register_tile_admission import RegisterTileUnsupported
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -165,17 +167,43 @@ def _reverse_lane_loop_iter(loop: ast.For) -> bool:
     return True
 
 
-def _create_lane_loop(lane_var: str, extent: int, body: list[ast.AST]) -> ast.For:
+def _create_lane_loop(
+    lane_var: str, extent: int, body: list[ast.AST], *, constexpr: bool = False
+) -> ast.For:
+    """Build a synthetic lane loop.
+
+    ``constexpr`` emits ``cutlass.range_constexpr`` so the lanes unroll at
+    trace time: a register-tile reduction (see
+    ``cute/register_tile_reductions.py``) needs every lane's loads issued
+    before any lane's store and keeps its per-lane values in trace-time Python
+    lists, which a rolled ``scf.for`` could not carry.
+    """
+    iterator = (
+        expr_from_string(f"cutlass.range_constexpr({extent})")
+        if constexpr
+        else _lane_loop_iter(extent)
+    )
     loop = create(
         ast.For,
         target=create(ast.Name, id=lane_var, ctx=ast.Store()),
-        iter=_lane_loop_iter(extent),
+        iter=iterator,
         body=body,
         orelse=[],
         type_comment=None,
     )
     setattr(loop, HELION_LANE_LOOP_VAR_ATTR, lane_var)
     return loop
+
+
+def _is_constexpr_lane_iter(loop: ast.For) -> bool:
+    """Whether a synthetic lane loop unrolls at trace time."""
+    iterator = loop.iter
+    return (
+        isinstance(iterator, ast.Call)
+        and ast.unparse(iterator.func) == "cutlass.range_constexpr"
+        and len(iterator.args) == 1
+        and not iterator.keywords
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -475,19 +503,28 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
     incomplete scalar inputs by the final safety net.
     """
 
-    def visit(node: ast.AST, lanes: tuple[str, ...]) -> None:
+    def visit(node: ast.AST, lanes: tuple[tuple[str, bool], ...]) -> None:
         lane = getattr(node, HELION_LANE_LOOP_VAR_ATTR, None)
         if isinstance(node, ast.For) and lane is not None:
-            lanes = (*lanes, lane)
+            lanes = (*lanes, (lane, _is_constexpr_lane_iter(node)))
         marker = _is_lane_reduce_marker_assign(node)
-        if (
-            marker is not None
-            and marker.owner_lane is not None
-            and (not lanes or lanes[-1] != marker.owner_lane)
-        ):
-            raise exc.BackendUnsupported(
-                "cute", "reduction marker is nested in a different lane owner"
-            )
+        if marker is not None and marker.owner_lane is not None:
+            # The owner is normally the innermost lane.  A register-tile
+            # reduction nests trace-time tile lane loops (one-vector wrappers)
+            # under a constexpr owner: those inner loops enumerate a thread's
+            # own elements and do not redistribute the reduction, so the
+            # owner may sit above them (``cute/register_tile_reductions.py``).
+            owners = [
+                index
+                for index, (name, _) in enumerate(lanes)
+                if name == marker.owner_lane
+            ]
+            if not owners or not all(
+                constexpr for _, constexpr in lanes[owners[-1] + 1 :]
+            ):
+                raise exc.BackendUnsupported(
+                    "cute", "reduction marker is nested in a different lane owner"
+                )
         for child in ast.iter_child_nodes(node):
             visit(child, lanes)
 
@@ -996,7 +1033,6 @@ def _split_one_lane_loop(
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
 ) -> list[ast.AST]:
-    from .. import exc
     from .ast_read_writes import ReadWrites
 
     body: list[ast.AST] = list(loop.body)
@@ -1006,6 +1042,38 @@ def _split_one_lane_loop(
         if parsed is not None:
             markers.append((idx, parsed))
     if not markers:
+        nested_owners = {
+            marker.owner_lane
+            for stmt in body
+            for node in ast.walk(stmt)
+            if (marker := _is_lane_reduce_marker_assign(node)) is not None
+        }
+        register_tile_failure: exc.BackendUnsupported | None = None
+        if nested_owners and _is_constexpr_lane_iter(loop):
+            if nested_owners == {lane_var}:
+                # Markers nested in trace-time tile element loops under this
+                # constexpr owner: the register-tile lowering schedules every
+                # lane's loads before the first store and reduces each tile
+                # element once.  A body outside its shape may still be a
+                # lane-invariant guard around one (lifted below).
+                from .cute.register_tile_reductions import lower_register_tile_lane_loop
+
+                try:
+                    return lower_register_tile_lane_loop(
+                        loop,
+                        lane_var,
+                        proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
+                        proven_tensor_stride_values=proven_tensor_stride_values,
+                        thread_axis_names=thread_axis_names,
+                        scalar_definitions=scalar_definitions,
+                        rename_groups=rename_groups,
+                    )
+                except RegisterTileUnsupported as failure:
+                    register_tile_failure = failure
+            elif lane_var not in nested_owners:
+                # A trace-time tile lane loop below a register-tile owner: the
+                # enclosing owner lowers these markers together.
+                return [loop]
         # A dynamic guard that does not depend on the synthetic lane may hide
         # reduction markers in one of its branches.  Move that guard outside
         # the lane loop so each branch owns an ordinary lane loop that can be
@@ -1023,9 +1091,11 @@ def _split_one_lane_loop(
                 rename_groups=rename_groups,
                 running_sums=running_sums,
             )
+        if register_tile_failure is not None:
+            # ``generate_ast`` regenerates the kernel with the rolled lane
+            # nesting; the reason stays in its debug log.
+            raise register_tile_failure
         if any(_find_lane_reduce_call(node) is not None for node in ast.walk(loop)):
-            from .. import exc
-
             raise exc.BackendUnsupported(
                 "cute",
                 "lane reduction under a guard whose thread uniformity cannot be proven",
@@ -1072,8 +1142,6 @@ def _split_one_lane_loop(
             else None
         ),
     ):
-        from .. import exc
-
         raise exc.BackendUnsupported(
             "cute",
             "synthetic-lane reduction would reorder a potentially aliasing write",
@@ -2835,6 +2903,20 @@ def _is_persistent_branch_vec_store(call: ast.Call) -> bool:
     )
 
 
+def _is_vector_flush_store(call: ast.Call) -> bool:
+    """``_cute_store_u16_vec(ptr, values)`` / ``_cute_store_u32_vec(ptr, values)``.
+
+    The flush of a V-loop's collected per-element values into one vector
+    store; its destination is the first argument and its value the second.
+    """
+    return (
+        isinstance(call.func, ast.Name)
+        and call.func.id in ("_cute_store_u16_vec", "_cute_store_u32_vec")
+        and len(call.args) == 2
+        and not call.keywords
+    )
+
+
 def _atomic_pointer_and_value(call: ast.Call) -> tuple[ast.AST, ast.AST] | None:
     if isinstance(call.func, ast.Name) and (
         call.func.id.startswith("atomic_")
@@ -3161,6 +3243,9 @@ def _store_thread_axes(
         if _is_persistent_branch_vec_store(store):
             pointer = store.args[3]
             value = store.args[4]
+        elif _is_vector_flush_store(store):
+            pointer = store.args[0]
+            value = store.args[1]
         else:
             store_func = cast("ast.Attribute", store.func)
             pointer = store_func.value
@@ -3231,6 +3316,7 @@ def _validated_owner_store(stmt: ast.AST) -> ast.Call | None:
             and node.func.attr == "store"
             and len(node.args) == 1
             or _is_persistent_branch_vec_store(node)
+            or _is_vector_flush_store(node)
         )
     ]
     if len(memory_calls) != 1 or len(stores) != 1:
@@ -3408,9 +3494,9 @@ def _lane_split_reorders_aliasing_memory(
     from .cute.fuse_two_pass_loads import _store_tensor_roots
     from .cute.fuse_two_pass_loads import _tensor_arg_roots
     from .cute.persistent_branch_vec import _definition_snapshots
+    from .cute.persistent_branch_vec import _generated_access_pointer
     from .cute.persistent_branch_vec import _lane_accesses_are_iteration_independent
     from .cute.persistent_branch_vec import _memory_load_calls
-    from .cute.persistent_branch_vec import _plain_scalar_store_pointer
 
     tensor_names = {
         node.value.id
@@ -3469,22 +3555,29 @@ def _lane_split_reorders_aliasing_memory(
                 if load_marker:
                     pointer = load_call.args[4]
                 else:
+                    load_access = _generated_access_pointer(load_call)
                     func = load_call.func
-                    assert isinstance(func, ast.Attribute)
-                    pointer = (
-                        load_call.args[0]
-                        if load_call.args and _contains_arch_attribute(func.value)
-                        else func.value
-                    )
+                    if load_access is not None:
+                        pointer = load_access[0]
+                    elif isinstance(func, ast.Attribute) and not (
+                        load_call.args and _contains_arch_attribute(func.value)
+                    ):
+                        pointer = func.value
+                    else:
+                        # A byte-packed word load or an unknown helper: the
+                        # element count is not visible, so no reordering.
+                        return True
                 load_roots = _tensor_arg_roots(pointer, tensor_names)
                 for write_index, store_call, write_roots in writes:
                     if not roots_may_alias(write_roots, load_roots):
                         continue
-                    store_pointer = (
-                        store_call.args[3]
-                        if _is_persistent_branch_vec_store(store_call)
-                        else _plain_scalar_store_pointer(store_call)
-                    )
+                    if _is_persistent_branch_vec_store(store_call):
+                        store_pointer: ast.AST | None = store_call.args[3]
+                    else:
+                        store_access = _generated_access_pointer(store_call)
+                        store_pointer = (
+                            None if store_access is None else store_access[0]
+                        )
                     if write_index <= load_index or store_pointer is None:
                         return True
                     # Freeze only the two addresses and their complete
@@ -3709,11 +3802,16 @@ def _interchange_one_lane_loop(
     from .ast_read_writes import ReadWrites
 
     body: list[ast.AST] = list(loop.body)
-    # Find the single inner serial ``for`` loop that carries lane-reduce markers.
+    # Find the single inner serial ``for`` loop that carries lane-reduce
+    # markers of THIS lane (or legacy unowned markers).  A vector tile's
+    # constexpr V-loop under a register-tile owner also holds markers, but
+    # they belong to the enclosing reduction lane and are lowered there
+    # (``cute/register_tile_reductions.py``).
     mb_index: int | None = None
     for idx, stmt in enumerate(body):
         if _is_serial_for(stmt) and any(
-            _is_lane_reduce_marker_assign(s) is not None
+            (marker := _is_lane_reduce_marker_assign(s)) is not None
+            and marker.owner_lane in (None, lane_var)
             for s in cast("ast.For", stmt).body
         ):
             if mb_index is not None:
@@ -3987,6 +4085,9 @@ def _is_proven_relocatable_call(
         return bool(member) and member[0].isupper()
     if name.startswith(("math.", "cute.math.")):
         return True
+    if name == "ir.VectorType.get":
+        # The MLIR vector type of a hoisted packet load: a pure type value.
+        return True
     if name.startswith("operator."):
         return name.rsplit(".", 1)[-1] in _PURE_OPERATOR_CALLS
     if name in {
@@ -3996,7 +4097,11 @@ def _is_proven_relocatable_call(
         "cute.arch.warp_idx",
     }:
         return True
-    if name == "cute.arch.load":
+    if name == "cute.arch.load" or name in _CUTE_CACHE_LOAD_HELPER_NAMES:
+        # The packet load and its L2-policy helper forms, the load-side twin
+        # of the ``_cute_store_*`` convention ``_is_store_call`` relies on.
+        # Only the listed helpers: the memory passes collect and measure
+        # exactly these, so any other ``_cute_load_*`` stays unproven.
         return allow_load
     return allow_reduction and (
         name in _CHUNK_REDUCTION_HELPERS or name.startswith("cute.arch.warp_reduction")
@@ -5013,7 +5118,8 @@ class DeviceGridState(DeviceLoopOrGridState):
     # loops; never names a lane with a ``vec_lane_wrappers`` entry.
     reversed_lane_vars: set[str] = dataclasses.field(default_factory=set)
     # Lane vars whose loops a later pass rewrites structurally (resident
-    # reductions); ``wrap_body`` keeps the full nest around them.
+    # reductions, register-tile reductions); ``wrap_body`` keeps the full
+    # nest around them.
     undistributable_lane_vars: set[str] = dataclasses.field(default_factory=set)
     # Body definitions that packet loads hoisted into a vec wrapper read
     # (``cute/memory_ops.py`` records them while lowering the body).
@@ -5022,6 +5128,10 @@ class DeviceGridState(DeviceLoopOrGridState):
     pending_relocations: list[CuteLaneRelocation] = dataclasses.field(
         default_factory=list
     )
+    # Synthetic reduction lanes materialized as ``cutlass.range_constexpr``
+    # loops OUTSIDE the one-vector tile wrappers (register-tile reductions,
+    # see ``nest_reduction_lane_outside_vector_tiles``).
+    constexpr_lane_vars: set[str] = dataclasses.field(default_factory=set)
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -5031,12 +5141,70 @@ class DeviceGridState(DeviceLoopOrGridState):
         block_id: int,
         lane_var: str,
         extent: int,
+        *,
+        position: int | None = None,
     ) -> None:
-        self.lane_loops.append((lane_var, extent))
+        if position is None:
+            self.lane_loops.append((lane_var, extent))
+        else:
+            self.lane_loops.insert(position, (lane_var, extent))
         self.lane_loop_blocks.add(block_id)
         self.lane_loop_block_ids[lane_var] = self.lane_loop_block_ids.get(
             lane_var, frozenset()
         ) | {block_id}
+
+    def nest_reduction_lane_outside_vector_tiles(
+        self,
+        block_id: int,
+        lane_var: str,
+        extent: int,
+        *,
+        max_unrolled_elements: int,
+    ) -> bool:
+        """Register a synthetic reduction lane as a trace-time loop OUTSIDE
+        every one-vector tile wrapper, so the tile V-loops become the innermost
+        element loops (a per-thread register tile).
+
+        With the default nesting the constexpr tile V-loop wraps the rolled
+        reduction lane loop, so a load whose row coordinate comes from the
+        reduction lane is defined below the V-loop and can never be hoisted as
+        one vector transaction; every lane iteration also waits for its own
+        load before the next lane's load issues.  Placing the reduction lane
+        outside the wrappers makes the row coordinate available above the
+        V-loop (one LDG.128 per lane) and, because both loops unroll at trace
+        time, lets ``split_lane_loop_reductions`` schedule every lane's loads
+        before the first store.
+
+        Applies only when every tile lane loop of this grid is a vector
+        wrapper whose outer loop has exactly one trip (each thread owns one
+        V-wide fragment per tile axis) and the unrolled per-thread element
+        count stays within ``max_unrolled_elements``; otherwise the caller
+        keeps the established rolled nesting.  Returns whether the lane was
+        registered.
+        """
+        if not self.lane_loops or extent <= 1:
+            return False
+        unrolled = extent
+        for tile_lane_var, _tile_extent in self.lane_loops:
+            wrapper = self.vec_lane_wrappers.get(tile_lane_var)
+            if wrapper is None or wrapper.elide_outer_loop:
+                return False
+            if _lane_loop_extent(wrapper.outer_for) != 1:
+                return False
+            unrolled *= _lane_loop_extent(wrapper.vloop)
+        if unrolled > max_unrolled_elements:
+            return False
+        for tile_lane_var, _tile_extent in self.lane_loops:
+            wrapper = self.vec_lane_wrappers[tile_lane_var]
+            constexpr_iter = expr_from_string("cutlass.range_constexpr(1)")
+            assert isinstance(constexpr_iter, ast.expr)
+            wrapper.outer_for.iter = constexpr_iter
+        self.constexpr_lane_vars.add(lane_var)
+        # The register-tile lowering (``cute/register_tile_reductions.py``)
+        # rewrites this nest as a whole, so ``wrap_body`` keeps it intact.
+        self.undistributable_lane_vars.add(lane_var)
+        self.add_lane_loop(block_id, lane_var, extent, position=0)
+        return True
 
     def _live_lane_setup(
         self, body: list[ast.AST]
@@ -5337,7 +5505,12 @@ class DeviceGridState(DeviceLoopOrGridState):
                 if wrapper.elide_outer_loop
                 else [wrapper.outer_for]
             )
-        lane_loop = _create_lane_loop(lane_var, extent, wrapped)
+        lane_loop = _create_lane_loop(
+            lane_var,
+            extent,
+            wrapped,
+            constexpr=lane_var in self.constexpr_lane_vars,
+        )
         if lane_var in self.reversed_lane_vars and not _reverse_lane_loop_iter(
             lane_loop
         ):

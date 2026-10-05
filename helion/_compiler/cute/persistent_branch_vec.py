@@ -15,8 +15,9 @@ import math
 import re
 from typing import TYPE_CHECKING
 
-from ...language.memory_ops import _CUTE_CACHE_LOAD_HELPERS
 from ..ast_read_writes import ReadWrites
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -280,6 +281,9 @@ class _CollectMemoryLoads(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute) and node.func.attr == "load":
             self.calls.append(node)
             return
+        if isinstance(node.func, ast.Name) and node.func.id in _VECTOR_LOAD_HELPERS:
+            self.calls.append(node)
+            return
         self.generic_visit(node)
 
 
@@ -406,7 +410,21 @@ def _plain_scalar_store_pointer(call: ast.Call) -> ast.expr | None:
 
 
 # Widest element count one 16-byte flush helper can write.
-_VECTOR_FLUSH_MAX_WIDTH = {"_cute_store_u16_vec": 8, "_cute_store_u32_vec": 4}
+_VECTOR_FLUSH_MAX_WIDTH = {
+    "_cute_store_u16_vec": 8,
+    "_cute_store_u32_vec": 4,
+    "_cute_store_u16x8_l2_evict_last": 8,
+    "_cute_store_u32x4_l2_evict_last": 4,
+}
+# The generated vector loads besides ``cute.arch.load``: the L2-policy helpers
+# (16- and 8-byte forms), called the same way
+# (``NAME(PTR, ir.VectorType.get([V], ...))``).
+_VECTOR_LOAD_HELPERS = _CUTE_CACHE_LOAD_HELPER_NAMES
+# Word carriers of byte-packed loads (several sub-word elements per word).  The
+# element count depends on the tensor dtype, which the call does not show.
+_PACKED_LOAD_CARRIERS = frozenset(
+    {"cutlass.Uint16", "cutlass.Uint32", "cutlass.Uint64"}
+)
 
 
 def _vector_type_width(node: ast.AST) -> int | None:
@@ -429,11 +447,14 @@ def _generated_access_pointer(call: ast.Call) -> tuple[ast.expr, int] | None:
 
     Recognizes ``PTR.load()`` / ``PTR.store(value)`` (one element), the
     hoisted ``cute.arch.load(PTR, ir.VectorType.get([V], ...))`` packet load
-    (``V`` elements; a scalar-typed ``cute.arch.load(PTR, dtype, ...)`` is one
-    element) and the ``_cute_store_u16_vec`` / ``_cute_store_u32_vec`` flush
-    of a V-loop's values.  The flush's element count is not visible in the
-    call, so it reports the widest fragment its helper can write.  Anything
-    else (atomics, unknown helpers) returns ``None``.
+    and its L2-policy helper forms (``V`` elements), a scalar-typed
+    ``cute.arch.load(PTR, cutlass.Float32, ...)`` (one element) and the
+    ``_cute_store_u16_vec`` / ``_cute_store_u32_vec`` flush of a V-loop's
+    values.  The flush's element count is not visible in the call, so it
+    reports the widest fragment its helper can write.  Anything else returns
+    ``None``: atomics, unknown helpers, and byte-packed loads through a word
+    carrier (``cute.arch.load(PTR, cutlass.Uint64)`` reads as many elements
+    as fit the word, a count the call does not show).
     """
     pointer = _plain_scalar_load_pointer(call)
     if pointer is None:
@@ -441,11 +462,17 @@ def _generated_access_pointer(call: ast.Call) -> tuple[ast.expr, int] | None:
     if pointer is not None:
         return pointer, 1
     func = call.func
-    if isinstance(func, ast.Attribute) and ast.unparse(func) == "cute.arch.load":
+    name = ast.unparse(func) if isinstance(func, (ast.Attribute, ast.Name)) else ""
+    if name == "cute.arch.load" or name in _VECTOR_LOAD_HELPERS:
         if len(call.args) < 2 or not isinstance(call.args[0], ast.expr):
             return None
-        width = _vector_type_width(call.args[1])
-        return call.args[0], 1 if width is None else width
+        carrier = call.args[1]
+        width = _vector_type_width(carrier)
+        if width is not None:
+            return call.args[0], width
+        if name != "cute.arch.load" or ast.unparse(carrier) in _PACKED_LOAD_CARRIERS:
+            return None
+        return call.args[0], 1
     if (
         isinstance(func, ast.Name)
         and func.id in _VECTOR_FLUSH_MAX_WIDTH

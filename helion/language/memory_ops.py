@@ -16,6 +16,8 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
+from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_8B_HELPERS
+from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
@@ -924,23 +926,17 @@ def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str])
     return len(index_exprs) - 1
 
 
-# Sentinel eviction "suffix" for the ``l2_last`` policy: not a kwarg on
-# ``cute.arch.load`` (which has no L2 policy support) but a marker that the
-# 16-byte unroll-hoist load should go through the inline-PTX
-# ``createpolicy.fractional.L2::evict_last`` helper.  Non-16-byte or scalar
-# sites silently drop the hint.
-_CUTE_L2_LAST_SUFFIX = "__l2_last__"
-_CUTE_CACHE_LOAD_HELPERS = {
-    _CUTE_L2_LAST_SUFFIX: "_cute_load_l2_evict_last",
-    "__l1_l2_first__": "_cute_load_l1_l2_evict_first",
-    "__l1_l2_last__": "_cute_load_l1_l2_evict_last",
-}
-
-
 def _cute_unroll_vec_load_expr(
     ptr_expr: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str = ""
 ) -> str:
-    """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist."""
+    """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist.
+
+    The L2-policy eviction "suffixes" (``_CUTE_CACHE_LOAD_HELPERS``) are not
+    ``cute.arch.load`` kwargs (it has no L2 policy support) but markers that a
+    16-byte (or, except for ``l2_last``, 8-byte) hoist load goes through the
+    inline-PTX ``createpolicy.fractional`` helper; other sites silently drop
+    the hint.
+    """
     if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
         if not _cute_is_byte_packed(dtype) and vec_width * dtype.itemsize == 16:
             return (
@@ -949,12 +945,12 @@ def _cute_unroll_vec_load_expr(
                 f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
             )
         if (
-            eviction_suffix != _CUTE_L2_LAST_SUFFIX
+            eviction_suffix in _CUTE_CACHE_LOAD_8B_HELPERS
             and not _cute_is_byte_packed(dtype)
             and vec_width * dtype.itemsize == 8
         ):
             return (
-                f"{_CUTE_CACHE_LOAD_HELPERS[eviction_suffix]}_8b({ptr_expr}, "
+                f"{_CUTE_CACHE_LOAD_8B_HELPERS[eviction_suffix]}({ptr_expr}, "
                 f"ir.VectorType.get([{vec_width}], "
                 f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
             )
