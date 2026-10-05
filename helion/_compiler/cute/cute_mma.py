@@ -1124,6 +1124,7 @@ def _tcgen05_tma_operand_is_aligned(
     key, including every stride's byte residue. Unproved layouts retain the
     scalar shared-memory producer while keeping native MMA.
     """
+    from .input_view_layout import input_view_copy_facts
     from .memory_ops import tensor_has_specialized_tma_alignment
     from .promote_output_axis import _fresh_tensors
 
@@ -1135,15 +1136,20 @@ def _tcgen05_tma_operand_is_aligned(
         return True
     if env.tensor_input_source(tensor) is not None:
         return tensor_has_specialized_tma_alignment(env, tensor)
-    # Kernel-owned allocations have aligned storage. Neither an unknown
-    # host view nor an ambiguous input can establish that guarantee.
-    if tensor not in _fresh_tensors(HostFunction.current()):
-        return False
-    storage_offset = tensor.storage_offset()
-    if not isinstance(storage_offset, int) or storage_offset != 0:
-        return False
+    if tensor in _fresh_tensors(HostFunction.current()):
+        storage_offset = tensor.storage_offset()
+        if not isinstance(storage_offset, int) or storage_offset != 0:
+            return False
+        strides = tensor.stride()
+    else:
+        # Pointer-preserving host views inherit their input's guarded base
+        # alignment. Their own outer strides must still satisfy TensorMap.
+        facts = input_view_copy_facts(env, tensor)
+        if facts is None:
+            return False
+        strides = facts.strides
     unit_strides = 0
-    for stride in tensor.stride():
+    for stride in strides:
         if isinstance(stride, torch.SymInt):
             expression = env.specialize_expr(env.shape_env.replace(stride._sympy_()))
             if expression.free_symbols:
@@ -6037,6 +6043,8 @@ def _build_kloop_non_pipeline_consumer_if(args: _PerKiterTmaArgs) -> ast.stmt:
             "    pass\n"
             if args.skip_consumer_wait
             else (
+                f"    {args.tma_consumer_try_token} = "
+                f"{args.tma_pipeline}.consumer_try_wait({args.tma_consumer_state})\n"
                 f"    {args.tma_pipeline}.consumer_wait("
                 f"{args.tma_consumer_state}, {args.tma_consumer_try_token})\n"
             )
@@ -6221,6 +6229,78 @@ def _build_initial_prefetch_if(
         + producer_advance_src
     )
     return statement_from_string(src)
+
+
+def _build_split_initial_prefetch(
+    args: _InitialPrefetchTmaArgs,
+    *,
+    stages: list[tuple[list[str], str, bool]],
+    dependent_side: str,
+    clone_state: str,
+    clone_barrier: str,
+    gate_tma_warp: bool,
+) -> list[ast.stmt]:
+    """Initial prefetch split around a programmatic dependency wait.
+
+    A materialized operand is produced by the kernel launched just ahead of
+    this one; the other operand is an ordinary input. Every stage's
+    ``producer_acquire`` arms its transaction barrier for both operands, so
+    the independent operand's TMA loads can be issued for all initial stages
+    first, then the TMA warp waits on the producer grid, then the dependent
+    operand's loads complete the same barriers. ``producer_commit`` is a no-op
+    for TMA pipelines (the transaction bytes complete the phase), so the
+    barriers can be re-derived from a cloned producer state. Each entry of
+    ``stages`` is ``(full_tile_gates, k_offset, skip_producer_acquire)``.
+    """
+    if dependent_side == "rhs":
+        independent_src, dependent_src = (
+            _initial_prefetch_copy_a_src,
+            _initial_prefetch_copy_b_src,
+        )
+    else:
+        independent_src, dependent_src = (
+            _initial_prefetch_copy_b_src,
+            _initial_prefetch_copy_a_src,
+        )
+
+    def predicate(gates: list[str]) -> str:
+        return " and ".join([*gates, *([args.tma_warp] if gate_tma_warp else [])])
+
+    statements = [
+        statement_from_string(f"{clone_state} = {args.tma_producer_state}.clone()")
+    ]
+    for gates, k_offset, skip_producer_acquire in stages:
+        src = f"if {predicate(gates)}:\n"
+        if not skip_producer_acquire:
+            src += (
+                f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+            )
+        src += (
+            f"    {args.tma_barrier_ptr} = "
+            f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+            + independent_src(args, k_offset=k_offset)
+            + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        )
+        statements.append(statement_from_string(src))
+    wait = "cute.arch.griddepcontrol_wait()"
+    statements.append(
+        statement_from_string(
+            f"if {args.tma_warp}:\n    {wait}" if gate_tma_warp else wait
+        )
+    )
+    dependent_args = replace(
+        args, tma_producer_state=clone_state, tma_barrier_ptr=clone_barrier
+    )
+    for gates, k_offset, _ in stages:
+        src = (
+            f"if {predicate(gates)}:\n"
+            f"    {clone_barrier} = "
+            f"{args.tma_pipeline}.producer_get_barrier({clone_state})\n"
+            + dependent_src(dependent_args, k_offset=k_offset)
+            + emit_pipeline_advance(clone_state, indent="    ")
+        )
+        statements.append(statement_from_string(src))
+    return statements
 
 
 def _is_persistent_pid_config(config: Mapping[str, object]) -> bool:
@@ -7602,19 +7682,35 @@ def _emit_mma_pipeline(
     m_size = int(lhs_m_size)
     n_size = int(rhs_n_size)
 
+    def _operand_gmem_access(
+        operand: _MmaOperandInfo, arg_name: str, logical_indices: tuple[str, ...]
+    ) -> str:
+        source_indices = logical_indices
+        if (order := operand.source_to_logical_order) is not None:
+            # Scalar SMEM producers address the source tensor directly. Undo
+            # the logical permutation just as the TMA descriptor setup does.
+            source_indices = tuple(
+                logical_indices[order.index(dim)] for dim in range(len(order))
+            )
+        return f"{arg_name}[{', '.join(source_indices)}]"
+
     def _lhs_gmem_access(m_expr: str, k_expr: str) -> str:
         if lhs_operand.is_leading_passthrough:
             assert leading_global is not None
-            return f"{lhs_arg_name}[{leading_global}, {m_expr}, {k_expr}]"
-        return f"{lhs_arg_name}[{m_expr}, {k_expr}]"
+            return _operand_gmem_access(
+                lhs_operand, lhs_arg_name, (leading_global, m_expr, k_expr)
+            )
+        return _operand_gmem_access(lhs_operand, lhs_arg_name, (m_expr, k_expr))
 
     def _rhs_gmem_access(k_expr: str, n_expr: str) -> str:
         if rhs_rank3_group_expr is not None:
             return f"{rhs_arg_name}[{rhs_rank3_group_expr}, {n_expr}, {k_expr}]"
         if rhs_operand.is_leading_passthrough:
             assert leading_global is not None
-            return f"{rhs_arg_name}[{leading_global}, {k_expr}, {n_expr}]"
-        return f"{rhs_arg_name}[{k_expr}, {n_expr}]"
+            return _operand_gmem_access(
+                rhs_operand, rhs_arg_name, (leading_global, k_expr, n_expr)
+            )
+        return _operand_gmem_access(rhs_operand, rhs_arg_name, (k_expr, n_expr))
 
     tcgen05_cluster_m = _tcgen05_cluster_m(df.config)
     row_profile = row_union_plan.schedule if row_union_plan is not None else None
@@ -9971,6 +10067,10 @@ def _emit_mma_pipeline(
     mma_phys_n = _mma_active_n_threads(mma_impl)
     mma_physical_m_threads = _grid_thread_extent(cg, m_block_id)
     tcgen05_cta_thread_count = _grid_cta_thread_count(cg)
+    if mma_impl == "warp" and tcgen05_cta_thread_count < bm * mma_phys_n:
+        raise exc.BackendUnsupported(
+            "cute", "warp MMA requires enough physical threads for every MMA warp"
+        )
     if tcgen05_grouped_static_persistent and (
         tcgen05_is_two_cta or tcgen05_nm_orientation
     ):
@@ -10609,40 +10709,42 @@ def _emit_mma_pipeline(
             )
         )
         prefix.append(statement_from_string(f"{lane_idx} = cute.arch.lane_idx()"))
-        if tcgen05_use_flat_role_coordinates:
-            mma_role_coordinates = _flat_mma_role_coordinate_plan(
-                lane_idx=lane_idx,
-                warp_idx=warp_idx,
-                mma_active_n_threads=mma_phys_n,
+        if mma_impl == "warp":
+            # Warp MMA instructions require complete physical CUDA warps.
+            # Logical M/N coordinates can permute lanes or include serial
+            # elements, so use the same physical prefix for copies and MMA.
+            mma_tidx_expr = f"{warp_idx} * cutlass.Int32(32) + {lane_idx}"
+            mma_active_expr = (
+                f"{mma_participant_linear} < cutlass.Int32({bm * mma_phys_n})"
             )
+            mma_copy_expr = mma_participant_linear
         else:
-            mma_role_coordinates = _block_axis_mma_role_coordinate_plan(
-                cg,
-                m_block_id=m_block_id,
-                n_block_id=n_block_id,
-                mma_m_thread_extent=mma_physical_m_threads,
-                mma_active_n_threads=mma_phys_n,
-            )
-        prefix.append(
-            statement_from_string(
-                f"{mma_participant_linear} = {mma_role_coordinates.mma_tidx_expr()}"
-            )
-        )
-        prefix.append(
-            statement_from_string(
-                f"{mma_copy_linear} = "
-                + (
-                    mma_participant_linear
-                    if tcgen05_collective_handles_operand_loads
-                    else f"{m_local} + ({n_local}) * cutlass.Int32({bm})"
+            if tcgen05_use_flat_role_coordinates:
+                mma_role_coordinates = _flat_mma_role_coordinate_plan(
+                    lane_idx=lane_idx,
+                    warp_idx=warp_idx,
+                    mma_active_n_threads=mma_phys_n,
                 )
+            else:
+                mma_role_coordinates = _block_axis_mma_role_coordinate_plan(
+                    cg,
+                    m_block_id=m_block_id,
+                    n_block_id=n_block_id,
+                    mma_m_thread_extent=mma_physical_m_threads,
+                    mma_active_n_threads=mma_phys_n,
+                )
+            mma_tidx_expr = mma_role_coordinates.mma_tidx_expr()
+            mma_active_expr = mma_role_coordinates.mma_active_expr()
+            mma_copy_expr = (
+                mma_participant_linear
+                if tcgen05_collective_handles_operand_loads
+                else f"{m_local} + ({n_local}) * cutlass.Int32({bm})"
             )
-        )
         prefix.append(
-            statement_from_string(
-                f"{mma_active} = {mma_role_coordinates.mma_active_expr()}"
-            )
+            statement_from_string(f"{mma_participant_linear} = {mma_tidx_expr}")
         )
+        prefix.append(statement_from_string(f"{mma_copy_linear} = {mma_copy_expr}"))
+        prefix.append(statement_from_string(f"{mma_active} = {mma_active_expr}"))
         if mma_impl == "tcgen05":
             assert tcgen05_plan is not None
             assert tcgen05_matmul_plan is not None
@@ -12768,20 +12870,20 @@ def _emit_mma_pipeline(
                             ),
                             tma_load=tcgen05_use_role_local_tma_producer,
                         )
-                        stage0_prefetch = _build_initial_prefetch_if(
-                            prefetch_args,
-                            full_tile_gates=[tma_initial_full_tile],
-                            k_offset="cutlass.Int32(0)",
-                            skip_producer_acquire=(
-                                diagnose_skip_ab_producer_acquire
-                                or diagnose_skip_initial_ab_producer_acquire
-                            ),
-                            gate_tma_warp=not tcgen05_use_role_local_tma_producer,
-                        )
-                        prefix.append(stage0_prefetch)
-                        per_tile_stmts.append(stage0_prefetch)
-                        if tcgen05_use_role_local_tma_producer:
-                            tma_load_role_stmts.append(stage0_prefetch)
+                        # Per initial stage: the gate assignments emitted ahead
+                        # of its prefetch block, its full-tile gates, its k
+                        # offset and whether producer_acquire is skipped.
+                        initial_stages: list[tuple[list[str], list[str], str, bool]] = [
+                            (
+                                [],
+                                [tma_initial_full_tile],
+                                "cutlass.Int32(0)",
+                                bool(
+                                    diagnose_skip_ab_producer_acquire
+                                    or diagnose_skip_initial_ab_producer_acquire
+                                ),
+                            )
+                        ]
                         if tcgen05_ab_stage_count_value > 1:
                             # Warm every stage 1..ab_stage_count-1; each gated by
                             # an ``i+1``-k_tile fits-in-K predicate. The old
@@ -12790,14 +12892,13 @@ def _emit_mma_pipeline(
                             # ab>=3 leaves intermediate stages unarmed and the
                             # consumer ``consumer_wait`` deadlocks on stage 1
                             # phase 0. See cute_plan.md §6.9.1.
-                            _emit_per_tile(
+                            stage_gate_sources = [
                                 f"{tma_initial_next_full_tile} = "
                                 + _tcgen05_tma_tile_predicate(
                                     k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
                                     full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
-                                ),
-                                tma_load=tcgen05_use_role_local_tma_producer,
-                            )
+                                )
+                            ]
                             for stage_idx in range(1, tcgen05_ab_stage_count_value):
                                 if stage_idx == tcgen05_ab_stage_count_value - 1:
                                     stage_gates = [
@@ -12808,28 +12909,101 @@ def _emit_mma_pipeline(
                                     stage_gate_var = df.new_var(
                                         f"tcgen05_tma_initial_stage_{stage_idx}_full_tile"
                                     )
-                                    _emit_per_tile(
+                                    stage_gate_sources.append(
                                         f"{stage_gate_var} = "
                                         + _tcgen05_tma_tile_predicate(
                                             k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
                                             full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
-                                        ),
-                                        tma_load=tcgen05_use_role_local_tma_producer,
+                                        )
                                     )
                                     stage_gates = [
                                         tma_initial_full_tile,
                                         stage_gate_var,
                                     ]
-                                stage_prefetch = _build_initial_prefetch_if(
+                                initial_stages.append(
+                                    (
+                                        stage_gate_sources,
+                                        stage_gates,
+                                        f"cutlass.Int32({stage_idx})",
+                                        prefetch_args.skip_producer_acquire,
+                                    )
+                                )
+                                stage_gate_sources = []
+                        pdl_roots = (
+                            CompileEnvironment.current().config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
+                            if df.config.get("tcgen05_materialized_pdl", False)
+                            else None
+                        )
+                        # Gate assignments (source text) and prefetch blocks
+                        # (statements), in emission order.
+                        initial_prefetch: list[str | ast.stmt] = []
+                        if (
+                            pdl_roots is not None
+                            and not tcgen05_is_two_cta
+                            and not prefetch_args.skip_producer_advance
+                            and not prefetch_args.tma_gA2
+                        ):
+                            # Issue the ordinary input's loads for every
+                            # initial stage before waiting on the producer
+                            # grid; only the materialized operand's loads
+                            # wait. The prelude wait is skipped for this role.
+                            # The paired family keeps its prelude wait: its
+                            # leader-armed multicast barriers measured slower
+                            # with the loads split around the wait. Every
+                            # stage gate is assigned ahead of the split, whose
+                            # first block already reads them all.
+                            for (
+                                gate_sources,
+                                _gates,
+                                _k_offset,
+                                _skip,
+                            ) in initial_stages:
+                                initial_prefetch.extend(gate_sources)
+                            initial_prefetch.extend(
+                                _build_split_initial_prefetch(
                                     prefetch_args,
-                                    full_tile_gates=stage_gates,
-                                    k_offset=f"cutlass.Int32({stage_idx})",
+                                    stages=[
+                                        (gates, k_offset, skip_acquire)
+                                        for _sources, gates, k_offset, skip_acquire in initial_stages
+                                    ],
+                                    dependent_side=pdl_roots.dependent_side,
+                                    clone_state=df.new_var(
+                                        "tcgen05_pdl_producer_state"
+                                    ),
+                                    clone_barrier=df.new_var("tcgen05_pdl_barrier"),
                                     gate_tma_warp=not tcgen05_use_role_local_tma_producer,
                                 )
-                                prefix.append(stage_prefetch)
-                                per_tile_stmts.append(stage_prefetch)
-                                if tcgen05_use_role_local_tma_producer:
-                                    tma_load_role_stmts.append(stage_prefetch)
+                            )
+                            df.cute_state.tcgen05_pdl_wait_in_prefetch = True
+                        else:
+                            # Each stage's gates are assigned directly ahead of
+                            # its own prefetch block.
+                            for (
+                                gate_sources,
+                                gates,
+                                k_offset,
+                                skip_acquire,
+                            ) in initial_stages:
+                                initial_prefetch.extend(gate_sources)
+                                initial_prefetch.append(
+                                    _build_initial_prefetch_if(
+                                        prefetch_args,
+                                        full_tile_gates=gates,
+                                        k_offset=k_offset,
+                                        skip_producer_acquire=skip_acquire,
+                                        gate_tma_warp=not tcgen05_use_role_local_tma_producer,
+                                    )
+                                )
+                        for item in initial_prefetch:
+                            if isinstance(item, str):
+                                _emit_per_tile(
+                                    item, tma_load=tcgen05_use_role_local_tma_producer
+                                )
+                                continue
+                            prefix.append(item)
+                            per_tile_stmts.append(item)
+                            if tcgen05_use_role_local_tma_producer:
+                                tma_load_role_stmts.append(item)
     else:
         prefix.append(
             statement_from_string(
@@ -13542,10 +13716,8 @@ def _emit_mma_pipeline(
         # sA / sB while a sibling in another warp is still reading the
         # current K tile -- a cross-warp write-after-read hazard that yields
         # nondeterministic wrong values (confirmed via compute-sanitizer
-        # racecheck). The ``warp`` and ``tcgen05`` paths gate both the loads
-        # and the MMA over the same active-thread set (and tcgen05 adds
-        # pipeline/mbarrier ordering), so they never open this cross-warp
-        # window and do not need the barrier here.
+        # racecheck). Warp MMA orders this boundary with a CTA barrier
+        # below; tcgen05 uses its pipeline/mbarrier protocol.
         cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
     else:
         assert mma_active is not None
@@ -13564,6 +13736,9 @@ def _emit_mma_pipeline(
                     f"    cute.gemm({tiled_mma}, {acc_frag}, {rA}, {rB}, {acc_frag})"
                 )
             )
+            # Every participating warp must finish reading this tile before
+            # any warp overwrites shared operands for the next K iteration.
+            cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
         else:
             assert tcgen05_plan is not None
             if not tcgen05_use_separate_mma_exec:

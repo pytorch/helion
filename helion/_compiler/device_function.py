@@ -28,6 +28,7 @@ from .._compat import get_tensor_descriptor_fn_name
 from .._compat import is_hip
 from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import ExtendedAST
+from .ast_extension import clone_ast
 from .ast_extension import create
 from .ast_extension import create_arg
 from .ast_extension import create_arguments
@@ -134,22 +135,6 @@ def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
     """Check if expression contains only block size symbols (no other variables)."""
     _, non_block = find_block_size_symbols(expr)
     return len(non_block) == 0
-
-
-def _clone_extended_ast(value: object) -> object:
-    """Clone Python/ExtendedAST nodes without dropping Helion source metadata."""
-    if isinstance(value, list):
-        return [_clone_extended_ast(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_extended_ast(item) for item in value)
-    if isinstance(value, ast.AST):
-        fields = {
-            field: _clone_extended_ast(getattr(value, field)) for field in value._fields
-        }
-        if isinstance(value, ExtendedAST):
-            return value.copy(**fields)
-        return ast.copy_location(type(value)(**fields), value)
-    return value
 
 
 @dataclasses.dataclass
@@ -785,8 +770,10 @@ class DeviceFunction:
             resolved = env.resolve_codegen_block_id(
                 origin.origin.block_id, self.codegen
             )
-            if type(origin.origin) in (GridOrigin, TileBeginOrigin):
+            if type(origin.origin) is GridOrigin:
                 return self.codegen.offset_var(resolved)
+            if type(origin.origin) is TileBeginOrigin:
+                return self.codegen.tile_begin_var(resolved)
             # Render through the origin so each derived edge keeps its own
             # formula, but on the resolved live loop: host_str() reads
             # offset_var and active_device_loops by block_id, and an aliased
@@ -1364,6 +1351,7 @@ class DeviceFunction:
                     reload_modes=reload_modes,
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     proven_tensor_stride_values=self.proven_tensor_stride_values(),
+                    dynamic_trip_counts=self.cute_state.dynamic_reduction_trips,
                 )
             # Some exact persistent fragments have addresses defined only
             # inside a runtime branch (for example a loaded state-slot index),
@@ -1513,7 +1501,23 @@ class DeviceFunction:
             # flight per thread; the triton backend and handwritten CuTe
             # kernels both load the whole tile fragment first).
             from .cute.split_lane_loads import split_lane_loads
+            from .cute.unroll_lane_loads import LaneUnrollNotApplied
+            from .cute.unroll_lane_loads import unroll_lane_loads
 
+            # ``cute_lane_unroll`` without vector-loop sinking: unroll the
+            # grid lane loops at trace time with every unrolled lane's
+            # loads (packets and scalars alike) issued before the first
+            # lane's compute.  The knob-off code is regenerated when no
+            # loop takes the unroll.
+            lane_unroll = cast("int", self.config.config.get("cute_lane_unroll", 1))
+            if lane_unroll > 1 and not self.config.config.get("cute_vloop_sink"):
+                kernel_body, unrolled = unroll_lane_loads(
+                    kernel_body,
+                    lane_unroll,
+                    lambda name: self.new_var(name, dce=False),
+                )
+                if not unrolled:
+                    raise LaneUnrollNotApplied
             kernel_body = split_lane_loads(kernel_body)
             # P18: software-pipeline the per-iteration vec load by one
             # stage.  Pre-issue iter 0's load above the loop and, inside
@@ -1532,7 +1536,10 @@ class DeviceFunction:
             # the softmax reduce sweep as having no loop-carried write
             # and incorrectly skip pipelining.
             kernel_body = pipeline_inner_loads(
-                kernel_body, constexpr_values, rename_groups=rename_groups
+                kernel_body,
+                constexpr_values,
+                rename_groups=rename_groups,
+                dynamic_trip_counts=self.cute_state.dynamic_reduction_trips,
             )
             # For an exact in-place vector state-update pattern, optionally
             # stage future rows through a private-per-thread cp.async ring.
@@ -1932,10 +1939,18 @@ class DeviceFunction:
         }
 
     def proven_tensor_stride_values(self) -> dict[tuple[str, int], int]:
-        """Return tensor strides whose exact value is cache-safe."""
+        """Return tensor strides whose exact value is cache-safe.
+
+        ``static_shapes`` keys the bound kernel on every input tensor's exact
+        sizes and strides (see ``_tensor_key``), so under that setting every
+        input stride is already a cache-safe fact; otherwise a stride is
+        cache-safe only when the ``input_tensor_metadata`` compiler fact or an
+        explicit ``hl.specialize`` guard covers it.
+        """
         env = CompileEnvironment.current()
         input_metadata_specialized = (
-            "input_tensor_metadata" in env.compiler_fact_specialization_facts
+            env.settings.static_shapes
+            or "input_tensor_metadata" in env.compiler_fact_specialization_facts
         )
         result: dict[tuple[str, int], int] = {}
         for arg in self.arguments:
@@ -2151,7 +2166,7 @@ class DeviceFunction:
         """Outline an opaque body without changing its computation AST."""
         if CompileEnvironment.current().backend_name != "triton":
             raise AssertionError("outlined Triton helpers require the Triton backend")
-        cloned_body = cast("list[ast.stmt]", _clone_extended_ast(body))
+        cloned_body = cast("list[ast.stmt]", clone_ast(body))
         if tuple(
             ast.dump(statement, include_attributes=False) for statement in cloned_body
         ) != tuple(ast.dump(statement, include_attributes=False) for statement in body):
@@ -2258,7 +2273,7 @@ class DeviceFunction:
                 argument_node.arg = renames.get(argument_node.arg, argument_node.arg)
                 arguments.append(argument_node)
             helper_module = ast.Module(
-                body=cast("list[ast.stmt]", _clone_extended_ast(list(body))),
+                body=cast("list[ast.stmt]", clone_ast(list(body))),
                 type_ignores=[],
             )
             ast_rename(helper_module, renames)

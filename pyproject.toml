@@ -166,6 +166,24 @@ allow-direct-references = true
 [tool.hatch.version]
 source = "vcs"
 
+[tool.pytest.ini_options]
+# artifacts/ holds gitignored benchmark and probe outputs, some of them named
+# test_*.py with import-time side effects; pytest must never collect them
+# (pytest's built-in defaults plus artifacts and the docs build).
+norecursedirs = [
+  "*.egg",
+  ".*",
+  "_darcs",
+  "build",
+  "CVS",
+  "dist",
+  "node_modules",
+  "venv",
+  "{arch}",
+  "artifacts",
+  "site",
+]
+
 [tool.pyrefly]
 project-includes = ["helion", "benchmarks", "docs", "examples"]
 # _flash_gemm_ptx.py is verbatim-vendored FA4 code (gemm_ptx_partial +

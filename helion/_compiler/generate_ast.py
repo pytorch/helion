@@ -4,6 +4,7 @@ import ast
 import collections
 import contextlib
 import dataclasses
+import logging
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -28,6 +29,9 @@ from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.unroll_lane_loads import LaneUnrollNotApplied
+from .cute.unroll_lane_loads import lane_unroll_off_config
 from .device_function import ConstExprArg
 from .device_function import DeviceFunction
 from .device_function import TensorArg
@@ -55,6 +59,27 @@ if TYPE_CHECKING:
     from .pallas.dma import DmaResources
     from .tile_strategy import DeviceLoopOrGridState
     from .type_info import TensorType
+
+log = logging.getLogger(__name__)
+
+
+class VloopSinkNotApplied(exc.Base):
+    """``cute_vloop_sink`` shaped the thread layout but sank no vector loop.
+
+    The knob must not change the code by itself, so the kernel is regenerated
+    with the knob off (``vloop_sink_off_config``): by ``generate_ast`` for the
+    codegen graphs it builds, and by a caller that supplied its own graphs
+    (materialized fission), which layout planning has annotated in place and
+    which therefore have to be rebuilt.  An ``exc.Base`` so the statement
+    visitor propagates it instead of wrapping it.
+    """
+
+
+def vloop_sink_off_config(config: Config) -> Config:
+    """``config`` with vector-loop sinking (and its lane unroll) off."""
+    return Config.from_dict(
+        {**config.config, "cute_vloop_sink": False, "cute_lane_unroll": 1}
+    )
 
 
 def _flatten_starred_args(args: list[ast.expr]) -> list[ast.expr]:
@@ -182,6 +207,12 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         self.next_else_block: list[ast.AST] | None = None
         self.store_transform = store_transform
         self.load_transform = load_transform
+        # Per-pass state of ``load_transform``: the fused inputs whose prologue
+        # placeholder this pass has emitted, mapped to their first dim-index
+        # expressions (``HelionTemplateBuffer._codegen_prologue_fusion``).  It
+        # lives on the pass rather than on the transform so the register-tile
+        # retry in ``generate_ast`` emits every placeholder again.
+        self.prologue_first_indexing: dict[str, str] = {}
         self._statement_owner_fx_node: Node | None = None
         self._codegen_results_by_owner_node_id: dict[int, object] = {}
         self.resident_prep_lowering_stack: list[
@@ -243,6 +274,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                     "chunk_prepare_tma",
                     "chunk_recurrence_sm100",
                     "chunk_recurrence_warp_dv4",
+                    "gdn_recurrence_sm100",
                     "helion_flash_bwd",
                     "gathered_mma_tma",
                     "block_scaled_mma",
@@ -304,6 +336,21 @@ class GenerateAST(NodeVisitor, CodegenInterface):
 
     def offset_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.offset_var(block_idx)
+
+    def tile_begin_var(self, block_idx: int) -> str:
+        """Uniform first index of the current tile along ``block_idx``.
+
+        ``tile.begin`` / ``tile.end`` / ``tile.id`` and their symbols render
+        through this; the CuTe backend derives it from the owning strategy's
+        thread / lane partition (see ``cute_tile_begin_expr``).
+        """
+        if CompileEnvironment.current().backend.name == "cute":
+            from .cute.tile_ops import cute_tile_begin_expr
+
+            return cute_tile_begin_expr(self, block_idx)
+        return self.active_device_loops[block_idx][-1].strategy.tile_begin_var(
+            block_idx
+        )
 
     def index_var(self, block_idx: int) -> str:
         return self.active_device_loops[block_idx][-1].strategy.index_var(block_idx)
@@ -529,6 +576,17 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             return True
         self.device_function.cute_state.chunk_recurrence_plan = None
         raise exc.BackendUnsupported("cute", "chunk recurrence failed late validation")
+
+    def _try_codegen_gdn_recurrence_root(self) -> bool:
+        plan = self.device_function.cute_state.gdn_recurrence_plan
+        if plan is None:
+            return False
+        from .cute.gdn_recurrence import codegen_gdn_recurrence
+
+        if codegen_gdn_recurrence(self):
+            return True
+        self.device_function.cute_state.gdn_recurrence_plan = None
+        raise exc.BackendUnsupported("cute", "gdn recurrence failed late validation")
 
     def _try_lower_direct_affine_root(
         self,
@@ -1308,6 +1366,9 @@ class GenerateAST(NodeVisitor, CodegenInterface):
             finally:
                 for idx in device_loop.block_ids:
                     self.active_device_loops[idx].pop()
+        # The body is complete: the CuTe per-thread lane loops nested around
+        # it must be the tile program (or pin their uniform atomics).
+        device_loop.check_lane_loop_nest()
         if needs_barrier_before:
             for statement in self.device_function.cta_barrier():
                 self.add_statement(statement)
@@ -1496,6 +1557,7 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         not self._try_codegen_block_scaled_root()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()
+                        and not self._try_codegen_gdn_recurrence_root()
                         and not self._try_codegen_single_token_rank1_root()
                         and not self._try_codegen_split_single_token_rank1_root()
                         and not self._try_codegen_fixed_token_rank1_root()
@@ -1776,12 +1838,52 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                         },
                         running_sums=self.device_function.cute_matmul_running_sums,
                     )
+                    # Interchange a grid constexpr vector loop into the serial
+                    # reduction nest it wraps (column sums): one vector load
+                    # per row, V register accumulators, one grouped combine.
+                    if (
+                        self.device_function.config.config.get("cute_vloop_sink")
+                        is True
+                    ):
+                        self._sink_grid_vector_loops()
                 self.device_function.dead_code_elimination()
                 if not self.device_function.preamble and not self.device_function.body:
                     raise exc.EmptyDeviceLoopAfterDCE
                 return self.device_function.codegen_function_call()
             return None
         return self.generic_visit(node)
+
+    def _sink_grid_vector_loops(self) -> None:
+        cute_state = self.device_function.cute_state
+        fired = False
+        if cute_state.vloop_sink_wrappers:
+            from .cute.sink_vector_loops import sink_grid_vector_loops
+
+            self.device_function.body, fired = sink_grid_vector_loops(
+                list(self.device_function.body),
+                wrappers=cute_state.vloop_sink_wrappers,
+                loads=cute_state.vloop_sink_loads,
+                rename_groups={
+                    name: aliases[0]
+                    for name, aliases in self.device_function._variable_renames.items()
+                },
+                lane_unroll=cast(
+                    "int",
+                    self.device_function.config.config.get("cute_lane_unroll", 1),
+                ),
+                new_var=self.device_function.new_var,
+                tensor_dtypes={
+                    arg.name: arg.fake_value.dtype
+                    for arg in self.device_function.arguments
+                    if isinstance(arg, TensorArg)
+                },
+            )
+        if not fired and cute_state.vloop_sink_layout_applied:
+            # The knob shaped the thread layout but nothing was sunk.  The
+            # knob must not change the code by itself, so start over with it
+            # off (``generate_ast`` or the owner of the codegen graphs
+            # regenerates the knob-off code).
+            raise VloopSinkNotApplied
 
     def visit_Name(self, node: ast.Name) -> ast.AST:
         assert isinstance(node, ExtendedAST)
@@ -1955,6 +2057,106 @@ def _maybe_emit_compact_worklist_builder(codegen: GenerateAST) -> None:
 
 
 def generate_ast(
+    func: HostFunction,
+    config: Config,
+    emit_repro_caller: bool,
+    *,
+    store_transform: Callable[..., ast.AST] | None = None,
+    load_transform: Callable[..., ast.AST] | None = None,
+    extra_params: list[str] | None = None,
+    _codegen_graphs: list[GraphInfo] | None = None,
+    _memory_counters: dict[str, int] | None = None,
+    _host_prefix: list[ast.AST] | None = None,
+    _bounded_cache_request: BoundedCacheRequest | None = None,
+) -> ast.Module:
+    """Generate the kernel module for ``config``.
+
+    Two CuTe decisions are made before the tile body exists and are revisited
+    once it does, each by generating the kernel again:
+
+    - A persistent reduction chooses its register-tile lane nesting from the
+      device IR; when the generated body then holds a statement the two-pass
+      register-tile schedule cannot place (``cute/register_tile_admission.py``,
+      ``RegisterTileUnsupported``), the kernel is generated again without the
+      register tile.  The register tile was the only reason normalization kept
+      a reduction thread count below the extent persistent, so the retry
+      re-normalizes ``config`` with register tiles withheld: the looped
+      reduction when the remaining threads cannot cover the extent, otherwise
+      the same config with the rolled lane nesting the strategy used before
+      register tiles existed.  Caller-built codegen graphs
+      (``_codegen_graphs``) were rolled for ``config`` as given, so that retry
+      keeps the config and only the lane nesting changes.
+    - ``cute_vloop_sink`` shapes the thread layout during layout planning;
+      when no vector loop is sunk after all (``VloopSinkNotApplied``), the
+      kernel is generated again with the knob off (``vloop_sink_off_config``)
+      so the knob alone never changes the code.
+    - ``cute_lane_unroll`` without sinking asks the last kernel-body pass to
+      unroll the grid lane loops loads-first; when no loop takes it
+      (``LaneUnrollNotApplied``) the kernel is generated again with the
+      unroll off (``lane_unroll_off_config``), for the same reason.
+
+    The two compose: the register tile is admitted afresh on the knob-off
+    pass, and the sink pass runs on the rolled body of a rejected register
+    tile.  Each retry fires at most once per call (its handler switches off
+    what raised it), so a call generates the kernel at most three times.  The
+    abandoned passes leave nothing behind but their host prefix; per-pass
+    state of the memory transforms lives on the pass's ``GenerateAST``
+    (``prologue_first_indexing``), so a retry starts it afresh.
+    """
+    prefix_length = len(_host_prefix) if _host_prefix is not None else 0
+    env = CompileEnvironment.current()
+    register_tiles_disabled = env.cute_register_tile_disabled
+    try:
+        while True:
+            try:
+                return _generate_ast(
+                    func,
+                    config,
+                    emit_repro_caller,
+                    store_transform=store_transform,
+                    load_transform=load_transform,
+                    extra_params=extra_params,
+                    _codegen_graphs=_codegen_graphs,
+                    _memory_counters=_memory_counters,
+                    _host_prefix=_host_prefix,
+                    _bounded_cache_request=_bounded_cache_request,
+                )
+            except RegisterTileUnsupported as failure:
+                if env.cute_register_tile_disabled:
+                    raise
+                log.debug("regenerating with the rolled reduction lane: %s", failure)
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                if _codegen_graphs is None:
+                    retried = env.config_spec.normalized_config(
+                        config, _cute_register_tiles=False
+                    )
+                    if retried.config != config.config:
+                        log.debug(
+                            "the retry loops the reduction: reduction_loops=%s",
+                            retried.reduction_loops,
+                        )
+                        config = retried
+                env.cute_register_tile_disabled = True
+            except VloopSinkNotApplied:
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                if _codegen_graphs is not None:
+                    # Layout planning annotated the caller's graphs in place;
+                    # the caller rebuilds them for the knob-off run.
+                    raise
+                config = vloop_sink_off_config(config)
+            except LaneUnrollNotApplied:
+                # The unroll is a late AST pass that touches no graph, so
+                # the knob-off run reuses the caller's graphs as they are.
+                if _host_prefix is not None:
+                    del _host_prefix[prefix_length:]
+                config = lane_unroll_off_config(config)
+    finally:
+        env.cute_register_tile_disabled = register_tiles_disabled
+
+
+def _generate_ast(
     func: HostFunction,
     config: Config,
     emit_repro_caller: bool,
@@ -2330,6 +2532,9 @@ def generate_ast(
                         "q_name",
                         "k_name",
                         "g_name",
+                        "w_name",
+                        "u_name",
+                        "h_name",
                         "beta_name",
                         "a_log_name",
                         "dt_name",
@@ -2361,6 +2566,10 @@ def generate_ast(
                         "direct_strides_name",
                         "scale_name",
                         "m_extent_name",
+                        "epi_aux0_name",
+                        "epi_aux1_name",
+                        "epi_aux2_name",
+                        "epi_aux3_name",
                     ):
                         if key in resolved:
                             arg_name = str(resolved.pop(key))

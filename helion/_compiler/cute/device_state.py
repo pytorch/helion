@@ -8,6 +8,8 @@ from typing import Literal
 from typing import Protocol
 from typing import cast
 
+import torch
+
 from ... import exc
 
 if TYPE_CHECKING:
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
     from .epilogue_fanout import FanoutStore
     from .fixed_token_rank1_recurrence import CuteFixedTokenRank1Plan
     from .fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .gdn_recurrence import CuteGdnRecurrencePlan
     from .grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
     from .grouped_row_union import GroupedRowUnionPlan
     from .resident_reductions import ResidentReductionLayout
@@ -586,6 +589,49 @@ class CuteTcgen05MatmulPlan(_CuteTcgen05OrientationMixin):
         return (self.physical_m_threads, self.launched_warp_count, 1)
 
 
+@dataclasses.dataclass(frozen=True)
+class CuteVloopWrapperFact:
+    """A grid tile axis partitioned into an outer lane loop x constexpr V-loop.
+
+    Recorded by ``PerThreadNDTileStrategy.codegen_grid`` for every
+    ``VecLaneWrapper`` so the late vector-loop sinking pass can identify the
+    V-loop by its constexpr lane variable and reason about the per-element
+    index (``index_var = base_index_var + vec_lane_var``) and bounds mask.
+    """
+
+    block_id: int
+    vec_width: int
+    lane_var: str
+    vec_lane_var: str
+    base_index_var: str
+    index_var: str
+    # The block's bounds mask variable, or None when the strategy elided it.
+    mask_var: str | None
+    # The tile extent is a proven multiple of ``vec_width`` and the tile
+    # starts at zero, so every V-wide chunk lies entirely inside or entirely
+    # outside the extent: a bound on the per-element index is equivalent to
+    # the same bound on the chunk base.
+    uniform_vector_mask: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class CuteVloopLoadFact:
+    """A scalar tile load that a sunk V-loop may turn into one vector load.
+
+    Recorded by the load lowering (keyed by the scalar pointer expression)
+    when the site addresses the vectorized grid axis at its stride-1 dim with
+    the plain per-element index but sits inside loops nested in the V-loop,
+    where the ordinary hoist above the V-loop cannot reach it.
+    """
+
+    vec_lane_var: str
+    tensor_name: str
+    vec_width: int
+    dtype: torch.dtype
+    # The site's cache-policy marker, applied to the vector form of the load.
+    eviction_suffix: str
+
+
 class CuteDeviceFunctionState:
     """CuTe-owned state for one DeviceFunction codegen instance."""
 
@@ -594,6 +640,13 @@ class CuteDeviceFunctionState:
         # The launcher consults only names that survive final AST lowering;
         # this does not depend on blocked/strided index-expression spelling.
         self.grid_thread_extents: dict[str, tuple[int, int]] = {}
+        # Grid V-loop wrappers (by constexpr lane variable) and sinkable scalar
+        # loads (by pointer expression) for ``cute/sink_vector_loops.py``.
+        self.vloop_sink_wrappers: dict[str, CuteVloopWrapperFact] = {}
+        self.vloop_sink_loads: dict[str, CuteVloopLoadFact] = {}
+        # ``cute_vloop_sink`` kept the vectorized grid axis on thread x; when
+        # no V-loop is sunk after all, codegen restarts with the knob off.
+        self.vloop_sink_layout_applied = False
         self.explicit_rng_seed_names: set[str] = set()
         self.uniform_comparison_marker: str | None = None
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
@@ -602,6 +655,18 @@ class CuteDeviceFunctionState:
         # ``PerThreadNDTileStrategy`` when a lane-looped axis is split
         # across cluster CTAs).  1 = no cluster.
         self.simt_cluster_n: int = 1
+        # Lane loops claimed by a register/shuffle ``hl.associative_scan``
+        # lowering, mapped to the direction (``True`` = reverse) their lanes
+        # are visited in.  A second scan over the same lane loop must agree
+        # or it falls back to the serial lowering (see ``cute/scan_ops.py``).
+        self.scan_lane_directions: dict[str, bool] = {}
+        # Rolled reductions over a symbolic extent expose their trip count as
+        # a host-computed ``cutlass.Constexpr`` kernel parameter so the
+        # two-pass load fuser can size a per-thread register cache that is
+        # exact for every runtime extent.  Keyed by the roll's offset variable
+        # (``roffset_N``), the loop target the AST passes see: (size-hint trip
+        # count used for profitability decisions, constexpr parameter name).
+        self.dynamic_reduction_trips: dict[str, tuple[int, str]] = {}
         self.resident_reduction_layouts: dict[str, ResidentReductionLayout] = {}
         # A reshape can reuse source lanes and leave its synthetic loop dead.
         # Resolve this recorded alternative only after actual loop pruning.
@@ -646,6 +711,10 @@ class CuteDeviceFunctionState:
         self.sched_pipeline_plan: _Tcgen05SchedPipelinePlan | None = None
         self.aux_pipeline_plan: _Tcgen05AuxPipelinePlan | None = None
         self.ab_startup_prefill: Tcgen05AbStartupPrefill | None = None
+        # The materialized-operand dependency wait was emitted inside the
+        # initial AB prefetch (independent operand first); the role-local
+        # prelude must not wait again ahead of those loads.
+        self.tcgen05_pdl_wait_in_prefetch: bool = False
         self._per_tile_stmt_ids: set[int] = set()
         self._post_loop_stmt_ids: set[int] = set()
         self._tma_load_role_stmt_ids: set[int] = set()
@@ -717,6 +786,10 @@ class CuteDeviceFunctionState:
         # prepare plan, this exists only after the complete semantic graph and
         # packed workspace ABI have matched.
         self.chunk_recurrence_plan: CuteChunkRecurrencePlan | None = None
+        # Whole-root gated-delta-rule (gdn_fwd_h) chunk recurrence.  Installed
+        # only after the semantic two-contraction graph match and the shape
+        # admission limits of the SM100 tcgen05 schedule both hold.
+        self.gdn_recurrence_plan: CuteGdnRecurrencePlan | None = None
         # Set by the backend's flash-attention detector when the fused
         # tcgen05 QK->softmax->PV path is active (HELION_CUTE_FLASH). Holds the
         # tile_n device-loop block ids. The dedicated flash codegen emits the

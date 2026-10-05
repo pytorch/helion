@@ -123,6 +123,7 @@ from .._compiler.cute.tcgen05_tma_rn import (
 )
 from .._compiler.cute.tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
 from .._compiler.cute.tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
+from .._compiler.cute.thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
 from .._utils import indexing_uses_tensor_descriptor
 from ..exc import InvalidConfig
 from ..runtime.triton.launcher import get_num_xcd
@@ -826,6 +827,10 @@ VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY = "cute_chunk_recurrence_dv_partitions"
 CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY = "cute_chunk_recurrence_register_cap"
 VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS = (None, 72, 76, 80)
+CUTE_GDN_RECURRENCE_STAGES_KEY = "cute_gdn_recurrence_stages"
+CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY = "cute_gdn_recurrence_epilogue_warps"
+CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY = "cute_gdn_recurrence_token_groups"
+CUTE_GDN_RECURRENCE_MMA_M_KEY = "cute_gdn_recurrence_mma_m"
 CUTE_CHUNK_PREPARE_SCHEDULE_KEY = "cute_chunk_prepare_schedule"
 VALID_CUTE_CHUNK_PREPARE_SCHEDULES = (
     "split_alias_cpc1",
@@ -899,8 +904,15 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
     | frozenset(FLASH_CONFIG_KEYS)
     | {
         "cross_loop_pipeline",
+        "cute_flash_bwd_persistent",
+        "cute_flash_bwd_two_cta",
+        "cute_flash_bwd_exp2_f32",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_GDN_RECURRENCE_STAGES_KEY,
+        CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+        CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+        CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_threads",
@@ -944,6 +956,8 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_independent_reduction",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -977,6 +991,10 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cross_loop_pipeline",
         CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY,
         CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY,
+        CUTE_GDN_RECURRENCE_STAGES_KEY,
+        CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+        CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+        CUTE_GDN_RECURRENCE_MMA_M_KEY,
         CUTE_CHUNK_PREPARE_SCHEDULE_KEY,
         CUTE_AFFINE_SCAN_SCHEDULE_KEY,
         "num_warps",
@@ -1037,6 +1055,8 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_independent_reduction",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1139,6 +1159,8 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_independent_reduction",
         "cute_replicated_reduction",
         "cute_vector_packet_unroll",
+        "cute_vloop_sink",
+        "cute_lane_unroll",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -1289,6 +1311,11 @@ class ConfigSpec:
         # updates. Generated-AST matching is stricter and remains authoritative.
         self.cute_resident_reduction_blocks: set[int] = set()
         self.cute_sequence_reduction_blocks: set[int] = set()
+        # Persistent reduction blocks whose device IR admits the register-tile
+        # lane nesting and whose extent is static (``DeviceIR`` fills this in;
+        # see ``cute/register_tile_admission.py``).  Only these may keep a
+        # thread count below their extent persistent.
+        self.cute_register_tile_reduction_blocks: set[int] = set()
         self.cute_async_load_pipeline_enabled = False
         self.cute_bf16x2_recurrence_enabled = False
         self.cute_signed_bitfield_bf16_available = False
@@ -1367,6 +1394,28 @@ class ConfigSpec:
         # selected value into a ptxas max-register constraint; unrelated CuTe
         # kernels never see this search dimension.
         self.cute_chunk_recurrence_register_cap: EnumFragment | None = None
+        # Enabled only when the gated-delta-rule chunk recurrence (gdn_fwd_h)
+        # is matched. Choices are derived from the matched geometry (shared
+        # memory ring budget and TMEM column slicing); first choice is default.
+        self.cute_gdn_recurrence_stages: EnumFragment | None = None
+        self.cute_gdn_recurrence_epilogue_warps: EnumFragment | None = None
+        self.cute_gdn_recurrence_token_groups: EnumFragment | None = None
+        self.cute_gdn_recurrence_mma_m: EnumFragment | None = None
+        # Each fragment is the union over the admitted dstate tiles;
+        # ``normalize`` re-validates a config's values against the tile its
+        # ``block_sizes`` entry for ``value_block_id`` selects: the tcgen05 M
+        # per (tile, epilogue warps), the ring depth per (tile, M) and the
+        # token groups per (tile, epilogue warps, M).
+        self.cute_gdn_recurrence_value_block_id: int | None = None
+        self.cute_gdn_recurrence_mma_m_choices_by_tile: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
+        self.cute_gdn_recurrence_stage_choices_by_tile: dict[
+            tuple[int, int], tuple[int, ...]
+        ] = {}
+        self.cute_gdn_recurrence_token_group_choices_by_tile: dict[
+            tuple[int, int, int], tuple[int, ...]
+        ] = {}
         # Enabled only when the exact five-factor BT16 chunk-prepare carrier is
         # detected. Choice order defines the default and ranked seed order.
         self.cute_chunk_prepare_schedule: EnumFragment | None = None
@@ -1405,6 +1454,9 @@ class ConfigSpec:
         self._cute_flash_head_dim: int | None = None
         self._cute_flash_num_kv: int | None = None
         self._cute_flash_num_bh: int | None = None
+        # SM count of the bound device (0 when unknown); small grids seed the
+        # 64-row flash tile from it.
+        self._cute_flash_device_sm_count: int = 0
         self._cute_flash_tensor_4d_heads: int | None = None
         self._cute_flash_dtype: torch.dtype = torch.float16
         self._cute_flash_is_causal: bool = False
@@ -1415,6 +1467,8 @@ class ConfigSpec:
         self._cute_flash_standard_causal_output: bool = False
         self._cute_flash_output_requires_tma: bool = False
         self._cute_flash_supports_tensor_4d_tma: bool = True
+        self._cute_flash_has_row_epilogue: bool = False
+        self._cute_flash_plain_row_body: bool = True
         self._cute_flash_block_size_targets: dict[int, int] = {}
         # Memo for ``flash_autotune_fragments``: every other input is fixed
         # ConfigSpec state, so (topology_override, pipeline_family_override) is
@@ -1710,6 +1764,8 @@ class ConfigSpec:
                 target_device_capability=self.target_device_capability,
                 output_requires_tma=self._cute_flash_output_requires_tma,
                 supports_tensor_4d_tma=self._cute_flash_supports_tensor_4d_tma,
+                has_row_epilogue=self._cute_flash_has_row_epilogue,
+                plain_row_body=self._cute_flash_plain_row_body,
                 topology_override=topology_override,
                 pipeline_family_override=pipeline_family_override,
             )
@@ -1741,6 +1797,8 @@ class ConfigSpec:
                 self._cute_flash_has_kv_tile_pruning
                 or self._cute_flash_requires_ws_overlap
             ),
+            plain_row_body=self._cute_flash_plain_row_body,
+            has_row_epilogue=self._cute_flash_has_row_epilogue,
         )
 
     def _legalize_cute_flash_compiler_seed(
@@ -2169,10 +2227,14 @@ class ConfigSpec:
         standard_causal_output: bool = False,
         output_requires_tma: bool = False,
         supports_tensor_4d_tma: bool = True,
+        has_row_epilogue: bool = False,
+        plain_row_body: bool = True,
+        device_sm_count: int = 0,
     ) -> None:
         self.cute_attention_generic_fallback_enabled = False
         self._cute_attention_generic_fallback_block_size_targets = {}
         self.cute_flash_search_enabled = True
+        self._cute_flash_device_sm_count = device_sm_count
         self._cute_flash_fragments_cache.clear()
         self._cute_flash_fragments_env_fingerprint = None
         self._cute_flash_head_dim = head_dim
@@ -2188,6 +2250,8 @@ class ConfigSpec:
         self._cute_flash_standard_causal_output = standard_causal_output
         self._cute_flash_output_requires_tma = output_requires_tma
         self._cute_flash_supports_tensor_4d_tma = supports_tensor_4d_tma
+        self._cute_flash_has_row_epilogue = has_row_epilogue
+        self._cute_flash_plain_row_body = plain_row_body
         self._cute_flash_block_size_targets = dict(block_size_targets)
         for block_id, target in block_size_targets.items():
             spec = self.block_sizes.block_id_lookup(block_id)
@@ -2208,6 +2272,133 @@ class ConfigSpec:
         )
         self.cute_chunk_recurrence_register_cap = EnumFragment(
             choices=VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
+        )
+
+    def enable_cute_gdn_recurrence_search(
+        self,
+        *,
+        value_block_id: int,
+        stage_choices_by_tile: Mapping[tuple[int, int], Sequence[int]],
+        epilogue_warp_choices: Sequence[int],
+        mma_m_choices_by_tile: Mapping[tuple[int, int], Sequence[int]],
+        token_group_choices_by_tile: Mapping[tuple[int, int, int], Sequence[int]],
+    ) -> None:
+        """Expose the gdn recurrence TMA ring depth, epilogue warp count,
+        tcgen05 M and token group count.
+
+        ``mma_m_choices_by_tile`` maps every (dstate tile, epilogue warps)
+        pair the planner lowers (the candidate tiles first, then the wider
+        admitted tiles the ``block_sizes`` search reaches for a
+        non-power-of-two dstate) to its legal MMA heights, preferred first;
+        ``stage_choices_by_tile`` maps every (tile, M) pair to its legal ring
+        depths and ``token_group_choices_by_tile`` every (tile, warps, M)
+        triple to its pipelined token groups.  Each search domain is the
+        union of its map's values so each per-tile seed is legal as written,
+        and :meth:`normalize` re-validates the values against the selected
+        tile: a defaulted value follows the tile, an explicit value the tile
+        cannot take is rejected.
+        """
+
+        mma_m_choices: list[int] = []
+        for choices in mma_m_choices_by_tile.values():
+            for mma_m in choices:
+                if mma_m not in mma_m_choices:
+                    mma_m_choices.append(mma_m)
+        stage_choices: list[int] = []
+        for choices in stage_choices_by_tile.values():
+            for stages in choices:
+                if stages not in stage_choices:
+                    stage_choices.append(stages)
+        group_choices: list[int] = []
+        for choices in token_group_choices_by_tile.values():
+            for groups in choices:
+                if groups not in group_choices:
+                    group_choices.append(groups)
+        if (
+            not stage_choices
+            or not epilogue_warp_choices
+            or not mma_m_choices
+            or not group_choices
+        ):
+            raise ValueError("gdn recurrence search requires at least one choice")
+        self.cute_gdn_recurrence_value_block_id = value_block_id
+        self.cute_gdn_recurrence_mma_m_choices_by_tile = {
+            tile: tuple(choices) for tile, choices in mma_m_choices_by_tile.items()
+        }
+        # The full 128-row tile leads the domain: it is legal for every
+        # tile, so a config that leaves the knob out keeps the full MMA.
+        self.cute_gdn_recurrence_mma_m = EnumFragment(
+            choices=tuple(sorted(mma_m_choices, reverse=True))
+        )
+        self.cute_gdn_recurrence_stage_choices_by_tile = {
+            tile: tuple(choices) for tile, choices in stage_choices_by_tile.items()
+        }
+        self.cute_gdn_recurrence_stages = EnumFragment(choices=tuple(stage_choices))
+        self.cute_gdn_recurrence_epilogue_warps = EnumFragment(
+            choices=tuple(epilogue_warp_choices)
+        )
+        self.cute_gdn_recurrence_token_group_choices_by_tile = {
+            tile: tuple(choices)
+            for tile, choices in token_group_choices_by_tile.items()
+        }
+        self.cute_gdn_recurrence_token_groups = EnumFragment(
+            choices=tuple(group_choices)
+        )
+
+    def _cute_gdn_recurrence_tile_of(self, config: dict[str, object]) -> int | None:
+        """The dstate tile ``config`` selects, or ``None`` when the gdn knobs
+        are off or ``config`` carries no dstate tile."""
+
+        block_id = self.cute_gdn_recurrence_value_block_id
+        if self.cute_gdn_recurrence_stages is None or block_id is None:
+            return None
+        block_sizes = config.get("block_sizes")
+        if not isinstance(block_sizes, list):
+            return None
+        return self.block_sizes.config_get(cast("list[int]", block_sizes), block_id)
+
+    def _cute_gdn_recurrence_mma_m_choices_for(
+        self, config: dict[str, object]
+    ) -> tuple[int, ...] | None:
+        """Legal gdn tcgen05 M values for the dstate tile and epilogue warp
+        count ``config`` selects; ``None`` when the knob is off or the pair
+        is one the planner declines (the kernel then takes the SIMT lowering
+        and the knob is inert)."""
+
+        block_size = self._cute_gdn_recurrence_tile_of(config)
+        warps = config.get(CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY)
+        if block_size is None or type(warps) is not int:
+            return None
+        return self.cute_gdn_recurrence_mma_m_choices_by_tile.get((block_size, warps))
+
+    def _cute_gdn_recurrence_stage_choices_for(
+        self, config: dict[str, object]
+    ) -> tuple[int, ...] | None:
+        """Legal gdn ring depths for the dstate tile and tcgen05 M ``config``
+        selects; ``None`` when the knob is off or the pair is one the planner
+        declines.  Every pair the planner lowers has an entry, so a depth
+        accepted here never fails at codegen."""
+
+        block_size = self._cute_gdn_recurrence_tile_of(config)
+        mma_m = config.get(CUTE_GDN_RECURRENCE_MMA_M_KEY)
+        if block_size is None or type(mma_m) is not int:
+            return None
+        return self.cute_gdn_recurrence_stage_choices_by_tile.get((block_size, mma_m))
+
+    def _cute_gdn_recurrence_token_group_choices_for(
+        self, config: dict[str, object]
+    ) -> tuple[int, ...] | None:
+        """Legal gdn token groups for the dstate tile, epilogue warp count and
+        tcgen05 M ``config`` selects; ``None`` when the knob is off or the
+        triple is one the planner declines."""
+
+        block_size = self._cute_gdn_recurrence_tile_of(config)
+        warps = config.get(CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY)
+        mma_m = config.get(CUTE_GDN_RECURRENCE_MMA_M_KEY)
+        if block_size is None or type(warps) is not int or type(mma_m) is not int:
+            return None
+        return self.cute_gdn_recurrence_token_group_choices_by_tile.get(
+            (block_size, warps, mma_m)
         )
 
     def enable_cute_flash_bwd_search(
@@ -2508,7 +2699,10 @@ class ConfigSpec:
                     standard_causal_output=self._cute_flash_standard_causal_output,
                     target_device_capability=self.target_device_capability,
                     supports_tensor_4d_tma=(self._cute_flash_supports_tensor_4d_tma),
+                    has_row_epilogue=self._cute_flash_has_row_epilogue,
+                    plain_row_body=self._cute_flash_plain_row_body,
                     block_size_targets=self._cute_flash_block_size_target_list(),
+                    device_sm_count=self._cute_flash_device_sm_count,
                 )
             )
             flash_seeds = self._legalize_cute_flash_compiler_seeds(flash_seeds)
@@ -2691,6 +2885,70 @@ class ConfigSpec:
         if self.backend_name != "cute":
             raise InvalidConfig("packet prefetch requires CuTe")
         self.cute_packet_prefetch_enabled = True
+
+    def _cute_config_forms_register_tile(
+        self,
+        config: dict[str, object],
+        rl_spec: ReductionLoopSpec,
+        available: int,
+    ) -> bool:
+        """Whether ``config`` spells out a per-thread register tile for the
+        persistent reduction ``rl_spec`` (see
+        ``DeviceGridState.nest_reduction_lane_outside_vector_tiles``).
+
+        The reduction block must admit the register tile (a static extent and
+        a body the two-pass schedule can lower,
+        ``cute_register_tile_reduction_blocks``); the reduction thread count
+        must be explicit, divide the extent and fit the remaining budget; every
+        lane-looped tile block must hold exactly one vector per thread
+        (elements per thread == its ``cute_vector_widths`` entry > 1), at least
+        one such block must exist, and the unrolled per-thread element count
+        stays within ``CUTE_REGISTER_TILE_MAX_ELEMENTS``.  Anything else keeps
+        the looped reduction a shrunk thread count always meant.
+        """
+        if rl_spec.block_id not in self.cute_register_tile_reduction_blocks:
+            return False
+        nt_list = cast("list[int]", config.get("num_threads", []) or [])
+        bs_list = cast("list[int]", config.get("block_sizes", []) or [])
+        vec_list = cast("list[int]", config.get("cute_vector_widths", []) or [])
+        requested = self.num_threads.config_get(nt_list, rl_spec.block_id, 0)
+        if (
+            not isinstance(requested, int)
+            or requested <= 0
+            or requested > available
+            or rl_spec.size_hint % requested
+        ):
+            return False
+        unrolled = rl_spec.size_hint // requested
+        reduction_block_ids = self.reduction_block_ids | {
+            spec.block_id for spec in self.reduction_loops
+        }
+        vector_block_ids = self.cute_vector_widths.valid_block_ids()
+        vector_blocks = 0
+        for nt_spec in self.num_threads:
+            block_id = nt_spec.block_id
+            if block_id in reduction_block_ids:
+                continue
+            nt = self.num_threads.config_get(nt_list, block_id, 0)
+            bs = self.block_sizes.config_get(bs_list, block_id, 1)
+            if (
+                not isinstance(nt, int)
+                or not isinstance(bs, int)
+                or nt <= 0
+                or nt >= bs
+            ):
+                # No lane loop on this block.
+                continue
+            vec = (
+                self.cute_vector_widths.config_get(vec_list, block_id, 1)
+                if block_id in vector_block_ids
+                else 1
+            )
+            if bs % nt or not isinstance(vec, int) or vec <= 1 or bs // nt != vec:
+                return False
+            unrolled *= vec
+            vector_blocks += 1
+        return vector_blocks > 0 and unrolled <= CUTE_REGISTER_TILE_MAX_ELEMENTS
 
     def _normalize_cute_pointwise_pid_type(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -3043,6 +3301,55 @@ class ConfigSpec:
                 else:
                     raise InvalidConfig(f"{key} must be a boolean")
 
+    def _normalize_cute_vloop_sink(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_vloop_sink`` is a boolean; ``cute_lane_unroll`` applies to
+        the lane loops of a sunk vector nest or, without sinking, to the grid
+        lane loops the config forms (``cute/unroll_lane_loads.py``), and is 1
+        when the config has neither."""
+        sink = config.get("cute_vloop_sink", False)
+        if type(sink) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig("cute_vloop_sink must be a boolean")
+            sink = False
+        if "cute_vloop_sink" in config or sink:
+            config["cute_vloop_sink"] = sink
+        unroll = config.get("cute_lane_unroll", 1)
+        if type(unroll) is not int or unroll not in _CUTE_LANE_UNROLL_CHOICES:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"cute_lane_unroll must be one of {_CUTE_LANE_UNROLL_CHOICES}"
+                )
+            unroll = 1
+        if not sink and not self._cute_config_forms_grid_lane_loop(config):
+            unroll = 1
+        if "cute_lane_unroll" in config or unroll != 1:
+            config["cute_lane_unroll"] = unroll
+
+    def _cute_config_forms_grid_lane_loop(self, config: dict[str, object]) -> bool:
+        """Whether some grid tile axis gets a per-thread lane loop: an explicit
+        thread count below its static block size that divides it (the
+        condition ``PerThreadNDTileStrategy`` allocates a lane variable on)."""
+        # Runs before the sequences are normalized: a single-block kernel may
+        # still spell them as scalars.
+        nt_list = _as_sequence(config.get("num_threads"))
+        bs_list = _as_sequence(config.get("block_sizes"))
+        thread_block_ids = self.num_threads.valid_block_ids()
+        for block_id in self.grid_block_ids:
+            if block_id not in thread_block_ids:
+                continue
+            nt = self.num_threads.config_get(nt_list, block_id, 0)
+            bs = self.block_sizes.config_get(bs_list, block_id, 1)
+            if (
+                isinstance(nt, int)
+                and isinstance(bs, int)
+                and 0 < nt < bs
+                and bs % nt == 0
+            ):
+                return True
+        return False
+
     def _normalize_cute_register_chain(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3215,6 +3522,8 @@ class ConfigSpec:
     def normalized_config(
         self,
         config: helion.Config | Mapping[str, object],
+        *,
+        _cute_register_tiles: bool = True,
     ) -> helion.Config:
         """Return a normalized copy without mutating the requested config."""
         values = config.config if isinstance(config, helion.Config) else config
@@ -3224,7 +3533,7 @@ class ConfigSpec:
         normalized = helion.Config(
             **copied_values  # pyrefly: ignore[bad-argument-type]
         )
-        self.normalize(normalized)
+        self.normalize(normalized, _cute_register_tiles=_cute_register_tiles)
         return normalized
 
     def _normalize_amd_mfma(
@@ -3264,7 +3573,11 @@ class ConfigSpec:
             )
 
     def normalize(
-        self, config: helion.Config | dict[str, object], *, _fix_invalid: bool = False
+        self,
+        config: helion.Config | dict[str, object],
+        *,
+        _fix_invalid: bool = False,
+        _cute_register_tiles: bool = True,
     ) -> None:
         """Normalize the config to match the block_sizes and validate the config.
 
@@ -3272,9 +3585,19 @@ class ConfigSpec:
             config: The config to normalize (modified in place).
             _fix_invalid: If True, silently fix invalid combinations instead of raising
                 errors. Used internally during autotuning config generation.
+            _cute_register_tiles: If False, a CuTe persistent reduction whose
+                threads cannot cover its extent is looped even when the config
+                spells out a per-thread register tile
+                (``_cute_config_forms_register_tile``).  ``generate_ast`` uses
+                it to regenerate a kernel whose register tile the lowering
+                rejected as the config without the register tile.
         """
         if isinstance(config, helion.Config):
-            self.normalize(config.config, _fix_invalid=_fix_invalid)
+            self.normalize(
+                config.config,
+                _fix_invalid=_fix_invalid,
+                _cute_register_tiles=_cute_register_tiles,
+            )
             return
 
         # ``cross_loop_schedule`` was the former public name. Accept old configs
@@ -3369,6 +3692,31 @@ class ConfigSpec:
                     "for matched BT16 chunk-recurrence kernels"
                 )
 
+        for gdn_key, gdn_fragment in (
+            (CUTE_GDN_RECURRENCE_STAGES_KEY, self.cute_gdn_recurrence_stages),
+            (
+                CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+                self.cute_gdn_recurrence_epilogue_warps,
+            ),
+            (
+                CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+                self.cute_gdn_recurrence_token_groups,
+            ),
+            (CUTE_GDN_RECURRENCE_MMA_M_KEY, self.cute_gdn_recurrence_mma_m),
+        ):
+            if (
+                gdn_key in config
+                and gdn_fragment is None
+                and self.supports_config_key(gdn_key)
+            ):
+                if _fix_invalid:
+                    config.pop(gdn_key)
+                else:
+                    raise InvalidConfig(
+                        f"{gdn_key} is available only for matched gated-delta-rule "
+                        "chunk-recurrence kernels"
+                    )
+
         if (
             CUTE_CHUNK_PREPARE_SCHEDULE_KEY in config
             and self.cute_chunk_prepare_schedule is None
@@ -3445,6 +3793,7 @@ class ConfigSpec:
             self._normalize_cute_affine_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
             if self.matmul_facts:
@@ -3749,14 +4098,19 @@ class ConfigSpec:
                 if changed:
                     config["reduction_loops"] = new_loops
 
-        # CuTe-specific: persistent reduction whose thread count is shrunk
-        # below the reduction extent by adjust_reduction_thread_count would
-        # wrap the kernel body in a synthetic lane loop. The lane loop
-        # carries the body-level reduction's accumulator across iterations,
-        # so the reduction result would only reflect the last lane iter.
-        # Force a looped reduction whenever the available reduction threads
-        # (max_reduction_threads // product_of_non_reduction_thread_axes)
-        # cannot cover the full reduction extent.
+        # CuTe-specific: a persistent reduction whose thread count is shrunk
+        # below the reduction extent by adjust_reduction_thread_count wraps
+        # the kernel body in a synthetic lane loop.  Force a looped reduction
+        # whenever the available reduction threads (max_reduction_threads //
+        # product_of_non_reduction_thread_axes) cannot cover the full
+        # reduction extent, unless the config spells out a per-thread
+        # register tile over a reduction block that admits one
+        # (``_cute_config_forms_register_tile``): that lane loop is the
+        # requested geometry and its lane reductions are lowered by
+        # ``split_lane_loop_reductions``; a body that lowering cannot place
+        # is regenerated with ``_cute_register_tiles=False`` (the looped
+        # reduction this branch chooses without the register tile), and an
+        # unproved reordering rejects the config instead of miscompiling.
         if (
             self.backend_name == "cute"
             and self.max_reduction_threads is not None
@@ -3796,8 +4150,8 @@ class ConfigSpec:
                         # budget there is no thread budget left for the reduction
                         # axis. A chunk of 1 is invalid (LoopedReductionStrategy
                         # requires block_size > 1) and a persistent reduction
-                        # would hit the synthetic-lane-loop bug described above.
-                        # Reject the config so the autotuner skips it.
+                        # could not place a single reduction thread.  Reject
+                        # the config so the autotuner skips it.
                         if available < 2:
                             raise InvalidConfig(
                                 f"cute backend: reduction axis {i} has no thread "
@@ -3805,6 +4159,13 @@ class ConfigSpec:
                                 f"{other_threads} of {self.max_reduction_threads} "
                                 f"threads)."
                             )
+                        if (
+                            _cute_register_tiles
+                            and self._cute_config_forms_register_tile(
+                                config, spec, available
+                            )
+                        ):
+                            continue
                         chunk = min(spec.size_hint, available)
                         if self.max_reduction_loop is not None:
                             chunk = min(chunk, self.max_reduction_loop)
@@ -4004,6 +4365,80 @@ class ConfigSpec:
                         f"{CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY} must be None for "
                         f"{CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY}=2 because the "
                         "TMEM schedule dynamically reallocates registers"
+                    )
+        gdn_stages_supplied = CUTE_GDN_RECURRENCE_STAGES_KEY in config
+        gdn_groups_supplied = CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY in config
+        gdn_mma_m_supplied = CUTE_GDN_RECURRENCE_MMA_M_KEY in config
+        for gdn_key, gdn_fragment in (
+            (CUTE_GDN_RECURRENCE_STAGES_KEY, self.cute_gdn_recurrence_stages),
+            (
+                CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+                self.cute_gdn_recurrence_epilogue_warps,
+            ),
+            (
+                CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+                self.cute_gdn_recurrence_token_groups,
+            ),
+            (CUTE_GDN_RECURRENCE_MMA_M_KEY, self.cute_gdn_recurrence_mma_m),
+        ):
+            if gdn_fragment is None:
+                continue
+            gdn_value = config.setdefault(gdn_key, gdn_fragment.default())
+            if type(gdn_value) is not int or gdn_value not in gdn_fragment.choices:
+                if _fix_invalid:
+                    config[gdn_key] = gdn_fragment.default()
+                else:
+                    raise InvalidConfig(
+                        f"{gdn_key} must be one of {gdn_fragment.choices!r}, got "
+                        f"{gdn_value!r}"
+                    )
+        # The tcgen05 M follows the tile and warps, the ring depth the tile
+        # and M, the token groups all three: validate in that order.
+        gdn_tile_mma_m_choices = self._cute_gdn_recurrence_mma_m_choices_for(config)
+        if gdn_tile_mma_m_choices is not None:
+            gdn_mma_m = config[CUTE_GDN_RECURRENCE_MMA_M_KEY]
+            if gdn_mma_m not in gdn_tile_mma_m_choices:
+                # A defaulted MMA height follows the selected tile and warps;
+                # only an explicit height they cannot take is an error.
+                if _fix_invalid or not gdn_mma_m_supplied:
+                    config[CUTE_GDN_RECURRENCE_MMA_M_KEY] = gdn_tile_mma_m_choices[0]
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_GDN_RECURRENCE_MMA_M_KEY} must be one of "
+                        f"{gdn_tile_mma_m_choices!r} for the selected dstate "
+                        f"tile and epilogue warps, got {gdn_mma_m!r}"
+                    )
+        gdn_tile_stage_choices = self._cute_gdn_recurrence_stage_choices_for(config)
+        if gdn_tile_stage_choices is not None:
+            gdn_stages = config[CUTE_GDN_RECURRENCE_STAGES_KEY]
+            if gdn_stages not in gdn_tile_stage_choices:
+                # A depth left to the default follows the selected tile; only
+                # an explicit depth the tile cannot hold is an error.
+                if _fix_invalid or not gdn_stages_supplied:
+                    config[CUTE_GDN_RECURRENCE_STAGES_KEY] = gdn_tile_stage_choices[0]
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_GDN_RECURRENCE_STAGES_KEY} must be one of "
+                        f"{gdn_tile_stage_choices!r} for the selected dstate "
+                        f"tile, got {gdn_stages!r}"
+                    )
+        gdn_tile_group_choices = self._cute_gdn_recurrence_token_group_choices_for(
+            config
+        )
+        if gdn_tile_group_choices is not None:
+            gdn_groups = config[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY]
+            if gdn_groups not in gdn_tile_group_choices:
+                # A defaulted group count follows the selected tile and warps;
+                # only an explicit count they cannot split is an error.
+                if _fix_invalid or not gdn_groups_supplied:
+                    config[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY] = (
+                        gdn_tile_group_choices[0]
+                    )
+                else:
+                    raise InvalidConfig(
+                        f"{CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY} must be one of "
+                        f"{gdn_tile_group_choices!r} for the selected dstate "
+                        f"tile and epilogue warps, got {gdn_groups!r}"
                     )
         prepare_schedule_fragment = self.cute_chunk_prepare_schedule
         if prepare_schedule_fragment is not None:
@@ -5004,6 +5439,25 @@ class ConfigSpec:
                             (False, True),
                             search_choices=(False, True) if seeded else (False,),
                         )
+                if len(self.cute_lane_layouts) > 0 and not self.matmul_facts:
+                    sink_seeded = any(
+                        seed.config.get("cute_vloop_sink") is True
+                        for seed in self.compiler_seed_configs
+                    )
+                    unroll_seeded = any(
+                        cast("int", seed.config.get("cute_lane_unroll", 1)) > 1
+                        for seed in self.compiler_seed_configs
+                    )
+                    fields["cute_vloop_sink"] = EnumFragment(
+                        (False, True),
+                        search_choices=(False, True) if sink_seeded else (False,),
+                    )
+                    fields["cute_lane_unroll"] = EnumFragment(
+                        _CUTE_LANE_UNROLL_CHOICES,
+                        search_choices=_CUTE_LANE_UNROLL_CHOICES
+                        if sink_seeded or unroll_seeded
+                        else (1,),
+                    )
                 if self.cute_rng_packet_enabled:
                     fields["cute_rng_packet"] = BooleanFragment()
                 if self.cute_packet_prefetch_enabled:
@@ -5083,6 +5537,18 @@ class ConfigSpec:
                 fields[CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY] = (
                     self.cute_chunk_recurrence_register_cap
                 )
+            if self.cute_gdn_recurrence_stages is not None:
+                fields[CUTE_GDN_RECURRENCE_STAGES_KEY] = self.cute_gdn_recurrence_stages
+            if self.cute_gdn_recurrence_epilogue_warps is not None:
+                fields[CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY] = (
+                    self.cute_gdn_recurrence_epilogue_warps
+                )
+            if self.cute_gdn_recurrence_token_groups is not None:
+                fields[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY] = (
+                    self.cute_gdn_recurrence_token_groups
+                )
+            if self.cute_gdn_recurrence_mma_m is not None:
+                fields[CUTE_GDN_RECURRENCE_MMA_M_KEY] = self.cute_gdn_recurrence_mma_m
             if self.cute_chunk_prepare_schedule is not None:
                 fields[CUTE_CHUNK_PREPARE_SCHEDULE_KEY] = (
                     self.cute_chunk_prepare_schedule
@@ -5100,6 +5566,15 @@ class ConfigSpec:
                 )
             if self.cute_matmul_min_blocks_search_enabled:
                 fields["cute_min_blocks_per_mp"] = EnumFragment(choices=(0, 1))
+            if (
+                self.supports_config_key("pid_type")
+                and "pid_type" not in fields
+                and "flat" not in self.allowed_pid_types
+            ):
+                # SIMT normally omits this coordinate and defaults to flat.
+                # Barriers require a persistent launch in the reference and in
+                # every candidate, including after a flatten/unflatten round trip.
+                fields["pid_type"] = EnumFragment(self.allowed_pid_types)
             fields.update(self.user_defined_tunables)
             return fields
 
@@ -5750,6 +6225,17 @@ class ReductionLoopSpec(_PowerOfTwoBlockIdItem):
 _CUTE_VECTOR_WIDTH_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
 _CUTE_LANE_LAYOUT_CHOICES: tuple[str, ...] = ("blocked", "strided")
 _CUTE_REDUCTION_RELOAD_CHOICES: tuple[str, ...] = ("auto", "register", "gmem")
+# Manual unroll of the row lane loop of a sunk vector nest (``cute_vloop_sink``).
+_CUTE_LANE_UNROLL_CHOICES: tuple[int, ...] = (1, 2, 4, 8, 16)
+
+
+def _as_sequence(value: object) -> list[object]:
+    """A config entry as a list: scalars name a single block, ``None`` is empty."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
 
 
 class CuteReductionReloadSpec(_BlockIdItem):

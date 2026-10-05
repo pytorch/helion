@@ -16,6 +16,8 @@ from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
+from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_8B_HELPERS
+from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
 from .._compiler.cute.device_state import Tcgen05GroupedDMode
 from .._compiler.cute.device_state import Tcgen05Orientation
@@ -91,6 +93,7 @@ if TYPE_CHECKING:
     from .._compiler.cute.device_state import CuteTcgen05StoreValue
     from .._compiler.cute.epilogue_fanout import RenderedChain
     from .._compiler.cute.fragment_epilogue import Tcgen05FragmentEpiloguePlan
+    from .._compiler.cute.signed_bitfield import PackedStoreValue
     from .._compiler.cute.signed_bitfield import SignedByteSite
     from .._compiler.inductor_lowering import CodegenState
     from .._compiler.tile_strategy import LoopDimInfo
@@ -339,6 +342,42 @@ def _cute_active_index_var(state: CodegenState, block_id: int) -> str | None:
     return None
 
 
+def _cute_resolve_active_slice_block_id(
+    state: CodegenState, size: object, used_block_ids: set[int]
+) -> int | None:
+    """Resolve the same slice axis for pointer arithmetic and atomic ownership."""
+    env = CompileEnvironment.current()
+    active_candidates = [
+        block_id
+        for block_id in _matching_block_ids(env, size)
+        if _cute_active_index_var(state, block_id) is not None
+    ]
+    active_unused_candidates = [
+        block_id for block_id in active_candidates if block_id not in used_block_ids
+    ]
+    if len(active_unused_candidates) == 1:
+        return active_unused_candidates[0]
+    if len(active_candidates) == 1:
+        return active_candidates[0]
+    if len(active_unused_candidates) > 1:
+        reduction_unused = [
+            block_id
+            for block_id in active_unused_candidates
+            if env.block_sizes[block_id].reduction
+        ]
+        if len(reduction_unused) == 1:
+            return reduction_unused[0]
+    if len(active_candidates) > 1:
+        reduction_active = [
+            block_id
+            for block_id in active_candidates
+            if env.block_sizes[block_id].reduction
+        ]
+        if len(reduction_active) == 1:
+            return reduction_active[0]
+    return None
+
+
 def _cute_active_mask_var(state: CodegenState, block_id: int) -> str | None:
     if _cute_index_override(state, block_id) is not None:
         return None
@@ -552,7 +591,9 @@ def _cute_index_exprs(
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
-            return state.codegen.offset_var(block_id)
+            # The uniform tile base, not ``offset_var``: on the CuTe per-thread
+            # flattened strategy the offset is already the per-element index.
+            return state.codegen.tile_begin_var(block_id)
         begin_var = "0"
         if loop_info is not None and loop_info.begin_var_name is not None:
             begin_var = loop_info.begin_var_name
@@ -578,41 +619,6 @@ def _cute_index_exprs(
         grid_state = state.codegen.current_grid_state
         if grid_state is not None and block_id in grid_state.block_ids:
             return grid_state.strategy.index_var(block_id)
-        return None
-
-    def resolve_active_slice_block_id(
-        size: object,
-        used_block_ids: set[int],
-    ) -> int | None:
-        candidates = _matching_block_ids(env, size)
-        active_candidates = [
-            block_id
-            for block_id in candidates
-            if active_index_var(block_id) is not None
-        ]
-        active_unused_candidates = [
-            block_id for block_id in active_candidates if block_id not in used_block_ids
-        ]
-        if len(active_unused_candidates) == 1:
-            return active_unused_candidates[0]
-        if len(active_candidates) == 1:
-            return active_candidates[0]
-        if len(active_unused_candidates) > 1:
-            reduction_unused = [
-                block_id
-                for block_id in active_unused_candidates
-                if env.block_sizes[block_id].reduction
-            ]
-            if len(reduction_unused) == 1:
-                return reduction_unused[0]
-        if len(active_candidates) > 1:
-            reduction_active = [
-                block_id
-                for block_id in active_candidates
-                if env.block_sizes[block_id].reduction
-            ]
-            if len(reduction_active) == 1:
-                return reduction_active[0]
         return None
 
     def index_var_for_block_id(block_id: int, size: object) -> str:
@@ -707,7 +713,9 @@ def _cute_index_exprs(
             if tensor is None:
                 raise exc.BackendUnsupported("cute", "slice indexing without tensor")
             dim_size = tensor.shape[tensor_dim]
-            block_id = resolve_active_slice_block_id(dim_size, used_block_ids)
+            block_id = _cute_resolve_active_slice_block_id(
+                state, dim_size, used_block_ids
+            )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
                 assert idx_var is not None
@@ -740,7 +748,9 @@ def _cute_index_exprs(
             dim_size = tensor.shape[tensor_dim]
             slice_size = compute_slice_size(idx, dim_size)
             start = idx.start if idx.start is not None else 0
-            block_id = resolve_active_slice_block_id(slice_size, used_block_ids)
+            block_id = _cute_resolve_active_slice_block_id(
+                state, slice_size, used_block_ids
+            )
             if block_id is not None:
                 idx_var = active_index_var(block_id)
                 assert idx_var is not None
@@ -750,6 +760,13 @@ def _cute_index_exprs(
                 else:
                     start_expr = state.device_function.literal_expr(start)
                     result.append(f"({start_expr} + {idx_var})")
+                tensor_dim += 1
+                continue
+            if inactive_singleton_slice_expr is not None and env.known_equal(
+                slice_size, 1
+            ):
+                start_expr = state.device_function.literal_expr(start)
+                result.append(f"({start_expr} + {inactive_singleton_slice_expr})")
                 tensor_dim += 1
                 continue
             raise exc.BackendUnsupported(
@@ -831,15 +848,20 @@ _CUTE_VECTOR_DTYPES: dict[torch.dtype, tuple[str, int]] = {
 }
 
 # ``unroll`` mode loads inputs as same-width INTEGER vectors (Uint16 for
-# bf16/fp16, Uint32 for fp32) and bitcasts each extracted lane back to the
-# original dtype.  This avoids the CuTe DSL crash that fires when
+# bf16/fp16/int16, Uint32 for fp32/int32) and bitcasts each extracted lane
+# back to the original dtype.  This avoids the CuTe DSL crash that fires when
 # subscripting a bf16/fp16 vector value, and for fp32 sidesteps the retired
-# explicit-vec mode (see ``_cute_vec_kernel_mode``).  Maps the tensor dtype
-# to the cutlass scalar type of the extracted lane.
+# explicit-vec mode (see ``_cute_vec_kernel_mode``).  Signed 16/32-bit
+# integer inputs (an int16 weight cast to bf16 inside the kernel) take the
+# same carrier packets; the lane bitcast is exact and the program's own cast
+# runs on the extracted scalar unchanged.  Maps the tensor dtype to the
+# cutlass scalar type of the extracted lane.
 _CUTE_VECTOR_UNROLL_DTYPES: dict[torch.dtype, str] = {
     torch.float16: "cutlass.Float16",
     torch.bfloat16: "cutlass.BFloat16",
     torch.float32: "cutlass.Float32",
+    torch.int16: "cutlass.Int16",
+    torch.int32: "cutlass.Int32",
 }
 
 # Integer carrier type for an unroll-mode vector load of a given dtype.
@@ -847,6 +869,8 @@ _CUTE_VECTOR_UNROLL_CARRIER: dict[torch.dtype, str] = {
     torch.float16: "cutlass.Uint16",
     torch.bfloat16: "cutlass.Uint16",
     torch.float32: "cutlass.Uint32",
+    torch.int16: "cutlass.Uint16",
+    torch.int32: "cutlass.Uint32",
 }
 
 # One-byte FP8 and signed INT8 inputs use ``unroll`` mode. Rather than a
@@ -909,23 +933,17 @@ def _cute_lane_axis_pos(strategy: object, block_id: int, index_exprs: list[str])
     return len(index_exprs) - 1
 
 
-# Sentinel eviction "suffix" for the ``l2_last`` policy: not a kwarg on
-# ``cute.arch.load`` (which has no L2 policy support) but a marker that the
-# 16-byte unroll-hoist load should go through the inline-PTX
-# ``createpolicy.fractional.L2::evict_last`` helper.  Non-16-byte or scalar
-# sites silently drop the hint.
-_CUTE_L2_LAST_SUFFIX = "__l2_last__"
-_CUTE_CACHE_LOAD_HELPERS = {
-    _CUTE_L2_LAST_SUFFIX: "_cute_load_l2_evict_last",
-    "__l1_l2_first__": "_cute_load_l1_l2_evict_first",
-    "__l1_l2_last__": "_cute_load_l1_l2_evict_last",
-}
-
-
 def _cute_unroll_vec_load_expr(
     ptr_expr: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str = ""
 ) -> str:
-    """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist."""
+    """Build the ``cute.arch.load(...)`` RHS for an unroll-mode hoist.
+
+    The L2-policy eviction "suffixes" (``_CUTE_CACHE_LOAD_HELPERS``) are not
+    ``cute.arch.load`` kwargs (it has no L2 policy support) but markers that a
+    16-byte (or, except for ``l2_last``, 8-byte) hoist load goes through the
+    inline-PTX ``createpolicy.fractional`` helper; other sites silently drop
+    the hint.
+    """
     if eviction_suffix in _CUTE_CACHE_LOAD_HELPERS:
         if not _cute_is_byte_packed(dtype) and vec_width * dtype.itemsize == 16:
             return (
@@ -934,12 +952,12 @@ def _cute_unroll_vec_load_expr(
                 f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
             )
         if (
-            eviction_suffix != _CUTE_L2_LAST_SUFFIX
+            eviction_suffix in _CUTE_CACHE_LOAD_8B_HELPERS
             and not _cute_is_byte_packed(dtype)
             and vec_width * dtype.itemsize == 8
         ):
             return (
-                f"{_CUTE_CACHE_LOAD_HELPERS[eviction_suffix]}_8b({ptr_expr}, "
+                f"{_CUTE_CACHE_LOAD_8B_HELPERS[eviction_suffix]}({ptr_expr}, "
                 f"ir.VectorType.get([{vec_width}], "
                 f"{_cute_unroll_vec_elem_type(dtype)}.mlir_type))"
             )
@@ -1003,7 +1021,7 @@ def _cute_register_tile_unroll_vec_store(
     dtype: torch.dtype = torch.float16,
     *,
     lane_axis_pos: int | None = None,
-    packed_values_expr: str | None = None,
+    packed_values: PackedStoreValue | None = None,
 ) -> ast.stmt | None:
     """Vector-store counterpart of ``_cute_register_tile_unroll_vec_hoist``.
 
@@ -1018,8 +1036,13 @@ def _cute_register_tile_unroll_vec_store(
     mask expression, whose per-element vars hold the last unrolled lane's
     (uniform) value after the V-loop.
 
-    Returns the per-lane append statement, or None when the lane context
-    isn't available.
+    With ``packed_values`` the flush converts a whole signed byte packet at
+    once, so the site appends nothing: it binds the packet under the flush
+    operand's name, which keeps the store's place in the body for the
+    lane-loop distribution (``PackedStoreValue``).
+
+    Returns the per-lane site statement (an append onto the list, or the
+    packet binding), or None when the lane context isn't available.
     """
     base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
     lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
@@ -1055,13 +1078,15 @@ def _cute_register_tile_unroll_vec_store(
     )
     sites.append(list_var)
     vloop_pos = _cute_lane_vloop_insert_pos(strategy, block_id, lane_body)
-    if packed_values_expr is None:
+    if packed_values is None:
         lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     flush_helper = (
-        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+        "_cute_store_u32_vec" if dtype.itemsize == 4 else "_cute_store_u16_vec"
     )
-    flush_values = packed_values_expr if packed_values_expr is not None else list_var
+    flush_values = (
+        list_var if packed_values is None else packed_values.flush_operand(list_var)
+    )
     flush_expr = f"{flush_helper}({base_ptr_expr}, {flush_values})"
     if mask_expr is not None:
         flush_stmt = statement_from_string(f"if {mask_expr}:\n    {flush_expr}")
@@ -1073,8 +1098,8 @@ def _cute_register_tile_unroll_vec_store(
         _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
         flush_stmt,
     )
-    if packed_values_expr is not None:
-        return ast.Pass()
+    if packed_values is not None:
+        return statement_from_string(f"{list_var} = {packed_values.carrier}")
     return statement_from_string(
         f"{list_var}.append(({value_expr}).bitcast({carrier}))"
     )
@@ -1097,9 +1122,10 @@ def _cute_register_reduction_unroll_vec_store(
     single ``_cute_store_u16_vec`` after the V-loop (ST.64/ST.128 instead
     of V scalar 2-byte stores).
 
-    Same mask precondition as the tile variant: the caller only reaches
-    this when ``strategy._mask_var is None`` (uniform, mask-free lanes), so
-    ``mask_expr`` can wrap the flush as a whole.
+    ``mask_expr`` predicates the whole flush, so the caller passes only terms
+    that are uniform across the V lanes: an outer row mask, the chunk-level
+    bounds mask of a roll whose extent is a multiple of V, or the whole-chunk
+    predicate of a roll whose straddling tail chunk is stored per element.
     """
     base_index_var = getattr(strategy, "_cute_lane_base_index_var", None)
     lane_body = getattr(strategy, "_cute_lane_body", None)
@@ -1135,7 +1161,7 @@ def _cute_register_reduction_unroll_vec_store(
     lane_body.insert(_vloop_pos(), statement_from_string(f"{list_var} = []"))
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     flush_helper = (
-        "_cute_store_u32_vec" if dtype is torch.float32 else "_cute_store_u16_vec"
+        "_cute_store_u32_vec" if dtype.itemsize == 4 else "_cute_store_u16_vec"
     )
     flush_expr = f"{flush_helper}({base_ptr_expr}, {list_var})"
     if mask_expr is not None:
@@ -1163,6 +1189,8 @@ def _cute_register_tile_unroll_vec_hoist(
     lane_axis_pos: int | None = None,
     mask_expr: str | None = None,
     signed_byte_site: SignedByteSite | None = None,
+    uniform_mask: str | None = None,
+    lane_base_expr: str | None = None,
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
     ``PerThreadNDTileStrategy`` lane loops.
@@ -1172,6 +1200,15 @@ def _cute_register_tile_unroll_vec_hoist(
     per-element extract expression so the existing scalar pipeline keeps
     working.  bf16/fp16 load as ``Uint16`` and bitcast; fp8 loads ``vec_width``
     bytes as one packed integer that the matmul fallback decodes downstream.
+
+    ``uniform_mask`` carries the mask terms other than the lane mask (an
+    outer tile mask, the bound of a gathered row coordinate, an
+    ``extra_mask`` proven uniform across the packet) that the caller proved
+    uniform across the V lanes and available above the V-loop.  They
+    predicate the packet's pointer: a masked thread loads the tensor's first
+    element instead, and the per-lane mask gate discards those bytes.
+    ``lane_base_expr`` replaces the block's lane base as the lane-axis
+    coordinate of the packet (``lane_base - n1`` for ``tile.index - n1``).
     """
     base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
     lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
@@ -1203,9 +1240,11 @@ def _cute_register_tile_unroll_vec_hoist(
             else _cute_lane_axis_pos(strategy, block_id, index_exprs)
         )
         base_exprs = list(index_exprs)
-        base_exprs[lane_pos] = base_index_var
+        base_exprs[lane_pos] = (
+            base_index_var if lane_base_expr is None else lane_base_expr
+        )
         base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
-    cache_key = (tensor_name, base_ptr_expr)
+    cache_key = (tensor_name, base_ptr_expr, uniform_mask)
     cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
     if cache_by_block is None:
         cache_by_block = {}
@@ -1266,7 +1305,12 @@ def _cute_register_tile_unroll_vec_hoist(
         is_grid_state = bool(loops_for_block) and isinstance(
             loops_for_block[-1], DeviceGridState
         )
-        if (
+        guard_terms: list[str] = []
+        if uniform_mask is not None:
+            # Outer-row / gathered-coordinate bounds the caller proved uniform
+            # across the V lanes decide the whole packet.
+            guard_terms.append(f"({uniform_mask})")
+        if not (
             mask_elided
             and isinstance(static_bs, int)
             and numel_int is not None
@@ -1274,6 +1318,8 @@ def _cute_register_tile_unroll_vec_hoist(
                 static_bs >= numel_int or (is_grid_state and numel_int % static_bs == 0)
             )
         ):
+            guard_terms.append(f"{base_index_var} < {numel_expr}")
+        if not guard_terms:
             # Single-trip tile loop whose block provably covers the extent
             # (the strategy elided the bounds mask): every per-thread vec
             # base is in-bounds and there is no next-iteration prefetch to
@@ -1295,9 +1341,16 @@ def _cute_register_tile_unroll_vec_hoist(
             else:
                 anchor_exprs = list(index_exprs)
                 anchor_exprs[lane_pos] = "0"
+                if uniform_mask is not None:
+                    # A masked outer row or gathered coordinate can itself be
+                    # out of range, so the anchor cannot keep it: point at the
+                    # tensor's first element instead (in bounds for any
+                    # non-empty tensor); the per-lane mask gate discards the
+                    # fetched bytes.
+                    anchor_exprs = ["0"] * len(anchor_exprs)
                 anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
             guarded_ptr = (
-                f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
+                f"({base_ptr_expr} if {' and '.join(guard_terms)} "
                 f"else {anchor_ptr_expr})"
             )
         hoist_stmt = statement_from_string(
@@ -1328,6 +1381,18 @@ def _cute_register_tile_unroll_vec_hoist(
             signed_byte_site,
         )
     return _cute_unroll_vec_extract(hoist_var, vec_lane_var, tensor.dtype)
+
+
+def _cute_is_tile_scalar(
+    env: CompileEnvironment, idx: torch.SymInt, block_id: int
+) -> bool:
+    """Whether ``idx``, mapped to ``block_id``, is a tile attribute or grid index.
+
+    ``CompileEnvironment.get_block_id`` answers for the block's own size
+    symbol, the tile, and for the symbols derived from it (``tile.begin``,
+    ``tile.id``, a grid index), which are scalars.
+    """
+    return _symint_expr(idx) != _symint_expr(env.block_sizes[block_id].var)
 
 
 def _cute_combined_mask(
@@ -1384,7 +1449,8 @@ def _cute_combined_mask(
         block_id = _cute_remap_block_id(state, block_id)
         loops = state.codegen.active_device_loops.get(block_id)
         if loops:
-            return state.codegen.offset_var(block_id)
+            # The uniform tile base, not ``offset_var`` (see the load helper).
+            return state.codegen.tile_begin_var(block_id)
         global_index = active_index_var(block_id)
         local_coord = active_local_coord(block_id)
         if global_index is not None and local_coord is not None:
@@ -1471,6 +1537,15 @@ def _cute_combined_mask(
             continue
         if isinstance(idx, torch.SymInt):
             block_id = env.get_block_id(idx)
+            if block_id is not None and _cute_is_tile_scalar(env, idx, block_id):
+                # A tile attribute (``tile.begin``, ``tile.id``) or a grid
+                # index is one address for the whole tile, in range whenever
+                # the tile is, and drops the dimension: no lane mask applies
+                # to it, as in the Triton lowering.  The axis's mask here
+                # would gate a value to its default in lanes past the tile's
+                # end, which a store of a tensor lacking the axis (guarded by
+                # fewer masks) then writes.
+                block_id = None
         elif isinstance(idx, slice) and idx == slice(None) and tensor is not None:
             for bid in _matching_block_ids(env, tensor.shape[tensor_dim]):
                 if bid not in seen and mask_var_for_block_id(bid) is not None:

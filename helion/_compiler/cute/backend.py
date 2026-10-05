@@ -1101,6 +1101,7 @@ class CuteBackend(Backend):
         from .chunk_recurrence import plan_chunk_recurrence
         from .direct_affine_candidate import discover_direct_affine_candidates
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
+        from .gdn_recurrence import plan_gdn_recurrence
         from .layout_propagation import plan_layouts
         from .single_token_rank1_recurrence import plan_single_token_rank1_recurrence
         from .split_single_token_rank1_recurrence import (
@@ -1146,6 +1147,9 @@ class CuteBackend(Backend):
             return
         plan_chunk_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.chunk_recurrence_plan is not None:
+            return
+        plan_gdn_recurrence(graphs, tile_strategy)
+        if DeviceFunction.current().cute_state.gdn_recurrence_plan is not None:
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if DeviceFunction.current().cute_state.single_token_rank1_plan is not None:
@@ -1225,6 +1229,8 @@ class CuteBackend(Backend):
             or key == "cute_replicated_reduction"
             or key == "cute_vector_packet_unroll"
             or key == "cute_packet_prefetch"
+            or key == "cute_vloop_sink"
+            or key == "cute_lane_unroll"
             or key
             in (
                 "cute_split_k_workspace",
@@ -1245,6 +1251,10 @@ class CuteBackend(Backend):
             or key == "cute_chunk_recurrence_dv_partitions"
             or key == "cute_chunk_recurrence_register_cap"
             or key == "cute_chunk_prepare_schedule"
+            or key == "cute_gdn_recurrence_stages"
+            or key == "cute_gdn_recurrence_epilogue_warps"
+            or key == "cute_gdn_recurrence_token_groups"
+            or key == "cute_gdn_recurrence_mma_m"
             or key == "cute_affine_scan_schedule"
             or key == "cute_cluster_n"
             or key == "cute_min_blocks_per_mp"
@@ -1525,6 +1535,8 @@ class CuteBackend(Backend):
             ),
             "_cute_grouped_reduce_shared_tree": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_tree",
             "_cute_grouped_reduce_shared_two_stage": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage",
+            "_cute_grouped_reduce_shared_two_stage_fragment": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_two_stage_fragment",
+            "_cute_grouped_reduce_shared_columns": "from helion._compiler.cute.reduce_helpers import _cute_grouped_reduce_shared_columns",
             "_cute_resident_load_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_load_vector",
             "_cute_resident_store_vector": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_store_vector",
             "_cute_resident_copy_async": "from helion._compiler.cute.resident_reduction_runtime import _cute_resident_copy_async",
@@ -1548,6 +1560,7 @@ class CuteBackend(Backend):
             "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
             "_cute_store_u32_vec": "from helion._compiler.cute.vec_utils import store_u32_vec as _cute_store_u32_vec",
+            "_cute_red_add_f32_vec": "from helion._compiler.cute.vec_utils import red_add_f32_vec as _cute_red_add_f32_vec",
             "_cute_rank1_pack_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_pack_bf16x2 as _cute_rank1_pack_bf16x2",
             "_cute_rank1_mul_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_mul_bf16x2 as _cute_rank1_mul_bf16x2",
             "_cute_rank1_add_bf16x2": "from helion._compiler.cute.single_token_rank1_recurrence import rank1_add_bf16x2 as _cute_rank1_add_bf16x2",
@@ -2340,6 +2353,11 @@ class CuteBackend(Backend):
         if recurrence_plan is not None:
             return launcher_args_with_compile_options(
                 f"block=({recurrence_plan.threads}, 1, 1)"
+            )
+        gdn_plan = device_function.cute_state.gdn_recurrence_plan
+        if gdn_plan is not None:
+            return launcher_args_with_compile_options(
+                f"block=({gdn_plan.threads}, 1, 1)"
             )
 
         # Fused tcgen05 flash-attention: 128 threads (single-warpgroup Stage-3)

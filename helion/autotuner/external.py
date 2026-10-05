@@ -58,6 +58,7 @@ class UserConfigSpec(ConfigSpec):
         config: helion.Config | dict[str, object],
         *,
         _fix_invalid: bool = False,
+        _cute_register_tiles: bool = True,
     ) -> None:
         pass
 

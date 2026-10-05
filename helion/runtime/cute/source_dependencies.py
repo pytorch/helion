@@ -21,6 +21,15 @@ _COMMON_DEPENDENCIES = (
     "_compiler/cute/cutedsl_compat.py",
 )
 
+# The flash families (dense, gated, backward) share one generated preamble that
+# imports these runtime modules.
+_FLASH_DEPENDENCIES = (
+    "_compiler/cute/_flash_runtime.py",
+    "_compiler/cute/_flash_gemm_ptx.py",
+    "_compiler/cute/_mlir_compat.py",
+    "_compiler/cute/epilogue_helpers.py",
+)
+
 # Keep transitive Helion device helpers with each wrapper or ordinary kernel
 # that compiles them.
 # CUTLASS itself is covered by the version in the launcher's cache key. These
@@ -63,10 +72,18 @@ _WRAPPER_DEPENDENCIES: dict[str, tuple[str, ...]] = {
         "_compiler/cute/_mlir_compat.py",
         "_compiler/cute/gathered_mma_runtime.py",
     ),
+    "helion_flash": _FLASH_DEPENDENCIES,
+    "helion_flash_gated": _FLASH_DEPENDENCIES,
+    "helion_flash_bwd": _FLASH_DEPENDENCIES,
     "chunk_recurrence_sm100": ("_compiler/cute/chunk_recurrence_sm100.py",),
     "chunk_recurrence_warp_dv4": (
         "_compiler/cute/chunk_recurrence_dv4_sm100.py",
         "_compiler/cute/kda_device_primitives.py",
+    ),
+    "gdn_recurrence_sm100": (
+        "_compiler/cute/gdn_recurrence_sm100.py",
+        "_compiler/cute/gdn_recurrence_geometry.py",
+        "_compiler/cute/affine_recurrence_primitives.py",
     ),
 }
 

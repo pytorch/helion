@@ -41,6 +41,9 @@ def register_materialized_pdl_coverage(
             spec.normalize(carrier)
         except InvalidConfig:
             continue
+        # Seeds request the dependent launch where the schedule supports it;
+        # the coverage group enumerates both values on a serial carrier.
+        carrier.config.pop("tcgen05_materialized_pdl", None)
         # Ordinary paired seeds explicitly disable the separate direct-entry
         # path. Omit only those neutral payloads when its search fields are
         # absent, so strict coverage transfer does not lose supplied settings.

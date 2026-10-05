@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import cutlass
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import vector as _vector_dialect
 import cutlass.cute as cute
 
@@ -33,6 +34,31 @@ def store_u32_vec(ptr: object, vals: list) -> None:
     vecty = ir.VectorType.get([len(vals)], cutlass.Uint32.mlir_type)
     packed = _vector_dialect.from_elements(vecty, [v.ir_value() for v in vals])
     cute.arch.store(ptr, packed)
+
+
+def red_add_f32_vec(ptr: object, vals: list) -> None:
+    """One ``red.global.add.v2/v4.f32`` for ``len(vals)`` fp32 lanes at ``ptr``.
+
+    ``ptr`` is the ``llvm_ptr`` of a ``cute.Pointer`` to a naturally aligned
+    8- or 16-byte span of global memory; ``vals`` are the per-lane
+    ``cutlass.Float32`` addends collected across an unrolled
+    ``cutlass.range_constexpr(V)`` lane loop (the atomic twin of
+    ``store_u32_vec``).  A fire-and-forget relaxed gpu-scope reduction, the
+    ordering ``cute.arch.atomic_add(..., sem='relaxed')`` gives, issued as a
+    single sm_90+ vector instruction instead of ``V`` scalar atomics.
+    """
+    width = len(vals)
+    assert width in (2, 4), width
+    operands = ", ".join(f"${i}" for i in range(1, width + 1))
+    llvm.inline_asm(
+        None,
+        [ptr, *(cutlass.Float32(v).ir_value() for v in vals)],
+        f"red.global.add.v{width}.f32 [$0], {{{operands}}};",
+        ",".join(["l", *(["f"] * width)]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 def signed_bitfield_to_bf16_packed(

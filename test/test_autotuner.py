@@ -77,6 +77,7 @@ from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
 from helion.autotuner.benchmark_provider import _compile_config_failure_source_hash
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
 from helion.autotuner.benchmarking import MirroredBenchmarkTrace
 from helion.autotuner.benchmarking import _mirrored_bench_call_layout
 from helion.autotuner.config_fragment import BlockSizeFragment
@@ -10265,6 +10266,101 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         ):
             self.assertIs(search.final_rebenchmark_best(noisy), stable)
 
+    def test_finalize_keeps_measured_best_when_worker_is_unkillable(self) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        best = PopulationMember(
+            lambda: None, [9.0], (), helion.Config(num_warps=4), status="ok"
+        )
+        other = PopulationMember(
+            lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
+        )
+        search.population = [other, best]
+        search._unkillable_configs = set()
+
+        with patch.object(
+            search,
+            "final_rebenchmark_best",
+            side_effect=BenchmarkWorkerUnkillable("worker remained alive"),
+        ):
+            self.assertEqual(search._finalize(), best.config)
+        self.assertIs(search.best, best)
+
+    def test_finalize_drops_the_candidate_whose_worker_could_not_be_reaped(
+        self,
+    ) -> None:
+        """The config under verification when the worker hung may be the one
+        that hung it: the fallback skips it, and raises when nothing is left."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        best = PopulationMember(
+            lambda: None, [9.0], (), helion.Config(num_warps=4), status="ok"
+        )
+        other = PopulationMember(
+            lambda: None, [11.0], (), helion.Config(num_warps=8), status="ok"
+        )
+        search.population = [other, best]
+        search._unkillable_configs = set()
+        error = BenchmarkWorkerUnkillable("worker remained alive")
+        error.fn_index = 1
+        search._record_unkillable([other, best], error)
+        self.assertEqual(search._unkillable_configs, {best.config})
+
+        with patch.object(search, "final_rebenchmark_best", side_effect=error):
+            self.assertEqual(search._finalize(), other.config)
+        self.assertIs(search.best, other)
+
+        search._record_unkillable([other, best], BenchmarkWorkerUnkillable("x"))
+        self.assertEqual(search._unkillable_configs, {best.config})
+        search._unkillable_configs.add(other.config)
+        with (
+            patch.object(search, "final_rebenchmark_best", side_effect=error),
+            self.assertRaises(BenchmarkWorkerUnkillable),
+        ):
+            search._finalize()
+
+    def test_autotune_keeps_selected_config_when_worker_cleanup_is_unkillable(
+        self,
+    ) -> None:
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.kernel = Mock()
+        search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
+        search.kernel.get_cached_path.return_value = None
+        search.args = ()
+        search._autotune_metrics = AutotuneMetrics()
+        search._search_space_tracker = None
+        search.benchmark_provider = Mock()
+        search.benchmark_provider.cleanup.side_effect = BenchmarkWorkerUnkillable(
+            "worker remained alive"
+        )
+        search._unkillable_configs = set()
+        selected = helion.Config(num_warps=4)
+
+        with (
+            patch.object(search, "_prepare"),
+            patch.object(search, "_autotune", return_value=selected),
+            patch.object(search, "_finalize_autotune_metrics"),
+        ):
+            self.assertEqual(search.autotune(), selected)
+        search.benchmark_provider.cleanup.assert_called_once()
+
+        # ... unless the selected config is the one whose worker hung
+        search._unkillable_configs = {selected}
+        with (
+            patch.object(search, "_prepare"),
+            patch.object(search, "_autotune", return_value=selected),
+            patch.object(search, "_finalize_autotune_metrics"),
+            self.assertRaises(BenchmarkWorkerUnkillable),
+        ):
+            search.autotune()
+
     def test_final_rebenchmark_rejects_all_failed_finalists(self) -> None:
         settings = Settings(
             autotune_log_level=logging.CRITICAL,
@@ -10844,6 +10940,52 @@ class TestAutotuner(RefEagerTestDisabled, TestCase):
         self.assertNotEqual(observed_pointers["a"], [original.data_ptr()])
         self.assertNotEqual(observed_pointers["b"], [original.data_ptr()])
         self.assertTrue(torch.equal(original, torch.zeros_like(original)))
+
+    def test_benchmark_isolated_names_the_candidate_whose_worker_hung(self) -> None:
+        """A worker that cannot be reaped names the batch position of the
+        candidate it ran, whether it refused to die under that candidate or at
+        the fresh-process shutdown before the next one."""
+        settings = Settings(autotune_log_level=logging.CRITICAL)
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = settings
+        provider.log = Mock()
+        provider.mutated_arg_indices = []
+        provider._autotune_metrics = AutotuneMetrics()
+        provider._subprocess_wrapper_unloadable = False
+        provider._subprocess_benchmark_enabled = lambda: True
+        provider._benchmark_worker = None
+        runs: list[object] = []
+
+        def hang_on_the_second(fn: object, *, warmup: int, rep: int) -> float:
+            runs.append(fn)
+            if len(runs) == 2:
+                raise BenchmarkWorkerUnkillable("worker remained alive")
+            return 1.0
+
+        provider._run_subprocess_benchmark_job = hang_on_the_second
+        fns = [object(), object(), object()]
+        with self.assertRaises(BenchmarkWorkerUnkillable) as caught:
+            provider.benchmark_isolated(fns, warmup=1, rep=1)
+        self.assertEqual(caught.exception.fn_index, 1)
+        self.assertEqual(runs, fns[:2])
+
+        # fresh processes: the worker that ran candidate 0 refuses to die when
+        # it is shut down ahead of candidate 1
+        runs.clear()
+        worker = Mock()
+        worker.shutdown.side_effect = BenchmarkWorkerUnkillable("worker remained alive")
+
+        def run_and_leave_a_worker(fn: object, *, warmup: int, rep: int) -> float:
+            runs.append(fn)
+            provider._benchmark_worker = worker
+            return 1.0
+
+        provider._run_subprocess_benchmark_job = run_and_leave_a_worker
+        with self.assertRaises(BenchmarkWorkerUnkillable) as caught:
+            provider.benchmark_isolated(fns, warmup=1, rep=1, fresh_process=True)
+        self.assertEqual(caught.exception.fn_index, 0)
+        self.assertEqual(runs, fns[:1])
+        self.assertIsNone(provider._benchmark_worker)
 
     def test_rebenchmark_falls_back_when_isolated_wrapper_is_unloadable(self) -> None:
         settings = Settings(autotune_log_level=logging.CRITICAL)
@@ -11806,6 +11948,8 @@ class TestCuteAutotuner(TestCase):
                 "cute_independent_reduction",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",
+                "cute_vloop_sink",
+                "cute_lane_unroll",
                 "load_eviction_policies",
             },
         )
@@ -11835,6 +11979,8 @@ class TestCuteAutotuner(TestCase):
                     "cute_independent_reduction",
                     "cute_replicated_reduction",
                     "cute_vector_packet_unroll",
+                    "cute_vloop_sink",
+                    "cute_lane_unroll",
                     "load_eviction_policies",
                 },
             )
@@ -12574,9 +12720,12 @@ class TestCuteAutotuner(TestCase):
         self.assertTrue(set(cute_flash.FLASH_CONFIG_KEYS).isdisjoint(mm_keys))
 
     def test_cute_flash_two_cta_uses_general_softmax_register_search(self) -> None:
+        from helion._compiler.cute.cute_flash import _FLASH_SOFTMAX_REGS_VALUES
         from helion._compiler.cute.cute_flash import FLASH_SOFTMAX_REGS_KEY
         from helion._compiler.cute.cute_flash import flash_autotune_fragments
 
+        general = set(_FLASH_SOFTMAX_REGS_VALUES)
+        self.assertLessEqual({176, 184, 192, 200}, general)
         for num_kv in (512, 1536, 2048):
             with self.subTest(num_kv=num_kv):
                 fragment = flash_autotune_fragments(
@@ -12587,10 +12736,8 @@ class TestCuteAutotuner(TestCase):
                     standard_dense_output=True,
                     pipeline_family_override="fa4_2cta",
                 )[FLASH_SOFTMAX_REGS_KEY]
-                self.assertEqual(
-                    set(fragment.search_choices or ()), {176, 184, 192, 200}
-                )
-                self.assertLessEqual({176, 184, 192, 200}, set(fragment.choices))
+                self.assertEqual(set(fragment.search_choices or ()), general)
+                self.assertLessEqual(general, set(fragment.choices))
 
 
 @onlyBackends(["triton"])

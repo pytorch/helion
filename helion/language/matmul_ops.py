@@ -719,9 +719,10 @@ def enable_cute_tcgen05_search(
         or allow_edge_cluster_m2_search
         or allow_fp8_small_grid_cluster_m2_search
     )
+    num_sms = _cuda_num_sms_or_zero(lhs.device)
+    spec._cute_tcgen05_config.device_sm_count = num_sms
     if allow_cluster_m2_search:
         assert static_m is not None and static_n is not None and static_k is not None
-        num_sms = _cuda_num_sms_or_zero(lhs.device)
         if num_sms > 0:
             if allow_fp8_small_grid_cluster_m2_search:
                 cluster_m = TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M

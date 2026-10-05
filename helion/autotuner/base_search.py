@@ -47,6 +47,7 @@ from .benchmark_provider import MultiShapeBenchmarkProvider
 from .benchmark_provider import _clone_args
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _unset_fn
+from .benchmark_worker import BenchmarkWorkerUnkillable
 from .benchmarking import MirroredBenchmarkTrace
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
@@ -399,6 +400,9 @@ class BaseSearch(BaseAutotuner):
         self._benchmarked_members: dict[Config, PopulationMember] = {}
         self._pinned_finalist_configs: set[Config] = set()
         self._pinned_finalist_members: dict[Config, PopulationMember] = {}
+        # configs whose isolated benchmark worker could not be reaped: their
+        # kernel may have hung, so they are never returned as the result
+        self._unkillable_configs: set[Config] = set()
         self._search_space_tracker: SearchSpaceTracker | None = None
         self._uncacheable_search_policy_nonce: str | None = None
         self._search_policy_cacheable = True
@@ -890,45 +894,59 @@ class BaseSearch(BaseAutotuner):
         self._prepare()
         start = time.perf_counter()
         exit_stack = contextlib.ExitStack()
-        with exit_stack:
-            if self.settings.autotune_log:
-                # .csv/.log follow the log path; the dataset (.meta.jsonl) also
-                # needs opt-in and a representative (non-restricted) search.
-                collect_dataset = (
-                    self.settings.autotune_log_details
-                    and not self._is_restricted_search()
-                )
-                exit_stack.enter_context(
-                    self.log.autotune_logging(
-                        metadata=self._kernel_metadata,
-                        collect_dataset=collect_dataset,
+        best: Config | None = None
+        try:
+            with exit_stack:
+                if self.settings.autotune_log:
+                    # .csv/.log follow the log path; the dataset (.meta.jsonl) also
+                    # needs opt-in and a representative (non-restricted) search.
+                    collect_dataset = (
+                        self.settings.autotune_log_details
+                        and not self._is_restricted_search()
                     )
+                    exit_stack.enter_context(
+                        self.log.autotune_logging(
+                            metadata=self._kernel_metadata,
+                            collect_dataset=collect_dataset,
+                        )
+                    )
+                elif self.settings.autotune_log_details:
+                    _warn_dataset_without_log(self.log)
+                self.log.reset()
+                # Autotuner triggers bugs in remote triton compile service.
+                # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)
+                # during autotuning to reduce cache size by ~40%. Only binaries and
+                # metadata are needed for execution.
+                env_overrides = {"TRITON_LOCAL_BUILD": "1"}
+                if "TRITON_STORE_BINARY_ONLY" not in os.environ:
+                    env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
+                exit_stack.enter_context(
+                    patch.dict(os.environ, env_overrides, clear=False)
                 )
-            elif self.settings.autotune_log_details:
-                _warn_dataset_without_log(self.log)
-            self.log.reset()
-            # Autotuner triggers bugs in remote triton compile service.
-            # Skip storing Triton intermediate IRs (.ttir, .ttgir, .llir, etc.)
-            # during autotuning to reduce cache size by ~40%. Only binaries and
-            # metadata are needed for execution.
-            env_overrides = {"TRITON_LOCAL_BUILD": "1"}
-            if "TRITON_STORE_BINARY_ONLY" not in os.environ:
-                env_overrides["TRITON_STORE_BINARY_ONLY"] = "1"
-            exit_stack.enter_context(patch.dict(os.environ, env_overrides, clear=False))
-            self.benchmark_provider.setup()
-            exit_stack.callback(self.benchmark_provider.cleanup)
-            best: Config | None = None
-            try:
-                best = self._autotune()
-                if isinstance(
-                    self.benchmark_provider, MultiShapeBenchmarkProvider
-                ) and isinstance(self.args, _MultiShapeAutotuneArgs):
-                    if not self.benchmark_provider.has_valid_measurement(best):
-                        raise exc.NoConfigFound
-                    if not self.args.defer_selected_log:
-                        self.benchmark_provider.log_selected(best)
-            finally:
-                self._finalize_autotune_metrics(best)
+                self.benchmark_provider.setup()
+                exit_stack.callback(self.benchmark_provider.cleanup)
+                try:
+                    best = self._autotune()
+                    if isinstance(
+                        self.benchmark_provider, MultiShapeBenchmarkProvider
+                    ) and isinstance(self.args, _MultiShapeAutotuneArgs):
+                        if not self.benchmark_provider.has_valid_measurement(best):
+                            raise exc.NoConfigFound
+                        if not self.args.defer_selected_log:
+                            self.benchmark_provider.log_selected(best)
+                finally:
+                    self._finalize_autotune_metrics(best)
+        except BenchmarkWorkerUnkillable as error:
+            if best is None or best in self._unkillable_configs:
+                raise
+            # The search already selected a config; only the post-search
+            # teardown of a benchmark worker failed (a hung kernel keeps the
+            # worker alive past SIGKILL). Keep the result instead of
+            # discarding the whole search.
+            self.log.warning(
+                "Keeping the selected config although a benchmark worker could "
+                f"not be reaped after the search finished: {error}"
+            )
         assert best is not None
         end = time.perf_counter()
         kernel_decorator = self.kernel.format_kernel_decorator(best, self.settings)
@@ -2276,15 +2294,19 @@ class PopulationBasedSearch(BaseSearch):
 
         in_process_isolation = False
         if use_isolated and self.settings.autotune_benchmark_fn is None:
-            isolated_results = self.benchmark_provider.benchmark_isolated(
-                [m.fn for m in members],
-                warmup=1,
-                rep=PopulationBasedSearch._isolated_rep_ms(
-                    target_ms, self.settings.autotune_benchmark_timeout
-                ),
-                desc=desc,
-                fresh_process=candidate_private_args,
-            )
+            try:
+                isolated_results = self.benchmark_provider.benchmark_isolated(
+                    [m.fn for m in members],
+                    warmup=1,
+                    rep=PopulationBasedSearch._isolated_rep_ms(
+                        target_ms, self.settings.autotune_benchmark_timeout
+                    ),
+                    desc=desc,
+                    fresh_process=candidate_private_args,
+                )
+            except BenchmarkWorkerUnkillable as error:
+                self._record_unkillable(members, error)
+                raise
             if isolated_results is not None:
                 new_timings, failure_statuses = (
                     self._resolve_isolated_rebenchmark_results(
@@ -2683,12 +2705,16 @@ class PopulationBasedSearch(BaseSearch):
         if not suspicious:
             return updated
 
-        confirmed = self.benchmark_provider.benchmark_isolated(
-            [members[i].fn for i in suspicious],
-            warmup=_SUSPICIOUS_REBENCHMARK_WARMUP,
-            rep=_SUSPICIOUS_REBENCHMARK_REP,
-            desc=f"{desc}: confirming suspicious timings",
-        )
+        try:
+            confirmed = self.benchmark_provider.benchmark_isolated(
+                [members[i].fn for i in suspicious],
+                warmup=_SUSPICIOUS_REBENCHMARK_WARMUP,
+                rep=_SUSPICIOUS_REBENCHMARK_REP,
+                desc=f"{desc}: confirming suspicious timings",
+            )
+        except BenchmarkWorkerUnkillable as error:
+            self._record_unkillable([members[i] for i in suspicious], error)
+            raise
         if confirmed is None:
             return updated
 
@@ -2918,17 +2944,44 @@ class PopulationBasedSearch(BaseSearch):
         self.best_perf_so_far = min(self.best_perf_so_far, best_member.perf)
         return best_member
 
+    def _record_unkillable(
+        self, members: list[PopulationMember], error: BenchmarkWorkerUnkillable
+    ) -> None:
+        """Remember the candidate whose isolated worker could not be reaped."""
+        if error.fn_index is not None and 0 <= error.fn_index < len(members):
+            self._unkillable_configs.add(members[error.fn_index].config)
+
     def _finalize(self) -> Config:
         """Final verification, finishing phase, and final-pick re-rank.
 
         Shared tail of the search ``_autotune`` methods; the final-pick re-rank
         runs only on TPU/Pallas (see ``_final_pick_supported``).
         """
-        best = self.final_rebenchmark_best(self.best)
-        best = self.run_finishing_phase(best, self.finishing_rounds)
-        best = self.run_terminal_refinement(best)
-        if self._final_pick_supported():
-            best = self.run_final_pick_verification(best)
+        best = self.best
+        try:
+            best = self.final_rebenchmark_best(best)
+            best = self.run_finishing_phase(best, self.finishing_rounds)
+            best = self.run_terminal_refinement(best)
+            if self._final_pick_supported():
+                best = self.run_final_pick_verification(best)
+        except BenchmarkWorkerUnkillable as error:
+            # A benchmark worker survived SIGKILL (a hung kernel), so no further
+            # worker may be launched and the verification phases cannot run.
+            # Keep the best config the search measured instead of discarding
+            # the search, except the candidate that hung the worker.
+            live = [
+                member
+                for member in (best, self.best, *self.population)
+                if math.isfinite(member.perf)
+                and member.config not in self._unkillable_configs
+            ]
+            if not live:
+                raise
+            best = min(live, key=performance)
+            self.log.warning(
+                f"Final verification abandoned; keeping {best.config} "
+                f"({self.format_performance(best.perf)}): {error}"
+            )
         self.best = best
         return best.config
 

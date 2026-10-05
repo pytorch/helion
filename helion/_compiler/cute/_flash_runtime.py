@@ -34,6 +34,8 @@ def flash_shared_storage(
     kv_stage: int = 1,
     s_stage: int = 1,
     dtype: object = cutlass.Float16,
+    o_stage: int = 0,
+    q_rows: int = 128,
 ) -> type:
     """Build the SharedStorage struct for a given head_dim / kv_stage / s_stage.
 
@@ -47,6 +49,10 @@ def flash_shared_storage(
     (QK->softmax) and ``p_ready`` (consumer->warp0 "PV safe") pipelines are 2 deep
     so the producer warpgroup runs QK(k+1) into the OTHER S buffer while the
     consumer warpgroup runs softmax(k) -- the QK MMA overlaps the softmax.
+
+    ``o_stage`` adds the ``sO`` staging tile(s) of the coalesced (smem-staged)
+    O epilogue; 0 keeps the direct-store struct layout. ``q_rows`` is the
+    query-tile height (128, or 64 for the M=64 tcgen05 tile).
     """
 
     @cute.struct
@@ -61,13 +67,17 @@ def flash_shared_storage(
         # allocated to keep the struct layout uniform.
         p_ready_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * s_stage]
         acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+        aux_full_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
-        sQ: cute.struct.Align[cute.struct.MemRange[dtype, 128 * head_dim], 1024]
+        sQ: cute.struct.Align[cute.struct.MemRange[dtype, q_rows * head_dim], 1024]
         sK: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
         ]
         sV: cute.struct.Align[
             cute.struct.MemRange[dtype, 128 * head_dim * kv_stage], 1024
+        ]
+        sO: cute.struct.Align[
+            cute.struct.MemRange[dtype, q_rows * head_dim * o_stage], 1024
         ]
 
     return SharedStorage
@@ -97,7 +107,10 @@ def flash_fa4_shared_storage(
     s0_corr / s1_corr use the first ``s_corr_stage`` slots as full barriers and
     the second half as empty barriers. ``sScale`` is the FA4-style softmax to
     correction handoff: steady slots carry alpha, and the final slot carries
-    row_sum. softmax_threads is fixed at 128 (one warpgroup). The optional
+    row_sum. ``prologue_mbar`` (count 1) is the first-work-item handshake of the
+    staged load order: the MMA warp arrives once its first Q/K tiles landed and
+    the load warp then issues the rest. softmax_threads is fixed at 128 (one
+    warpgroup). The optional
     epi-TMA path gets a dedicated 2-stage ``sO`` buffer so persistent work-items
     can load the next Q tile while the epilogue drains the previous O tile.
     """
@@ -118,9 +131,11 @@ def flash_fa4_shared_storage(
             pfor2_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             o_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             corr_epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+            aux_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             s0_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
             s1_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
             tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            prologue_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_holding_buf: cutlass.Int32
             sScale: cute.struct.MemRange[
                 cutlass.Float32, s_corr_stage * q_stage * softmax_threads
@@ -154,10 +169,12 @@ def flash_fa4_shared_storage(
             o_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             # correction -> epilogue TMA-store full/empty handshakes.
             corr_epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+            aux_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             # softmax -> correction raw full/empty handshakes.
             s0_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
             s1_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
             tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+            prologue_mbar: cute.struct.MemRange[cutlass.Int64, 1]
             tmem_holding_buf: cutlass.Int32
             sScale: cute.struct.MemRange[
                 cutlass.Float32, s_corr_stage * q_stage * softmax_threads
@@ -189,10 +206,12 @@ def flash_fa4_shared_storage(
         pfor2_mbar: cute.struct.MemRange[cutlass.Int64, 2]
         o_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
         corr_epi_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 4]
+        aux_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
         # softmax -> correction raw full/empty handshakes.
         s0_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
         s1_corr_mbar_ptr: cute.struct.MemRange[cutlass.Int64, s_corr_stage * 2]
         tmem_dealloc_mbar: cute.struct.MemRange[cutlass.Int64, 1]
+        prologue_mbar: cute.struct.MemRange[cutlass.Int64, 1]
         tmem_holding_buf: cutlass.Int32
         sScale: cute.struct.MemRange[
             cutlass.Float32, s_corr_stage * q_stage * softmax_threads
@@ -469,6 +488,22 @@ def ld_volatile_shared_u32(
 
 
 @dsl_user_op
+def prefetch_global_l2(
+    gmem_ptr: cute.Pointer,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``prefetch.global.L2`` of the line holding ``gmem_ptr``.
+
+    Issued by the flash consumer warpgroup for the fused row epilogue's aux
+    rows ahead of the KV loop, so the epilogue's loads hit L2 instead of
+    exposing an HBM round trip after the last PV.
+    """
+    cute.arch.prefetch(gmem_ptr.llvm_ptr, cache_level="L2", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def cp_async_ca_4(
     smem_ptr: cute.Pointer,
     gmem_ptr: cute.Pointer,
@@ -626,6 +661,47 @@ def mbar_spin_wait(
         "DONE:\n\t"
         "}\n",
         "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def mbar_spin_wait_bounded(
+    mbar_ptr: object, phase: object, max_tries: int, wait_hint: int = 1_000
+) -> None:
+    """Wait for ``phase`` like ``mbar_spin_wait`` but give up after ``max_tries``.
+
+    For a wait that only paces work (nothing downstream depends on the phase
+    having completed) on a barrier whose phase the waiting role cannot track:
+    a plain parity wait on such a barrier aliases once the barrier completed
+    twice before the probe and may never return. Each probe suspends for up
+    to ``wait_hint`` ns, so the wait is bounded by about
+    ``max_tries * wait_hint`` ns and returns immediately when the phase flips.
+    The suspend hint is advisory (a probe may resume earlier or later), so
+    the bound is approximate in time; it only ever affects pacing, never
+    correctness.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(mbar_ptr.toint()).ir_value(),  # pyrefly: ignore[missing-attribute]
+            cutlass.Int32(phase).ir_value(),  # pyrefly: ignore[bad-argument-type]
+            cutlass.Int32(max_tries).ir_value(),
+        ],
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        ".reg .u32 R1;\n\t"
+        "mov.u32 R1, $2;\n\t"
+        "LAB_WAIT:\n\t"
+        f"mbarrier.try_wait.parity.shared::cta.b64 P1, [$0], $1, {wait_hint};\n\t"
+        "@P1 bra DONE;\n\t"
+        "sub.u32 R1, R1, 1;\n\t"
+        "setp.ne.u32 P1, R1, 0;\n\t"
+        "@P1 bra LAB_WAIT;\n\t"
+        "DONE:\n\t"
+        "}\n",
+        "r,r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -2901,6 +2977,72 @@ def fa4_correction_epilogue_to_smem_scoped_2cta(
         cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
 
 
+def fa4_correction_epilogue_partitions(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    use_2cta_instrs: bool = False,
+) -> tuple[object, object, cute.Tensor, cute.Tensor, cute.Tensor]:
+    """Copy views of the chunked FA4 correction epilogue for inline programs.
+
+    Mirrors ``fa4_correction_epilogue_to_smem_scoped[_2cta]`` but returns the
+    tiled copies and per-thread partitions instead of running the identity
+    epilogue, so a fused row epilogue can walk the chunks itself.  Returns
+    ``(tiled_t2r, tiled_r2s, tOtO_t2r, tOsO_r2s, tOcO_t2r)``.
+    """
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    epi_subtile = (128, corr_tile_size)
+    mma_rows = 256 if use_2cta_instrs else 128
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (mma_rows, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        epi_subtile,
+        use_2cta_instrs=use_2cta_instrs,
+    )
+    cO = cute.make_identity_tensor((mma_rows, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((128, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((128, corr_tile_size)))
+    # sO is per CTA, so both CTAs use the rank-zero SMEM mapping.
+    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((128, corr_tile_size)))
+
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    smem_atom = sm100_utils_flash.get_smem_store_op(
+        o_layout, o_dtype, cutlass.Float32, tiled_t2r
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+    return tiled_t2r, tiled_r2s, tOtO_t2r, tOsO_r2s, tOcO_t2r
+
+
+def fa4_correction_epilogue_gmem_partition(
+    tiled_t2r: object,
+    tidx: object,
+    tOgX: cute.Tensor,
+    corr_tile_size: int,
+) -> cute.Tensor:
+    """Per-thread chunk partition of an MMA-partitioned global tile.
+
+    ``tOgX`` is ``thr_mma.partition_C`` of a flat-divided ``(128, head_dim)``
+    tile with the output's geometry, so element ``[None, 0, 0, i]`` addresses
+    exactly the rows/columns this thread's O chunk ``i`` covers.
+    """
+    tOgX_i = cute.logical_divide(tOgX, cute.make_layout((128, corr_tile_size)))
+    thr_t2r = cast("Any", tiled_t2r).get_slice(tidx)
+    return thr_t2r.partition_D(tOgX_i[(None, None), None])
+
+
 def fa4_correction_epilogue_handoff_to_smem_scoped(
     o_full_ptr_stage: object,
     o_full_phase: object,
@@ -3736,6 +3878,149 @@ def _scale_fragment_packed_f32x2(frg: cute.Tensor, scale: object) -> None:
         )
         frg[i] = r0
         frg[i + 1] = r1
+
+
+# ===========================================================================
+# 64-row query tiles (tcgen05 M=64, cta_group ONE). The accumulator keeps 16
+# rows per 32-lane TMEM quadrant, so the 16x256b/16x128b copy ops hand every
+# thread TWO rows (r and r+8 of its warp's 16) and every row is shared by the
+# four lanes of a quad. A 16x256b fragment is ordered (2 columns, 2 rows,
+# groups): element 4g + 2s + c holds column 8g + 2q + c of row r + 8s, where q
+# is the thread's lane within its quad.
+# ===========================================================================
+
+
+def ws_m64_row_views(frg: cute.Tensor) -> tuple[cute.Tensor, cute.Tensor]:
+    """Split a 16x256b TMEM fragment into its two (2, groups) row views."""
+    n = cute.size(frg)
+    layout = cute.make_layout((2, n // 4), stride=(1, 4))
+    iterator = cast("cute.Pointer", frg.iterator)
+    return (
+        cute.make_tensor(iterator, layout),
+        cute.make_tensor(iterator + 2, layout),
+    )
+
+
+@dsl_user_op
+def quad_max(value: Float32, *, loc: object = None, ip: object = None) -> Float32:
+    """Max over the four lanes of a quad (butterfly shuffles 1 and 2)."""
+    value = _fmax3(value, cute.arch.shuffle_sync_bfly(value, offset=1))
+    return _fmax3(value, cute.arch.shuffle_sync_bfly(value, offset=2))
+
+
+@dsl_user_op
+def quad_sum(value: Float32, *, loc: object = None, ip: object = None) -> Float32:
+    """Sum over the four lanes of a quad (butterfly shuffles 1 and 2)."""
+    value = value + cute.arch.shuffle_sync_bfly(value, offset=1)
+    return value + cute.arch.shuffle_sync_bfly(value, offset=2)
+
+
+@dsl_user_op
+def rescale_o_tmem_m64(
+    tOtO: cute.Tensor,
+    alpha0: object,
+    alpha1: object,
+    tidx: object,
+    head_dim: int,
+    rescale_chunk_cols: int = 0,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """``O = alpha * O`` in place for a 64-row accumulator (two rows per thread)."""
+    chunk = 32 if head_dim == 64 else 16
+    if rescale_chunk_cols in (8, 16, 32, 64) and head_dim % rescale_chunk_cols == 0:
+        chunk = rescale_chunk_cols
+    cO = cute.make_identity_tensor((64, head_dim))
+    ld_atom = cute.make_copy_atom(
+        tcgen05.Ld16x256bOp(tcgen05.Repetition(chunk // 8)), cutlass.Float32
+    )
+    st_atom = cute.make_copy_atom(
+        tcgen05.St16x256bOp(tcgen05.Repetition(chunk // 8)), cutlass.Float32
+    )
+    tOtO_i = cute.make_tensor(
+        tOtO.iterator, cute.composition(tOtO.layout, cute.make_layout((64, chunk)))
+    )
+    tOcO_i = cute.make_tensor(
+        cO.iterator, cute.composition(cO.layout, cute.make_layout((64, chunk)))
+    )
+    tiled_ld = tcgen05.make_tmem_copy(ld_atom, tOtO_i)
+    tiled_st = tcgen05.make_tmem_copy(st_atom, tOtO_i)
+    thr_ld = tiled_ld.get_slice(tidx)
+    thr_st = tiled_st.get_slice(tidx)
+    tLD = thr_ld.partition_S(tOtO_i)
+    tLDc = thr_ld.partition_D(tOcO_i)
+    tST = thr_st.partition_D(tOtO_i)
+    for i in range(head_dim // chunk):
+        tLD_i = cute.make_tensor(tLD.iterator + i * chunk, tLD.layout)
+        tST_i = cute.make_tensor(tST.iterator + i * chunk, tST.layout)
+        reg = cute.make_rmem_tensor(tLDc.shape, cutlass.Float32)
+        cute.copy(tiled_ld, tLD_i, reg)
+        cute.arch.fence_view_async_tmem_load()
+        row0, row1 = ws_m64_row_views(reg)
+        _scale_fragment_packed_f32x2(row0, alpha0)
+        _scale_fragment_packed_f32x2(row1, alpha1)
+        cute.copy(tiled_st, reg, tST_i)
+
+
+@dsl_user_op
+def ws_m64_epilogue_to_smem(
+    flash_pvt: object,
+    tOtO: cute.Tensor,
+    sO: cute.Tensor,
+    tidx: object,
+    inv_sum0: object,
+    inv_sum1: object,
+    head_dim: int,
+    corr_tile_size: int,
+    o_dtype: object,
+    relu_output: bool = False,
+    *,
+    loc: object = None,
+    ip: object = None,
+) -> None:
+    """Staged O epilogue for a 64-row accumulator: t2r -> per-row 1/l scale ->
+    cast -> swizzled sO. Mirrors ``fa4_correction_epilogue_to_smem_scoped``."""
+    o_layout = cutlass.utils.layout.LayoutEnum.ROW_MAJOR
+    tmem_atom = sm100_utils_flash.get_tmem_load_op(
+        (64, head_dim),
+        o_layout,
+        o_dtype,
+        cutlass.Float32,
+        (64, corr_tile_size),
+        use_2cta_instrs=False,
+    )
+    cO = cute.make_identity_tensor((64, head_dim))
+    flash_pvt_copy = cast("Any", flash_pvt)
+    tOcO = flash_pvt_copy.partition_C(cO)
+    tOtO_i = cute.logical_divide(tOtO, cute.make_layout((64, corr_tile_size)))
+    tOcO_i = cute.logical_divide(tOcO, cute.make_layout((64, corr_tile_size)))
+    tOsO = flash_pvt_copy.get_slice(0).partition_C(sO)
+    tOsO_i = cute.logical_divide(tOsO, cute.make_layout((64, corr_tile_size)))
+    tiled_t2r = tcgen05.make_tmem_copy(tmem_atom, tOtO_i[(None, None), 0])
+    # The 16x256b ownership (two adjacent columns per row per thread) would
+    # select stmatrix, whose 512-bit smem alignment the position-independent
+    # swizzled partition cannot prove; store the column pairs as plain 32-bit
+    # shared stores instead.
+    smem_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), o_dtype, num_bits_per_copy=32
+    )
+    tiled_r2s = cute.make_tiled_copy_D(smem_atom, tiled_t2r)
+    thr_t2r = tiled_t2r.get_slice(tidx)
+    tOcO_t2r = thr_t2r.partition_D(tOcO_i[(None, None), None])
+    tOtO_t2r = thr_t2r.partition_S(tOtO_i[(None, None), None])
+    tOsO_r2s = partition_D_position_independent(thr_t2r, tOsO_i[(None, None), None])
+    for i in range(head_dim // corr_tile_size):
+        reg_src = cast("cute.Tensor", tOcO_t2r[None, 0, 0, i])
+        reg = cute.make_rmem_tensor(reg_src.shape, cutlass.Float32)
+        cute.copy(tiled_t2r, tOtO_t2r[None, 0, 0, i], reg)
+        cute.arch.fence_view_async_tmem_load()
+        row0, row1 = ws_m64_row_views(reg)
+        _scale_fragment_packed_f32x2(row0, inv_sum0)
+        _scale_fragment_packed_f32x2(row1, inv_sum1)
+        if cutlass.const_expr(relu_output):
+            relu_fragment_inplace(reg)
+        cvt_copy(tiled_r2s, reg, tOsO_r2s[None, 0, 0, i])
 
 
 # ===========================================================================

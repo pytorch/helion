@@ -25,20 +25,24 @@ from .cute import CuteAsyncStateLoadHeuristic
 from .cute import CuteChunkPrepareHeuristic
 from .cute import CuteChunkRecurrenceHeuristic
 from .cute import CuteCollectiveMatmulHeuristic
+from .cute import CuteColumnReductionHeuristic
 from .cute import CuteFixedTokenRank1Heuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
+from .cute import CuteGdnRecurrenceHeuristic
 from .cute import CuteNestedRowHeuristic
 from .cute import CutePackedSingleTokenRank1Heuristic
 from .cute import CutePersistentSubwarpRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
+from .cute import CuteRegisterTileHeuristic
 from .cute import CuteResidentMultiRowHeuristic
 from .cute import CuteResidentRowHeuristic
 from .cute import CuteResidentRowWideClusterHeuristic
 from .cute import CuteRolledClusterLadderHeuristic
 from .cute import CuteRolledRowLadderHeuristic
+from .cute import CuteScanTileHeuristic
 from .cute import CuteSiblingRowHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
@@ -102,6 +106,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteAsyncStateLoadHeuristic,
         CuteFp8GemmSkinnyMHeuristic,
         CuteChunkRecurrenceHeuristic,
+        CuteGdnRecurrenceHeuristic,
         CuteChunkPrepareHeuristic,
         CuteAffineScanHeuristic,
         CuteFlashAttentionHeuristic,
@@ -120,6 +125,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteTcgen05GroupedDynamicBk64Heuristic,
         CuteTcgen05ThreadLocalEpilogueHeuristic,
         CuteReductionTileHeuristic,
+        CuteRegisterTileHeuristic,
         CuteReductionWideChunkHeuristic,
         CuteResidentReductionHeuristic,
         CuteResidentSequenceHeuristic,
@@ -127,9 +133,11 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteAsyncPersistentSubwarpRowsHeuristic,
         CuteRolledRowLadderHeuristic,
         CuteRolledClusterLadderHeuristic,
+        CuteScanTileHeuristic,
         CuteTileVecHeuristic,
         CuteTileVecWarpReduceHeuristic,
         CuteTileVecWarpPerRowHeuristic,
+        CuteColumnReductionHeuristic,
         CuteSiblingRowHeuristic,
         CuteNestedRowHeuristic,
         CuteResidentRowHeuristic,

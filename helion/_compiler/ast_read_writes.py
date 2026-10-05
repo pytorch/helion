@@ -13,6 +13,10 @@ if TYPE_CHECKING:
 
 
 HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
+# On a CuTe atomic call: the lane variables of the synthetic lane loops along
+# whose tile axes the atomic is uniform (``cute/atomic_ops.py``); the lane-loop
+# distribution pins the atomic to their first lane when it runs inside them.
+HELION_ATOMIC_UNIFORM_LANES_ATTR = "_helion_atomic_uniform_lanes"
 
 # Accessing these tensor attributes only reads host-side metadata, not tensor
 # storage.  Keep counting them as ordinary reads for liveness, but identify them

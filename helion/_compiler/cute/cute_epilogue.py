@@ -58,12 +58,14 @@ import math
 import operator
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
 from ...language._gelu_tanh_approx import gelu_erf_epilogue_unary_step_template
+from ...language._tracing_ops import _get_symnode
 from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
@@ -157,6 +159,13 @@ class Tcgen05GroupedTailEpilogueMatch:
 
 
 @dataclasses.dataclass(frozen=True)
+class _RuntimeScalarExpr:
+    """A host scalar lifted into the kernel, never a per-lane coordinate."""
+
+    expr: sympy.Expr
+
+
+@dataclasses.dataclass(frozen=True)
 class _CurrentTensorExpr:
     """The current accumulator-derived value at one chain step."""
 
@@ -189,7 +198,11 @@ class _BinaryTensorExpr:
 
 
 _TensorExpr = (
-    _CurrentTensorExpr | _AuxiliaryTensorLoadExpr | _UnaryTensorExpr | _BinaryTensorExpr
+    _CurrentTensorExpr
+    | _AuxiliaryTensorLoadExpr
+    | _UnaryTensorExpr
+    | _BinaryTensorExpr
+    | _RuntimeScalarExpr
 )
 
 
@@ -600,10 +613,26 @@ def _aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
     )
 
 
+def _runtime_scalar(node: torch.fx.Node) -> _RuntimeScalarExpr | None:
+    if node.op != "call_function" or node.target is not _get_symnode:
+        return None
+    value = node.meta.get("val")
+    if not isinstance(value, (torch.SymInt, torch.SymFloat)):
+        return None
+    if not node.meta.get("helion_host_scalar", False):
+        return None
+    expr = value.node.expr
+    if not isinstance(expr, sympy.Expr):
+        return None
+    return _RuntimeScalarExpr(expr)
+
+
 def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
     """Return whether ``node`` is structurally an aux-only expression."""
     if depth >= 32:
         return False
+    if _runtime_scalar(node) is not None:
+        return True
     load_node, _ = _aux_load_operand(node)
     if _is_helion_load_node(load_node):
         return True
@@ -645,7 +674,7 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
 def _auxiliary_tensor_expr_operands(
     expr: _TensorExpr,
 ) -> tuple[_AuxiliaryTensorLoadExpr, ...]:
-    if isinstance(expr, _CurrentTensorExpr):
+    if isinstance(expr, (_CurrentTensorExpr, _RuntimeScalarExpr)):
         return ()
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
         return (expr,)
@@ -662,7 +691,7 @@ def _auxiliary_tensor_expr_operands(
 def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
     if isinstance(expr, _CurrentTensorExpr):
         return True
-    if isinstance(expr, _AuxiliaryTensorLoadExpr):
+    if isinstance(expr, (_AuxiliaryTensorLoadExpr, _RuntimeScalarExpr)):
         return False
     if isinstance(expr, _UnaryTensorExpr):
         return _tensor_expr_contains_current(expr.operand)
@@ -681,6 +710,11 @@ def _render_auxiliary_tensor_expr(
     prelude_indent: str,
 ) -> tuple[str, str]:
     """Render an expression tree into bound TensorSSA locals."""
+    if isinstance(expr, _RuntimeScalarExpr):
+        from ..device_function import DeviceFunction
+
+        scalar = DeviceFunction.current().sympy_expr(expr.expr)
+        return "", f"cutlass.Float32({scalar})"
     if isinstance(expr, _CurrentTensorExpr):
         return "", carrier_name
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
@@ -1147,6 +1181,8 @@ def _classify_auxiliary_tensor_expr_impl(
 ) -> _TensorExpr | None:
     if depth >= 32:
         return None
+    if (scalar := _runtime_scalar(node)) is not None:
+        return scalar
 
     load_node, aux_template = _aux_load_operand(node)
     kind = aux_tensor_load_kind(
@@ -1240,8 +1276,14 @@ def _classify_auxiliary_tensor_expr_impl(
         result_dtype = _node_tensor_dtype(node)
         if (
             result_dtype is None
-            or _node_tensor_dtype(lhs) != result_dtype
-            or _node_tensor_dtype(rhs) != result_dtype
+            or (
+                not isinstance(lhs_expr, _RuntimeScalarExpr)
+                and _node_tensor_dtype(lhs) != result_dtype
+            )
+            or (
+                not isinstance(rhs_expr, _RuntimeScalarExpr)
+                and _node_tensor_dtype(rhs) != result_dtype
+            )
         ):
             return None
         return _BinaryTensorExpr(

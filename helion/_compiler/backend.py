@@ -77,6 +77,8 @@ class FlashSearchSurface(NamedTuple):
     standard_causal_output: bool
     output_requires_tma: bool
     supports_tensor_4d_tma: bool
+    has_row_epilogue: bool
+    plain_row_body: bool
 
 
 class AttentionSoftmaxPattern(NamedTuple):
@@ -3105,6 +3107,7 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
             continue
         from .cute.cute_flash import _flash_output_requires_tma
         from .cute.cute_flash import flash_attention_graph_lse_plan_valid_from_graphs
+        from .cute.cute_flash import flash_attention_graph_row_epilogue_from_graphs
         from .cute.cute_flash import (
             flash_attention_graph_small_biased_candidate_from_graphs,
         )
@@ -3157,6 +3160,12 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 kv_block_id=block_ids[0],
                 score_plan=pattern.score_plan,
             )
+        )
+        has_row_epilogue = flash_attention_graph_row_epilogue_from_graphs(
+            device_ir.graphs,
+            root_block_ids=root_grid_ids,
+            kv_block_id=block_ids[0],
+            score_plan=pattern.score_plan,
         )
         tensor_4d_batch_heads = flash_attention_graph_tensor_4d_batch_heads_from_graphs(
             device_ir.graphs,
@@ -3224,6 +3233,11 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
                 standard_causal_output=standard_causal_output,
                 output_requires_tma=output_requires_tma,
                 supports_tensor_4d_tma=supports_tensor_4d_tma,
+                has_row_epilogue=has_row_epilogue,
+                # The 64-row query tile exists only for plain rows.
+                plain_row_body=(
+                    not pattern.score_plan.modifiers and not has_row_epilogue
+                ),
             )
     if generic_fallback_required:
         env.config_spec.enable_cute_attention_generic_fallback(

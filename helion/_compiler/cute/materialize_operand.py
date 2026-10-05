@@ -330,7 +330,21 @@ def _resolve(value: ast.expr, source: _Source) -> ast.expr:
     return value
 
 
-def _needed_statements(values: Sequence[ast.expr], source: _Source) -> list[ast.Assign]:
+def _needed_statements(
+    values: Sequence[ast.expr],
+    source: _Source,
+    *,
+    forbidden: tuple[str, ...] | None = None,
+) -> list[ast.Assign]:
+    """Collect the K-loop definitions feeding ``values``.
+
+    ``forbidden`` names the loop-carried values a materialized operand may not
+    depend on: the accumulator and the output axis it is reused across (the
+    output rows for an RHS ``[K, N]`` recipe, the output columns for an LHS
+    ``[M, K]`` recipe).
+    """
+    if forbidden is None:
+        forbidden = (source.m, source.accumulator)
     pending = [
         node.id
         for value in values
@@ -351,10 +365,39 @@ def _needed_statements(values: Sequence[ast.expr], source: _Source) -> list[ast.
                 if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
             )
     _require(
-        not seen.intersection((source.m, source.accumulator)),
-        "operand depends on output rows or the accumulator",
+        not seen.intersection(forbidden),
+        "operand depends on the reused output axis or the accumulator",
     )
     return [statement for name, statement in source.definitions.items() if name in seen]
+
+
+def _direct_input_subscript(value: ast.expr, host: HostFunction) -> str | None:
+    """Return the input binding name when ``value`` is a plain ``name[...]`` load."""
+    if (
+        isinstance(value, ast.Subscript)
+        and isinstance(value.value, ast.Name)
+        and value.value.id in host.params.arguments
+    ):
+        return value.value.id
+    return None
+
+
+def _recipe_side(source: _Source, host: HostFunction) -> str:
+    """``"rhs"`` when the RHS carries the recipe (direct A), else ``"lhs"``.
+
+    A program whose LHS is the recipe (``x[tile_m, tile_k].to(bf16) @ w``)
+    materializes an ``[M, K]`` operand reused across the output columns; the
+    RHS must then be the direct input load.
+    """
+    if _direct_input_subscript(_resolve(source.lhs, source), host) is not None:
+        return "rhs"
+    if _direct_input_subscript(_resolve(source.rhs, source), host) is not None:
+        return "lhs"
+    return "rhs"
+
+
+def _recipe_forbidden(source: _Source, side: str) -> tuple[str, str]:
+    return ((source.m if side == "rhs" else source.n), source.accumulator)
 
 
 def _static(value: int | torch.SymInt, env: CompileEnvironment) -> int | None:
@@ -387,6 +430,13 @@ def _exact_integer_cast(node: Node) -> bool:
         or original.is_complex()
         or original.dtype is torch.bool
     ):
+        return True
+    if source.target is memory_ops.load:
+        # A bare cast of the loaded integer tile: the program itself rounds
+        # every loaded value to the half format before the contraction, so the
+        # materialized tensor holds exactly the values the original recipe
+        # feeds the FP32 products.  Only derived integer arithmetic needs the
+        # proved-range check below.
         return True
     if original.dtype not in (
         torch.int8,
@@ -481,7 +531,7 @@ def _strip_zero_padding(node: Node) -> tuple[Node, set[Node]]:
 
 def _prove(
     host: HostFunction, source: _Source, env: CompileEnvironment
-) -> tuple[int, torch.dtype, str, tuple[ast.expr, ...], tuple[str, ...]]:
+) -> tuple[int, torch.dtype, str, tuple[ast.expr, ...], tuple[str, ...], str]:
     ir = host.device_ir
     _require(len(ir.root_ids) == 1 and len(ir.graphs) == 2, "unexpected nested graphs")
     root_axes = _indices(source.root)
@@ -529,32 +579,35 @@ def _prove(
         "contraction is not owned by the canonical K loop",
     )
     a, b = lhs.meta["val"], rhs.meta["val"]
+    side = _recipe_side(source, host)
+    # ``direct`` is the operand that stays a plain input load; ``recipe`` is
+    # the operand that is materialized.  An RHS recipe is reused across the
+    # output rows (M), an LHS recipe across the output columns (N).
+    direct, recipe_root = (lhs, rhs) if side == "rhs" else (rhs, lhs)
+    direct_expr = source.lhs if side == "rhs" else source.rhs
     _require(
         isinstance(a, torch.Tensor)
         and isinstance(b, torch.Tensor)
         and a.ndim == b.ndim == 2
         and a.dtype == b.dtype
         and a.dtype in (torch.float16, torch.bfloat16)
-        and lhs.target is memory_ops.load,
-        "requires direct half/BF16 A and a matching RHS recipe",
+        and direct.target is memory_ops.load,
+        "requires one direct half/BF16 operand and a matching recipe",
     )
-    left = _resolve(source.lhs, source)
+    a_name = _direct_input_subscript(_resolve(direct_expr, source), host)
     _require(
-        isinstance(left, ast.Subscript)
-        and isinstance(left.value, ast.Name)
-        and left.value.id in host.params.arguments,
-        "A must load directly from an unchanged input binding",
+        a_name is not None,
+        "the direct operand must load from an unchanged input binding",
     )
-    assert isinstance(left, ast.Subscript) and isinstance(left.value, ast.Name)
-    a_name = left.value.id
-    a_tensor = _access_tensor(lhs)
+    assert a_name is not None
+    a_tensor = _access_tensor(direct)
     _require(
         a_tensor is host.params.arguments[a_name] and _is_contiguous_2d(a_tensor, env),
-        "A has an unsupported alias or layout",
+        "the direct operand has an unsupported alias or layout",
     )
     assert a_tensor is not None
-    recipe, padding = _strip_zero_padding(rhs)
-    packed = packed_matmul_axis(env, lhs, recipe)
+    recipe, padding = _strip_zero_padding(recipe_root)
+    packed = packed_matmul_axis(env, lhs, recipe) if side == "rhs" else None
     factor = packed.factor if packed is not None else 1
     if packed is not None:
         _require(packed.block_id == k_id, "packed K does not own the contraction")
@@ -582,30 +635,42 @@ def _prove(
         )
         expressions = tuple(stack.args[0].elts)
     else:
-        indices = lhs.args[1]
+        indices = direct.args[1]
+        direct_k_position = 1 if side == "rhs" else 0
         _require(
             isinstance(indices, (list, tuple))
             and len(indices) == 2
-            and _exact_tile(indices[1], k_id, env),
-            "direct A has a noncanonical K mapping",
+            and _exact_tile(indices[direct_k_position], k_id, env),
+            "the direct operand has a noncanonical K mapping",
         )
         terms = (recipe,)
-        expressions = (source.rhs,)
-    indices = lhs.args[1]
+        expressions = (source.rhs if side == "rhs" else source.lhs,)
+    indices = direct.args[1]
+    direct_outer_id = m_id if side == "rhs" else n_id
+    direct_outer_position = 0 if side == "rhs" else 1
     _require(
         isinstance(indices, (list, tuple))
         and len(indices) == 2
-        and _exact_tile(indices[0], m_id, env),
-        "A changes output-row ownership",
+        and _exact_tile(indices[direct_outer_position], direct_outer_id, env),
+        "the direct operand changes output ownership",
     )
     extents = [
         _static(cast("int | torch.SymInt", env.block_sizes[axis].size), env)
         for axis in (m_id, n_id, k_id)
     ]
+    if side == "rhs":
+        direct_shape_ok = (
+            _static(a_tensor.shape[0], env) == extents[0]
+            and _static(a_tensor.shape[1], env) == cast("int", extents[2]) * factor
+        )
+    else:
+        direct_shape_ok = (
+            _static(a_tensor.shape[0], env) == extents[2]
+            and _static(a_tensor.shape[1], env) == extents[1]
+        )
     _require(
         all(extent is not None and extent > 0 for extent in extents)
-        and _static(a_tensor.shape[0], env) == extents[0]
-        and _static(a_tensor.shape[1], env) == cast("int", extents[2]) * factor,
+        and direct_shape_ok,
         "guarded matrix extents do not cover the complete logical K domain",
     )
     inputs = {
@@ -614,12 +679,15 @@ def _prove(
         if isinstance(value, torch.Tensor)
     }
     assert terms is not None
-    recipe_nodes = _prove_recipe(terms, k=k_id, n=n_id, inputs=inputs, env=env)
+    if side == "rhs":
+        recipe_nodes = _prove_recipe(terms, k=k_id, n=n_id, inputs=inputs, env=env)
+    else:
+        recipe_nodes = _prove_recipe(terms, k=m_id, n=k_id, inputs=inputs, env=env)
     _require(
         factor > 1 or any(item.target is not memory_ops.load for item in recipe_nodes),
-        "direct RHS is already materialized",
+        "direct operands are already materialized",
     )
-    _needed_statements(expressions, source)
+    _needed_statements(expressions, source, forbidden=_recipe_forbidden(source, side))
     recipe_nodes.update(padding)
     stores = [
         item
@@ -654,7 +722,9 @@ def _prove(
     for graph in ir.graphs:
         for item in graph.graph.nodes:
             if item.target is memory_ops.load:
-                _require(item is lhs or item in recipe_nodes, "unexpected memory read")
+                _require(
+                    item is direct or item in recipe_nodes, "unexpected memory read"
+                )
             _require(
                 item is node or item in recipe_nodes or _ordinary_operation(item),
                 "unexpected side effect or control flow",
@@ -674,7 +744,7 @@ def _prove(
             )
             captures.append(cast("ast.Name", statement.targets[0]).id)
     _require(source.output in captures, "output is not captured by its original name")
-    return factor, b.dtype, a_name, expressions, tuple(captures)
+    return factor, b.dtype, a_name, expressions, tuple(captures), side
 
 
 def _replacement(
@@ -682,9 +752,20 @@ def _replacement(
     source: _Source,
     original_body: list[ast.stmt],
     specializations: list[ast.stmt],
-    proof: tuple[int, torch.dtype, str, tuple[ast.expr, ...], tuple[str, ...]],
+    proof: tuple[int, torch.dtype, str, tuple[ast.expr, ...], tuple[str, ...], str],
 ) -> MaterializedFissionPlan:
-    factor, dtype, a_name, expressions, captures = proof
+    factor, dtype, a_name, expressions, captures, side = proof
+    if side == "lhs":
+        return _replacement_lhs(
+            host,
+            source,
+            original_body,
+            specializations,
+            dtype,
+            a_name,
+            expressions,
+            captures,
+        )
     used = _bound_names(host) | set(host.fn.__globals__)
 
     def fresh(name: str) -> str:
@@ -774,29 +855,7 @@ def _replacement(
         assert isinstance(contraction, ast.For)
         contraction.body = [update]
         consumer.body[1] = contraction
-        prefix = [
-            cast("ast.stmt", _clone_untyped(stmt))
-            for stmt in original_body[: source.index]
-        ]
-        for statement in prefix:
-            if (
-                isinstance(statement, ast.Assign)
-                and len(statement.targets) == 1
-                and isinstance(statement.targets[0], ast.Name)
-                and statement.targets[0].id == source.output
-                and isinstance(statement.value, ast.Call)
-            ):
-                factory = _callee(statement.value.func, host)
-                replacements: dict[object, object] = {
-                    torch.zeros: torch.empty,
-                    torch.ones: torch.empty,
-                    torch.zeros_like: torch.empty_like,
-                    torch.ones_like: torch.empty_like,
-                }
-                replacement = replacements.get(factory)
-                if replacement is not None:
-                    reference = _reference(replacement, host)
-                    statement.value.func = cast("ast.expr", reference)
+        prefix = _rewritten_prefix(host, source, original_body)
         replacement_body = (
             *specializations,
             *prefix,
@@ -817,6 +876,155 @@ def _replacement(
         ),
         pointwise_region_indices=(0,),
         operand_interleave_factor=factor,
+    )
+
+
+def _rewritten_prefix(
+    host: HostFunction, source: _Source, original_body: list[ast.stmt]
+) -> list[ast.stmt]:
+    """Clone the host statements before the grid; the consumer overwrites every
+    output element, so a zero/one-filled output factory becomes ``empty``."""
+    prefix = [
+        cast("ast.stmt", _clone_untyped(stmt)) for stmt in original_body[: source.index]
+    ]
+    for statement in prefix:
+        if (
+            isinstance(statement, ast.Assign)
+            and len(statement.targets) == 1
+            and isinstance(statement.targets[0], ast.Name)
+            and statement.targets[0].id == source.output
+            and isinstance(statement.value, ast.Call)
+        ):
+            factory = _callee(statement.value.func, host)
+            replacements: dict[object, object] = {
+                torch.zeros: torch.empty,
+                torch.ones: torch.empty,
+                torch.zeros_like: torch.empty_like,
+                torch.ones_like: torch.empty_like,
+            }
+            replacement = replacements.get(factory)
+            if replacement is not None:
+                reference = _reference(replacement, host)
+                statement.value.func = cast("ast.expr", reference)
+    return prefix
+
+
+def _replacement_lhs(
+    host: HostFunction,
+    source: _Source,
+    original_body: list[ast.stmt],
+    specializations: list[ast.stmt],
+    dtype: torch.dtype,
+    b_name: str,
+    expressions: tuple[ast.expr, ...],
+    captures: tuple[str, ...],
+) -> MaterializedFissionPlan:
+    """Materialize an ``[M, K]`` LHS recipe reused across the output columns.
+
+    The producer tiles ``[M, K]`` and stores the recipe; the consumer keeps the
+    original ``[M, N]`` grid and contracts ``matrix[m, k] @ b[k, n]`` over the
+    direct RHS input's leading extent.
+    """
+    used = _bound_names(host) | set(host.fn.__globals__)
+
+    def fresh(name: str) -> str:
+        while name in used:
+            name += "_"
+        used.add(name)
+        return name
+
+    matrix = fresh("_helion_materialized_operand")
+    row = fresh("_helion_materialize_m")
+    column = fresh("_helion_materialize_k")
+    logical_k = fresh("_helion_materialize_logical_k")
+    assert isinstance(source.root, ExtendedAST)
+    with source.root:
+        tile = _reference(hl.tile, host)
+        empty = _reference(torch.empty, host)
+        element_type = _reference(dtype, host)
+        assert isinstance(source.loop.iter, ast.Call)
+        assert isinstance(source.root.iter, ast.Call)
+        assert isinstance(source.root.iter.args[0], (ast.Tuple, ast.List))
+        m_bound = source.root.iter.args[0].elts[0]
+        allocation = statement_from_string(
+            f"{matrix} = {{empty}}(({{m}}, {b_name}.size(0)), "
+            f"dtype={{dtype}}, device={b_name}.device)",
+            empty=empty,
+            m=m_bound,
+            dtype=element_type,
+        )
+        producer = statement_from_string(
+            f"for {row}, {column} in {{tile}}([{{m}}, {{k}}]):\n    pass",
+            tile=tile,
+            m=m_bound,
+            k=source.loop.iter.args[0],
+        )
+        assert isinstance(producer, ast.For) and isinstance(producer.iter, ast.Call)
+        if source.loop.iter.keywords:
+            block = source.loop.iter.keywords[0].value
+            block_call = expr_from_string("f(block_size=[None, {block}])", block=block)
+            assert isinstance(block_call, ast.Call)
+            producer.iter.keywords = block_call.keywords
+        body: list[ast.stmt] = list(
+            _needed_statements(
+                expressions, source, forbidden=_recipe_forbidden(source, "lhs")
+            )
+        )
+        (expression,) = expressions
+        body.append(
+            statement_from_string(
+                f"{matrix}[{source.m}, {source.k}] = {{value}}", value=expression
+            )
+        )
+        producer.body = [cast("ast.stmt", _clone_untyped(stmt)) for stmt in body]
+        for node in ast.walk(producer):
+            if isinstance(node, ast.Name):
+                if node.id == source.m:
+                    node.id = row
+                elif node.id == source.k:
+                    node.id = column
+        consumer = cast("ast.For", _clone_untyped(source.root))
+        original_update = source.loop.body[-1]
+        assert isinstance(original_update, ast.Assign)
+        update = cast("ast.Assign", _clone_untyped(original_update))
+        assert isinstance(update.value, ast.Call)
+        load_a = cast(
+            "ast.expr", expr_from_string(f"{matrix}[{source.m}, {logical_k}]")
+        )
+        load_b = cast(
+            "ast.expr", expr_from_string(f"{b_name}[{logical_k}, {source.n}]")
+        )
+        if _callee(source.call.func, host) is hl.dot:
+            update.value.args = [load_a, load_b]
+        else:
+            update.value.args[1:] = [load_a, load_b]
+        contraction = statement_from_string(
+            f"for {logical_k} in {{tile}}({b_name}.size(0)):\n    pass", tile=tile
+        )
+        assert isinstance(contraction, ast.For)
+        contraction.body = [update]
+        consumer.body[1] = contraction
+        prefix = _rewritten_prefix(host, source, original_body)
+        replacement_body = (
+            *specializations,
+            *prefix,
+            allocation,
+            producer,
+            consumer,
+            *original_body[source.index + 1 :],
+        )
+    return MaterializedFissionPlan(
+        root_index=len(specializations) + source.index + 1,
+        source_root_key=ast.dump(original_body[source.index]),
+        materialized_names=(*captures, matrix),
+        region_count=2,
+        source_root_index=source.index,
+        replacement_body=tuple(
+            cast("ast.stmt", _clone_untyped(statement))
+            for statement in replacement_body
+        ),
+        pointwise_region_indices=(0,),
+        operand_interleave_factor=1,
     )
 
 
@@ -857,7 +1065,12 @@ def plan_operand_materialization(
                 compiler.unroll(host)
                 compiler.customize_ast(host)
                 source = _source(host)
-                _needed_statements((source.rhs,), source)
+                side = _recipe_side(source, host)
+                _needed_statements(
+                    (source.rhs if side == "rhs" else source.lhs,),
+                    source,
+                    forbidden=_recipe_forbidden(source, side),
+                )
                 _require(
                     not host.args.posonlyargs
                     and not host.args.kwonlyargs
