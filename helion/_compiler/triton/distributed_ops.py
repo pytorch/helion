@@ -1043,8 +1043,10 @@ def _record_scatter(
     device_function.inband_scatter_done[scatter.root] = done
 
 
-def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> int:
-    """Words per asm lane: more than a thread's elements would fault."""
+def _poll_pack(
+    state: CodegenState, output_size: list[int | torch.SymInt], lanes: int
+) -> int:
+    """Words per asm lane: more than a thread's words would fault."""
     env = CompileEnvironment.current()
     numel = 1
     for size in output_size:
@@ -1057,8 +1059,69 @@ def _poll_pack(state: CodegenState, output_size: list[int | torch.SymInt]) -> in
         if not isinstance(size, int):
             return 1
         numel *= size
+    numel //= lanes
     threads = 32 * state.config.num_warps
     return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
+
+
+def _joined(parts: list[str]) -> str:
+    """Invert ``_interleaved``: interleave the parts along a new last axis."""
+    while len(parts) > 1:
+        half = len(parts) // 2
+        parts = [f"tl.join({parts[i]}, {parts[i + half]})" for i in range(half)]
+    return parts[0]
+
+
+def _word_poll(
+    state: CodegenState,
+    fake_tensor: torch.Tensor,
+    indexing: SubscriptIndexing,
+    output_size: list[int | torch.SymInt],
+    extra_mask: ast.AST | None,
+    access: TileAccess,
+    lanes: int,
+) -> tuple[str, str | None, str] | None:
+    """Word offsets, mask and shape of a block poll whose last axis is aligned
+    runs of the mailbox's ``lanes``-element words, else None."""
+    env = CompileEnvironment.current()
+    graph = HostFunction.current().device_ir.tile_dependency_graph
+    assert graph is not None
+
+    def block_size(block_id: int) -> int:
+        return env.size_hint(env.block_sizes[block_id].from_config_assert(state.config))
+
+    tile_strategy = state.tile_strategy
+    dims = tile_strategy.shape_dims(output_size)
+    if (
+        not indexing.block_shaped_offset
+        or indexing.needs_broadcast()
+        or len(dims) != len(output_size)
+        or graph.inband_row(access, block_size) % lanes
+    ):
+        return None
+    last = tile_strategy.expand_str(output_size, len(output_size) - 1)
+    *rest, (term, block) = zip(
+        indexing.dim_index_exprs, indexing.block_dims, strict=True
+    )
+    # Only the last dim may vary along the last axis.
+    if not block or not term.endswith(last):
+        return None
+    if any(block and not term.endswith("None]") for term, block in rest):
+        return None
+    mask = None
+    if indexing.has_mask():
+        mask = _start_mask(state, indexing, extra_mask, output_size, lanes)
+        if mask is None:
+            return None
+    vector = term[: len(term) - len(last)]
+    rest.append((f"({_interleaved(state, vector, dims[-1:], lanes)[0]}){last}", True))
+    terms = [
+        f"{term} * {state.device_function.tensor_stride(fake_tensor, dim).name}"
+        for dim, (term, _) in enumerate(rest)
+        if dim == len(rest) - 1 or not env.known_equal(fake_tensor.size(dim), 1)
+    ]
+    shape = ", ".join([*dims[:-1], f"{dims[-1]} // {lanes}"])
+    return f"({' + '.join(terms)}) // {lanes}", mask, f"[{shape}]"
 
 
 def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadCodegen:
@@ -1094,12 +1157,19 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         _, _, lanes, _ = peer.mailboxes[access.allocation_id]
         dtype = fake_tensor.dtype
         scatter = peer.scatters.get(access.allocation_id)
+        words = None
+        if lanes > 1 and scatter is None:
+            words = _word_poll(
+                state, fake_tensor, indexing, output_size, extra_mask, access, lanes
+            )
         shift = ""
         element = ""
-        if lanes > 1 or scatter is not None:
+        if words is not None:
+            offset = expr_from_string(words[0])
+        elif lanes > 1 or scatter is not None:
             element = state.codegen.lift(offset, dce=True, prefix="inband_offset").id
             offset = expr_from_string(element)
-        if lanes > 1:
+        if lanes > 1 and words is None:
             # Each lane polls the word holding its element and shifts it out.
             shift = (
                 f" >> (tl.cast({element} % {lanes}, tl.uint64) * {8 * dtype.itemsize})"
@@ -1112,14 +1182,24 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
         )
         mask = None
         if indexing.has_mask():
-            mask = state.codegen.lift(
-                indexing.mask_expr, dce=True, prefix="inband_mask"
-            ).id
+            mask_expr = indexing.mask_expr
+            if words is not None:
+                assert words[1] is not None
+                mask_expr = expr_from_string(words[1])
+            mask = state.codegen.lift(mask_expr, dce=True, prefix="inband_mask").id
         word = device_function.new_var("inband_word", dce=False)
         result = expr_from_string(
             f"tl.cast(tl.cast({word}{shift}, {_bits(dtype)}), "
             f"{backend.dtype_str(dtype)}, bitcast=True)"
         )
+        if words is not None:
+            # A thread unpacks its whole words, keeping each row's lanes in-thread.
+            parts = [
+                f"tl.cast(tl.cast({word}{f' >> {8 * dtype.itemsize * i}' * (i > 0)}, "
+                f"{_bits(dtype)}), {backend.dtype_str(dtype)}, bitcast=True)"
+                for i in range(lanes)
+            ]
+            result = expr_from_string(f"tl.reshape({_joined(parts)}, {shape})")
         # Triton's pipeliner would make the first read an early, weak cp.async.
         for loops in state.codegen.active_device_loops.values():
             for loop in loops:
@@ -1135,7 +1215,8 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 backend.broadcast_to_expr("{value}", shape), value=result
             )
         elif indexing.block_shaped_offset or mask is not None:
-            group, pack = shape, _poll_pack(state, output_size)
+            group = shape if words is None else words[2]
+            pack = _poll_pack(state, output_size, 1 if words is None else lanes)
             if not _in_warp_specialized_loop(state):
                 threads = 32 * state.config.num_warps
         else:
