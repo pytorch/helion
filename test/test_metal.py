@@ -2025,24 +2025,76 @@ class TestMetalReductions(unittest.TestCase):
         with self.assertRaisesRegex(exc.BackendUnsupported, "2 reduction dimensions"):
             two_reduce_dims(torch.randn(3, 8, 16, device=DEVICE))
 
-    def test_strided_reduce_group_is_rejected(self) -> None:
-        """Reducing a thread axis above a sibling axis would mix rows."""
+    def test_strided_tile_reduction_is_correct(self) -> None:
+        """Reducing a tile-inner dim uses the strided threadgroup path.
 
-        @helion.kernel(backend="metal", autotune_effort="none", static_shapes=True)
-        def inner_dim_sum(w: torch.Tensor) -> torch.Tensor:
+        Both tile axes sit on thread axes (as in ``softmax_two_pass``), so
+        the inner reduction lands on a lane-strided group.
+        """
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
+        )
+        def tile_row_sum(w: torch.Tensor) -> torch.Tensor:
             o, d = w.shape
-            d = hl.specialize(d)
             out = torch.empty([o], dtype=torch.float32, device=w.device)
-            d_block = hl.register_block_size(
-                helion.next_power_of_2(d), helion.next_power_of_2(d)
-            )
-            for tile_o, tile_d in hl.tile([o, d], block_size=[None, d_block]):
-                out[tile_o] = torch.sum(w[tile_o, tile_d].to(torch.float32), dim=-1)
+            for tile_o in hl.tile(o):
+                acc = hl.zeros([tile_o], dtype=torch.float32)
+                for tile_d in hl.tile(d):
+                    acc = acc + torch.sum(w[tile_o, tile_d].to(torch.float32), dim=-1)
+                out[tile_o] = acc
             return out
 
         w = torch.randn(512, 128, device=DEVICE)
-        with self.assertRaisesRegex(exc.BackendUnsupported, "strided by"):
-            inner_dim_sum(w)
+        torch.testing.assert_close(tile_row_sum(w), w.sum(-1))
+
+    def test_strided_tile_amax_propagates_nan(self) -> None:
+        """Strided amax matches torch, including NaN and inf rows."""
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
+        )
+        def tile_row_amax(w: torch.Tensor) -> torch.Tensor:
+            o, d = w.shape
+            out = torch.empty([o], dtype=torch.float32, device=w.device)
+            for tile_o in hl.tile(o):
+                best = hl.full([tile_o], float("-inf"), dtype=torch.float32)
+                for tile_d in hl.tile(d):
+                    local = torch.amax(w[tile_o, tile_d].to(torch.float32), dim=-1)
+                    best = torch.maximum(best, local)
+                out[tile_o] = best
+            return out
+
+        @helion.kernel(
+            backend="metal",
+            configs=[helion.Config(block_sizes=[32, 32], num_warps=4)],
+        )
+        def tile_row_amin(w: torch.Tensor) -> torch.Tensor:
+            o, d = w.shape
+            out = torch.empty([o], dtype=torch.float32, device=w.device)
+            for tile_o in hl.tile(o):
+                best = hl.full([tile_o], float("inf"), dtype=torch.float32)
+                for tile_d in hl.tile(d):
+                    local = torch.amin(w[tile_o, tile_d].to(torch.float32), dim=-1)
+                    best = torch.minimum(best, local)
+                out[tile_o] = best
+            return out
+
+        w = torch.randn(256, 96, device=DEVICE)
+        torch.testing.assert_close(tile_row_amax(w), w.amax(-1))
+        w[7, 41] = float("nan")
+        w[8, :] = float("-inf")
+        result = tile_row_amax(w)
+        self.assertTrue(torch.isnan(result[7]).item())
+        self.assertTrue(torch.isinf(result[8]).item())
+        torch.testing.assert_close(
+            result, w.amax(-1), equal_nan=True, rtol=1e-4, atol=1e-4
+        )
+        v = torch.randn(256, 96, device=DEVICE)
+        v[9, :] = float("inf")
+        torch.testing.assert_close(tile_row_amin(v), v.amin(-1))
 
     def test_device_loop_lane_reduction_is_rejected(self) -> None:
         """A reduction carried by a device-loop lane must not under-reduce."""

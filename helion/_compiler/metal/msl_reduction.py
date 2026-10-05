@@ -180,6 +180,52 @@ HELION_TG_REDUCE(max, ::metal::numeric_limits<T>::lowest())
 HELION_TG_REDUCE(min, ::metal::numeric_limits<T>::max())
 #undef HELION_TG_REDUCE
 
+// Strided max/min identities: floating types start at infinity so an
+// all-inf row returns inf (not FLT_MAX); integrals, which have no
+// infinity, keep lowest()/max().
+template <typename T>
+inline T strided_max_init() { return ::metal::numeric_limits<T>::lowest(); }
+template <>
+inline float strided_max_init<float>() { return -::metal::numeric_limits<float>::infinity(); }
+template <>
+inline half strided_max_init<half>() { return -::metal::numeric_limits<half>::infinity(); }
+template <typename T>
+inline T strided_min_init() { return ::metal::numeric_limits<T>::max(); }
+template <>
+inline float strided_min_init<float>() { return ::metal::numeric_limits<float>::infinity(); }
+template <>
+inline half strided_min_init<half>() { return ::metal::numeric_limits<half>::infinity(); }
+
+// Strided-group reduction: the group's members are not lane-contiguous
+// (lane stride > 1), so no shuffle butterfly can fold them.  Instead every
+// thread spills its value to scratch at its linear lane index, and each
+// row's leader (the member with lane == base) folds its own strided members
+// serially.  Correct for any span and stride; costs scratch plus barriers
+// and a serial second stage per row.  Like tg_*, the leading barrier makes
+// the buffer safe to reuse across device-loop iterations.
+#define HELION_TG_STRIDED_REDUCE(NAME, INIT, COMBINE)                          \
+  template <typename T>                                                        \
+  inline T tg_strided_##NAME(threadgroup T* buf, T v, uint lane, uint base,     \
+                             uint span, uint stride) {                          \
+    ::metal::threadgroup_barrier(::metal::mem_flags::mem_threadgroup);         \
+    buf[lane] = v;                                                             \
+    ::metal::threadgroup_barrier(::metal::mem_flags::mem_threadgroup);         \
+    if (lane == base) {                                                        \
+      T acc = (INIT);                                                          \
+      for (uint k = 0; k < span; k++) {                                        \
+        acc = (COMBINE);                                                       \
+      }                                                                        \
+      buf[base] = acc;                                                         \
+    }                                                                          \
+    ::metal::threadgroup_barrier(::metal::mem_flags::mem_threadgroup);         \
+    return buf[base];                                                          \
+  }
+HELION_TG_STRIDED_REDUCE(sum, 0, acc + buf[base + k * stride])
+HELION_TG_STRIDED_REDUCE(prod, 1, acc * buf[base + k * stride])
+HELION_TG_STRIDED_REDUCE(max, strided_max_init<T>(), ::c10::metal::max(acc, buf[base + k * stride]))
+HELION_TG_STRIDED_REDUCE(min, strided_min_init<T>(), ::c10::metal::min(acc, buf[base + k * stride]))
+#undef HELION_TG_STRIDED_REDUCE
+
 // Each tg_* below carries its own leading barrier, which is what keeps the
 // value pass and the index pass from racing on their separate buffers.
 #define HELION_TG_ARGREDUCE(NAME, VALUE_OP)                                  \\
