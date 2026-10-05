@@ -57,6 +57,7 @@ from .indexing import CuteSortableLoad
 from .indexing import is_cute_shape_chain_target
 from .indexing import match_cute_affine_range_iota
 from .iota_utils import cute_free_arange_indexed_dim_key
+from .iota_utils import cute_free_arange_memory_index_positions
 from .iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .iota_utils import cute_iota_is_free_memory_index
 from .matmul_fallback import _emit_cute_matmul
@@ -366,6 +367,7 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         lhs_node.meta["val"].shape[-1],
         rhs_node.meta["val"].shape[-2],
         rhs_node.meta["val"].shape[-1],
+        lhs_m_size=lhs_node.meta["val"].shape[-2],
     )
     if k_block_id is None and packed_rhs is not None:
         packed_nodes, _ = packed_rhs
@@ -540,6 +542,7 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         lhs_node.meta["val"].shape[-1],
         rhs_node.meta["val"].shape[-2],
         rhs_node.meta["val"].shape[-1],
+        lhs_m_size=lhs_node.meta["val"].shape[-2],
     )
     if k_block_id is None and packed_rhs is not None:
         packed_nodes, _ = packed_rhs
@@ -798,6 +801,7 @@ def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         lhs_node.meta["val"].shape[-1],
         rhs_node.meta["val"].shape[-2],
         rhs_node.meta["val"].shape[-1],
+        lhs_m_size=lhs_node.meta["val"].shape[-2],
     )
     if k_block_id is None and packed_rhs is not None:
         packed_nodes, _ = packed_rhs
@@ -952,6 +956,27 @@ def _cute_free_arange_axis_expr(
         _arange_endpoint_key(start),
         _arange_endpoint_key(step),
     )
+    # The key is taken from the arange's *first* memory-op user, so two
+    # distinct hl.arange() dims can still land on one axis (``rows``/``cols`` both
+    # loaded from equal-sized dims).  Within a single load/store that would
+    # address only the diagonal: refuse it rather than silently drop lanes.
+    # One arange reaching two index dims of a single access is the same
+    # collapse: Helion indexes two tensor entries as a cartesian tile, so
+    # ``x[r.unsqueeze(1), r.unsqueeze(0)]`` and ``x[r + 1, r + 2]`` both need a
+    # second lane coordinate that this arange's one axis cannot provide.
+    positions = cg.cute_synthetic_arange_access_positions
+    claimed: set[Node] = set()
+    for access, position in cute_free_arange_memory_index_positions(source_node):
+        if (
+            access in claimed
+            or positions.setdefault((access, key), position) != position
+        ):
+            raise exc.BackendUnsupported(
+                "cute",
+                "two index dims of one load/store share a free hl.arange lane; "
+                "the SIMT lowering addresses one lane coordinate per thread axis",
+            )
+        claimed.add(access)
     return cg.allocate_cute_synthetic_arange_coord(key, length_hint)
 
 

@@ -130,6 +130,7 @@ def _(state: CodegenState) -> object:
         lhs_proxy.shape[-1],
         rhs_proxy.shape[-2],
         rhs_proxy.shape[-1],
+        lhs_m_size=lhs_proxy.shape[-2],
     )
     packed_rhs = None
     if (

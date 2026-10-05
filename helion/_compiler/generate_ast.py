@@ -177,6 +177,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # ``backend.py`` can grow the thread block to cover those lanes.
         self.cute_synthetic_arange_axes: dict[tuple[object, ...], int] = {}
         self.cute_synthetic_arange_axis_sizes: dict[int, int] = {}
+        # ``(load/store node, synthetic axis key) -> index position``: one
+        # synthetic lane may address only one index dim of a given access.
+        self.cute_synthetic_arange_access_positions: dict[
+            tuple[torch.fx.Node, object], int
+        ] = {}
         # CuTe only: stack of ``(if_node_id, branch_side)`` entries describing the
         # mutually-exclusive control-flow branch the current codegen is inside.
         # ``branch_side`` is 0 for the ``if`` body and 1 for the ``else`` body of
