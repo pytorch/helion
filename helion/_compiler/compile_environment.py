@@ -765,22 +765,23 @@ class CompileEnvironment:
             and (storage_offset * fake_tensor.element_size()) % 16 == 0
         )
 
-    def tensor_descriptor_alignment_source(
+    def tensor_alignment_owner(
         self, fake_tensor: torch.Tensor
-    ) -> Source | None:
-        """Find the input whose base-alignment predicate applies to ``fake_tensor``.
+    ) -> tuple[Source, int] | None:
+        """The input whose runtime base ``fake_tensor`` starts a fixed number of bytes past.
 
-        A zero-offset, statically exact view has the same data pointer as its
-        unique input storage owner.  Layout legality remains a separate proof;
-        this only lets the descriptor reuse that owner's runtime alignment guard.
+        A direct input is its own owner at offset zero.  A statically exact
+        view of the storage of exactly one zero-offset input starts
+        ``storage_offset * element_size`` bytes past that input's base, so
+        its base residue follows from the owner's bound residue and the
+        static offset.  Layout legality remains a separate proof.
         """
         source = self.tensor_input_source(fake_tensor)
         if source is not None and _is_supported_tensor_input_source(source):
-            return source
+            return source, 0
         storage_offset = fake_tensor.storage_offset()
         if (
             not isinstance(storage_offset, int)
-            or storage_offset != 0
             or not (
                 self.settings.static_shapes
                 or self.tensor_layout_is_symbolically_exact(fake_tensor)
@@ -804,7 +805,21 @@ class CompileEnvironment:
         )
         if len(owners) != 1:
             return None
-        return owners[0][1]
+        return owners[0][1], storage_offset * fake_tensor.element_size()
+
+    def tensor_descriptor_alignment_source(
+        self, fake_tensor: torch.Tensor
+    ) -> Source | None:
+        """Find the input whose base-alignment predicate applies to ``fake_tensor``.
+
+        A zero-offset, statically exact view has the same data pointer as its
+        unique input storage owner.  Layout legality remains a separate proof;
+        this only lets the descriptor reuse that owner's runtime alignment guard.
+        """
+        owner = self.tensor_alignment_owner(fake_tensor)
+        if owner is None or owner[1] != 0:
+            return None
+        return owner[0]
 
     def snapshot_tensor_descriptor_alignments(
         self, root_values: typing.Mapping[str, object]

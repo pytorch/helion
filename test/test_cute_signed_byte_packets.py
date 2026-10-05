@@ -17,7 +17,7 @@ import helion
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
-from helion._compiler.cute.memory_ops import _cute_signed_byte_packet_is_aligned
+from helion._compiler.cute.memory_ops import _cute_tile_packet_is_aligned
 from helion._compiler.cute.memory_ops import (
     register_persistent_vec_alignment_specializations,
 )
@@ -135,6 +135,13 @@ class _BindingFacts:
     def tensor_input_source(self, tensor: torch.Tensor) -> object:
         return self.source if tensor is self.tensor else None
 
+    def tensor_alignment_owner(self, tensor: torch.Tensor) -> tuple[object, int] | None:
+        source = self.tensor_input_source(tensor)
+        return None if source is None else (source, 0)
+
+    def tensor_storage_is_compiler_allocated(self, tensor: torch.Tensor) -> bool:
+        return False
+
     def register_runtime_input_specialization(self, key: str, value: Any) -> None:
         self.runtime_input_specializations[key] = value
 
@@ -164,7 +171,7 @@ def test_bound_residues_admit_exact_packet_alignment(
     tensor = _view(offset, stride)
     env = _BindingFacts(tensor)
     env.snapshot()
-    assert _cute_signed_byte_packet_is_aligned(env, tensor, 1, width)
+    assert _cute_tile_packet_is_aligned(env, tensor, 1, width, flat=False)
 
 
 @pytest.mark.parametrize(
@@ -188,7 +195,22 @@ def test_unproved_alignment_and_unsupported_widths_decline(
     tensor = _view(offset, stride, lane_stride)
     env = _BindingFacts(tensor)
     env.snapshot()
-    assert not _cute_signed_byte_packet_is_aligned(env, tensor, 1, width)
+    assert not _cute_tile_packet_is_aligned(env, tensor, 1, width, flat=False)
+
+
+@pytest.mark.parametrize(
+    ("offset", "stride", "aligned"),
+    ((0, 129, True), (0, 130, True), (8, 129, True), (4, 128, False), (1, 128, False)),
+)
+def test_flat_packets_need_only_the_base(
+    offset: int, stride: int, aligned: bool
+) -> None:
+    # A flat packet addresses a contiguous cover of the tile, so only the
+    # base residue decides; the outer stride is not part of its address.
+    tensor = _view(offset, stride)
+    env = _BindingFacts(tensor)
+    env.snapshot()
+    assert _cute_tile_packet_is_aligned(env, tensor, 1, 8, flat=True) is aligned
 
 
 @pytest.mark.parametrize("missing", ("source", "registration", "snapshot", "entry"))
@@ -206,7 +228,7 @@ def test_missing_bound_proof_declines(missing: str) -> None:
         env.bound_runtime_input_specialization_results[
             _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
         ] = (None,)
-    assert not _cute_signed_byte_packet_is_aligned(env, tensor, 1, 8)
+    assert not _cute_tile_packet_is_aligned(env, tensor, 1, 8, flat=False)
 
 
 @pytest.mark.parametrize(
@@ -217,8 +239,10 @@ def test_missing_bound_proof_declines(missing: str) -> None:
         (torch.float16, True),
         (torch.bfloat16, True),
         (torch.float32, True),
+        (torch.int16, True),
+        (torch.int32, True),
         (torch.uint8, False),
-        (torch.int16, False),
+        (torch.int64, False),
         (torch.bool, False),
     ),
 )

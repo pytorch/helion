@@ -157,6 +157,25 @@ class TestCuteVloopSink(TestCase):
         self.assertNotIn("_vsink", code)
         self.assertNotIn(FRAGMENT_REDUCE, code)
 
+    def test_a_misaligned_input_view_declines_and_stays_correct(self) -> None:
+        """A view whose base is four bytes into its allocation cannot take the
+        8-byte sunk packet: the pass declines (it shares the tile hoist's base
+        proof) and the knob-off code runs instead of faulting on a misaligned
+        address."""
+        x = torch.randn(4096, 4112, device=DEVICE, dtype=torch.bfloat16)[:, 2:4098]
+        self.assertEqual(x.data_ptr() % 8, 4)
+        config = _sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+        )
+        code, out = code_and_output(col_reduce_sum_static, (x,), **config)
+        code_off, out_off = code_and_output(
+            col_reduce_sum_static, (x,), **{**config, "cute_vloop_sink": False}
+        )
+        torch.testing.assert_close(out, _col_sum(x), atol=2e-2, rtol=2e-2)
+        self.assertEqual(code, code_off)
+        self.assertTrue(torch.equal(out, out_off))
+        self.assertNotIn("_vsink", code)
+
     def test_row_weighted_mean(self) -> None:
         """A row-only weight load and a row-only sum next to the column sum:
         both become per-lane state; partial tiles on both axes."""

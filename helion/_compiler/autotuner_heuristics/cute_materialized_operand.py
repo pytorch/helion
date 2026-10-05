@@ -60,6 +60,7 @@ class CuteMaterializedOperandHeuristic(AutotunerHeuristic):
         plan = env.cute_fission_plan
         assert plan is not None
         spec = env.config_spec
+        state = spec._cute_tcgen05_config
         [region_index] = plan.pointwise_region_indices
         axes = device_ir.grid_block_ids[region_index]
         if len(axes) != 2:
@@ -84,58 +85,58 @@ class CuteMaterializedOperandHeuristic(AutotunerHeuristic):
         column_slot = spec.block_sizes.block_id_to_index(column_id)
         row_fragment = fragments[row_slot]
         column_fragment = fragments[column_slot]
-        # Retain the original persistent seeds even though independent
-        # pointwise grids can now search below the occupancy heuristic floor.
-        row_spec = spec.block_sizes[row_slot]
         column_spec = spec.block_sizes[column_slot]
-        rows = min(max(row_spec.min_size, row_spec.autotuner_min), row_spec.max_size)
         column_low = min(
             max(column_spec.min_size, column_spec.autotuner_min), column_spec.max_size
         )
         columns = min(max(128 * vector, column_low), column_fragment.high)
         vector = min(vector, columns)
-        threads = min(128, columns // vector)
+        # One 16-byte packet per thread and a 128-thread CTA. The producer is a
+        # single cold pass over the operand: a thread that owns several rows
+        # serializes its DRAM round trips, and a CTA narrower than a warp
+        # quartet leaves the SM's load queue idle. When the column tile holds
+        # fewer than 128 packets, stack rows across threads instead of looping.
+        column_threads = min(128, columns // vector)
+        row_threads = max(
+            row_fragment.low, min(128 // column_threads, row_fragment.high)
+        )
+        rows = row_threads
         configs = []
         for native in native_seeds:
             block_sizes = native.block_sizes.copy()
             block_sizes[row_slot] = rows
             block_sizes[column_slot] = columns
-            configs.append(
-                Config.from_dict(
-                    native.config
-                    | {
-                        "block_sizes": block_sizes,
-                        "num_threads": cast(
-                            "list[int]",
-                            _seq_config_list(
-                                spec.num_threads, {row_id: 1, column_id: threads}
-                            ),
-                        ),
-                        "cute_vector_widths": cast(
-                            "list[int]",
-                            _seq_config_list(
-                                spec.cute_vector_widths, {column_id: vector}
-                            ),
-                        ),
-                        "cute_lane_layouts": _seq_config_list(
-                            spec.cute_lane_layouts, {}
-                        ),
-                    }
-                )
-            )
+            values = native.config | {
+                "block_sizes": block_sizes,
+                "num_threads": cast(
+                    "list[int]",
+                    _seq_config_list(
+                        spec.num_threads,
+                        {row_id: row_threads, column_id: column_threads},
+                    ),
+                ),
+                "cute_vector_widths": cast(
+                    "list[int]",
+                    _seq_config_list(spec.cute_vector_widths, {column_id: vector}),
+                ),
+                "cute_lane_layouts": _seq_config_list(spec.cute_lane_layouts, {}),
+            }
+            # The consumer's TMA role waits on the producer grid instead of the
+            # launch boundary, so its prologue (barrier init, TMEM allocation,
+            # descriptor prefetch) overlaps the producer's tail. The proof and
+            # schedule gates decide admission; the seed only asks for it.
+            if state.materialized_operand_pdl_supported(values):
+                values["tcgen05_materialized_pdl"] = True
+            configs.append(Config.from_dict(values))
         if tuple(axes) in spec.cute_pointwise_region_grid_groups:
-            flat_configs = []
-            for config in configs:
-                block_sizes = config.block_sizes.copy()
-                block_sizes[row_slot] = row_fragment.low
-                flat_configs.append(
+            # A flat producer grid launches one CTA per tile; the persistent
+            # grid above serializes tiles once there are more of them than SMs.
+            configs.extend(
+                [
                     Config.from_dict(
-                        config.config
-                        | {
-                            "block_sizes": block_sizes,
-                            "cute_pointwise_pid_type": "flat",
-                        }
+                        config.config | {"cute_pointwise_pid_type": "flat"}
                     )
-                )
-            configs.extend(flat_configs)
+                    for config in configs
+                ]
+            )
         return dedupe_configs(configs)

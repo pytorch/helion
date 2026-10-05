@@ -6231,6 +6231,78 @@ def _build_initial_prefetch_if(
     return statement_from_string(src)
 
 
+def _build_split_initial_prefetch(
+    args: _InitialPrefetchTmaArgs,
+    *,
+    stages: list[tuple[list[str], str, bool]],
+    dependent_side: str,
+    clone_state: str,
+    clone_barrier: str,
+    gate_tma_warp: bool,
+) -> list[ast.stmt]:
+    """Initial prefetch split around a programmatic dependency wait.
+
+    A materialized operand is produced by the kernel launched just ahead of
+    this one; the other operand is an ordinary input. Every stage's
+    ``producer_acquire`` arms its transaction barrier for both operands, so
+    the independent operand's TMA loads can be issued for all initial stages
+    first, then the TMA warp waits on the producer grid, then the dependent
+    operand's loads complete the same barriers. ``producer_commit`` is a no-op
+    for TMA pipelines (the transaction bytes complete the phase), so the
+    barriers can be re-derived from a cloned producer state. Each entry of
+    ``stages`` is ``(full_tile_gates, k_offset, skip_producer_acquire)``.
+    """
+    if dependent_side == "rhs":
+        independent_src, dependent_src = (
+            _initial_prefetch_copy_a_src,
+            _initial_prefetch_copy_b_src,
+        )
+    else:
+        independent_src, dependent_src = (
+            _initial_prefetch_copy_b_src,
+            _initial_prefetch_copy_a_src,
+        )
+
+    def predicate(gates: list[str]) -> str:
+        return " and ".join([*gates, *([args.tma_warp] if gate_tma_warp else [])])
+
+    statements = [
+        statement_from_string(f"{clone_state} = {args.tma_producer_state}.clone()")
+    ]
+    for gates, k_offset, skip_producer_acquire in stages:
+        src = f"if {predicate(gates)}:\n"
+        if not skip_producer_acquire:
+            src += (
+                f"    {args.tma_pipeline}.producer_acquire({args.tma_producer_state})\n"
+            )
+        src += (
+            f"    {args.tma_barrier_ptr} = "
+            f"{args.tma_pipeline}.producer_get_barrier({args.tma_producer_state})\n"
+            + independent_src(args, k_offset=k_offset)
+            + emit_pipeline_advance(args.tma_producer_state, indent="    ")
+        )
+        statements.append(statement_from_string(src))
+    wait = "cute.arch.griddepcontrol_wait()"
+    statements.append(
+        statement_from_string(
+            f"if {args.tma_warp}:\n    {wait}" if gate_tma_warp else wait
+        )
+    )
+    dependent_args = replace(
+        args, tma_producer_state=clone_state, tma_barrier_ptr=clone_barrier
+    )
+    for gates, k_offset, _ in stages:
+        src = (
+            f"if {predicate(gates)}:\n"
+            f"    {clone_barrier} = "
+            f"{args.tma_pipeline}.producer_get_barrier({clone_state})\n"
+            + dependent_src(dependent_args, k_offset=k_offset)
+            + emit_pipeline_advance(clone_state, indent="    ")
+        )
+        statements.append(statement_from_string(src))
+    return statements
+
+
 def _is_persistent_pid_config(config: Mapping[str, object]) -> bool:
     pid_type = config.get("pid_type", "flat")
     return isinstance(pid_type, str) and pid_type.startswith("persistent")
@@ -12798,20 +12870,20 @@ def _emit_mma_pipeline(
                             ),
                             tma_load=tcgen05_use_role_local_tma_producer,
                         )
-                        stage0_prefetch = _build_initial_prefetch_if(
-                            prefetch_args,
-                            full_tile_gates=[tma_initial_full_tile],
-                            k_offset="cutlass.Int32(0)",
-                            skip_producer_acquire=(
-                                diagnose_skip_ab_producer_acquire
-                                or diagnose_skip_initial_ab_producer_acquire
-                            ),
-                            gate_tma_warp=not tcgen05_use_role_local_tma_producer,
-                        )
-                        prefix.append(stage0_prefetch)
-                        per_tile_stmts.append(stage0_prefetch)
-                        if tcgen05_use_role_local_tma_producer:
-                            tma_load_role_stmts.append(stage0_prefetch)
+                        # Per initial stage: the gate assignments emitted ahead
+                        # of its prefetch block, its full-tile gates, its k
+                        # offset and whether producer_acquire is skipped.
+                        initial_stages: list[tuple[list[str], list[str], str, bool]] = [
+                            (
+                                [],
+                                [tma_initial_full_tile],
+                                "cutlass.Int32(0)",
+                                bool(
+                                    diagnose_skip_ab_producer_acquire
+                                    or diagnose_skip_initial_ab_producer_acquire
+                                ),
+                            )
+                        ]
                         if tcgen05_ab_stage_count_value > 1:
                             # Warm every stage 1..ab_stage_count-1; each gated by
                             # an ``i+1``-k_tile fits-in-K predicate. The old
@@ -12820,14 +12892,13 @@ def _emit_mma_pipeline(
                             # ab>=3 leaves intermediate stages unarmed and the
                             # consumer ``consumer_wait`` deadlocks on stage 1
                             # phase 0. See cute_plan.md §6.9.1.
-                            _emit_per_tile(
+                            stage_gate_sources = [
                                 f"{tma_initial_next_full_tile} = "
                                 + _tcgen05_tma_tile_predicate(
                                     k_tile_start_expr=f"cutlass.Int32({bk * (tcgen05_ab_stage_count_value - 1)})",
                                     full_tile_end_expr=f"cutlass.Int32({bk * tcgen05_ab_stage_count_value})",
-                                ),
-                                tma_load=tcgen05_use_role_local_tma_producer,
-                            )
+                                )
+                            ]
                             for stage_idx in range(1, tcgen05_ab_stage_count_value):
                                 if stage_idx == tcgen05_ab_stage_count_value - 1:
                                     stage_gates = [
@@ -12838,28 +12909,101 @@ def _emit_mma_pipeline(
                                     stage_gate_var = df.new_var(
                                         f"tcgen05_tma_initial_stage_{stage_idx}_full_tile"
                                     )
-                                    _emit_per_tile(
+                                    stage_gate_sources.append(
                                         f"{stage_gate_var} = "
                                         + _tcgen05_tma_tile_predicate(
                                             k_tile_start_expr=f"cutlass.Int32({bk * stage_idx})",
                                             full_tile_end_expr=f"cutlass.Int32({bk * (stage_idx + 1)})",
-                                        ),
-                                        tma_load=tcgen05_use_role_local_tma_producer,
+                                        )
                                     )
                                     stage_gates = [
                                         tma_initial_full_tile,
                                         stage_gate_var,
                                     ]
-                                stage_prefetch = _build_initial_prefetch_if(
+                                initial_stages.append(
+                                    (
+                                        stage_gate_sources,
+                                        stage_gates,
+                                        f"cutlass.Int32({stage_idx})",
+                                        prefetch_args.skip_producer_acquire,
+                                    )
+                                )
+                                stage_gate_sources = []
+                        pdl_roots = (
+                            CompileEnvironment.current().config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
+                            if df.config.get("tcgen05_materialized_pdl", False)
+                            else None
+                        )
+                        # Gate assignments (source text) and prefetch blocks
+                        # (statements), in emission order.
+                        initial_prefetch: list[str | ast.stmt] = []
+                        if (
+                            pdl_roots is not None
+                            and not tcgen05_is_two_cta
+                            and not prefetch_args.skip_producer_advance
+                            and not prefetch_args.tma_gA2
+                        ):
+                            # Issue the ordinary input's loads for every
+                            # initial stage before waiting on the producer
+                            # grid; only the materialized operand's loads
+                            # wait. The prelude wait is skipped for this role.
+                            # The paired family keeps its prelude wait: its
+                            # leader-armed multicast barriers measured slower
+                            # with the loads split around the wait. Every
+                            # stage gate is assigned ahead of the split, whose
+                            # first block already reads them all.
+                            for (
+                                gate_sources,
+                                _gates,
+                                _k_offset,
+                                _skip,
+                            ) in initial_stages:
+                                initial_prefetch.extend(gate_sources)
+                            initial_prefetch.extend(
+                                _build_split_initial_prefetch(
                                     prefetch_args,
-                                    full_tile_gates=stage_gates,
-                                    k_offset=f"cutlass.Int32({stage_idx})",
+                                    stages=[
+                                        (gates, k_offset, skip_acquire)
+                                        for _sources, gates, k_offset, skip_acquire in initial_stages
+                                    ],
+                                    dependent_side=pdl_roots.dependent_side,
+                                    clone_state=df.new_var(
+                                        "tcgen05_pdl_producer_state"
+                                    ),
+                                    clone_barrier=df.new_var("tcgen05_pdl_barrier"),
                                     gate_tma_warp=not tcgen05_use_role_local_tma_producer,
                                 )
-                                prefix.append(stage_prefetch)
-                                per_tile_stmts.append(stage_prefetch)
-                                if tcgen05_use_role_local_tma_producer:
-                                    tma_load_role_stmts.append(stage_prefetch)
+                            )
+                            df.cute_state.tcgen05_pdl_wait_in_prefetch = True
+                        else:
+                            # Each stage's gates are assigned directly ahead of
+                            # its own prefetch block.
+                            for (
+                                gate_sources,
+                                gates,
+                                k_offset,
+                                skip_acquire,
+                            ) in initial_stages:
+                                initial_prefetch.extend(gate_sources)
+                                initial_prefetch.append(
+                                    _build_initial_prefetch_if(
+                                        prefetch_args,
+                                        full_tile_gates=gates,
+                                        k_offset=k_offset,
+                                        skip_producer_acquire=skip_acquire,
+                                        gate_tma_warp=not tcgen05_use_role_local_tma_producer,
+                                    )
+                                )
+                        for item in initial_prefetch:
+                            if isinstance(item, str):
+                                _emit_per_tile(
+                                    item, tma_load=tcgen05_use_role_local_tma_producer
+                                )
+                                continue
+                            prefix.append(item)
+                            per_tile_stmts.append(item)
+                            if tcgen05_use_role_local_tma_producer:
+                                tma_load_role_stmts.append(item)
     else:
         prefix.append(
             statement_from_string(

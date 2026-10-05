@@ -124,21 +124,20 @@ def _persistent_vec_alignment_matrix_signature(
 def register_persistent_vec_alignment_specializations(
     env: CompileEnvironment,
 ) -> None:
-    """Specialize persistent-vector candidates on runtime pointer alignment.
+    """Specialize vector-packet candidates on runtime pointer alignment.
 
     Dynamic FakeTensors intentionally carry symbolic storage offsets.  The
     branch-local vectorizer therefore consults the real input tensor during
-    codegen.  Register the corresponding address/stride residue in the bound
+    codegen, and the tile-packet admission reads the bound residues.  Register
+    the address/stride residue of every input whose dtype has a packet
+    lowering (explicit vectors, unroll carriers and byte packets) in the bound
     kernel cache key before any config is compiled, so a later unaligned view
     can never reuse code emitted for an aligned tensor.
     """
     sources = tuple(
         source
         for tensor in env.input_sources
-        if (
-            tensor.dtype in _CUTE_VECTOR_DTYPES
-            or tensor.dtype in (torch.float8_e4m3fn, torch.int8)
-        )
+        if (tensor.dtype in _CUTE_VECTOR_DTYPES or _cute_is_unroll_dtype(tensor.dtype))
         and (source := env.tensor_input_source(tensor)) is not None
     )
     if not sources:
@@ -316,43 +315,59 @@ def tensor_has_specialized_stride_multiple(
     )
 
 
+def cute_tensor_base_is_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
+) -> bool:
+    """Whether ``tensor``'s base pointer is a multiple of ``alignment`` bytes.
+
+    The base is proven by provenance, as for tensor descriptors: an input, or
+    a statically exact view that exactly one input owns, reads that input's
+    bound pointer residue plus the view's static byte offset, and a fresh
+    wrapper allocation is aligned to the allocator granularity less its
+    static storage offset.  Anything else (a view of two inputs' shared
+    storage, say) is refused rather than trusted.
+    """
+    if alignment <= 0 or _CUTE_VECTOR_MAX_BYTES % alignment:
+        return False
+    owner = env.tensor_alignment_owner(tensor)
+    if owner is not None:
+        source, offset_bytes = owner
+        signature = _bound_vec_alignment_signature(env, source)
+        return signature is not None and (signature[0] + offset_bytes) % alignment == 0
+    if env.tensor_storage_is_compiler_allocated(tensor):
+        offset = tensor.storage_offset()
+        return (
+            isinstance(offset, int)
+            and (offset * tensor.dtype.itemsize) % alignment == 0
+        )
+    return False
+
+
 def cute_reduction_vector_layout_aligned(
     env: CompileEnvironment, tensor: torch.Tensor, lane_dim: int, vec_width: int
 ) -> bool:
     """Whether every V-wide chunk along ``lane_dim`` is naturally aligned.
 
     A chunk base is a multiple of V along the lane dim, so the packet is
-    aligned exactly when the tensor's base is and every other stride is a
-    multiple of V elements: a 4100-wide bf16 row is only 8-byte aligned, and
-    an LDG.128 at the start of its second row faults.  Static strides are
-    checked directly; a symbolic stride is proven either as a multiple of V
-    through the size residues (the contiguous ``stride == extent`` case) or
-    through the bound stride residue of an input tensor.  The base is proven
-    by provenance, as for tensor descriptors: an input, or a zero-offset
-    statically exact view that exactly one input owns, reads that input's
-    bound pointer residue, and a fresh wrapper allocation is aligned to the
-    allocator granularity less its static storage offset.  Anything else (a
-    dtype-punning view of an input, say) is refused rather than trusted.
+    aligned exactly when the tensor's base is (``cute_tensor_base_is_aligned``)
+    and every other stride is a multiple of V elements: a 4100-wide bf16 row
+    is only 8-byte aligned, and an LDG.128 at the start of its second row
+    faults.  Static strides are checked directly; a symbolic stride is proven
+    either as a multiple of V through the size residues (the contiguous
+    ``stride == extent`` case) or through the bound stride residue of an
+    input tensor.  A static size-1 dim is exempt: it never contributes to an
+    address, and PyTorch gives it an arbitrary stride (``x.view(s, 1)`` and
+    ``torch.empty([n, 1])`` both have strides ``(1, 1)``).
     """
     if vec_width <= 1:
         return True
-    vector_bytes = vec_width * tensor.dtype.itemsize
-    source = env.tensor_descriptor_alignment_source(tensor)
-    if source is not None:
-        signature = _bound_vec_alignment_signature(env, source)
-        if signature is None or signature[0] % vector_bytes:
-            return False
-    elif env.tensor_storage_is_compiler_allocated(tensor):
-        offset = tensor.storage_offset()
-        if (
-            not isinstance(offset, int)
-            or (offset * tensor.dtype.itemsize) % vector_bytes
-        ):
-            return False
-    else:
+    if not cute_tensor_base_is_aligned(env, tensor, vec_width * tensor.dtype.itemsize):
         return False
     for dim in range(tensor.ndim):
         if dim == lane_dim:
+            continue
+        size = tensor.shape[dim]
+        if isinstance(size, int) and size == 1:
             continue
         stride = tensor.stride(dim)
         if isinstance(stride, int):
@@ -4104,23 +4119,37 @@ def _cute_relocate_above_vloop(scope: _CuteVloopScope, moved: list[ast.AST]) -> 
         relocation.apply(scope.body)
 
 
-def _cute_signed_byte_packet_is_aligned(
+def _cute_tile_packet_is_aligned(
     env: CompileEnvironment,
     tensor: torch.Tensor,
     lane_axis: int,
     vec_width: int,
+    *,
+    flat: bool,
 ) -> bool:
-    """Prove packed byte addresses from the bound pointer/stride residues."""
-    if vec_width not in (2, 4, 8) or not tensor_has_specialized_base_alignment(
-        env, tensor, vec_width
-    ):
+    """Prove a tile packet's addresses from the bound pointer/stride residues.
+
+    The hoist reads ``vec_width`` contiguous elements at a lane base that is
+    a multiple of V, so the packet is naturally aligned exactly when the
+    tensor base is aligned to the packet and every other stride is a multiple
+    of V elements (``cute_reduction_vector_layout_aligned``); a flat packet
+    addresses a contiguous tensor (``_cute_flat_multi_cover_ok``) and needs
+    only the base.  A 132-wide bf16 row or a view four elements into its
+    storage faults the 16-byte access, so an unprovable site stays on scalar
+    loads.  The lane axis must be the unit-stride dim, and byte packets ride
+    a packed integer carrier of at most eight bytes.
+    """
+    vector_bytes = vec_width * tensor.dtype.itemsize
+    if vec_width < 2 or _CUTE_VECTOR_MAX_BYTES % vector_bytes:
         return False
-    signature = _bound_vec_alignment_signature(env, env.tensor_input_source(tensor))
-    assert signature is not None  # The base-alignment proof checked this entry.
-    return all(
-        unit_stride if axis == lane_axis else residue % vec_width == 0
-        for axis, (unit_stride, residue) in enumerate(signature[2])
-    )
+    if tensor.dtype.itemsize == 1 and vec_width not in (2, 4, 8):
+        return False
+    if flat:
+        return cute_tensor_base_is_aligned(env, tensor, vector_bytes)
+    lane_stride = tensor.stride(lane_axis)
+    if not isinstance(lane_stride, int) or lane_stride != 1:
+        return False
+    return cute_reduction_vector_layout_aligned(env, tensor, lane_axis, vec_width)
 
 
 def _cute_tile_axis_block_id(idx: torch.SymInt) -> int | None:
@@ -4508,17 +4537,14 @@ def _cute_vector_load_ctx(
                 is None
             ):
                 return None
-        if tensor.dtype is torch.int8 and (
-            not _cute_signed_byte_packet_is_aligned(
-                env, tensor, stride1_tensor_dim, vec_width
-            )
-            or index_exprs[lane_axis_pos]
-            != _cute_active_index_var(state, inner_block_id)
-        ):
+        if tensor.dtype is torch.int8 and index_exprs[
+            lane_axis_pos
+        ] != _cute_active_index_var(state, inner_block_id):
             # The hoist substitutes the canonical lane base. Do not discard
-            # an affine/gather offset or assume alignment for a signed input.
+            # an affine/gather offset for a signed input.
             return None
-        if getattr(strategy, "_cute_flat_multi", False):
+        flat_multi = bool(getattr(strategy, "_cute_flat_multi", False))
+        if flat_multi:
             # Flattened multi-dim tile: the hoist emits FLAT base pointers
             # (``t.iterator + lane_base``), which is only sound when the
             # tensor is contiguous and covers the whole iteration space in
@@ -4545,6 +4571,13 @@ def _cute_vector_load_ctx(
             numel = env.block_sizes[inner_block_id].numel
             if not env.known_multiple(numel, vec_width):
                 return None
+        if not _cute_tile_packet_is_aligned(
+            env, tensor, stride1_tensor_dim, vec_width, flat=flat_multi
+        ):
+            # The lane base is a multiple of V, but the packet also needs an
+            # aligned tensor base and non-lane strides; prove both from the
+            # bound residues or stay scalar.
+            return None
         # Record the index_exprs position of the stride-1 lane axis so the
         # hoist substitutes the per-lane base there.  Row-major lhs loads
         # use the last position; a column-major rhs (K-major ``y``) uses
@@ -4575,11 +4608,14 @@ def _cute_record_sinkable_scalar_load(
     addresses the vectorized grid axis at the tensor's stride-1 dim with the
     plain per-element index, that axis is a zero-origin tile whose extent is
     a multiple of V (every V-wide chunk is V-aligned and lies entirely inside
-    or outside the extent), every other stride is a proven multiple of V and
-    the packet fits one 16-byte transaction, ``cute/sink_vector_loops.py``
-    can load the whole chunk once per row after interchanging the V-loop
-    into those loops.  The fact is keyed by the scalar pointer expression
-    the pass will find in the AST.
+    or outside the extent), the tensor's base and every other stride are
+    proven aligned for the packet and the packet fits one 16-byte
+    transaction, ``cute/sink_vector_loops.py`` can load the whole chunk once
+    per row after interchanging the V-loop into those loops.  The base and
+    stride proof is the tile hoist's (``cute_reduction_vector_layout_aligned``),
+    so a misaligned input view the hoist left on scalar loads is not widened
+    here either.  The fact is keyed by the scalar pointer expression the
+    pass will find in the AST.
     """
     from ..tile_strategy import DeviceGridState
 
@@ -4630,10 +4666,8 @@ def _cute_record_sinkable_scalar_load(
         or not wrapper.uniform_vector_mask
         or wrapper.vec_width * tensor.dtype.itemsize > _CUTE_VECTOR_MAX_BYTES
         or index_exprs[lane_axis_pos] != wrapper.index_var
-        or not all(
-            env.specialized_multiple(tensor.stride(dim), wrapper.vec_width)
-            for dim in range(tensor.ndim)
-            if dim != stride1_dim
+        or not cute_reduction_vector_layout_aligned(
+            env, tensor, stride1_dim, wrapper.vec_width
         )
     ):
         return

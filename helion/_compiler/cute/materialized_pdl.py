@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from typing import NamedTuple
 
 from ...language import memory_ops
 from .materialized_fission_codegen import _region_graph_ids
@@ -15,9 +16,18 @@ if TYPE_CHECKING:
     from .cute_mma import _CuteMmaNode
 
 
+class MaterializedOperandPdl(NamedTuple):
+    """Root identities of the proved producer/consumer edge and the MMA side
+    (``"lhs"`` or ``"rhs"``) that reads the materialized scratch tensor."""
+
+    producer: int
+    consumer: int
+    dependent_side: str
+
+
 def prove_materialized_operand_pdl(
     env: CompileEnvironment, device_ir: DeviceIR, candidate: _CuteMmaNode
-) -> tuple[int, int] | None:
+) -> MaterializedOperandPdl | None:
     """Recheck the typed materialization's fresh scratch edge after retracing.
 
     The original extractor proves the pure complete producer, unchanged inputs,
@@ -44,8 +54,18 @@ def prove_materialized_operand_pdl(
         for info in device_ir.graphs
     ):
         return None
-    scratch = candidate.operands.rhs.source_fake
-    if scratch not in _fresh_tensors(host):
+    # The materialized operand is the fresh scratch tensor on either side of
+    # the contraction (a transformed RHS recipe or a cast LHS recipe).
+    fresh = _fresh_tensors(host)
+    scratch = next(
+        (
+            operand.source_fake
+            for operand in (candidate.operands.rhs, candidate.operands.lhs)
+            if operand.source_fake in fresh
+        ),
+        None,
+    )
+    if scratch is None:
         return None
     stores = [
         node
@@ -56,4 +76,5 @@ def prove_materialized_operand_pdl(
     ]
     if not stores or any(_access_tensor(store) is not scratch for store in stores):
         return None
-    return producer, consumer
+    side = "rhs" if candidate.operands.rhs.source_fake is scratch else "lhs"
+    return MaterializedOperandPdl(producer, consumer, side)
