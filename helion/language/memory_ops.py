@@ -1175,6 +1175,8 @@ def _cute_register_tile_unroll_vec_hoist(
     lane_axis_pos: int | None = None,
     mask_expr: str | None = None,
     signed_byte_site: SignedByteSite | None = None,
+    uniform_mask: str | None = None,
+    lane_base_expr: str | None = None,
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for
     ``PerThreadNDTileStrategy`` lane loops.
@@ -1184,6 +1186,15 @@ def _cute_register_tile_unroll_vec_hoist(
     per-element extract expression so the existing scalar pipeline keeps
     working.  bf16/fp16 load as ``Uint16`` and bitcast; fp8 loads ``vec_width``
     bytes as one packed integer that the matmul fallback decodes downstream.
+
+    ``uniform_mask`` carries the mask terms other than the lane mask (an
+    outer tile mask, the bound of a gathered row coordinate, an
+    ``extra_mask`` proven uniform across the packet) that the caller proved
+    uniform across the V lanes and available above the V-loop.  They
+    predicate the packet's pointer: a masked thread loads the tensor's first
+    element instead, and the per-lane mask gate discards those bytes.
+    ``lane_base_expr`` replaces the block's lane base as the lane-axis
+    coordinate of the packet (``lane_base - n1`` for ``tile.index - n1``).
     """
     base_var_by_block = getattr(strategy, "_cute_lane_base_index_var_by_block", {})
     lane_body_by_block = getattr(strategy, "_cute_lane_body_by_block", {})
@@ -1215,9 +1226,11 @@ def _cute_register_tile_unroll_vec_hoist(
             else _cute_lane_axis_pos(strategy, block_id, index_exprs)
         )
         base_exprs = list(index_exprs)
-        base_exprs[lane_pos] = base_index_var
+        base_exprs[lane_pos] = (
+            base_index_var if lane_base_expr is None else lane_base_expr
+        )
         base_ptr_expr = _cute_scalar_pointer_expr(tensor_name, base_exprs)
-    cache_key = (tensor_name, base_ptr_expr)
+    cache_key = (tensor_name, base_ptr_expr, uniform_mask)
     cache_by_block = getattr(strategy, "_cute_lane_vec_loads_by_block", None)
     if cache_by_block is None:
         cache_by_block = {}
@@ -1278,7 +1291,12 @@ def _cute_register_tile_unroll_vec_hoist(
         is_grid_state = bool(loops_for_block) and isinstance(
             loops_for_block[-1], DeviceGridState
         )
-        if (
+        guard_terms: list[str] = []
+        if uniform_mask is not None:
+            # Outer-row / gathered-coordinate bounds the caller proved uniform
+            # across the V lanes decide the whole packet.
+            guard_terms.append(f"({uniform_mask})")
+        if not (
             mask_elided
             and isinstance(static_bs, int)
             and numel_int is not None
@@ -1286,6 +1304,8 @@ def _cute_register_tile_unroll_vec_hoist(
                 static_bs >= numel_int or (is_grid_state and numel_int % static_bs == 0)
             )
         ):
+            guard_terms.append(f"{base_index_var} < {numel_expr}")
+        if not guard_terms:
             # Single-trip tile loop whose block provably covers the extent
             # (the strategy elided the bounds mask): every per-thread vec
             # base is in-bounds and there is no next-iteration prefetch to
@@ -1307,9 +1327,16 @@ def _cute_register_tile_unroll_vec_hoist(
             else:
                 anchor_exprs = list(index_exprs)
                 anchor_exprs[lane_pos] = "0"
+                if uniform_mask is not None:
+                    # A masked outer row or gathered coordinate can itself be
+                    # out of range, so the anchor cannot keep it: point at the
+                    # tensor's first element instead (in bounds for any
+                    # non-empty tensor); the per-lane mask gate discards the
+                    # fetched bytes.
+                    anchor_exprs = ["0"] * len(anchor_exprs)
                 anchor_ptr_expr = _cute_scalar_pointer_expr(tensor_name, anchor_exprs)
             guarded_ptr = (
-                f"({base_ptr_expr} if {base_index_var} < {numel_expr} "
+                f"({base_ptr_expr} if {' and '.join(guard_terms)} "
                 f"else {anchor_ptr_expr})"
             )
         hoist_stmt = statement_from_string(
