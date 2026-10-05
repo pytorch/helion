@@ -1538,6 +1538,10 @@ class TestDistributedTileDependencies(TestCase):
             self.assertIn(f"(x, {2 * world * 4000 + 2}, torch.uint64, True)", code)
             self.assertNotIn("_wait_at_least", code)
             self.assertNotIn("_add_on_every_rank", code)
+        # Under dynamic tickets the poller waits only in band, yet still warms
+        # its code with a dry pass.
+        code = bound.to_triton_code({**config, "cross_loop_pipeline": "dynamic"})
+        self.assertEqual(code.count("for tile_dependency_dry_pass in"), 1)
         # A push may be the kernel's first tensor access.
         bound = pipelined_allreduce_kernel.bind((symm, x, group, "constant", world))
         code = bound.to_triton_code()

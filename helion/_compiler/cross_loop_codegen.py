@@ -2122,12 +2122,20 @@ def emit_cross_loop_schedule(
                 "because an inband scatter store must run once in every task"
             )
 
+    # Roots that poll in-band peer data wait on it in their bodies.
+    inband_consumer_roots = {
+        access.root
+        for access in dependency_graph.accesses
+        if dependency_graph.is_inband(access) and access.kind != "store"
+    }
+
     def waits_on_dependency(root: int) -> bool:
         return bool(
             root_barrier_incoming.get(root)
             or readiness_consumers_by_root.get(root)
             or nested_loop_counters_by_consumer.get(root)
             or any(consumer == root for _producer, consumer in peer_edges)
+            or root in inband_consumer_roots
         )
 
     def dry_pass_task(task_body: list[ast.stmt]) -> list[ast.stmt] | None:
