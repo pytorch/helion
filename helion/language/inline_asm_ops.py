@@ -53,9 +53,11 @@ def inline_asm_elementwise(
     tuple of tensors.
 
     Each invocation of the inline asm processes pack elements at a
-    time. Exactly which set of inputs a block receives is unspecified.
-    Input elements of size less than 4 bytes are packed into 4-byte
-    registers.
+    time. Exactly which set of inputs a block receives is unspecified,
+    and a backend may fill the pack slots of one invocation with
+    duplicate elements, so packed asm must compute each output slot
+    from its own input slot alone (slot-independent). Input elements of
+    size less than 4 bytes are packed into 4-byte registers.
 
     This op does not support empty dtype -- the inline asm must
     return at least one tensor, even if you don't need it. You can work
