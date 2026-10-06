@@ -1115,5 +1115,331 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
         self.assertNotIn("tl.atomic_add(", code)
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _atomic_logical_axes_2d(out, buckets, values, mode: hl.constexpr):
+    for row, col in hl.tile(values.shape):
+        if mode == "scatter":
+            index = buckets[row, col]
+            value = values[row, col]
+        elif mode == "broadcast_value":
+            index = buckets[row, 0][:, None]
+            value = values[row, col]
+        elif mode == "broadcast_constant":
+            index = buckets[row, 0][:, None]
+            value = 1
+        else:
+            index = buckets[row, 0][:, None]
+            value = hl.full([row, col], 1, dtype=values.dtype)
+        hl.atomic_add(out, [row.index[:, None], index], value)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _atomic_logical_axes_3d(out, buckets, values, scalar_plane: hl.constexpr):
+    for plane, row, col in hl.tile(values.shape):
+        index = buckets[plane, row, col]
+        value = values[plane, row, col]
+        if scalar_plane:
+            hl.atomic_add(out, [0, index], value)
+        else:
+            hl.atomic_add(out, [index], value)
+    return out
+
+
+def _atomic_logical_axes_codegen(kernel, inputs, tiles):
+    from unittest.mock import patch
+
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        bound = _cpu_bind(kernel, inputs)
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = tiles
+        return bound.to_code(config)
+
+
+def _execute_atomic_thread_program(source, inputs):
+    """Run the actual scalar source for each emitted CTA/thread, with CPU atomics."""
+    import ast
+    import itertools
+    from types import SimpleNamespace
+
+    current = {"block": (0, 0, 0), "thread": (0, 0, 0)}
+    atomic_calls = []
+
+    class Pointer:
+        def __init__(self, tensor, offset=0):
+            self.tensor, self.offset = tensor, int(offset)
+
+        def __add__(self, offset):
+            return Pointer(self.tensor, self.offset + int(offset))
+
+        @property
+        def llvm_ptr(self):
+            return self
+
+        def load(self):
+            assert 0 <= self.offset < self.tensor.numel()
+            return self.tensor.reshape(-1)[self.offset].item()
+
+        def store(self, value):
+            assert 0 <= self.offset < self.tensor.numel()
+            self.tensor.reshape(-1)[self.offset] = value
+
+    def atomic_add(pointer, val, sem):
+        assert sem == "relaxed"
+        atomic_calls.append((pointer.offset, val))
+        previous = pointer.load()
+        pointer.store(previous + val)
+        return previous
+
+    def launcher(function, grid, *arguments, block):
+        args = [
+            SimpleNamespace(
+                iterator=Pointer(arg), layout=SimpleNamespace(stride=arg.stride())
+            )
+            if isinstance(arg, torch.Tensor)
+            else arg
+            for arg in arguments
+        ]
+        for cta in itertools.product(*(range(size) for size in grid)):
+            current["block"] = (*cta, *((0,) * (3 - len(cta))))
+            for thread in itertools.product(*(range(size) for size in block)):
+                current["thread"] = thread
+                function(*args)
+
+    tree = ast.parse(source)
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.FunctionDef):
+            node.decorator_list = []
+        body.append(node)
+    namespace = {
+        "torch": torch,
+        "hl": hl,
+        "cutlass": SimpleNamespace(Int32=int, Int64=int, Float32=float),
+        "cute": SimpleNamespace(
+            crd2idx=lambda coords, layout: sum(
+                c * s for c, s in zip(coords, layout.stride, strict=True)
+            ),
+            arch=SimpleNamespace(
+                block_idx=lambda: current["block"],
+                thread_idx=lambda: current["thread"],
+                atomic_add=atomic_add,
+            ),
+        ),
+        "_default_cute_launcher": launcher,
+        "_next_power_of_2": lambda value: 1 << (value - 1).bit_length(),
+    }
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])),
+            "<actual-atomic-thread-program>",
+            "exec",
+        ),
+        namespace,
+    )
+    wrapper = next(
+        node.name for node in reversed(body) if isinstance(node, ast.FunctionDef)
+    )
+    result = namespace[wrapper](*inputs)
+    return result, atomic_calls
+
+
+class TestAtomicLogicalAxesCPU(unittest.TestCase):
+    def test_data_dependent_and_broadcast_atomic_contributions(self):
+        for shape, tiles in [((3, 19), [4, 8]), ((5, 7), [2, 4])]:
+            for mode in (
+                "scatter",
+                "broadcast_value",
+                "broadcast_constant",
+                "broadcast_tensor_constant",
+            ):
+                for dtype in (torch.int32, torch.float32):
+                    with self.subTest(shape=shape, mode=mode, dtype=dtype):
+                        values = (
+                            torch.arange(1, 1 + shape[0] * shape[1])
+                            .reshape(shape)
+                            .to(dtype)
+                        )
+                        buckets = (torch.arange(values.numel()).reshape(shape) % 3).to(
+                            torch.int32
+                        )
+                        out = torch.zeros((shape[0], 3), dtype=dtype)
+                        inputs = (out, buckets, values, mode)
+                        source = _atomic_logical_axes_codegen(
+                            _atomic_logical_axes_2d, inputs, tiles
+                        )
+                        actual, calls = _execute_atomic_thread_program(source, inputs)
+                        expected = torch.zeros_like(out)
+                        if mode == "broadcast_constant":
+                            contributions = (shape[1] + tiles[1] - 1) // tiles[1]
+                            for row in range(shape[0]):
+                                expected[row, buckets[row, 0]] = contributions
+                            expected_calls = shape[0] * contributions
+                        else:
+                            for row in range(shape[0]):
+                                for col in range(shape[1]):
+                                    bucket = (
+                                        buckets[row, col]
+                                        if mode == "scatter"
+                                        else buckets[row, 0]
+                                    )
+                                    value = (
+                                        1
+                                        if mode == "broadcast_tensor_constant"
+                                        else values[row, col]
+                                    )
+                                    expected[row, bucket] += value
+                            expected_calls = values.numel()
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        self.assertEqual(len(calls), expected_calls)
+
+    def test_three_dimensional_and_mixed_scalar_tensor_atomic_contributions(self):
+        for scalar_plane in (False, True):
+            with self.subTest(scalar_plane=scalar_plane):
+                shape = (3, 5, 9)
+                values = torch.arange(1, 136, dtype=torch.int32).reshape(shape)
+                buckets = (values % 7).to(torch.int32)
+                out = torch.zeros((1, 7) if scalar_plane else (7,), dtype=values.dtype)
+                inputs = (out, buckets, values, scalar_plane)
+                source = _atomic_logical_axes_codegen(
+                    _atomic_logical_axes_3d, inputs, [2, 4, 4]
+                )
+                actual, calls = _execute_atomic_thread_program(source, inputs)
+                expected = torch.zeros(7, dtype=values.dtype).scatter_add_(
+                    0, buckets.flatten().long(), values.flatten()
+                )
+                torch.testing.assert_close(actual.flatten(), expected, rtol=0, atol=0)
+                self.assertEqual(len(calls), values.numel())
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _atomic_logical_axes_ghost(out, copied, values, row_values):
+    for row in hl.tile(values.size(0)):
+        for col in hl.tile(values.size(1)):
+            copied[row, col] = values[row, col]
+        hl.atomic_add(out, [row], row_values[row])
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _atomic_logical_axes_reduced(out, values):
+    for row, col in hl.tile(values.shape):
+        total = values[row, col].sum(-1)
+        hl.atomic_add(out, [row], total)
+    return out
+
+
+class TestAtomicLogicalAxisLeadersCPU(unittest.TestCase):
+    def test_ghost_axis_contributes_once_after_nested_loop(self):
+        values = torch.arange(15, dtype=torch.int32).reshape(3, 5)
+        row_values = values.sum(-1).to(torch.int32)
+        out = torch.zeros(3, dtype=torch.int32)
+        copied = torch.full_like(values, -1)
+        inputs = (out, copied, values, row_values)
+        source = _atomic_logical_axes_codegen(
+            _atomic_logical_axes_ghost, inputs, [2, 4]
+        )
+        result, calls = _execute_atomic_thread_program(source, inputs)
+        torch.testing.assert_close(copied, values, rtol=0, atol=0)
+        torch.testing.assert_close(result, row_values, rtol=0, atol=0)
+        self.assertEqual(len(calls), 3)
+
+
+@onlyBackends("cute")
+class TestAtomicLogicalAxesNative(TestCase):
+    def test_atomic_rank_two_contribution_domain(self):
+        for mode in (
+            "scatter",
+            "broadcast_value",
+            "broadcast_constant",
+            "broadcast_tensor_constant",
+        ):
+            with self.subTest(mode=mode):
+                values = torch.arange(1, 58, device=DEVICE, dtype=torch.int32).reshape(
+                    3, 19
+                )
+                buckets = values % 7
+                out = torch.zeros((3, 7), device=DEVICE, dtype=values.dtype)
+                expected = torch.zeros_like(out)
+                if mode == "scatter":
+                    expected.scatter_add_(1, buckets.long(), values)
+                elif mode == "broadcast_value":
+                    expected.scatter_add_(
+                        1,
+                        buckets[:, :1].long(),
+                        values.sum(-1, keepdim=True).to(values.dtype),
+                    )
+                else:
+                    expected.scatter_add_(
+                        1,
+                        buckets[:, :1].long(),
+                        torch.full(
+                            (3, 1),
+                            3 if mode == "broadcast_constant" else 19,
+                            device=DEVICE,
+                            dtype=values.dtype,
+                        ),
+                    )
+                _, result = code_and_output(
+                    _atomic_logical_axes_2d,
+                    (out, buckets, values, mode),
+                    block_sizes=[4, 8],
+                )
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    def test_atomic_rank_three_contribution_domain(self):
+        for scalar_plane in (False, True):
+            with self.subTest(scalar_plane=scalar_plane):
+                values = torch.arange(1, 136, device=DEVICE, dtype=torch.int32).reshape(
+                    3, 5, 9
+                )
+                buckets = values % 7
+                out = torch.zeros(
+                    (1, 7) if scalar_plane else (7,), device=DEVICE, dtype=values.dtype
+                )
+                expected = torch.zeros(
+                    7, device=DEVICE, dtype=values.dtype
+                ).scatter_add_(0, buckets.flatten().long(), values.flatten())
+                _, result = code_and_output(
+                    _atomic_logical_axes_3d,
+                    (out, buckets, values, scalar_plane),
+                    block_sizes=[2, 4, 4],
+                )
+                torch.testing.assert_close(result.flatten(), expected, rtol=0, atol=0)
+
+    def test_atomic_reduced_value_leaders(self):
+        values = torch.arange(15, device=DEVICE, dtype=torch.float32).reshape(3, 5)
+        out = torch.zeros(3, device=DEVICE)
+        _, result = code_and_output(
+            _atomic_logical_axes_reduced, (out, values), block_sizes=[2, 4]
+        )
+        torch.testing.assert_close(result, values.sum(-1), rtol=0, atol=0)
+
+    def test_atomic_ghost_axis_leaders(self):
+        values = torch.arange(15, device=DEVICE, dtype=torch.int32).reshape(3, 5)
+        row_values = values.sum(-1).to(torch.int32)
+        out = torch.zeros(3, device=DEVICE, dtype=torch.int32)
+        copied = torch.full_like(values, -1)
+        _, result = code_and_output(
+            _atomic_logical_axes_ghost,
+            (out, copied, values, row_values),
+            block_sizes=[2, 4],
+        )
+        torch.testing.assert_close(copied, values, rtol=0, atol=0)
+        torch.testing.assert_close(result, row_values, rtol=0, atol=0)
+
+
 if __name__ == "__main__":
     unittest.main()

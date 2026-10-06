@@ -21,7 +21,6 @@ STRUCTURAL_POLICY = helion.CuteStructuralPolicy(
 
 _DEFAULT_CONFIG = {
     "block_sizes": [32],
-    "reduction_loops": [32],
     "cute_topk_lanes_per_row": 8,
     "cute_topk_rows_per_block": 64,
     "cute_topk_vector_width": 8,
@@ -88,7 +87,6 @@ _CONFIG_OVERRIDES = {
     },
     (65536, 256, 8, False): {
         "block_sizes": [16],
-        "reduction_loops": [64],
         "cute_proven_bounds": False,
         "cute_topk_lanes_per_row": 4,
         "cute_topk_vector_width": 4,
@@ -97,7 +95,6 @@ _CONFIG_OVERRIDES = {
     },
     (65536, 256, 16, False): {
         "block_sizes": [16],
-        "reduction_loops": [64],
         "cute_proven_bounds": False,
         "cute_topk_lanes_per_row": 4,
         "cute_topk_rows_per_block": 32,
@@ -105,14 +102,12 @@ _CONFIG_OVERRIDES = {
     },
     (65536, 256, 32, False): {
         "block_sizes": [16],
-        "reduction_loops": [64],
         "cute_proven_bounds": False,
         "cute_topk_lanes_per_row": 4,
         "cute_topk_rows_per_block": 32,
     },
     (65536, 512, 8, False): {
         "block_sizes": [1],
-        "reduction_loops": [None],
         "cute_proven_bounds": False,
         "cute_topk_rows_per_block": 16,
         "cute_topk_key_dtype": "float32_bits",
@@ -121,7 +116,6 @@ _CONFIG_OVERRIDES = {
     },
     (65536, 512, 16, False): {
         "block_sizes": [1],
-        "reduction_loops": [None],
         "cute_proven_bounds": False,
         "cute_topk_rows_per_block": 16,
         "cute_topk_vector_width": 2,
@@ -131,13 +125,11 @@ _CONFIG_OVERRIDES = {
     },
     (65536, 512, 32, False): {
         "block_sizes": [1],
-        "reduction_loops": [None],
         "cute_proven_bounds": False,
         "cute_topk_rows_per_block": 4,
     },
     (65536, 1024, 8, False): {
         "block_sizes": [1],
-        "reduction_loops": [None],
         "cute_proven_bounds": False,
         "cute_topk_rows_per_block": 8,
         "cute_topk_key_dtype": "float32_bits",
@@ -145,7 +137,6 @@ _CONFIG_OVERRIDES = {
     },
     (65536, 1024, 16, False): {
         "block_sizes": [1],
-        "reduction_loops": [None],
         "cute_proven_bounds": False,
         "cute_topk_rows_per_block": 8,
         "cute_topk_output_vector_width": 8,
@@ -153,7 +144,6 @@ _CONFIG_OVERRIDES = {
     },
     (65536, 1024, 32, False): {
         "block_sizes": [1],
-        "reduction_loops": [None],
         "cute_proven_bounds": False,
         "cute_topk_lanes_per_row": 16,
         "cute_topk_rows_per_block": 4,
@@ -267,8 +257,14 @@ _CONFIG_OVERRIDES = {
     },
 }
 
+# Selection requires its complete input axis, so only the selected-value
+# softmax contributes a rollable reduction axis to the current config schema.
 _CONFIGS = {
-    shape: {**_DEFAULT_CONFIG, **overrides}
+    shape: {
+        **_DEFAULT_CONFIG,
+        "reduction_loops": [32] if shape[-1] else [],
+        **overrides,
+    }
     for shape, overrides in _CONFIG_OVERRIDES.items()
 }
 # Standalone AOT compilation can inspect the complete config set.

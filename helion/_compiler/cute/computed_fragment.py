@@ -17,15 +17,12 @@ from typing import cast
 
 import sympy
 import torch
-from torch._dynamo.source import TensorProperty
-from torch._dynamo.source import TensorPropertySource
 from torch._inductor.ir import Reduction
 from torch._inductor.virtualized import V
 from torch.fx import Node
 from torch.fx.node import map_arg
 
 from ... import exc
-from ..._compat import shape_env_size_hint
 from ...language import _tracing_ops
 from ...language import creation_ops
 from ...language import inline_asm_ops
@@ -50,12 +47,15 @@ from ..inductor_lowering import SympyExprLowering
 from ..inductor_lowering import install_inductor_kernel_handlers
 from ..matmul_utils import _compute_out_dtype
 from ..matmul_utils import _needs_f32_accumulator
-from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
 from ..variable_origin import TileIdOrigin
+from .captured_reduction import captured_reduction_coordinates
 from .fragment_expression import FragmentExpression
+from .fragment_storage import aligned_shared_bytes
+from .fragment_storage import configured_fragment_expr
+from .fragment_storage import metadata_guarded
 from .independent_reduction import independent_reduction_coordinates
 from .tcgen05_config import CuteTcgen05Config
 
@@ -203,67 +203,10 @@ class FragmentCompiler:
         ]
 
     def metadata_guarded(self, expr: sympy.Expr) -> bool:
-        if "input_tensor_metadata" not in self.env.compiler_fact_specialization_facts:
-            return False
-        # The exact metadata guard covers sizes and strides, not runtime scalar
-        # arguments, device values, or storage offsets.
-        return all(
-            isinstance(symbol, sympy.Symbol)
-            and any(
-                isinstance(source, TensorPropertySource)
-                and source.prop in (TensorProperty.SIZE, TensorProperty.STRIDE)
-                for source in self.env.shape_env.var_to_sources.get(symbol, ())
-            )
-            for symbol in expr.free_symbols
-        )
+        return metadata_guarded(self.env, expr)
 
     def configured_expr(self, value: sympy.Basic) -> sympy.Basic:
-        """Resolve logical dimensions using their owning block, not aliases.
-
-        Reduction blocks can reuse a tile symbol or have a derived full-axis
-        extent. Fragment roots own their iteration/reduction geometry, so a
-        reduction's logical numel is required rather than a padded tracing hint.
-        Runtime symbols with no block-size origin remain symbolic.
-        """
-        origins = HostFunction.current().expr_to_origin
-
-        def resolve(expr: sympy.Basic, visiting: frozenset[sympy.Basic]) -> sympy.Basic:
-            substitutions = {}
-            for symbol in expr.free_symbols:
-                info = origins.get(symbol)
-                if info is None or not isinstance(info.origin, BlockSizeOrigin):
-                    continue
-                if symbol in visiting:
-                    raise exc.InvalidConfig(
-                        f"cyclic computed fragment block-size extent: {symbol}"
-                    )
-                block = self.env.block_sizes[info.origin.block_id]
-                replacement = (
-                    block.numel
-                    if block.reduction
-                    else self.df.resolved_block_size(block.block_id)
-                )
-                if replacement is None:
-                    continue
-                if isinstance(replacement, torch.SymInt):
-                    replacement = replacement._sympy_()
-                resolved = resolve(sympy.sympify(replacement), visiting | {symbol})
-                if block.reduction:
-                    logical = self.env.specialize_expr(sympy.sympify(resolved))
-                    if logical.free_symbols and self.metadata_guarded(logical):
-                        # Storage has a static capacity; masks and scans still
-                        # use block.numel's runtime logical bound. Exact tensor
-                        # metadata in the binding key makes this hint a proof,
-                        # including when a direct BoundKernel call is replayed.
-                        resolved = sympy.Integer(
-                            self.env.backend.static_rdim_size(
-                                max(1, shape_env_size_hint(self.env.shape_env, logical))
-                            )
-                        )
-                substitutions[symbol] = resolved
-            return expr.xreplace(substitutions)
-
-        return resolve(value, frozenset())
+        return configured_fragment_expr(self.env, value, self.df.resolved_block_size)
 
     def extent(self, value: object) -> int:
         if isinstance(value, int):
@@ -408,7 +351,7 @@ class FragmentCompiler:
         if selected is None:
             name = self.df.new_var("fragment_buffer")
             self.buffers.append((name, value.dtype, count))
-            self.smem_bytes += (count * value.dtype.itemsize + 15) // 16 * 16
+            self.smem_bytes += aligned_shared_bytes(count, value.dtype)
         else:
             capacity, name, index = selected
             if capacity >= count:
@@ -418,9 +361,9 @@ class FragmentCompiler:
                 # grow for its next lifetime without retaining a separate size
                 # class in shared memory; earlier flat indices stay valid.
                 self.buffers[index] = (name, value.dtype, count)
-                self.smem_bytes += (count * value.dtype.itemsize + 15) // 16 * 16 - (
-                    capacity * value.dtype.itemsize + 15
-                ) // 16 * 16
+                self.smem_bytes += aligned_shared_bytes(
+                    count, value.dtype
+                ) - aligned_shared_bytes(capacity, value.dtype)
         return Fragment(
             value.shape,
             value.dtype,
@@ -1079,6 +1022,15 @@ class FragmentCompiler:
         info = self.graphs[cast("int", node.args[1])]
         assert isinstance(info, IfGraphInfo)
         assert info.branches_outputs is not None
+        for side, names in enumerate((info.if_arg_names, info.else_arg_names)):
+            assert names is not None
+            if any(
+                isinstance(slots[side], str) and slots[side] not in names
+                for slots in info.branches_outputs
+            ):
+                raise exc.InvalidConfig(
+                    "computed fragment conditional requires a captured unchanged output"
+                )
         merged: list[Fragment] = []
         self.held.append(merged)
         fake_outputs = cast("list[torch.Tensor]", node.meta["val"])
@@ -1383,6 +1335,7 @@ def computed_fragment_supported(
     """
     graph_by_id = {info.graph_id: info for info in graphs}
     independent_reductions = independent_reduction_coordinates(env, graphs)
+    captured_reductions = captured_reduction_coordinates(env, graphs)
 
     def configured_axis(size: int | torch.SymInt) -> bool:
         if isinstance(size, int):
@@ -1461,7 +1414,7 @@ def computed_fragment_supported(
         return len(sizes) != len(set(sizes))
 
     def needs_coordinates(node: Node) -> bool:
-        if node in independent_reductions:
+        if node in independent_reductions or node in captured_reductions:
             return True
         if node.target is _tracing_ops._host_tensor:
             return False
@@ -1710,16 +1663,33 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         fragment_warp_reduction_supported,
     )
 
-    if (
-        CompileEnvironment.current().backend_name != "cute"
-        or len(cg.host_function.device_ir.root_ids) != 1
-        or cg.device_function.config.get("cute_collective_mma", False)
-        or cg.device_function.config.get("cute_register_chain", False)
-    ):
+    env = CompileEnvironment.current()
+    if env.backend_name != "cute":
         return False
     root = cg.current_root_graph_info
     assert root is not None
-    graphs = cg.codegen_graphs
+    captured_required = bool(
+        captured_reduction_coordinates(
+            env, cg.host_function.device_ir.graphs, root_graph_id=root.graph_id
+        )
+    )
+    if (
+        len(cg.host_function.device_ir.root_ids) != 1
+        or cg.device_function.config.get("cute_collective_mma", False)
+        or cg.device_function.config.get("cute_register_chain", False)
+    ):
+        if captured_required:
+            raise exc.InvalidConfig(
+                "captured full reductions require a computed fragment root"
+            )
+        return False
+    graphs = (
+        cg.host_function.device_ir.build_codegen_graphs(
+            cg.device_function.config, roll_reductions=False
+        )
+        if captured_required
+        else cg.codegen_graphs
+    )
 
     scan_required = (
         cg.device_function.config.get("cute_fragment_scan", "serial") == "cooperative"
@@ -1733,9 +1703,11 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     )
 
     def decline() -> bool:
-        if scan_required or reduction_required:
+        if captured_required or scan_required or reduction_required:
             raise exc.InvalidConfig(
-                "cooperative scan requires a computed fragment root"
+                "captured full reductions require a computed fragment root"
+                if captured_required
+                else "cooperative scan requires a computed fragment root"
                 if scan_required
                 else "warp reduction requires a computed fragment root"
             )
@@ -1758,9 +1730,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     # This owner implements configured reduction tiling directly. Keep the
     # logical producer graph, including every other codegen transformation,
     # rather than applying scalar graph rolling before fragment ownership.
-    graphs = cg.host_function.device_ir.build_codegen_graphs(
-        cg.device_function.config, roll_reductions=False
-    )
+    if not captured_required:
+        graphs = cg.host_function.device_ir.build_codegen_graphs(
+            cg.device_function.config, roll_reductions=False
+        )
     if not computed_fragment_supported(CompileEnvironment.current(), graphs):
         return decline()
     root = graphs[root.graph_id]

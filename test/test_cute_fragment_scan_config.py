@@ -613,3 +613,167 @@ def test_fragment_reduction_key_is_specific_to_cute_backend():
 
     assert CuteBackend().supports_config_key(REDUCTION_KEY)
     assert not TritonBackend().supports_config_key(REDUCTION_KEY)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _resource_fullrow_scan(x: torch.Tensor):
+    out = torch.empty((x.size(0),), dtype=x.dtype, device=x.device)
+    for row in hl.tile(x.size(0)):
+        values = x[row, :]
+        maximum = values.amax(-1)
+        prefix = hl.cumsum(values - maximum[:, None], dim=-1)
+        out[row] = prefix.sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _resource_repeated_scan_dot(x: torch.Tensor):
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for row in hl.tile(x.size(0)):
+        first = hl.cumsum(x[row, :, :] + 1, dim=-1)
+        second = hl.cumsum(first, dim=-1)
+        out[row, :, :] = hl.dot(first, second.transpose(-1, -2))
+    return out
+
+
+def _resource_bound_and_actual(bound, config):
+    import math
+
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        FragmentResourceCatalog,
+    )
+    from helion._compiler.cute.computed_fragment import FragmentCompiler
+
+    allocations = []
+    original = FragmentCompiler.allocate
+
+    def allocate(compiler, value):
+        result = original(compiler, value)
+        allocations.append((compiler, math.prod(value.shape) * value.dtype.itemsize))
+        return result
+
+    with bound.env, bound.host_function:
+        catalog = FragmentResourceCatalog.create(
+            bound.env, bound.host_function.device_ir, config
+        )
+        assert catalog is not None
+        estimate = catalog.shared_bytes(bound.env, config)
+    with (
+        patch.object(FragmentCompiler, "allocate", allocate),
+        patch(
+            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            return_value=232448,
+        ),
+    ):
+        source = bound.to_code(config)
+    compilers = {compiler for compiler, _ in allocations}
+    assert compilers
+    for compiler in compilers:
+        request_sum = sum(
+            ((size + 15) // 16) * 16 for owner, size in allocations if owner is compiler
+        )
+        assert estimate >= request_sum >= compiler.smem_bytes
+    return source
+
+
+@pytest.mark.parametrize("width", [4097, 8193])
+def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
+    inputs = (torch.ones(3, width),)
+    with patch(
+        "helion._compiler.autotuner_heuristics.fragment_resource_carrier",
+        return_value=None,
+    ):
+        old_bound = _cpu_bind(_resource_fullrow_scan, inputs)
+    kernel = helion.kernel(
+        _resource_fullrow_scan.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = _cpu_bind(kernel, inputs)
+    old = make_search(old_bound.config_spec, count=20)
+    full = make_search(bound.config_spec, count=20)
+    seeds = deepcopy(bound.config_spec.compiler_seed_configs)
+    default = bound.config_spec.default_config()
+    random.seed(151)
+    expected = old._generate_initial_population_flat()
+    expected_state = random.getstate()
+    random.seed(151)
+    actual = full._generate_initial_population_flat()
+    assert random.getstate() == expected_state
+    assert actual[: len(expected)] == expected
+    assert len(actual) == len(expected) + 2
+    assert bound.config_spec.compiler_seed_configs == seeds
+    assert bound.config_spec.default_config() == default
+    assert len(full._pinned_finalist_configs) == len(old._pinned_finalist_configs) + 2
+    for row in actual[len(expected) :]:
+        config = full.config_gen.unflatten(row)
+        assert config in full._pinned_finalist_configs
+        _resource_bound_and_actual(bound, config)
+    random.seed(155)
+    modes = {
+        full.config_gen.random_config().get(REDUCTION_KEY, "serial") for _ in range(32)
+    }
+    assert modes == {"serial", "warp"}
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("width", [5, 17])
+def test_fragment_resource_bound_covers_scan_aliases_dot_and_tails(dtype, width):
+    bound = _cpu_bind(
+        _resource_repeated_scan_dot, (torch.ones(3, width, width, dtype=dtype),)
+    )
+    for mode in ("serial", "cooperative"):
+        config = bound.config_spec.default_config()
+        config.config[KEY] = mode
+        _resource_bound_and_actual(bound, config)
+
+
+def test_fragment_resource_catalog_declines_nested_and_unproved_runtime_extents():
+    from test.test_cute_computed_fragment import _fragment_captured_reduction
+
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        FragmentResourceCatalog,
+    )
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        FragmentStorageTerm,
+    )
+
+    bound = _cpu_bind(_fragment_captured_reduction, (torch.ones(3, 17), 3))
+    with bound.env, bound.host_function:
+        config = bound.config_spec.default_config()
+        assert (
+            FragmentResourceCatalog.create(
+                bound.env, bound.host_function.device_ir, config
+            )
+            is None
+        )
+        unknown = bound.env.shape_env.create_unbacked_symint()
+        with pytest.raises(
+            exc.InvalidConfig, match="unproved fragment resource extent"
+        ):
+            FragmentStorageTerm((unknown,), torch.float32).shared_bytes(
+                bound.env, config
+            )
+
+
+def test_fragment_resource_carrier_builds_catalog_only_once():
+    from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
+        FragmentResourceCatalog,
+    )
+
+    with patch.object(
+        FragmentResourceCatalog, "create", wraps=FragmentResourceCatalog.create
+    ) as create:
+        kernel = helion.kernel(
+            _resource_fullrow_scan.fn,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="none",
+        )
+        bound = _cpu_bind(kernel, (torch.ones(3, 8193),))
+    assert create.call_count == 1
+    assert all(
+        group.supplemental_witnesses
+        for group in bound.config_spec.compiler_coverage_groups
+    )

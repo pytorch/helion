@@ -24,6 +24,11 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from test._cute_binding import _cpu_bind
+from test._cute_binding import _forbid_native_compile
+from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import _target
+
 import helion
 from helion import exc
 from helion._compiler.autotuner_heuristics import get_heuristics
@@ -37,6 +42,7 @@ from helion._compiler.cute.topk import topk_tensors_are_proven_disjoint
 from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.aot_structural_policy import model_configs
 from helion.autotuner.config_generation import ConfigGeneration
@@ -78,6 +84,108 @@ def _row_topk(
         values[row, :] = vals
         indices[row, :] = idx
     return values, indices
+
+
+@skipIfRefEager("requires compiler IR and explicit configurations")
+@pytest.mark.parametrize("backend", ["cute", "triton"])
+@pytest.mark.parametrize("operation", ["topk", "sort"])
+def test_ordering_axis_keeps_complete_reduction_input(backend, operation):
+    function = _row_topk.fn if operation == "topk" else _row_network_sort.fn
+    inputs = (
+        (torch.ones(3, 8192), 64, True)
+        if operation == "topk"
+        else (torch.ones(3, 8192), True)
+    )
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        kernel = helion.kernel(
+            function, backend=backend, static_shapes=True, autotune_effort="none"
+        )
+        bound = _cpu_bind(kernel, inputs)
+        assert not bound.config_spec.reduction_loops.valid_block_ids()
+        source = bound.to_code(bound.config_spec.default_config())
+    if backend == "triton":
+        tree = ast.parse(source)
+        assert not any(isinstance(node, ast.For) for node in ast.walk(tree))
+        assert "8192" in source
+
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def _topk_with_independent_sum(x: torch.Tensor, y: torch.Tensor):
+    values = torch.empty((x.size(0), 8), device=x.device, dtype=x.dtype)
+    indices = torch.empty((x.size(0), 8), device=x.device, dtype=torch.int64)
+    sums = torch.empty((x.size(0),), device=x.device, dtype=x.dtype)
+    for row in hl.tile(x.size(0)):
+        selected, order = torch.topk(x[row, :], 8, dim=-1)
+        values[row, :] = selected
+        indices[row, :] = order
+        sums[row] = y[row, :].sum(-1)
+    return values, indices, sums
+
+
+@skipIfRefEager("requires compiler IR and explicit configurations")
+def test_ordering_does_not_disable_independent_reduction_rolling():
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        bound = _cpu_bind(
+            _topk_with_independent_sum, (torch.ones(3, 64), torch.ones(3, 8192))
+        )
+        blocks = bound.config_spec.reduction_loops.valid_block_ids()
+        assert blocks
+        with bound.env:
+            assert all(
+                bound.env.block_sizes[block].size_hint() == 8192 for block in blocks
+            )
+        config = bound.config_spec.default_config()
+        config.config["reduction_loops"] = [4096] * len(blocks)
+        source = bound.to_code(config)
+    assert any(
+        isinstance(node, ast.For) and "8192" in ast.unparse(node.iter)
+        for node in ast.walk(ast.parse(source))
+    )
+
+
+@pytest.mark.parametrize("operation", ["topk", "sort"])
+@pytest.mark.parametrize("dim", [-2, -1, 0, 1])
+def test_ordering_axis_guard_uses_consumed_dimension(operation, dim):
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.roll_reduction import ReductionRoller
+
+    graph = torch.fx.Graph()
+    source = graph.placeholder("source")
+    source.meta["val"] = torch.empty(5, 9)
+    target = (
+        torch.ops.aten.topk.default
+        if operation == "topk"
+        else torch.ops.aten.sort.default
+    )
+    node = graph.call_function(
+        target, (source, 3, dim) if operation == "topk" else (source, dim)
+    )
+    node.meta.update(
+        val=target(source.meta["val"], 3, dim)
+        if operation == "topk"
+        else target(source.meta["val"], dim),
+        lowering=None,
+    )
+    axis = dim % 2
+    env = SimpleNamespace(get_block_id=lambda size: {5: 0, 9: 1}.get(size))
+    roller = ReductionRoller(None, SimpleNamespace(block_id=axis), {})
+    with (
+        patch.object(CompileEnvironment, "current", return_value=env),
+        pytest.raises(
+            NotImplementedError, match="selection axes require complete input"
+        ),
+    ):
+        roller.should_go_in_inner_graph(node)
 
 
 def _check_topk(
@@ -3422,7 +3530,13 @@ def test_topk_new_seeds_cover_growing_and_native_fragments(
 @pytest.mark.usefixtures("_cpu_compile_environment")
 @pytest.mark.parametrize(
     "dtype,inner_stride,supported",
-    [(torch.float32, 1, False), (torch.bfloat16, 2, True)],
+    [
+        (torch.float16, 1, True),
+        (torch.bfloat16, 2, True),
+        (torch.float32, 1, True),
+        (torch.float64, 1, False),
+        (torch.int32, 1, False),
+    ],
 )
 def test_topk_seeds_follow_root_capabilities(
     dtype: torch.dtype, inner_stride: int, supported: bool
@@ -3445,7 +3559,12 @@ def test_topk_seeds_follow_root_capabilities(
         config = bound.config_spec.default_config()
         config.config.update(seeds[0])
         code = bound.to_code(config)
-        assert "row_selected_indices" in code
+        assert any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id.startswith("_cute_local_topk_")
+            for node in ast.walk(ast.parse(code))
+        )
         assert "sort_rank" not in code
 
 
@@ -4828,10 +4947,12 @@ def test_pretuned_topk_rejects_untuned_inputs(unsupported: str) -> None:
 
 
 @pytest.mark.usefixtures("cpu_codegen")
-@pytest.mark.parametrize("softmax", [False, True])
-def test_pretuned_topk_codegen_is_one_fused_launch(softmax: bool) -> None:
+@pytest.mark.parametrize("rows,width,k,softmax", pretuned_topk.SHAPES)
+def test_pretuned_topk_codegen_is_one_fused_launch(
+    rows: int, width: int, k: int, softmax: bool
+) -> None:
     with FakeTensorMode():
-        x = torch.empty((65536, 1024), dtype=torch.bfloat16)
+        x = torch.empty((rows, width), dtype=torch.bfloat16)
     # Bind the source without loading hardware-dependent AOT caches on the CPU.
     kernel = helion.kernel(
         backend="cute",
@@ -4839,9 +4960,16 @@ def test_pretuned_topk_codegen_is_one_fused_launch(softmax: bool) -> None:
         autotune_effort="none",
         cute_structural_policy=pretuned_topk.STRUCTURAL_POLICY,
     )(pretuned_topk.topk.fn)
-    bound = kernel._bind_isolated((x, 32, softmax))
-    config = topk_heuristic.autotune_topk(x, 32, softmax)
+    bound = kernel._bind_isolated((x, k, softmax))
+    config = topk_heuristic.autotune_topk(x, k, softmax)
+    assert len(bound.config_spec.reduction_loops.valid_block_ids()) == int(softmax)
+    reduction_loops = config.config["reduction_loops"]
+    assert isinstance(reduction_loops, list) and len(reduction_loops) == int(softmax)
     code = bound.to_code(config)
+    if not softmax:
+        stale = helion.Config.from_dict({**config.config, "reduction_loops": [None]})
+        with pytest.raises(exc.InvalidConfig, match="Too many values.*reduction_loops"):
+            bound.to_code(stale)
     assert code.count("@cute.kernel") == 1
     assert "sort_rank" not in code
     assert ("topk_softmax_values" in code) == softmax

@@ -65,6 +65,7 @@ from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
 from .cute_fragment_reduction import CuteFragmentReductionHeuristic
 from .cute_fragment_reduction import register_fragment_reduction_coverage
+from .cute_fragment_resources import fragment_resource_carrier
 from .cute_fragment_scan import CuteFragmentScanHeuristic
 from .cute_fragment_scan import register_fragment_scan_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
@@ -576,5 +577,10 @@ def register_compiler_coverage_groups(
                 )
             )
             break
-    register_fragment_scan_coverage(env, device_ir)
-    register_fragment_reduction_coverage(env, device_ir)
+    resource_carrier = fragment_resource_carrier(env, device_ir)
+    register_fragment_scan_coverage(
+        env, device_ir, supplemental_carrier=resource_carrier
+    )
+    register_fragment_reduction_coverage(
+        env, device_ir, supplemental_carrier=resource_carrier
+    )

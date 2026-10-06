@@ -163,6 +163,11 @@ def independent_reduction_coordinates(
                     if node not in ancestors or node in visited:
                         continue
                     visited.add(node)
+                    # Broadcasting a statistic back onto its own full axis
+                    # retains the existing native reduction coordinates. Later
+                    # row broadcasts do not make that normalization independent.
+                    if full_axis in axes[node]:
+                        continue
                     if axes[node] & independent:
                         result.add(reduction)
                         break
