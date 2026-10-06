@@ -118,7 +118,8 @@ def snapshot_chains(
             or not load.users
             or not isinstance(fake, torch.Tensor)
             or fake.ndim != 1
-            or cast("Node", load.args[0]).target is not _tracing_ops._host_tensor
+            or not isinstance(load.args[0], Node)
+            or load.args[0].target is not _tracing_ops._host_tensor
             or not host_load_is_readonly(load, env, graphs, allow_unbound=allow_unbound)
         ):
             return frozenset()

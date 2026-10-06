@@ -221,6 +221,231 @@ class FragmentOps(GenerateASTFromInductor):
         )
 
 
+def _fragment_logical_shape(
+    env: CompileEnvironment,
+    node: Node,
+    *,
+    scalar_indexed_loads: bool = False,
+    tensor_indexed_loads: bool = False,
+    pure_inline_asm: bool = False,
+    all_axis_reductions: bool = False,
+    proven_domains: dict[Node, tuple[sympy.Expr, ...]] | None = None,
+) -> tuple[sympy.Expr, ...] | None:
+    """Prove fragment coordinates from producers, never padded fake capacity.
+
+    Full slices and factories retain their declared extents. Pointwise operations
+    broadcast those extents; layout changes must prove the same logical mapping.
+    Unknown captures and padding-changing reshapes decline. Indexed-load
+    domains are proved only for the opt-in bounded gather path.
+    """
+    memo: dict[Node, tuple[sympy.Expr, ...] | None] = {}
+
+    def dimension(value: object) -> sympy.Expr:
+        if isinstance(value, Node):
+            value = value.meta["val"]
+        if isinstance(value, torch.SymInt):
+            value = value._sympy_()
+        return env.specialize_expr(sympy.sympify(value))
+
+    def fake_shape(value: torch.Tensor) -> tuple[sympy.Expr, ...]:
+        return tuple(dimension(size) for size in value.shape)
+
+    def equal(a: sympy.Expr, b: sympy.Expr) -> bool:
+        return sympy.expand(a) == sympy.expand(b)
+
+    def infer(source: Node) -> tuple[sympy.Expr, ...] | None:
+        if proven_domains is not None and source in proven_domains:
+            return proven_domains[source]
+        if source in memo:
+            return memo[source]
+        memo[source] = None
+        result = calculate(source)
+        memo[source] = result
+        return result
+
+    def calculate(source: Node) -> tuple[sympy.Expr, ...] | None:
+        value = source.meta.get("val")
+        if not isinstance(value, torch.Tensor):
+            return None
+        target = source.target
+        if pure_inline_asm and target is inline_asm_ops.inline_asm_elementwise:
+            from .bounded_gather import inline_asm_shape
+
+            return inline_asm_shape(source, infer, dimension)
+        if target is memory_ops.load:
+            tensor_node = cast("Node", source.args[0])
+            tensor = tensor_node.meta.get("val")
+            if not isinstance(tensor, torch.Tensor):
+                return None
+            tensor_shape = (
+                tuple(dimension(size) for size in tensor.shape)
+                if tensor_node.target is _tracing_ops._host_tensor
+                else infer(tensor_node)
+            )
+            if tensor_shape is None:
+                return None
+            index_shapes = {}
+            if tensor_indexed_loads:
+                from .bounded_gather import indexed_load_shapes
+
+                index_shapes = indexed_load_shapes(
+                    env, cast("list[object]", source.args[1]), infer, dimension
+                )
+                if index_shapes is None:
+                    return None
+            sizes: list[sympy.Expr] = []
+            axis = 0
+            for ordinal, index in enumerate(cast("list[object]", source.args[1])):
+                if index is None:
+                    sizes.append(sympy.Integer(1))
+                    continue
+                if index == slice(None):
+                    sizes.append(tensor_shape[axis])
+                elif isinstance(index, Node):
+                    proxy = index.meta.get("val")
+                    if isinstance(proxy, torch.Tensor):
+                        if ordinal not in index_shapes:
+                            return None
+                        sizes.extend(index_shapes[ordinal])
+                    elif isinstance(proxy, torch.SymInt):
+                        bid = env.resolve_block_id(proxy)
+                        if (
+                            bid is None
+                            or proxy._sympy_() != env.block_sizes[bid].var._sympy_()
+                        ):
+                            if not scalar_indexed_loads:
+                                return None
+                            # A scalar grid/load index removes this source axis;
+                            # it does not determine any gathered-axis capacity.
+                        else:
+                            sizes.append(dimension(proxy))
+                elif not isinstance(index, int):
+                    return None
+                axis += 1
+            sizes.extend(tensor_shape[axis:])
+            return tuple(sizes)
+        if target is torch.ops.prims.iota.default:
+            return (dimension(source.args[0]),)
+        if target in (creation_ops.full, torch.ops.aten.full.default):
+            return tuple(
+                dimension(size) for size in cast("list[object]", source.args[0])
+            )
+        if target is torch.ops.aten.scalar_tensor.default:
+            return ()
+        if target is torch.ops.aten.gather.default:
+            return infer(cast("Node", source.args[2]))
+        tensors = [
+            n
+            for n in source.all_input_nodes
+            if isinstance(n.meta.get("val"), torch.Tensor)
+        ]
+        if not tensors:
+            return None
+        shapes = [infer(n) for n in tensors]
+        if any(shape is None for shape in shapes):
+            return None
+        inputs = cast("list[tuple[sympy.Expr, ...]]", shapes)
+        first = inputs[0]
+        if target in (
+            _tracing_ops._mask_to,
+            _tracing_ops._new_var,
+            torch.ops.aten.alias.default,
+            torch.ops.aten.clone.default,
+            torch.ops.aten.view.dtype,
+        ):
+            return first
+        if target is view_ops.subscript:
+            subscript_shape: list[sympy.Expr] = []
+            axis = 0
+            for index in cast("list[object]", source.args[1]):
+                if index is None:
+                    subscript_shape.append(sympy.Integer(1))
+                    continue
+                if index == slice(None):
+                    subscript_shape.append(first[axis])
+                elif not isinstance(index, int):
+                    return None
+                axis += 1
+            return (*subscript_shape, *first[axis:])
+        if target is torch.ops.aten.permute.default:
+            return tuple(first[axis] for axis in cast("list[int]", source.args[1]))
+        if target is torch.ops.aten.unsqueeze.default:
+            axis = cast("int", source.args[1]) % (len(first) + 1)
+            return (*first[:axis], sympy.Integer(1), *first[axis:])
+        if target in (
+            torch.ops.aten.view.default,
+            torch.ops.aten.reshape.default,
+            torch.ops.aten._unsafe_view.default,
+        ):
+            # The emitter flattens physical coordinates. A reshape of a padded
+            # axis cannot be justified just by matching logical element counts.
+            physical = fake_shape(cast("torch.Tensor", tensors[0].meta["val"]))
+            if any(not equal(a, b) for a, b in zip(first, physical, strict=True)):
+                return None
+            result = fake_shape(value)
+            return result if equal(sympy.prod(first), sympy.prod(result)) else None
+        if target is torch.ops.aten.expand.default:
+            result = tuple(
+                dimension(size) for size in cast("list[object]", source.args[1])
+            )
+            padded = (sympy.Integer(1),) * (len(result) - len(first)) + first
+            if any(
+                a != 1 and not equal(a, b) for a, b in zip(padded, result, strict=True)
+            ):
+                return None
+            return result
+        if isinstance(source.meta.get("lowering"), ReductionLowering):
+            if all_axis_reductions:
+                from .bounded_gather import all_axis_reduction_shape
+
+                reduced = all_axis_reduction_shape(source, infer, dimension)
+                if reduced is not None:
+                    return reduced
+            # Dimension-list reductions remove axes without reinterpreting the
+            # remaining coordinates. Other reduction signatures are unproved.
+            if (
+                len(source.args) < 2
+                or not isinstance(source.args[1], (list, tuple))
+                or not source.args[1]
+            ):
+                return None
+            axes = {axis % len(first) for axis in cast("list[int]", source.args[1])}
+            physical = fake_shape(cast("torch.Tensor", tensors[0].meta["val"]))
+            if any(not equal(first[axis], physical[axis]) for axis in axes):
+                return None
+            keepdim = (
+                source.args[2]
+                if len(source.args) > 2
+                else source.kwargs.get("keepdim", False)
+            )
+            return tuple(
+                sympy.Integer(1) if axis in axes else size
+                for axis, size in enumerate(first)
+                if keepdim or axis not in axes
+            )
+        if (
+            isinstance(source.meta.get("lowering"), PointwiseLowering)
+            or target is torch.ops.aten.where.self
+        ):
+            rank = max(map(len, inputs))
+            broadcast_shape: list[sympy.Expr] = [sympy.Integer(1)] * rank
+            for shape in inputs:
+                for axis, size in enumerate(
+                    (sympy.Integer(1),) * (rank - len(shape)) + shape
+                ):
+                    if size == 1:
+                        continue
+                    if broadcast_shape[axis] != 1 and not equal(
+                        broadcast_shape[axis], size
+                    ):
+                        return None
+                    broadcast_shape[axis] = size
+            return tuple(broadcast_shape)
+        return None
+
+    return infer(node)
+
+
 class FragmentCompiler:
     def __init__(self, cg: GenerateAST, graphs: list[GraphInfo] | None = None) -> None:
         self.cg = cg
@@ -1346,7 +1571,17 @@ class FragmentCompiler:
         ) and host_load_is_readonly(node, self.env, self.graphs):
             from .packet_loads import materialize_packet_load
 
-            packet = materialize_packet_load(self, tensor, loaded_fragment, load)
+            index_values = (
+                values[index] for index in indices if isinstance(index, Node)
+            )
+            packet = materialize_packet_load(
+                self,
+                tensor,
+                loaded_fragment,
+                load,
+                tuple(value for value in index_values if isinstance(value, Fragment))
+                + ((mask_value,) if isinstance(mask_value, Fragment) else ()),
+            )
             if packet is not None:
                 return packet
         if (
@@ -1388,6 +1623,67 @@ class FragmentCompiler:
             elif self.env.block_sizes[bid].reduction:
                 extent = f"min({extent}, {self.sym(self.env.block_sizes[bid].numel)})"
         return extent
+
+    def bounded_gather(self, node: Node, values: dict[Node, object]) -> Fragment:
+        from .bounded_gather import prove_gather
+
+        proof = prove_gather(self.env, node, graphs=self.graphs)
+        assert proof is not None
+        source_shape, index_shape = proof.source_shape, proof.index_shape
+        source = values[cast("Node", node.args[0])]
+        indices = values[cast("Node", node.args[2])]
+        assert isinstance(source, Fragment) and isinstance(indices, Fragment)
+        # Both original recipes remain live while either is materialized. In
+        # particular an index recipe may read storage that source allocation
+        # would otherwise recycle. Snapshot indices before gathering the source.
+        self.held.extend((source, indices))
+        indices = self.materialize(indices)
+        self.held.append(indices)
+        source = self.materialize(source)
+        self.held.append(source)
+
+        def source_coordinates(coords: tuple[str, ...]) -> tuple[str, ...]:
+            return (*coords[:-1], indices.read(coords))
+
+        def output_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+            return tuple(
+                f"0 <= ({coord}) and ({coord}) < ({self.sym(size)})"
+                for coord, size in zip(coords, index_shape, strict=True)
+            )
+
+        def read(coords: tuple[str, ...]) -> str:
+            location = source_coordinates(coords)
+            valid = self.predicate(
+                [
+                    *output_domain(coords),
+                    *source.domain(location),
+                    *(
+                        f"0 <= ({coord}) and ({coord}) < ({self.sym(size)})"
+                        for coord, size in zip(location, source_shape, strict=True)
+                    ),
+                ]
+            )
+            # Padded output coordinates are not covered by the logical range
+            # proof. Do not evaluate their source reads, even if a padded iota
+            # makes an otherwise proved index exceed the source allocation.
+            return f"({source.read(location)} if {valid} else {self.cast('0', source.dtype)})"
+
+        result = self.materialize(
+            Fragment(
+                indices.shape,
+                source.dtype,
+                read,
+                dependencies=(source, indices),
+                # Once copied, the result domain must not retain a value read
+                # from the index/source allocations that can now be recycled.
+                logical_domain=output_domain,
+            )
+        )
+        self.held.pop()
+        self.held.pop()
+        self.held.pop()
+        self.held.pop()
+        return result
 
     def dot(self, node: Node, values: dict[Node, object]) -> Fragment:
         lhs, rhs = (values[cast("Node", x)] for x in node.args[:2])
@@ -1928,6 +2224,9 @@ class FragmentCompiler:
         return result
 
     def scan(self, node: Node, values: dict[Node, object]) -> Fragment:
+        from ..autotuner_heuristics.cute_fragment_warp_scan import (
+            active_warp_scan_roots,
+        )
         from ..autotuner_heuristics.cute_fragment_warp_scan import warp_scan_supported
 
         source = values[cast("Node", node.args[1])]
@@ -1937,7 +2236,7 @@ class FragmentCompiler:
         assert root is not None
         if (
             self.df.config.get("cute_fragment_warp_scan", False)
-            and root.graph_id in self.env.config_spec.cute_fragment_warp_scan_root_ids
+            and root.graph_id in active_warp_scan_roots(self.env, self.df.config)
             and warp_scan_supported(source.dtype, source.shape[dim])
         ):
             return self.warp_scan(node, values)
@@ -1963,12 +2262,26 @@ class FragmentCompiler:
         capacity = source.shape[dim]
         if not warp_scan_supported(source.dtype, capacity):
             raise exc.InvalidConfig(
-                "warp-prefix scan requires Float32/64 or Int32/64 and axis capacity <= 1024"
+                "warp-prefix scan requires a positive Int32/64 axis or Float32/64 axis capacity <= 1024"
             )
         assert self.threads % 32 == 0
         reverse = bool(node.args[3])
         fake = cast("torch.Tensor", node.meta["val"])
         extent = self.logical_axis_extent(fake, dim, capacity)
+        return self.warp_scan_fragment(source, dim, extent, reverse)
+
+    def warp_scan_fragment(
+        self, source: Fragment, dim: int, extent: str, reverse: bool
+    ) -> Fragment:
+        """Recursively scan chunk totals using associative integer addition.
+
+        Every chunk writes a total, including zero for logical padding. These
+        totals have their own complete logical domain. Their recursive scan is
+        forward even when the original positions are visited in reverse order.
+        Small scans retain the original two-phase floating-point tree verbatim.
+        """
+        capacity = source.shape[dim]
+        assert capacity <= 1024 or source.dtype in (torch.int32, torch.int64)
         row_shape = (*source.shape[:dim], *source.shape[dim + 1 :])
         chunks = (capacity + 31) // 32
         work_shape = (*row_shape, chunks)
@@ -2036,6 +2349,39 @@ class FragmentCompiler:
             )
 
         self.elements(work_shape, partials, threads_per_element=32)
+
+        if chunks > 32:
+            prefixes = self.warp_scan_fragment(
+                totals, len(work_shape) - 1, str(chunks), False
+            )
+            self.held.append(prefixes)
+
+            def wide_carries(coords: tuple[str, ...]) -> None:
+                position = coords[dim]
+                rank = f"({extent}) - 1 - ({position})" if reverse else position
+                chunk = f"(({rank}) // 32)"
+                row = (*coords[:dim], *coords[dim + 1 :])
+                branch = cast(
+                    "ast.If",
+                    statement_from_string(
+                        f"if ({position}) < ({extent}) and {chunk} > 0:\n    pass"
+                    ),
+                )
+                branch.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                    carry = prefixes.read((*row, f"{chunk} - 1"))
+                    partial = result.read(coords)
+                    self.emit(
+                        f"{partial} = {self.cast(f'{carry} + {partial}', source.dtype)}"
+                    )
+                self.cg.add_statement(branch)
+
+            self.elements(source.shape, wide_carries)
+            self.held.pop()
+            self.held.pop()
+            self.held.pop()
+            self.held.pop()
+            return result
 
         def carries(coords: tuple[str, ...]) -> None:
             lane, rank, location = positions(coords)
@@ -2481,6 +2827,8 @@ class FragmentCompiler:
             return self.atomic_add(node, values)
         if target in (memory_ops.load, memory_ops.store):
             return self.memory(node, values, target is memory_ops.store)
+        if target is torch.ops.aten.gather.default:
+            return self.bounded_gather(node, values)
         if target is matmul_ops.dot:
             return self.dot(node, values)
         if target is scan_ops._associative_scan:
@@ -2741,6 +3089,7 @@ def computed_fragment_supported(
     physical_axes: frozenset[int] = frozenset(),
     owned_iota_axes: frozenset[int] = frozenset(),
     snapshot_owned: bool = False,
+    bounded_gather_owned: bool = False,
 ) -> bool:
     """Structural root ownership shared by search discovery and code generation.
 
@@ -2946,7 +3295,7 @@ def computed_fragment_supported(
             )
         )
 
-    if not snapshot_owned and not any(
+    if not (snapshot_owned or bounded_gather_owned) and not any(
         needs_coordinates(node) for info in graphs for node in info.graph.nodes
     ):
         return False
@@ -2990,6 +3339,7 @@ def computed_fragment_supported(
         torch.ops.aten.where.self,
         torch.ops.aten.view.dtype,
         torch.ops.aten.alias.default,
+        torch.ops.aten.gather.default,
     }
     if any(
         node.op == "call_function"
@@ -3004,6 +3354,17 @@ def computed_fragment_supported(
         return False
     for info in graphs:
         for node in info.graph.nodes:
+            if node.target is torch.ops.aten.gather.default:
+                from .bounded_gather import prove_gather
+
+                if not (
+                    bounded_gather_owned
+                    and prove_gather(
+                        env, node, graphs=graphs
+                    )
+                    is not None
+                ):
+                    return False
             if node.target is torch.ops.aten.view.dtype:
                 source = cast("Node", node.args[0]).meta["val"]
                 target = node.meta["val"]
@@ -3107,6 +3468,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     from ..autotuner_heuristics.cute_fragment_reduction import (
         fragment_warp_reduction_supported,
     )
+    from ..autotuner_heuristics.cute_fragment_warp_scan import active_warp_scan_roots
 
     env = CompileEnvironment.current()
     if env.backend_name != "cute":
@@ -3126,13 +3488,16 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.device_function.config.get("cute_fragment_producer_cache", False)
         and root.graph_id in env.config_spec.cute_fragment_producer_cache_root_ids
     )
-    warp_scan_required = (
-        cg.device_function.config.get("cute_fragment_warp_scan", False)
-        and root.graph_id in env.config_spec.cute_fragment_warp_scan_root_ids
-    )
+    warp_scan_required = cg.device_function.config.get(
+        "cute_fragment_warp_scan", False
+    ) and root.graph_id in active_warp_scan_roots(env, cg.device_function.config)
     snapshots_required = (
         cg.device_function.config.get("cute_fragment_register_snapshots", False) is True
         and root.graph_id in env.config_spec.cute_fragment_register_snapshots_root_ids
+    )
+    bounded_gather_required = (
+        cg.device_function.config.get("cute_fragment_bounded_gather", False) is True
+        and root.graph_id in env.config_spec.cute_fragment_bounded_gather_root_ids
     )
     register_loads_required = (
         cg.device_function.config.get("cute_fragment_register_loads", False)
@@ -3149,6 +3514,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or register_loads_required
         or producer_cache_required
         or published_scalars_required
+        or bounded_gather_required
         or snapshots_required
         or warp_scan_required
         or cg.device_function.config.get("cute_fragment_reduction", "serial")
@@ -3166,6 +3532,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or register_loads_required
         or producer_cache_required
         or published_scalars_required
+        or bounded_gather_required
         or snapshots_required
         or warp_scan_required
         or warp_results_required
@@ -3192,6 +3559,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or register_loads_required
         or producer_cache_required
         or published_scalars_required
+        or bounded_gather_required
         or snapshots_required
         or warp_scan_required
         or warp_results_required
@@ -3303,6 +3671,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or register_loads_required
             or producer_cache_required
             or published_scalars_required
+            or bounded_gather_required
             or snapshots_required
             or warp_scan_required
             or warp_results_required
@@ -3317,7 +3686,11 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
         )
-        if captured_required or local_required or free_required or snapshots_required
+        if captured_required
+        or local_required
+        or free_required
+        or snapshots_required
+        or bounded_gather_required
         else cg.codegen_graphs
     )
 
@@ -3349,6 +3722,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or register_loads_required
             or producer_cache_required
             or published_scalars_required
+            or bounded_gather_required
             or snapshots_required
             or warp_scan_required
             or warp_results_required
@@ -3382,6 +3756,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         physical_axes=physical_axes,
         owned_iota_axes=owned_iota_axes,
         snapshot_owned=snapshots_required,
+        bounded_gather_owned=bounded_gather_required,
     ):
         return decline()
     # This owner implements configured reduction tiling directly. Keep the
@@ -3392,6 +3767,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         and not local_required
         and not free_required
         and not snapshots_required
+        and not bounded_gather_required
     ):
         graphs = cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
@@ -3402,6 +3778,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         physical_axes=physical_axes,
         owned_iota_axes=owned_iota_axes,
         snapshot_owned=snapshots_required,
+        bounded_gather_owned=bounded_gather_required,
     ):
         return decline()
     root = graphs[root.graph_id]

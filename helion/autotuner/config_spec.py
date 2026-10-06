@@ -153,6 +153,9 @@ if TYPE_CHECKING:
 
     import sympy
 
+    from .._compiler.autotuner_heuristics.cute_fragment_common import (
+        FragmentRootRequirement,
+    )
     from .._compiler.backend import Backend
     from .._compiler.cute.loop_nesting import TileLoopPath
     from .._compiler.cute.split_k_cluster import ClusterKFacts
@@ -943,6 +946,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
+        "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
@@ -1062,6 +1066,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
+        "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
@@ -1186,6 +1191,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
+        "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
@@ -1509,6 +1515,9 @@ class ConfigSpec:
         self.cute_fragment_producer_cache_search_enabled = False
         self.cute_fragment_register_load_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_scan_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_scan_requirements: tuple[
+            FragmentRootRequirement, ...
+        ] = ()
         self.cute_fragment_warp_scan_search_enabled = False
         self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_integer_atomic_epochs_root_ids: frozenset[int] = frozenset()
@@ -1523,6 +1532,8 @@ class ConfigSpec:
         self.cute_fragment_register_snapshots_search_enabled = False
         self.cute_fragment_register_producer_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_register_producers_search_enabled = False
+        self.cute_fragment_bounded_gather_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_bounded_gather_search_enabled = False
         self.cute_integer_loop_reduction_available = False
         self.cute_integer_loop_reduction_search_enabled = False
         self.cute_fragment_register_snapshot_min_threads = 0
@@ -3421,6 +3432,10 @@ class ConfigSpec:
     def _normalize_cute_fragment_warp_scan(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
+        from .._compiler.autotuner_heuristics.cute_fragment_common import (
+            active_fragment_roots,
+        )
+
         key = "cute_fragment_warp_scan"
         value = config.get(key, False)
         if value is False:
@@ -3428,7 +3443,11 @@ class ConfigSpec:
             return
         if (
             value is True
-            and self.cute_fragment_warp_scan_root_ids
+            and active_fragment_roots(
+                self.cute_fragment_warp_scan_root_ids,
+                self.cute_fragment_warp_scan_requirements,
+                config,
+            )
             and not config.get("cute_collective_mma")
             and not config.get("cute_register_chain")
         ):
@@ -3546,6 +3565,26 @@ class ConfigSpec:
         raise InvalidConfig(
             f"{key} requires a pure single integer min/max loop recurrence"
         )
+
+    def _normalize_cute_fragment_bounded_gather(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_bounded_gather"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_bounded_gather_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(f"{key} requires a proved bounded last-axis gather")
 
     def _normalize_cute_fragment_register_producers(
         self, config: dict[str, object], *, fix_invalid: bool
@@ -4639,6 +4678,9 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_skip_zero_atomics(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_bounded_gather(
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_register_producers(
@@ -5831,6 +5873,7 @@ class ConfigSpec:
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
                 "cute_fragment_register_producers",
+                "cute_fragment_bounded_gather",
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
                 "cute_fragment_atomic_consumer_fusion",
@@ -6082,6 +6125,8 @@ class ConfigSpec:
                 fields["cute_integer_loop_reduction"] = BooleanFragment()
             if self.cute_fragment_register_snapshots_search_enabled:
                 fields["cute_fragment_register_snapshots"] = BooleanFragment()
+            if self.cute_fragment_bounded_gather_search_enabled:
+                fields["cute_fragment_bounded_gather"] = BooleanFragment()
             if self.cute_fragment_register_producers_search_enabled:
                 fields["cute_fragment_register_producers"] = BooleanFragment()
             if self.cute_fragment_published_scalars_search_enabled:
