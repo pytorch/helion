@@ -6957,7 +6957,20 @@ class TestFragmentLocalRegistersCPU(unittest.TestCase):
             static_shapes=True,
             autotune_effort="full",
         )
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_published_scalars_coverage"
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
+            ),
+            patch(
+                "helion._compiler.autotuner_heuristics.register_fragment_register_snapshots_coverage"
+            ),
+        ):
             bound = _cpu_bind(kernel, args)
             spec = bound.config_spec
             default = spec.default_config()
@@ -8669,3 +8682,607 @@ class TestFragmentReadonlySnapshotNative(TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _skip_zero_codegen(kernel, args, enabled, threads=32, **options):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_skip_zero_atomics=enabled,
+            cute_fragment_threads=threads,
+            **options,
+        )
+        return bound.to_code(config)
+
+
+def _skip_zero_reference(x, indices, bins, initial, repeats):
+    result = torch.full((x.size(0), bins), initial, dtype=torch.int32, device=x.device)
+    wrapped = torch.where(indices < 0, indices + bins, indices).long()
+    valid = (wrapped >= 0) & (wrapped < bins)
+    for iteration in range(repeats):
+        # Mask before converting: invalid positions may contain NaNs.
+        value = torch.where(valid, x + iteration, 0).to(torch.int32)
+        result.scatter_add_(1, wrapped.clamp(0, bins - 1), value)
+    return result
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _dead_zero_tickets(x, indices, mode: hl.constexpr, initial: hl.constexpr):
+    rows, width = x.shape
+    out = torch.empty(x.shape, device=x.device, dtype=torch.int32)
+    second = torch.empty(x.shape, device=x.device, dtype=torch.int32)
+    totals = torch.empty((rows, 17), device=x.device, dtype=torch.int32)
+    for row in hl.grid(rows):
+        column = hl.arange(width)
+        hl.store(out, [row, column], -99)
+        hl.store(second, [row, column], -99)
+        valid = column < width - 7
+        values = hl.load(x, [row, column], extra_mask=valid)
+        index = indices[row, column]
+        above = valid & (values > 0)
+        tied = valid & (values == 0)
+        active = above | tied
+        counters = hl.full([17], initial, dtype=torch.int32)
+        if mode != "gated":
+            # Keeps the pre-existing unused-zero option eligible in negatives.
+            hl.atomic_add(counters, [0], 0)
+        update = active.to(torch.int32)
+        if mode == "numeric":
+            update = values.to(torch.int32)
+        ticket = hl.atomic_add(counters, [index], update)
+        chosen = above | (tied & (ticket < 7))
+        if mode == "lost_mask":
+            chosen = above | (ticket < 7)
+        elif mode == "flip":
+            ticket = torch.flip(ticket, [0])
+        elif mode == "divide":
+            ticket = 17 // (ticket + 1)
+        hl.store(out, [row, column], ticket + 3, extra_mask=chosen)
+        if mode == "observe":
+            hl.store(second, [row, column], ticket)
+        else:
+            hl.store(second, [row, column], ticket ^ 85, extra_mask=chosen & active)
+        hl.store(totals, [row, hl.arange(17)], counters)
+    return out, second, totals
+
+
+class TestFragmentDeadZeroResultsCPU(unittest.TestCase):
+    def test_existing_register_snapshot_storage_composes(self):
+        x = (torch.arange(256).reshape(2, 128) % 5 - 2).float()
+        indices = (torch.arange(128) % 17).repeat(2, 1).int()
+        records = []
+        for enabled in (False, True):
+            code = _skip_zero_codegen(
+                _dead_zero_tickets,
+                (x, indices, "gated", 3),
+                enabled,
+                cute_fragment_local_atomic_registers=True,
+            )
+            self.assertIn("fragment_local_tickets", code)
+            hosts = {
+                "indices": indices,
+                "out": torch.full_like(indices, -99),
+                "second": torch.full_like(indices, -99),
+                "totals": torch.empty((2, 17), dtype=torch.int32),
+            }
+            _, barriers = _simulate_register_load_program(
+                code, x, 32, host_tensors=hosts, lane_order=list(reversed(range(32)))
+            )
+            records.append((hosts, barriers))
+        for key in ("out", "second", "totals"):
+            torch.testing.assert_close(
+                records[0][0][key], records[1][0][key], rtol=0, atol=0
+            )
+        self.assertEqual(records[0][1], records[1][1])
+
+    def test_masked_return_observations_and_coupled_orders(self):
+        import numpy as np
+
+        for width, threads in ((32, 32), (128, 128), (256, 512)):
+            for initial in (3, 2147483646):
+                for all_dead in (False, True):
+                    with self.subTest(width=width, initial=initial, all_dead=all_dead):
+                        x = (torch.arange(2 * width).reshape(2, width) % 5 - 2).float()
+                        if all_dead:
+                            x.fill_(-1)
+                        x[:, ::11] = float("nan")
+                        x[:, -7:] = float("nan")
+                        indices = (torch.arange(width) % 17).repeat(2, 1).int()
+                        indices[:, ::2] -= 17
+                        indices[:, 1::13] = -18
+                        before = x.clone()
+                        codes = [
+                            _skip_zero_codegen(
+                                _dead_zero_tickets,
+                                (x, indices, "gated", initial),
+                                flag,
+                                threads,
+                            )
+                            for flag in (False, True)
+                        ]
+                        self.assertIn("fragment_atomic_nonzero_value", codes[1])
+                        for order in (
+                            list(range(threads)),
+                            list(reversed(range(threads))),
+                        ):
+                            records = []
+                            for code in codes:
+                                hosts = {
+                                    "indices": indices,
+                                    "out": torch.full_like(indices, -99),
+                                    "second": torch.full_like(indices, -99),
+                                    "totals": torch.full(
+                                        (2, 17), -99, dtype=torch.int32
+                                    ),
+                                }
+                                events = []
+                                with np.errstate(over="ignore"):
+                                    _, barriers = _simulate_register_load_program(
+                                        code,
+                                        x,
+                                        threads,
+                                        host_tensors=hosts,
+                                        lane_order=order,
+                                        atomic_events=events,
+                                    )
+                                records.append((hosts, events, barriers))
+                            for name in ("out", "second", "totals"):
+                                torch.testing.assert_close(
+                                    records[0][0][name],
+                                    records[1][0][name],
+                                    rtol=0,
+                                    atol=0,
+                                )
+                            self.assertEqual(
+                                [e for e in records[0][1] if e[-1] != 0], records[1][1]
+                            )
+                            self.assertEqual(records[0][2], records[1][2])
+                            if all_dead:
+                                self.assertFalse(records[1][1])
+                                self.assertTrue(torch.all(records[1][0]["out"] == -99))
+                        torch.testing.assert_close(
+                            x, before, rtol=0, atol=0, equal_nan=True
+                        )
+
+    def test_observed_remapped_unsafe_and_nonboolean_returns_stay(self):
+        for mode in ("observe", "lost_mask", "flip", "divide", "numeric"):
+            with self.subTest(mode=mode):
+                x = (torch.arange(64).reshape(2, 32) % 5 - 2).float()
+                indices = torch.zeros_like(x, dtype=torch.int32)
+                code = _skip_zero_codegen(
+                    _dead_zero_tickets, (x, indices, mode, 3), True
+                )
+                # Exactly the unrelated unused scalar atomic gets a guard.
+                self.assertEqual(code.count("!= cutlass.Int32(0)"), 1)
+
+    def test_boolean_implication_does_not_assume_ticket_value(self):
+        from torch.fx import Graph
+
+        from helion._compiler.cute.dead_zero_atomics import _masks_imply_update
+
+        graph = Graph()
+
+        def value(name):
+            node = graph.placeholder(name)
+            node.meta["val"] = torch.empty((17,), dtype=torch.bool)
+            return node
+
+        def call(target, *args):
+            node = graph.call_function(target, args)
+            node.meta["val"] = torch.empty((17,), dtype=torch.bool)
+            return node
+
+        a, b, ticket_test = value("a"), value("b"), value("ticket_test")
+        update = call(torch.ops.aten.bitwise_or.Tensor, a, b)
+        chosen = call(
+            torch.ops.aten.bitwise_or.Tensor,
+            a,
+            call(torch.ops.aten.bitwise_and.Tensor, b, ticket_test),
+        )
+        self.assertTrue(_masks_imply_update(update, [chosen]))
+        self.assertFalse(_masks_imply_update(update, [chosen, ticket_test]))
+        self.assertFalse(_masks_imply_update(a, [chosen]))
+        for i in range(13):
+            chosen = call(
+                torch.ops.aten.bitwise_and.Tensor, chosen, value(f"unknown{i}")
+            )
+        self.assertFalse(_masks_imply_update(update, [chosen]))
+
+    def test_fractional_converted_zero_return_remains_observable(self):
+        x = torch.full((2, 32), 0.25)
+        indices = torch.zeros_like(x, dtype=torch.int32)
+        code = _skip_zero_codegen(_dead_zero_tickets, (x, indices, "numeric", 3), True)
+        hosts = {
+            "indices": indices,
+            "out": torch.full_like(indices, -99),
+            "second": torch.full_like(indices, -99),
+            "totals": torch.full((2, 17), -99, dtype=torch.int32),
+        }
+        events = []
+        _simulate_register_load_program(
+            code, x, 32, host_tensors=hosts, atomic_events=events
+        )
+        self.assertEqual(len(events), 64)
+        self.assertTrue(torch.all(hosts["out"][:, :25] == 6))
+        self.assertTrue(torch.all(hosts["out"][:, 25:] == -99))
+        self.assertTrue(torch.all(hosts["totals"] == 3))
+
+    def test_missing_readonly_proof_and_unmatched_shape_decline(self):
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.dead_zero_atomics import dead_zero_atomic_results
+
+        for width in (17, 32):
+            x = torch.ones((2, width))
+            args = (x, torch.zeros_like(x, dtype=torch.int32), "gated", 3)
+            with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                if width == 17:
+                    with self.assertRaises(helion.exc.TorchOpTracingError):
+                        _cpu_bind(_dead_zero_tickets, args)
+                    continue
+                bound = _cpu_bind(_dead_zero_tickets, args)
+                with bound.env, bound.host_function:
+                    graphs = bound.host_function.device_ir.graphs
+                    self.assertEqual(
+                        bool(dead_zero_atomic_results(graphs, bound.env)), width == 32
+                    )
+                    with patch(
+                        "helion._compiler.cute.dead_zero_atomics.host_load_is_readonly",
+                        return_value=False,
+                    ):
+                        self.assertFalse(dead_zero_atomic_results(graphs, bound.env))
+
+
+class TestFragmentDeadZeroResultsNative(TestCase):
+    @onlyBackends(["cute"])
+    def test_masked_tickets_shared_and_register_storage(self):
+        for width, threads in ((32, 32), (128, 128), (256, 512)):
+            x = torch.ones((2, width), device=DEVICE)
+            x[:, ::3] = -1
+            before = x.clone()
+            indices = torch.zeros_like(x, dtype=torch.int32)
+            active = (x > 0) & (torch.arange(width, device=DEVICE) < width - 7)
+            bound = _dead_zero_tickets.bind((x, indices, "gated", 3))
+            for registers in (False, True):
+                for enabled in (False, True):
+                    config = bound.config_spec.default_config()
+                    config.config.update(
+                        cute_fragment_threads=threads,
+                        cute_fragment_skip_zero_atomics=enabled,
+                        cute_fragment_local_atomic_registers=registers,
+                    )
+                    out, second, totals = bound.compile_config(config)(
+                        x, indices, "gated", 3
+                    )
+                    expected_totals = torch.full_like(totals, 3)
+                    expected_totals[:, 0] += active.sum(1).int()
+                    torch.testing.assert_close(totals, expected_totals, rtol=0, atol=0)
+                    for row in range(2):
+                        count = int(active[row].sum())
+                        expected = torch.arange(
+                            6, 6 + count, device=DEVICE, dtype=torch.int32
+                        )
+                        torch.testing.assert_close(
+                            out[row][active[row]].sort().values,
+                            expected,
+                            rtol=0,
+                            atol=0,
+                        )
+                    self.assertTrue(torch.all(out[~active] == -99))
+                    self.assertTrue(torch.all(second[~active] == -99))
+                    torch.testing.assert_close(
+                        second[active], (out[active] - 3) ^ 85, rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+class TestFragmentSkipZeroAtomicsCPU(unittest.TestCase):
+    def test_signed_cast_wrap_epochs_and_zero_events(self):
+        import numpy as np
+
+        for dtype, width, threads in (
+            (torch.int32, 17, 32),
+            (torch.int64, 65, 128),
+            (torch.float32, 129, 512),
+        ):
+            for all_zero in (False, True):
+                with self.subTest(dtype=dtype, width=width, zero=all_zero):
+                    x = (torch.arange(2 * width).reshape(2, width) % 7 - 3).to(dtype)
+                    if dtype == torch.int64:
+                        x[:, ::3] += 2**40
+                    elif dtype == torch.float32:
+                        x += 0.75
+                    else:
+                        x[:, ::5] = torch.iinfo(torch.int32).max
+                        x[:, 1::7] = torch.iinfo(torch.int32).min
+                    if all_zero:
+                        x.zero_()
+                    indices = (torch.arange(width) % 17).repeat(2, 1).int()
+                    indices[:, ::2] -= 17
+                    args = (x, indices, 17, 3, 2)
+                    expected = _skip_zero_reference(*args)
+                    codes = [
+                        _skip_zero_codegen(
+                            _fragment_aggregated_histogram, args, flag, threads
+                        )
+                        for flag in (False, True)
+                    ]
+                    for order in (list(range(threads)), list(reversed(range(threads)))):
+                        records = []
+                        for code in codes:
+                            out = torch.full_like(expected, -99)
+                            events = []
+                            with np.errstate(over="ignore"):
+                                _, barriers = _simulate_register_load_program(
+                                    code,
+                                    x,
+                                    threads,
+                                    host_tensors={"indices": indices, "out": out},
+                                    lane_order=order,
+                                    atomic_events=events,
+                                )
+                            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                            records.append((events, barriers))
+                        self.assertEqual(
+                            [e for e in records[0][0] if e[-1] != 0], records[1][0]
+                        )
+                        self.assertEqual(records[0][1], records[1][1])
+
+    def test_masked_nan_never_reaches_conversion(self):
+        import warnings
+
+        for mode in ("logical_tail", "invalid_index"):
+            for flag in (False, True):
+                with self.subTest(mode=mode, flag=flag):
+                    x = torch.ones((2, 17), dtype=torch.float32)
+                    hosts = {}
+                    expected = torch.ones((2, 17), dtype=torch.int32)
+                    if mode == "logical_tail":
+                        kernel, args = _fragment_aggregation_masked_tail, (x,)
+                    else:
+                        indices = torch.arange(17).repeat(2, 1).int()
+                        indices[:, 0] = 17
+                        indices[:, 1] = -18
+                        x[:, :2] = float("nan")
+                        expected[:, :2] = 0
+                        hosts["indices"] = indices
+                        kernel, args = (
+                            _fragment_aggregated_histogram,
+                            (x, indices, 17, 0, 1),
+                        )
+                    source = _skip_zero_codegen(kernel, args, flag)
+                    out = torch.full_like(expected, -99)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", RuntimeWarning)
+                        _simulate_register_load_program(
+                            source, x, 32, host_tensors={"out": out, **hosts}
+                        )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_global_ordered_and_float_zero_operations_are_retained(self):
+        for sem in ("relaxed", "acquire", "release", "acq_rel"):
+            with self.subTest(sem=sem):
+                x = torch.zeros((2, 17), dtype=torch.int32)
+                counter = torch.full((2,), 9, dtype=torch.int32)
+                tickets = torch.full_like(counter, -1)
+                out = torch.full_like(x, -1)
+                floating_out = torch.full_like(x, -1, dtype=torch.float32)
+                source = _skip_zero_codegen(
+                    _fragment_aggregation_mixed, (x, counter, tickets, sem), True
+                )
+                events, memory = [], []
+                _simulate_register_load_program(
+                    source,
+                    x,
+                    32,
+                    host_tensors={
+                        "counter": counter,
+                        "tickets": tickets,
+                        "out": out,
+                        "floating_out": floating_out,
+                    },
+                    atomic_events=events,
+                    memory_events=memory,
+                )
+                self.assertEqual(sum(e[0] == "gpu" for e in events), 2)
+                self.assertEqual(sum(e[0] == "cta" for e in events), 34)
+                self.assertEqual(
+                    [e[4] for e in memory if e[0] == "atomic" and e[-1] == "gpu"],
+                    [sem, sem],
+                )
+                self.assertTrue(torch.equal(counter, tickets))
+                self.assertFalse(out.any())
+                self.assertFalse(floating_out.any())
+
+    def test_returned_zeros_and_snapshot_consumers_remain(self):
+        for flag in (False, True):
+            args = _local_fetch_args(17, "epochs", initial=3, value=0)
+            source = _skip_zero_codegen(_fragment_local_fetch_add, args, flag)
+            out = torch.full((2, 17), -99, dtype=torch.int32)
+            events = []
+            _simulate_register_load_program(
+                source,
+                args[0],
+                32,
+                host_tensors={
+                    "tickets": args[1],
+                    "reused": args[2],
+                    "reversed_tickets": args[3],
+                    "out": out,
+                },
+                atomic_events=events,
+            )
+            self.assertEqual(len(events), 68 if flag else 102)
+            self.assertTrue(torch.all(args[1] == 3))
+            self.assertTrue(torch.all(args[2] == (3 ^ 85)))
+            self.assertTrue(torch.all(args[3] == 3))
+            self.assertTrue(torch.all(out == 3))
+
+    def test_aggregation_composes_and_excluded_roots_reject(self):
+        x = torch.zeros((1, 17), dtype=torch.int32)
+        args = (x, torch.zeros_like(x), 17, 0, 2)
+        sources = [
+            _skip_zero_codegen(
+                _fragment_aggregated_histogram,
+                args,
+                flag,
+                cute_fragment_atomic_aggregation=True,
+            )
+            for flag in (False, True)
+        ]
+        self.assertEqual(sources[0], sources[1])
+        for mode in (
+            "early_scan",
+            "later_update",
+            "loop_read",
+            "loop_allocation",
+            "conditional",
+            "alias",
+            "self_derived_update",
+        ):
+            with self.subTest(mode=mode), self.assertRaises(helion.exc.InvalidConfig):
+                _skip_zero_codegen(_local_histogram_consumer_negative, (x, mode), True)
+        with self.assertRaises(helion.exc.InvalidConfig):
+            _skip_zero_codegen(
+                _local_histogram_consumers, (x.float(), 17, "pointwise"), True
+            )
+        args = _local_fetch_args(17, "negative")
+        with self.assertRaises(helion.exc.InvalidConfig):
+            _skip_zero_codegen(_fragment_local_fetch_add, args, True)
+
+    def test_default_normalization_and_deferred_coverage(self):
+        from copy import deepcopy
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        key = "cute_fragment_skip_zero_atomics"
+        x = torch.ones((1, 17), dtype=torch.int32)
+        args = (x, torch.zeros_like(x), 17, 0, 1)
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(_fragment_aggregated_histogram, args)
+            default = bound.config_spec.default_config()
+            self.assertNotIn(key, default)
+            self.assertTrue(
+                all(key not in seed for seed in bound.config_spec.compiler_seed_configs)
+            )
+            off = deepcopy(default)
+            off.config[key] = False
+            self.assertEqual(bound.to_code(default), bound.to_code(off))
+            group = bound.config_spec.compiler_coverage_groups[-1]
+            self.assertEqual(group.key, key)
+            self.assertTrue(group.deferred)
+            self.assertFalse(group.legacy)
+            for value in (1, "zero", None):
+                config = deepcopy(default)
+                config.config[key] = value
+                with self.assertRaises(helion.exc.InvalidConfig):
+                    bound.to_code(config)
+
+
+@onlyBackends("cute")
+class TestFragmentSkipZeroAtomicsNative(TestCase):
+    def test_zero_signed_and_cast_updates(self):
+        for dtype, width, mode in (
+            (torch.int32, 17, "wrap"),
+            (torch.int64, 65, "wide"),
+            (torch.float32, 129, "fraction"),
+            (torch.int32, 65, "zero"),
+        ):
+            with self.subTest(dtype=dtype, width=width, mode=mode):
+                x = (
+                    torch.arange(2 * width, device=DEVICE).reshape(2, width) % 7 - 3
+                ).to(dtype)
+                if mode == "wrap":
+                    x[:, ::3] = torch.iinfo(torch.int32).max
+                    x[:, 1::7] = torch.iinfo(torch.int32).min
+                elif mode == "wide":
+                    x[:, ::3] += 2**40
+                elif mode == "fraction":
+                    x += 0.75
+                else:
+                    x.zero_()
+                indices = (torch.arange(width, device=DEVICE) % 17).repeat(2, 1).int()
+                indices[:, ::2] -= 17
+                args = (x, indices, 17, 3, 2)
+                expected = _skip_zero_reference(*args)
+                before = (x.clone(), indices.clone())
+                for enabled in (False, True):
+                    _, out = code_and_output(
+                        _fragment_aggregated_histogram,
+                        args,
+                        cute_fragment_skip_zero_atomics=enabled,
+                        cute_fragment_threads=32,
+                    )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(x, before[0], rtol=0, atol=0)
+                    torch.testing.assert_close(indices, before[1], rtol=0, atol=0)
+
+    def test_nan_logical_tail_and_invalid_index(self):
+        for mode in ("logical_tail", "invalid_index"):
+            x = torch.ones((2, 17), dtype=torch.float32, device=DEVICE)
+            if mode == "logical_tail":
+                kernel, args = _fragment_aggregation_masked_tail, (x,)
+                expected = torch.ones((2, 17), dtype=torch.int32, device=DEVICE)
+            else:
+                indices = torch.arange(17, device=DEVICE).repeat(2, 1).int()
+                indices[:, 0] = 17
+                indices[:, 1] = -18
+                x[:, :2] = float("nan")
+                kernel, args = _fragment_aggregated_histogram, (x, indices, 17, 0, 1)
+                expected = _skip_zero_reference(*args)
+            before = x.clone()
+            for enabled in (False, True):
+                _, out = code_and_output(
+                    kernel,
+                    args,
+                    cute_fragment_skip_zero_atomics=enabled,
+                    cute_fragment_threads=32,
+                )
+                torch.testing.assert_close(out, expected, rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0, equal_nan=True)
+
+    def test_global_ordered_float_and_local_returned_zeros(self):
+        for sem in ("relaxed", "acquire", "release", "acq_rel"):
+            x = torch.zeros((2, 17), dtype=torch.int32, device=DEVICE)
+            counter = torch.full((2,), 9, dtype=torch.int32, device=DEVICE)
+            tickets = torch.full_like(counter, -1)
+            _, (out, floating) = code_and_output(
+                _fragment_aggregation_mixed,
+                (x, counter, tickets, sem),
+                cute_fragment_skip_zero_atomics=True,
+                cute_fragment_threads=32,
+            )
+            torch.testing.assert_close(
+                counter, torch.full_like(counter, 9), rtol=0, atol=0
+            )
+            torch.testing.assert_close(tickets, counter, rtol=0, atol=0)
+            torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+            torch.testing.assert_close(
+                floating, torch.zeros_like(floating), rtol=0, atol=0
+            )
+        args = _local_fetch_args(17, "epochs", initial=3, value=0, device=DEVICE)
+        _, out = code_and_output(
+            _fragment_local_fetch_add,
+            args,
+            cute_fragment_skip_zero_atomics=True,
+            cute_fragment_threads=32,
+        )
+        torch.testing.assert_close(out, torch.full_like(out, 3), rtol=0, atol=0)
+        for actual, value in zip(args[1:4], (3, 3 ^ 85, 3), strict=True):
+            torch.testing.assert_close(
+                actual, torch.full_like(actual, value), rtol=0, atol=0
+            )

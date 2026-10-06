@@ -1344,6 +1344,8 @@ def _without_later_fragment_coverage():
     with ExitStack() as stack:
         for registration in (
             "register_fragment_register_snapshots_coverage",
+            "register_fragment_published_scalars_coverage",
+            "register_fragment_skip_zero_atomics_coverage",
         ):
             stack.enter_context(
                 patch("helion._compiler.autotuner_heuristics." + registration)
@@ -1550,6 +1552,17 @@ def test_fragment_extensions_complete_legacy_prefix_rng_and_final_coverage(
     specs = []
     for enabled in range(len(registrations) + 1):
         with ExitStack() as stack:
+            # This test inventories the four earlier additions only.
+            stack.enter_context(
+                patch(
+                    "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "helion._compiler.autotuner_heuristics.register_fragment_published_scalars_coverage"
+                )
+            )
             for registration in registrations[enabled:]:
                 stack.enter_context(
                     patch("helion._compiler.autotuner_heuristics." + registration)
@@ -1650,10 +1663,13 @@ def test_atomic_aggregation_strict_scope_and_ordinary_mutation():
 )
 def test_atomic_aggregation_complete_prior_prefix_rng_seeds_and_overrides(strategy):
     with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_atomic_aggregation_coverage"
+        "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
     ):
-        old_bound = _atomic_aggregation_bind()
-    bound = _atomic_aggregation_bind()
+        with patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_atomic_aggregation_coverage"
+        ):
+            old_bound = _atomic_aggregation_bind()
+        bound = _atomic_aggregation_bind()
     old, new = (
         make_search(b.config_spec, count=20, strategy=strategy)
         for b in (old_bound, bound)

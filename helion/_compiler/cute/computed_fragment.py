@@ -57,6 +57,7 @@ from ..variable_origin import TileEndOrigin
 from ..variable_origin import TileIdOrigin
 from .captured_reduction import captured_reduction_coordinates
 from .captured_reduction import physical_capture_axes
+from .dead_zero_atomics import dead_zero_atomic_results
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .fragment_expression import FragmentExpression
 from .fragment_indexing import memory_index_coordinates
@@ -448,6 +449,11 @@ class FragmentCompiler:
         self.pending_local_atomics: set[str] = set()
         self.scalar_ordered_tickets: dict[Node, Fragment] = {}
         self.graphs = cg.codegen_graphs if graphs is None else graphs
+        self.dead_zero_results = (
+            dead_zero_atomic_results(self.graphs, self.env)
+            if self.df.config.get("cute_fragment_skip_zero_atomics", False)
+            else frozenset()
+        )
         self.private_scalar_loops = (
             private_scalar_loop_nodes(self.graphs)
             if self.df.config.get("cute_fragment_private_scalar_loops", False)
@@ -1109,6 +1115,23 @@ class FragmentCompiler:
                 root.graph_id
                 in self.env.config_spec.cute_fragment_atomic_aggregation_root_ids
             )
+        # Zero has no counter effect; returned zeros additionally require every
+        # observable consumer to be disabled. Keep masks, value conversion,
+        # result snapshot writes and epoch publication when updates are skipped.
+        skip_zero = (
+            local
+            and target_fake.dtype == torch.int32
+            and sem == "relaxed"
+            and (not node.users or node in self.dead_zero_results)
+            and self.df.config.get("cute_fragment_skip_zero_atomics", False) is True
+        )
+        if skip_zero:
+            root = self.cg.current_root_graph_info
+            assert root is not None
+            skip_zero = (
+                root.graph_id
+                in self.env.config_spec.cute_fragment_skip_zero_atomics_root_ids
+            )
         aggregate_vars = (
             tuple(
                 self.df.new_var(name)
@@ -1191,12 +1214,31 @@ class FragmentCompiler:
                 f"{self.cast(contribution, target_fake.dtype)}, "
                 f"sem={sem!r}, scope={scope!r})"
             )
-            if result is None:
+            if skip_zero and result is None:
+                update_value = self.df.new_var("fragment_atomic_nonzero_value")
+                self.emit(
+                    f"if {self.predicate(masks)}:\n"
+                    f"    {update_value} = {self.cast(contribution, torch.int32)}\n"
+                    f"    if {update_value} != cutlass.Int32(0):\n"
+                    f"        cute.arch.atomic_add({pointer}, {update_value}, "
+                    f"sem={sem!r}, scope={scope!r})"
+                )
+            elif result is None:
                 self.emit(f"if {self.predicate(masks)}:\n    {atomic}")
             else:
                 previous = self.df.new_var("fragment_atomic_previous")
                 self.emit(f"{previous} = {self.cast('0', target_fake.dtype)}")
-                self.emit(f"if {self.predicate(masks)}:\n    {previous} = {atomic}")
+                if skip_zero:
+                    update_value = self.df.new_var("fragment_atomic_nonzero_value")
+                    self.emit(
+                        f"if {self.predicate(masks)}:\n"
+                        f"    {update_value} = {self.cast(contribution, torch.int32)}\n"
+                        f"    if {update_value} != cutlass.Int32(0):\n"
+                        f"        {previous} = cute.arch.atomic_add({pointer}, "
+                        f"{update_value}, sem={sem!r}, scope={scope!r})"
+                    )
+                else:
+                    self.emit(f"if {self.predicate(masks)}:\n    {previous} = {atomic}")
                 self.emit(f"{result.read(coords)} = {previous}")
 
         if aggregate_vars is None:
@@ -3533,6 +3575,11 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.device_function.config.get("cute_fragment_threads", 128) != 128
         and root.graph_id in env.config_spec.cute_fragment_thread_root_ids
     )
+    published_scalars_required = (
+        cg.device_function.config.get("cute_fragment_published_scalars", False)
+        and root.graph_id
+        in CompileEnvironment.current().config_spec.cute_fragment_published_scalar_root_ids
+    )
     producer_cache_required = (
         cg.device_function.config.get("cute_fragment_producer_cache", False)
         and root.graph_id in env.config_spec.cute_fragment_producer_cache_root_ids
@@ -3563,6 +3610,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if threads_required
         or register_loads_required
         or producer_cache_required
+        or published_scalars_required
         or topk_network_required
         or snapshots_required
         or warp_scan_required
@@ -3580,6 +3628,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if threads_required
         or register_loads_required
         or producer_cache_required
+        or published_scalars_required
         or topk_network_required
         or snapshots_required
         or warp_scan_required
@@ -3606,6 +3655,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or threads_required
         or register_loads_required
         or producer_cache_required
+        or published_scalars_required
         or topk_network_required
         or snapshots_required
         or warp_scan_required
@@ -3718,6 +3768,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or threads_required
             or register_loads_required
             or producer_cache_required
+            or published_scalars_required
             or topk_network_required
             or snapshots_required
             or warp_scan_required
@@ -3764,6 +3815,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or threads_required
             or register_loads_required
             or producer_cache_required
+            or published_scalars_required
             or topk_network_required
             or snapshots_required
             or warp_scan_required
@@ -3904,6 +3956,16 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     if capacity and compiler.smem_bytes > capacity:
         raise exc.InvalidConfig(
             f"computed fragments need {compiler.smem_bytes} shared bytes, exceeding {capacity}"
+        )
+    if published_scalars_required:
+        from .published_scalars import PublishedScalarRequest
+
+        compiler.df.cute_state.published_scalar_requests.append(
+            PublishedScalarRequest(
+                frozenset(name for name, _, _ in compiler.buffers),
+                compiler.thread,
+                compiler.threads,
+            )
         )
     cg.device_function.cute_state.owned_root_block_dims = (compiler.threads, 1, 1)
     for statement in (*compiler.allocations(), *body):

@@ -3408,6 +3408,9 @@ def test_fragment_producer_cache_preserves_prefix_and_rng(strategy_name):
         patch(
             "helion._compiler.autotuner_heuristics.register_fragment_warp_scan_coverage"
         ),
+        patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_published_scalars_coverage"
+        ),
     ):
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_producer_cache_coverage"

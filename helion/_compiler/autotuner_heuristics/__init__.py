@@ -79,6 +79,10 @@ from .cute_fragment_private_scalar_loops import (
 )
 from .cute_fragment_producer_cache import CuteFragmentProducerCacheHeuristic
 from .cute_fragment_producer_cache import register_fragment_producer_cache_coverage
+from .cute_fragment_published_scalars import CuteFragmentPublishedScalarsHeuristic
+from .cute_fragment_published_scalars import (
+    register_fragment_published_scalars_coverage,
+)
 from .cute_fragment_reduction import CuteFragmentReductionHeuristic
 from .cute_fragment_reduction import register_fragment_reduction_coverage
 from .cute_fragment_register_loads import CuteFragmentRegisterLoadsHeuristic
@@ -90,6 +94,10 @@ from .cute_fragment_register_snapshots import (
 from .cute_fragment_resources import fragment_resource_carrier
 from .cute_fragment_scan import CuteFragmentScanHeuristic
 from .cute_fragment_scan import register_fragment_scan_coverage
+from .cute_fragment_skip_zero_atomics import CuteFragmentSkipZeroAtomicsHeuristic
+from .cute_fragment_skip_zero_atomics import (
+    register_fragment_skip_zero_atomics_coverage,
+)
 from .cute_fragment_threads import CuteFragmentThreadsHeuristic
 from .cute_fragment_threads import register_fragment_threads_coverage
 from .cute_fragment_topk_network import CuteFragmentTopKNetworkHeuristic
@@ -202,6 +210,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentAtomicAggregationHeuristic,
         CuteFragmentLocalAtomicRegistersHeuristic,
         CuteFragmentRegisterSnapshotsHeuristic,
+        CuteFragmentPublishedScalarsHeuristic,
+        CuteFragmentSkipZeroAtomicsHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -656,5 +666,11 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_register_snapshots_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_published_scalars_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_skip_zero_atomics_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
