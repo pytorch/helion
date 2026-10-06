@@ -60,6 +60,8 @@ from .atomic_consumer_fusion import AtomicConsumerRegion
 from .atomic_consumer_fusion import atomic_consumer_regions
 from .captured_reduction import captured_reduction_coordinates
 from .captured_reduction import physical_capture_axes
+from .completed_scan import CompletedScan
+from .completed_scan import completed_scan_plans
 from .dead_zero_atomics import dead_zero_atomic_results
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .fragment_expression import FragmentExpression
@@ -73,6 +75,7 @@ from .independent_reduction import independent_reduction_coordinates
 from .integer_atomic_epochs import can_defer_integer_epoch
 from .local_atomic import local_atomic_allocations
 from .local_atomic import local_buffer_conditional_inputs
+from .local_atomic import local_indexed_load
 from .local_atomic import prove_local_atomics
 from .local_atomic import terminal_finalizer_inputs
 from .local_atomic import terminal_loop_symbols
@@ -83,7 +86,9 @@ from .private_scalar_loops import privatize_scalar_loop
 from .pure_producer_regions import pure_producer_plan
 from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
+from .register_snapshots import SnapshotBinding
 from .register_snapshots import SnapshotOwner
+from .register_snapshots import snapshot_capture_slots
 from .register_snapshots import snapshot_chains
 from .register_snapshots import snapshot_logical_shape
 from .tcgen05_config import CuteTcgen05Config
@@ -131,6 +136,8 @@ class Fragment:
     dependencies: tuple[Fragment, ...] = ()
     storage: str | None = None
     logical_domain: Callable[[tuple[str, ...]], tuple[str, ...]] | None = None
+
+    snapshot: SnapshotBinding | None = None
 
     def read(self, indices: tuple[str, ...]) -> str:
         assert len(indices) == len(self.shape)
@@ -508,6 +515,9 @@ class FragmentCompiler:
                         warp_result_chain(node, self.env, self.threads)
                     )
 
+        self.scan_plans: dict[Node, CompletedScan] = {}
+        self.scan_reductions: dict[Node, CompletedScan] = {}
+        self.scan_pending: list[tuple[Fragment, Callable, torch.dtype, str]] = []
         self.snapshot_owner: SnapshotOwner | None = None
         self.snapshot_loads: set[Node] = set()
         self.register_snapshot_buffers: dict[str, int] = {}
@@ -1387,6 +1397,108 @@ class FragmentCompiler:
             self.scalar_ordered_tickets[node] = result
         return result
 
+    def completed_local_load(
+        self, node: Node, values: dict[Node, object], source: Fragment
+    ) -> Fragment:
+        """Snapshot a masked indexed read after the target's final atomic epoch."""
+        assert id(source) in self.local_logical_sizes and source.storage is not None
+        assert local_indexed_load(node)
+        index_node = cast("list[object]", node.args[1])[0]
+        index = values[index_node] if isinstance(index_node, Node) else index_node
+        mask_node = node.args[2]
+        mask = values[mask_node] if isinstance(mask_node, Node) else None
+        fake = cast("torch.Tensor", node.meta["val"])
+        shape = self.shape(fake.shape)
+        if len(shape) > 1 or (
+            isinstance(mask, Fragment)
+            and (
+                len(mask.shape) > len(shape)
+                or any(
+                    left not in (1, right)
+                    for left, right in zip(
+                        mask.shape, shape[len(shape) - len(mask.shape) :], strict=True
+                    )
+                )
+            )
+        ):
+            raise exc.InvalidConfig("local indexed loads require scalar/vector masks")
+        extent = self.local_logical_sizes[id(source)]
+        tensor_index = isinstance(index_node, Node) and isinstance(
+            index_node.meta.get("val"), torch.Tensor
+        )
+        # Match hl.load's reference contract: tensor indices with an explicit
+        # mask use nonnegative bounds, while unmasked/scalar indexing follows
+        # PyTorch's one-extent negative normalization. Do not assign an output
+        # value to unmasked out-of-bounds accesses: require a proved range.
+        wrap_negative = mask_node is None or not tensor_index
+        if wrap_negative:
+            from .bounded_gather import integer_bounds
+
+            interval = integer_bounds(index_node, captured_bounds={})
+            if interval is None or not -extent <= interval[0] <= interval[1] < extent:
+                raise exc.InvalidConfig(
+                    "unmasked local indexed loads require a proved logical index range"
+                )
+        dependencies = (
+            source,
+            *(value for value in (index, mask) if isinstance(value, Fragment)),
+        )
+
+        def output_domain(coords: tuple[str, ...]) -> tuple[str, ...]:
+            # Shape ownership survives the copy; runtime index/mask values do
+            # not. Never retain a lazy shared read in the result's domain.
+            return tuple(
+                f"({coord}) < ({self.logical_axis_extent(fake, dim, size)})"
+                for dim, (coord, size) in enumerate(zip(coords, shape, strict=True))
+            )
+
+        def read(coords: tuple[str, ...]) -> str:
+            result = self.df.new_var("fragment_local_load")
+            self.emit(f"{result} = {self.cast('0', source.dtype)}")
+            domains = list(output_domain(coords))
+            if isinstance(index, Fragment):
+                domains.extend(index.broadcast_domain(coords))
+            if isinstance(mask, Fragment):
+                domains.extend(mask.broadcast_domain(coords))
+            branch = statement_from_string(f"if {self.predicate(domains)}:\n    pass")
+            assert isinstance(branch, ast.If)
+            branch.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                location = self.df.new_var("fragment_local_index")
+                expression = (
+                    index.broadcast(coords)
+                    if isinstance(index, Fragment)
+                    else self.scalar(index)
+                )
+                if wrap_negative:
+                    self.emit(f"{location} = cutlass.Int64({expression})")
+                    self.emit(
+                        f"if {location} < 0:\n"
+                        f"    {location} = {location} + cutlass.Int64({extent})"
+                    )
+                else:
+                    self.emit(f"{location} = {expression}")
+                valid = [f"0 <= ({location}) and ({location}) < ({extent})"]
+                if isinstance(mask, Fragment):
+                    valid.append(mask.broadcast(coords))
+                predicate = self.predicate(valid)
+                self.emit(f"if {predicate}:\n    {result} = {source.read((location,))}")
+            self.cg.add_statement(branch)
+            return result
+
+        # The normal node boundary published pending writes before entering
+        # memory(). Holding every dependency prevents result allocation from
+        # recycling the source or a still-lazy index/mask operand.
+        return self.materialize(
+            Fragment(
+                shape,
+                source.dtype,
+                read,
+                dependencies=dependencies,
+                logical_domain=output_domain,
+            )
+        )
+
     def memory(
         self,
         node: Node,
@@ -1420,6 +1532,12 @@ class FragmentCompiler:
         extra_mask = node.args[3] if store else node.args[2]
         mask_value = values[extra_mask] if isinstance(extra_mask, Node) else extra_mask
         if isinstance(tensor, Fragment):
+            if (
+                not store
+                and id(tensor) in self.local_logical_sizes
+                and local_indexed_load(node)
+            ):
+                return self.completed_local_load(node, values, tensor)
             if (
                 store
                 or extra_mask is not None
@@ -1658,6 +1776,22 @@ class FragmentCompiler:
                 read_snapshot,
                 True,
                 logical_domain=loaded_fragment.logical_domain,
+                snapshot=SnapshotBinding(
+                    node,
+                    name,
+                    self.threads,
+                    shape,
+                    output.dtype,
+                    frozenset(
+                        self.referenced_buffers(
+                            [
+                                values[index]
+                                for index in indices
+                                if isinstance(index, Node)
+                            ]
+                        )
+                    ),
+                ),
             )
         if self.df.config.get(
             "cute_fragment_packet_loads", False
@@ -2188,6 +2322,23 @@ class FragmentCompiler:
                     expression = f"{left} if {left} != {left} else ({expression})"
                 return expression
 
+            if node in self.scan_reductions:
+                plan = self.scan_reductions[node]
+                result = self.allocate(
+                    Fragment(result_shape, fake.dtype, lambda _: "0")
+                )
+                if not self.scan_pending:
+                    self.held.append([])
+                cast("list[object]", self.held[-1]).extend([result, *dependencies])
+                self.scan_pending.append(
+                    (result, element, compute_dtype, lowering.reduction_type)
+                )
+                if node is plan.reductions[-1]:
+                    self.completed_scan_reductions(reduction_shape)
+                    self.scan_pending.clear()
+                    self.held.pop()
+                return result
+
             if node in self.snapshot_reductions:
                 if (
                     self.shape(fake.shape) != ()
@@ -2575,7 +2726,6 @@ class FragmentCompiler:
         if any(
             self.df.config.get(key, False)
             for key in (
-                "cute_fragment_register_snapshots",
                 "cute_fragment_register_loads",
                 "cute_fragment_register_producers",
                 "cute_fragment_producer_cache",
@@ -2602,13 +2752,28 @@ class FragmentCompiler:
                 "resident while requires scalar static packet loops"
             )
 
-        # Freeze even readonly input recipes into held shared storage. A fake
-        # scalar or a register recipe is not evidence of physical replication.
+        # Preserve only already initialized immutable snapshots. All mutable
+        # carries and other recipes retain the original held shared copies.
         captures: list[Fragment] = []
         self.held.append(captures)
-        for entry in plan.body.captures:
+        for slot, entry in enumerate(plan.body.captures):
+            value = cast("Fragment", values[entry])
+            binding = value.snapshot
+            keep_snapshot = (
+                binding is not None
+                and self.df.config.get("cute_fragment_register_snapshots", False)
+                and binding.source in self.snapshot_loads
+                and binding.threads == self.threads
+                and binding.shape == value.shape
+                and binding.dtype == value.dtype
+                and not binding.domain_storage
+                and value.resident
+                and value.storage is None
+                and not value.dependencies
+                and slot in snapshot_capture_slots(node, self.graphs, binding.source)
+            )
             captures.append(
-                self.materialize(cast("Fragment", values[entry]), copy=True)
+                value if keep_snapshot else self.materialize(value, copy=True)
             )
         carries = [captures[slot] for _index, slot in plan.body.carry_map]
         predicate = self.allocate(Fragment((), torch.bool, lambda _: "False"))
@@ -2741,10 +2906,18 @@ class FragmentCompiler:
         reverse = bool(node.args[3])
         fake = cast("torch.Tensor", node.meta["val"])
         extent = self.logical_axis_extent(fake, dim, capacity)
-        return self.warp_scan_fragment(source, dim, extent, reverse)
+        return self.warp_scan_fragment(
+            source, dim, extent, reverse, export=node in self.scan_plans
+        )
 
     def warp_scan_fragment(
-        self, source: Fragment, dim: int, extent: str, reverse: bool
+        self,
+        source: Fragment,
+        dim: int,
+        extent: str,
+        reverse: bool,
+        *,
+        export: bool = False,
     ) -> Fragment:
         """Recursively scan chunk totals using associative integer addition.
 
@@ -2759,6 +2932,41 @@ class FragmentCompiler:
         chunks = (capacity + 31) // 32
         work_shape = (*row_shape, chunks)
         zero = self.cast("0", source.dtype)
+        register = self.df.new_var("fragment_scan_export") if export else ""
+        slot = self.df.new_var("fragment_scan_slot") if export else ""
+        if export:
+            slots = (capacity + self.threads - 1) // self.threads
+            self.emit(
+                f"{register} = cute.make_rmem_tensor(({slots},), {self.dtype(source.dtype)})"
+            )
+            self.emit(f"{register}.fill({zero})")
+
+        def scan_elements(body: Callable[[tuple[str, ...]], None]) -> None:
+            if not export:
+                self.elements(work_shape, body, threads_per_element=32)
+                return
+            loop = cast(
+                "ast.For",
+                statement_from_string(
+                    f"for {slot} in cutlass.range_constexpr({slots}):\n    pass"
+                ),
+            )
+            loop.body.clear()
+            chunk = self.df.new_var("fragment_scan_chunk")
+            with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+                self.emit(
+                    f"{chunk} = {self.thread} // 32 + {slot} * {self.threads // 32}"
+                )
+                guard = cast(
+                    "ast.If", statement_from_string(f"if {chunk} < {chunks}:\n    pass")
+                )
+                guard.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", guard.body)):
+                    body((*("0" for _ in row_shape), chunk))
+                self.cg.add_statement(guard)
+            self.cg.add_statement(loop)
+            self.synchronize()
+
         self.held.append(source)
         result = self.allocate(source)
         self.held.append(result)
@@ -2801,6 +3009,8 @@ class FragmentCompiler:
             branch.orelse = [statement_from_string(f"{value} = {zero}")]
             self.cg.add_statement(branch)
             prefix(value, lane)
+            if export:
+                self.emit(f"{register}[{slot}] = {value}")
             row = coords[:-1]
             padding = (*row[:dim], rank, *row[dim:])
             self.emit(
@@ -2821,7 +3031,7 @@ class FragmentCompiler:
                 f"    {totals.read(coords)} = {total} if ({coords[-1]}) * 32 < ({extent}) else {zero}"
             )
 
-        self.elements(work_shape, partials, threads_per_element=32)
+        scan_elements(partials)
 
         if chunks > 32:
             prefixes = self.warp_scan_fragment(
@@ -2870,17 +3080,119 @@ class FragmentCompiler:
             )
             # Chunk zero retains its partial bit-for-bit: adding an artificial
             # zero would change negative zero and is unnecessary.
-            partial = result.read(location)
+            partial = f"{register}[{slot}]" if export else result.read(location)
             self.emit(
                 f"if {rank} < ({extent}) and ({coords[-1]}) > 0:\n"
                 f"    {result.read(location)} = {self.cast(f'{carry} + {partial}', source.dtype)}"
             )
+            if export:
+                self.emit(
+                    f"if {rank} < ({extent}) and ({coords[-1]}) > 0:\n"
+                    f"    {register}[{slot}] = {self.cast(f'{carry} + {partial}', source.dtype)}"
+                )
 
-        self.elements(work_shape, carries, threads_per_element=32)
+        scan_elements(carries)
         self.held.pop()
         self.held.pop()
         self.held.pop()
+        if export:
+
+            def read(coords: tuple[str, ...]) -> str:
+                if self.snapshot_owner is None:
+                    return result.read(coords)
+                self.snapshot_owner.prove(self.flatten(coords, source.shape))
+                return f"{register}[{self.snapshot_owner.slot}]"
+
+            return dataclasses.replace(result, element=read, dependencies=(result,))
         return result
+
+    def completed_scan_reductions(self, shape: tuple[int, ...]) -> None:
+        size = math.prod(shape)
+        pending = self.scan_pending
+        dtype = pending[0][2]
+        assert all(item[2] == dtype for item in pending)
+        totals = [self.df.new_var("fragment_scan_reduce") for _ in pending]
+        identities = [
+            self.cast(self.scalar(Reduction.default_accumulator(item[3], dtype)), dtype)
+            for item in pending
+        ]
+
+        def combine(kind: str, left: str, right: str) -> str:
+            return self.cast(
+                self.env.backend.reduction_combine_expr(kind, left, right, dtype), dtype
+            )
+
+        for total, identity in zip(totals, identities, strict=True):
+            self.emit(f"{total} = {identity}")
+        slot = self.df.new_var("fragment_scan_consumer_slot")
+        index = self.df.new_var("fragment_scan_consumer_index")
+        loop = cast(
+            "ast.For",
+            statement_from_string(
+                f"for {slot} in cutlass.range_constexpr({(size + self.threads - 1) // self.threads}):\n    pass"
+            ),
+        )
+        loop.body.clear()
+        with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+            self.emit(f"{index} = {self.thread} + {slot} * {self.threads}")
+            guard = cast(
+                "ast.If", statement_from_string(f"if {index} < {size}:\n    pass")
+            )
+            guard.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", guard.body)):
+                assert self.snapshot_owner is None
+                self.snapshot_owner = SnapshotOwner(index, slot, size)
+                try:
+                    for (result, element, _, kind), total in zip(
+                        pending, totals, strict=True
+                    ):
+                        value = element(
+                            tuple("0" for _ in result.shape),
+                            self.coordinates(index, shape),
+                        )
+                        self.emit(f"{total} = {combine(kind, total, value)}")
+                finally:
+                    self.snapshot_owner = None
+            self.cg.add_statement(guard)
+        self.cg.add_statement(loop)
+        peer = self.df.new_var("fragment_scan_reduce_peer")
+        for distance in (16, 8, 4, 2, 1):
+            for (_, _, _, kind), total in zip(pending, totals, strict=True):
+                self.emit(
+                    f"{peer} = cute.arch.shuffle_sync_bfly({total}, offset={distance}, mask=0xffffffff, mask_and_clamp=31)"
+                )
+                self.emit(f"{total} = {combine(kind, total, peer)}")
+        warps = self.threads // 32
+        scratch = self.allocate(Fragment((warps * len(pending),), dtype, lambda _: "0"))
+        self.held.append(scratch)
+        for i, total in enumerate(totals):
+            self.emit(
+                f"if {self.thread} % 32 == 0:\n    {scratch.read((f'{i * warps} + {self.thread} // 32',))} = {total}"
+            )
+        self.synchronize()
+        guard = cast(
+            "ast.If", statement_from_string(f"if {self.thread} < 32:\n    pass")
+        )
+        guard.body.clear()
+        with self.cg.set_statements(cast("list[ast.AST]", guard.body)):
+            for i, ((result, _, _, kind), total, identity) in enumerate(
+                zip(pending, totals, identities, strict=True)
+            ):
+                self.emit(f"{total} = {identity}")
+                self.emit(
+                    f"if {self.thread} < {warps}:\n    {total} = {scratch.read((f'{i * warps} + {self.thread}',))}"
+                )
+                for distance in (16, 8, 4, 2, 1):
+                    self.emit(
+                        f"{peer} = cute.arch.shuffle_sync_bfly({total}, offset={distance}, mask=0xffffffff, mask_and_clamp=31)"
+                    )
+                    self.emit(f"{total} = {combine(kind, total, peer)}")
+                self.emit(
+                    f"if {self.thread} == 0:\n    {result.read(tuple('0' for _ in result.shape))} = {self.cast(total, result.dtype)}"
+                )
+        self.cg.add_statement(guard)
+        self.synchronize()
+        self.held.pop()
 
     def cooperative_scan(self, node: Node, values: dict[Node, object]) -> Fragment:
         source = values[cast("Node", node.args[1])]
@@ -3211,6 +3523,17 @@ class FragmentCompiler:
         self.lazy_opaque_producers = pure_plan.lazy if pure_plan else frozenset()
         if pure_plan is not None:
             cache_nodes = (cache_nodes - pure_plan.replicated) | pure_plan.publications
+        previous_scans, previous_reductions = self.scan_plans, self.scan_reductions
+        plans = (
+            completed_scan_plans(graph, self.shape)
+            if self.df.config.get("cute_fragment_scan_exports", False)
+            and not self.scopes
+            else ()
+        )
+        self.scan_plans = {plan.scan: plan for plan in plans}
+        self.scan_reductions = {
+            node: plan for plan in plans for node in plan.reductions
+        }
         uses = {node: len(node.users) for node in graph.nodes}
         regions = (
             atomic_consumer_regions(self.graphs, self.env)
@@ -3274,6 +3597,7 @@ class FragmentCompiler:
         finally:
             self.iteration_local_returns = frozenset()
             self.lazy_opaque_producers = previous_opaque
+            self.scan_plans, self.scan_reductions = previous_scans, previous_reductions
             self.scopes.pop()
         raise AssertionError("graph has no output")
 

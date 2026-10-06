@@ -965,6 +965,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
         "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
@@ -1090,6 +1091,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
         "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
@@ -1219,6 +1221,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
+        "cute_fragment_scan_exports",
         "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
@@ -1569,9 +1572,14 @@ class ConfigSpec:
         self.cute_fragment_pure_producer_regions_search_enabled = False
         self.cute_fragment_local_atomic_register_min_threads = 0
         self.cute_fragment_register_snapshots_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_register_snapshot_while_root_ids: frozenset[int] = (
+            frozenset()
+        )
         self.cute_fragment_register_snapshots_search_enabled = False
         self.cute_fragment_register_producer_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_register_producers_search_enabled = False
+        self.cute_fragment_scan_exports_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_scan_exports_search_enabled = False
         self.cute_fragment_bounded_gather_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_bounded_gather_search_enabled = False
         self.cute_integer_loop_reduction_available = False
@@ -3692,6 +3700,39 @@ class ConfigSpec:
             return
         raise InvalidConfig(f"{key} requires a proved bounded last-axis gather")
 
+    def _normalize_cute_fragment_scan_exports(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_scan_exports"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_scan_exports_root_ids
+            and config.get("cute_fragment_warp_scan") is True
+            and not any(
+                config.get(k)
+                for k in (
+                    "cute_collective_mma",
+                    "cute_register_chain",
+                    "cute_fragment_register_snapshots",
+                    "cute_fragment_register_loads",
+                    "cute_fragment_register_producers",
+                    "cute_fragment_warp_results",
+                    "cute_fragment_pure_producer_regions",
+                )
+            )
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key} requires shared producers and a proved terminal warp-scan interval"
+        )
+
     def _normalize_cute_fragment_register_producers(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -3728,6 +3769,10 @@ class ConfigSpec:
             and self.cute_fragment_register_snapshots_root_ids
             and cast("int", config.get("cute_fragment_threads", 128))
             >= self.cute_fragment_register_snapshot_min_threads
+            and (
+                not self.cute_fragment_register_snapshot_while_root_ids
+                or config.get("cute_fragment_bounded_gather", False) is True
+            )
             and not config.get("cute_collective_mma")
             and not config.get("cute_register_chain")
         ):
@@ -4855,6 +4900,7 @@ class ConfigSpec:
             self._normalize_cute_fragment_register_producers(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_fragment_scan_exports(config, fix_invalid=_fix_invalid)
             self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
             self._normalize_cute_materialized_operand_schedule(
                 config, fix_invalid=_fix_invalid
@@ -6045,6 +6091,7 @@ class ConfigSpec:
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
                 "cute_fragment_register_producers",
+                "cute_fragment_scan_exports",
                 "cute_fragment_bounded_gather",
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
@@ -6312,6 +6359,8 @@ class ConfigSpec:
                 fields["cute_fragment_bounded_gather"] = BooleanFragment()
             if self.cute_fragment_register_producers_search_enabled:
                 fields["cute_fragment_register_producers"] = BooleanFragment()
+            if self.cute_fragment_scan_exports_search_enabled:
+                fields["cute_fragment_scan_exports"] = BooleanFragment()
             if self.cute_fragment_published_scalars_search_enabled:
                 fields["cute_fragment_published_scalars"] = BooleanFragment()
             if self.cute_fragment_skip_zero_atomics_search_enabled:

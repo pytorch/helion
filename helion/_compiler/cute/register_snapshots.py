@@ -85,6 +85,79 @@ class SnapshotOwner:
             )
 
 
+@dataclass(frozen=True)
+class SnapshotBinding:
+    """One initialized immutable rmem value, with the existing striped owner map."""
+
+    source: Node
+    name: str
+    threads: int
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    domain_storage: frozenset[str]
+
+
+def snapshot_capture_slots(
+    call: Node, graphs: list[GraphInfo], source: Node
+) -> tuple[int, ...]:
+    """Only a dominating direct snapshot (or typed identity) can cross a while.
+
+    This is intentionally not a pure-recipe/LICM proof. The caller separately
+    proves whole-region readonly storage and every physical coordinate read.
+    """
+    from .resident_while import resident_while_plan
+
+    try:
+        plan = resident_while_plan(call, graphs)
+    except exc.InvalidConfig:
+        return ()
+    if source.graph is not plan.root.graph:
+        return ()
+    # Limit persistent domains to the existing direct iota coordinates. A
+    # loaded/remapped index can hide a shared domain dependency whose lifetime
+    # is not represented by the copied snapshot value.
+    if any(
+        isinstance(index, Node)
+        and isinstance(index.meta.get("val"), torch.Tensor)
+        and index.target is not torch.ops.prims.iota.default
+        for index in cast("list[object]", source.args[1])
+    ):
+        return ()
+
+    order = {node: i for i, node in enumerate(plan.root.graph.nodes)}
+    if source not in order or order[source] >= order[call]:
+        return ()
+
+    def identity(value: Node) -> bool:
+        while value is not source:
+            if (
+                value.graph is not source.graph
+                or value.target
+                not in (_tracing_ops._new_var, torch.ops.aten.alias.default)
+                or len(value.args) != 1
+                or value.kwargs
+                or not isinstance(value.args[0], Node)
+            ):
+                return False
+            parent = value.args[0]
+            if parent not in order or order[parent] >= order[value]:
+                return False
+            left, right = value.meta.get("val"), parent.meta.get("val")
+            if (
+                not isinstance(left, torch.Tensor)
+                or not isinstance(right, torch.Tensor)
+                or left.dtype != right.dtype
+                or left.shape != right.shape
+            ):
+                return False
+            value = parent
+        return True
+
+    return tuple(
+        slot for slot in plan.invariant_slots if identity(plan.body.captures[slot])
+    )
+
+
 def snapshot_logical_shape(node: Node) -> tuple[int | torch.SymInt, ...]:
     target = cast("Node", node.args[0]).meta["val"]
     indices = [
@@ -135,10 +208,38 @@ def snapshot_chains(
         dead_graphs = set()
         while pending:
             node = pending.pop()
-            if node in seen and node.target is not _tracing_ops._if:
+            if node in seen and node.target not in (
+                _tracing_ops._if,
+                _tracing_ops._while_loop,
+            ):
                 continue
             seen.add(node)
             value = node.meta.get("val")
+            if node.target is _tracing_ops._while_loop:
+                slots = snapshot_capture_slots(node, graphs, load)
+                if not slots:
+                    return frozenset()
+                captures = cast("list[Node]", node.args[2])
+                # Any derived or mutable capture reached by this chain must
+                # stay shared; do not infer invariance from its initial bits.
+                if any(
+                    entry in seen and slot not in slots
+                    for slot, entry in enumerate(captures)
+                ):
+                    return frozenset()
+                used = False
+                for graph_id in node.args[:2]:
+                    child = by_id[cast("int", graph_id)]
+                    placeholders = list(child.graph.find_nodes(op="placeholder"))
+                    for slot in slots:
+                        placeholder = placeholders[slot]
+                        used |= bool(placeholder.users)
+                        if placeholder not in seen:
+                            seen.add(placeholder)
+                            pending.extend(placeholder.users)
+                if not used:
+                    return frozenset()
+                continue
             if node.target is _tracing_ops._if:
                 if node.users or local_buffer_conditional_inputs(node, graphs) is None:
                     return frozenset()

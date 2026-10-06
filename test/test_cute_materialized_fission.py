@@ -1068,10 +1068,16 @@ def test_load_hints_keep_global_positions_across_stages() -> None:
     )
     with _cpu_target():
         stages = _sources(bound.to_code(config))
-    assert "cop='cs'" in stages[0]
-    assert "evict_last" not in stages[0]
-    assert "cop='cs'" not in stages[1]
-    assert "evict_last" in stages[1]
+    policies = [
+        {
+            ast.literal_eval(node.args[2])
+            for node in ast.walk(ast.parse(stage))
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "_cute_scalar_policy_load"
+        }
+        for stage in stages
+    ]
+    assert policies == [{"streaming"}, {"last"}]
 
 
 @skipUnlessBackends(["cute"])

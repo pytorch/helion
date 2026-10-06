@@ -711,3 +711,264 @@ def test_snapshot_final_epoch_scalars_native(threads, width, dtype):
         for result, reference in zip(actual, expected, strict=True):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
         torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        "",
+        ", approx=True",
+        ", ftz=False",
+        ", approx=True, ftz=True",
+        ", approx=False, ftz=True",
+        ", ftz=False, approx=True",
+    ],
+)
+def test_div_recipe_preserves_exact_semantic_flags(flags):
+    from helion._compiler.cute.published_scalars import _recipe
+
+    source = f"cutlass.Float32(cute.math.div(cutlass.Float32(1), shared[0]{flags}))"
+    node = ast.parse(source, mode="eval").body
+    result = _recipe(node, {}, {"shared"})
+    assert result is not None
+    assert ast.dump(result.expression) == ast.dump(node)
+    assert result.slots == frozenset({"shared"})
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "cute.math.div(shared[0])",
+        "cute.math.div(1, shared[0], True)",
+        "cute.math.div(1, shared[0], approx=flag)",
+        "cute.math.div(1, shared[0], ftz=shared[0])",
+        "cute.math.div(1, shared[0], approx=1)",
+        "cute.math.div(1, shared[0], ftz=None)",
+        "cute.math.div(1, shared[0], rounding=mode)",
+        "cute.math.div(1, shared[0], fastmath=True)",
+        "cute.math.div(1, shared[0], loc=None)",
+        "cute.math.div(1, shared[0], **options)",
+        "cute.math.div(*operands, approx=True)",
+        "cute.math.div(unknown(), shared[0], approx=True)",
+        "cute.math.div(1, shared[0], approx=True, approx=False)",
+    ],
+)
+def test_div_recipe_declines_dynamic_semantics_and_unsupported_abi(call):
+    from helion._compiler.cute.published_scalars import _recipe
+    from helion._compiler.cute.published_scalars import _Value
+
+    # Even a recipe-known value is not a literal SDK semantic flag.
+    values = {"flag": _Value(ast.Constant(True), frozenset())}
+    assert _recipe(ast.parse(call, mode="eval").body, values, {"shared"}) is None
+
+
+def _div_producer_program(width, flags=", approx=True, ftz=True"):
+    slots = (width + 31) // 32
+    expression = (
+        "cutlass.Int32(cute.math.max(cute.math.min("
+        "cute.math.div(cutlass.Float32((snapshot[SLOT] + 3) * 2 - 1), "
+        f"cutlass.Float32(3){flags}), cutlass.Float32(8)), "
+        "cutlass.Float32(-8)) + cutlass.Float32(9))"
+    )
+    result = f"""
+snapshot = cute.make_rmem_tensor(({slots},), cutlass.Float32)
+snapshot.fill(cutlass.Float32(0))
+for load_slot in cutlass.range_constexpr({slots}):
+    load_index = thread + load_slot * 32
+    if load_index < {width}:
+        snapshot[load_slot] = cutlass.Float32(load_index % 19 - 9)
+    else:
+        pass
+"""
+    for prefix in ("first", "second"):
+        result += f"""
+for {prefix}_slot in cutlass.range_constexpr({slots}):
+    {prefix}_index = thread + {prefix}_slot * 32
+    if {prefix}_index < {width}:
+        {prefix} = {expression.replace("SLOT", prefix + "_slot")}
+        consumer({prefix}_index, {prefix})
+    else:
+        pass
+"""
+    return result
+
+
+def _cache_div_producer(source, width):
+    from helion._compiler.cute.register_producers import cache_register_producers
+
+    body = ast.parse(source).body
+    names = itertools.count()
+    changed = cache_register_producers(
+        body,
+        set(),
+        {"snapshot": width},
+        "thread",
+        32,
+        lambda p: f"{p}_{next(names)}",
+    )
+    return ast.unparse(
+        ast.fix_missing_locations(ast.Module(body=body, type_ignores=[]))
+    ), changed
+
+
+@pytest.mark.parametrize("width", [17, 32, 65, 129])
+def test_div_composition_caches_final_integer_and_preserves_owner_effects(width):
+    original = _div_producer_program(width)
+    result, changed = _cache_div_producer(original, width)
+    assert changed == 1
+    assert f"cute.make_rmem_tensor(({(width + 31) // 32},), cutlass.Int32)" in result
+    assert result.count("cute.math.div(") == 1
+    assert "approx=True, ftz=True" in result
+    for order in (range(32), reversed(range(32))):
+        lanes = list(order)
+        observations = []
+        for text in (original, result):
+            events = []
+
+            def divide(x, y, *, approx, ftz):
+                assert approx is True and ftz is True
+                # Same deterministic typed operation on both sides tests the
+                # emitted recipe/effect order, not hardware approximation error.
+                return np.float32(x / y)
+
+            for lane in lanes:
+                scope = {
+                    "thread": lane,
+                    "consumer": lambda index, value, events=events: events.append(
+                        (index, type(value), value.tobytes())
+                    ),
+                    "cutlass": SimpleNamespace(
+                        Float32=np.float32, Int32=np.int32, range_constexpr=range
+                    ),
+                    "cute": SimpleNamespace(
+                        make_rmem_tensor=lambda shape, dtype: np.zeros(
+                            shape, dtype=dtype
+                        ),
+                        math=SimpleNamespace(
+                            div=divide, min=np.minimum, max=np.maximum
+                        ),
+                    ),
+                }
+                exec(text, scope)
+            observations.append(events)
+        assert observations[0] == observations[1]
+        assert len(observations[1]) == 2 * width
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("snapshot[second_slot]", "snapshot[(second_slot + 1) % 3]"),
+        ("for second_slot", "snapshot[0] = cutlass.Float32(5)\nfor second_slot"),
+        ("for second_slot", "alias = snapshot\nfor second_slot"),
+        ("for second_slot", "unknown(snapshot)\nfor second_slot"),
+        ("second_slot * 32", "second_slot * 64"),
+        ("        second =", "        second_slot = 0\n        second ="),
+        ("approx=True", "approx=flag"),
+    ],
+)
+def test_div_composition_keeps_owner_epoch_and_semantic_declines(old, new):
+    source = _div_producer_program(65).replace(old, new)
+    result, count = _cache_div_producer(source, 65)
+    assert count == 0
+    assert ast.dump(ast.parse(result)) == ast.dump(ast.parse(source))
+
+
+def test_div_published_scalar_caches_exact_flags_without_merging_variants():
+    source = _SOURCE.replace("Int32", "Float32").replace(
+        "    d = cutlass.Float32(shared[0])",
+        "    raw = shared[0]\n    d = cutlass.Float32(raw)",
+    )
+    source = source.replace(
+        "b + 3", "cute.math.div(cutlass.Float32(1), b, approx=True, ftz=True)"
+    )
+    source = source.replace(
+        "d + 3", "cute.math.div(cutlass.Float32(1), d, approx=True, ftz=True)"
+    )
+    result, count = _transform(source)
+    assert count > 0
+    assert result.count("cute.math.div(") == 1
+    assert "approx=True, ftz=True" in result
+    changed_flags = source.replace(
+        "d, approx=True, ftz=True", "d, approx=True, ftz=False"
+    )
+    result, count = _transform(changed_flags)
+    assert count > 0
+    assert result.count("cute.math.div(") == 2
+    assert "approx=True, ftz=False" in result
+    for old, new in (
+        ("for j", "shared[0] = cutlass.Float32(7)\nfor j"),
+        ("for j", "alias = shared\nfor j"),
+    ):
+        text = source.replace(old, new)
+        result, count = _transform(text)
+        assert count == 0
+        assert ast.dump(ast.parse(result)) == ast.dump(ast.parse(text))
+
+
+def test_div_published_typed_execution_preserves_zero_and_nonfinite_bits():
+    source = _SOURCE.replace("Int32", "Float32").replace(
+        "    d = cutlass.Float32(shared[0])",
+        "    raw = shared[0]\n    d = cutlass.Float32(raw)",
+    )
+    source = source.replace(
+        "b + 3", "cute.math.div(cutlass.Float32(1), b, approx=True, ftz=True)"
+    )
+    source = source.replace(
+        "d + 3", "cute.math.div(cutlass.Float32(1), d, approx=True, ftz=True)"
+    )
+    result, changed = _transform(source)
+    assert changed > 0 and result.count("cute.math.div(") == 1
+    for value in (
+        np.float32(-0.0),
+        np.float32(0.0),
+        np.float32(-3),
+        np.float32(7),
+        np.float32(np.inf),
+        np.float32(-np.inf),
+        np.float32(np.nan),
+    ):
+        for order in (list(range(32)), list(reversed(range(32)))):
+            observations = []
+            for text in (source, result):
+                shared = np.zeros(1, dtype=np.float32)
+                out = np.zeros(65, dtype=np.float32)
+
+                def divide(x, y, *, approx, ftz):
+                    assert approx is True and ftz is True
+                    # Model unchanged operands/typed results; actual approximate
+                    # instruction selection is checked offline; native outputs remain pending.
+                    return np.float32(x / y)
+
+                envs = [
+                    {
+                        "thread": t,
+                        "source": value,
+                        "shared": shared,
+                        "out": out,
+                        "cutlass": SimpleNamespace(Float32=np.float32),
+                        "cute": SimpleNamespace(math=SimpleNamespace(div=divide)),
+                    }
+                    for t in range(32)
+                ]
+                phases = [[]]
+                for node in ast.parse(text).body:
+                    if ast.unparse(node) == "cute.arch.sync_threads()":
+                        phases.append([])
+                    else:
+                        phases[-1].append(node)
+                observed = []
+                for phase in phases:
+                    code = compile(
+                        ast.fix_missing_locations(
+                            ast.Module(body=phase, type_ignores=[])
+                        ),
+                        "<typed-div>",
+                        "exec",
+                    )
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        for t in order:
+                            exec(code, envs[t])
+                    observed.append(out.tobytes())
+                observations.append(observed)
+            assert observations[0] == observations[1]
