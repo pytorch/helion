@@ -68,6 +68,8 @@ from .local_atomic import local_atomic_allocations
 from .local_atomic import prove_local_atomics
 from .local_atomic import terminal_finalizer_inputs
 from .local_atomic import terminal_loop_symbols
+from .private_scalar_loops import private_scalar_loop_nodes
+from .private_scalar_loops import privatize_scalar_loop
 from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
 from .tcgen05_config import CuteTcgen05Config
@@ -229,6 +231,11 @@ class FragmentCompiler:
         self.pending_local_atomics: set[str] = set()
         self.scalar_ordered_tickets: dict[Node, Fragment] = {}
         self.graphs = cg.codegen_graphs if graphs is None else graphs
+        self.private_scalar_loops = (
+            private_scalar_loop_nodes(self.graphs)
+            if self.df.config.get("cute_fragment_private_scalar_loops", False)
+            else frozenset()
+        )
         self.warp_result_nodes: dict[Node, int] = {}
         if self.df.config.get("cute_fragment_warp_results", False):
             for graph in self.graphs:
@@ -575,6 +582,58 @@ class FragmentCompiler:
         self.held.pop()
         return result
 
+    def aggregate_local_updates(
+        self,
+        shape: tuple[int, ...],
+        storage: str,
+        variables: tuple[str, ...],
+        prepare: Callable[[tuple[str, ...]], None],
+    ) -> None:
+        """Aggregate one private relaxed Int32 update epoch, without new barriers.
+
+        All CTA threads enter every round. Only lanes in the ballot execute
+        match/redux, using the same member mask for each equal wrapped address.
+        No observer can read the private target until its existing epoch barrier.
+        """
+        assert self.threads % 32 == 0
+        size = math.prod(shape)
+        iteration = self.df.new_var("fragment_atomic_round")
+        index = self.df.new_var("fragment_atomic_element")
+        address, value, active = variables
+        loop = cast(
+            "ast.For",
+            statement_from_string(
+                f"for {iteration} in range({(size + self.threads - 1) // self.threads}):\n    pass"
+            ),
+        )
+        loop.body.clear()
+        with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
+            self.emit(f"{index} = {iteration} * {self.threads} + {self.thread}")
+            # Dominating definitions are required by CuTe's staged SSA lowering.
+            self.emit(f"{address} = cutlass.Int64(0)")
+            self.emit(f"{value} = cutlass.Int32(0)")
+            self.emit(f"{active} = False")
+            valid = cast(
+                "ast.If", statement_from_string(f"if {index} < {size}:\n    pass")
+            )
+            valid.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", valid.body)):
+                prepare(self.coordinates(index, shape))
+            self.cg.add_statement(valid)
+            members = self.df.new_var("fragment_atomic_members")
+            peers = self.df.new_var("fragment_atomic_peers")
+            total = self.df.new_var("fragment_atomic_total")
+            self.emit(f"{members} = cute.arch.vote_ballot_sync({active})")
+            self.emit(
+                f"if {active}:\n"
+                f"    {peers} = cute.arch.match_sync({members}, {address})\n"
+                f"    {total} = cute.arch.warp_redux_sync({value}, 'add', {peers})\n"
+                f"    if ({peers} & cute.arch.lanemask_lt()) == 0:\n"
+                f"        cute.arch.atomic_add(({storage}.iterator + {address}).llvm_ptr, "
+                f"{total}, sem='relaxed', scope='cta')"
+            )
+        self.cg.add_statement(loop)
+
     def atomic_add(self, node: Node, values: dict[Node, object]) -> Fragment | None:
         """Each contribution is owned once; barriers are outside lane loops."""
         target, indices, value, sem = cast(
@@ -675,6 +734,34 @@ class FragmentCompiler:
             else None
         )
 
+        aggregate = (
+            local
+            and target_fake.dtype == torch.int32
+            and sem == "relaxed"
+            and not node.users
+            and not warp_owned
+            and self.df.config.get("cute_fragment_atomic_aggregation", False) is True
+        )
+        if aggregate:
+            root = self.cg.current_root_graph_info
+            assert root is not None
+            aggregate = (
+                root.graph_id
+                in self.env.config_spec.cute_fragment_atomic_aggregation_root_ids
+            )
+        aggregate_vars = (
+            tuple(
+                self.df.new_var(name)
+                for name in (
+                    "fragment_atomic_address",
+                    "fragment_atomic_value",
+                    "fragment_atomic_active",
+                )
+            )
+            if aggregate
+            else None
+        )
+
         def update(coords: tuple[str, ...]) -> None:
             masks = list(logical_domain(coords))
             positions = []
@@ -730,6 +817,15 @@ class FragmentCompiler:
                 if isinstance(value, Fragment)
                 else self.scalar(value)
             )
+            if aggregate_vars is not None:
+                address, update_value, active = aggregate_vars
+                self.emit(f"{address} = cutlass.Int64({positions[0]})")
+                self.emit(
+                    f"if {self.predicate(masks)}:\n"
+                    f"    {update_value} = {self.cast(contribution, torch.int32)}\n"
+                    f"    {active} = {update_value} != 0"
+                )
+                return
             atomic = (
                 f"cute.arch.atomic_add({pointer}, "
                 f"{self.cast(contribution, target_fake.dtype)}, "
@@ -743,7 +839,11 @@ class FragmentCompiler:
                 self.emit(f"if {self.predicate(masks)}:\n    {previous} = {atomic}")
                 self.emit(f"{result.read(coords)} = {previous}")
 
-        self.elements(shape, update, warp_owned=warp_owned, synchronize=not local)
+        if aggregate_vars is None:
+            self.elements(shape, update, warp_owned=warp_owned, synchronize=not local)
+        else:
+            assert isinstance(target, Fragment) and target.storage is not None
+            self.aggregate_local_updates(shape, target.storage, aggregate_vars, update)
         if local:
             assert isinstance(target, Fragment) and target.storage is not None
             self.pending_local_atomics.add(target.storage)
@@ -1417,6 +1517,17 @@ class FragmentCompiler:
             loop.body = cast("list[ast.stmt]", body)
             body = [loop]
         self.offsets, self.bounds = outer_offsets, outer_bounds
+        if node in self.private_scalar_loops:
+            if len(body) != 1 or not isinstance(body[0], ast.For):
+                raise exc.InvalidConfig("private scalar loops require one scalar axis")
+            outgoing = {carry.storage for carry in carries}
+            if None in outgoing or any(carry.shape for carry in carries):
+                raise exc.InvalidConfig(
+                    "private scalar loops require shared scalar carries"
+                )
+            body = list(
+                privatize_scalar_loop(self, body[0], cast("set[str]", outgoing))
+            )
         for stmt in body:
             self.cg.add_statement(stmt)
         self.held.pop()
@@ -1460,12 +1571,140 @@ class FragmentCompiler:
         return result
 
     def scan(self, node: Node, values: dict[Node, object]) -> Fragment:
+        from ..autotuner_heuristics.cute_fragment_warp_scan import warp_scan_supported
+
+        source = values[cast("Node", node.args[1])]
+        assert isinstance(source, Fragment)
+        dim = cast("int", node.args[2]) % len(source.shape)
+        root = self.cg.current_root_graph_info
+        assert root is not None
+        if (
+            self.df.config.get("cute_fragment_warp_scan", False)
+            and root.graph_id in self.env.config_spec.cute_fragment_warp_scan_root_ids
+            and warp_scan_supported(source.dtype, source.shape[dim])
+        ):
+            return self.warp_scan(node, values)
         mode = self.df.config.get("cute_fragment_scan", "serial")
         if mode == "serial":
             return self.serial_scan(node, values)
         if mode == "cooperative":
             return self.cooperative_scan(node, values)
         raise exc.InvalidConfig(f"unsupported computed fragment scan: {mode!r}")
+
+    def warp_scan(self, node: Node, values: dict[Node, object]) -> Fragment:
+        """Two CTA phases, each with full-warp, typed prefix exchanges.
+
+        A warp owns one row chunk. The second phase scans at most 32 chunk
+        totals, then adds the exclusive chunk carry to its own partials.
+        No input is overwritten and no collective is guarded by a lane test.
+        """
+        from ..autotuner_heuristics.cute_fragment_warp_scan import warp_scan_supported
+
+        source = values[cast("Node", node.args[1])]
+        assert isinstance(source, Fragment)
+        dim = cast("int", node.args[2]) % len(source.shape)
+        capacity = source.shape[dim]
+        if not warp_scan_supported(source.dtype, capacity):
+            raise exc.InvalidConfig(
+                "warp-prefix scan requires Float32/64 or Int32/64 and axis capacity <= 1024"
+            )
+        assert self.threads % 32 == 0
+        reverse = bool(node.args[3])
+        fake = cast("torch.Tensor", node.meta["val"])
+        extent = self.logical_axis_extent(fake, dim, capacity)
+        row_shape = (*source.shape[:dim], *source.shape[dim + 1 :])
+        chunks = (capacity + 31) // 32
+        work_shape = (*row_shape, chunks)
+        zero = self.cast("0", source.dtype)
+        self.held.append(source)
+        result = self.allocate(source)
+        self.held.append(result)
+        totals = self.allocate(Fragment(work_shape, source.dtype, lambda _: zero))
+        self.held.append(totals)
+
+        def prefix(value: str, lane: str) -> None:
+            for distance in (1, 2, 4, 8, 16):
+                peer = self.df.new_var("fragment_scan_peer")
+                self.emit(
+                    f"{peer} = cute.arch.shuffle_sync_up({value}, offset={distance}, "
+                    "mask=0xffffffff, mask_and_clamp=0)"
+                )
+                self.emit(
+                    f"if {lane} >= {distance}:\n"
+                    f"    {value} = {self.cast(f'{peer} + {value}', source.dtype)}"
+                )
+
+        def positions(coords: tuple[str, ...]) -> tuple[str, str, tuple[str, ...]]:
+            lane = self.df.new_var("fragment_scan_lane")
+            rank = self.df.new_var("fragment_scan_rank")
+            self.emit(f"{lane} = {self.thread} % 32")
+            self.emit(f"{rank} = ({coords[-1]}) * 32 + {lane}")
+            position = f"({extent}) - 1 - {rank}" if reverse else rank
+            row = coords[:-1]
+            return lane, rank, (*row[:dim], position, *row[dim:])
+
+        def partials(coords: tuple[str, ...]) -> None:
+            lane, rank, location = positions(coords)
+            value = self.df.new_var("fragment_scan_value")
+            self.emit(f"{value} = {zero}")
+            # A lazy source read can emit statements. Keep all such statements
+            # under the logical-bound guard, including reverse-tail addresses.
+            branch = cast(
+                "ast.If", statement_from_string(f"if {rank} < ({extent}):\n    pass")
+            )
+            branch.body.clear()
+            with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                self.emit(f"{value} = {self.cast(source.read(location), source.dtype)}")
+            branch.orelse = [statement_from_string(f"{value} = {zero}")]
+            self.cg.add_statement(branch)
+            prefix(value, lane)
+            row = coords[:-1]
+            padding = (*row[:dim], rank, *row[dim:])
+            self.emit(
+                f"if {rank} < ({extent}):\n"
+                f"    {result.read(location)} = {value}\n"
+                f"elif {rank} < {capacity}:\n"
+                f"    {result.read(padding)} = {zero}"
+            )
+            last = self.df.new_var("fragment_scan_last")
+            total = self.df.new_var("fragment_scan_total")
+            self.emit(f"{last} = min(31, max(0, ({extent}) - ({coords[-1]}) * 32 - 1))")
+            self.emit(
+                f"{total} = cute.arch.shuffle_sync({value}, {last}, "
+                "mask=0xffffffff, mask_and_clamp=31)"
+            )
+            self.emit(
+                f"if {lane} == 0:\n"
+                f"    {totals.read(coords)} = {total} if ({coords[-1]}) * 32 < ({extent}) else {zero}"
+            )
+
+        self.elements(work_shape, partials, threads_per_element=32)
+
+        def carries(coords: tuple[str, ...]) -> None:
+            lane, rank, location = positions(coords)
+            value = self.df.new_var("fragment_scan_chunks")
+            self.emit(
+                f"{value} = {totals.read((*coords[:-1], lane))} if {lane} < {chunks} else {zero}"
+            )
+            prefix(value, lane)
+            carry = self.df.new_var("fragment_scan_carry")
+            self.emit(
+                f"{carry} = cute.arch.shuffle_sync({value}, max(0, ({coords[-1]}) - 1), "
+                "mask=0xffffffff, mask_and_clamp=31)"
+            )
+            # Chunk zero retains its partial bit-for-bit: adding an artificial
+            # zero would change negative zero and is unnecessary.
+            partial = result.read(location)
+            self.emit(
+                f"if {rank} < ({extent}) and ({coords[-1]}) > 0:\n"
+                f"    {result.read(location)} = {self.cast(f'{carry} + {partial}', source.dtype)}"
+            )
+
+        self.elements(work_shape, carries, threads_per_element=32)
+        self.held.pop()
+        self.held.pop()
+        self.held.pop()
+        return result
 
     def cooperative_scan(self, node: Node, values: dict[Node, object]) -> Fragment:
         source = values[cast("Node", node.args[1])]
@@ -1650,6 +1889,14 @@ class FragmentCompiler:
         return [*merged, *merged]
 
     def graph(self, graph: torch.fx.Graph, values: dict[Node, object]) -> object:
+        from .producer_cache import producer_cache_candidates
+
+        cache_nodes = (
+            producer_cache_candidates(graph, self.shape)
+            if self.df.config.get("cute_fragment_producer_cache", False)
+            and not self.scopes
+            else frozenset()
+        )
         uses = {node: len(node.users) for node in graph.nodes}
         self.scopes.append(values)
         try:
@@ -1660,6 +1907,10 @@ class FragmentCompiler:
                     return _resolve(node.args[0], values)
                 with node.meta["location"], V.set_current_node(node):
                     values[node] = self.node(node, values)
+                    if node in cache_nodes:
+                        value = values[node]
+                        assert isinstance(value, Fragment)
+                        values[node] = self.materialize(value)
                 for source in node.all_input_nodes:
                     uses[source] -= 1
                     if uses[source] == 0:
@@ -2364,6 +2615,14 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.device_function.config.get("cute_fragment_threads", 128) != 128
         and root.graph_id in env.config_spec.cute_fragment_thread_root_ids
     )
+    producer_cache_required = (
+        cg.device_function.config.get("cute_fragment_producer_cache", False)
+        and root.graph_id in env.config_spec.cute_fragment_producer_cache_root_ids
+    )
+    warp_scan_required = (
+        cg.device_function.config.get("cute_fragment_warp_scan", False)
+        and root.graph_id in env.config_spec.cute_fragment_warp_scan_root_ids
+    )
     register_loads_required = (
         cg.device_function.config.get("cute_fragment_register_loads", False)
         and root.graph_id in env.config_spec.cute_fragment_register_load_root_ids
@@ -2377,6 +2636,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         frozenset()
         if threads_required
         or register_loads_required
+        or producer_cache_required
+        or warp_scan_required
         or cg.device_function.config.get("cute_fragment_reduction", "serial")
         != "serial"
         else owned_iota_reduction_axes(cg)
@@ -2390,6 +2651,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         frozenset()
         if threads_required
         or register_loads_required
+        or producer_cache_required
+        or warp_scan_required
         or warp_results_required
         or cg.device_function.config.get("cute_fragment_scan", "serial") != "serial"
         or cg.device_function.config.get("cute_fragment_reduction", "serial")
@@ -2405,8 +2668,15 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         )
     )
     fragment_schedule_required = (
-        threads_required
+        (
+            cg.device_function.config.get("cute_fragment_private_scalar_loops", False)
+            and root.graph_id
+            in env.config_spec.cute_fragment_private_scalar_loop_root_ids
+        )
+        or threads_required
         or register_loads_required
+        or producer_cache_required
+        or warp_scan_required
         or warp_results_required
         or (
             cg.device_function.config.get("cute_fragment_scan", "serial")
@@ -2514,6 +2784,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             captured_required
             or threads_required
             or register_loads_required
+            or producer_cache_required
+            or warp_scan_required
             or warp_results_required
         ):
             raise exc.InvalidConfig(
@@ -2530,7 +2802,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         else cg.codegen_graphs
     )
 
-    scan_required = (
+    scan_required = warp_scan_required or (
         cg.device_function.config.get("cute_fragment_scan", "serial") == "cooperative"
         and root.graph_id
         in CompileEnvironment.current().config_spec.cute_fragment_scan_root_ids
@@ -2556,6 +2828,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or reduction_required
             or threads_required
             or register_loads_required
+            or producer_cache_required
+            or warp_scan_required
             or warp_results_required
         ):
             raise exc.InvalidConfig(
@@ -2678,6 +2952,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
     if local_required and not capacity:
         raise exc.InvalidConfig(
             "CTA-local atomics require a known shared memory capacity"
+        )
+    if producer_cache_required and not capacity:
+        raise exc.InvalidConfig(
+            "shared producer caches require a known shared memory capacity"
         )
     if capacity and compiler.smem_bytes > capacity:
         raise exc.InvalidConfig(

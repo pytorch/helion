@@ -200,6 +200,7 @@ def test_cooperative_scan_oversized_shared_memory_rejected():
     ],
 )
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_warp_scan_coverage")
 def test_scan_coverage_preserves_original_population_and_rng(strategy):
     with patch("helion._compiler.autotuner_heuristics.register_fragment_scan_coverage"):
         old_bound = _bind()
@@ -282,6 +283,7 @@ def test_scan_search_full_neighbors_and_random_mutation_reach_both_modes():
 
 @pytest.mark.parametrize("disabled", [False, True])
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_warp_scan_coverage")
 def test_scan_coverage_honors_explicit_legacy_override_and_disabled_heuristics(
     disabled,
 ):
@@ -549,6 +551,7 @@ def _scan_and_fragment_reduction(x: torch.Tensor):
 
 
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_warp_scan_coverage")
 def test_fragment_reduction_coverage_composes_with_existing_scan_coverage():
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
@@ -683,6 +686,7 @@ def _resource_bound_and_actual(bound, config):
 
 @pytest.mark.parametrize("width", [4097, 8193])
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_warp_scan_coverage")
 def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
     inputs = (torch.ones(3, width),)
     with patch(
@@ -764,6 +768,7 @@ def test_fragment_resource_catalog_declines_nested_and_unproved_runtime_extents(
 
 
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_warp_scan_coverage")
 def test_fragment_resource_carrier_builds_catalog_only_once():
     from helion._compiler.autotuner_heuristics.cute_fragment_resources import (
         FragmentResourceCatalog,
@@ -788,6 +793,7 @@ def test_fragment_resource_carrier_builds_catalog_only_once():
 
 @pytest.mark.parametrize("rows", [65536, 131072])
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_warp_scan_coverage")
 def test_fragment_resource_hard_minima_preserve_prefix_and_rng(rows):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -1017,6 +1023,7 @@ def test_fragment_threads_codegen_rechecks_owner_and_preserves_default():
     ],
 )
 @pytest.mark.parametrize("resource", [False, True])
+@pytest.mark.usefixtures("_without_warp_scan_coverage")
 def test_fragment_threads_complete_prior_population_and_rng(strategy, resource):
     kernel = _resource_fullrow_scan if resource else _scan_and_fragment_reduction
     x = torch.ones(3, 8193) if resource else torch.ones(3, 128)
@@ -1262,3 +1269,396 @@ def test_register_loads_preloop_capture_remains_shared():
     config.config[REGISTER_LOADS_KEY] = True
     with pytest.raises(exc.InvalidConfig, match="lane-private"):
         bound.to_code(config)
+
+
+WARP_SCAN_KEY = "cute_fragment_warp_scan"
+
+
+@pytest.fixture
+def _without_warp_scan_coverage():
+    # The original groups retain their isolated historical assertions. The
+    # complete prefix including every previous group is checked separately.
+    with patch(
+        "helion._compiler.autotuner_heuristics.register_fragment_warp_scan_coverage"
+    ):
+        yield
+
+
+def _warp_scan_config(bound, value=True):
+    return helion.Config.from_dict(
+        dict(bound.config_spec.default_config()) | {WARP_SCAN_KEY: value}
+    )
+
+
+def test_warp_scan_boolean_strict_admission_and_legacy_emitters():
+    bound = _bind()
+    spec = bound.config_spec
+    generation = spec.create_config_generation()
+    assert WARP_SCAN_KEY not in spec.default_config()
+    assert spec._flat_fields()[KEY].choices == ("serial", "cooperative")
+    assert (
+        generation.strict_config_pair(_warp_scan_config(bound, False))[1]
+        == spec.default_config()
+    )
+    flat, config = generation.strict_config_pair(_warp_scan_config(bound))
+    assert config[WARP_SCAN_KEY] is True
+    assert generation.unflatten(flat) == config
+    for invalid in (1, 0, None, "true"):
+        with pytest.raises(exc.InvalidConfig, match="bounded warp-prefix"):
+            generation.strict_config_pair(_warp_scan_config(bound, invalid))
+    for mode in ("serial", "cooperative"):
+        legacy = _config(bound, mode)
+        explicit = helion.Config.from_dict(dict(legacy) | {WARP_SCAN_KEY: False})
+        assert bound.to_code(legacy) == bound.to_code(explicit)
+    code = bound.to_code(_warp_scan_config(bound))
+    assert "shuffle_sync_up" in code and "fragment_scan_carry" in code
+    assert any(
+        p.key == WARP_SCAN_KEY and p.outcome == "candidate"
+        for p in generation.coordinate_neighbor_projections(generation.default_flat())
+    )
+    random.seed(67312)
+    assert {
+        generation.random_config().get(WARP_SCAN_KEY, False) for _ in range(24)
+    } == {False, True}
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        InitialPopulationStrategy.FROM_RANDOM,
+        InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+    ],
+)
+def test_warp_scan_complete_prior_prefix_rng_seeds_and_overrides(strategy):
+    with patch(
+        "helion._compiler.autotuner_heuristics.register_fragment_warp_scan_coverage"
+    ):
+        old_bound = _bind()
+    bound = _bind()
+    old, new = (
+        make_search(b.config_spec, count=20, strategy=strategy)
+        for b in (old_bound, bound)
+    )
+    random.seed(72391)
+    before = [
+        old.config_gen.unflatten(row) for row in old._generate_initial_population_flat()
+    ]
+    rng = random.getstate()
+    random.seed(72391)
+    after = [
+        new.config_gen.unflatten(row) for row in new._generate_initial_population_flat()
+    ]
+    assert random.getstate() == rng
+    assert after[: len(before)] == before
+    assert len(after) == len(before) + 1
+    assert after[-1][WARP_SCAN_KEY] is True
+    assert bound.config_spec.default_config() == old_bound.config_spec.default_config()
+    assert (
+        bound.config_spec.compiler_seed_configs
+        == old_bound.config_spec.compiler_seed_configs
+    )
+    for disabled, overrides in ((True, {}), (False, {WARP_SCAN_KEY: False})):
+        search = make_search(
+            bound.config_spec, count=20, disabled=disabled, overrides=overrides
+        )
+        assert all(
+            not search.config_gen.unflatten(row).get(WARP_SCAN_KEY, False)
+            for row in search._generate_initial_population_flat()
+        )
+
+
+@pytest.mark.parametrize("kernel", [_direct_scan, _computed_product])
+def test_warp_scan_unsupported_owner_rejects(kernel):
+    bound = _cpu_bind(kernel, (torch.ones(3, 65),))
+    assert not bound.config_spec.cute_fragment_warp_scan_root_ids
+    with pytest.raises(exc.InvalidConfig, match="bounded warp-prefix"):
+        bound.to_code(_warp_scan_config(bound))
+
+
+@pytest.mark.parametrize(
+    "dtype,columns", [(torch.float16, 65), (torch.bfloat16, 65), (torch.float32, 1025)]
+)
+def test_warp_scan_dtype_and_capacity_rejection(dtype, columns):
+    bound = _cpu_bind(
+        _computed_scan, (torch.ones(1, 2, columns, dtype=dtype), 2, False)
+    )
+    with pytest.raises(exc.InvalidConfig, match="(warp-prefix|axis capacity)"):
+        bound.to_code(_warp_scan_config(bound))
+
+
+def test_warp_scan_lost_proof_and_specialized_owner_do_not_fallback():
+    from helion._compiler.generate_ast import GenerateAST
+
+    bound = _bind()
+    with patch.object(
+        GenerateAST,
+        "_try_codegen_block_scaled_root",
+        side_effect=AssertionError("wrong owner"),
+    ):
+        assert "shuffle_sync_up" in bound.to_code(_warp_scan_config(bound))
+    with (
+        patch(
+            "helion._compiler.cute.computed_fragment.computed_fragment_supported",
+            return_value=False,
+        ),
+        pytest.raises(exc.InvalidConfig, match="computed fragment root"),
+    ):
+        bound.to_code(_warp_scan_config(bound))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _mixed_dtype_phase_scans(x: torch.Tensor, y: torch.Tensor):
+    a = torch.empty_like(x)
+    b = torch.empty_like(y)
+    for row in hl.tile(x.size(0)):
+        a[row, :] = hl.cumsum(x[row, :] + 1, -1)
+    hl.barrier()
+    for row in hl.tile(y.size(0)):
+        b[row, :] = hl.cumsum(y[row, :] + 1, -1)
+    return a, b
+
+
+def test_warp_scan_mixed_phase_roots_keep_ineligible_serial_emitter():
+    bound = _cpu_bind(
+        _mixed_dtype_phase_scans,
+        (torch.ones(3, 33, dtype=torch.float16), torch.ones(3, 65)),
+    )
+    assert len(bound.config_spec.cute_fragment_warp_scan_root_ids) == 1
+    code = bound.to_code(_warp_scan_config(bound))
+    assert "fragment_scan_initialized" in code
+    assert "shuffle_sync_up" in code
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_warp_scan_zero_physical_capacity_rejects(reverse):
+    bound = _cpu_bind(_computed_scan, (torch.empty(3, 5, 0), 2, reverse))
+    with pytest.raises(exc.InvalidConfig, match="axis capacity"):
+        bound.to_code(_warp_scan_config(bound))
+
+
+@pytest.mark.parametrize("family", ["private", "producer", "scan"])
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        InitialPopulationStrategy.FROM_RANDOM,
+        InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+    ],
+)
+def test_fragment_extensions_complete_legacy_prefix_rng_and_final_coverage(
+    family, strategy
+):
+    from contextlib import ExitStack
+
+    from test.test_atomic_ops import _fragment_terminal_loop_finalizer
+    from test.test_atomic_ops import _terminal_loop_args
+    from test.test_cute_computed_fragment import _fragment_cached_transcendental
+
+    keys = (
+        "cute_fragment_private_scalar_loops",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_atomic_aggregation",
+    )
+    registrations = (
+        "register_fragment_private_scalar_loops_coverage",
+        "register_fragment_producer_cache_coverage",
+        "register_fragment_warp_scan_coverage",
+        "register_fragment_atomic_aggregation_coverage",
+    )
+    if family == "private":
+        fn = _fragment_terminal_loop_finalizer.fn
+        args = _terminal_loop_args(3, 17, torch.int32, 0, 2, 1)
+        eligible = {keys[0], keys[3]}
+    elif family == "producer":
+        fn = _fragment_cached_transcendental.fn
+        args = (torch.ones(3, 65),)
+        eligible = {keys[1], keys[2]}
+    else:
+        fn = _computed_scan.fn
+        args = (torch.ones(3, 5, 65), 2, False)
+        eligible = {keys[2]}
+
+    specs = []
+    for enabled in range(len(registrations) + 1):
+        with ExitStack() as stack:
+            for registration in registrations[enabled:]:
+                stack.enter_context(
+                    patch("helion._compiler.autotuner_heuristics." + registration)
+                )
+            specs.append(
+                _cpu_bind(
+                    helion.kernel(fn, backend="cute", static_shapes=True), args
+                ).config_spec
+            )
+    for spec in specs[1:]:
+        assert spec.default_config() == specs[0].default_config()
+        assert spec.compiler_seed_configs == specs[0].compiler_seed_configs
+
+    for seed in (73, 741, 2031):
+        populations, states = [], []
+        for spec in specs:
+            search = make_search(spec, count=20, strategy=strategy)
+            random.seed(seed)
+            populations.append(
+                [
+                    search.config_gen.unflatten(row)
+                    for row in search._generate_initial_population_flat()
+                ]
+            )
+            states.append(random.getstate())
+        assert all(state == states[0] for state in states)
+        # The whole pre-extension population remains an exact prefix.
+        assert populations[-1][: len(populations[0])] == populations[0]
+        for index, key in enumerate(keys):
+            before, after = populations[index : index + 2]
+            assert after[: len(before)] == before
+            assert len(after) == len(before) + (key in eligible)
+            if key in eligible:
+                assert after[-1][key] is True
+        observed = {
+            key
+            for key in keys
+            if any(config.get(key, False) for config in populations[-1])
+        }
+        assert observed == eligible
+
+
+ATOMIC_AGGREGATION_KEY = "cute_fragment_atomic_aggregation"
+
+
+def _atomic_aggregation_bind():
+    from test.test_atomic_ops import _fragment_aggregated_histogram
+
+    return _cpu_bind(
+        _fragment_aggregated_histogram,
+        (
+            torch.ones((2, 65), dtype=torch.int32),
+            torch.zeros((2, 65), dtype=torch.int32),
+            17,
+            0,
+            1,
+        ),
+    )
+
+
+def test_atomic_aggregation_strict_scope_and_ordinary_mutation():
+    bound = _atomic_aggregation_bind()
+    generation = bound.config_spec.create_config_generation()
+    default = bound.config_spec.default_config()
+    assert ATOMIC_AGGREGATION_KEY not in default
+    for invalid in (1, 0, "true", None):
+        with pytest.raises(exc.InvalidConfig, match="CTA-private Int32"):
+            generation.strict_config_pair(
+                helion.Config.from_dict(
+                    dict(default) | {ATOMIC_AGGREGATION_KEY: invalid}
+                )
+            )
+    _, config = generation.strict_config_pair(
+        helion.Config.from_dict(dict(default) | {ATOMIC_AGGREGATION_KEY: True})
+    )
+    assert "match_sync" in bound.to_code(config)
+    assert "match_sync" not in bound.to_code(default)
+    random.seed(12831)
+    assert {
+        generation.random_config().get(ATOMIC_AGGREGATION_KEY, False) for _ in range(24)
+    } == {False, True}
+    plain = _bind()
+    with pytest.raises(exc.InvalidConfig, match="CTA-private Int32"):
+        plain.to_code(
+            helion.Config.from_dict(
+                dict(plain.config_spec.default_config())
+                | {ATOMIC_AGGREGATION_KEY: True}
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        InitialPopulationStrategy.FROM_RANDOM,
+        InitialPopulationStrategy.FROM_BEST_AVAILABLE,
+    ],
+)
+def test_atomic_aggregation_complete_prior_prefix_rng_seeds_and_overrides(strategy):
+    with patch(
+        "helion._compiler.autotuner_heuristics.register_fragment_atomic_aggregation_coverage"
+    ):
+        old_bound = _atomic_aggregation_bind()
+    bound = _atomic_aggregation_bind()
+    old, new = (
+        make_search(b.config_spec, count=20, strategy=strategy)
+        for b in (old_bound, bound)
+    )
+    random.seed(72391)
+    before = [
+        old.config_gen.unflatten(row) for row in old._generate_initial_population_flat()
+    ]
+    rng = random.getstate()
+    random.seed(72391)
+    after = [
+        new.config_gen.unflatten(row) for row in new._generate_initial_population_flat()
+    ]
+    assert random.getstate() == rng
+    assert after[: len(before)] == before and len(after) == len(before) + 1
+    assert after[-1][ATOMIC_AGGREGATION_KEY] is True
+    assert bound.config_spec.default_config() == old_bound.config_spec.default_config()
+    assert (
+        bound.config_spec.compiler_seed_configs
+        == old_bound.config_spec.compiler_seed_configs
+    )
+    for disabled, overrides in ((True, {}), (False, {ATOMIC_AGGREGATION_KEY: False})):
+        search = make_search(
+            bound.config_spec, count=20, disabled=disabled, overrides=overrides
+        )
+        assert all(
+            not search.config_gen.unflatten(row).get(ATOMIC_AGGREGATION_KEY, False)
+            for row in search._generate_initial_population_flat()
+        )
+
+
+@pytest.mark.parametrize("mode", ["serial", "cooperative"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_warp_scan_phase_capacity_and_default_parity(mode, reverse):
+    args = (torch.ones(3, 1057), torch.ones(3, 65))
+    if reverse:
+        args = args[::-1]
+    bound = _cpu_bind(_mixed_dtype_phase_scans, args)
+    default = _config(bound, mode)
+    assert bound.to_code(default) == bound.to_code(
+        helion.Config.from_dict(dict(default) | {WARP_SCAN_KEY: False})
+    )
+    code = bound.to_code(helion.Config.from_dict(dict(default) | {WARP_SCAN_KEY: True}))
+    assert "shuffle_sync_up" in code
+    assert ("fragment_scan_initialized" in code) == (mode == "serial")
+
+
+def test_mixed_warp_scan_all_ineligible_phases_reject():
+    bound = _cpu_bind(
+        _mixed_dtype_phase_scans, (torch.ones(3, 1057), torch.ones(3, 2049))
+    )
+    with pytest.raises(exc.InvalidConfig, match="at least one supported operation"):
+        bound.to_code(_warp_scan_config(bound))
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _mixed_warp_scan_dynamic(x: torch.Tensor):
+    out = torch.empty_like(x)
+    for row, column in hl.tile(x.shape):
+        out[row, column] = hl.cumsum(x[row, column] + 1, dim=-1)
+    return out
+
+
+def test_mixed_warp_scan_configured_capacity_changes_on_same_binding():
+    bound = _cpu_bind(_mixed_warp_scan_dynamic, (torch.ones(3, 2053),))
+    for width in (32, 1024, 2048, 256):
+        config = helion.Config.from_dict(
+            dict(bound.config_spec.default_config())
+            | {"block_sizes": [2, width], WARP_SCAN_KEY: True}
+        )
+        if width > 1024:
+            with pytest.raises(
+                exc.InvalidConfig, match="at least one supported operation"
+            ):
+                bound.to_code(config)
+        else:
+            assert "shuffle_sync_up" in bound.to_code(config)
