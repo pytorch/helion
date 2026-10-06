@@ -81,6 +81,171 @@ def _live_grid_thread_dims(
     return [live.get(axis, 1) for axis in range(3)]
 
 
+# The ``cute.arch`` calls a thread makes on its own: its coordinates and the
+# launch's shape, per-thread memory operations, scalar math and the
+# programmatic-dependent-launch controls (atomics by their ``atomic_`` prefix).
+# Every other ``cute.arch`` call reaches other threads: shuffles, votes, warp
+# reductions, barriers, mbarriers, shared memory, warp and lane indices,
+# clusters, asynchronous copies.
+_CUTE_ARCH_PER_THREAD_CALLS = frozenset(
+    {
+        "thread_idx",
+        "block_idx",
+        "grid_dim",
+        "block_dim",
+        "load",
+        "store",
+        "prefetch",
+        "fmax",
+        "fmin",
+        "exp2",
+        "rcp_approx",
+        "cvt_f32_tf32",
+        "fma_packed_f32x2",
+        "mul_packed_f32x2",
+        "add_packed_f32x2",
+        "sub_packed_f32x2",
+        "calc_packed_f32x2_op",
+        "griddepcontrol_wait",
+        "griddepcontrol_launch_dependents",
+    }
+)
+# Helion's kernel-side helpers a thread calls on its own; the others
+# (``_cute_grouped_reduce_*``, ``_cute_resident_*``, the rank-1 and tcgen05
+# paths) combine or stage values across threads.
+_CUTE_PER_THREAD_HELPERS = frozenset(
+    {
+        "_cute_argreduce_index",
+        "_cute_atomic_max_float32",
+        "_cute_atomic_min_float32",
+        "_cute_fp8e4m3fn_to_float32",
+        "_cute_gelu_erf_exact_f32x2",
+        "_cute_sigmoid_approx_ftz_f32",
+    }
+)
+# The ``cute`` entry points through which a body partitions a tile across
+# threads: copies, MMA and their atoms; ``cutlass.utils`` (shared-memory and
+# TMEM allocators, schedulers) and ``cutlass.pipeline`` as a whole.
+_CUTE_CROSS_THREAD_ENTRY_POINTS = frozenset(
+    {
+        "copy",
+        "gemm",
+        "nvgpu",
+        "autovec_copy",
+        "local_partition",
+        "local_tile",
+        "make_copy_atom",
+        "make_mma_atom",
+        "make_tiled_mma",
+    }
+)
+_CUTE_CROSS_THREAD_ENTRY_PREFIXES = ("make_tiled_copy",)
+
+
+def _cross_thread_constructs(statements: Sequence[ast.AST]) -> list[str]:
+    """The constructs of a kernel body that reach other threads or hand a tile to a collective.
+
+    Each was emitted for the static launch shape: the lanes a warp reduction
+    spans, the stride of a shared-memory reduction's lane index, the
+    partition of a tiled copy or MMA.  A launch axis sized by a kernel
+    argument holds a one in that shape, so the construct is wrong once the
+    axis has more than one thread (a warp reduction over 32 column threads
+    beside eight row threads sums across rows).  Fail closed: every
+    ``cute.arch`` call outside ``_CUTE_ARCH_PER_THREAD_CALLS`` and every
+    ``_cute_`` helper outside ``_CUTE_PER_THREAD_HELPERS`` counts.
+    """
+    found: set[str] = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name):
+                if (
+                    node.id.startswith("_cute_")
+                    and node.id not in _CUTE_PER_THREAD_HELPERS
+                ):
+                    found.add(node.id)
+                continue
+            if not isinstance(node, ast.Attribute):
+                continue
+            owner = node.value
+            if isinstance(owner, ast.Name):
+                if owner.id == "cute" and (
+                    node.attr in _CUTE_CROSS_THREAD_ENTRY_POINTS
+                    or node.attr.startswith(_CUTE_CROSS_THREAD_ENTRY_PREFIXES)
+                ):
+                    found.add(f"cute.{node.attr}")
+                elif owner.id == "cutlass" and node.attr in ("utils", "pipeline"):
+                    found.add(f"cutlass.{node.attr}")
+            elif (
+                isinstance(owner, ast.Attribute)
+                and isinstance(owner.value, ast.Name)
+                and owner.value.id == "cute"
+                and owner.attr == "arch"
+                and node.attr not in _CUTE_ARCH_PER_THREAD_CALLS
+                and not node.attr.startswith("atomic_")
+            ):
+                found.add(f"cute.arch.{node.attr}")
+    return sorted(found)
+
+
+def _symbolic_axes_text(axes: dict[int, str]) -> str:
+    return ", ".join(f"{axis} ({expr})" for axis, expr in sorted(axes.items()))
+
+
+def _thread_idx_axis(node: ast.AST) -> int | None:
+    """The axis of a ``cute.arch.thread_idx()[k]`` subscript, else ``None``."""
+    if not (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, int)
+    ):
+        return None
+    call = node.value
+    if not (
+        isinstance(call, ast.Call)
+        and not call.args
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr == "thread_idx"
+    ):
+        return None
+    owner = call.func.value
+    if (
+        isinstance(owner, ast.Attribute)
+        and owner.attr == "arch"
+        and isinstance(owner.value, ast.Name)
+        and owner.value.id == "cute"
+    ):
+        return node.slice.value
+    return None
+
+
+def _thread_axes_read_outside_leader_guards(statements: Sequence[ast.AST]) -> set[int]:
+    """The launch axes whose thread index the body reads, leader guards aside.
+
+    A leader guard compares the index with zero (``cute.arch.thread_idx()[k]
+    == 0``, see ``atomic_ops._cute_leader_predicate``); it is the one read of
+    an axis that holds for a single thread.
+    """
+    guards: set[int] = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            if (
+                isinstance(node, ast.Compare)
+                and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.Eq)
+                and isinstance(node.comparators[0], ast.Constant)
+                and node.comparators[0].value == 0
+                and _thread_idx_axis(node.left) is not None
+            ):
+                guards.add(id(node.left))
+    axes: set[int] = set()
+    for statement in statements:
+        for node in ast.walk(statement):
+            axis = _thread_idx_axis(node)
+            if axis is not None and id(node) not in guards:
+                axes.add(axis)
+    return axes
+
+
 def _pointwise_grid_thread_dims(
     live_extents: dict[int, int],
     final_thread_axes: set[int],
@@ -1527,6 +1692,7 @@ class CuteBackend(Backend):
             "ir": "from cutlass._mlir import ir",
             "mlir_math": "from cutlass._mlir.dialects import math as mlir_math",
             "_default_cute_launcher": "from helion.runtime import default_cute_launcher as _default_cute_launcher",
+            "_cute_checked_block_dims": "from helion._compiler.cute.thread_budget import checked_thread_block_dims as _cute_checked_block_dims",
             "_next_power_of_2": "from helion._utils import next_power_of_2 as _next_power_of_2",
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
@@ -2239,7 +2405,7 @@ class CuteBackend(Backend):
         from ..device_function import DeviceFunction
         from ..host_function import HostFunction
         from .thread_budget import MAX_THREADS_PER_BLOCK
-        from .thread_budget import check_thread_limit
+        from .thread_budget import check_thread_block_dims
 
         device_function = DeviceFunction.current()
         codegen = device_function.codegen
@@ -2317,7 +2483,9 @@ class CuteBackend(Backend):
         direct_affine_plan = device_function.cute_state.direct_affine_plan
         if direct_affine_plan is not None:
             x, y, z = direct_affine_plan.cta_shape
-            check_thread_limit(x * y * z, context=str(direct_affine_plan.cta_shape))
+            check_thread_block_dims(
+                (x, y, z), context=str(direct_affine_plan.cta_shape)
+            )
             return launcher_args_with_compile_options(f"block=({x}, {y}, {z})")
 
         register_chain_block_dims = (
@@ -2557,6 +2725,24 @@ class CuteBackend(Backend):
         referenced_dims = tuple(codegen.referenced_thread_block_dims)
         static_dims = tile_strategy.thread_block_dims()
         dim_exprs = tile_strategy.thread_block_dim_exprs()
+        # The axes whose thread extent is a kernel argument (``hl.tile(n,
+        # block_size=bsz)`` under ``static_shapes=False``): the static shapes
+        # below hold a one for them, and the launch takes their extent from
+        # the host constant at the end (``_symbolic_launch_block_arg``).
+        symbolic_axes = tile_strategy.symbolic_thread_axes()
+        if symbolic_axes and (
+            dim_exprs is None
+            or any(
+                axis >= len(dim_exprs) or dim_exprs[axis] != expr
+                for axis, expr in symbolic_axes.items()
+            )
+        ):
+            raise exc.BackendUnsupported(
+                self.name,
+                f"launch axis {_symbolic_axes_text(symbolic_axes)} is sized by a "
+                "kernel argument and the kernel's strategies share no single "
+                "launch shape",
+            )
         static_threads = functools.reduce(operator.mul, static_dims, 1)
         dynamic_threads = functools.reduce(operator.mul, dims, 1)
         has_nested_device_loops = any(
@@ -2674,10 +2860,9 @@ class CuteBackend(Backend):
                     for expr_dim, current_dim in zip(expr_dims, dims, strict=True)
                 ):
                     dims = expr_dims
-            elif dims == (1, 1, 1):
-                return launcher_args_with_compile_options(
-                    f"block=({dim_exprs[0]}, {dim_exprs[1]}, {dim_exprs[2]})"
-                )
+            # Otherwise an axis is sized by a kernel argument (``symbolic_axes``):
+            # the static ``dims`` keep a one for it through the checks below,
+            # and the launch substitutes the host constant at the end.
         if offset_thread_dims != [1, 1, 1]:
             candidate_dims = tuple(
                 starmap(max, zip(dims, offset_thread_dims, strict=True))
@@ -2757,7 +2942,7 @@ class CuteBackend(Backend):
         # so the strategy can intentionally launch fewer threads on a
         # reduction axis (e.g. K) than the codegen "references" through the
         # strategy's per-block thread count.
-        from .thread_budget import check_thread_limit
+        from .thread_budget import check_thread_block_dims
 
         def _emits_cute_gemm(stmt: ast.AST) -> bool:
             for sub in ast.walk(stmt):
@@ -2807,9 +2992,71 @@ class CuteBackend(Backend):
                             ),
                         )
 
-        check_thread_limit(dims[0] * dims[1] * dims[2], context=str(tuple(dims)))
+        check_thread_block_dims(dims, context=str(tuple(dims)))
+        if symbolic_axes:
+            return launcher_args_with_compile_options(
+                self._symbolic_launch_block_arg(
+                    dims,
+                    symbolic_axes,
+                    [*device_function.preamble, *device_function.body],
+                )
+            )
         return launcher_args_with_compile_options(
             f"block=({dims[0]}, {dims[1]}, {dims[2]})"
+        )
+
+    def _symbolic_launch_block_arg(
+        self,
+        dims: tuple[int, ...],
+        symbolic_axes: dict[int, str],
+        statements: Sequence[ast.AST],
+    ) -> str:
+        """The ``block=`` argument of a launch with an argument-sized axis.
+
+        ``dims`` is the static launch shape, checked at codegen, with a one on
+        every axis of ``symbolic_axes``; the axis is launched with its host
+        constant instead (``_BLOCK_SIZE_n``, one thread per element) when the
+        body reads its thread index, and the tuple goes through
+        ``checked_thread_block_dims`` at launch, where the value is known.
+        An axis whose index the body never reads keeps the one: more threads
+        would only repeat the same work.  A leader guard
+        (``cute.arch.thread_idx()[axis] == 0`` around a tile-uniform atomic)
+        is not such a read: it holds for the one thread, and it is what keeps
+        the atomic to one thread when the axis is launched wide.
+
+        The body must not combine threads.  Every cross-thread construct was
+        emitted for the static shape (a warp reduction over 32 column threads
+        beside the symbolic row axis spans one warp only while the axis has
+        one thread), so a body with any is declined rather than launched
+        wrong; the reduction over the symbolic dim itself is declined by
+        ``BlockReductionStrategy.codegen_reduction``.
+        """
+        read_axes = _thread_axes_read_outside_leader_guards(statements)
+        live_axes = {
+            axis: expr for axis, expr in symbolic_axes.items() if axis in read_axes
+        }
+        if not live_axes:
+            return f"block=({dims[0]}, {dims[1]}, {dims[2]})"
+        for axis in live_axes:
+            if dims[axis] != 1:
+                raise exc.BackendUnsupported(
+                    self.name,
+                    f"launch axis {axis} is sized by the kernel argument "
+                    f"{live_axes[axis]} but static tracking claims {dims[axis]} "
+                    "threads on it",
+                )
+        cross_thread = _cross_thread_constructs(statements)
+        if cross_thread:
+            raise exc.BackendUnsupported(
+                self.name,
+                f"launch axis {_symbolic_axes_text(live_axes)} is sized by a "
+                f"kernel argument and the body combines threads "
+                f"({', '.join(cross_thread)}), which was emitted for the static "
+                "launch shape",
+            )
+        launch = tuple(live_axes.get(axis, str(size)) for axis, size in enumerate(dims))
+        return (
+            f"block=_cute_checked_block_dims(({launch[0]}, {launch[1]}, {launch[2]}))"
         )
 
     def build_launcher_args(

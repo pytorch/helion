@@ -61,11 +61,11 @@ def _matmul_then_k2_scaled_rows(
 
 
 def _inputs(
-    device: torch.device | str, *, k2: int = 16
+    device: torch.device | str, *, k2: int = 16, k: int = 64
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator().manual_seed(0)
-    x = torch.randn(64, 64, generator=generator)
-    y = torch.randn(64, 256, generator=generator)
+    x = torch.randn(64, k, generator=generator)
+    y = torch.randn(k, 256, generator=generator)
     z = torch.randn(64, k2, 256, generator=generator)
     return x.to(device), y.to(device), z.to(device)
 
@@ -132,6 +132,22 @@ def test_a_lane_looped_reduction_narrower_than_the_launch_is_declined() -> None:
             _config(bound, block_sizes=[16, 64, 32], num_threads=[1, 32])
         )
     assert "cute.arch.warp_reduction_sum(load_2, threads_in_group=32)" in code
+
+
+def test_a_thread_shape_beyond_the_launch_limits_is_declined_at_codegen() -> None:
+    """``num_threads=[2, 128]`` lands the K loop's 128 threads on the z axis, whose CUDA limit is 64: the shape passed the total-thread check and failed at launch with ``cudaErrorInvalidValue``; it is declined when the launch shape is emitted instead."""
+    with _cpu_codegen():
+        bound = _cpu_bind(_matmul_then_k2_scaled_rows, _inputs("cpu", k=256))
+        with pytest.raises(
+            helion.exc.BackendUnsupported, match="exceeds the launch limit of 64"
+        ):
+            bound.to_code(
+                _config(bound, block_sizes=[16, 128, 16], num_threads=[2, 128])
+            )
+        code = bound.to_code(
+            _config(bound, block_sizes=[16, 128, 16], num_threads=[2, 64])
+        )
+    assert "block=(1, 2, 64)" in code
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -82,6 +82,22 @@ class ThreadAxisTracker:
         for block_id in block_ids:
             self.block_axes[block_id] = axis
 
+    def record_symbolic_axis(self, block_ids: Iterable[int], axis: int) -> None:
+        """Record the thread axis of blocks whose extent is only known at launch.
+
+        An argument-sized ``hl.tile`` (``block_size=bsz`` with ``bsz`` an int
+        argument, ``static_shapes=False``) lives one element per thread on an
+        axis the static shapes hold a one for, so no size is recorded; the
+        axis itself still names the leader thread of a tile-uniform atomic
+        (``cute.arch.thread_idx()[axis] == 0``), which ran once per thread of
+        the axis while the block was missing here.  CuTe only: the other
+        backends have no thread layout.
+        """
+        if CompileEnvironment.current().backend_name != "cute":
+            return
+        for block_id in block_ids:
+            self.block_axes[block_id] = axis
+
 
 def _lane_loop_iter(extent: int) -> ast.AST:
     # CuTe lane loops carry per-thread scalar state. Emitting them via
@@ -348,10 +364,11 @@ def _lane_reduce_marker_expr(
         assert owner_lane is not None
         owner += f", {matmul_contribution!s}"
     if strided_restore or shared_lane_expr:
-        # strided_restore: the consumers keep the per-element strided semantics
-        # (their own carries accumulate the lanes), so an unsplittable loop may
-        # finalize this lane's raw input across the thread group instead of
-        # failing.
+        # strided_restore: the loop body keeps the per-element strided
+        # semantics, so a loop the two-pass split declines may finalize this
+        # lane's raw input across the thread group in place -- complete when
+        # the result feeds lane carries only; otherwise the per-lane shares
+        # are totalled over the lanes (``_restore_lane_markers``).
         owner += f", {strided_restore!s}"
     if shared_lane_expr:
         owner += f", {shared_lane_expr!r}"
@@ -394,10 +411,12 @@ class _LaneReduceMarker:
     # Emitted only for the product side of a scalar matmul contraction. The
     # accumulator/rescale is deliberately outside this complete sum.
     matmul_contribution: bool = False
-    # True when the loop body still carries the per-element strided semantics
-    # (the reduction's consumers accumulate the lanes themselves), so a lane
-    # loop that cannot be split may finalize this lane's raw input across the
-    # thread group in place instead of rejecting the config.
+    # True when the loop body still carries the per-element strided semantics,
+    # so a lane loop the two-pass split declines may finalize this lane's raw
+    # input across the thread group in place: complete as it stands when the
+    # result feeds lane carries only (each lane adds its share), otherwise the
+    # shares are totalled over the lanes for a lane-invariant tail, and a
+    # consumer varying with the lane is declined (``_restore_lane_markers``).
     strided_restore: bool = False
     # Optional lane expression that keys the cross-warp two-stage helper's
     # shared memory instead of ``group_lane_expr`` (which stays the static
@@ -4499,6 +4518,10 @@ def interchange_lane_outside_serial_reductions(
     * Nest B (grad_w): the original ``for LANE: ... for MB: ...`` loop. Remove
       reduction-consuming stores and their dead producers when aliasing and
       exact overwrite coverage are proven; otherwise retain the partial stores.
+      A reduction-consuming atomic is always removed (Nest A applies the full
+      reduction once; the lanes' partials must not be added on top), and the
+      nest is declined when it cannot be; Nest B itself goes when that leaves
+      it empty.
     * Nest A (grad_x): a ``for MB: ... for LANE: ...`` loop carrying only the
       lane reduction and its broadcast consumer. Its inner lane loop still holds
       the markers so the subsequent ``split_lane_loop_reductions`` pass produces
@@ -4675,6 +4698,8 @@ def _interchange_one_lane_loop(
     # already correct; its reduction-broadcast store writes a partial (per-lane)
     # value that Nest A re-stores with the full reduction afterwards. Prune the
     # first store only after proving it is unobservable and fully overwritten.
+    # An atomic consumer has no such overwrite: Nest A applies the full
+    # reduction once, so Nest B must not apply the lanes' partials at all.
     restored_mb_body = list(mb_loop.body)
     for idx, m in markers:
         restored_mb_body[idx] = statement_from_string(
@@ -4683,22 +4708,42 @@ def _interchange_one_lane_loop(
     mb_loop.body = restored_mb_body
     nest_b = loop
 
+    from .cute.interchanged_store_dce import atomic_write_calls
+    from .cute.interchanged_store_dce import eliminate_interchanged_atomics
     from .cute.interchanged_store_dce import eliminate_interchanged_stores
 
     reduction_consumers = _forward_live_names(mb_body, marker_results)
+    consumer_indices = {
+        index
+        for index, statement in enumerate(mb_body)
+        if _has_side_effect(statement)
+        and set(ReadWrites.from_ast(statement).reads) & reduction_consumers
+    }
+    atomic_consumers = [
+        mb_body[index]
+        for index in sorted(consumer_indices)
+        if atomic_write_calls(mb_body[index])
+    ]
     eliminate_interchanged_stores(
         nest_b,
         mb_loop,
         nest_a,
-        {
-            index
-            for index, statement in enumerate(mb_body)
-            if _has_side_effect(statement)
-            and set(ReadWrites.from_ast(statement).reads) & reduction_consumers
-        },
+        consumer_indices,
         proven_disjoint_tensor_pairs,
         protected_names,
     )
+    if atomic_consumers:
+        dropped = eliminate_interchanged_atomics(
+            nest_b, mb_loop, nest_a, atomic_consumers, protected_names
+        )
+        if dropped != len(atomic_consumers):
+            raise exc.BackendUnsupported(
+                "cute",
+                "interchanged lane reduction has an atomic consumer the first "
+                "pass cannot drop",
+            )
+        if not nest_b.body:
+            return nest_a
 
     return [nest_b, *nest_a]
 
@@ -7984,6 +8029,10 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     tracker.record_all(
                         self.block_ids, self._flat_thread_axis(), self.block_size
                     )
+                elif self._uses_thread_axis():
+                    tracker.record_symbolic_axis(
+                        self.block_ids, self._flat_thread_axis()
+                    )
                 return DeviceGridState(
                     self,
                     block_id_to_info=self._create_block_id_info_dict(
@@ -8059,6 +8108,8 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 tracker.record_all(
                     self.block_ids, self._flat_thread_axis(), thread_size
                 )
+            else:
+                tracker.record_symbolic_axis(self.block_ids, self._flat_thread_axis())
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
@@ -8122,6 +8173,8 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 tracker.record_all(
                     self.block_ids, self._flat_thread_axis(), thread_size
                 )
+            else:
+                tracker.record_symbolic_axis(self.block_ids, self._flat_thread_axis())
         return DeviceLoopState(
             self,
             for_node=for_node,
@@ -8459,6 +8512,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             idx_expr = env.backend.grid_index_expr(offset_var, bs, dtype, axis=axis)
             if uses_thread_axis and isinstance(block_size, int):
                 tracker.record(block_idx, axis, block_size)
+            elif uses_thread_axis:
+                tracker.record_symbolic_axis([block_idx], axis)
             state.add_statement(f"{index_var} = {idx_expr}")
             if (
                 uses_thread_axis
@@ -8628,6 +8683,8 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             idx_expr = env.backend.loop_index_expr(offset_var, bs, dtype, axis=axis)
             if uses_thread_axis and isinstance(block_size, int):
                 tracker.record(block_idx, axis, block_size)
+            elif uses_thread_axis:
+                tracker.record_symbolic_axis([block_idx], axis)
             extra_body = [
                 statement_from_string(f"{index_var} = {idx_expr}"),
             ]
@@ -9316,6 +9373,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 )
                 if isinstance(static_extent, int):
                     tracker.record(block_idx, axis, static_extent)
+                else:
+                    tracker.record_symbolic_axis([block_idx], axis)
             else:
                 idx_expr = offset_var
             if lane_var := self._lane_var_by_block.get(block_idx):
@@ -9689,6 +9748,8 @@ class PerThreadNDTileStrategy(NDTileStrategy):
                 )
                 if isinstance(static_extent, int):
                     tracker.record(block_idx, axis, static_extent)
+                else:
+                    tracker.record_symbolic_axis([block_idx], axis)
             else:
                 idx_expr = offset_var
             block_vec_width = self._cute_lane_vec_width_by_block.get(block_idx, 1)
@@ -10217,6 +10278,8 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         tracker = ThreadAxisTracker()
         if self._uses_thread_axis() and isinstance(thread_extent, int):
             tracker.record_all(self.block_ids, axis, thread_extent)
+        elif self._uses_thread_axis():
+            tracker.record_symbolic_axis(self.block_ids, axis)
         return DeviceGridState(
             self,
             block_id_to_info=block_id_to_info,
@@ -10308,6 +10371,8 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         thread_extent = self._thread_extent()
         if self._uses_thread_axis() and isinstance(thread_extent, int):
             tracker.record_all(self.block_ids, axis, thread_extent)
+        elif self._uses_thread_axis():
+            tracker.record_symbolic_axis(self.block_ids, axis)
         return DeviceLoopState(
             self,
             for_node=for_node,
