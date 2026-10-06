@@ -4089,7 +4089,10 @@ def test_fragment_mixed_warp_scans_cpu(mode, dtype, fallback_dtype, width, rever
         )
         code = bound.to_code(config)
     assert "shuffle_sync_up" in code
-    assert ("fragment_scan_initialized" in code) == (mode == "serial")
+    # Wide integer phases now use hierarchical prefixes; floating and narrow
+    # unsupported dtypes retain the explicitly selected fallback schedule.
+    fallback = fallback_dtype not in (torch.int32, torch.int64)
+    assert ("fragment_scan_initialized" in code) == (mode == "serial" and fallback)
     actual = [torch.full_like(value, -9) for value in expected]
     state = _simulate_fragment_warp_reduction(
         code,
@@ -4668,3 +4671,377 @@ def test_fragment_packet_loads_zero_extent_does_not_issue_packets(dtype):
         else:
             with pytest.raises(exc.InvalidConfig, match="readonly Float32"):
                 bound.to_code(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_packet_shared_address(
+    x, offsets, width: hl.constexpr, modulus: hl.constexpr
+):
+    out = torch.empty((2, width), device=x.device, dtype=x.dtype)
+    raw = torch.empty_like(out)
+    for row in hl.tile(2):
+        index = hl.arange(width)
+        samples = hl.load(offsets, [row, hl.arange(offsets.size(1))])
+        offset = samples.sum(-1).to(torch.int32)
+        selected = index[None, :] + offset[:, None]
+        flat = row.index[:, None] * width + selected
+        value = hl.load(
+            x,
+            [flat],
+            extra_mask=(selected >= 0)
+            & (selected < width)
+            & (index[None, :] % modulus != 0),
+        )
+        raw[row, :] = value
+        out[row, :] = hl.cumsum(value + 1, dim=-1) + value.sum(-1)[:, None]
+    return raw, out
+
+
+@pytest.mark.parametrize("width", [4, 17, 65])
+@pytest.mark.parametrize("layout", ["dense", "stride", "offset"])
+@pytest.mark.parametrize("offset", [-1, 0, 3])
+def test_fragment_packet_shared_address_generated(width, layout, offset):
+    base = torch.arange(4 * width, dtype=torch.float32)
+    x = (
+        base[: 2 * width]
+        if layout == "dense"
+        else base[::2]
+        if layout == "stride"
+        else base[1 : 2 * width + 1]
+    )
+    before = x.clone()
+    offsets = torch.zeros((2, 4), dtype=torch.float32)
+    offsets[:, 0] = offset
+    codes = []
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_packet_shared_address, (x, offsets, width, 13))
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [1]
+        for enabled in (False, True):
+            config.config["cute_fragment_packet_loads"] = enabled
+            codes.append(bound.to_code(config))
+    assert codes[0].count("sync_threads") == codes[1].count("sync_threads")
+    index = torch.arange(width)
+    wanted = index + offset
+    matrix = x.reshape(2, width)
+    expected = torch.where(
+        (wanted >= 0) & (wanted < width) & (index % 13 != 0),
+        matrix[:, wanted.clamp(0, width - 1)],
+        0,
+    )
+    for code in codes:
+        out = torch.full((2, width), -99, dtype=x.dtype)
+        raw = torch.full_like(out, -99)
+        stats = _simulate_independent_fragment(
+            code, {"x": x, "offsets": offsets}, {"raw": raw, "out": out}, 2
+        )
+        torch.testing.assert_close(raw, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            out, (expected + 1).cumsum(-1) + expected.sum(-1)[:, None], rtol=0, atol=0
+        )
+        if code == codes[1] and layout == "dense" and width == 65 and offset == 0:
+            assert stats["vector"] > 0
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+def _packet_shared_proof_fixture():
+    from helion._compiler.cute.packet_loads import _published_dependencies
+
+    slot = Fragment((), torch.float32, lambda _: "slot[0]", True, storage="slot")
+    view = Fragment((), torch.float32, lambda _: "slot[0]", True, (slot,))
+    # A lazy view is not register-backed: it has transitive shared storage.
+    lazy = Fragment((), torch.float32, lambda _: "slot[0]", dependencies=(slot,))
+    compiler = object.__new__(FragmentCompiler)
+    compiler.thread = "thread"
+    compiler.threads = 128
+    compiler.buffers = [("slot", torch.float32, 1), ("unused", torch.float32, 1)]
+    compiler.scopes = [{"lazy": lazy}]
+    compiler.held = []
+    compiler.pending_local_atomics = set()
+    compiler.cg = SimpleNamespace(
+        statements_stack=[
+            ast.parse(
+                "for owner in range(thread, 1, 128):\n    slot[0] = cutlass.Float32(3)\ncute.arch.sync_threads()\n"
+            ).body
+        ]
+    )
+    return compiler, slot, view, lazy, _published_dependencies
+
+
+def test_fragment_packet_shared_publication_and_transitive_lifetime():
+    compiler, slot, view, lazy, proof = _packet_shared_proof_fixture()
+    assert proof(compiler, (lazy,)) == frozenset({"slot"})
+    assert proof(compiler, (view,)) == frozenset({"slot"})
+    result = Fragment((4,), torch.float32, lambda _: "0")
+    compiler.held.append((result, lazy))
+    compiler.scopes.clear()
+    compiler.smem_bytes = 0
+    selected = compiler.allocate(result)
+    assert selected.storage == "unused" and selected.storage != slot.storage
+    assert compiler.live_buffers() == {"slot"}
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "pending",
+        "alias",
+        "later_write",
+        "multiple",
+        "missing_publication",
+        "unknown_storage",
+        "register",
+    ],
+)
+def test_fragment_packet_shared_publication_declines(bad):
+    compiler, slot, _view, lazy, proof = _packet_shared_proof_fixture()
+    dependencies = (lazy,)
+    body = compiler.cg.statements_stack[-1]
+    if bad == "pending":
+        compiler.pending_local_atomics.add("slot")
+    elif bad == "alias":
+        body.extend(ast.parse("alias = slot").body)
+    elif bad == "later_write":
+        body.extend(
+            ast.parse(
+                "for owner in range(thread, 1, 128):\n    slot[0] = cutlass.Float32(9)"
+            ).body
+        )
+    elif bad == "multiple":
+        body.extend(
+            ast.parse("slot[0] = cutlass.Float32(9)\ncute.arch.sync_threads()").body
+        )
+    elif bad == "missing_publication":
+        body.pop()
+    elif bad == "unknown_storage":
+        compiler.buffers.clear()
+    else:
+        register = Fragment((), torch.float32, lambda _: "private", True)
+        dependencies = (lazy, register)
+    assert not proof(compiler, dependencies)
+
+
+@pytest.mark.parametrize("index", ["0", "0 * 1", "2 - 2"])
+def test_fragment_packet_shared_slot_keeps_conditional_scope(index):
+    from helion._compiler.cute.packet_loads import _load_assignment
+
+    body = ast.parse(
+        f"if valid:\n    offset = cutlass.Int64(slot[{index}])\n    result = cutlass.Float32((x.iterator + offset).load())"
+    ).body
+    before = ast.dump(ast.Module(body=body, type_ignores=[]))
+    assert _load_assignment(body, "x") is None
+    assert _load_assignment(body, "x", frozenset({"slot"})) is not None
+    assert ast.dump(ast.Module(body=body, type_ignores=[])) == before
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "slot[lane]",
+        "slot[1]",
+        "slot[False]",
+        "slot[0.0]",
+        "private[0]",
+        "unknown[0]",
+        "slot[0 * call()]",
+    ],
+)
+def test_fragment_packet_shared_slot_unknown_or_register_declines(expression):
+    from helion._compiler.cute.packet_loads import _load_assignment
+
+    body = ast.parse(
+        f"offset = {expression}\nresult = (x.iterator + offset).load()"
+    ).body
+    assert _load_assignment(body, "x", frozenset({"slot"})) is None
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "width,layout,offset", [(65, "dense", 0), (65, "stride", 3), (17, "offset", -1)]
+)
+def test_fragment_packet_shared_address_native(width, layout, offset):
+    base = torch.arange(4 * width, dtype=torch.float32, device=DEVICE)
+    x = (
+        base[: 2 * width]
+        if layout == "dense"
+        else base[::2]
+        if layout == "stride"
+        else base[1 : 2 * width + 1]
+    )
+    offsets = torch.zeros((2, 4), dtype=torch.float32, device=DEVICE)
+    offsets[:, 0] = offset
+    before = x.clone(), offsets.clone()
+    bound = _fragment_packet_shared_address._bind_isolated((x, offsets, width, 13))
+    config = bound.config_spec.default_config()
+    config.config.update(block_sizes=[1], cute_fragment_packet_loads=True)
+    raw, out = bound.compile_config(config)(x, offsets, width, 13)
+    index = torch.arange(width, device=DEVICE)
+    selected = index + offset
+    expected = torch.where(
+        (selected >= 0) & (selected < width) & (index % 13 != 0),
+        x.reshape(2, width)[:, selected.clamp(0, width - 1)],
+        0,
+    )
+    torch.testing.assert_close(raw, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        out, (expected + 1).cumsum(-1) + expected.sum(-1)[:, None], rtol=0, atol=0
+    )
+    torch.testing.assert_close(x, before[0], rtol=0, atol=0)
+    torch.testing.assert_close(offsets, before[1], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    "width,reverse,threads", [(1025, False, 32), (2048, True, 128), (4097, True, 512)]
+)
+def test_fragment_hierarchical_integer_scan_cpu(dtype, width, reverse, threads):
+    x = (torch.arange(2 * width).reshape(2, width) % 19 - 9).to(dtype)
+    limits = torch.iinfo(dtype)
+    x[0, ::37] = limits.max
+    x[1, ::41] = limits.min
+    before = x.clone()
+    ordered = x.flip((-1,)) if reverse else x
+    expected = ordered.cumsum(-1, dtype=dtype)
+    if reverse:
+        expected = expected.flip((-1,))
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_warp_scan_special, (x, reverse))
+        config = helion.Config.from_dict(
+            dict(bound.config_spec.default_config())
+            | {
+                "block_sizes": [1],
+                "cute_fragment_threads": threads,
+                "cute_fragment_warp_scan": True,
+            }
+        )
+        code = bound.to_code(config)
+    actual = torch.full_like(x, -123)
+    _simulate_fragment_warp_reduction(
+        code, {"x": x}, {"out": actual}, 2, threads, allow_lane_stores=True
+    )
+    assert torch.equal(actual, expected)
+    assert torch.equal(x, before)
+    assert "shuffle_sync_up" in code
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("width,reverse", [(1025, False), (2048, True), (4097, True)])
+def test_fragment_hierarchical_integer_scan_native(dtype, width, reverse):
+    x = (torch.arange(3 * width, device=DEVICE).reshape(3, width) % 19 - 9).to(dtype)
+    limits = torch.iinfo(dtype)
+    x[0, ::37] = limits.max
+    x[1, ::41] = limits.min
+    before = x.clone()
+    ordered = x.flip((-1,)) if reverse else x
+    expected = ordered.cumsum(-1, dtype=dtype)
+    if reverse:
+        expected = expected.flip((-1,))
+    bound = _fragment_warp_scan_special.bind((x, reverse))
+    config = helion.Config.from_dict(
+        dict(bound.config_spec.default_config())
+        | {
+            "block_sizes": [1],
+            "cute_fragment_threads": 128,
+            "cute_fragment_warp_scan": True,
+        }
+    )
+    actual = bound.compile_config(config)(x, reverse)
+    assert torch.equal(actual, expected)
+    assert torch.equal(x, before)
+
+
+@pytest.mark.parametrize("axis,reverse", [(1, False), (1, True), (2, True)])
+def test_fragment_hierarchical_integer_scan_cpu_strides_and_input_reuse(axis, reverse):
+    from test.test_cute_fragment_scan_config import _computed_scan
+
+    width = 1057
+    shape = (3, width, 2) if axis == 1 else (3, 2, width)
+    storage = torch.arange(2 * math.prod(shape)).reshape(*shape, 2)
+    x = (storage[..., 0] % 13 - 6).to(torch.int32)
+    # Preserve a noncontiguous input after the dtype conversion/pointwise work.
+    backing = torch.stack((x, x + 7), -1)
+    x = backing[..., 0]
+    assert not x.is_contiguous()
+    before = x.clone()
+    backing_before = backing.clone()
+    values = x + 1
+    ordered = values.flip((axis,)) if reverse else values
+    expected = ordered.cumsum(axis, dtype=x.dtype)
+    if reverse:
+        expected = expected.flip((axis,))
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_computed_scan, (x, axis, reverse))
+        config = helion.Config.from_dict(
+            dict(bound.config_spec.default_config())
+            | {
+                "block_sizes": [2],
+                "cute_fragment_threads": 128,
+                "cute_fragment_warp_scan": True,
+            }
+        )
+        code = bound.to_code(config)
+    out, reused = torch.full_like(x, -123), torch.full_like(x, -123)
+    # The simulator's pointer reads physical storage offsets. Codegen was
+    # bound to the strided view; its pointer starts at this backing allocation.
+    _simulate_fragment_warp_reduction(
+        code,
+        {"x": backing},
+        {"out": out, "reused": reused},
+        2,
+        128,
+        allow_lane_stores=True,
+    )
+    assert torch.equal(out, expected)
+    assert torch.equal(reused, values * 2)
+    assert torch.equal(x, before)
+    assert torch.equal(backing, backing_before)
+
+
+def test_fragment_hierarchical_integer_scan_resource_limit():
+    x = torch.ones((1, 16385), dtype=torch.int64)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_warp_scan_special, (x, False))
+        config = helion.Config.from_dict(
+            dict(bound.config_spec.default_config())
+            | {
+                "block_sizes": [1],
+                "cute_fragment_threads": 1024,
+                "cute_fragment_warp_scan": True,
+            }
+        )
+        with pytest.raises(exc.InvalidConfig, match="shared bytes, exceeding"):
+            bound.to_code(config)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    "dtype,axis,reverse",
+    [(torch.int32, 1, False), (torch.int64, 1, True), (torch.int64, 2, True)],
+)
+def test_fragment_hierarchical_integer_scan_native_strides(dtype, axis, reverse):
+    from test.test_cute_fragment_scan_config import _computed_scan
+
+    shape = (3, 1057, 2) if axis == 1 else (3, 2, 1057)
+    backing = (torch.arange(2 * math.prod(shape), device=DEVICE) % 13 - 6).to(dtype)
+    backing = backing.reshape(*shape, 2)
+    x = backing[..., 0]
+    before = backing.clone()
+    values = x + 1
+    ordered = values.flip((axis,)) if reverse else values
+    expected = ordered.cumsum(axis, dtype=dtype)
+    if reverse:
+        expected = expected.flip((axis,))
+    bound = _computed_scan.bind((x, axis, reverse))
+    config = helion.Config.from_dict(
+        dict(bound.config_spec.default_config())
+        | {
+            "block_sizes": [2],
+            "cute_fragment_threads": 128,
+            "cute_fragment_warp_scan": True,
+        }
+    )
+    out, reused = bound.compile_config(config)(x, axis, reverse)
+    assert torch.equal(out, expected)
+    assert torch.equal(reused, values * 2)
+    assert torch.equal(backing, before)

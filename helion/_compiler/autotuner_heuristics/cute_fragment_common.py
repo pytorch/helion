@@ -2,13 +2,37 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ...language import _tracing_ops
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
+
+
+@dataclass(frozen=True)
+class FragmentRootRequirement:
+    """Explicit Boolean capabilities required by one additional root."""
+
+    root: int
+    enabled_options: frozenset[str]
+
+
+def active_fragment_roots(
+    ordinary: frozenset[int],
+    requirements: tuple[FragmentRootRequirement, ...],
+    config: Mapping[str, object],
+) -> frozenset[int]:
+    """Select proved roots without changing or repairing the configuration."""
+    return ordinary | frozenset(
+        item.root
+        for item in requirements
+        if all(config.get(key) is True for key in item.enabled_options)
+    )
 
 
 def fragment_root_regions(ir: DeviceIR) -> list[tuple[int, list[GraphInfo]]]:
