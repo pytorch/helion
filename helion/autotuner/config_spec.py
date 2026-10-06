@@ -946,6 +946,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
         "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1063,6 +1064,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
         "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1185,6 +1187,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
         "cute_integer_loop_reduction",
+        "cute_fragment_packet_loads",
         "cute_fragment_warp_results",
         "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
@@ -1518,6 +1521,8 @@ class ConfigSpec:
         self.cute_integer_loop_reduction_available = False
         self.cute_integer_loop_reduction_search_enabled = False
         self.cute_fragment_register_snapshot_min_threads = 0
+        self.cute_fragment_packet_load_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_packet_loads_search_enabled = False
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_results_search_enabled = False
@@ -3561,6 +3566,28 @@ class ConfigSpec:
             f"{key}={value!r} requires proved bounded readonly rank-one snapshots with exact integer reductions"
         )
 
+    def _normalize_cute_fragment_packet_loads(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_packet_loads"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_packet_load_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a complete fragment root with readonly Float32 host loads"
+        )
+
     def _normalize_cute_fragment_register_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4572,6 +4599,7 @@ class ConfigSpec:
             self._normalize_cute_fragment_atomic_consumer_fusion(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_fragment_packet_loads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_register_loads(
                 config, fix_invalid=_fix_invalid
             )
@@ -5775,6 +5803,7 @@ class ConfigSpec:
                 "cute_fragment_skip_zero_atomics",
                 "cute_fragment_atomic_consumer_fusion",
                 "cute_integer_loop_reduction",
+                "cute_fragment_packet_loads",
             ):
                 return True, False
             if key == "cute_fragment_threads":
@@ -6011,6 +6040,8 @@ class ConfigSpec:
                 fields["cute_fragment_atomic_aggregation"] = BooleanFragment()
             if self.cute_fragment_integer_atomic_epochs_search_enabled:
                 fields["cute_fragment_integer_atomic_epochs"] = BooleanFragment()
+            if self.cute_fragment_packet_loads_search_enabled:
+                fields["cute_fragment_packet_loads"] = BooleanFragment()
             if self.cute_fragment_warp_scan_search_enabled:
                 fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_local_atomic_registers_search_enabled:

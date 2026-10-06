@@ -1774,9 +1774,11 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                 finally:
                     self.current_root_graph_info = previous_root_graph_info
 
-                # Flush deferred RDIM definitions now that block sizes are determined
-                # This ensures block size and rdim vars are defined in the correct order
-                self.device_function.flush_deferred_rdim_defs(self)
+                # Reduction preambles can register extents that depend on a later
+                # root's block size. Its cached name exists before its host
+                # assignment, so wait until every root has emitted its definitions.
+                if node._root_id == len(self.host_function.device_ir.root_ids) - 1:
+                    self.device_function.flush_deferred_rdim_defs(self)
 
                 if isinstance(self.device_function.pid, ForEachProgramID):
                     self.device_function.pid.case_phases.append(

@@ -10,6 +10,7 @@ import operator
 import re
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import NoReturn
 from typing import TypeVar
 from typing import cast
 import weakref
@@ -30,6 +31,7 @@ from .compile_environment import _to_sympy
 from .cute.access_regions import new_loop_instance
 from .cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
 from .cute.register_tile_admission import RegisterTileUnsupported
+from .cute.thread_budget import MAX_THREADS_PER_BLOCK
 from .device_function import DeviceFunction
 from .host_function import HostFunction
 from .host_function import NoCurrentFunction
@@ -301,6 +303,7 @@ def _clone_lane_loop_with_body(loop: ast.For, body: list[ast.AST]) -> ast.For:
 # The marker never reaches the emitted kernel — the post-pass strips every
 # marker it processes.
 _HELION_LANE_REDUCE_MARKER = "_helion_lane_reduce"
+HELION_VECTOR_REDUCTION_OWNER_ATTR = "_helion_vector_reduction_owner"
 _CUTE_UNIFORM_GLOBAL_NAMES = frozenset(
     {
         "abs",
@@ -738,6 +741,14 @@ def _finalize_lane_reduce_marker(m: _LaneReduceMarker, acc_var: str) -> list[ast
 
 
 def _warp_reduce_expr(reduction_type: str, acc: str, threads_in_group: int) -> str:
+    if threads_in_group > 32:
+        from .. import exc
+
+        raise exc.BackendUnsupported(
+            "cute",
+            "lane reduction spanning multiple physical warps requires a proven "
+            "CTA reduction group",
+        )
     tg = f", threads_in_group={threads_in_group}"
     if reduction_type == "sum":
         return f"cute.arch.warp_reduction_sum({acc}{tg})"
@@ -831,7 +842,7 @@ def split_lane_loop_reductions(
         )
         _update_proven_uniform_names(stmt, proven_uniform)
         _update_thread_axis_names(stmt, proven_thread_axes)
-        _update_scalar_definitions(stmt, proven_scalar_definitions)
+        _update_scalar_definitions(stmt, proven_scalar_definitions, rename_groups)
     return new_body
 
 
@@ -885,6 +896,12 @@ def _split_stmt_lane_reductions(
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
+    body_definitions = _loop_body_scalar_definitions(
+        stmt, scalar_definitions, thread_axis_names, rename_groups
+    )
+    exit_definitions = _loop_invariant_scalar_definitions(
+        stmt, scalar_definitions, rename_groups
+    )
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
         if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
@@ -897,7 +914,9 @@ def _split_stmt_lane_reductions(
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     proven_tensor_stride_values=proven_tensor_stride_values,
                     thread_axis_names=dict(thread_axis_names),
-                    scalar_definitions=dict(scalar_definitions),
+                    scalar_definitions=dict(
+                        body_definitions if field == "body" else exit_definitions
+                    ),
                     rename_groups=rename_groups,
                     running_sums=running_sums,
                 ),
@@ -917,7 +936,7 @@ def _split_stmt_lane_reductions(
         proven_disjoint_tensor_pairs,
         proven_tensor_stride_values,
         thread_axis_names,
-        scalar_definitions,
+        body_definitions,
         rename_groups,
         running_sums,
     )
@@ -1495,6 +1514,7 @@ def _split_one_lane_loop(
         body,
         thread_axis_names,
         scalar_definitions,
+        rename_groups,
     )
 
     def is_lane_varying(stmt: ast.AST) -> bool:
@@ -1972,23 +1992,29 @@ def _update_thread_axis_names(
 def _update_scalar_definitions(
     stmt: ast.AST,
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: Mapping[str, str] | None = None,
 ) -> None:
     """Track simple generated scalar assignments for predicate proofs."""
     from .ast_read_writes import ReadWrites
 
-    writes = set(ReadWrites.from_ast(stmt).writes)
-    invalidated = set(writes)
+    renames = rename_groups or {}
+    invalidated = {renames.get(name, name) for name in ReadWrites.from_ast(stmt).writes}
     changed = True
     while changed:
         changed = False
         for name, expression in list(scalar_definitions.items()):
             if (
-                name in invalidated
-                or set(ReadWrites.from_ast(expression).reads) & invalidated
+                renames.get(name, name) in invalidated
+                or {
+                    renames.get(read, read)
+                    for read in ReadWrites.from_ast(expression).reads
+                }
+                & invalidated
             ):
                 scalar_definitions.pop(name)
-                if name not in invalidated:
-                    invalidated.add(name)
+                canonical = renames.get(name, name)
+                if canonical not in invalidated:
+                    invalidated.add(canonical)
                     changed = True
     if (
         isinstance(stmt, ast.Assign)
@@ -2002,6 +2028,7 @@ def _statement_provenance_before(
     body: list[ast.AST],
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    rename_groups: Mapping[str, str] | None = None,
 ) -> tuple[
     dict[int, dict[str, frozenset[int]]],
     dict[int, dict[str, ast.AST]],
@@ -2015,7 +2042,7 @@ def _statement_provenance_before(
         thread_axes_before[id(stmt)] = dict(local_thread_axes)
         scalar_defs_before[id(stmt)] = dict(local_scalar_defs)
         _update_thread_axis_names(stmt, local_thread_axes)
-        _update_scalar_definitions(stmt, local_scalar_defs)
+        _update_scalar_definitions(stmt, local_scalar_defs, rename_groups)
     return thread_axes_before, scalar_defs_before
 
 
@@ -2161,6 +2188,7 @@ def _split_dependent_lane_reductions(
         body,
         thread_axis_names,
         scalar_definitions,
+        rename_groups,
     )
 
     # Every stage indexes a prefix of the marker-free body below.
@@ -3023,7 +3051,10 @@ def _lane_reduce_owner_expr(
             return None
         if reduce_axis in store_axes.unique_predicate:
             return None
-        if reduce_axis in store_axes.predicate or reduce_axis in store_axes.value:
+        if reduce_axis in store_axes.value or (
+            reduce_axis in store_axes.predicate
+            and reduce_axis not in store_axes.bounded_zero_safe_predicate
+        ):
             raise exc.BackendUnsupported(
                 "cute",
                 "cannot infer unique ownership for a thread-varying store",
@@ -3128,6 +3159,7 @@ class _StoreThreadAxes(NamedTuple):
     predicate: set[int]
     unique_predicate: set[int]
     zero_safe_predicate: set[int]
+    bounded_zero_safe_predicate: frozenset[int] = frozenset()
 
 
 def _contains_sync_threads(stmt: ast.AST) -> bool:
@@ -3421,11 +3453,143 @@ def _is_generated_block_extent(
     return isinstance(node, ast.Name) and node.id.startswith("_BLOCK_SIZE_")
 
 
+_SCALAR_INTEGER_BOUNDS_ATTR = "_helion_scalar_integer_bounds"
+
+
+def _scalar_integer_bounds(
+    node: ast.AST,
+    scalar_definitions: dict[str, ast.AST],
+    seen: frozenset[str] = frozenset(),
+) -> tuple[int, int] | None:
+    """Bound simple generated coordinates without signed Int32 overflow.
+
+    Loop-index ranges annotate proof-only name expressions in the scalar
+    context; they never replace an expression in emitted code. Unknown loads,
+    calls, cyclic aliases, and narrowing or overflowing arithmetic decline.
+    """
+    bounds: tuple[int, int] | None = None
+    if isinstance(node, ast.Name):
+        bounds = getattr(node, _SCALAR_INTEGER_BOUNDS_ATTR, None)
+        if bounds is None and node.id in scalar_definitions and node.id not in seen:
+            return _scalar_integer_bounds(
+                scalar_definitions[node.id], scalar_definitions, seen | {node.id}
+            )
+    elif isinstance(node, ast.Constant) and type(node.value) is int:
+        bounds = node.value, node.value
+    elif _direct_thread_coordinate(node) is not None:
+        # CUDA permits at most 1024 threads per block. Using that upper bound
+        # also covers smaller and multidimensional launches conservatively.
+        bounds = 0, MAX_THREADS_PER_BLOCK - 1
+    elif isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        if ast.unparse(node.func) in ("int", "cutlass.Int32", "cutlass.Int64"):
+            bounds = _scalar_integer_bounds(node.args[0], scalar_definitions, seen)
+    elif isinstance(node, ast.UnaryOp):
+        operand = _scalar_integer_bounds(node.operand, scalar_definitions, seen)
+        if operand is not None:
+            if isinstance(node.op, ast.UAdd):
+                bounds = operand
+            elif isinstance(node.op, ast.USub):
+                bounds = -operand[1], -operand[0]
+    elif isinstance(node, ast.BinOp):
+        left = _scalar_integer_bounds(node.left, scalar_definitions, seen)
+        right = _scalar_integer_bounds(node.right, scalar_definitions, seen)
+        if left is not None and right is not None:
+            if isinstance(node.op, ast.Add):
+                bounds = left[0] + right[0], left[1] + right[1]
+            elif isinstance(node.op, ast.Sub):
+                bounds = left[0] - right[1], left[1] - right[0]
+            elif isinstance(node.op, ast.Mult):
+                products = [a * b for a in left for b in right]
+                bounds = min(products), max(products)
+    if bounds is None or not -(2**31) <= bounds[0] <= bounds[1] < 2**31:
+        return None
+    return bounds
+
+
+def _loop_invariant_scalar_definitions(
+    statement: ast.AST,
+    scalar_definitions: dict[str, ast.AST],
+    rename_groups: Mapping[str, str],
+) -> dict[str, ast.AST]:
+    """Invalidate body writes before any iteration, including carry aliases."""
+    from .ast_read_writes import ReadWrites
+
+    if not isinstance(statement, (ast.For, ast.While)):
+        return scalar_definitions
+    definitions = dict(scalar_definitions)
+    writes = set(ReadWrites.from_ast(statement).writes)
+    if isinstance(statement, ast.For):
+        # ReadWrites treats induction names as local to the loop; incoming
+        # proof facts for a shadowed name must nevertheless be retired.
+        writes.update(
+            node.id for node in ast.walk(statement.target) if isinstance(node, ast.Name)
+        )
+    canonical_writes = {rename_groups.get(name, name) for name in writes}
+    changed = True
+    while changed:
+        changed = False
+        for name, expression in list(definitions.items()):
+            reads = set(ReadWrites.from_ast(expression).reads)
+            if any(
+                rename_groups.get(value, value) in canonical_writes
+                for value in (name, *reads)
+            ):
+                definitions.pop(name)
+                canonical_writes.add(rename_groups.get(name, name))
+                changed = True
+    return definitions
+
+
+def _loop_body_scalar_definitions(
+    statement: ast.AST,
+    scalar_definitions: dict[str, ast.AST],
+    thread_axis_names: dict[str, frozenset[int]],
+    rename_groups: Mapping[str, str] | None = None,
+) -> dict[str, ast.AST]:
+    """Bound a thread-uniform positive-step induction in its lexical body."""
+    definitions = _loop_invariant_scalar_definitions(
+        statement, scalar_definitions, rename_groups or {}
+    )
+    if not isinstance(statement, ast.For) or not isinstance(statement.target, ast.Name):
+        return definitions
+    index = ast.Name(id=statement.target.id, ctx=ast.Load())
+    # Kill old aliases of the target even when this loop has no proved range.
+    _update_scalar_definitions(
+        ast.Assign(targets=[statement.target], value=index), definitions, rename_groups
+    )
+    call = statement.iter
+    if not (
+        isinstance(call, ast.Call)
+        and ast.unparse(call.func) in ("range", "cutlass.range_constexpr")
+        and not call.keywords
+        and 1 <= len(call.args) <= 3
+        and not any(_thread_axes_read_by(arg, thread_axis_names) for arg in call.args)
+    ):
+        return definitions
+    start = ast.Constant(0) if len(call.args) == 1 else call.args[0]
+    stop = call.args[0] if len(call.args) == 1 else call.args[1]
+    step = call.args[2] if len(call.args) == 3 else ast.Constant(1)
+    begin = _scalar_integer_bounds(start, scalar_definitions)
+    end = _scalar_integer_bounds(stop, scalar_definitions)
+    stride = _scalar_integer_bounds(step, scalar_definitions)
+    positive_step = stride is not None and stride[0] > 0
+    if (
+        begin is not None
+        and end is not None
+        and begin[0] < end[1]
+        and (positive_step or _is_generated_block_extent(step, scalar_definitions))
+    ):
+        setattr(index, _SCALAR_INTEGER_BOUNDS_ATTR, (begin[0], end[1] - 1))
+    return definitions
+
+
 def _predicate_accepts_zero_thread_axis(
     predicate: ast.AST,
     axis: int,
     thread_axis_names: dict[str, frozenset[int]],
     scalar_definitions: dict[str, ast.AST],
+    *,
+    require_bounded: bool = False,
 ) -> bool:
     """Prove a generated bound remains true after selecting axis lane zero.
 
@@ -3443,6 +3607,7 @@ def _predicate_accepts_zero_thread_axis(
             axis,
             thread_axis_names,
             scalar_definitions,
+            require_bounded=require_bounded,
         )
     if isinstance(predicate, ast.BoolOp) and isinstance(predicate.op, ast.And):
         return all(
@@ -3451,6 +3616,7 @@ def _predicate_accepts_zero_thread_axis(
                 axis,
                 thread_axis_names,
                 scalar_definitions,
+                require_bounded=require_bounded,
             )
             for value in predicate.values
         )
@@ -3463,9 +3629,22 @@ def _predicate_accepts_zero_thread_axis(
         return False
     lhs = _resolve_scalar_definition(predicate.left, scalar_definitions)
     rhs = _resolve_scalar_definition(predicate.comparators[0], scalar_definitions)
+    literal_end = _literal_int_expr(rhs)
+    bounded_coordinate = (
+        literal_end is not None
+        and 0 < literal_end < 2**31
+        and _scalar_integer_bounds(lhs, scalar_definitions) is not None
+    )
     return (
         axis not in _thread_axes_read_by(rhs, thread_axis_names)
-        and _is_generated_block_extent(rhs, scalar_definitions)
+        and (
+            _is_generated_block_extent(rhs, scalar_definitions)
+            or (require_bounded and bounded_coordinate)
+        )
+        and (
+            not require_bounded
+            or _scalar_integer_bounds(lhs, scalar_definitions) is not None
+        )
         and (
             coefficient := _thread_axis_linear_coefficient(
                 lhs,
@@ -3575,6 +3754,21 @@ def _store_thread_axes(
                 for predicate, axes in zip(predicates, predicate_axes, strict=True)
             )
         },
+        frozenset(
+            axis
+            for axis in all_predicate_axes
+            if all(
+                axis not in axes
+                or _predicate_accepts_zero_thread_axis(
+                    predicate,
+                    axis,
+                    thread_axis_names,
+                    scalar_definitions,
+                    require_bounded=True,
+                )
+                for predicate, axes in zip(predicates, predicate_axes, strict=True)
+            )
+        ),
     )
 
 
@@ -4098,7 +4292,7 @@ def _rereduce_restored_lane_markers(
         for _, marker in markers
     ]
     thread_axes_before, scalar_defs_before = _statement_provenance_before(
-        body, thread_axis_names, scalar_definitions
+        body, thread_axis_names, scalar_definitions, rename_groups
     )
     for stmt in tail:
         owner_exprs = _lane_reduction_owner_exprs_for_statement(
@@ -4570,6 +4764,102 @@ def _interchange_stmt(
     )
 
 
+def _flatten_vector_reduction_lane(
+    loop: ast.For, vector_loop: ast.For, lane_var: str
+) -> ast.For:
+    """Restore one complete scalar domain before the ordinary reduction split.
+
+    The strategy records this ownership when it emits the reduction marker.
+    Flattening preserves the original (outer, vector) visitation order. Only
+    pure coordinate preparation may move from once per outer lane to once per
+    element; vector loads/stores, staging, and unproved carries must decline.
+    The existing splitter still checks all producer/consumer aliasing.
+    """
+    from .ast_read_writes import ReadWrites
+
+    def unsupported() -> NoReturn:
+        raise exc.BackendUnsupported(
+            "cute", "vector lane reduction has no complete scalar ownership proof"
+        )
+
+    def extent(node: ast.For) -> int:
+        call = node.iter
+        if not (
+            isinstance(call, ast.Call)
+            and ast.unparse(call.func) in ("range", "cutlass.range_constexpr")
+            and len(call.args) == 1
+            and not call.keywords
+            and isinstance(call.args[0], ast.Constant)
+            and type(call.args[0].value) is int
+            and call.args[0].value > 0
+            and not node.orelse
+        ):
+            unsupported()
+        return call.args[0].value
+
+    outer_size, vector_size = extent(loop), extent(vector_loop)
+    if not isinstance(vector_loop.target, ast.Name):
+        unsupported()
+    vector_var = vector_loop.target.id
+    if vector_var == lane_var or loop.body[-1] is not vector_loop:
+        unsupported()
+    prefix = loop.body[:-1]
+    body_rw = ReadWrites.from_list(vector_loop.body)
+    body_writes = set(body_rw.writes) | set(body_rw.inplace_writes)
+    prefix_writes = set(ReadWrites.from_list(prefix).writes)
+    prepared: set[str] = set()
+    for statement in prefix:
+        name = _plain_assignment_name(statement)
+        if (
+            name is None
+            or not _is_proven_relocatable_assignment(statement, allow_load=False)
+            or name in body_writes | prepared | {lane_var, vector_var}
+            or any(
+                isinstance(node, ast.Subscript)
+                and not (
+                    isinstance(node.value, ast.Call)
+                    and ast.unparse(node.value.func)
+                    in ("cute.arch.thread_idx", "cute.arch.block_idx")
+                )
+                for node in ast.walk(statement)
+            )
+        ):
+            unsupported()
+        reads = set(ReadWrites.from_ast(statement).reads)
+        # A prefix value cannot depend on state changed by an element, nor on
+        # its own prior-iteration value. Earlier coordinate definitions are OK.
+        if reads & (body_writes | (prefix_writes - prepared) | {vector_var}):
+            unsupported()
+        prepared.add(name)
+    if body_writes & {lane_var, vector_var} or any(
+        isinstance(
+            node, (ast.Break, ast.Continue, ast.Return, ast.Yield, ast.While, ast.For)
+        )
+        for statement in vector_loop.body
+        for node in ast.walk(statement)
+    ):
+        unsupported()
+    for statement in vector_loop.body:
+        marker = _is_lane_reduce_marker_assign(statement)
+        if marker is not None and marker.owner_lane != lane_var:
+            unsupported()
+
+    class Coordinates(ast.NodeTransformer):
+        def visit_Name(self, node: ast.Name) -> ast.AST:
+            if isinstance(node.ctx, ast.Load):
+                if node.id == lane_var:
+                    return expr_from_string(f"({lane_var} // {vector_size})")
+                if node.id == vector_var:
+                    return expr_from_string(f"({lane_var} % {vector_size})")
+            return node
+
+    flattened = [
+        Coordinates().visit(_clone_stmt(statement))
+        for statement in [*prefix, *vector_loop.body]
+    ]
+    return _create_lane_loop(lane_var, outer_size * vector_size, flattened)
+
+
 def _interchange_one_lane_loop(
     loop: ast.For,
     lane_var: str,
@@ -4598,6 +4888,10 @@ def _interchange_one_lane_loop(
     if mb_index is None:
         return [loop]
     mb_loop = cast("ast.For", body[mb_index])
+    if getattr(mb_loop, HELION_VECTOR_REDUCTION_OWNER_ATTR, None) == lane_var:
+        # These slots partition the SAME reduced axis, unlike an independent
+        # serial row loop. Reducing each slot separately overwrites the output.
+        return [_flatten_vector_reduction_lane(loop, mb_loop, lane_var)]
     lane_prefix = body[:mb_index]
     lane_suffix = body[mb_index + 1 :]
     mb_body: list[ast.AST] = list(mb_loop.body)

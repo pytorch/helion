@@ -28,6 +28,7 @@ from .device_function import find_block_size_symbols
 from .host_function import HostFunction
 from .inductor_lowering import ReductionLowering
 from .inductor_lowering import install_inductor_kernel_handlers
+from .tile_strategy import HELION_VECTOR_REDUCTION_OWNER_ATTR
 from .tile_strategy import CompactedShape
 from .tile_strategy import CuteLaneAxis
 from .tile_strategy import DeviceGridState
@@ -805,9 +806,23 @@ class ReductionStrategy(TileStrategy):
             if isinstance(strategy, PerThreadNDTileStrategy):
                 owner = strategy._lane_var_by_block.get(self.block_index)
                 if owner is not None:
+                    vector_loop = strategy._cute_lane_vloop_by_block.get(
+                        self.block_index
+                    )
+                    if vector_loop is not None:
+                        setattr(vector_loop, HELION_VECTOR_REDUCTION_OWNER_ATTR, owner)
                     return owner
             elif isinstance(strategy, PerThreadFlattenedTileStrategy):
                 if strategy._lane_var is not None:
+                    vector_loop = strategy._cute_lane_vloop_by_block.get(
+                        strategy.block_ids[-1]
+                    )
+                    if vector_loop is not None:
+                        setattr(
+                            vector_loop,
+                            HELION_VECTOR_REDUCTION_OWNER_ATTR,
+                            strategy._lane_var,
+                        )
                     return strategy._lane_var
         raise exc.BackendUnsupported("cute", "reduction lane owner is not proven")
 
@@ -2831,11 +2846,11 @@ class BlockReductionStrategy(ReductionStrategy):
         * ``lane_expr`` — the linear thread index across all live thread axes.
 
         Returns ``None`` (so the caller keeps the plain warp-reduce / no-op
-        finalize) when the reduce axis sits at the bottom of the linear thread
-        index (``pre == 1``).  With ``pre > 1`` the marker finalize picks the
-        single-warp grouped reduce (``group_span <= 32``) or the cross-warp
-        two-stage shared reduce (``group_span`` a multiple of 32); a group that
-        straddles a warp boundary has no de-interleaving helper and is rejected.
+        finalize) for contiguous groups (``pre == 1``) fitting one warp.
+        Strided groups use a single-warp grouped reduce when
+        ``group_span <= 32``. Wider groups, including contiguous ones, use
+        the two-stage shared reduce when ``group_span`` is a multiple of 32;
+        groups straddling a warp boundary without that alignment are rejected.
         """
         env = CompileEnvironment.current()
         backend = env.backend
