@@ -18,7 +18,9 @@ if TYPE_CHECKING:
     from .registry import CompilerHeuristicSpecializationFact
 
 KEY = "cute_fragment_threads"
-THREADS = (128, 32, 64, 256, 512)
+# Existing coverage geometry is stable when the legal search domain grows.
+LEGACY_COVERAGE_THREADS = (128, 32, 64, 256, 512)
+THREADS = (*LEGACY_COVERAGE_THREADS, 1024)
 
 
 class CuteFragmentThreadsHeuristic(AutotunerHeuristic):
@@ -88,7 +90,11 @@ def register_fragment_threads_coverage(
             key=KEY,
             domain=THREADS,
             legacy=128,
-            witnesses=tuple(CoverageWitness(carrier, count) for count in THREADS[1:]),
+            # Keep the established four-witness budget. The appended 1024 value
+            # remains an ordinary enum neighbor/random-search choice.
+            witnesses=tuple(
+                CoverageWitness(carrier, count) for count in LEGACY_COVERAGE_THREADS[1:]
+            ),
             deferred=True,
         )
     )

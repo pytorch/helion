@@ -11,6 +11,7 @@ from ...autotuner.compiler_coverage import CoverageWitness
 from ...exc import InvalidConfig
 from ...runtime.config import Config
 from .cute_fragment_common import fragment_root_regions
+from .cute_fragment_threads import LEGACY_COVERAGE_THREADS
 from .cute_fragment_threads import THREADS
 from .registry import AutotunerHeuristic
 
@@ -87,9 +88,12 @@ def register_fragment_warp_results_coverage(
     spec.cute_fragment_warp_results_search_enabled = True
     generation = spec.create_config_generation()
     # A declared coverage coupling, without changing any existing seed/default.
-    # The largest existing CTA domain witnesses every bounded group count.
-    # It also stays explicit after normalization (128 is the omitted default).
-    threads = max(THREADS)
+    # Preserve existing witness geometry. Newly supported group counts can
+    # require a larger legal CTA; their coverage is genuinely new.
+    threads = max(LEGACY_COVERAGE_THREADS)
+    required = spec.cute_fragment_warp_result_min_threads
+    if required > threads:
+        threads = min(count for count in THREADS if count >= required)
     requested = Config.from_dict(
         deepcopy(carrier.config) | {"cute_fragment_threads": threads}
     )

@@ -66,6 +66,12 @@ from .cute_fragment_atomic_aggregation import CuteFragmentAtomicAggregationHeuri
 from .cute_fragment_atomic_aggregation import (
     register_fragment_atomic_aggregation_coverage,
 )
+from .cute_fragment_local_atomic_registers import (
+    CuteFragmentLocalAtomicRegistersHeuristic,
+)
+from .cute_fragment_local_atomic_registers import (
+    register_fragment_local_atomic_registers_coverage,
+)
 from .cute_fragment_private_scalar_loops import CuteFragmentPrivateScalarLoopsHeuristic
 from .cute_fragment_private_scalar_loops import (
     register_fragment_private_scalar_loops_coverage,
@@ -183,6 +189,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentProducerCacheHeuristic,
         CuteFragmentWarpScanHeuristic,
         CuteFragmentAtomicAggregationHeuristic,
+        CuteFragmentLocalAtomicRegistersHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -626,5 +633,8 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_atomic_aggregation_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_local_atomic_registers_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )

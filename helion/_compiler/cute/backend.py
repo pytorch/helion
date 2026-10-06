@@ -1477,6 +1477,7 @@ class CuteBackend(Backend):
                 "cute_fragment_producer_cache",
                 "cute_fragment_warp_scan",
                 "cute_fragment_atomic_aggregation",
+                "cute_fragment_local_atomic_registers",
                 "cute_fragment_warp_results",
                 "cute_fragment_private_scalar_loops",
                 "cute_pointwise_pid_type",
