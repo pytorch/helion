@@ -99,6 +99,12 @@ from .cute_fragment_published_scalars import CuteFragmentPublishedScalarsHeurist
 from .cute_fragment_published_scalars import (
     register_fragment_published_scalars_coverage,
 )
+from .cute_fragment_pure_producer_regions import (
+    CuteFragmentPureProducerRegionsHeuristic,
+)
+from .cute_fragment_pure_producer_regions import (
+    register_fragment_pure_producer_regions_coverage,
+)
 from .cute_fragment_reduction import CuteFragmentReductionHeuristic
 from .cute_fragment_reduction import register_fragment_reduction_coverage
 from .cute_fragment_register_loads import CuteFragmentRegisterLoadsHeuristic
@@ -241,6 +247,7 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentPacketLoadsHeuristic,
         CuteFragmentRegisterProducersHeuristic,
         CuteFragmentBoundedGatherHeuristic,
+        CuteFragmentPureProducerRegionsHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -720,3 +727,9 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_gather_warp_scan_coverage(env, device_ir)
+    register_fragment_atomic_consumer_fusion_coverage(
+        env, device_ir, resource_carrier=resource_carrier, extended_only=True
+    )
+    register_fragment_pure_producer_regions_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )

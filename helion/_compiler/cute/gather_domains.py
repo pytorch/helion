@@ -14,6 +14,7 @@ import torch
 from torch.fx import Node
 
 from ...language import _tracing_ops
+from ...language import inline_asm_ops
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import RootGraphInfo
 
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 class GatherDomainFacts:
     shapes: dict[Node, tuple[sympy.Expr, ...]] = field(default_factory=dict)
     readonly_ranges: dict[Node, tuple[int, int]] = field(default_factory=dict)
+    resident_whiles: set[Node] = field(default_factory=set)
 
 
 def _carry_map(
@@ -66,7 +68,9 @@ def _carry_map(
     return slots
 
 
-def _readonly_index_recipe(node: Node, known: set[Node]) -> bool:
+def _readonly_index_recipe(
+    node: Node, known: set[Node], *, identity_captures: frozenset[Node] = frozenset()
+) -> bool:
     """Only closed/iota-rooted pure values can inherit a captured interval.
 
     In particular, full() can denote mutable CTA storage and host/local loads
@@ -84,6 +88,13 @@ def _readonly_index_recipe(node: Node, known: set[Node]) -> bool:
             torch.ops.prims.iota.default,
             torch.ops.aten.scalar_tensor.default,
         ):
+            continue
+        # A new nested tree has separately rejected all writes/aliases across
+        # its entry and body. The emitter's identity capture wrapper may then
+        # forward an already proved readonly recipe, never a mutable carry's
+        # initial range. Preserve the old flat-loop rule otherwise.
+        if value in identity_captures:
+            pending.append(cast("Node", value.args[0]))
             continue
         if not (
             isinstance(value.target, torch._ops.OpOverload)
@@ -109,13 +120,14 @@ def _readonly_index_recipe(node: Node, known: set[Node]) -> bool:
 
 
 def loop_domain_facts(
-    env: CompileEnvironment, graphs: Sequence[GraphInfo]
+    env: CompileEnvironment, graphs: Sequence[GraphInfo], *, allow_unbound: bool = False
 ) -> GatherDomainFacts:
     """Publish a loop's facts only after all sibling backedges agree.
 
     Current call identity, argument order, logical axes and dtype are checked
-    together. Nested/ambiguous graph calls decline. Facts affect admission only;
-    the existing loop snapshots, storage dependencies and barriers are retained.
+    together. Nested for trees are transactional: provisional child facts never
+    escape a failed enclosing recurrence. Facts affect admission only; the
+    existing loop snapshots, storage dependencies and barriers are retained.
     """
     from .bounded_gather import integer_bounds
     from .computed_fragment import _selection_logical_shape
@@ -166,108 +178,227 @@ def loop_domain_facts(
     calls = [
         node for info in graphs for node in info.graph.nodes if node.target in loops
     ]
-    for root in graphs:
-        if not isinstance(root, RootGraphInfo):
-            continue
-        for call in root.graph.nodes:
-            if call.target not in loops or len(call.args) < 4:
-                continue
-            matches = [info for info in graphs if info.graph_id == call.args[0]]
-            if len(matches) != 1 or not isinstance(matches[0], ForLoopGraphInfo):
-                continue
-            body = matches[0]
-            graph_id = call.args[0]
-            if (
-                type(graph_id) is not int
-                or not 0 <= graph_id < len(graphs)
-                or graphs[graph_id] is not body
-            ):
-                continue
-            if sum(other.args[0] == body.graph_id for other in calls) != 1:
-                continue
-            if any(
-                node.target in loops or node.target is _tracing_ops._if
-                for node in body.graph.nodes
-            ):
-                continue
-            captures = call.args[3]
-            if not isinstance(captures, (list, tuple)) or not all(
-                isinstance(n, Node) for n in captures
-            ):
-                continue
-            captures = list(cast("Sequence[Node]", captures))
-            placeholders = list(body.graph.find_nodes(op="placeholder"))
-            # GraphInfo.copy retains original node_args. The emitter binds the
-            # current call's args[3] to current placeholders by strict position;
-            # stale outer objects must never supply facts for this call.
-            if len(placeholders) != len(captures) or len(body.node_args) != len(
-                captures
-            ):
-                continue
-            output_nodes = list(body.graph.find_nodes(op="output"))
-            if len(output_nodes) != 1:
-                continue
-            outputs = output_nodes[0].args[0]
-            if not isinstance(outputs, (list, tuple)) or not all(
-                isinstance(n, Node) for n in outputs
-            ):
-                continue
-            outputs = list(cast("Sequence[Node]", outputs))
-            slots = _carry_map(call, captures, outputs)
-            if slots is None:
-                continue
-            provisional = dict(facts.shapes)
-            local: dict[Node, tuple[sympy.Expr, ...]] = {}
-            for placeholder, entry in zip(placeholders, captures, strict=True):
-                entry_shape = shape(entry, facts.shapes)
-                if entry_shape is not None and compatible(placeholder, entry):
-                    provisional[placeholder] = local[placeholder] = entry_shape
-            valid = True
-            for index, output in enumerate(outputs):
-                slot = slots[index]
-                expected = local.get(placeholders[slot])
-                actual = shape(output, provisional)
+    dynamic_control = (_tracing_ops._if, _tracing_ops._while_loop)
+
+    def body_for(call: Node) -> ForLoopGraphInfo | None:
+        if call.target not in loops or len(call.args) < 4:
+            return None
+        graph_id = call.args[0]
+        if type(graph_id) is not int or not 0 <= graph_id < len(graphs):
+            return None
+        body = graphs[graph_id]
+        if not isinstance(body, ForLoopGraphInfo) or body.graph_id != graph_id:
+            return None
+        if sum(info.graph_id == graph_id for info in graphs) != 1:
+            return None
+        if sum(info.graph is body.graph for info in graphs) != 1:
+            return None
+        if sum(bool(other.args) and other.args[0] == graph_id for other in calls) != 1:
+            return None
+        # Even a differently typed control edge cannot reuse these Node keys
+        # as another call context. The selected graph list is authoritative.
+        for info in graphs:
+            for node in info.graph.nodes:
+                if node.target is _tracing_ops._if and graph_id in node.args[1:3]:
+                    return None
                 if (
-                    expected is None
-                    or actual is None
-                    or not compatible(output, captures[slot])
-                    or len(actual) != len(expected)
+                    node.target is _tracing_ops._while_loop
+                    and graph_id in node.args[:2]
+                ):
+                    return None
+        return body
+
+    def effect_free(nodes: Sequence[Node], active: frozenset[int]) -> bool:
+        defined: set[Node] = set()
+        for node in nodes:
+            if any(
+                arg.graph is not node.graph or arg not in defined
+                for arg in node.all_input_nodes
+            ):
+                return False
+            defined.add(node)
+            if node.target in dynamic_control:
+                return False
+            if node.target in loops:
+                child = body_for(node)
+                if child is None or child.graph_id in active:
+                    return False
+                if not effect_free(list(child.graph.nodes), active | {child.graph_id}):
+                    return False
+            elif node.target is inline_asm_ops.inline_asm_elementwise:
+                # Normalized assembly has six positional arguments. Match the
+                # existing single-output pack=1 shape rule, not source kwargs.
+                # Logical broadcast domains still require their separate proof.
+                output = node.meta.get("val")
+                if (
+                    node.kwargs
+                    or len(node.args) != 6
+                    or node.args[4] is not True
+                    or type(node.args[5]) is not int
+                    or node.args[5] != 1
+                    or not isinstance(node.args[3], torch.dtype)
+                    or not isinstance(output, torch.Tensor)
+                    or output.dtype != node.args[3]
+                    or not isinstance(node.args[2], (list, tuple))
+                    or not node.args[2]
                     or any(
-                        sympy.expand(a) != sympy.expand(b)
-                        for a, b in zip(actual, expected, strict=True)
+                        not isinstance(operand, Node)
+                        or not isinstance(operand.meta.get("val"), torch.Tensor)
+                        for operand in node.args[2]
                     )
                 ):
-                    valid = False
-                    break
-            if not valid:
-                continue
-            outgoing: dict[Node, tuple[sympy.Expr, ...]] = {}
-            for item in call.users:
-                index = cast("int", item.args[1])
-                entry = captures[slots[index]]
-                if not compatible(item, entry):
-                    valid = False
-                    break
-                outgoing[item] = local[placeholders[slots[index]]]
-                for phi in item.users:
-                    if phi.target is _tracing_ops._phi:
-                        if not compatible(phi, entry):
-                            valid = False
-                            break
-                        outgoing[phi] = outgoing[item]
-            if not valid:
-                continue
-            # Commit all domains together. Mutable carries never inherit ranges.
-            facts.shapes.update(local)
-            facts.shapes.update(outgoing)
-            for slot, (placeholder, entry) in enumerate(
-                zip(placeholders, captures, strict=True)
+                    return False
+            elif node.op not in ("placeholder", "output") and node.target not in (
+                _tracing_ops._phi,
+                _tracing_ops._new_var,
+                _tracing_ops._host_tensor,
             ):
-                if slot in slots.values() or placeholder not in local:
-                    continue
-                if not _readonly_index_recipe(entry, set(facts.readonly_ranges)):
-                    continue
-                interval = integer_bounds(entry, captured_bounds=facts.readonly_ranges)
-                if interval is not None:
-                    facts.readonly_ranges[placeholder] = interval
-    return facts
+                if node.is_impure():
+                    return False
+        return True
+
+    def prove(
+        call: Node,
+        incoming: GatherDomainFacts,
+        active: frozenset[int] = frozenset(),
+        nested: bool = False,
+    ) -> GatherDomainFacts | None:
+        body = body_for(call)
+        if body is None or body.graph_id in active:
+            return None
+        nodes = list(body.graph.nodes)
+        children = [node for node in nodes if node.target in loops]
+        if any(node.target in dynamic_control for node in nodes):
+            return None
+        new_tree = nested or bool(children)
+        captures = call.args[3]
+        if not isinstance(captures, (list, tuple)) or not all(
+            isinstance(n, Node) for n in captures
+        ):
+            return None
+        captures = list(cast("Sequence[Node]", captures))
+        identity_captures: frozenset[Node] = frozenset()
+        if new_tree:
+            parent_nodes = list(call.graph.nodes)
+            preceding = parent_nodes[: parent_nodes.index(call)]
+            # Actual entry definitions must dominate the call. Exclude writes
+            # even through distinct aliases: this new scope makes no storage
+            # mutation proof, and cannot inherit a pre-mutation index interval.
+            if any(
+                entry.graph is not call.graph or entry not in preceding
+                for entry in captures
+            ):
+                return None
+            if any(
+                item.graph is not call.graph
+                or any(
+                    phi.graph is not call.graph
+                    for phi in item.users
+                    if phi.target is _tracing_ops._phi
+                )
+                for item in call.users
+            ):
+                return None
+            if not effect_free(preceding, active) or not effect_free(
+                nodes, active | {body.graph_id}
+            ):
+                return None
+            positions = {node: i for i, node in enumerate(preceding)}
+            identity_captures = frozenset(
+                node
+                for node in preceding
+                if node.target is _tracing_ops._new_var
+                and len(node.args) == 1
+                and not node.kwargs
+                and isinstance(node.args[0], Node)
+                and node.args[0] in positions
+                and positions[node.args[0]] < positions[node]
+                and compatible(node, node.args[0])
+            )
+        placeholders = list(body.graph.find_nodes(op="placeholder"))
+        # GraphInfo.copy retains original node_args. Only current call edges
+        # bind current placeholders; metadata can check arity, not substitute
+        # stale outer values for the current entry.
+        if len(placeholders) != len(captures) or len(body.node_args) != len(captures):
+            return None
+        output_nodes = list(body.graph.find_nodes(op="output"))
+        if len(output_nodes) != 1:
+            return None
+        outputs = output_nodes[0].args[0]
+        if not isinstance(outputs, (list, tuple)) or not all(
+            isinstance(n, Node) for n in outputs
+        ):
+            return None
+        outputs = list(cast("Sequence[Node]", outputs))
+        slots = _carry_map(call, captures, outputs)
+        if slots is None:
+            return None
+        trial = GatherDomainFacts(dict(incoming.shapes), dict(incoming.readonly_ranges))
+        local: dict[Node, tuple[sympy.Expr, ...]] = {}
+        for placeholder, entry in zip(placeholders, captures, strict=True):
+            entry_shape = shape(entry, incoming.shapes)
+            if entry_shape is not None and compatible(placeholder, entry):
+                trial.shapes[placeholder] = local[placeholder] = entry_shape
+            elif new_tree and isinstance(entry.meta.get("val"), torch.Tensor):
+                # Unknown readonly captures cannot make a nested context look
+                # complete merely because its mutable outputs happen to match.
+                return None
+        for slot, (placeholder, entry) in enumerate(
+            zip(placeholders, captures, strict=True)
+        ):
+            if slot in slots.values() or placeholder not in local:
+                continue
+            if not _readonly_index_recipe(
+                entry,
+                set(incoming.readonly_ranges),
+                identity_captures=identity_captures,
+            ):
+                continue
+            interval = integer_bounds(entry, captured_bounds=incoming.readonly_ranges)
+            if interval is not None:
+                trial.readonly_ranges[placeholder] = interval
+        # Descendants may assume this iteration's entry domains, but nothing
+        # escapes the trial until every enclosing output proves the recurrence.
+        for child in children:
+            child_trial = prove(child, trial, active | {body.graph_id}, True)
+            if child_trial is None:
+                return None
+            trial = child_trial
+        for index, output in enumerate(outputs):
+            slot = slots[index]
+            expected = local.get(placeholders[slot])
+            actual = shape(output, trial.shapes)
+            if (
+                expected is None
+                or actual is None
+                or not compatible(output, captures[slot])
+                or len(actual) != len(expected)
+                or any(
+                    sympy.expand(a) != sympy.expand(b)
+                    for a, b in zip(actual, expected, strict=True)
+                )
+            ):
+                return None
+        for item in call.users:
+            index = cast("int", item.args[1])
+            entry = captures[slots[index]]
+            if not compatible(item, entry):
+                return None
+            trial.shapes[item] = local[placeholders[slots[index]]]
+            for phi in item.users:
+                if phi.target is _tracing_ops._phi:
+                    if not compatible(phi, entry):
+                        return None
+                    trial.shapes[phi] = trial.shapes[item]
+        return trial
+
+    for root in graphs:
+        if isinstance(root, RootGraphInfo):
+            for call in root.graph.nodes:
+                if call.target in loops:
+                    result = prove(call, facts)
+                    if result is not None:
+                        facts = result
+    from .resident_while import resident_while_domain_facts
+
+    return resident_while_domain_facts(env, graphs, facts, allow_unbound=allow_unbound)

@@ -969,6 +969,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
         "cute_fragment_warp_results",
@@ -1093,6 +1094,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
         "cute_fragment_warp_results",
@@ -1221,6 +1223,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
+        "cute_fragment_pure_producer_regions",
         "cute_integer_loop_reduction",
         "cute_fragment_packet_loads",
         "cute_fragment_warp_results",
@@ -1562,6 +1565,8 @@ class ConfigSpec:
         self.cute_fragment_local_atomic_registers_search_enabled = False
         self.cute_fragment_atomic_consumer_fusion_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_atomic_consumer_fusion_search_enabled = False
+        self.cute_fragment_pure_producer_regions_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_pure_producer_regions_search_enabled = False
         self.cute_fragment_local_atomic_register_min_threads = 0
         self.cute_fragment_register_snapshots_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_register_snapshots_search_enabled = False
@@ -3582,6 +3587,28 @@ class ConfigSpec:
             f"{key}={value!r} requires a proved same-coordinate local Int32 atomic consumer region"
         )
 
+    def _normalize_cute_fragment_pure_producer_regions(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_pure_producer_regions"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_pure_producer_regions_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a proved same-owner pure producer publication region"
+        )
+
     def _normalize_cute_fragment_integer_atomic_epochs(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4805,6 +4832,9 @@ class ConfigSpec:
             self._normalize_cute_fragment_atomic_consumer_fusion(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_fragment_pure_producer_regions(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_fragment_packet_loads(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_register_loads(
                 config, fix_invalid=_fix_invalid
@@ -6019,6 +6049,7 @@ class ConfigSpec:
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
                 "cute_fragment_atomic_consumer_fusion",
+                "cute_fragment_pure_producer_regions",
                 "cute_integer_loop_reduction",
                 "cute_fragment_packet_loads",
             ):
@@ -6287,6 +6318,8 @@ class ConfigSpec:
                 fields["cute_fragment_skip_zero_atomics"] = BooleanFragment()
             if self.cute_fragment_atomic_consumer_fusion_search_enabled:
                 fields["cute_fragment_atomic_consumer_fusion"] = BooleanFragment()
+            if self.cute_fragment_pure_producer_regions_search_enabled:
+                fields["cute_fragment_pure_producer_regions"] = BooleanFragment()
             if self.cute_fragment_register_loads_search_enabled:
                 fields["cute_fragment_register_loads"] = BooleanFragment()
             if self.cute_fragment_threads_search_enabled:

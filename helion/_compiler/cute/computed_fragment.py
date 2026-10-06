@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 from contextlib import contextmanager
+from contextlib import nullcontext
 import dataclasses
 from dataclasses import dataclass
 import math
@@ -79,6 +80,7 @@ from .local_atomic_registers import MAX_SLOTS
 from .local_atomic_registers import local_atomic_register_chains
 from .private_scalar_loops import private_scalar_loop_nodes
 from .private_scalar_loops import privatize_scalar_loop
+from .pure_producer_regions import pure_producer_plan
 from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
 from .register_snapshots import SnapshotOwner
@@ -273,6 +275,12 @@ def _selection_logical_shape(
             from .bounded_gather import inline_asm_shape
 
             return inline_asm_shape(source, infer, dimension)
+        if all_axis_reductions:
+            from .bounded_gather import all_axis_reduction_shape
+
+            reduced = all_axis_reduction_shape(source, infer, dimension)
+            if reduced is not None:
+                return reduced
         if target is memory_ops.load:
             tensor_node = cast("Node", source.args[0])
             tensor = tensor_node.meta.get("val")
@@ -405,12 +413,6 @@ def _selection_logical_shape(
                 return None
             return result
         if isinstance(source.meta.get("lowering"), ReductionLowering):
-            if all_axis_reductions:
-                from .bounded_gather import all_axis_reduction_shape
-
-                reduced = all_axis_reduction_shape(source, infer, dimension)
-                if reduced is not None:
-                    return reduced
             # Dimension-list reductions remove axes without reinterpreting the
             # remaining coordinates. Other reduction signatures are unproved.
             if (
@@ -481,6 +483,7 @@ class FragmentCompiler:
         self.thread = ""
         self.sym_indices: dict[sympy.Symbol, str] = {}
         self.expression: FragmentExpression | None = None
+        self.lazy_opaque_producers: frozenset[Node] = frozenset()
         self.local_allocations: frozenset[Node] = frozenset()
         self.local_logical_sizes: dict[int, int] = {}
         self.local_storage: list[Fragment] = []
@@ -536,6 +539,9 @@ class FragmentCompiler:
 
         self.local_register_nodes: set[Node] = set()
         self.local_register_slot: str | None = None
+        self.iteration_local_returns: frozenset[Node] = frozenset()
+        self.iteration_owner: SnapshotOwner | None = None
+        self.iteration_defined: set[Node] = set()
         if self.df.config.get("cute_fragment_local_atomic_registers", False):
             for node, chain in local_atomic_register_chains(
                 self.graphs, self.env
@@ -560,6 +566,17 @@ class FragmentCompiler:
     def begin(self) -> None:
         self.allocator = self.df.new_var("fragment_smem")
         self.thread = self.df.new_var("fragment_thread")
+
+    @contextmanager
+    def iteration_scope(self, index: str, size: int) -> Iterator[None]:
+        """A returned scalar is valid only in this active owner's iteration."""
+        assert self.iteration_owner is None and not self.iteration_defined
+        self.iteration_owner = SnapshotOwner(index, "", size)
+        try:
+            yield
+        finally:
+            self.iteration_owner = None
+            self.iteration_defined.clear()
 
     def allocations(self) -> list[ast.AST]:
         return [
@@ -714,10 +731,11 @@ class FragmentCompiler:
             and self.expression.body is self.cg.statements_stack[-1]
         ):
             result = tuple(self.expression.coordinate(value) for value in coordinates)
-            if self.snapshot_owner is not None:
-                for name, value in zip(result, coordinates, strict=True):
-                    if name != value:
-                        self.snapshot_owner.aliases.setdefault(name, value)
+            for owner in (self.snapshot_owner, self.iteration_owner):
+                if owner is not None:
+                    for name, value in zip(result, coordinates, strict=True):
+                        if name != value:
+                            owner.aliases.setdefault(name, value)
             return result
         result = []
         for coordinate in coordinates:
@@ -726,8 +744,9 @@ class FragmentCompiler:
                 result.append(coordinate)
                 continue
             name = self.cg.lift(expression, prefix="fragment_coordinate").id
-            if self.snapshot_owner is not None:
-                self.snapshot_owner.aliases.setdefault(name, coordinate)
+            for owner in (self.snapshot_owner, self.iteration_owner):
+                if owner is not None:
+                    owner.aliases.setdefault(name, coordinate)
             result.append(name)
         return tuple(result)
 
@@ -840,7 +859,9 @@ class FragmentCompiler:
         warp_owned: bool = False,
         synchronize: bool = True,
         register_owned: bool = False,
+        iteration_local: bool = False,
     ) -> None:
+        assert not iteration_local or (len(shape) == 1 and not warp_owned)
         register_owned = register_owned or (
             shape in self.snapshot_shapes
             and not warp_owned
@@ -874,6 +895,9 @@ class FragmentCompiler:
                     with (
                         self.cg.set_statements(cast("list[ast.AST]", branch.body)),
                         self.snapshot_scope(index, slot, math.prod(shape)),
+                        self.iteration_scope(index, math.prod(shape))
+                        if iteration_local
+                        else nullcontext(),
                     ):
                         body(self.coordinates(index, shape))
                     self.cg.add_statement(branch)
@@ -910,7 +934,12 @@ class FragmentCompiler:
                     body(self.coordinates(index, shape))
                 self.cg.add_statement(branch)
             else:
-                body(self.coordinates(index, shape))
+                with (
+                    self.iteration_scope(index, math.prod(shape))
+                    if iteration_local
+                    else nullcontext()
+                ):
+                    body(self.coordinates(index, shape))
         self.cg.add_statement(loop)
         if synchronize:
             self.synchronize()
@@ -1100,9 +1129,21 @@ class FragmentCompiler:
         )
         if register is not None:
             self.emit(f"{register} = {self.cast('0', target_fake.dtype)}")
+        iteration_ticket = (
+            self.df.new_var("fragment_iteration_ticket")
+            if node in self.iteration_local_returns
+            else None
+        )
+        if iteration_ticket is not None:
+            assert deferred_updates is not None and local and node.users
+            assert sem == "relaxed" and target_fake.dtype == torch.int32
+            assert len(shape) == 1 and not warp_owned
         local_registers = (
             self.df.new_var("fragment_local_tickets")
-            if local and node.users and node in self.local_register_nodes
+            if local
+            and node.users
+            and node in self.local_register_nodes
+            and iteration_ticket is None
             else None
         )
         if local_registers is not None:
@@ -1116,8 +1157,24 @@ class FragmentCompiler:
             assert self.local_register_slot is not None
             return f"{local_registers}[{self.local_register_slot}]"
 
+        def iteration_read(coords: tuple[str, ...]) -> str:
+            assert self.iteration_owner is not None
+            assert node in self.iteration_local_returns
+            assert node in self.iteration_defined
+            self.iteration_owner.prove(coords[0])
+            assert iteration_ticket is not None
+            return iteration_ticket
+
         result = (
             Fragment(
+                shape,
+                target_fake.dtype,
+                iteration_read,
+                True,
+                logical_domain=logical_domain,
+            )
+            if iteration_ticket is not None
+            else Fragment(
                 shape,
                 target_fake.dtype,
                 local_register_read,
@@ -1271,7 +1328,9 @@ class FragmentCompiler:
             elif result is None:
                 self.emit(f"if {self.predicate(masks)}:\n    {atomic}")
             else:
-                previous = self.df.new_var("fragment_atomic_previous")
+                previous = iteration_ticket or self.df.new_var(
+                    "fragment_atomic_previous"
+                )
                 self.emit(f"{previous} = {self.cast('0', target_fake.dtype)}")
                 if skip_zero:
                     update_value = self.df.new_var("fragment_atomic_nonzero_value")
@@ -1284,10 +1343,13 @@ class FragmentCompiler:
                     )
                 else:
                     self.emit(f"if {self.predicate(masks)}:\n    {previous} = {atomic}")
-                self.emit(f"{result.read(coords)} = {previous}")
+                if iteration_ticket is not None:
+                    self.iteration_defined.add(node)
+                else:
+                    self.emit(f"{result.read(coords)} = {previous}")
 
         if deferred_updates is not None:
-            assert local and not warp_owned and local_registers is None
+            assert local and not warp_owned
             assert aggregate_vars is None and target_fake.dtype == torch.int32
             deferred_updates.append((update, result is not None))
         elif aggregate_vars is None:
@@ -1325,7 +1387,16 @@ class FragmentCompiler:
             self.scalar_ordered_tickets[node] = result
         return result
 
-    def memory(self, node: Node, values: dict[Node, object], store: bool) -> object:
+    def memory(
+        self,
+        node: Node,
+        values: dict[Node, object],
+        store: bool,
+        deferred_updates: list[tuple[Callable[[tuple[str, ...]], None], bool]]
+        | None = None,
+    ) -> object:
+        if deferred_updates is not None:
+            values = dict(values)
         tensor = values[cast("Node", node.args[0])]
         indices = cast("list[object]", node.args[1])
         output = (
@@ -1482,12 +1553,15 @@ class FragmentCompiler:
                     f"if {mask}:\n    {pointer}.store({self.cast(stored, tensor.value.dtype)})"
                 )
 
-            self.elements(
-                shape,
-                write,
-                warp_owned=self.warp_result_nodes.get(node) == math.prod(shape),
-                register_owned=node in self.local_register_nodes,
-            )
+            if deferred_updates is not None:
+                deferred_updates.append((write, True))
+            else:
+                self.elements(
+                    shape,
+                    write,
+                    warp_owned=self.warp_result_nodes.get(node) == math.prod(shape),
+                    register_owned=node in self.local_register_nodes,
+                )
             return None
 
         def load(coords: tuple[str, ...]) -> str:
@@ -2487,6 +2561,104 @@ class FragmentCompiler:
         self.held.pop()
         return carries
 
+    def resident_while(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
+        from .gather_domains import loop_domain_facts
+        from .resident_while import resident_while_plan
+
+        plan = resident_while_plan(node, self.graphs)
+        if node not in loop_domain_facts(self.env, self.graphs).resident_whiles:
+            raise exc.InvalidConfig(
+                "resident while lacks complete logical/readonly proof"
+            )
+        if self.df.config.get("cute_fragment_bounded_gather", False) is not True:
+            raise exc.InvalidConfig("resident while requires explicit bounded gather")
+        if any(
+            self.df.config.get(key, False)
+            for key in (
+                "cute_fragment_register_snapshots",
+                "cute_fragment_register_loads",
+                "cute_fragment_register_producers",
+                "cute_fragment_producer_cache",
+                "cute_fragment_published_scalars",
+                "cute_fragment_private_scalar_loops",
+                "cute_fragment_warp_results",
+                "cute_fragment_packet_loads",
+                "cute_integer_loop_reduction",
+            )
+        ):
+            raise exc.InvalidConfig(
+                "resident while requires shared uncached carry storage"
+            )
+        grid = self.cg.current_grid_state
+        assert grid is not None
+        if any(self.df.resolved_block_size(bid) != 1 for bid in grid.block_id_to_info):
+            raise exc.InvalidConfig("resident while requires one scalar row per CTA")
+        if any(
+            self.df.resolved_block_size(bid) != 1
+            for child in plan.nested_fors
+            for bid in cast("ForLoopGraphInfo", child.graph).block_ids
+        ):
+            raise exc.InvalidConfig(
+                "resident while requires scalar static packet loops"
+            )
+
+        # Freeze even readonly input recipes into held shared storage. A fake
+        # scalar or a register recipe is not evidence of physical replication.
+        captures: list[Fragment] = []
+        self.held.append(captures)
+        for entry in plan.body.captures:
+            captures.append(
+                self.materialize(cast("Fragment", values[entry]), copy=True)
+            )
+        carries = [captures[slot] for _index, slot in plan.body.carry_map]
+        predicate = self.allocate(Fragment((), torch.bool, lambda _: "False"))
+        self.held.append(predicate)
+        take = self.df.new_var("fragment_while_take")
+
+        def condition() -> None:
+            result = self.graph(
+                plan.condition.graph.graph,
+                dict(zip(plan.condition.placeholders, captures, strict=True)),
+            )
+            assert isinstance(result, list) and len(result) == 1
+            # One owned scalar writer, followed by unconditional publication.
+            self.copy(cast("Fragment", result[0]), predicate)
+            self.emit(f"{take} = {predicate.read(())}")
+            # Every physical thread must finish reading before any can enter
+            # the next iteration and overwrite this same predicate slot.
+            self.synchronize()
+
+        condition()
+        statements: list[ast.AST] = []
+        with self.cg.set_statements(statements):
+            results = self.graph(
+                plan.body.graph.graph,
+                dict(zip(plan.body.placeholders, captures, strict=True)),
+            )
+            assert isinstance(results, list)
+            snapshots: list[Fragment] = []
+            self.held.extend([results, snapshots])
+            destinations = self.referenced_buffers(carries)
+            for result in results:
+                value = cast("Fragment", result)
+                snapshots.append(
+                    self.materialize(value, copy=True)
+                    if self.referenced_buffers([value]) & destinations
+                    else value
+                )
+            for target, source in zip(carries, snapshots, strict=True):
+                self.copy(source, target)
+            self.held.pop()
+            self.held.pop()
+            condition()
+        loop = statement_from_string(f"while {take}:\n    pass")
+        assert isinstance(loop, ast.While)
+        loop.body = cast("list[ast.stmt]", statements)
+        self.cg.add_statement(loop)
+        self.held.pop()
+        self.held.pop()
+        return carries
+
     def serial_scan(self, node: Node, values: dict[Node, object]) -> Fragment:
         source = values[cast("Node", node.args[1])]
         assert isinstance(source, Fragment)
@@ -2948,8 +3120,7 @@ class FragmentCompiler:
             fake = cast("torch.Tensor", node.meta["val"])
             target = values.get(cast("Node", node.args[0]))
             if (
-                node in self.local_register_nodes
-                or node in self.warp_result_nodes
+                node in self.warp_result_nodes
                 or not isinstance(target, Fragment)
                 or target.storage is None
                 or len(target.shape) != 1
@@ -2959,14 +3130,31 @@ class FragmentCompiler:
                 return False
             storages.add(target.storage)
             shapes.add(self.shape(fake.shape))
-        return len(shapes) == 1
+        if len(shapes) != 1:
+            return False
+        external = {
+            arg
+            for node in region.nodes
+            for arg in node.all_input_nodes
+            if arg not in region.nodes and arg not in region.targets
+        }
+        if (
+            self.referenced_buffers([values[arg] for arg in external if arg in values])
+            & storages
+        ):
+            return False
+        shape = next(iter(shapes))
+        register_owned = any(node in self.local_register_nodes for node in region.nodes)
+        if register_owned and math.prod(shape) > self.threads * MAX_SLOTS:
+            return False
+        return not any(node in self.warp_result_nodes for node in region.nodes)
 
     def fused_atomic_updates(
         self,
         region: AtomicConsumerRegion,
         updates: list[tuple[Callable[[tuple[str, ...]], None], bool]],
     ) -> None:
-        assert len(updates) == len(region.atomics)
+        assert len(updates) == len(region.atomics) + len(region.stores)
         shape = self.shape(cast("torch.Tensor", region.atomics[0].meta["val"]).shape)
 
         def body(coords: tuple[str, ...]) -> None:
@@ -2981,7 +3169,15 @@ class FragmentCompiler:
             finally:
                 self.expression = previous
 
-        self.elements(shape, body, synchronize=False)
+        self.elements(
+            shape,
+            body,
+            synchronize=False,
+            register_owned=any(
+                node in self.local_register_nodes for node in region.nodes
+            ),
+            iteration_local=bool(region.local_returns),
+        )
         pending = self.pending_local_atomics.copy()
         for _update, synchronize in updates:
             if synchronize:
@@ -2999,6 +3195,22 @@ class FragmentCompiler:
             and not self.scopes
             else frozenset()
         )
+        previous_opaque = self.lazy_opaque_producers
+        pure_plan = (
+            pure_producer_plan(
+                graph,
+                self.env,
+                cache_nodes=cache_nodes,
+                shape=self.shape,
+                graphs=self.graphs,
+            )
+            if self.df.config.get("cute_fragment_pure_producer_regions", False)
+            and not self.scopes
+            else None
+        )
+        self.lazy_opaque_producers = pure_plan.lazy if pure_plan else frozenset()
+        if pure_plan is not None:
+            cache_nodes = (cache_nodes - pure_plan.replicated) | pure_plan.publications
         uses = {node: len(node.users) for node in graph.nodes}
         regions = (
             atomic_consumer_regions(self.graphs, self.env)
@@ -3024,6 +3236,8 @@ class FragmentCompiler:
                 ):
                     assert region is None
                     region = regions[node]
+                    assert not self.iteration_local_returns
+                    self.iteration_local_returns = frozenset(region.local_returns)
                     updates, held = [], []
                     self.held.append(held)
                 if region is not None:
@@ -3036,7 +3250,8 @@ class FragmentCompiler:
                 with node.meta["location"], V.set_current_node(node):
                     values[node] = (
                         self.node(node, values, updates)
-                        if region is not None and node in region.atomics
+                        if region is not None
+                        and node in (*region.atomics, *region.stores)
                         else self.node(node, values)
                     )
                     if region is not None:
@@ -3055,7 +3270,10 @@ class FragmentCompiler:
                     self.fused_atomic_updates(region, updates)
                     self.held.pop()
                     region = None
+                    self.iteration_local_returns = frozenset()
         finally:
+            self.iteration_local_returns = frozenset()
+            self.lazy_opaque_producers = previous_opaque
             self.scopes.pop()
         raise AssertionError("graph has no output")
 
@@ -3120,6 +3338,8 @@ class FragmentCompiler:
             self.synchronize_local_atomics()
         if target is _tracing_ops._if:
             return self.conditional(node, values)
+        if target is _tracing_ops._while_loop:
+            return self.resident_while(node, values)
         if _tracing_ops.is_for_loop_target(target):
             return self.loop(node, values)
         if target is atomic_ops.atomic_add:
@@ -3127,7 +3347,9 @@ class FragmentCompiler:
                 return self.atomic_add(node, values, deferred_updates)
             return self.atomic_add(node, values)
         if target in (memory_ops.load, memory_ops.store):
-            return self.memory(node, values, target is memory_ops.store)
+            return self.memory(
+                node, values, target is memory_ops.store, deferred_updates
+            )
         if target is torch.ops.aten.topk.default:
             return self.topk(node, values)
         if target is torch.ops.aten.gather.default:
@@ -3159,6 +3381,16 @@ class FragmentCompiler:
                     f"_cute_inline_asm_elementwise({arguments}, asm={asm!r}, "
                     f"constraints={constraints!r}, dtype={self.dtype(fake.dtype)}, "
                     "is_pure=True)"
+                )
+
+            if node in self.lazy_opaque_producers:
+                return Fragment(
+                    self.shape(fake.shape),
+                    fake.dtype,
+                    lambda coords: self.pointwise_read(
+                        node, coords, lambda: self.cast(inline_asm(coords), fake.dtype)
+                    ),
+                    dependencies=fragments,
                 )
 
             # Opaque scalar programs may be expensive and can feed several
@@ -3381,6 +3613,11 @@ class FragmentCompiler:
             )
         if target is torch.ops.aten.where.self:
             condition, lhs, rhs = cast("tuple[Fragment, Fragment, Fragment]", args)
+            logical_dependencies = tuple(
+                value
+                for value in (condition, lhs, rhs)
+                if value.logical_domain is not None
+            )
             return Fragment(
                 shape,
                 fake.dtype,
@@ -3388,6 +3625,18 @@ class FragmentCompiler:
                     f"({self.cast(lhs.broadcast(coords), fake.dtype)} if {condition.broadcast(coords)} else {self.cast(rhs.broadcast(coords), fake.dtype)})"
                 ),
                 dependencies=(condition, lhs, rhs),
+                # All operands share the broadcast output domain, regardless of
+                # which value the predicate selects. Preserve logical tails for
+                # the reduction's neutral mask; load/value masks are separate.
+                logical_domain=(
+                    lambda coords: tuple(
+                        mask
+                        for value in logical_dependencies
+                        for mask in value.broadcast_domain(coords)
+                    )
+                )
+                if logical_dependencies
+                else None,
             )
         raise exc.BackendUnsupported("cute", f"computed fragment operation {target}")
 
@@ -3400,6 +3649,7 @@ def computed_fragment_supported(
     owned_iota_axes: frozenset[int] = frozenset(),
     snapshot_owned: bool = False,
     bounded_gather_owned: bool = False,
+    allow_unbound: bool = False,
 ) -> bool:
     """Structural root ownership shared by search discovery and code generation.
 
@@ -3415,6 +3665,28 @@ def computed_fragment_supported(
         for info in graphs
     ):
         return False
+    while_calls = {
+        node
+        for info in graphs
+        for node in info.graph.nodes
+        if node.target is _tracing_ops._while_loop
+    }
+    if while_calls:
+        from .gather_domains import loop_domain_facts
+
+        if (
+            not bounded_gather_owned
+            or loop_domain_facts(
+                env, graphs, allow_unbound=allow_unbound
+            ).resident_whiles
+            != while_calls
+            or any(
+                node.target in atomic_ops.ATOMIC_OPS
+                for info in graphs
+                for node in info.graph.nodes
+            )
+        ):
+            return False
     graph_by_id = {info.graph_id: info for info in graphs}
     independent_reductions = independent_reduction_coordinates(env, graphs)
     free_reductions = {
@@ -3644,6 +3916,7 @@ def computed_fragment_supported(
         return False
     supported = {
         _tracing_ops._if,
+        _tracing_ops._while_loop,
         _tracing_ops._host_tensor,
         _tracing_ops._get_symnode,
         _tracing_ops._new_var,
@@ -3730,7 +4003,10 @@ def computed_fragment_supported(
 
                 if (
                     bounded_gather_owned
-                    and prove_gather(env, node, graphs=graphs) is not None
+                    and prove_gather(
+                        env, node, graphs=graphs, allow_unbound=allow_unbound
+                    )
+                    is not None
                 ):
                     continue
                 source, dim, index = node.args[:3]
@@ -3890,6 +4166,11 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         and root.graph_id
         in CompileEnvironment.current().config_spec.cute_fragment_published_scalar_root_ids
     )
+    pure_regions_required = (
+        cg.device_function.config.get("cute_fragment_pure_producer_regions", False)
+        and root.graph_id
+        in env.config_spec.cute_fragment_pure_producer_regions_root_ids
+    )
     producer_cache_required = (
         cg.device_function.config.get("cute_fragment_producer_cache", False)
         and root.graph_id in env.config_spec.cute_fragment_producer_cache_root_ids
@@ -3923,6 +4204,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if threads_required
         or register_loads_required
         or producer_cache_required
+        or pure_regions_required
         or published_scalars_required
         or topk_network_required
         or bounded_gather_required
@@ -3942,6 +4224,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if threads_required
         or register_loads_required
         or producer_cache_required
+        or pure_regions_required
         or published_scalars_required
         or topk_network_required
         or bounded_gather_required
@@ -3970,6 +4253,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or threads_required
         or register_loads_required
         or producer_cache_required
+        or pure_regions_required
         or published_scalars_required
         or topk_network_required
         or bounded_gather_required
@@ -4084,6 +4368,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or threads_required
             or register_loads_required
             or producer_cache_required
+            or pure_regions_required
             or published_scalars_required
             or topk_network_required
             or bounded_gather_required
@@ -4136,6 +4421,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or threads_required
             or register_loads_required
             or producer_cache_required
+            or pure_regions_required
             or published_scalars_required
             or topk_network_required
             or bounded_gather_required
@@ -4199,6 +4485,13 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         return decline()
     root = graphs[root.graph_id]
     compiler = FragmentCompiler(cg, graphs)
+    if (
+        pure_regions_required
+        and not pure_producer_plan(root.graph, env, shape=compiler.shape).lazy
+    ):
+        raise exc.InvalidConfig(
+            "pure producer regions require a current same-owner publication"
+        )
     compiler.local_allocations = prove_local_atomics(graphs)
     for info in graphs:
         for node in info.graph.nodes:
@@ -4270,6 +4563,14 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         # Root lifetime can be nested in an outer generated grid loop.
         compiler.synchronize_local_atomics()
     capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(compiler.env.device)
+    if not capacity and any(
+        node.target is _tracing_ops._while_loop
+        for info in graphs
+        for node in info.graph.nodes
+    ):
+        raise exc.InvalidConfig(
+            "resident while requires a known shared memory capacity"
+        )
     if local_required and not capacity:
         raise exc.InvalidConfig(
             "CTA-local atomics require a known shared memory capacity"

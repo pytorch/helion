@@ -8,6 +8,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch._inductor.ir import Pointwise
 from torch._inductor.ir import Reduction
 from torch.fx import Node
 
@@ -37,6 +38,7 @@ def all_axis_reduction_shape(
     Bind the current call against its exact schema. The emitter still owns
     masks, accumulation and dtype conversions; padding is not a logical axis.
     """
+    from ..inductor_lowering import PointwiseLowering
     from ..inductor_lowering import ReductionLowering
 
     kinds = {
@@ -51,8 +53,11 @@ def all_axis_reduction_shape(
     lowering = node.meta.get("lowering")
     if (
         node.target not in kinds
-        or not isinstance(lowering, ReductionLowering)
-        or lowering.reduction_type != kinds[node.target]
+        or not isinstance(lowering, (PointwiseLowering, ReductionLowering))
+        or (
+            isinstance(lowering, ReductionLowering)
+            and lowering.reduction_type != kinds[node.target]
+        )
     ):
         return None
     target = cast("torch._ops.OpOverload", node.target)
@@ -108,13 +113,17 @@ def all_axis_reduction_shape(
     # Rank zero contains one scalar; a zero-volume tensor does not gain support.
     volume = sympy.prod(logical)
     data = lowering.buffer.data
-    if not isinstance(data, Reduction):
+    if isinstance(lowering, ReductionLowering):
+        if not isinstance(data, Reduction) or sympy.expand(volume) != sympy.expand(
+            sympy.prod(dimension(size) for size in data.reduction_ranges)
+        ):
+            return None
+    elif not isinstance(data, Pointwise) or sympy.expand(volume) != 1:
+        # Inductor removes a one-element reduction's reduction loop. Retain
+        # the schema's rank change only for a proved single logical element.
         return None
-    if (
-        sympy.expand(volume)
-        != sympy.expand(sympy.prod(dimension(size) for size in data.reduction_ranges))
-        or output.dtype != lowering.buffer.get_dtype()
-        or (bound.get("dtype") is not None and bound["dtype"] != output.dtype)
+    if output.dtype != lowering.buffer.get_dtype() or (
+        bound.get("dtype") is not None and bound["dtype"] != output.dtype
     ):
         return None
     result = (sympy.Integer(1),) * len(logical) if keepdim else ()
@@ -448,7 +457,11 @@ def integer_bounds(
 
 
 def prove_gather(
-    env: CompileEnvironment, node: Node, *, graphs: Sequence[GraphInfo] | None = None
+    env: CompileEnvironment,
+    node: Node,
+    *,
+    graphs: Sequence[GraphInfo] | None = None,
+    allow_unbound: bool = False,
 ) -> GatherBounds | None:
     from .computed_fragment import _selection_logical_shape
     from .gather_domains import loop_domain_facts
@@ -481,7 +494,7 @@ def prove_gather(
         from ..host_function import HostFunction
 
         graphs = HostFunction.current().device_ir.graphs
-    facts = loop_domain_facts(env, graphs)
+    facts = loop_domain_facts(env, graphs, allow_unbound=allow_unbound)
     source_shape = _selection_logical_shape(
         env,
         source,
