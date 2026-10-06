@@ -18,9 +18,11 @@ from torch.fx import Node
 
 from ... import exc
 from ...language import _tracing_ops
+from ...language import atomic_ops
 from ...language import creation_ops
 from ...language import inline_asm_ops
 from ...language import memory_ops
+from ...language import scan_ops
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import GraphInfo
 from ..device_ir import RootGraphInfo
@@ -56,6 +58,7 @@ class ResidentWhilePlan:
     body: ResidentCallContext
     nested_fors: tuple[ResidentCallContext, ...]
     invariant_slots: tuple[int, ...]
+    local_allocations: frozenset[Node] = frozenset()
     requirements: tuple[str, ...] = (
         "whole_cta_entry_and_shared_predicate_publication",
         "predicate_reader_barrier_before_overwrite",
@@ -276,9 +279,40 @@ def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhil
         "one Boolean scalar condition required (not a uniformity proof)",
     )
 
+    # A fresh mutable epoch is confined to this one straight-line body. No
+    # allocation identity or vector carry can escape across its backedge.
+    # The local-atomic proof separately checks initialization/update/read order.
+    for_targets = (_tracing_ops._for_loop, _tracing_ops._for_loop_step)
+    updates = [
+        node for node in body.graph.graph.nodes if node.target in atomic_ops.ATOMIC_OPS
+    ]
+    local_allocations: set[Node] = set()
+    if updates:
+        _require(
+            all(_signature(value)[1] == () for value in body.outputs),
+            "fresh local epochs require scalar carries",
+        )
+        _require(
+            all(
+                node.target not in (*for_targets, _tracing_ops._if)
+                for info in graphs
+                for node in info.graph.nodes
+            ),
+            "fresh local epochs require a straight-line root while",
+        )
+        for update in updates:
+            target = update.args[0]
+            _require(
+                update.target is atomic_ops.atomic_add
+                and isinstance(target, Node)
+                and target.graph is body.graph.graph
+                and target.target is creation_ops.full,
+                "fresh local epochs cannot mutate captured or host storage",
+            )
+            local_allocations.add(cast("Node", target))
+
     nested: list[ResidentCallContext] = []
     seen_graphs = {condition.graph.graph_id, body.graph.graph_id}
-    for_targets = (_tracing_ops._for_loop, _tracing_ops._for_loop_step)
 
     def visit(current: ResidentCallContext, *, allow_for: bool) -> None:
         seen: set[Node] = set()
@@ -362,6 +396,14 @@ def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhil
                     "resident while load requires a direct host tensor",
                 )
                 continue
+            if (
+                local_allocations
+                and current is body
+                and (node in updates or node.target is scan_ops._associative_scan)
+            ):
+                # Scan legality and every atomic address/type/effect remain
+                # checked by complete-fragment and local-allocation admission.
+                continue
             if node.target in (
                 operator.add,
                 operator.sub,
@@ -430,6 +472,7 @@ def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhil
         body,
         tuple(nested),
         tuple(i for i in range(len(body.captures)) if i not in destinations),
+        frozenset(local_allocations),
     )
 
 
@@ -551,8 +594,22 @@ def resident_while_domain_facts(
         for node in context.graph.graph.nodes:
             if node in children and not prove(children[node]):
                 return False
+            if plan.local_allocations and node.target is scan_ops._associative_scan:
+                source = node.args[1]
+                if not isinstance(source, Node) or _signature(node) != _signature(
+                    source
+                ):
+                    return False
+                logical = shape(source)
+                if logical is None:
+                    return False
+                trial.shapes[node] = logical
         for index, slot in context.carry_map:
-            logical = shape(context.outputs[index])
+            # This new slice admits only physical rank-zero carried results.
+            # Their domain is one scalar even when an input reduction has a
+            # padded local axis. Do not export any inferred histogram/index
+            # range: the unchanged emitter owns its neutral masks and copies.
+            logical = () if plan.local_allocations else shape(context.outputs[index])
             expected = entry_shapes[slot]
             if (
                 logical is None

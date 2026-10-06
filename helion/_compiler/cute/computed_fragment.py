@@ -74,11 +74,11 @@ from .free_iota_reduction import owned_iota_reduction_axes
 from .independent_reduction import independent_reduction_coordinates
 from .integer_atomic_epochs import can_defer_integer_epoch
 from .local_atomic import local_atomic_allocations
-from .local_atomic import local_buffer_conditional_inputs
 from .local_atomic import local_indexed_load
 from .local_atomic import prove_local_atomics
 from .local_atomic import terminal_finalizer_inputs
 from .local_atomic import terminal_loop_symbols
+from .local_atomic import uniform_local_branch_inputs
 from .local_atomic_registers import MAX_SLOTS
 from .local_atomic_registers import local_atomic_register_chains
 from .private_scalar_loops import private_scalar_loop_nodes
@@ -2721,7 +2721,10 @@ class FragmentCompiler:
             raise exc.InvalidConfig(
                 "resident while lacks complete logical/readonly proof"
             )
-        if self.df.config.get("cute_fragment_bounded_gather", False) is not True:
+        if (
+            not plan.local_allocations
+            and self.df.config.get("cute_fragment_bounded_gather", False) is not True
+        ):
             raise exc.InvalidConfig("resident while requires explicit bounded gather")
         if any(
             self.df.config.get(key, False)
@@ -2801,6 +2804,9 @@ class FragmentCompiler:
                 dict(zip(plan.body.placeholders, captures, strict=True)),
             )
             assert isinstance(results, list)
+            # An unused final update still belongs to this iteration. Close it
+            # before carry copies or any next-iteration reset can reuse storage.
+            self.synchronize_local_atomics()
             snapshots: list[Fragment] = []
             self.held.extend([results, snapshots])
             destinations = self.referenced_buffers(carries)
@@ -3278,12 +3284,18 @@ class FragmentCompiler:
 
     def conditional(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
         local_inputs = (
-            local_buffer_conditional_inputs(node, self.graphs)
+            uniform_local_branch_inputs(node, self.graphs)
             if self.local_allocations
             else None
         )
         if local_inputs is not None:
-            reductions, symbols = local_inputs
+            reductions, symbols, loads = local_inputs
+            if any(
+                not host_load_is_readonly(load, self.env, self.graphs) for load in loads
+            ):
+                raise exc.InvalidConfig(
+                    "local-buffer predicate requires readonly bound host storage"
+                )
             self.uniform_finalizer_symbols(symbols)
             if reductions & self.warp_result_nodes.keys():
                 raise exc.InvalidConfig(
@@ -3642,7 +3654,7 @@ class FragmentCompiler:
         )
         read_args = args[1:] if local_update else args
         if (
-            target is _tracing_ops._if
+            target in (_tracing_ops._if, _tracing_ops._while_loop)
             or _tracing_ops.is_for_loop_target(target)
             or (target is atomic_ops.atomic_add and not local_update)
             or (
@@ -3997,17 +4009,30 @@ def computed_fragment_supported(
     }
     if while_calls:
         from .gather_domains import loop_domain_facts
+        from .resident_while import resident_while_plan
+
+        try:
+            mutable_while = len(while_calls) == 1 and bool(
+                resident_while_plan(next(iter(while_calls)), graphs).local_allocations
+            )
+            if mutable_while:
+                prove_local_atomics(graphs)
+        except exc.InvalidConfig:
+            return False
 
         if (
-            not bounded_gather_owned
+            (not bounded_gather_owned and not mutable_while)
             or loop_domain_facts(
                 env, graphs, allow_unbound=allow_unbound
             ).resident_whiles
             != while_calls
-            or any(
-                node.target in atomic_ops.ATOMIC_OPS
-                for info in graphs
-                for node in info.graph.nodes
+            or (
+                not mutable_while
+                and any(
+                    node.target in atomic_ops.ATOMIC_OPS
+                    for info in graphs
+                    for node in info.graph.nodes
+                )
             )
         ):
             return False
