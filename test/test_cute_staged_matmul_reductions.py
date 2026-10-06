@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import operator
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -231,6 +232,41 @@ def test_raw_product_is_not_a_complete_matmul_contribution() -> None:
     source = _body().replace(_marker("product", "sum", product=True), "product")
     with pytest.raises(helion.exc.BackendUnsupported, match="loop-carried value"):
         _lower(_loop(source=source))
+
+
+@pytest.mark.parametrize("divisor", [-5, 5])
+def test_signed_modulo_remains_relocatable_in_staged_products(divisor: int) -> None:
+    source = _body().replace(
+        "score_input = cutlass.Float32(scores[index] / 64)",
+        "bias = _cute_python_mod(cutlass.Int32(index - 11), cutlass.Int32(divisor))\n"
+        "score_input = cutlass.Float32((scores[index] + bias) / 64)",
+    )
+    lowered = _lower(_loop(source=source))
+    scores = np.arange(8, dtype=np.float32)
+    values = np.arange(1, 9, dtype=np.float16)
+    actual, calls = _execute(
+        lowered,
+        scores=scores,
+        values=values,
+        offset=0,
+        high=np.float32(-np.inf),
+        mass=np.float32(0),
+        total=np.float32(0),
+        divisor=divisor,
+        _cute_python_mod=operator.mod,
+    )
+    expected, expected_calls = _execute(
+        _lower(_loop()),
+        scores=scores + np.array([(i - 11) % divisor for i in range(8)], np.float32),
+        values=values,
+        offset=0,
+        high=np.float32(-np.inf),
+        mass=np.float32(0),
+        total=np.float32(0),
+    )
+    assert calls == expected_calls == 8
+    for name in ("high", "mass", "total"):
+        assert actual[name] == expected[name]
 
 
 @pytest.mark.parametrize(

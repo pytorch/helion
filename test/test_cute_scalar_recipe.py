@@ -248,6 +248,38 @@ def test_shadowed_external_snapshot_is_unavailable() -> None:
     assert build_recipe(_expr("old"), statements, {"index"}) is None
 
 
+@pytest.mark.parametrize("divisor", [-7, 7])
+def test_python_mod_recipe_keeps_signed_indices_and_casts(divisor: int) -> None:
+    statements = _body(
+        "wrapped = cutlass.Int32(index)\n"
+        "result = _cute_python_mod(wrapped, cutlass.Int32(divisor))\n"
+    )
+    recipe = build_recipe(_expr("result"), statements, {"index", "divisor"})
+    assert recipe is not None
+    replay, result = recipe.emit({"index": _expr("replacement")}, _fresh())
+    for index in (-(2**32) - 9, -9, 0, 9, 2**32 + 9):
+        assert (
+            _evaluate(
+                replay,
+                result,
+                {
+                    "replacement": index,
+                    "divisor": divisor,
+                    "_cute_python_mod": operator.mod,
+                },
+            )
+            == _i32(index) % divisor
+        )
+    assert (
+        build_recipe(
+            _expr("result"),
+            _body("_cute_python_mod = replacement\n") + statements,
+            {"index", "divisor", "replacement"},
+        )
+        is None
+    )
+
+
 def test_architecture_indices_are_pure_and_substitutable() -> None:
     statements = _body(
         "lane = cutlass.Int32(cute.arch.thread_idx()[0])\n"

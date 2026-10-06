@@ -952,6 +952,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_reduction",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
+        "cute_fragment_warp_results",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1058,6 +1059,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_reduction",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
+        "cute_fragment_warp_results",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1168,6 +1170,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_reduction",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
+        "cute_fragment_warp_results",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1486,6 +1489,9 @@ class ConfigSpec:
         self.cute_fragment_threads_search_enabled = False
         self.cute_fragment_register_load_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_register_loads_search_enabled = False
+        self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_results_search_enabled = False
+        self.cute_fragment_warp_result_min_threads = 32
         self.cute_materialized_operand_schedule_available: bool = False
         self.cute_materialized_operand_schedule_search_enabled: bool = False
         self.cute_grouped_rna_k_choices: tuple[int, ...] = ()
@@ -3321,6 +3327,30 @@ class ConfigSpec:
             f"{key}={value!r} requires a supported lane-private fragment load"
         )
 
+    def _normalize_cute_fragment_warp_results(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_warp_results"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_warp_result_root_ids
+            and cast("int", config.get("cute_fragment_threads", 128))
+            >= self.cute_fragment_warp_result_min_threads
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a supported warp-owned reduction/atomic value chain"
+        )
+
     def _normalize_cute_fragment_threads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4064,6 +4094,19 @@ class ConfigSpec:
             )
             return
 
+        if (
+            self.backend_name == "cute"
+            and config.get("cute_fragment_warp_results") is True
+            and config.get("cute_fragment_register_loads") is True
+        ):
+            # These modes assign different physical owners to the same logical
+            # element. Even repair-mode search must reject, not silently pick
+            # one storage policy and benchmark a different configuration.
+            raise InvalidConfig(
+                "cute_fragment_warp_results and cute_fragment_register_loads "
+                "have incompatible physical ownership"
+            )
+
         # ``cross_loop_schedule`` was the former public name. Accept old configs
         # only at this boundary, then keep ``cross_loop_pipeline`` as the sole
         # internal key.
@@ -4272,6 +4315,7 @@ class ConfigSpec:
             self._normalize_cute_fragment_register_loads(
                 config, fix_invalid=_fix_invalid
             )
+            self._normalize_cute_fragment_warp_results(config, fix_invalid=_fix_invalid)
             self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
             self._normalize_cute_materialized_operand_schedule(
                 config, fix_invalid=_fix_invalid
@@ -5446,6 +5490,8 @@ class ConfigSpec:
                 return True, "off"
             if key == "cute_materialized_operand_schedule":
                 return True, "off"
+            if key == "cute_fragment_warp_results":
+                return True, False
             if key == "cute_fragment_register_loads":
                 return True, False
             if key == "cute_fragment_threads":
@@ -5672,6 +5718,8 @@ class ConfigSpec:
                 fields["cute_materialized_operand_schedule"] = EnumFragment(
                     choices=("off", "warp_narrow4")
                 )
+            if self.cute_fragment_warp_results_search_enabled:
+                fields["cute_fragment_warp_results"] = BooleanFragment()
             if self.cute_fragment_register_loads_search_enabled:
                 fields["cute_fragment_register_loads"] = BooleanFragment()
             if self.cute_fragment_threads_search_enabled:
