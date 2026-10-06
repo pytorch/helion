@@ -1,12 +1,14 @@
 """CuTe codegen for tile reshape/permute operations.
 
-Each thread holds one element of a tile. Shape operations (permute, reshape,
-view) change which element each thread should hold. When the thread-to-element
-mapping changes, data must be shuffled between threads via shared memory.
+Each thread (or lane iteration) holds one element of a tile, the one at its
+coordinates. Those coordinates are per block id: each tile dimension's block_id
+is looked up and mapped to its thread axis or lane loop via
+active_device_loops, NOT derived from the element's position in the tile.
 
-Key design: Per-dimension thread coordinates are determined by looking up
-each tile dimension's block_id and finding its thread axis via
-active_device_loops, NOT from the global thread block dimensions.
+Permuting the dimensions of a tile therefore never moves an element between
+threads (the thread holding ``x[i, j]`` holds ``x.T[j, i]``); only a reshape
+that changes which block ids own the elements shuffles them through shared
+memory.
 """
 
 from __future__ import annotations
@@ -26,16 +28,34 @@ from torch.utils._sympy.functions import FloorDiv
 from ... import exc
 from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _for_loop_step
+from ...language.inline_asm_ops import inline_asm_elementwise
+from ...language.matmul_ops import dot as hl_dot
+from ...language.memory_ops import _cute_resolve_active_slice_block_id
+from ...language.reduce_ops import _reduce
+from ...language.scan_ops import _associative_scan
+from ...language.view_ops import join
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import _symint_expr
+from ..host_function import HostFunction
+from ..indexing_strategy import _get_tile_with_offset_info
+from ..indexing_strategy import compute_slice_size
+from ..tile_strategy import DeviceLoopState
+from ..variable_origin import BlockSizeOrigin
+from .cute_fx_walk import build_inner_outputs_index_from_graphs
+from .cute_fx_walk import reach_matmul_anchors
 from .indexing import CuteShapeChainView
 from .indexing import is_cute_shape_chain_target
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+    from collections.abc import Sequence
+
     from ..aten_lowering import LoweringContext
     from ..compile_environment import Config
     from ..generate_ast import GenerateAST
+    from ..helper_function import CodegenInterface
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import TileStrategy
 
@@ -351,31 +371,6 @@ def _grid_local_coord_expr(
     return f"{coord} * cutlass.Int32({elements_per_thread}) + cutlass.Int32({lane_var})"
 
 
-def _dim_has_active_local_coord(
-    cg: GenerateAST,
-    fake_tensor: torch.Tensor,
-    dim: int,
-) -> bool:
-    env = CompileEnvironment.current()
-    block_id = env.get_block_id(fake_tensor.shape[dim])
-    if block_id is None:
-        return False
-    return bool(cg.active_device_loops.get(block_id))
-
-
-def _permute_reorders_active_dims(
-    cg: GenerateAST,
-    fake_tensor: torch.Tensor,
-    perm: list[int],
-) -> bool:
-    active_dims = [
-        dim
-        for dim in range(len(perm))
-        if _dim_has_active_local_coord(cg, fake_tensor, dim)
-    ]
-    return [dim for dim in perm if dim in active_dims] != active_dims
-
-
 # Per-thread pointwise / cast ops whose output element on a given thread is a
 # pure function of that same thread's input element(s). A transpose-like shape op
 # feeding such an op only relabels the logical layout; the scalar each thread
@@ -413,7 +408,7 @@ _LAYOUT_PRESERVING_SHAPE_TARGETS = frozenset(
 
 # Transpose-like shape ops: a chain of them feeding a matmul relabels the
 # operand layout as a whole (``k[tile, :, :].transpose(0, 1).transpose(-2, -1)``
-# in the HSTU examples), so none of them needs a shuffle.
+# in the HSTU examples).
 _PERMUTE_TARGETS = frozenset(
     {
         torch.ops.aten.permute.default,
@@ -434,8 +429,6 @@ def _loop_body_placeholders_for(value: Node, loop: Node) -> list[Node]:
     ``node_args``: the graph under codegen may be a copy whose nodes are not
     the traced ones.
     """
-    from ..host_function import HostFunction
-
     graph_id = loop.args[0]
     args = loop.args[3]
     assert isinstance(graph_id, int) and isinstance(args, (list, tuple))
@@ -451,7 +444,6 @@ def _shape_op_needs_materialization(node: Node) -> bool:
     """Return True when non-store consumers need values, not just metadata."""
     from ...language import memory_ops
     from ...language._tracing_ops import _new_var
-    from ...language.matmul_ops import dot as hl_dot
     from ...language.matmul_ops import dot_scaled as hl_dot_scaled
 
     matmul_targets = {
@@ -514,9 +506,8 @@ def _shape_op_needs_materialization(node: Node) -> bool:
         # transposes, ``_new_var`` copies or a device loop argument: the
         # matmul reads one scalar per thread (or re-reads the operand loads
         # in the synthetic-lane K fold), so the chain relabels the layout as
-        # a whole. Any other consumer on the way reads this op's value at its
-        # own position, which the store-side permute folding only tracks one
-        # transpose deep, so this op then materializes as before.
+        # a whole.  Any other consumer on the way reads this op's value, so
+        # the op lowers to a concrete per-thread scalar.
         if user.target in _PERMUTE_TARGETS or user.target is _new_var:
             return not _feeds_only_matmuls(user, visited)
         if user.target in _LOOP_TARGETS:
@@ -529,8 +520,7 @@ def _shape_op_needs_materialization(node: Node) -> bool:
         if any(name in target_name for name in reduction_names):
             return False
         # Layout-preserving per-thread pointwise/cast/shape ops keep each
-        # thread's element in place, so recurse to find the ultimate consumer
-        # instead of forcing a shared-memory shuffle for the intervening op.
+        # thread's element in place, so recurse to find the ultimate consumer.
         if (
             user.target in _LAYOUT_PRESERVING_POINTWISE_TARGETS
             or user.target in _LAYOUT_PRESERVING_SHAPE_TARGETS
@@ -599,62 +589,6 @@ def _coords_from_flat_index(
     return coords
 
 
-def _emit_cute_permute_shuffle(
-    cg: GenerateAST,
-    tensor: ast.AST,
-    input_val: torch.Tensor,
-    output_val: torch.Tensor,
-    perm: list[int],
-) -> ast.AST:
-    env = CompileEnvironment.current()
-    df = cg.device_function
-    config = df.config
-
-    input_shape = _get_tile_shape(input_val, env, config)
-    output_shape = _get_tile_shape(output_val, env, config)
-
-    input_numel = 1
-    for size in input_shape:
-        input_numel *= size
-
-    if input_numel == 1:
-        return tensor
-
-    dtype_str = env.backend.dtype_str(input_val.dtype)
-    smem_ptr = df.new_var("permute_smem_ptr")
-    smem = df.new_var("permute_smem")
-    input_name = df.new_var("permute_input")
-    result = df.new_var("permuted")
-
-    src_coords = [
-        _get_dim_local_coord(cg, input_val, i) for i in range(len(input_shape))
-    ]
-    current_flat = _flat_index_from_coords(src_coords, input_shape)
-
-    # Preserve the current positional thread assignment, reinterpret that
-    # position in the permuted output shape, then map back to the source
-    # coordinates to fetch the transposed value.
-    output_coords = _coords_from_flat_index(current_flat, output_shape)
-    read_coords = [output_coords[perm.index(i)] for i in range(len(perm))]
-    read_flat = _flat_index_from_coords(read_coords, input_shape)
-
-    cg.add_statement(
-        statement_from_string(
-            f"{smem_ptr} = cute.arch.alloc_smem({dtype_str}, {input_numel})"
-        )
-    )
-    cg.add_statement(
-        statement_from_string(
-            f"{smem} = cute.make_tensor({smem_ptr}, ({input_numel},))"
-        )
-    )
-    cg.add_statement(statement_from_string(f"{input_name} = {{_inp}}", _inp=tensor))
-    cg.add_statement(statement_from_string(f"{smem}[{current_flat}] = {input_name}"))
-    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
-    cg.add_statement(statement_from_string(f"{result} = {smem}[{read_flat}]"))
-    return expr_from_string(result)
-
-
 def _inverse_permute_coords(coords: list[str], perm: list[int]) -> list[str]:
     return [coords[perm.index(i)] for i in range(len(perm))]
 
@@ -698,67 +632,6 @@ def _stack_choice_expr(
     return selected
 
 
-def _permute_node_perm(node: Node, value: torch.Tensor) -> list[int] | None:
-    """Return the explicit permutation for a permute/transpose/t node."""
-    if node.target is torch.ops.aten.permute.default:
-        dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dims")
-        if not isinstance(dims, (list, tuple)):
-            return None
-        perm = [dim for dim in dims if isinstance(dim, int)]
-        return perm if len(perm) == len(dims) else None
-    if node.target is torch.ops.aten.transpose.int:
-        dim0 = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim0")
-        dim1 = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim1")
-        if not isinstance(dim0, int) or not isinstance(dim1, int):
-            return None
-        ndim = len(value.shape)
-        dim0 %= ndim
-        dim1 %= ndim
-        perm = list(range(ndim))
-        perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
-        return perm
-    if node.target is torch.ops.aten.t.default:
-        if len(value.shape) != 2:
-            return None
-        return [1, 0]
-    return None
-
-
-def _materialized_permute_value(
-    ctx: LoweringContext,
-    node: Node,
-    value: torch.Tensor,
-) -> ast.AST | None:
-    """Return the already-materialized AST for a permute/transpose/t node.
-
-    ``codegen_cute_permute`` materializes a permute to a concrete scalar (via a
-    shared-memory shuffle) whenever it reorders active thread dims *and* a
-    downstream consumer needs values. When a later shape op folds back through
-    such a node we must reuse that materialized value instead of re-folding the
-    coordinate swap all the way to the raw source (which would silently drop the
-    already-emitted shuffle).
-    """
-    if not node.args:
-        return None
-    source = node.args[0]
-    if not isinstance(source, Node):
-        return None
-    source_val = source.meta.get("val")
-    if not isinstance(source_val, torch.Tensor):
-        return None
-    perm = _permute_node_perm(node, value)
-    if perm is None:
-        return None
-    cg = cast("GenerateAST", ctx.cg)
-    if not (
-        _permute_reorders_active_dims(cg, source_val, perm)
-        and _shape_op_needs_materialization(node)
-    ):
-        return None
-    resolved = ctx.env.get(node)
-    return resolved if isinstance(resolved, ast.AST) else None
-
-
 def _resolve_shape_chain_expr(
     ctx: LoweringContext,
     node: Node,
@@ -772,18 +645,6 @@ def _resolve_shape_chain_expr(
     if not isinstance(value, torch.Tensor):
         resolved = ctx.env.get(node)
         return resolved if isinstance(resolved, ast.AST) else None
-
-    # A permute/transpose/t node that was already materialized to a concrete
-    # per-thread scalar must not be folded again: doing so would silently drop
-    # the shuffle that already applied its coordinate swap and recurse to the raw
-    # source, collapsing two transposes into one. The materialized value already
-    # holds the correct element for the current thread (just like a load), so we
-    # return it directly as a chain leaf.
-    materialized = _materialized_permute_value(ctx, node, value)
-    if materialized is not None:
-        # A shuffled permute holds only this thread's own element, so it
-        # cannot be re-read at another coordinate.
-        return None if leaf_resolver is not None else materialized
 
     if node.target in (
         torch.ops.aten.reshape.default,
@@ -1105,10 +966,20 @@ def codegen_cute_reshape(ctx: LoweringContext, node: Node) -> object:
 
 
 def codegen_cute_permute(ctx: LoweringContext, node: Node) -> object:
-    """Codegen for permute/transpose on CuTe tiles.
+    """Codegen for permute/transpose on CuTe tiles: a relabel of each thread's element.
 
-    Uses shared memory to shuffle elements between threads. Each dimension's
-    thread coordinate is determined by looking up its block_id's thread axis.
+    Helion's tiles are positional arrays, but the SIMT lowering binds every
+    block id to one coordinate per thread (and per lane iteration when the
+    block runs as a lane loop) and addresses loads, stores and reductions by
+    those coordinates.  While every consumer binds each dim of the permuted
+    tile to the same block id (``out[tile_n, tile_m] = x[tile_m, tile_n].T``),
+    permuting never moves an element between threads: the thread holding
+    ``x[i, j]`` is the one that holds ``x.T[j, i]``.  Shape-only consumers keep
+    the permute virtual (``CuteShapeChainView``); any other consumer gets the
+    thread's own scalar, selected from a virtual chain at this thread's
+    coordinates.  A consumer that re-binds a dim to another block id
+    (``out[tile_m, tile_n] = x[tile_m, tile_n].T`` with equal block sizes) is
+    handled where it happens, see ``rebound_block_dims``.
     """
     from ..generate_ast import GenerateAST
 
@@ -1123,142 +994,680 @@ def codegen_cute_permute(ctx: LoweringContext, node: Node) -> object:
 
     # pyrefly: ignore [not-iterable]
     perm = [*dims]
-    ndim = len(input_val.shape)
-    assert len(perm) == ndim
-    needs_materialization = _permute_reorders_active_dims(
-        ctx.cg, input_val, perm
-    ) and _shape_op_needs_materialization(node)
+    assert len(perm) == len(input_val.shape)
 
-    if perm == list(range(ndim)) and isinstance(tensor, ast.AST):
+    if isinstance(tensor, ast.AST):
+        # A concrete per-thread scalar is the permuted tile's element at this
+        # thread's coordinates already.
         return tensor
-
-    source_node = shape_chain.node if shape_chain is not None else node.args[0]
-    output_val = node.meta["val"]
-    if (
-        shape_chain is not None
-        and not needs_materialization
-        and _shape_chain_only_users(node)
-    ):
+    if shape_chain is None:
+        raise TypeError(f"Expected AST for CuTe permute input, got {type(tensor)}")
+    if _shape_chain_only_users(node):
         return CuteShapeChainView(node)
-    if (
-        not needs_materialization
-        and isinstance(source_node, Node)
-        and isinstance(output_val, torch.Tensor)
-    ):
+    output_val = node.meta["val"]
+    if isinstance(output_val, torch.Tensor):
+        # This thread's coordinates in the permuted shape; the chain resolver
+        # maps them back through the permute (and the virtual chain below it)
+        # to the same thread's source coordinates.
         output_shape = _get_tile_shape(
             output_val, CompileEnvironment.current(), ctx.cg.device_function.config
         )
         output_coords = [
-            _get_dim_local_coord(ctx.cg, output_val, i)
+            _get_dim_local_coord(ctx.cg, output_val, i, strict=True)
             for i in range(len(output_shape))
         ]
         output_flat = _flat_index_from_coords(output_coords, output_shape)
-        fused_expr = _resolve_shape_chain_expr(ctx, source_node, output_flat)
+        fused_expr = _resolve_shape_chain_expr(ctx, node, output_flat)
         if fused_expr is not None:
             return fused_expr
+    raise TypeError(f"Unresolved CuTe permute of a virtual shape chain: {node}")
 
-    if not needs_materialization:
-        if isinstance(tensor, ast.AST):
-            return tensor
-        raise TypeError(f"Expected AST for CuTe permute input, got {type(tensor)}")
 
-    assert isinstance(output_val, torch.Tensor)
-    if shape_chain is not None:
-        input_shape = _get_tile_shape(
-            input_val, CompileEnvironment.current(), ctx.cg.device_function.config
+def rebound_block_dims(
+    env: CompileEnvironment,
+    config: Config,
+    value: torch.Tensor,
+    consumer_sizes: Sequence[int | torch.SymInt],
+    consumer_block_ids: Sequence[int | None],
+    *,
+    lower_rank_by_block_id: bool,
+) -> list[tuple[int, int, int]]:
+    """Dims of ``value`` that a consumer binds to a different block id.
+
+    ``consumer_sizes`` / ``consumer_block_ids`` describe the consumer's dims
+    (the dims of a pointwise op's result, the tiles of a store subscript).
+    Helion's tiles are positional arrays: an operand of the consumer's rank
+    is right-aligned (``PointwiseLowering._check_block_broadcast_compatibility``)
+    and a store or atomic value is right-aligned whatever its rank
+    (``tl.store`` / ``tl.atomic_*`` receive it unexpanded), so the consumer
+    reads the element at the same *position*.  Only a lower-rank pointwise
+    operand is placed by ``TileDispatch.broadcast_expand_dims``
+    (``lower_rank_by_block_id``): every source dim is matched to a result dim,
+    a tile dim to the one with its canonical block id, a non-tile dim to an
+    unused non-tile dim of equal size or else the last unused dim, and the
+    source dims then occupy the matched positions *in order* (the expansion
+    only inserts ``None``, it never permutes), so ``b[tile1, tile0]`` meets a
+    ``[tile0, tile1, tile2]`` result positionally while ``b[tile1]`` is its
+    middle-dim broadcast.  The SIMT lowering keeps each thread's element by
+    block-id coordinates, so a dim bound to another block id must be
+    exchanged between threads (or the program refused).  Returns
+    ``(value_dim, value_block_id, consumer_block_id)`` for each such dim.
+    Dims that are not block ids (static extents; a reduction dim is a block
+    id here, cute pads factory tensors so every slice gets one) or that
+    broadcast (stride 0, or a block whose extent under ``config`` is 1, on
+    either side) bind nothing.  A dim bound to a block id already on another
+    axis of the same tensor is rejected earlier (``check_repeated_block_ids``).
+    """
+    consumer_canonical = [
+        None if block_id is None else env.canonical_block_id(block_id)
+        for block_id in consumer_block_ids
+    ]
+    offset = len(consumer_block_ids) - value.ndim
+    positions = [dim + offset for dim in range(value.ndim)]
+    if lower_rank_by_block_id and 0 < value.ndim < len(consumer_block_ids):
+        matched: list[int] = []
+        used: set[int] = set()
+        for size in value.shape:
+            block_id = env.get_block_id(size)
+            canonical = None if block_id is None else env.canonical_block_id(block_id)
+            match = None
+            if canonical is not None:
+                match = next(
+                    (
+                        position
+                        for position, candidate in enumerate(consumer_canonical)
+                        if position not in used and candidate == canonical
+                    ),
+                    None,
+                )
+            else:
+                match = next(
+                    (
+                        position
+                        for position, candidate in enumerate(consumer_canonical)
+                        if position not in used
+                        and candidate is None
+                        and env.known_equal(size, consumer_sizes[position])
+                    ),
+                    None,
+                )
+            if match is None:
+                match = max(
+                    position
+                    for position in range(len(consumer_block_ids))
+                    if position not in used
+                )
+            matched.append(match)
+            used.add(match)
+        positions = sorted(matched)
+    rebound: list[tuple[int, int, int]] = []
+    for dim, size in enumerate(value.shape):
+        position = positions[dim]
+        if position < 0 or value.stride(dim) == 0:
+            continue
+        block_id = env.get_block_id(size)
+        if block_id is None or _resolve_tile_extent(size, env, config) == 1:
+            continue
+        consumer_block_id = consumer_block_ids[position]
+        if (
+            consumer_block_id is None
+            or block_extent(env, config, consumer_block_id) == 1
+        ):
+            continue
+        if env.canonical_block_id(block_id) != consumer_canonical[position]:
+            rebound.append((dim, block_id, consumer_block_id))
+    return rebound
+
+
+def block_extent(env: CompileEnvironment, config: Config, block_id: int) -> int | None:
+    """``block_id``'s extent under ``config`` (``None`` while it is symbolic)."""
+    extent = env.block_sizes[env.canonical_block_id(block_id)].from_config(config)
+    return extent if isinstance(extent, int) else None
+
+
+def tensor_dim_block_ids(
+    env: CompileEnvironment, sizes: Sequence[int | torch.SymInt]
+) -> list[int | None]:
+    """The block id each of ``sizes`` names, ``None`` for non-block extents."""
+    return [
+        env.get_block_id(size) if isinstance(size, torch.SymInt) else None
+        for size in sizes
+    ]
+
+
+def _subscript_slot_dims(
+    state: CodegenState, tensor: torch.Tensor, subscript: Sequence[object]
+) -> tuple[list[int | torch.SymInt], list[int | None]]:
+    """The dims of ``tensor[subscript]`` with the block id each is addressed
+    by, walked the way ``_cute_index_exprs`` addresses them.
+
+    A tile binds its block id; a slice binds the block the index expressions
+    resolve for it (``_cute_resolve_active_slice_block_id`` with the raw slice
+    size, the block ids used so far, each resolved slice block then used), a
+    size-1 dim and a scalar index bind nothing, a tensor indexer binds its
+    own dims' block ids.
+    """
+    env = CompileEnvironment.current()
+    used_block_ids = {
+        block_id
+        for idx in subscript
+        if isinstance(idx, torch.SymInt)
+        if (block_id := env.get_block_id(idx)) is not None
+    }
+    sizes: list[int | torch.SymInt] = []
+    block_ids: list[int | None] = []
+    tensor_indexers = [idx for idx in subscript if isinstance(idx, torch.Tensor)]
+    should_broadcast = env.should_broadcast_tensor_indexers([*subscript])
+    tensor_dim = 0
+    for position, idx in enumerate(subscript):
+        if idx is None:
+            sizes.append(1)
+            block_ids.append(None)
+            continue
+        unit_dim = tensor_dim < tensor.ndim and env.known_equal(
+            tensor.shape[tensor_dim], 1
         )
-        src_coords = [
-            _get_dim_local_coord(ctx.cg, input_val, i) for i in range(len(input_shape))
-        ]
-        src_flat = _flat_index_from_coords(src_coords, input_shape)
-        tensor = _resolve_shape_chain_expr(ctx, shape_chain.node, src_flat)
-    if not isinstance(tensor, ast.AST):
-        raise TypeError(f"Expected AST for CuTe permute input, got {type(tensor)}")
-    return _emit_cute_permute_shuffle(ctx.cg, tensor, input_val, output_val, perm)
+        tile_info = _get_tile_with_offset_info(idx, state.fx_node, position)
+        if tile_info is not None and tile_info.block_size is not None:
+            # ``_cute_index_exprs`` takes its unit-dim "0" branch first and
+            # does not use the block then.
+            if not unit_dim:
+                used_block_ids.add(tile_info.block_id)
+            sizes.append(tile_info.resolved_block_size_var(env))
+            block_ids.append(None if unit_dim else tile_info.block_id)
+            tensor_dim += 1
+        elif isinstance(idx, torch.SymInt):
+            # As ``compute_shape``: only a block-size symbol (a tile) keeps a
+            # dim; ``tile.begin`` and other scalar symbols index it away.
+            symbol = _symint_expr(idx)
+            origin = (
+                HostFunction.current().expr_to_origin.get(symbol)
+                if isinstance(symbol, sympy.Symbol)
+                else None
+            )
+            if origin is not None and isinstance(origin.origin, BlockSizeOrigin):
+                sizes.append(idx)
+                block_ids.append(None if unit_dim else origin.origin.block_id)
+            tensor_dim += 1
+        elif isinstance(idx, int):
+            tensor_dim += 1
+        elif isinstance(idx, torch.Tensor):
+            if not should_broadcast:
+                indexer_sizes = [*env.tensor_indexer_dims(idx)]
+            elif idx is tensor_indexers[0]:
+                indexer_sizes = [*env.tensor_indexer_broadcast_shape(tensor_indexers)]
+            else:
+                indexer_sizes = []
+            sizes.extend(indexer_sizes)
+            block_ids.extend(tensor_dim_block_ids(env, indexer_sizes))
+            tensor_dim += 1
+        elif isinstance(idx, slice):
+            dim_size = tensor.shape[tensor_dim]
+            size = dim_size if idx == slice(None) else compute_slice_size(idx, dim_size)
+            block_id = None
+            if not env.known_equal(size, 1):
+                block_id = _cute_resolve_active_slice_block_id(
+                    state, size, used_block_ids
+                )
+                if block_id is not None:
+                    used_block_ids.add(block_id)
+            sizes.append(size)
+            block_ids.append(block_id)
+            tensor_dim += 1
+        else:
+            raise exc.InvalidIndexingType(idx)
+    return sizes, block_ids
 
 
-def codegen_cute_store_permute(
+def subscript_rebound_block_dims(
     state: CodegenState,
-    tensor: ast.AST,
-    permute_node: Node,
-) -> ast.AST | None:
-    """Materialize a permute when a store needs the transposed values."""
-    from ..generate_ast import GenerateAST
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    value: torch.Tensor,
+    *,
+    leading_sizes: Sequence[int | torch.SymInt] = (),
+) -> list[tuple[int, int, int]]:
+    """``rebound_block_dims`` of ``value`` written through ``tensor[subscript]``
+    (``leading_sizes``: the dims a stack tensor's pointer table puts in front).
 
-    if not isinstance(state.codegen, GenerateAST):
-        return None
-
-    if _shape_op_needs_materialization(permute_node):
-        return None
-
-    info = _store_permute_info(permute_node)
-    if info is None:
-        return None
-    input_node, perm = info
-
-    input_val = input_node.meta.get("val")
-    output_val = permute_node.meta.get("val")
-    if not isinstance(input_val, torch.Tensor) or not isinstance(
-        output_val, torch.Tensor
-    ):
-        return None
-
-    if not _permute_reorders_active_dims(state.codegen, input_val, perm):
-        return tensor
-
-    return _emit_cute_permute_shuffle(
-        state.codegen,
-        tensor,
-        input_val,
-        output_val,
-        perm,
+    The value is right-aligned whatever its rank, as ``tl.store`` and
+    ``tl.atomic_*`` receive it, against the blocks the index expressions
+    address each dim with (``_subscript_slot_dims``), so an exchanged value is
+    read at the slice's block coordinate (the load's reduction block for
+    ``out[tile_m, :] = x[:, tile_m]``, ``tile_n`` for the second slice of
+    ``out[tile_m, :, :] = x[tile_m, :, tile_n]``).
+    """
+    env = CompileEnvironment.current()
+    slot_sizes, slot_block_ids = _subscript_slot_dims(state, tensor, subscript)
+    leading = [*leading_sizes]
+    return rebound_block_dims(
+        env,
+        state.device_function.config,
+        value,
+        [*leading, *slot_sizes],
+        [*tensor_dim_block_ids(env, leading), *slot_block_ids],
+        lower_rank_by_block_id=False,
     )
 
 
-def _store_permute_info(node: Node) -> tuple[Node, list[int]] | None:
-    """Normalize transpose-like store inputs to an explicit permutation."""
-    if node.op != "call_function" or not node.args:
-        return None
+def describe_rebound_block_dims(rebound: Sequence[tuple[int, int, int]]) -> str:
+    return ", ".join(
+        f"dim {dim} (block id {value_block_id}) bound to block id {consumer_block_id}"
+        for dim, value_block_id, consumer_block_id in rebound
+    )
 
-    input_node = node.args[0]
-    if not isinstance(input_node, Node):
-        return None
 
-    input_val = input_node.meta.get("val")
-    if not isinstance(input_val, torch.Tensor):
-        return None
+# Custom lowerings that combine several tile operands per thread and so need
+# ``check_pointwise_rebound_block_ids`` like a PointwiseLowering: where, stack,
+# hl.join, hl.inline_asm_elementwise, the tuple forms of hl.reduce /
+# hl.associative_scan (whose combine function pairs the inputs' elements) and
+# the matmuls with an accumulator, which the SIMT fallback adds per thread.
+REBOUND_CHECK_TARGETS = frozenset(
+    {
+        torch.ops.aten.where.self,
+        torch.ops.aten.stack.default,
+        join,
+        inline_asm_elementwise,
+        _reduce,
+        _associative_scan,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.baddbmm.default,
+        hl_dot,
+        torch.ops.aten.gather.default,
+    }
+)
 
+_MATMUL_WITH_ACCUMULATOR = frozenset(
+    {torch.ops.aten.addmm.default, torch.ops.aten.baddbmm.default, hl_dot}
+)
+
+
+def _rebound_operands(node: Node) -> list[Node]:
+    """The operands of ``node`` whose elements are combined per thread.
+
+    A matmul's lhs / rhs have their own layout logic; only its accumulator
+    (``addmm(acc, ...)``, ``baddbmm(acc, ...)``, ``hl.dot(..., acc=acc)``) is
+    added element-wise to the product.
+    """
+    if node.target in _MATMUL_WITH_ACCUMULATOR:
+        if node.target is hl_dot:
+            acc = node.args[2] if len(node.args) > 2 else node.kwargs.get("acc")
+        else:
+            acc = node.args[0] if node.args else None
+        return [acc] if isinstance(acc, Node) else []
+    if node.target is torch.ops.aten.gather.default:
+        # The index is read per thread and selects along ``dim`` of the input
+        # the thread addresses by its own block coordinates.
+        index = node.args[2] if len(node.args) > 2 else node.kwargs.get("index")
+        return [index] if isinstance(index, Node) else []
+    return list(node.all_input_nodes)
+
+
+def _rebound_consumer_dims(
+    node: Node,
+) -> tuple[list[int | torch.SymInt], bool] | None:
+    """The dims an operand of ``node`` is compared against, and whether a
+    lower-rank operand is placed by block id.
+
+    Only a PointwiseLowering expands a lower-rank operand by block id
+    (``TileDispatch.broadcast_expand_dims``).  ``tl.where``, the inline asm,
+    ``hl.join``, the combine functions of a tuple reduce / scan and the
+    matmul accumulator receive their operands unexpanded and so right-align
+    them: a stack's or join's operands meet the result without the stacked
+    (last) dim, a tuple reduce or scan's inputs meet each other, a
+    tuple-result inline asm's operands meet its (broadcast) outputs.  A
+    single-input reduce or scan has nothing to re-bind against.
+    """
+    value = node.meta.get("val")
     target = node.target
-    if target is torch.ops.aten.permute.default:
-        if len(node.args) < 2:
+    if target is torch.ops.aten.stack.default or target is join:
+        if not isinstance(value, torch.Tensor):
             return None
-        dims = node.args[1]
-        if not isinstance(dims, (list, tuple)):
+        sizes: list[int | torch.SymInt] = [*value.shape]
+        if target is join:
+            dim = value.ndim - 1
+        else:
+            dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim", 0)
+            assert isinstance(dim, int)
+            dim %= value.ndim
+        del sizes[dim]
+        return sizes, False
+    if target is _reduce or target is _associative_scan:
+        is_tuple_input = (
+            node.args[4] if len(node.args) > 4 else node.kwargs.get("is_tuple_input")
+        )
+        if not is_tuple_input:
             return None
-        perm: list[int] = []
-        for dim in dims:
-            if not isinstance(dim, int):
-                return None
-            perm.append(dim)
-        return input_node, perm
+        first = next(
+            (
+                operand.meta["val"]
+                for operand in node.all_input_nodes
+                if isinstance(operand.meta.get("val"), torch.Tensor)
+            ),
+            None,
+        )
+        return None if first is None else ([*first.shape], False)
+    if target is inline_asm_elementwise:
+        if isinstance(value, (list, tuple)):
+            value = value[0] if value else None
+        return ([*value.shape], False) if isinstance(value, torch.Tensor) else None
+    if target is torch.ops.aten.gather.default:
+        source = node.args[0] if node.args else None
+        source_val = source.meta.get("val") if isinstance(source, Node) else None
+        if not isinstance(source_val, torch.Tensor):
+            return None
+        return [*source_val.shape], False
+    if not isinstance(value, torch.Tensor):
+        return None
+    if target is torch.ops.aten.where.self or target in _MATMUL_WITH_ACCUMULATOR:
+        return [*value.shape], False
+    return [*value.shape], True
 
-    ndim = input_val.ndim
-    if target is torch.ops.aten.transpose.int:
-        if len(node.args) < 3:
-            return None
-        dim0_arg = node.args[1]
-        dim1_arg = node.args[2]
-        if not isinstance(dim0_arg, int) or not isinstance(dim1_arg, int):
-            return None
-        dim0 = dim0_arg % ndim
-        dim1 = dim1_arg % ndim
-        perm = list(range(ndim))
-        perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
-        return input_node, perm
 
-    if target is torch.ops.aten.t.default:
-        if ndim != 2:
-            return None
-        return input_node, [1, 0]
+def check_pointwise_rebound_block_ids(
+    cg: CodegenInterface, node: Node, *, defer_tcgen05_epilogues: bool = True
+) -> None:
+    """Refuse an element-wise op that binds an operand dim to another block id
+    than the dims it is combined with (``t + t.T`` with equal block sizes,
+    ``torch.where(c, t, t.T)``, ``hl.join(t, t.T)``, an inline asm or tuple
+    reduce over ``t`` and ``t.T``, ``torch.gather(t, 1, idx.T)``, or a
+    lower-rank pointwise operand whose tile dims are in another order than
+    the result's).
 
-    return None
+    The op would need the operand element held by another thread; the SIMT
+    lowering combines each thread's own scalars.  Unequal extents are the
+    ``ShapeMismatch`` the Triton backend raises.  An op on a tcgen05 matmul's
+    epilogue chain is checked from the store instead
+    (``run_deferred_rebound_checks``), after the epilogue classifier has had
+    its say: its diagnostic names the supported epilogue forms.
+    """
+    from ..generate_ast import GenerateAST
+
+    consumer = _rebound_consumer_dims(node)
+    if consumer is None or not consumer[0]:
+        return
+    consumer_sizes, lower_rank_by_block_id = consumer
+    df = cg.device_function
+    env = CompileEnvironment.current()
+    config = df.config
+    result_block_ids = tensor_dim_block_ids(env, consumer_sizes)
+    if node.target is torch.ops.aten.gather.default:
+        # Along the gather dim the index has the result's extent and its
+        # values select the position; only the other dims must align.
+        gather_dim = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+        assert isinstance(gather_dim, int)
+        result_block_ids[gather_dim % len(result_block_ids)] = None
+    for operand in _rebound_operands(node):
+        operand_val = operand.meta.get("val")
+        if not isinstance(operand_val, torch.Tensor):
+            continue
+        rebound = rebound_block_dims(
+            env,
+            config,
+            operand_val,
+            consumer_sizes,
+            result_block_ids,
+            lower_rank_by_block_id=lower_rank_by_block_id,
+        )
+        if not rebound:
+            continue
+        cute_state = df.cute_state
+        if (
+            defer_tcgen05_epilogues
+            and isinstance(cg, GenerateAST)
+            and cute_state.matmul_fx_nodes
+        ):
+            if cute_state.rebound_inner_outputs_index is None:
+                cute_state.rebound_inner_outputs_index = (
+                    build_inner_outputs_index_from_graphs(cg.codegen_graphs)
+                )
+            if reach_matmul_anchors(
+                node,
+                target_fx_nodes=cute_state.matmul_fx_nodes,
+                inner_outputs_by_graph_id=cute_state.rebound_inner_outputs_index,
+            ):
+                cute_state.deferred_rebound_pointwise_nodes.append(node)
+                return
+        for dim, _operand_block_id, result_block_id in rebound:
+            operand_extent = _resolve_tile_extent(operand_val.shape[dim], env, config)
+            result_extent = block_extent(env, config, result_block_id)
+            if operand_extent != result_extent:
+                raise exc.ShapeMismatch(
+                    f"operand {operand.name} dim {dim} of extent {operand_extent}",
+                    f"{node.target} result tile of extent {result_extent}",
+                )
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{node.target} reads operand {operand.name} (shape "
+            f"{list(operand_val.shape)}) at the position of another "
+            f"block's lane: {describe_rebound_block_dims(rebound)}; the "
+            "SIMT lowering combines each thread's own elements",
+        )
+
+
+def run_deferred_rebound_checks(
+    cg: CodegenInterface, nodes: Collection[Node] | None = None
+) -> None:
+    """Check the pointwise ops deferred from a tcgen05 epilogue chain.
+
+    Called by the store lowering once the epilogue classifier has accepted
+    or passed on the chain (a rejected chain raises its own diagnostic
+    first), for the deferred ops among ``nodes`` (the chain's ancestors) so
+    that another chain's store still gets its classifier's diagnostic, and
+    once more for everything at the end of the root codegen for chains that
+    no store consumed.
+    """
+    cute_state = cg.device_function.cute_state
+    pending = cute_state.deferred_rebound_pointwise_nodes
+    selected = [node for node in pending if nodes is None or node in nodes]
+    cute_state.deferred_rebound_pointwise_nodes = [
+        node for node in pending if node not in selected
+    ]
+    for node in selected:
+        check_pointwise_rebound_block_ids(cg, node, defer_tcgen05_epilogues=False)
+
+
+def cute_lane_loops_active(cg: GenerateAST) -> bool:
+    """Whether the statements being emitted run inside a lane loop."""
+    grid_state = cg.current_grid_state
+    if grid_state is not None and grid_state.has_lane_loops():
+        return True
+    return any(
+        isinstance(state, DeviceLoopState) and bool(state.lane_loops)
+        for states in cg.active_device_loops.values()
+        for state in states
+    )
+
+
+def check_memory_mask_rebound(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    mask_val: object,
+    *,
+    what: str,
+    leading_sizes: Sequence[int | torch.SymInt] = (),
+) -> None:
+    """Refuse a load or store ``extra_mask`` bound to another block id than
+    the subscript's dims: Triton ANDs it positionally into the index masks,
+    the per-thread lowering would test another lane's element."""
+    if not isinstance(mask_val, torch.Tensor) or mask_val.ndim == 0:
+        return
+    rebound = subscript_rebound_block_dims(
+        state, tensor, subscript, mask_val, leading_sizes=leading_sizes
+    )
+    if rebound:
+        raise exc.BackendUnsupported(
+            "cute",
+            f"{what} mask of {list(mask_val.shape)} re-binds "
+            f"{describe_rebound_block_dims(rebound)}; the mask must be held by "
+            "the thread that owns the addressed lane",
+        )
+
+
+def store_rebound_dims(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    *,
+    leading_sizes: Sequence[int | torch.SymInt] = (),
+) -> list[tuple[int, int, int]]:
+    """The dims of the stored value that ``tensor[subscript]`` binds to another
+    block id (``subscript_rebound_block_dims``), with unequal extents the
+    ``ShapeMismatch`` the Triton backend raises; a store mask bound that way
+    is refused (a mask is not exchanged)."""
+    env = CompileEnvironment.current()
+    config = state.device_function.config
+    check_memory_mask_rebound(
+        state,
+        tensor,
+        subscript,
+        state.proxy_arg(3),
+        what="store",
+        leading_sizes=leading_sizes,
+    )
+    value_val = state.proxy_arg(2)
+    if not isinstance(value_val, torch.Tensor) or value_val.ndim == 0:
+        return []
+    rebound = subscript_rebound_block_dims(
+        state, tensor, subscript, value_val, leading_sizes=leading_sizes
+    )
+    if not rebound:
+        return []
+    value_shape = _get_tile_shape(value_val, env, config)
+    for dim, _value_block_id, slot_block_id in rebound:
+        slot_extent = block_extent(env, config, slot_block_id)
+        if value_shape[dim] != slot_extent:
+            raise exc.ShapeMismatch(
+                f"stored tile dim {dim} of extent {value_shape[dim]}",
+                f"subscript tile of extent {slot_extent}",
+            )
+    return rebound
+
+
+def tcgen05_rebound_store_error(
+    state: CodegenState, rebound: Sequence[tuple[int, int, int]]
+) -> exc.BackendUnsupported:
+    """A re-binding store of a tcgen05 matmul epilogue: the accumulator tile
+    is not one element per thread, so there is nothing to exchange.  Raised
+    by the store lowering where a tcgen05 store path would otherwise accept
+    the chain (its own classifier's diagnostic wins where it rejects)."""
+    value_val = state.proxy_arg(2)
+    assert isinstance(value_val, torch.Tensor)
+    return exc.BackendUnsupported(
+        "cute",
+        f"store of {list(value_val.shape)} re-binds "
+        f"{describe_rebound_block_dims(rebound)} of a tcgen05 matmul epilogue; "
+        "the accumulator tile is not held one element per thread, so it cannot "
+        "be exchanged between threads (store the accumulator in its own layout)",
+    )
+
+
+def codegen_cute_store_rebound_value(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: Sequence[object],
+    value: ast.AST,
+    rebound: Sequence[tuple[int, int, int]],
+) -> ast.AST:
+    """Exchange ``value`` between threads when ``tensor[subscript]`` re-binds
+    its dims (``rebound``, from ``store_rebound_dims``), so that each thread
+    stores the element at its own position.
+
+    ``out[tile_m, tile_n] = x[tile_m, tile_n].T`` with equal block sizes
+    stores, at position ``(i, j)`` of the slot, the value's element ``(i, j)``:
+    ``x[j, i]`` of the tile, held by the thread with the swapped coordinates.
+    Every thread stages its element at its position in the value's shape (its
+    coordinates by the value's block ids) and, after a barrier, reads the
+    element at its position in the slot (its coordinates by the subscript's
+    block ids).  Both accesses are predicated on the coordinates lying inside
+    the tile: a launch widened for a sibling root loop has surplus threads
+    whose coordinates exceed the extent (their masks keep them off the
+    store, but not off the buffer).  The whole tile must be resident across
+    the thread block at one barrier, so the exchange is refused inside lane
+    loops.
+    """
+    from ..generate_ast import GenerateAST
+
+    value_val = state.proxy_arg(2)
+    assert isinstance(value_val, torch.Tensor) and rebound
+    cg = state.codegen
+    assert isinstance(cg, GenerateAST)
+    env = CompileEnvironment.current()
+    df = state.device_function
+    description = describe_rebound_block_dims(rebound)
+    value_shape = _get_tile_shape(value_val, env, df.config)
+    if cute_lane_loops_active(cg):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"store of {list(value_val.shape)} re-binds {description} inside a "
+            "lane loop; the exchange needs the whole thread block at one barrier",
+        )
+
+    own_coords = [
+        _get_dim_local_coord(cg, value_val, dim, strict=True)
+        for dim in range(value_val.ndim)
+    ]
+    slot_coords = list(own_coords)
+    for dim, _value_block_id, slot_block_id in rebound:
+        coord = _get_block_local_coord(cg, slot_block_id)
+        if coord is None:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"store re-binds {description} to a block without a thread coordinate",
+            )
+        slot_coords[dim] = coord
+    numel = 1
+    for extent in value_shape:
+        numel *= extent
+    dtype_str = env.backend.dtype_str(value_val.dtype)
+    smem_ptr = df.new_var("rebind_smem_ptr")
+    smem = df.new_var("rebind_smem")
+    staged = df.new_var("rebind_staged")
+    reads = df.new_var("rebind_reads")
+    result = df.new_var("rebound")
+    cg.add_statement(
+        statement_from_string(
+            f"{smem_ptr} = cute.arch.alloc_smem({dtype_str}, {numel})"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(f"{smem} = cute.make_tensor({smem_ptr}, ({numel},))")
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"{staged} = {_in_tile_predicate(own_coords, value_shape)}"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"{reads} = {_in_tile_predicate(slot_coords, value_shape)}"
+        )
+    )
+    cg.add_statement(
+        statement_from_string(
+            f"if {staged}:\n"
+            f"    {smem}[{_flat_index_from_coords(own_coords, value_shape)}] = {{value}}",
+            value=value,
+        )
+    )
+    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+    cg.add_statement(
+        statement_from_string(
+            f"{result} = {smem}[{_flat_index_from_coords(slot_coords, value_shape)}]"
+            f" if {reads} else {dtype_str}(0)"
+        )
+    )
+    # Unconditional: an enclosing device or persistent loop runs the store
+    # again and must not overwrite the buffer before every read of it.
+    cg.add_statement(statement_from_string("cute.arch.sync_threads()"))
+    return expr_from_string(result)
+
+
+def _in_tile_predicate(coords: Sequence[str], shape: Sequence[int]) -> str:
+    """``coords`` all below their extents (surplus threads of a widened launch
+    sit at or beyond the extent)."""
+    return " and ".join(
+        f"({coord}) < cutlass.Int32({extent})"
+        for coord, extent in zip(coords, shape, strict=True)
+    )

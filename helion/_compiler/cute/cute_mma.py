@@ -1177,19 +1177,76 @@ def _tcgen05_tma_destination_is_legal(
     ) == expected_major and _tcgen05_tma_tensor_is_aligned(env, tensor)
 
 
+def _tcgen05_grouped_rhs_keeps_store_protocol(rhs_info: _MmaOperandInfo) -> bool:
+    """Whether a grouped RHS form is exempt from the TMA-store destination proof.
+
+    Shared by codegen's ``tcgen05_output_tma_store_proven`` and its bind-time
+    form so the two cannot disagree. The rank-3 N,K-major grouped RHS (its
+    group expression selects the per-group destination) and the
+    segment-metadata form store through their own protocols; the shared
+    rank-2 RHS and a packed group without segment metadata store through the
+    plain epilogue and keep the proof.
+    """
+    return rhs_info.rhs_rank3_grouped_nt or rhs_info.rhs_segment_group is not None
+
+
+def _tcgen05_mma_output_tma_store_provable(
+    env: CompileEnvironment,
+    mma_node: Node,
+    candidate: _CuteMmaNode,
+    graphs: list[GraphInfo],
+) -> bool:
+    """Bind-time form of codegen's ``tcgen05_output_tma_store_proven``.
+
+    The flat-role / TVM-FFI direct-entry path also hard-requires the TMA
+    store epilogue, which ``_emit_mma_pipeline`` enables only when every
+    store the accumulator reaches has a TensorMap-legal destination
+    (``_tcgen05_tma_destination_is_legal``: 16-byte base and outer strides,
+    contiguous axis matching the staged D layout). The grouped RHS forms
+    exempt here are exactly codegen's structural ones
+    (``_tcgen05_grouped_rhs_keeps_store_protocol``); codegen's remaining
+    exemptions (N,M orientation, row union, a grouped mode) are config
+    requests the direct-entry seed never makes. An untraced fan-out is left
+    to the store lowering, as in codegen.
+
+    ``candidate`` was analyzed with the DeviceIR, which also analyzes the
+    output stores; codegen analyzes the MMA from the graphs alone and stages
+    D row-major unless that view carries a store analysis (leading
+    passthrough or permuted operands), so the expected destination layout is
+    taken from the same graph-only view.
+    """
+    if _tcgen05_grouped_rhs_keeps_store_protocol(candidate.operands.rhs):
+        return True
+    stores = _trace_mma_to_stores(mma_node, graphs)
+    if stores is None:
+        return True
+    codegen_candidate = analyze_cute_mma_node(mma_node, graphs=graphs)
+    output_column_major = (
+        codegen_candidate is not None and codegen_candidate.output_column_major
+    )
+    return all(
+        _tcgen05_tma_destination_is_legal(
+            env, store, output_column_major=output_column_major
+        )
+        for store in stores
+    )
+
+
 def host_function_matmul_operands_tma_provable(
     env: CompileEnvironment, host_function: HostFunction
 ) -> bool:
-    """Return False when any MMA candidate operand fails the TMA alignment proof.
+    """Return False when an MMA candidate operand or output fails the TMA proof.
 
     The tcgen05 flat-role / TVM-FFI direct-entry seed hard-requires the TMA
-    A/B pipeline, which ``_emit_mma_pipeline`` only enables when both operands
-    pass ``_tcgen05_tma_operand_is_aligned``. The matmul plan facts alone
-    cannot see this: an input whose base pointer or outer byte stride is not a
-    16-byte multiple keeps the scalar SMEM producers, so the seed config would
-    be rejected at codegen. ``CuteTcgen05ClusterM2FfiHeuristic.register_facts``
-    evaluates the same operand proof at bind time so the seed stays ineligible
-    for such kernels.
+    A/B pipeline and the TMA store epilogue, which ``_emit_mma_pipeline`` only
+    enables when both operands pass ``_tcgen05_tma_operand_is_aligned`` and
+    every traced output store passes ``_tcgen05_tma_destination_is_legal``.
+    The matmul plan facts alone cannot see this: an input whose base pointer
+    or outer byte stride is not a 16-byte multiple keeps the scalar SMEM
+    producers, and an under-aligned or N-major output destination takes the
+    SIMT store body, so the seed config would be rejected at codegen.
+    ``CuteTcgen05ClusterM2FfiHeuristic.register_facts`` evaluates the same
+    proofs at bind time so the seed stays ineligible for such kernels.
 
     The proof reads the immutable bound alignment facts, which the runtime
     records only after seed registration. While the bound kernel's runtime
@@ -1227,6 +1284,10 @@ def host_function_matmul_operands_tma_provable(
                         for operand in (candidate.operands.lhs, candidate.operands.rhs):
                             if not _tcgen05_tma_operand_is_aligned(env, operand):
                                 return False
+                        if not _tcgen05_mma_output_tma_store_provable(
+                            env, node, candidate, device_ir.graphs
+                        ):
+                            return False
         finally:
             env.bound_runtime_input_specialization_results = saved
         return True
@@ -8680,14 +8741,15 @@ def _emit_mma_pipeline(
     # residue specialization for arguments, the allocator alignment of fresh
     # host tensors, static alias views of one input); an unproved destination
     # takes the SIMT store body, which addresses every element itself.  The
-    # grouped and row-union families (transposed NM stores, packed and
-    # segmented destinations) keep their own store protocols; the store
-    # lowering still refuses a destination known to break the rules.
+    # grouped and row-union families (transposed NM stores, N,K-major grouped
+    # and segmented destinations) keep their own store protocols; the store
+    # lowering still refuses a destination known to break the rules. The
+    # structural grouped exemption is shared with the bind-time direct-entry
+    # seed gate (``_tcgen05_mma_output_tma_store_provable``).
     tcgen05_output_tma_store_proven = (
         tcgen05_nm_orientation
         or row_union_plan is not None
-        or rhs_rank3_group_expr is not None
-        or bool(rhs_rank3_segment_metadata)
+        or _tcgen05_grouped_rhs_keeps_store_protocol(rhs_info)
         or grouped_mode is not None
         or tcgen05_traced_output_stores is None
         or all(

@@ -28,6 +28,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cute.cute_reshape import run_deferred_rebound_checks
 from .cute.direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .cute.register_tile_admission import RegisterTileUnsupported
 from .cute.unroll_lane_loads import LaneUnrollNotApplied
@@ -1668,8 +1669,19 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                                     grid_state.outer_suffix
                                 )
                             else:
+                                # The index and mask definitions a strategy
+                                # hoists ahead of its lane loops are the
+                                # body's whether or not it has any: a tile
+                                # widened to a sibling loop's launch keeps one
+                                # element per thread and parks them there.
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_prefix
+                                )
                                 grid_state.add_body_barriers(wrapped_body)
                                 self.statements_stack[-1].extend(wrapped_body)
+                                self.statements_stack[-1].extend(
+                                    grid_state.outer_suffix
+                                )
                         else:
                             codegen_call_with_graph(self, root, [])
                 finally:
@@ -2471,6 +2483,10 @@ def _generate_ast(
                     prefix_recorded = True
                 codegen.add_statement(codegen.visit(stmt))
             codegen.device_function.cute_state.finalize_tcgen05_pure_lifecycle_stores()
+            # Re-binding checks deferred from tcgen05 epilogue chains that no
+            # store drained (chains ending in an atomic or a specialized
+            # store path).
+            run_deferred_rebound_checks(codegen)
             if _bounded_cache_request is None:
                 kernel_def = codegen.device_function.codegen_function_def()
             else:

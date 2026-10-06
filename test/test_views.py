@@ -118,6 +118,194 @@ class TestViews(RefEagerTestBase, TestCase):
         _code, result = code_and_output(fn, args)
         torch.testing.assert_close(result, args[0] + args[1].transpose(0, 1))
 
+    @skipIfPallas("blockwise transpose stores are not verified on Pallas")
+    @skipIfRefEager("ref eager runs the whole tensor as one tile")
+    def test_blockwise_transpose_store(self):
+        # The slot binds the transposed tile's dims to the other tile: with
+        # equal block sizes each 16x16 tile is transposed in place (positional
+        # tile semantics), which on cute needs an exchange between threads.
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n].T
+            return out
+
+        x = torch.randn([64, 48], device=DEVICE)
+        _, result = code_and_output(fn, (x,), block_sizes=[16, 16])
+        expected = torch.empty_like(x)
+        for i in range(0, 64, 16):
+            for j in range(0, 48, 16):
+                expected[i : i + 16, j : j + 16] = x[i : i + 16, j : j + 16].T
+        torch.testing.assert_close(result, expected)
+
+    @skipIfPallas("lower-rank store values are not verified on Pallas")
+    @skipIfRefEager("ref eager runs the whole tensor as one tile")
+    def test_lower_rank_store_value(self):
+        # hl.store receives its value unexpanded, so a rank-1 b[tile_m] is
+        # right-aligned to the tile_n axis: column j of each tile carries
+        # b[m0 + j] on every backend, and unequal extents are a ShapeMismatch.
+        @helion.kernel(static_shapes=True)
+        def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile_m, tile_n in hl.tile(a.size()):
+                hl.store(out, [tile_m, tile_n], b[tile_m])
+            return out
+
+        a = torch.randn([64, 64], device=DEVICE)
+        b = torch.randn([64], device=DEVICE)
+        _, result = code_and_output(fn, (a, b), block_sizes=[16, 16])
+        expected = torch.empty_like(a)
+        for m0 in range(0, 64, 16):
+            for n0 in range(0, 64, 16):
+                expected[m0 : m0 + 16, n0 : n0 + 16] = b[m0 : m0 + 16][None, :]
+        torch.testing.assert_close(result, expected)
+        with self.assertRaises(helion.exc.ShapeMismatch):
+            code_and_output(fn, (a, b), block_sizes=[16, 32])
+
+    @skipIfPallas("slice stores of transposed slices are not verified on Pallas")
+    @skipIfRefEager("ref eager runs the whole tensor as one tile")
+    def test_slice_store_of_transposed_slice(self):
+        # ``out[tile_m, :] = x[:, tile_m]`` is positional: with one 32-tile it
+        # is the identity on every backend (cute exchanges the value through
+        # shared memory, reading the slice at the load's reduction block).
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[tile_m, :] = x[:, tile_m]
+            return out
+
+        @helion.kernel(static_shapes=True)
+        def fn_b(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                out[:, tile_m] = x[tile_m, :]
+            return out
+
+        x = torch.randn([32, 32], device=DEVICE)
+        for kernel in (fn, fn_b):
+            _, result = code_and_output(kernel, (x,), block_sizes=[32])
+            torch.testing.assert_close(result, x)
+
+    @skipIfPallas("slice stores beside a tile are not verified on Pallas")
+    @skipIfRefEager("ref eager runs the whole tensor as one tile")
+    def test_two_slices_beside_a_tile(self):
+        # ``out[tile_m, :, :] = x[tile_m, :, tile_n]`` with the second slice
+        # as wide as tile_n is the identity on every backend.
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            M, A, B = x.shape
+            out = torch.empty([M, A, B], dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([M, B]):
+                out[tile_m, :, :] = x[tile_m, :, tile_n]
+            return out
+
+        x = torch.randn([4, 8, 8], device=DEVICE)
+        _, result = code_and_output(fn, (x,), block_sizes=[1, 8])
+        torch.testing.assert_close(result, x)
+
+    @skipIfPallas("positional load masks are not verified on Pallas")
+    @skipIfRefEager("ref eager runs the whole tensor as one tile")
+    def test_load_extra_mask_is_positional(self):
+        # Triton ANDs extra_mask positionally into the index masks: m.T masks
+        # with the blockwise transpose of m, row[tm] with row[m0 + j]; cute
+        # cannot test another lane's mask element and refuses both.
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile(x.size()):
+                out[tm, tn] = hl.load(x, [tm, tn], extra_mask=m[tm, tn].T)
+            return out
+
+        x = torch.randn([64, 64], device=DEVICE)
+        m = torch.rand([64, 64], device=DEVICE) > 0.5
+        if _get_backend() == "cute":
+            with self.assertRaises(helion.exc.BackendUnsupported):
+                code_and_output(fn, (x, m), block_sizes=[16, 16])
+            return
+        _, result = code_and_output(fn, (x, m), block_sizes=[16, 16])
+        blockwise = torch.empty_like(m)
+        for i in range(0, 64, 16):
+            for j in range(0, 64, 16):
+                blockwise[i : i + 16, j : j + 16] = m[i : i + 16, j : j + 16].T
+        torch.testing.assert_close(
+            result, torch.where(blockwise, x, torch.zeros_like(x))
+        )
+
+    @skipIfPallas("lower-rank where operands are not verified on Pallas")
+    @skipIfRefEager("ref eager runs the whole tensor as one tile")
+    def test_where_lower_rank_operand(self):
+        # tl.where receives its operands unexpanded, so a rank-1 row[tm] is
+        # right-aligned to the tn axis: Triton reads row[m0 + j] and raises
+        # ShapeMismatch for unequal block sizes; the cute per-thread lowering
+        # cannot read another lane's element and refuses.
+        @helion.kernel(static_shapes=True)
+        def fn(c: torch.Tensor, x: torch.Tensor, row: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile(x.size()):
+                out[tm, tn] = torch.where(c[tm, tn], x[tm, tn], row[tm])
+            return out
+
+        c = torch.rand([64, 64], device=DEVICE) > 0.5
+        x = torch.randn([64, 64], device=DEVICE)
+        row = torch.randn([64], device=DEVICE)
+        if _get_backend() == "cute":
+            with self.assertRaises(helion.exc.BackendUnsupported):
+                code_and_output(fn, (c, x, row), block_sizes=[16, 16])
+            return
+        _, result = code_and_output(fn, (c, x, row), block_sizes=[16, 16])
+        positional = torch.empty_like(x)
+        for m0 in range(0, 64, 16):
+            for n0 in range(0, 64, 16):
+                positional[m0 : m0 + 16, n0 : n0 + 16] = row[m0 : m0 + 16][None, :]
+        torch.testing.assert_close(result, torch.where(c, x, positional))
+        with self.assertRaises(helion.exc.ShapeMismatch):
+            code_and_output(fn, (c, x, row), block_sizes=[16, 32])
+
+    @skipIfPallas("reordered lower-rank operands are not verified on Pallas")
+    @skipIfRefEager("ref eager runs the whole tensor as one tile")
+    def test_reordered_lower_rank_operand(self):
+        # The implicit broadcast only inserts None, so b[t1, t0]'s tile dims
+        # meet the [t0, t1, t2] result positionally: Triton adds
+        # b[t1_0 + i, t0_0 + j]; the cute per-thread lowering cannot (it would
+        # add b at its block-id coordinates) and refuses.
+        @helion.kernel(static_shapes=True)
+        def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for t0, t1, t2 in hl.tile(a.size()):
+                out[t0, t1, t2] = a[t0, t1, t2] + b[t1, t0]
+            return out
+
+        a = torch.randn([16, 16, 8], device=DEVICE)
+        b = torch.randn([16, 16], device=DEVICE)
+        if _get_backend() == "cute":
+            with self.assertRaises(helion.exc.BackendUnsupported):
+                code_and_output(fn, (a, b), block_sizes=[8, 8, 8])
+            return
+        _, result = code_and_output(fn, (a, b), block_sizes=[8, 8, 8])
+        expected = torch.empty_like(a)
+        for t0_0 in range(0, 16, 8):
+            for t1_0 in range(0, 16, 8):
+                tile = b[t1_0 : t1_0 + 8, t0_0 : t0_0 + 8]
+                expected[t0_0 : t0_0 + 8, t1_0 : t1_0 + 8] = (
+                    a[t0_0 : t0_0 + 8, t1_0 : t1_0 + 8] + tile[:, :, None]
+                )
+        torch.testing.assert_close(result, expected)
+
+    @skipIfPallas("blockwise transpose stores are not verified on Pallas")
+    def test_single_tile_transpose_store(self):
+        @helion.kernel(static_shapes=True)
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size()):
+                out[tile_m, tile_n] = x[tile_m, tile_n].T
+            return out
+
+        x = torch.randn([16, 16], device=DEVICE)
+        _, result = code_and_output(fn, (x,), block_sizes=[16, 16])
+        torch.testing.assert_close(result, x.T)
+
     def test_transpose_T_unsqueeze(self):
         @helion.kernel(autotune_effort="none")
         def fn(x: torch.Tensor) -> torch.Tensor:
