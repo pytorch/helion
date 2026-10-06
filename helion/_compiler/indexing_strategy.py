@@ -1863,6 +1863,7 @@ class SubscriptIndexing(NamedTuple):
                 else cur_output_idx - tensor_indexer_broadcast_dims
             )
             non_trivial_output_positions: list[int] = []
+            pos: int | None
             if is_cartesian:
                 pos = first_tensor_out_idx + tensor_idx
                 single_output_dim = True
@@ -1874,11 +1875,24 @@ class SubscriptIndexing(NamedTuple):
                     for i in range(index_elem.ndim)
                     if env.size_hint(index_elem.size(i)) != 1
                 ]
-                pos = non_trivial_output_positions[0]
+                pos = (
+                    non_trivial_output_positions[0]
+                    if non_trivial_output_positions
+                    else None
+                )
                 single_output_dim = len(non_trivial_output_positions) <= 1
 
             new_masks: dict[str, None] = {}
-            if single_output_dim:
+            if not non_trivial_output_positions and not is_cartesian:
+                # An all-singleton tensor contributes a scalar index to the
+                # shared advanced-index broadcast shape. Expand it across that
+                # shape, but do not attach a tile mask to an arbitrary axis.
+                expand = tile_strategy.expand_dims_str(
+                    output_size, first_tensor_out_idx, tensor_indexer_broadcast_dims
+                )
+                idx_val = f"({index_var}){expand}"
+            elif single_output_dim:
+                assert pos is not None
                 if index_elem.ndim == 1:
                     expand = tile_strategy.expand_str(output_size, pos)
                 else:
