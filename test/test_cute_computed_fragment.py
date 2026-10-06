@@ -1435,6 +1435,8 @@ def test_fragment_singleton_view_logical_coordinates(
     expected = target(value, *arguments)
     compiler = object.__new__(FragmentCompiler)
     compiler.pending_local_atomics = set()
+    compiler.snapshot_owner = None
+    compiler.snapshot_shapes = set()
     compiler.local_register_nodes = set()
     compiler.local_register_slot = None
     compiler.shape = lambda sizes: tuple(sizes)
@@ -4098,3 +4100,293 @@ def test_fragment_mixed_warp_scans_native(mode, dtype, fallback_dtype, width, re
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
     assert torch.equal(x, before[0]) and torch.equal(y, before[1])
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_readonly_snapshots(
+    x, kind: hl.constexpr, integer_dtype: hl.constexpr = torch.int64
+):
+    out = torch.empty_like(x)
+    reduced = torch.empty((x.size(0),), dtype=integer_dtype, device=x.device)
+    for row in hl.grid(x.size(0)):
+        index = hl.arange(x.size(1))
+        values = hl.load(x, [row, index])
+        integers = values.to(integer_dtype) + 1
+        if kind == "sum":
+            reduced[row] = integers.sum(dtype=integer_dtype)
+        elif kind == "min":
+            reduced[row] = integers.min()
+        else:
+            reduced[row] = integers.max()
+        hl.store(out, [row, index], values + 2)
+    return out, reduced
+
+
+def _snapshot_codegen(kernel, args, threads=128, enabled=True):
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_threads=threads, cute_fragment_register_snapshots=enabled
+        )
+        return bound.to_code(config)
+
+
+@pytest.mark.parametrize("kind", ["sum", "min", "max"])
+@pytest.mark.parametrize(
+    "threads,width", [(32, 65), (128, 129), (512, 513), (1024, 1025)]
+)
+def test_readonly_snapshot_integer_generated(kind, threads, width):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    x = torch.arange(2 * width).reshape(2, width).float() - width
+    code = _snapshot_codegen(_fragment_readonly_snapshots, (x, kind), threads)
+    assert "fragment_snapshot_reduce" in code
+    out = torch.full_like(x, -99)
+    reduced = torch.full((2,), -99, dtype=torch.int64)
+    _simulate_register_load_program(
+        code, x, threads, host_tensors={"out": out, "reduced": reduced}
+    )
+    expected = x.to(torch.int64) + 1
+    expected = (
+        expected.sum(-1)
+        if kind == "sum"
+        else expected.amin(-1)
+        if kind == "min"
+        else expected.amax(-1)
+    )
+    torch.testing.assert_close(out, x + 2, rtol=0, atol=0)
+    torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.parametrize(
+    "kind,threads", [("sum", 32), ("min", 32), ("max", 32), ("sum", 1024)]
+)
+def test_readonly_snapshot_actual_sdk(tmp_path, kind, threads):
+    import importlib.util
+
+    import cutlass
+    from cutlass._mlir import ir
+    from cutlass._mlir.dialects import func
+    import cutlass.cute as cute
+
+    source = _snapshot_codegen(
+        _fragment_readonly_snapshots, (torch.zeros(2, 65), kind), threads
+    )
+    tree = ast.parse(source)
+    fn = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    )
+    fn.name = "staged"
+    fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+    tree.body = [
+        n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom, ast.Assign))
+    ] + [fn]
+    path = tmp_path / "snapshot.py"
+    path.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+    spec = importlib.util.spec_from_file_location("snapshot_sdk", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with ir.Context(), ir.Location.unknown():
+        emitted = ir.Module.create()
+        with ir.InsertionPoint(emitted.body):
+            entry = func.FuncOp("entry", ([], []))
+            with ir.InsertionPoint(entry.add_entry_block()):
+                args = [
+                    cute.make_tensor(
+                        cute.make_ptr(
+                            cutlass.Int64 if a.arg == "reduced" else cutlass.Float32,
+                            0,
+                            cute.AddressSpace.gmem,
+                            assumed_align=16,
+                        ),
+                        cute.make_layout((4096,)),
+                    )
+                    for a in fn.args.args
+                ]
+                module.staged(*args)
+                func.ReturnOp([])
+        assert emitted.operation.verify()
+        text = str(emitted)
+        assert "nvvm.shfl.sync" in text and "nvvm.barrier" in text
+
+
+def test_snapshot_requested_coordinate_proof():
+    from helion._compiler.cute.register_snapshots import SnapshotOwner
+
+    owner = SnapshotOwner("index", "slot", 65)
+    owner.aliases["coordinate"] = "index // 1 % 128"
+    owner.prove("coordinate // 1")
+    owner.prove("index * 4 // 1 - index * 3")
+    for expression in (
+        "64 - index",
+        "index + 1",
+        "index % 64",
+        "foreign",
+        "index // 2",
+    ):
+        with pytest.raises(exc.InvalidConfig, match="active owner"):
+            owner.prove(expression)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_snapshot_unsupported(x, kind: hl.constexpr):
+    out = torch.empty_like(x)
+    reduced = torch.empty((x.size(0),), device=x.device)
+    for row in hl.grid(x.size(0)):
+        index = hl.arange(x.size(1))
+        value = hl.load(x, [row, index])
+        if kind == "float":
+            reduced[row] = value.sum()
+        elif kind == "arg":
+            reduced[row] = value.argmax().to(torch.float32)
+        elif kind == "flip":
+            hl.store(out, [row, index], torch.flip(value, [0]))
+        elif kind == "gather":
+            hl.store(out, [row, index], torch.gather(value, 0, x.size(1) - 1 - index))
+        elif kind == "carry":
+            for _ in range(2):
+                value = value + 1
+            hl.store(out, [row, index], value)
+        elif kind == "phi":
+            if row % 2 == 0:
+                changed = value + 1
+            else:
+                changed = value - 1
+            hl.store(out, [row, index], changed)
+    return out, reduced
+
+
+@pytest.mark.parametrize("kind", ["float", "arg", "flip", "gather", "carry", "phi"])
+def test_snapshot_unsupported_consumers_decline(kind):
+    with pytest.raises(exc.InvalidConfig):
+        _snapshot_codegen(_fragment_snapshot_unsupported, (torch.ones(2, 65), kind))
+
+
+@pytest.mark.parametrize("width", [0, 1])
+def test_snapshot_scalarized_or_empty_domain_declines(width):
+    with pytest.raises(exc.InvalidConfig):
+        _snapshot_codegen(_fragment_readonly_snapshots, (torch.ones(2, width), "sum"))
+
+
+def test_snapshot_budget_and_boolean_config():
+    x = torch.ones(2, 1025)
+    with pytest.raises(exc.InvalidConfig):
+        _snapshot_codegen(_fragment_readonly_snapshots, (x, "sum"), 32)
+    x = torch.ones(2, 65)
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_readonly_snapshots, (x, "sum"))
+        config = bound.config_spec.default_config()
+        original = bound.to_code(config)
+        config.config["cute_fragment_register_snapshots"] = False
+        assert bound.to_code(config) == original
+        for value in (1, "true", None):
+            config.config["cute_fragment_register_snapshots"] = value
+            with pytest.raises(exc.InvalidConfig):
+                bound.to_code(config)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("kind", ["sum", "min", "max"])
+def test_snapshot_integer_boundary_payloads(dtype, kind):
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    limit = torch.iinfo(dtype)
+    x = torch.tensor([limit.min, limit.max, -1, 0, 1] * 13, dtype=dtype).reshape(1, 65)
+    code = _snapshot_codegen(_fragment_readonly_snapshots, (x, kind, dtype), 32)
+    out = torch.empty_like(x)
+    reduced = torch.empty((1,), dtype=dtype)
+    _simulate_register_load_program(
+        code, x, 32, host_tensors={"out": out, "reduced": reduced}
+    )
+    values = x + 1
+    expected = (
+        values.sum(-1, dtype=dtype)
+        if kind == "sum"
+        else values.amin(-1)
+        if kind == "min"
+        else values.amax(-1)
+    )
+    torch.testing.assert_close(out, x + 2, rtol=0, atol=0)
+    torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
+
+
+def test_snapshot_strided_offset_storage_and_input_integrity():
+    from test.test_atomic_ops import _simulate_register_load_program
+
+    backing = torch.arange(2 * 131).reshape(2, 131).float()
+    x = backing[:, 1::2]
+    before = backing.clone()
+    code = _snapshot_codegen(_fragment_readonly_snapshots, (x, "sum"), 32)
+    out = torch.full_like(x, -99)
+    reduced = torch.empty((2,), dtype=torch.int64)
+    _simulate_register_load_program(
+        code, x, 32, host_tensors={"out": out, "reduced": reduced}
+    )
+    torch.testing.assert_close(out, x + 2, rtol=0, atol=0)
+    torch.testing.assert_close(reduced, (x.to(torch.int64) + 1).sum(-1), rtol=0, atol=0)
+    torch.testing.assert_close(backing, before, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_snapshot_alias(x, out):
+    for row in hl.grid(x.size(0)):
+        index = hl.arange(x.size(1))
+        values = hl.load(x, [row, index])
+        hl.store(out, [row, x.size(1) - 1 - index], values + 1)
+    return out
+
+
+def test_snapshot_alias_conflict_fails_closed():
+    backing = torch.ones(2, 128)
+    for x, out in ((backing, backing), (backing[:, :65], backing[:, 63:])):
+        with pytest.raises(exc.InvalidConfig):
+            _snapshot_codegen(_fragment_snapshot_alias, (x, out), 32)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("threads", [32, 1024])
+@pytest.mark.parametrize("kind", ["sum", "min", "max"])
+def test_snapshot_native_integer_boundaries(threads, kind, dtype):
+    limits = torch.iinfo(dtype)
+    x = torch.tensor(
+        [limits.min, limits.max, -1, 0, 1] * 13, dtype=dtype, device=DEVICE
+    ).reshape(1, 65)
+    before = x.clone()
+    bound = _fragment_readonly_snapshots.bind((x, kind, dtype))
+    config = bound.config_spec.default_config()
+    config.config.update(
+        cute_fragment_register_snapshots=True, cute_fragment_threads=threads
+    )
+    out, reduced = bound.compile_config(config)(x, kind, dtype)
+    values = x + 1
+    expected = (
+        values.sum(-1, dtype=dtype)
+        if kind == "sum"
+        else values.amin(-1)
+        if kind == "min"
+        else values.amax(-1)
+    )
+    torch.testing.assert_close(out, x + 2, rtol=0, atol=0)
+    torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_snapshot_native_typed_loads(dtype):
+    x = torch.arange(130, device=DEVICE).reshape(2, 65).to(dtype) - 65
+    before = x.clone()
+    bound = _fragment_readonly_snapshots.bind((x, "sum"))
+    config = bound.config_spec.default_config()
+    config.config.update(
+        cute_fragment_register_snapshots=True, cute_fragment_threads=128
+    )
+    out, reduced = bound.compile_config(config)(x, "sum")
+    torch.testing.assert_close(out, x + 2, rtol=0, atol=0)
+    torch.testing.assert_close(reduced, (x.to(torch.int64) + 1).sum(-1), rtol=0, atol=0)
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
