@@ -1637,14 +1637,39 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             )
                         )
                     )
+                    from .cute.free_iota_reduction import free_iota_reductions
+                    from .cute.free_iota_reduction import owned_iota_reduction_axes
+
+                    free_fragment = False
+                    if CompileEnvironment.current().backend_name == "cute":
+                        owned_iota_axes = owned_iota_reduction_axes(self)
+                        free_fragment = any(
+                            node.graph
+                            is self.host_function.device_ir.graphs[
+                                root_graph_info.graph_id
+                            ].graph
+                            and node.meta["lowering"].block_index not in owned_iota_axes
+                            for node in free_iota_reductions(
+                                CompileEnvironment.current(),
+                                self.host_function.device_ir.graphs,
+                            )
+                        )
                     requested_fragment = (
                         captured_fragment
+                        or free_fragment
                         or (
                             self.device_function.config.get(
                                 "cute_fragment_register_loads", False
                             )
                             and root_graph_info.graph_id
                             in CompileEnvironment.current().config_spec.cute_fragment_register_load_root_ids
+                        )
+                        or (
+                            self.device_function.config.get(
+                                "cute_fragment_warp_results", False
+                            )
+                            and root_graph_info.graph_id
+                            in CompileEnvironment.current().config_spec.cute_fragment_warp_result_root_ids
                         )
                         or (
                             self.device_function.config.get(
