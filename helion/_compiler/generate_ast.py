@@ -1665,8 +1665,22 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             )
                         )
                     requested_fragment = (
-                        captured_fragment
+                        (
+                            self.device_function.config.get(
+                                "cute_fragment_producer_cache", False
+                            )
+                            and root_graph_info.graph_id
+                            in CompileEnvironment.current().config_spec.cute_fragment_producer_cache_root_ids
+                        )
+                        or captured_fragment
                         or free_fragment
+                        or (
+                            self.device_function.config.get(
+                                "cute_fragment_warp_scan", False
+                            )
+                            and root_graph_info.graph_id
+                            in CompileEnvironment.current().config_spec.cute_fragment_warp_scan_root_ids
+                        )
                         or (
                             self.device_function.config.get(
                                 "cute_fragment_register_loads", False
@@ -2349,6 +2363,16 @@ def _generate_ast(
 ) -> ast.Module:
     with func:
         env = CompileEnvironment.current()
+        if (
+            env.backend_name == "cute"
+            and config.get("cute_fragment_warp_scan", False)
+            and _codegen_graphs is None
+        ):
+            from .autotuner_heuristics.cute_fragment_warp_scan import (
+                validate_warp_scan_request,
+            )
+
+            validate_warp_scan_request(env, func.device_ir, config)
         if (
             env.backend_name == "cute"
             and config.get("cute_materialized_operand_schedule", "off") != "off"

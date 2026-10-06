@@ -63,6 +63,16 @@ from .cute import grouped_row_union_paired_clc_carrier
 from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
+from .cute_fragment_atomic_aggregation import CuteFragmentAtomicAggregationHeuristic
+from .cute_fragment_atomic_aggregation import (
+    register_fragment_atomic_aggregation_coverage,
+)
+from .cute_fragment_private_scalar_loops import CuteFragmentPrivateScalarLoopsHeuristic
+from .cute_fragment_private_scalar_loops import (
+    register_fragment_private_scalar_loops_coverage,
+)
+from .cute_fragment_producer_cache import CuteFragmentProducerCacheHeuristic
+from .cute_fragment_producer_cache import register_fragment_producer_cache_coverage
 from .cute_fragment_reduction import CuteFragmentReductionHeuristic
 from .cute_fragment_reduction import register_fragment_reduction_coverage
 from .cute_fragment_register_loads import CuteFragmentRegisterLoadsHeuristic
@@ -74,6 +84,8 @@ from .cute_fragment_threads import CuteFragmentThreadsHeuristic
 from .cute_fragment_threads import register_fragment_threads_coverage
 from .cute_fragment_warp_results import CuteFragmentWarpResultsHeuristic
 from .cute_fragment_warp_results import register_fragment_warp_results_coverage
+from .cute_fragment_warp_scan import CuteFragmentWarpScanHeuristic
+from .cute_fragment_warp_scan import register_fragment_warp_scan_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
@@ -167,8 +179,12 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteFragmentScanHeuristic,
         CuteFragmentReductionHeuristic,
         CuteFragmentThreadsHeuristic,
+        CuteFragmentPrivateScalarLoopsHeuristic,
         CuteFragmentRegisterLoadsHeuristic,
         CuteFragmentWarpResultsHeuristic,
+        CuteFragmentProducerCacheHeuristic,
+        CuteFragmentWarpScanHeuristic,
+        CuteFragmentAtomicAggregationHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -600,5 +616,17 @@ def register_compiler_coverage_groups(
         env, device_ir, resource_carrier=resource_carrier
     )
     register_fragment_warp_results_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_private_scalar_loops_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_producer_cache_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_warp_scan_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
+    register_fragment_atomic_aggregation_coverage(
         env, device_ir, resource_carrier=resource_carrier
     )
