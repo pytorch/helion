@@ -105,6 +105,72 @@ def jit_add_combine_fn(x, y):
 
 @onlyBackends(["triton", "cute"])
 class TestAssociativeScan(RefEagerTestBase, TestCase):
+    def test_computed_cumsum_numeric_dtypes(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def kernel(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+            output = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                columns = hl.arange(x.size(1))
+                values = torch.where(columns[None, :] < x.size(1), x[row, :] + 1, 0)
+                output[row, :] = hl.cumsum(values, dim=-1, reverse=reverse)
+            return output
+
+        for dtype in (
+            torch.int8,
+            torch.uint8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ):
+            x = (torch.arange(195, device=DEVICE).reshape(3, 65) % 3).to(dtype)
+            for reverse in (False, True):
+                with self.subTest(dtype=dtype, reverse=reverse):
+                    _, actual = code_and_output(kernel, (x, reverse), block_sizes=[1])
+                    values = x + 1
+                    if reverse:
+                        values = values.flip([-1])
+                    expected = values.cumsum(-1, dtype=dtype)
+                    if reverse:
+                        expected = expected.flip([-1])
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @onlyBackends(["cute"])
+    def test_computed_cumsum_unmasked_tail(self) -> None:
+        @helion.kernel(static_shapes=True)
+        def kernel(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+            output = torch.empty_like(x)
+            for row in hl.tile(x.size(0)):
+                values = x[row, :] + 1
+                output[row, :] = hl.cumsum(values, dim=-1, reverse=reverse)
+            return output
+
+        for dtype in (
+            torch.int8,
+            torch.uint8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+        ):
+            x = (torch.arange(195, device=DEVICE).reshape(3, 65) % 3).to(dtype)
+            for reverse in (False, True):
+                with self.subTest(dtype=dtype, reverse=reverse):
+                    _, actual = code_and_output(kernel, (x, reverse), block_sizes=[1])
+                    values = x + 1
+                    if reverse:
+                        values = values.flip([-1])
+                    expected = values.cumsum(-1, dtype=dtype)
+                    if reverse:
+                        expected = expected.flip([-1])
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_computed_cumsum_axes_and_source_reuse(self) -> None:
         @helion.kernel(static_shapes=True)
         def kernel(

@@ -7321,6 +7321,10 @@ class TileStrategy:
         """
         return self.offset_var(block_idx)
 
+    def grid_origin_var(self, block_idx: int) -> str:
+        """Return the CTA's logical tile origin, without a thread/lane offset."""
+        return self.offset_var(block_idx)
+
     def index_var(self, block_idx: int) -> str:
         return self.index_vars[block_idx]
 
@@ -7947,6 +7951,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         self._mask_elision_decided = False
         self._mask_var: str | None = self.new_var("mask", dce=True)
         self._offsets_var = self.new_var("offsets", dce=True)
+        self._grid_origin_vars: dict[int, str] = {}
 
         key = (*self.block_ids,)
         assert key not in fn.block_size_var_cache
@@ -7961,6 +7966,38 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
 
     def offset_var(self, block_idx: int) -> str:
         raise NotImplementedError("offset_var not used in FlattenedTileStrategy")
+
+    def grid_origin_var(self, block_idx: int) -> str:
+        if block_idx not in self._grid_origin_vars:
+            raise exc.InvalidConfig(
+                "computed fragments require rectangular flattened grid tiles"
+            )
+        return self._grid_origin_vars[block_idx]
+
+    def _record_grid_origins(
+        self,
+        state: CodegenState,
+        pid_var: str,
+        block_size_var: str,
+        begins: list[object],
+        steps: list[object | None],
+    ) -> None:
+        if CompileEnvironment.current().backend.name != "cute":
+            return
+        if self.block_size == 1:
+            # A singleton flat tile is a singleton Cartesian tile on every
+            # axis, including nonzero begins and scalar iteration strides.
+            self._grid_origin_vars.update(self.index_vars)
+        elif len(self.block_ids) == 1 and steps[0] in (None, 1):
+            block_id = self.block_ids[0]
+            origin = self.offset_vars[block_id]
+            expression = f"({pid_var}) * ({block_size_var})"
+            if begins[0] != 0:
+                expression = f"({self._expr_str(begins[0])}) + ({expression})"
+            state.add_statement(f"{origin} = {expression}")
+            self._grid_origin_vars[block_id] = origin
+        # A multi-axis flattened interval is not a Cartesian tile. Do not
+        # reinterpret its scalar per-thread coordinates as independent origins.
 
     def mask_var(self, block_idx: int) -> str | None:
         if not self._mask_elision_decided:
@@ -8259,6 +8296,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 if isinstance(state.device_function.pid, ForEachProgramID):
                     pids.shared_pid_var = state.device_function.pid.shared_pid_var
                 pids.append(PIDInfo(pid_var, block_size_var, trip_count, block_id))
+                self._record_grid_origins(
+                    state, pid_var, block_size_var, [begin], [step]
+                )
                 state.add_statement(
                     env.backend.arange_expr(
                         offsets_var,
@@ -8325,6 +8365,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
 
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
+        self._record_grid_origins(state, pid_var, block_size_var, begins, steps)
 
         # A CuTe grid whose block size is 1 does not claim a thread axis: its
         # ``offsets = pid * 1 + thread_idx[axis]`` term is always 0 (launch dim
@@ -10555,6 +10596,8 @@ class PerThreadFlattenedTileStrategy(FlattenedTileStrategy):
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
         pids.append(PIDInfo(pid_var, block_size_var, total_numel, self.block_ids[0]))
+        begins, _, steps = self._extract_root_bounds(state)
+        self._record_grid_origins(state, pid_var, block_size_var, begins, steps)
         if vec_width > 1 and lane_strided:
             # The strided vec base folds the thread index in itself.
             state.add_statement(

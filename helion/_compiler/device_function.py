@@ -744,6 +744,13 @@ class DeviceFunction:
         expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
+        if env.codegen_name == "cute":
+            from .integer_power import prepare_integer_powers
+
+            # Expressions already evaluated on the host or in a device local
+            # need no new arithmetic. Prove integer powers only for the residual
+            # expression that will actually be evaluated in this device scope.
+            expr = prepare_integer_powers(expr, self)
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
@@ -1936,11 +1943,13 @@ class DeviceFunction:
             {k: v[0] for k, v in self._variable_renames.items()},
         )
         if CompileEnvironment.current().backend.name == "cute":
+            from .cute.backend import validate_thread_axis_accesses
             from .cute.boolean_guards import reassociate_boolean_guards
 
             # Type facts must see the final binding names, including every
             # loop-carried alias, before changing the SDK's Boolean tree shape.
             definition.body = reassociate_boolean_guards(definition.body)
+            validate_thread_axis_accesses([*prefix, definition])
         result = [*prefix, definition]
         if (
             CompileEnvironment.current().backend.name == "cute"
