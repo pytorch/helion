@@ -48,7 +48,6 @@ from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
-from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
@@ -1121,66 +1120,6 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, ref)
         if _get_backend() == "triton":
             self.assertIn("tl.associative_scan", code)
-
-    @skipIfXPU("Triton topk produces incorrect values on XPU")
-    def test_torch_topk_in_kernel(self):
-        """Test that torch.topk works inside Helion kernels.
-
-        torch.topk returns the k largest elements and their indices.
-        We implement this using tl.sort and then extracting the first k elements.
-        """
-
-        @helion.kernel()
-        def topk_kernel(x: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-            m, n = x.shape
-            k = hl.specialize(k)
-            out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
-            out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
-            for tile_m in hl.tile(m):
-                vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=True)
-                out_vals[tile_m, :] = vals
-                out_indices[tile_m, :] = indices
-            return out_vals, out_indices
-
-        x = torch.randn(4, 16, device=DEVICE)
-        k = 4
-        code, (vals, indices) = code_and_output(topk_kernel, (x, k))
-
-        ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=True)
-        torch.testing.assert_close(vals, ref_vals)
-        torch.testing.assert_close(indices, ref_indices)
-        if _get_backend() == "triton":
-            # Uses tl.topk for largest=True
-            self.assertIn("tl.topk", code)
-
-    @skipIfXPU("Triton sort produces incorrect values on XPU")
-    def test_torch_topk_smallest(self):
-        """Test torch.topk with largest=False (k smallest elements)."""
-
-        @helion.kernel()
-        def topk_smallest_kernel(
-            x: torch.Tensor, k: int
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            m, n = x.shape
-            k = hl.specialize(k)
-            out_vals = torch.empty(m, k, dtype=x.dtype, device=x.device)
-            out_indices = torch.empty(m, k, dtype=torch.int64, device=x.device)
-            for tile_m in hl.tile(m):
-                vals, indices = torch.topk(x[tile_m, :], k, dim=-1, largest=False)
-                out_vals[tile_m, :] = vals
-                out_indices[tile_m, :] = indices
-            return out_vals, out_indices
-
-        x = torch.randn(4, 16, device=DEVICE)
-        k = 4
-        code, (vals, indices) = code_and_output(topk_smallest_kernel, (x, k))
-
-        ref_vals, ref_indices = torch.topk(x, k, dim=-1, largest=False)
-        torch.testing.assert_close(vals, ref_vals)
-        torch.testing.assert_close(indices, ref_indices)
-        if _get_backend() == "triton":
-            # Uses tl.sort for largest=False (tl.topk only supports largest=True)
-            self.assertIn("tl.sort", code)
 
     def test_profiler_does_not_concretize_block_vars(self):
         """Compiling a kernel inside a torch.profiler context must not

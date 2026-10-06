@@ -1796,6 +1796,26 @@ class CompileEnvironment:
         assert isinstance(n, int)
         return n
 
+    def is_singleton_size(self, size: int | torch.SymInt) -> bool:
+        """Specialize input singletons without fixing configurable tile extents.
+
+        Backed input sizes need a binding-cache guard when collapsed. Allocation
+        sizes involving unbacked tile symbols must remain valid across configs,
+        even when their tracing hint happens to be one.
+        """
+        if not isinstance(size, torch.SymInt):
+            return size == 1
+        symbols = _symint_free_symbols(size)
+        if _has_unbacked(size._sympy_()):
+            return self.known_equal(size, 1)
+        singleton = bool(size == 1)
+        if singleton:
+            # ShapeEnv equality guards alone are not part of BoundKernel's
+            # cache key. Capture symbols before evaluating the equality, which
+            # may replace the backed expression with the constant one.
+            self.specialized_vars.update(symbols)
+        return singleton
+
     def known_equal(self, a: int | torch.SymInt, b: int | torch.SymInt) -> bool:
         if isinstance(a, torch.SymInt) or isinstance(b, torch.SymInt):
             sa = _symint_expr(a) if isinstance(a, torch.SymInt) else sympy.Integer(a)

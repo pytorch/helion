@@ -434,8 +434,7 @@ class ReductionStrategy(TileStrategy):
         self,
     ) -> tuple[int, int, str] | None:
         """Return ``(pre, group_span, lane_expr)`` for a reshape-merged
-        reduction whose live thread axis is interleaved with a *sibling*
-        thread axis, or ``None`` when no such interleaving exists.
+        reduction, including a contiguous or entirely serial source layout.
 
         When ``x[tile0, tile1, tile2].reshape(tile0, -1).sum(-1)`` merges
         ``tile1`` (a live thread axis) and ``tile2`` (a lane loop) into a
@@ -449,10 +448,9 @@ class ReductionStrategy(TileStrategy):
 
         This computes the ``pre`` (product of live thread extents on axes
         *below* the reduce axis) and ``group_span`` (``pre`` times the
-        reduce axis extent) used by ``_cute_grouped_reduce_warp``. Returns
-        ``None`` when ``pre == 1`` (no sibling axis below the reduce axis),
-        in which case the plain consecutive-lane warp reduction is already
-        correct.
+        reduce axis extent) used by ``_cute_grouped_reduce_warp``. A contiguous
+        group still needs an explicit source-lane owner when reshaping removes
+        the synthetic coordinate. Unsupported source layouts return ``None``.
         """
         env = CompileEnvironment.current()
         backend = env.backend
@@ -460,6 +458,8 @@ class ReductionStrategy(TileStrategy):
             return None
         numel = env.block_sizes[self.block_index].numel
         if not isinstance(numel, sympy.Expr):
+            return None
+        if numel != sympy.prod(numel.free_symbols):
             return None
         # Source block ids merged into this reduction dim by the reshape.
         source_block_ids: set[int] = set()
@@ -490,7 +490,31 @@ class ReductionStrategy(TileStrategy):
             reduce_axis = axis
             reduce_extent = max(reduce_extent, extent)
         if reduce_axis is None:
-            return None
+            # No source axis has hardware lanes. A single serial source lane
+            # plus active singleton tiles needs no physical thread reduction.
+            owners: set[str] = set()
+            for block_id in source_block_ids:
+                active = {
+                    id(loop): loop
+                    for loop in self.fn.codegen.active_device_loops.get(block_id, [])
+                    if isinstance(loop, DeviceLoopState)
+                    and isinstance(loop.strategy, PerThreadNDTileStrategy)
+                }
+                if len(active) != 1:
+                    return None
+                loop = next(iter(active.values()))
+                if block_id in loop.lane_loop_blocks:
+                    owner = cast(
+                        "PerThreadNDTileStrategy", loop.strategy
+                    )._lane_var_by_block.get(block_id)
+                    if owner is None:
+                        return None
+                    owners.add(owner)
+                elif self.fn.resolved_block_size(block_id) != 1:
+                    return None
+            if len(owners) != 1:
+                return None
+            return 1, 1, "0"
         # Live thread extents of ALL blocks (siblings included) so the linear
         # lane index strides are computed correctly. The reduction block's own
         # synthetic thread axis is excluded -- it is fictional (no real warp
@@ -508,12 +532,6 @@ class ReductionStrategy(TileStrategy):
         pre = 1
         for axis in range(reduce_axis):
             pre *= logical_axis_sizes.get(axis, 1)
-        if pre <= 1:
-            # No sibling thread axis below the reduce axis: the reduce axis is
-            # already at the bottom of the linear lane index, so consecutive
-            # warp lanes belong to the reduction and the plain warp reduce is
-            # correct.
-            return None
         group_span = pre * reduce_extent
         if group_span > 32:
             # Cross-warp grouped reduction is not handled by the marker path.
@@ -522,6 +540,104 @@ class ReductionStrategy(TileStrategy):
         if lane_expr is None:
             return None
         return pre, group_span, lane_expr
+
+    def _reshape_physical_reduction_group_params(
+        self, state: CodegenState
+    ) -> tuple[int, int, str] | None:
+        """Prove a merged reduction is distributed entirely over hardware lanes.
+
+        Unlike the serial-lane fallback, every source tile must fit its own
+        active physical axis. Two adjacent axes may form one warp group; an
+        unrelated axis between them, a partial tile, or a serial source cannot.
+        This records layout only. The post-wrap pass must also prove uniform
+        execution and the absence of the synthetic coordinate and loop.
+        """
+        env = CompileEnvironment.current()
+        numel = env.block_sizes[self.block_index].numel
+        if (
+            env.backend.name != "cute"
+            or self.fn.cute_state.simt_cluster_n != 1
+            or not isinstance(numel, sympy.Expr)
+            or numel != sympy.prod(numel.free_symbols)
+        ):
+            return None
+        sources: set[int] = set()
+        for symbol in numel.free_symbols:
+            block_id = env.get_block_id(symbol)
+            if block_id is None:
+                return None
+            sources.add(env.canonical_block_id(block_id))
+        if len(sources) < 2:
+            return None
+        dispatch = self.fn.tile_strategy
+        source_axes: set[int] = set()
+        for block_id in sources:
+            active = {
+                id(loop): loop
+                for loop in state.codegen.active_device_loops.get(block_id, [])
+                if isinstance(loop, DeviceLoopState)
+                and isinstance(loop.strategy, PerThreadNDTileStrategy)
+            }
+            if len(active) != 1:
+                return None
+            loop = next(iter(active.values()))
+            if block_id in loop.lane_loop_blocks:
+                return None
+            size = self.fn.resolved_block_size(block_id)
+            if size is None:
+                return None
+            axis = loop.block_thread_axes.get(block_id)
+            if axis is None:
+                if size != 1:
+                    return None
+                continue
+            if (
+                axis not in range(3)
+                or dispatch.thread_axis_for_block_id(block_id) != axis
+                or dispatch.thread_extent_for_block_id(block_id) != size
+                or axis in source_axes
+            ):
+                return None
+            if size > 1:
+                source_axes.add(axis)
+
+        # Use only actual active source/sibling axes, not the fictional merged
+        # strategy. Final launch dimensions are likewise based on live indices.
+        sizes: dict[int, int] = {}
+        for block_id, loops in state.codegen.active_device_loops.items():
+            for loop in loops:
+                if not isinstance(loop, (DeviceGridState, DeviceLoopState)):
+                    continue
+                axis = loop.block_thread_axes.get(block_id)
+                if axis is None or block_id == self.block_index:
+                    continue
+                extent = dispatch.thread_extent_for_block_id(block_id)
+                if extent is None or axis not in range(3):
+                    return None
+                if extent > 1:
+                    if axis in sizes and sizes[axis] != extent:
+                        return None
+                    sizes[axis] = extent
+                    if axis in source_axes and block_id not in sources:
+                        return None
+        if not source_axes:
+            return 1, 1, "0"
+        first, last = min(source_axes), max(source_axes)
+        if any(axis not in source_axes for axis in sizes if first <= axis <= last):
+            return None
+        pre = 1
+        span = 1
+        for axis in range(last + 1):
+            extent = sizes.get(axis, 1)
+            if extent <= 0 or extent & (extent - 1):
+                return None
+            if axis < first:
+                pre *= extent
+            span *= extent
+        if span > 32:
+            return None
+        lane_expr = env.backend.thread_linear_index_expr(sizes)
+        return (pre, span, lane_expr) if lane_expr is not None else None
 
     def _lane_reduce_marker_unsupported(self, state: CodegenState) -> bool:
         """Return True when the two-pass lane-reduction marker cannot be
@@ -649,6 +765,10 @@ class ReductionStrategy(TileStrategy):
                                 owners.add(owner)
                                 covered.add(block_id)
                         elif block_id in loop.block_thread_axes:
+                            covered.add(block_id)
+                        elif self.fn.resolved_block_size(block_id) == 1:
+                            # An active singleton tile contributes no lane or
+                            # hardware coordinate to the merged reduction.
                             covered.add(block_id)
                     if (
                         covered == source_blocks
@@ -1062,6 +1182,14 @@ class PersistentReductionStrategy(ReductionStrategy):
             isinstance(graph, ReductionLoopGraphInfo) and block_index in graph.block_ids
             for graph in fn.codegen.codegen_graphs
         )
+        merged_tiled_extent = (
+            isinstance(numel, sympy.Expr)
+            and len(numel.free_symbols) >= 2
+            and numel == sympy.prod(numel.free_symbols)
+            and all(
+                env.get_block_id(symbol) is not None for symbol in numel.free_symbols
+            )
+        )
         if self._thread_count > 0:
             # For a non-graph-reduction dim we always try to recover the
             # full extent through a synthetic lane loop. For a graph
@@ -1074,15 +1202,26 @@ class PersistentReductionStrategy(ReductionStrategy):
             # graph-reduction dim only addresses the first ``thread_count``
             # elements (e.g. layer_norm_bwd's feature axis), leaving the
             # remaining columns/partial sums uncomputed.
-            needs_synthetic = not is_graph_reduction_dim or (
-                self._thread_count < next_power_of_2(size_hint)
-                if max_threads is not None
-                else False
+            needs_synthetic = (
+                merged_tiled_extent
+                or not is_graph_reduction_dim
+                or (
+                    self._thread_count < next_power_of_2(size_hint)
+                    if max_threads is not None
+                    else False
+                )
             )
             if needs_synthetic:
                 lane_extent = env.backend.create_synthetic_reduction_lanes(
                     self._thread_count, size_hint
                 )
+                # A merged tiled axis can still contain a serial source lane
+                # when its configured total extent fits in one warp. Keep an
+                # explicit logical owner for the reduction; after wrapping,
+                # resolve_pruned_lane_owners maps unused synthetic coordinates
+                # back to the proven source lane and its physical subgroup.
+                if lane_extent is None and merged_tiled_extent:
+                    lane_extent = 1
                 # One complete vector per live thread: the requested V exactly
                 # covers each thread's synthetic slice, so the lane loop is a
                 # constexpr V-fold with no loop-carried lanes.  The memory-op
@@ -1681,6 +1820,16 @@ class PersistentReductionStrategy(ReductionStrategy):
                 constant_repr(default), _dtype_str(acc_dtype)
             )
             group_params = self._reshape_merged_reduction_group_params()
+            physical_group = self._reshape_physical_reduction_group_params(state)
+            if physical_group is not None:
+                group_params = physical_group
+                previous = self.fn.cute_state.reshape_physical_fallbacks.setdefault(
+                    self._synthetic_cute_lane_var, physical_group
+                )
+                if previous != physical_group:
+                    raise exc.BackendUnsupported(
+                        "cute", "reshape reduction has conflicting physical groups"
+                    )
             owner_lane = self._lane_reduce_owner(state, reshape_group=group_params)
             if group_params is not None:
                 group_pre, group_span, group_lane_expr = group_params

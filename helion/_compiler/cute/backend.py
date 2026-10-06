@@ -1476,6 +1476,8 @@ class CuteBackend(Backend):
                 "cute_materialized_operand_schedule",
                 "cute_fragment_scan",
                 "cute_fragment_reduction",
+                "cute_fragment_threads",
+                "cute_fragment_register_loads",
                 "cute_pointwise_pid_type",
             }
             or key == "cute_async_store_policy"

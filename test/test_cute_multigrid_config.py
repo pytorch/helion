@@ -13,6 +13,7 @@ from .test_cute_grid_launch_extents import _launch_block
 from .test_cute_grid_launch_extents import _merged_copy
 from .test_cute_grid_launch_extents import _mixed_rank_copy
 from .test_cute_grid_launch_extents import _opposed_grids
+from .test_cute_grid_launch_extents import _single_thread_axis
 import helion
 from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
 from helion._testing import DEVICE
@@ -98,7 +99,7 @@ def test_independent_mixed_rank_threads_roundtrip(
         assert result.num_threads == list(threads)
         assert result.block_sizes == config.block_sizes
         assert result.config["cute_vector_widths"] == [1, vector, 1]
-        assert _launch_block(bound.to_code(result)) == (1, max(threads), 1)
+        _single_thread_axis(bound.to_code(result), max(threads))
 
 
 @pytest.mark.parametrize("flatten", [False, True])
@@ -230,7 +231,7 @@ def test_multigrid_pointwise_seeds_transfer_by_live_block_id(
             and config.num_threads == [128, 128]
             and config.config["cute_vector_widths"] == [1, width, 1]
         )
-        assert _launch_block(bound.to_code(target)) == (1, 128, 1)
+        _single_thread_axis(bound.to_code(target), 128)
 
 
 def test_single_root_extra_vector_slot_seed_transfer() -> None:

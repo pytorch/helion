@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import operator
 import unittest
 from unittest.mock import patch
 
@@ -676,10 +677,16 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
             return x
 
         x = torch.ones(256, device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(
-            helion.exc.AtomicOnDeviceTensor,
-            r"hl\.atomic_add\(\)",
-        ):
+        error = helion.exc.AtomicOnDeviceTensor
+        message = r"hl\.atomic_add\(\)"
+        if _get_backend() == "cute":
+            # CuTe supports constant CTA-local allocations, but this allocation
+            # is tile-dependent and therefore has no supported local owner.
+            error = helion.exc.InvalidConfig
+            message = (
+                "CTA-local atomics require a constant one-dimensional root allocation"
+            )
+        with self.assertRaisesRegex(error, message):
             kernel(x)
 
     def test_atomic_and(self):
@@ -1439,6 +1446,1219 @@ class TestAtomicLogicalAxesNative(TestCase):
         )
         torch.testing.assert_close(copied, values, rtol=0, atol=0)
         torch.testing.assert_close(result, row_values, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_histogram(
+    x, bins: hl.constexpr, repeats: hl.constexpr, mode: hl.constexpr
+):
+    out = torch.empty((x.size(0), bins), dtype=x.dtype, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.full([bins], 3, dtype=x.dtype)
+        indices = hl.arange(x.size(1)) % bins
+        values = x[row, :]
+        if mode == "bounds":
+            indices = hl.arange(x.size(1)) - 1
+        for _iteration in range(repeats):
+            if mode == "alias":
+                alias = local[:, None]
+                hl.atomic_add(alias, [indices, 0], values)
+            elif mode == "result":
+                previous = hl.atomic_add(local, [indices], values)
+                out[row, :] = previous
+            elif mode == "release":
+                hl.atomic_add(local, [indices], values, sem="release")
+            elif mode == "divergent":
+                if x[row, 0] > 0:
+                    hl.atomic_add(local, [indices], values)
+            elif mode == "early_read":
+                out[row, :] = local
+                hl.atomic_add(local, [indices], values)
+            elif mode == "nested":
+                for inner in range(2):
+                    hl.atomic_add(local, [indices], values * (inner + 1))
+            elif mode == "counts":
+                hl.atomic_add(local, [indices], 1)
+            elif mode == "self_value":
+                hl.atomic_add(local, [indices], local)
+            else:
+                hl.atomic_add(local, [indices], values)
+        out[row, :] = local
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_subnormal(x):
+    out = torch.empty((x.size(0), 1), dtype=x.dtype, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([1], dtype=x.dtype)
+        indices = hl.arange(x.size(1)) * 0
+        hl.atomic_add(local, [indices], x[row, :])
+        out[row, :] = local
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_flush(x, out):
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=x.dtype)
+        indices = hl.arange(x.size(1)) % 17
+        hl.atomic_add(local, [indices], x[row, :])
+        hl.atomic_add(out, [0, hl.arange(17)], local)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_negative(x, mode: hl.constexpr):
+    out = torch.empty((x.size(0), 17), device=x.device, dtype=x.dtype)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=x.dtype)
+        if mode == "last":
+            hl.atomic_add(local, [-1], x[row, 0])
+        elif mode == "first":
+            hl.atomic_add(local, [-17], x[row, 0])
+        elif mode == "invalid":
+            hl.atomic_add(local, [17], x[row, 0])
+        else:
+            hl.atomic_add(local, [hl.arange(x.size(1)) - 17], x[row, :])
+        out[row, :] = local
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_negative_flush(x, out):
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=x.dtype)
+        hl.atomic_add(local, [hl.arange(17)], x[row, :])
+        hl.atomic_add(out, [row - x.size(0), hl.arange(17) - 17], local)
+    return out
+
+
+def _simulate_local_atomic_program(source, x, shape):
+    """Run complete generated phases; this models coordinates, not GPU races."""
+    import ast
+    import math
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    calls = []
+
+    class Pointer:
+        def __init__(self, values, written=None, offset=0):
+            self.values, self.written, self.offset = values, written, int(offset)
+
+        def __add__(self, offset):
+            return Pointer(self.values, self.written, self.offset + int(offset))
+
+        @property
+        def llvm_ptr(self):
+            return self
+
+        def load(self):
+            assert 0 <= self.offset < self.values.size
+            if self.written is not None:
+                assert self.written[self.offset], "read before shared initialization"
+            return self.values[self.offset]
+
+        def store(self, value):
+            assert 0 <= self.offset < self.values.size
+            self.values[self.offset] = value
+            if self.written is not None:
+                self.written[self.offset] = True
+
+    class Shared:
+        def __init__(self, dtype, shape):
+            self.values = np.empty(math.prod(shape), dtype=dtype)
+            self.written = np.zeros(self.values.size, dtype=bool)
+            self.iterator = Pointer(self.values, self.written)
+
+        def __getitem__(self, index):
+            return (self.iterator + index).load()
+
+        def __setitem__(self, index, value):
+            (self.iterator + index).store(value)
+
+    class Allocator:
+        def allocate_tensor(self, dtype, layout, byte_alignment):
+            assert byte_alignment == 16
+            return Shared(dtype, layout)
+
+    def atomic_add(pointer, value, *, sem, scope):
+        assert sem == "relaxed" and scope in ("cta", "gpu")
+        assert (pointer.written is not None) == (scope == "cta")
+        previous = pointer.load()
+        pointer.store(previous + value)
+        calls.append(pointer.offset)
+        return previous
+
+    class SerialPhases(ast.NodeTransformer):
+        def visit_For(self, node):
+            node = self.generic_visit(node)
+            if isinstance(node.target, ast.Name) and node.target.id.startswith(
+                "fragment_index"
+            ):
+                assert isinstance(node.iter, ast.Call) and len(node.iter.args) == 3
+                node.iter.args[0] = ast.Constant(0)
+                node.iter.args[2] = ast.Constant(1)
+            return node
+
+    tree = ast.parse(source)
+    function = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    )
+    function.decorator_list = []
+    function = SerialPhases().visit(function)
+    module = ast.fix_missing_locations(
+        ast.Module(
+            body=[*[n for n in tree.body if isinstance(n, ast.Assign)], function],
+            type_ignores=[],
+        )
+    )
+    input_array = x.numpy().reshape(-1)
+    output = np.zeros(shape, dtype=input_array.dtype)
+    for row in range(x.size(0)):
+        environment = {
+            "operator": operator,
+            "cutlass": SimpleNamespace(
+                Int32=np.int32,
+                Int64=np.int64,
+                Float32=np.float32,
+                Boolean=bool,
+                utils=SimpleNamespace(SmemAllocator=Allocator),
+            ),
+            "cute": SimpleNamespace(
+                math=SimpleNamespace(
+                    min=lambda left, right, propagate_nan=True: (
+                        np.minimum(left, right)
+                        if propagate_nan
+                        else np.fmin(left, right)
+                    ),
+                    max=lambda left, right, propagate_nan=True: (
+                        np.maximum(left, right)
+                        if propagate_nan
+                        else np.fmax(left, right)
+                    ),
+                ),
+                make_layout=lambda shape: shape,
+                arch=SimpleNamespace(
+                    thread_idx=lambda: (0, 0, 0),
+                    block_idx=lambda row=row: (row, 0, 0),
+                    sync_threads=lambda: None,
+                    atomic_add=atomic_add,
+                ),
+            ),
+        }
+        exec(compile(module, "<local-atomic-generated>", "exec"), environment)
+        arguments = {
+            "x": SimpleNamespace(iterator=Pointer(input_array)),
+            "out": SimpleNamespace(iterator=Pointer(output.reshape(-1))),
+        }
+        environment[function.name](*(arguments[arg.arg] for arg in function.args.args))
+    return torch.from_numpy(output), calls
+
+
+class TestLocalAtomicCPU(unittest.TestCase):
+    def test_local_atomic_generated_counts_repeats_tails(self):
+        for rows, width, bins, repeats in (
+            (1, 1, 1, 1),
+            (3, 65, 17, 3),
+            (2, 257, 31, 2),
+        ):
+            for dtype in (torch.int32, torch.float32):
+                with self.subTest(
+                    rows=rows, width=width, bins=bins, repeats=repeats, dtype=dtype
+                ):
+                    x = torch.arange(rows * width, dtype=dtype).reshape(rows, width) % 7
+                    source = _atomic_logical_axes_codegen(
+                        _local_atomic_histogram, (x, bins, repeats, "plain"), []
+                    )
+                    actual, calls = _simulate_local_atomic_program(
+                        source, x, (rows, bins)
+                    )
+                    expected = torch.full((rows, bins), 3, dtype=dtype)
+                    expected.scatter_add_(
+                        1, (torch.arange(width) % bins).expand(rows, -1), x * repeats
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.assertEqual(len(calls), rows * width * repeats)
+                    self.assertIn("scope='cta'", source)
+                    self.assertIn("block=(128, 1, 1)", source)
+
+    def test_local_atomic_nested_loops_scalar_contributions_and_global_flush(self):
+        x = torch.arange(3 * 65, dtype=torch.int32).reshape(3, 65) % 7
+        indices = (torch.arange(65) % 17).expand(3, -1)
+        for mode in ("nested", "counts"):
+            source = _atomic_logical_axes_codegen(
+                _local_atomic_histogram, (x, 17, 2, mode), []
+            )
+            actual, calls = _simulate_local_atomic_program(source, x, (3, 17))
+            expected = torch.full((3, 17), 3, dtype=torch.int32)
+            expected.scatter_add_(
+                1, indices, x * 6 if mode == "nested" else torch.full_like(x, 2)
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertEqual(len(calls), x.numel() * (4 if mode == "nested" else 2))
+        out = torch.zeros((1, 17), dtype=x.dtype)
+        source = _atomic_logical_axes_codegen(_local_atomic_flush, (x, out), [])
+        actual, calls = _simulate_local_atomic_program(source, x, (1, 17))
+        expected = torch.zeros_like(out).scatter_add_(
+            1, indices.reshape(1, -1), x.reshape(1, -1)
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(len(calls), x.numel() + 3 * 17)
+
+    def test_local_atomic_masks_logical_non_power_of_two_bounds(self):
+        x = torch.arange(2 * 65, dtype=torch.int32).reshape(2, 65)
+        source = _atomic_logical_axes_codegen(
+            _local_atomic_histogram, (x, 17, 2, "bounds"), []
+        )
+        actual, calls = _simulate_local_atomic_program(source, x, (2, 17))
+        expected = 3 + 2 * x[:, 1:18]
+        expected[:, -1] += 2 * x[:, 0]
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(len(calls), 2 * 18 * 2)
+
+    def test_local_atomic_valid_negative_indices_and_flush(self):
+        x = torch.arange(1, 35, dtype=torch.int32).reshape(2, 17)
+        for mode in ("last", "first", "tensor"):
+            source = _atomic_logical_axes_codegen(_local_atomic_negative, (x, mode), [])
+            actual, calls = _simulate_local_atomic_program(source, x, (2, 17))
+            expected = torch.zeros_like(x)
+            if mode == "tensor":
+                expected.copy_(x)
+            else:
+                expected[:, -1 if mode == "last" else 0] = x[:, 0]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            self.assertEqual(len(calls), x.numel() if mode == "tensor" else 2)
+        out = torch.zeros_like(x)
+        source = _atomic_logical_axes_codegen(
+            _local_atomic_negative_flush, (x, out), []
+        )
+        actual, calls = _simulate_local_atomic_program(source, x, x.shape)
+        torch.testing.assert_close(actual, x, rtol=0, atol=0)
+        self.assertEqual(len(calls), 2 * x.numel())
+
+    def test_local_atomic_invalid_static_index_rejects(self):
+        from helion import exc
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "static index"):
+            _atomic_logical_axes_codegen(
+                _local_atomic_negative, (torch.ones((2, 17)), "invalid"), []
+            )
+
+    def test_local_atomic_shared_subnormal_arithmetic(self):
+        tiny = torch.finfo(torch.float32).tiny
+        x = torch.full((2, 2), tiny / 2)
+        source = _atomic_logical_axes_codegen(_local_atomic_subnormal, (x,), [])
+        actual, calls = _simulate_local_atomic_program(source, x, (2, 1))
+        torch.testing.assert_close(actual, torch.full((2, 1), tiny), rtol=0, atol=0)
+        self.assertEqual(len(calls), 4)
+        # Global FP32 atomic inputs would each flush to zero, unlike shared adds.
+        self.assertTrue(torch.all(x.abs() < tiny))
+
+    def test_local_atomic_rejects_unsupported_ownership(self):
+        from helion import exc
+
+        for mode in ("alias", "result", "release", "divergent", "early_read"):
+            with self.subTest(mode=mode), self.assertRaises(exc.InvalidConfig):
+                _atomic_logical_axes_codegen(
+                    _local_atomic_histogram, (torch.ones((2, 17)), 17, 2, mode), []
+                )
+
+    def test_local_atomic_rejects_self_reading_updates(self):
+        from helion import exc
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "do not read"):
+            _atomic_logical_axes_codegen(
+                _local_atomic_histogram, (torch.ones((2, 32)), 32, 2, "self_value"), []
+            )
+
+    def test_local_atomic_capacity_rejection(self):
+        from helion import exc
+
+        with self.assertRaisesRegex(exc.InvalidConfig, "shared bytes"):
+            _atomic_logical_axes_codegen(
+                _local_atomic_histogram, (torch.ones((1, 17)), 131072, 1, "plain"), []
+            )
+
+
+@onlyBackends("cute")
+class TestLocalAtomicNative(TestCase):
+    def test_local_atomic_counts_repeats_tails(self):
+        for dtype in (torch.int32, torch.float32):
+            x = torch.arange(3 * 257, device=DEVICE, dtype=dtype).reshape(3, 257) % 7
+            _, actual = code_and_output(_local_atomic_histogram, (x, 17, 3, "plain"))
+            expected = torch.full((3, 17), 3, dtype=dtype, device=DEVICE)
+            expected.scatter_add_(
+                1, (torch.arange(257, device=DEVICE) % 17).expand(3, -1), x * 3
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        x = torch.arange(1, 35, device=DEVICE, dtype=torch.int32).reshape(2, 17)
+        for mode in ("last", "first", "tensor"):
+            _, actual = code_and_output(_local_atomic_negative, (x, mode))
+            expected = torch.zeros_like(x)
+            if mode == "tensor":
+                expected.copy_(x)
+            else:
+                expected[:, -1 if mode == "last" else 0] = x[:, 0]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        out = torch.zeros_like(x)
+        _, actual = code_and_output(_local_atomic_negative_flush, (x, out))
+        torch.testing.assert_close(actual, x, rtol=0, atol=0)
+
+    def test_local_atomic_nested_and_global_flush(self):
+        x = torch.arange(3 * 65, device=DEVICE, dtype=torch.int32).reshape(3, 65) % 7
+        _, actual = code_and_output(_local_atomic_histogram, (x, 17, 2, "nested"))
+        indices = (torch.arange(65, device=DEVICE) % 17).expand(3, -1)
+        expected = torch.full((3, 17), 3, device=DEVICE, dtype=x.dtype).scatter_add_(
+            1, indices, x * 6
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        out = torch.zeros((1, 17), device=DEVICE, dtype=x.dtype)
+        _, actual = code_and_output(_local_atomic_flush, (x, out))
+        expected = torch.zeros_like(out).scatter_add_(
+            1, indices.reshape(1, -1), x.reshape(1, -1)
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_local_atomic_preserves_subnormals(self):
+        tiny = torch.finfo(torch.float32).tiny
+        x = torch.full((2, 2), tiny / 2, device=DEVICE)
+        _, actual = code_and_output(_local_atomic_subnormal, (x,))
+        torch.testing.assert_close(
+            actual, torch.full((2, 1), tiny, device=DEVICE), rtol=0, atol=0
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _register_load_histogram(x, repeats: hl.constexpr, capacity: hl.constexpr):
+    out = torch.empty((x.size(0), 17), dtype=torch.float32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.float32)
+        for iteration in range(repeats):
+            columns = hl.arange(capacity)
+            values = hl.load(x, [row, columns], extra_mask=columns < x.size(1))
+            contribution = torch.where(
+                columns < x.size(1),
+                values.to(torch.float32) + iteration,
+                0.0,
+            )
+            indices = columns % 17
+            hl.atomic_add(local, [indices], contribution)
+            hl.atomic_add(local, [indices], contribution * 2)
+        out[row, :] = local
+    return out
+
+
+def _register_load_codegen(x, enabled, threads=128, repeats=3):
+    from unittest.mock import patch
+
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    with (
+        _mock_cuda_unavailable(),
+        _target(),
+        _forbid_native_compile(),
+        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+    ):
+        bound = _cpu_bind(
+            _register_load_histogram, (x, repeats, 1 << (x.size(1) - 1).bit_length())
+        )
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_register_loads=enabled, cute_fragment_threads=threads
+        )
+        return bound.to_code(config)
+
+
+def _simulate_register_load_program(
+    source, x, threads, *, host_tensors=None, lane_order=None
+):
+    """Execute each actual thread as a coroutine, rendezvousing at CTA barriers."""
+    import ast
+    import operator
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    state = {"lane": 0, "row": 0, "shared": [], "barriers": 0}
+
+    class Pointer:
+        def __init__(self, values, offset=0):
+            self.values, self.offset = values, int(offset)
+
+        def __add__(self, offset):
+            return Pointer(self.values, self.offset + int(offset))
+
+        @property
+        def llvm_ptr(self):
+            return self
+
+        def load(self):
+            assert 0 <= self.offset < self.values.numel()
+            return self.values.flatten()[self.offset].item()
+
+        def store(self, value):
+            assert 0 <= self.offset < self.values.numel()
+            self.values.flatten()[self.offset] = float(value)
+
+    class Shared:
+        def __init__(self, count):
+            self.values = torch.full((count,), float("nan"))
+            self.iterator = Pointer(self.values)
+
+        def __getitem__(self, index):
+            return (self.iterator + index).load()
+
+        def __setitem__(self, index, value):
+            (self.iterator + index).store(value)
+
+    class Allocator:
+        def __init__(self):
+            self.ordinal = 0
+
+        def allocate_tensor(self, dtype, layout, byte_alignment):
+            assert byte_alignment == 16
+            ordinal = self.ordinal
+            self.ordinal += 1
+            if len(state["shared"]) == ordinal:
+                state["shared"].append(Shared(layout[0]))
+            return state["shared"][ordinal]
+
+    def atomic_add(pointer, value, *, sem, scope):
+        assert sem == "relaxed" and scope in ("cta", "gpu")
+        old = pointer.load()
+        assert not np.isnan(old), "atomic before shared initialization"
+        pointer.store(np.float32(np.float32(old) + np.float32(value)))
+        return old
+
+    class Barriers(ast.NodeTransformer):
+        def visit_Expr(self, node):
+            if (
+                isinstance(node.value, ast.Call)
+                and ast.unparse(node.value.func) == "cute.arch.sync_threads"
+            ):
+                return ast.copy_location(
+                    ast.Expr(ast.Yield(ast.Constant(node.lineno))), node
+                )
+            return self.generic_visit(node)
+
+    tree = ast.parse(source)
+    fn = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+    )
+    fn.decorator_list = []
+    fn = Barriers().visit(fn)
+    tree = ast.fix_missing_locations(
+        ast.Module(
+            body=[*[n for n in tree.body if isinstance(n, ast.Assign)], fn],
+            type_ignores=[],
+        )
+    )
+    out = torch.full((x.size(0), 17), -999.0)
+    env = {
+        "operator": operator,
+        "cutlass": SimpleNamespace(
+            Int32=np.int32,
+            Int64=np.int64,
+            Float32=np.float32,
+            Float64=np.float64,
+            Float16=np.float16,
+            BFloat16=lambda value: torch.tensor(float(value)).bfloat16().item(),
+            Boolean=bool,
+            utils=SimpleNamespace(SmemAllocator=Allocator),
+        ),
+        "cute": SimpleNamespace(
+            make_layout=lambda shape: shape,
+            arch=SimpleNamespace(
+                thread_idx=lambda: (state["lane"], 0, 0),
+                block_idx=lambda: (state["row"], 0, 0),
+                atomic_add=atomic_add,
+            ),
+        ),
+    }
+    exec(compile(tree, "<actual-register-load-threads>", "exec"), env)
+    for row in range(x.size(0)):
+        state.update(row=row, shared=[])
+        args = {
+            "x": SimpleNamespace(iterator=Pointer(x)),
+            "out": SimpleNamespace(iterator=Pointer(out)),
+        }
+        if host_tensors is not None:
+            args.update(
+                {
+                    name: SimpleNamespace(iterator=Pointer(value))
+                    for name, value in host_tensors.items()
+                }
+            )
+        order = list(range(threads)) if lane_order is None else lane_order
+        assert sorted(order) == list(range(threads))
+        lanes = [
+            env[fn.name](*(args[arg.arg] for arg in fn.args.args))
+            for _ in range(threads)
+        ]
+        while True:
+            reached = []
+            for lane in order:
+                program = lanes[lane]
+                state["lane"] = lane
+                try:
+                    reached.append(next(program))
+                except StopIteration:
+                    reached.append(None)
+            assert len(set(reached)) == 1, "divergent CTA barriers"
+            if reached[0] is None:
+                break
+            state["barriers"] += 1
+    return out, state["barriers"]
+
+
+class TestFragmentRegisterLoadsCPU(unittest.TestCase):
+    def test_register_loads_typing_tails_and_loop_refresh(self):
+        for dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float64,
+            torch.int32,
+            torch.int64,
+        ):
+            for columns in (17, 65, 128, 129):
+                with self.subTest(dtype=dtype, columns=columns):
+                    x = (torch.arange(3 * columns).reshape(3, columns) % 11).to(dtype)
+                    # One-element lanes follow the reference's accumulation
+                    # order. Multi-element fallback uses exact integer sums;
+                    # its legal per-thread atomic interleaving differs.
+                    if dtype.is_floating_point and columns <= 128:
+                        x = (x.double() * 0.1 + 2**-30).to(dtype)
+                    elif dtype == torch.int64 and columns <= 128:
+                        x += (1 << 24) + 1
+                    before = _register_load_codegen(x, False)
+                    after = _register_load_codegen(x, True)
+                    expected = torch.zeros((3, 17))
+                    index = (torch.arange(columns) % 17).expand(3, -1)
+                    for iteration in range(3):
+                        expected.scatter_add_(1, index, x.float() + iteration)
+                        expected.scatter_add_(1, index, (x.float() + iteration) * 2)
+                    old, old_barriers = _simulate_register_load_program(before, x, 128)
+                    actual, barriers = _simulate_register_load_program(after, x, 128)
+                    torch.testing.assert_close(old, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.assertEqual("fragment_register_load" in after, columns <= 128)
+                    self.assertEqual(
+                        old_barriers - barriers, 3 * x.size(0) if columns <= 128 else 0
+                    )
+
+    def test_register_loads_preserve_shared_subnormals(self):
+        x = torch.full((2, 17), torch.finfo(torch.float32).tiny / 2)
+        for enabled in (False, True):
+            source = _register_load_codegen(x, enabled, repeats=1)
+            actual, _barriers = _simulate_register_load_program(source, x, 128)
+            expected = torch.zeros((2, 17))
+            for iteration in range(1):
+                value = x + iteration
+                expected += value
+                expected += value * 2
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@onlyBackends("cute")
+class TestFragmentRegisterLoadsNative(TestCase):
+    def test_register_loads_values_and_fallback(self):
+        for threads, columns in ((32, 17), (128, 65), (128, 129), (512, 129)):
+            with self.subTest(threads=threads, columns=columns):
+                x = (
+                    torch.arange(3 * columns, device=DEVICE).reshape(3, columns) % 11
+                ).float()
+                before = x.clone()
+                args = (x, 3, 1 << (columns - 1).bit_length())
+                reference = torch.zeros((3, 17), device=DEVICE)
+                indices = (torch.arange(columns, device=DEVICE) % 17).expand(3, -1)
+                for iteration in range(3):
+                    reference.scatter_add_(1, indices, (x + iteration) * 3)
+                for enabled in (False, True):
+                    code, actual = code_and_output(
+                        _register_load_histogram,
+                        args,
+                        cute_fragment_threads=threads,
+                        cute_fragment_register_loads=enabled,
+                    )
+                    torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+                    torch.testing.assert_close(x, before, rtol=0, atol=0)
+                    self.assertEqual(
+                        "fragment_register_load" in code, enabled and args[2] <= threads
+                    )
+
+    def test_register_loads_cross_warp_alias_ordering(self):
+        original = torch.arange(256, device=DEVICE).reshape(2, 128).float()
+        z = torch.full_like(original, 2)
+        indices = (torch.arange(128, device=DEVICE) % 17).expand(2, -1)
+        expected = torch.zeros((2, 17), device=DEVICE).scatter_add_(
+            1, indices, original + z
+        )
+        for mode in ("dependent_store", "unrelated_atomic"):
+            for aliased in (False, True):
+                for enabled in (False, True):
+                    with self.subTest(mode=mode, aliased=aliased, enabled=enabled):
+                        x = original.clone()
+                        y = x.view_as(x) if aliased else torch.full_like(x, 500)
+                        before_y = y.clone()
+                        _code, actual = code_and_output(
+                            _register_load_cross_lane_effect,
+                            (x, y, z, mode),
+                            cute_fragment_register_loads=enabled,
+                        )
+                        contribution = (
+                            original + 1
+                            if mode == "dependent_store"
+                            else torch.arange(128, device=DEVICE).float().expand(2, -1)
+                            + 1000
+                        )
+                        target = torch.flip(contribution, [1])
+                        if mode == "unrelated_atomic":
+                            target += before_y
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        torch.testing.assert_close(y, target, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            z, torch.full_like(z, 2), rtol=0, atol=0
+                        )
+                        if not aliased:
+                            torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+    def test_register_loads_index_logical_domain(self):
+        for width in (17, 65, 129):
+            x = (torch.arange(2 * width, device=DEVICE).reshape(2, width) % 7).int()
+            expected = torch.zeros((2, 17), device=DEVICE).scatter_add_(
+                1, x.long(), torch.full(x.shape, 6.0, device=DEVICE)
+            )
+            for enabled in (False, True):
+                with self.subTest(width=width, enabled=enabled):
+                    before = x.clone()
+                    code, actual = code_and_output(
+                        _register_load_index_domain,
+                        (x,),
+                        cute_fragment_register_loads=enabled,
+                    )
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(x, before, rtol=0, atol=0)
+                    self.assertEqual(
+                        "fragment_register_load" in code, enabled and width <= 128
+                    )
+
+    def test_register_loads_shared_subnormals(self):
+        x = torch.full((2, 17), torch.finfo(torch.float32).tiny / 2, device=DEVICE)
+        for enabled in (False, True):
+            _code, actual = code_and_output(
+                _register_load_histogram,
+                (x, 1, 32),
+                cute_fragment_register_loads=enabled,
+            )
+            torch.testing.assert_close(actual, x * 3, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _register_load_mutation(x):
+    out = torch.empty((x.size(0), 17), dtype=torch.float32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.float32)
+        values = x[row, :]
+        x[row, :] = values + 1
+        indices = hl.arange(x.size(1)) % 17
+        hl.atomic_add(local, [indices], values)
+        refreshed = x[row, :]
+        hl.atomic_add(local, [indices], refreshed)
+        out[row, :] = local
+    return out
+
+
+class TestFragmentRegisterLifetimeCPU(unittest.TestCase):
+    def test_register_load_snapshots_survive_alias_store_and_reload(self):
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        x = torch.arange(64).reshape(2, 32).float()
+        expected = torch.zeros((2, 17))
+        index = (torch.arange(32) % 17).expand(2, -1)
+        expected.scatter_add_(1, index, x)
+        expected.scatter_add_(1, index, x + 1)
+        for enabled in (False, True):
+            with (
+                _mock_cuda_unavailable(),
+                _target(),
+                _forbid_native_compile(),
+                patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+            ):
+                bound = _cpu_bind(_register_load_mutation, (x,))
+                config = bound.config_spec.default_config()
+                config.config["cute_fragment_register_loads"] = enabled
+                if enabled:
+                    self.assertFalse(
+                        bound.config_spec.cute_fragment_register_load_root_ids
+                    )
+                    with self.assertRaisesRegex(
+                        helion.exc.InvalidConfig, "lane-private"
+                    ):
+                        bound.to_code(config)
+                    continue
+                source = bound.to_code(config)
+            actual_input = x.clone()
+            actual, _barriers = _simulate_register_load_program(
+                source, actual_input, 128
+            )
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            torch.testing.assert_close(actual_input, x + 1, rtol=0, atol=0)
+            self.assertEqual("fragment_register_load" in source, enabled)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _register_load_cross_lane_effect(x, y, z, mode: hl.constexpr):
+    out = torch.empty((x.size(0), 17), dtype=torch.float32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.float32)
+        values = x[row, :]
+        columns = hl.arange(x.size(1))
+        if mode == "dependent_store":
+            y[row, x.size(1) - 1 - columns] = values + 1
+        elif mode == "unrelated_store":
+            y[row, x.size(1) - 1 - columns] = columns.to(torch.float32) + 1000
+        elif mode == "dependent_atomic":
+            hl.atomic_add(y, [row, x.size(1) - 1 - columns], values + 1)
+        else:
+            hl.atomic_add(
+                y,
+                [row, x.size(1) - 1 - columns],
+                columns.to(torch.float32) + 1000,
+            )
+        hl.atomic_add(local, [columns % 17], values)
+        other = z[row, :]
+        hl.atomic_add(local, [columns % 17], other)
+        out[row, :] = local
+    return out
+
+
+class TestFragmentRegisterEffectsCPU(unittest.TestCase):
+    def test_cross_warp_host_effects_and_aliased_arguments(self):
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        x = torch.arange(256).reshape(2, 128).float()
+        z = torch.full_like(x, 2)
+        index = (torch.arange(128) % 17).expand(2, -1)
+        expected = torch.zeros((2, 17)).scatter_add_(1, index, x + z)
+        orders = [
+            list(range(128)),
+            [
+                lane
+                for warp in (2, 0, 3, 1)
+                for lane in range(warp * 32, (warp + 1) * 32)
+            ],
+        ]
+        for mode in (
+            "dependent_store",
+            "unrelated_store",
+            "dependent_atomic",
+            "unrelated_atomic",
+        ):
+            for aliased in (False, True):
+                y = x.view_as(x) if aliased else torch.full_like(x, 500)
+                with self.subTest(mode=mode, aliased=aliased):
+                    with (
+                        _mock_cuda_unavailable(),
+                        _target(),
+                        _forbid_native_compile(),
+                        patch(
+                            "torch.cuda._lazy_init",
+                            side_effect=AssertionError("CPU only"),
+                        ),
+                    ):
+                        bound = _cpu_bind(
+                            _register_load_cross_lane_effect, (x, y, z, mode)
+                        )
+                        config = bound.config_spec.default_config()
+                        sources = []
+                        for enabled in (False, True):
+                            config.config["cute_fragment_register_loads"] = enabled
+                            sources.append(bound.to_code(config))
+                    for source in sources:
+                        for order in orders:
+                            actual_x = x.clone()
+                            actual_y = (
+                                actual_x.view_as(actual_x) if aliased else y.clone()
+                            )
+                            actual, _barriers = _simulate_register_load_program(
+                                source,
+                                actual_x,
+                                128,
+                                host_tensors={"y": actual_y, "z": z},
+                                lane_order=order,
+                            )
+                            contribution = (
+                                x + 1
+                                if mode.startswith("dependent")
+                                else torch.arange(128).float().expand(2, -1) + 1000
+                            )
+                            target = torch.flip(contribution, [1])
+                            if mode.endswith("atomic"):
+                                target = target + (x if aliased else y)
+                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                            torch.testing.assert_close(actual_y, target, rtol=0, atol=0)
+                            if not aliased:
+                                torch.testing.assert_close(actual_x, x, rtol=0, atol=0)
+                    # The independent z input remains eligible even when x must
+                    # retain its materialization barrier. This exercises a real
+                    # mixed root, rather than only rejecting the config key.
+                    self.assertIn("fragment_register_load", sources[1])
+
+    def test_runtime_alias_matrix_guards_rebinding_and_views(self):
+        from unittest.mock import patch
+
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.local_atomic import _reachable_graphs
+        from helion._compiler.cute.register_loads import host_load_is_readonly
+        from helion.language import memory_ops
+
+        kernel = helion.kernel(
+            _register_load_cross_lane_effect.fn,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="none",
+        )
+        storage = torch.arange(257).float()
+        x = storage[:256].view(2, 128)
+        y = torch.zeros_like(x)
+        z = torch.full_like(x, 2)
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+        ):
+            disjoint = kernel.bind((x, y, z, "dependent_store"))
+            for alias in (
+                x,
+                x.view_as(x),
+                torch.from_dlpack(x),
+                storage[1:].view_as(x),
+            ):
+                with self.subTest(offset=alias.storage_offset(), same=alias is x):
+                    overlapping = kernel.bind((x, alias, z, "dependent_store"))
+                    self.assertIsNot(disjoint, overlapping)
+                    self.assertIs(kernel.bind((x, y, z, "dependent_store")), disjoint)
+                    for bound, expected in ((disjoint, True), (overlapping, False)):
+                        host = bound.host_function
+                        graphs = _reachable_graphs(host.device_ir.graphs)
+                        loads = [
+                            n
+                            for graph in graphs
+                            for n in graph.graph.nodes
+                            if n.target is memory_ops.load and n.args[0].args == ("x",)
+                        ]
+                        self.assertTrue(loads)
+                        with bound.env, host:
+                            for load in loads:
+                                self.assertEqual(
+                                    host_load_is_readonly(load, bound.env, graphs),
+                                    expected,
+                                )
+                    # Even a previously safe plan cannot consume missing or
+                    # contradictory alias facts during later code generation.
+                    host = disjoint.host_function
+                    graphs = _reachable_graphs(host.device_ir.graphs)
+                    load = next(
+                        n
+                        for g in graphs
+                        for n in g.graph.nodes
+                        if n.target is memory_ops.load and n.args[0].args == ("x",)
+                    )
+                    with disjoint.env, host:
+                        with patch.object(
+                            disjoint.env,
+                            "bound_runtime_input_specialization_results",
+                            {},
+                        ):
+                            self.assertFalse(
+                                host_load_is_readonly(load, disjoint.env, graphs)
+                            )
+                        with disjoint.env.use_runtime_arg_values(
+                            {"x": x, "y": alias, "z": z}
+                        ):
+                            self.assertFalse(
+                                host_load_is_readonly(load, disjoint.env, graphs)
+                            )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_index_domain(x, bins: hl.constexpr, mode: hl.constexpr):
+    out = torch.empty((x.size(0), bins), dtype=x.dtype, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([bins], dtype=x.dtype)
+        for iteration in range(3):
+            if mode == "load_mask":
+                values = hl.load(
+                    x,
+                    [row, hl.arange(x.size(1))],
+                    extra_mask=hl.arange(x.size(1)) < x.size(1) // 2,
+                )
+            else:
+                values = hl.load(x, [row, hl.arange(x.size(1))])
+            contribution = values + iteration
+            indices = hl.arange(x.size(1)) % bins
+            if mode == "negative":
+                indices = indices - bins
+            elif mode == "clamp":
+                indices = torch.clamp(hl.arange(x.size(1)), max=bins - 1)
+            if mode == "masked":
+                contribution = torch.where(values > 0, contribution, 0)
+            if mode == "counts":
+                hl.atomic_add(local, [indices], iteration + 1)
+            else:
+                hl.atomic_add(local, [indices], contribution)
+                hl.atomic_add(local, [indices], contribution * 2)
+        out[row, :] = local
+        if mode == "global":
+            hl.atomic_add(out, [row, hl.arange(x.size(1)) % bins], 1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_broadcast_domain(x, planes: hl.constexpr):
+    out = torch.empty((x.size(0), 17), dtype=x.dtype, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=x.dtype)
+        # The singleton row coordinate must broadcast. Each physical axis
+        # retains its own logical extent, even when both pad to the same size.
+        index = (hl.arange(planes)[:, None] + hl.arange(x.size(1))[None, :]) % 17
+        for iteration in range(3):
+            hl.atomic_add(local, [index], iteration + 1)
+        out[row, :] = local
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _local_atomic_loaded_index_domain(x, mode: hl.constexpr):
+    out = torch.empty((x.size(0), 17), dtype=x.dtype, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=x.dtype)
+        if mode == "factory":
+            indices = hl.full([x.size(1)], 1, dtype=torch.int32)
+        else:
+            indices = x[row, :].to(torch.int32) % 17
+        for iteration in range(3):
+            if mode == "carry":
+                indices = (indices + 1) % 17
+            hl.atomic_add(local, [indices], iteration + 1)
+        out[row, :] = local
+    return out
+
+
+def _local_atomic_index_domain_reference(x, bins, mode):
+    indices = torch.arange(x.size(1))
+    indices = indices.clamp(max=bins - 1) if mode == "clamp" else indices % bins
+    result = torch.zeros((x.size(0), bins), dtype=x.dtype, device=x.device)
+    indices = indices.to(x.device).expand(x.size(0), -1)
+    for iteration in range(3):
+        values = (
+            torch.where(torch.arange(x.size(1), device=x.device) < x.size(1) // 2, x, 0)
+            if mode == "load_mask"
+            else x
+        )
+        contribution = values + iteration
+        if mode == "masked":
+            contribution = torch.where(x > 0, contribution, 0)
+        if mode == "counts":
+            contribution = torch.full_like(x, iteration + 1)
+        else:
+            contribution = contribution * 3
+        result.scatter_add_(1, indices, contribution)
+    if mode == "global":
+        result.scatter_add_(1, indices, torch.ones_like(x))
+    return result
+
+
+class TestFragmentAtomicIndexDomainCPU(unittest.TestCase):
+    def test_loaded_factory_and_carried_index_domains(self):
+        for width in (17, 31, 65):
+            for mode in ("loaded", "factory", "carry"):
+                with self.subTest(width=width, mode=mode):
+                    x = torch.arange(2 * width, dtype=torch.int32).reshape(2, width) % 7
+                    source = _atomic_logical_axes_codegen(
+                        _local_atomic_loaded_index_domain, (x, mode), []
+                    )
+                    result, calls = _simulate_local_atomic_program(source, x, (2, 17))
+                    indices = torch.ones_like(x) if mode == "factory" else x.clone()
+                    expected = torch.zeros((2, 17), dtype=x.dtype)
+                    for iteration in range(3):
+                        if mode == "carry":
+                            indices = (indices + 1) % 17
+                        expected.scatter_add_(
+                            1, indices.long(), torch.full_like(x, iteration + 1)
+                        )
+                    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                    self.assertEqual(len(calls), 2 * width * 3)
+
+    def test_logical_tail_contributions_after_arithmetic(self):
+        for width, bins in ((1, 1), (17, 17), (31, 17), (33, 31), (65, 17)):
+            for dtype in (torch.float32, torch.int32):
+                for mode in (
+                    "plain",
+                    "negative",
+                    "clamp",
+                    "masked",
+                    "load_mask",
+                    "counts",
+                    "global",
+                ):
+                    with self.subTest(width=width, bins=bins, dtype=dtype, mode=mode):
+                        x = torch.ones((2, width), dtype=dtype)
+                        x[:, ::3] = 0
+                        source = _atomic_logical_axes_codegen(
+                            _local_atomic_index_domain, (x, bins, mode), []
+                        )
+                        result, calls = _simulate_local_atomic_program(
+                            source, x, (2, bins)
+                        )
+                        torch.testing.assert_close(
+                            result,
+                            _local_atomic_index_domain_reference(x, bins, mode),
+                            rtol=0,
+                            atol=0,
+                        )
+                        self.assertEqual(
+                            len(calls),
+                            2 * width * (3 if mode == "counts" else 6)
+                            + (2 * width if mode == "global" else 0),
+                        )
+
+    def test_broadcast_axes_keep_distinct_logical_extents(self):
+        for planes, width in ((1, 17), (17, 1), (17, 31), (31, 17), (3, 65)):
+            with self.subTest(planes=planes, width=width):
+                x = torch.ones((2, width), dtype=torch.int32)
+                source = _atomic_logical_axes_codegen(
+                    _local_atomic_broadcast_domain, (x, planes), []
+                )
+                result, calls = _simulate_local_atomic_program(source, x, (2, 17))
+                indices = (torch.arange(planes)[:, None] + torch.arange(width)) % 17
+                expected = torch.zeros((2, 17), dtype=x.dtype)
+                expected.scatter_add_(
+                    1,
+                    indices.flatten().expand(2, -1),
+                    torch.full((2, planes * width), 6, dtype=x.dtype),
+                )
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+                self.assertEqual(len(calls), 2 * planes * width * 3)
+
+
+@onlyBackends("cute")
+class TestFragmentAtomicIndexDomainNative(TestCase):
+    def test_loaded_index_loop_carry(self):
+        x = torch.arange(130, dtype=torch.int32, device=DEVICE).reshape(2, 65) % 7
+        _, result = code_and_output(_local_atomic_loaded_index_domain, (x, "carry"))
+        expected = torch.zeros((2, 17), dtype=x.dtype, device=DEVICE)
+        for iteration in range(3):
+            indices = (x + iteration + 1) % 17
+            expected.scatter_add_(1, indices.long(), torch.full_like(x, iteration + 1))
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    def test_logical_tail_after_arithmetic(self):
+        for width, mode in (
+            (17, "plain"),
+            (65, "negative"),
+            (31, "masked"),
+            (33, "global"),
+        ):
+            with self.subTest(width=width, mode=mode):
+                x = torch.ones((2, width), dtype=torch.float32, device=DEVICE)
+                x[:, ::3] = 0
+                _, result = code_and_output(_local_atomic_index_domain, (x, 17, mode))
+                torch.testing.assert_close(
+                    result,
+                    _local_atomic_index_domain_reference(x, 17, mode),
+                    rtol=0,
+                    atol=0,
+                )
+
+    def test_broadcast_axes_keep_distinct_extents(self):
+        x = torch.ones((2, 31), dtype=torch.int32, device=DEVICE)
+        _, result = code_and_output(_local_atomic_broadcast_domain, (x, 17))
+        indices = (
+            torch.arange(17, device=DEVICE)[:, None] + torch.arange(31, device=DEVICE)
+        ) % 17
+        expected = torch.zeros((2, 17), dtype=x.dtype, device=DEVICE)
+        expected.scatter_add_(
+            1,
+            indices.flatten().expand(2, -1),
+            torch.full((2, 17 * 31), 6, dtype=x.dtype, device=DEVICE),
+        )
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _register_load_index_domain(x):
+    out = torch.empty((x.size(0), 17), dtype=torch.float32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.float32)
+        for iteration in range(3):
+            columns = hl.arange(x.size(1))[None, :]
+            indices = hl.load(x, [row, columns]).to(torch.int32) % 17
+            hl.atomic_add(local, [indices], iteration + 1)
+        out[row, :] = local
+    return out
+
+
+class TestFragmentRegisterDomainCPU(unittest.TestCase):
+    def test_promoted_indices_retain_logical_tail_domain(self):
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        for width in (17, 31, 65, 129):
+            x = (torch.arange(2 * width).reshape(2, width) % 7).int()
+            expected = torch.zeros((2, 17)).scatter_add_(
+                1, x.long(), torch.full(x.shape, 6.0)
+            )
+            for enabled in (False, True):
+                with self.subTest(width=width, enabled=enabled):
+                    with (
+                        _mock_cuda_unavailable(),
+                        _target(),
+                        _forbid_native_compile(),
+                        patch(
+                            "torch.cuda._lazy_init",
+                            side_effect=AssertionError("CPU only"),
+                        ),
+                    ):
+                        bound = _cpu_bind(_register_load_index_domain, (x,))
+                        config = bound.config_spec.default_config()
+                        config.config["cute_fragment_register_loads"] = enabled
+                        source = bound.to_code(config)
+                    actual, _barriers = _simulate_register_load_program(source, x, 128)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.assertEqual(
+                        "fragment_register_load" in source, enabled and width <= 128
+                    )
 
 
 if __name__ == "__main__":
