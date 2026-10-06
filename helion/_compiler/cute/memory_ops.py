@@ -537,6 +537,10 @@ def runtime_tensors_are_proven_disjoint(
     """Return a cache-specialized positive runtime storage-disjointness fact."""
     left_source = env.tensor_input_source(left)
     right_source = env.tensor_input_source(right)
+    if left_source is None:
+        left_source = env.tensor_storage_input_source(left)
+    if right_source is None:
+        right_source = env.tensor_storage_input_source(right)
     if left_source is None or right_source is None:
         return False
     return runtime_tensor_sources_are_proven_disjoint(
