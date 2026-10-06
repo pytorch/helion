@@ -28,6 +28,9 @@ from helion._compiler.cute.computed_fragment import FragmentCompiler
 from helion._compiler.host_function import HostFunction
 from helion._compiler.variable_origin import BlockSizeOrigin
 from helion._testing import DEVICE
+from helion._testing import TestCase
+from helion._testing import code_and_output
+from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
@@ -7075,3 +7078,49 @@ def test_immutable_while_snapshot_early_and_reentry():
                     assert ast.unparse(statements[i + 1]) == "cute.arch.sync_threads()"
                     sites += 1
     assert sites == 2
+
+
+@onlyBackends("cute")
+class TestImmutableWhileSnapshotsNative(TestCase):
+    def _check_snapshot_pair(self, width, dtype):
+        cpu = (torch.arange(3 * width).reshape(3, width) % 9 - 3).to(dtype)
+        if dtype == torch.float32:
+            cpu[1, :4] = torch.tensor([float("nan"), float("inf"), -0.0, float("-inf")])
+        limits_cpu = torch.tensor([0, 1, 4], dtype=torch.int32)
+        capacity = helion.next_power_of_2(width)
+        expected = []
+        for row, limit in zip(cpu, limits_cpu, strict=True):
+            threshold = torch.arange(capacity) % 3
+            total = 0
+            for _ in range(int(limit)):
+                total += int((row > threshold[:width]).sum())
+                threshold = torch.roll(threshold, -1)
+            expected.append(total)
+        expected = torch.tensor(expected, dtype=torch.int32)
+        x, limits = cpu.to(DEVICE), limits_cpu.to(DEVICE)
+        outputs = []
+        for enabled in (False, True):
+            with self.subTest(snapshots=enabled):
+                code, actual = code_and_output(
+                    _immutable_while_snapshot,
+                    (x, limits, capacity),
+                    cute_fragment_bounded_gather=True,
+                    cute_fragment_threads=128,
+                    cute_fragment_register_snapshots=enabled,
+                )
+                self.assertEqual(
+                    "fragment_snapshot = cute.make_rmem_tensor" in code, enabled
+                )
+                outputs.append(actual.cpu())
+                torch.testing.assert_close(outputs[-1], expected, rtol=0, atol=0)
+                self.assertTrue(
+                    torch.equal(x.view(torch.int32).cpu(), cpu.view(torch.int32))
+                )
+                self.assertTrue(torch.equal(limits.cpu(), limits_cpu))
+        torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+    def test_int32_padded_snapshot_and_zero_trip(self):
+        self._check_snapshot_pair(257, torch.int32)
+
+    def test_float32_padded_snapshot_and_zero_trip(self):
+        self._check_snapshot_pair(17, torch.float32)

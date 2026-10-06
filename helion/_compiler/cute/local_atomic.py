@@ -16,6 +16,7 @@ from ...language import atomic_ops
 from ...language import creation_ops
 from ...language import memory_ops
 from ...language import scan_ops
+from ..device_ir import ElseGraphInfo
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import IfGraphInfo
 from ..device_ir import RootGraphInfo
@@ -245,7 +246,28 @@ def terminal_finalizer_inputs(
 def local_buffer_conditional_inputs(
     node: Node, graphs: list[GraphInfo]
 ) -> tuple[frozenset[Node], frozenset[Node]] | None:
-    """Admit a terminal uniform branch controlled by completed local reductions.
+    """The existing completed-local-reduction terminal branch proof."""
+    result = _local_buffer_conditional_inputs(node, graphs, readonly_predicate=False)
+    return result[:2] if result is not None else None
+
+
+def uniform_local_branch_inputs(
+    node: Node, graphs: list[GraphInfo]
+) -> tuple[frozenset[Node], frozenset[Node], frozenset[Node]] | None:
+    """One-level fresh local targets under a uniform readonly scalar predicate.
+
+    No buffer or branch result escapes. Later root operations may reuse retired
+    arm storage after the unconditional join barrier. This does not admit nested
+    control, captured mutation, or a second update generation after any read.
+    Returned host loads require the emitter's actual alias proof.
+    """
+    return _local_buffer_conditional_inputs(node, graphs, readonly_predicate=True)
+
+
+def _local_buffer_conditional_inputs(
+    node: Node, graphs: list[GraphInfo], *, readonly_predicate: bool
+) -> tuple[frozenset[Node], frozenset[Node], frozenset[Node]] | None:
+    """Prove fresh arm epochs with either old reduction or readonly predicates.
 
     This is separate from ordered global-ticket finalizers. Only direct, complete
     local allocations may cross this branch as read-only captures. Fresh mutable
@@ -254,6 +276,9 @@ def local_buffer_conditional_inputs(
     predicate into one shared slot before any branch code can reuse its storage.
     """
     allocations = local_atomic_allocations(graphs)
+    reachable = _reachable_graphs(graphs)
+    targets = atomic_target_origins(graphs)
+    by_id = {info.graph_id: info for info in reachable}
 
     def dependencies(value: object) -> set[Node]:
         pending = [value] if isinstance(value, Node) else []
@@ -265,8 +290,21 @@ def local_buffer_conditional_inputs(
                 pending.extend(source.all_input_nodes)
         return seen
 
-    if not dependencies(node.args[0]) & allocations:
+    local_predicate = bool(dependencies(node.args[0]) & allocations)
+    if not local_predicate and not readonly_predicate:
         return None
+    if not local_predicate:
+        # Broaden only branches containing fresh local mutation. Unrelated
+        # ordered global-ticket finalizers keep their original proof.
+        arms = {cast("int", graph_id) for graph_id in node.args[1:3]}
+        if not any(
+            target in allocations
+            for info in reachable
+            if info.graph_id in arms
+            for child, target in targets.items()
+            if child.graph is info.graph
+        ):
+            return None
 
     def reject() -> NoReturn:
         raise exc.InvalidConfig(
@@ -274,25 +312,65 @@ def local_buffer_conditional_inputs(
             "complete allocation captures and uniform scalar local reductions"
         )
 
-    by_id = {info.graph_id: info for info in _reachable_graphs(graphs)}
     root = next(info for info in by_id.values() if info.graph is node.graph)
     following = list(node.graph.nodes)
     if (
         not isinstance(root, RootGraphInfo)
         or node.users
-        or any(n.op != "output" for n in following[following.index(node) + 1 :])
+        or (
+            local_predicate
+            and any(n.op != "output" for n in following[following.index(node) + 1 :])
+        )
     ):
         reject()
     info = by_id[cast("int", node.args[1])]
     if not isinstance(info, IfGraphInfo) or info.branches_outputs:
         reject()
-    targets = atomic_target_origins(graphs)
+    if not local_predicate:
+        positions = {value: i for i, value in enumerate(node.graph.nodes)}
+        if node.args[1] == node.args[2]:
+            reject()
+        for side, graph_id in enumerate(node.args[1:3]):
+            branch = by_id[cast("int", graph_id)]
+            if not isinstance(branch, IfGraphInfo if side == 0 else ElseGraphInfo):
+                reject()
+            # Bind this exact call and its current positional captures. A
+            # different caller may not share a fresh allocation's lexical epoch.
+            callers = [
+                (other, slot)
+                for graph in reachable
+                for other in graph.graph.nodes
+                if other.target is _tracing_ops._if
+                for slot in (1, 2)
+                if other.args[slot] == graph_id
+            ]
+            if callers != [(node, 1 + side)]:
+                reject()
+            placeholders = list(branch.graph.find_nodes(op="placeholder"))
+            captures = cast("list[Node]", node.args[3 + side])
+            if len(placeholders) != len(captures):
+                reject()
+            for placeholder, captured in zip(placeholders, captures, strict=True):
+                if (
+                    captured.graph is not node.graph
+                    or positions[captured] >= positions[node]
+                ):
+                    reject()
+                before, after = captured.meta.get("val"), placeholder.meta.get("val")
+                if isinstance(before, torch.Tensor):
+                    if (
+                        not isinstance(after, torch.Tensor)
+                        or before.dtype != after.dtype
+                        or before.shape != after.shape
+                    ):
+                        reject()
     for graph_id in node.args[1:3]:
         branch = by_id[cast("int", graph_id)]
         for child in branch.graph.nodes:
-            if child.target is _tracing_ops._if or _tracing_ops.is_for_loop_target(
-                child.target
-            ):
+            if child.target in (
+                _tracing_ops._if,
+                _tracing_ops._while_loop,
+            ) or _tracing_ops.is_for_loop_target(child.target):
                 reject()
             if child.target is atomic_ops.atomic_add:
                 target = targets[child]
@@ -310,6 +388,7 @@ def local_buffer_conditional_inputs(
         return value
 
     reductions: set[Node] = set()
+    loads: set[Node] = set()
     symbols: set[Node] = set()
     proved: set[Node] = set()
 
@@ -333,7 +412,23 @@ def local_buffer_conditional_inputs(
             or fake.dtype not in (torch.bool, torch.int32, torch.int64)
         ):
             reject()
-        if value.target in (
+        if value.target is memory_ops.load and not local_predicate:
+            if (
+                len(value.args) != 4
+                or value.kwargs
+                or not isinstance(value.args[0], Node)
+                or value.args[0].target is not _tracing_ops._host_tensor
+            ):
+                reject()
+            # Scalar shape alone is insufficient. Every index/mask must have
+            # uniform origins; emission also checks whole-region readonly
+            # storage against actual bound host aliases.
+            for index in cast("list[object]", value.args[1]):
+                uniform(index)
+            if value.args[2] is not None:
+                uniform(value.args[2])
+            loads.add(value)
+        elif value.target in (
             torch.ops.aten.sum.default,
             torch.ops.aten.sum.dim_IntList,
             torch.ops.aten.amax.default,
@@ -369,7 +464,7 @@ def local_buffer_conditional_inputs(
         proved.add(value)
 
     uniform(node.args[0])
-    if not reductions:
+    if local_predicate and not reductions:
         reject()
     for values in node.args[3:5]:
         for source in cast("list[Node]", values):
@@ -377,7 +472,7 @@ def local_buffer_conditional_inputs(
                 # A scalar already proved uniform is safe to read, but a lazy
                 # tensor view/pointwise capture is deliberately outside this scope.
                 uniform(source)
-    return frozenset(reductions), frozenset(symbols)
+    return frozenset(reductions), frozenset(symbols), frozenset(loads)
 
 
 def terminal_loop_symbols(node: Node, graphs: list[GraphInfo]) -> frozenset[Node]:
@@ -488,11 +583,23 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
 
     View aliases, captured conditional mutation and reads before later mutation
     are excluded. Int32 atomic returns are independent materialized snapshots.
-    Each allocation lives in its root or one immediate uniform branch arm.
+    Each allocation lives in its root, one immediate uniform branch arm, or
+    the straight-line body of one proved fresh-epoch while.
     Root allocations are captured unchanged through scalar loops. A terminal
     uniform finalizer may consume fresh global data without local captures.
     The emitter additionally proves scalar grid/loop geometry and capacity.
     """
+    from .resident_while import resident_while_plan
+
+    # Keep the indexed current-call graph list for the recurrence proof before
+    # traversing reachable graphs in dependency order.
+    local_bodies = {
+        plan.body.graph.graph_id
+        for info in graphs
+        for node in info.graph.nodes
+        if node.target is _tracing_ops._while_loop
+        and (plan := resident_while_plan(node, graphs)).local_allocations
+    }
     graphs = _reachable_graphs(graphs)
     allocations = local_atomic_allocations(graphs)
     if not allocations:
@@ -517,12 +624,12 @@ def prove_local_atomics(graphs: list[GraphInfo]) -> frozenset[Node]:
             )
         for node in info.graph.nodes:
             if node.target is _tracing_ops._if:
-                if local_buffer_conditional_inputs(node, graphs) is not None:
+                if uniform_local_branch_inputs(node, graphs) is not None:
                     local_branches.add(node)
                 else:
                     terminal_finalizer_inputs(node, graphs)
 
-    local_regions = {
+    local_regions = local_bodies | {
         cast("int", graph_id)
         for branch in local_branches
         for graph_id in branch.args[1:3]
