@@ -36,7 +36,9 @@ def canonical_config_id(config: Config) -> str:
     The same config always maps to the same id, so it is safe as a set key for
     counting distinct configs. Shared with the autotuner dataset logger.
     """
-    canonical = json.dumps(config.config, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        config.config, sort_keys=True, separators=(",", ":"), default=str
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 

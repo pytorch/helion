@@ -1910,6 +1910,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         fn_b.source_hash = "healthy"  # type: ignore[attr-defined]
         provider = FakeProvider()
         search = object.__new__(PatternSearch)
+        search.log = Mock(trace_enabled=False)
         search.settings = Settings(
             autotune_benchmark_fn=custom_benchmark_fn,
             autotune_benchmark_subprocess=True,
@@ -1918,7 +1919,6 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         search.benchmark_provider = provider  # type: ignore[assignment]
         search.best_perf_so_far = 1.0
         search.args = ()
-        search.log = Mock()
         search.kernel = SimpleNamespace(  # type: ignore[assignment]
             env=SimpleNamespace(process_group_name=None)
         )
@@ -1991,6 +1991,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
 
         provider = FakeProvider()
         search = object.__new__(PatternSearch)
+        search.log = Mock(trace_enabled=False)
         search.settings = Settings(autotune_benchmark_subprocess=True)
         search.benchmark_provider = provider  # type: ignore[assignment]
         search.best_perf_so_far = 1.0
@@ -2028,6 +2029,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
             generated_source_hash=lambda fn: fn.source_hash,
         )
         search = object.__new__(LFBOPatternSearch)
+        search.log = Mock(trace_enabled=False)
         search.settings = Settings(autotune_benchmark_subprocess=True)
         search.benchmark_provider = FakeProvider()  # type: ignore[assignment]
         search.best_perf_so_far = 1.0
@@ -2105,6 +2107,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self,
     ) -> None:
         search = object.__new__(PopulationBasedSearch)
+        search.log = Mock(trace_enabled=False)
         search.config_spec = SimpleNamespace(
             backend_name="cute",
             cute_flash_search_enabled=True,
@@ -2156,6 +2159,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
                 raise AssertionError("non-CuTe source must not be invalidated")
 
         search = object.__new__(PatternSearch)
+        search.log = Mock(trace_enabled=False)
         search.settings = Settings(autotune_benchmark_subprocess=True)
         search.benchmark_provider = FakeProvider()  # type: ignore[assignment]
         search.best_perf_so_far = 1.0
@@ -2202,6 +2206,7 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
                 raise AssertionError("non-CuTe source must not be quarantined")
 
         search = object.__new__(PatternSearch)
+        search.log = Mock(trace_enabled=False)
         search.settings = Settings(autotune_benchmark_subprocess=True)
         search.benchmark_provider = FakeProvider()  # type: ignore[assignment]
         search.best_perf_so_far = 1.0
