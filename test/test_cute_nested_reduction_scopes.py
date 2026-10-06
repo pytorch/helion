@@ -77,6 +77,33 @@ def _normalize(body: list[ast.AST]) -> list[ast.AST]:
     )
 
 
+def test_marker_free_normalization_preserves_ast_and_skips_dependency_analysis() -> (
+    None
+):
+    body = _body(
+        "initial = 7\n"
+        "for tile in range(8):\n"
+        "    if tile % 2:\n"
+        "        value = x[tile] + initial\n"
+        "    else:\n"
+        "        value = x[tile] - initial\n"
+        "    out[tile] = value\n"
+    )
+    tree = ast.Module(body=cast("list[ast.stmt]", body), type_ignores=[])
+    before = ast.dump(tree, include_attributes=True)
+    source = ast.unparse(tree)
+    node_ids = [id(node) for node in ast.walk(tree)]
+    with patch.object(
+        lanes,
+        "_update_scalar_definitions",
+        side_effect=AssertionError("marker-free dependency analysis"),
+    ):
+        assert _normalize(body) is body
+    assert ast.dump(tree, include_attributes=True) == before
+    assert ast.unparse(tree) == source
+    assert [id(node) for node in ast.walk(tree)] == node_ids
+
+
 class _Memory:
     def __init__(self, values: np.ndarray, offset: int = 0) -> None:
         self.values = values

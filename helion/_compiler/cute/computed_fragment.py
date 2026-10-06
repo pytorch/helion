@@ -17,12 +17,15 @@ from typing import cast
 
 import sympy
 import torch
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.ir import Reduction
 from torch._inductor.virtualized import V
 from torch.fx import Node
 from torch.fx.node import map_arg
 
 from ... import exc
+from ..._compat import shape_env_size_hint
 from ...language import _tracing_ops
 from ...language import creation_ops
 from ...language import inline_asm_ops
@@ -52,12 +55,17 @@ from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
 from ..variable_origin import TileEndOrigin
 from ..variable_origin import TileIdOrigin
+from .fragment_expression import FragmentExpression
+from .independent_reduction import independent_reduction_coordinates
 from .tcgen05_config import CuteTcgen05Config
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
 
+    from ..autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
+    from ..device_ir import DeviceIR
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
 
 
@@ -140,7 +148,20 @@ class FragmentOps(GenerateASTFromInductor):
                 continue
             indices[dim] = f"(({remaining}) // {strides[dim]})"
             remaining = f"(({remaining}) % {strides[dim]})"
-        return self._lift(expr_from_string(value.read(tuple(indices))))
+        coordinates = self.compiler.coordinate_locals(tuple(indices))
+        return self._lift(expr_from_string(value.read(coordinates)))
+
+    def to_dtype(
+        self,
+        x: object,
+        dtype: torch.dtype,
+        src_dtype: torch.dtype | None = None,
+        use_compute_types: bool = True,
+    ) -> str:
+        # Fragment loads and shared buffers contain logical typed scalars.
+        # The parent handler's FP8 byte decoder belongs to ordinary raw-byte
+        # global loads; applying it to a typed Float8 register corrupts its bits.
+        return self._lift(self._create_cast_expr(x, dtype))
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> str:
         return self._lift(
@@ -149,7 +170,7 @@ class FragmentOps(GenerateASTFromInductor):
 
 
 class FragmentCompiler:
-    def __init__(self, cg: GenerateAST) -> None:
+    def __init__(self, cg: GenerateAST, graphs: list[GraphInfo] | None = None) -> None:
         self.cg = cg
         self.df = cg.device_function
         self.env = CompileEnvironment.current()
@@ -163,6 +184,8 @@ class FragmentCompiler:
         self.threads = 128
         self.thread = ""
         self.sym_indices: dict[sympy.Symbol, str] = {}
+        self.expression: FragmentExpression | None = None
+        self.graphs = cg.codegen_graphs if graphs is None else graphs
 
     def begin(self) -> None:
         self.allocator = self.df.new_var("fragment_smem")
@@ -178,6 +201,21 @@ class FragmentCompiler:
                 for name, dtype, count in self.buffers
             ],
         ]
+
+    def metadata_guarded(self, expr: sympy.Expr) -> bool:
+        if "input_tensor_metadata" not in self.env.compiler_fact_specialization_facts:
+            return False
+        # The exact metadata guard covers sizes and strides, not runtime scalar
+        # arguments, device values, or storage offsets.
+        return all(
+            isinstance(symbol, sympy.Symbol)
+            and any(
+                isinstance(source, TensorPropertySource)
+                and source.prop in (TensorProperty.SIZE, TensorProperty.STRIDE)
+                for source in self.env.shape_env.var_to_sources.get(symbol, ())
+            )
+            for symbol in expr.free_symbols
+        )
 
     def configured_expr(self, value: sympy.Basic) -> sympy.Basic:
         """Resolve logical dimensions using their owning block, not aliases.
@@ -209,9 +247,20 @@ class FragmentCompiler:
                     continue
                 if isinstance(replacement, torch.SymInt):
                     replacement = replacement._sympy_()
-                substitutions[symbol] = resolve(
-                    sympy.sympify(replacement), visiting | {symbol}
-                )
+                resolved = resolve(sympy.sympify(replacement), visiting | {symbol})
+                if block.reduction:
+                    logical = self.env.specialize_expr(sympy.sympify(resolved))
+                    if logical.free_symbols and self.metadata_guarded(logical):
+                        # Storage has a static capacity; masks and scans still
+                        # use block.numel's runtime logical bound. Exact tensor
+                        # metadata in the binding key makes this hint a proof,
+                        # including when a direct BoundKernel call is replayed.
+                        resolved = sympy.Integer(
+                            self.env.backend.static_rdim_size(
+                                max(1, shape_env_size_hint(self.env.shape_env, logical))
+                            )
+                        )
+                substitutions[symbol] = resolved
             return expr.xreplace(substitutions)
 
         return resolve(value, frozenset())
@@ -280,6 +329,43 @@ class FragmentCompiler:
 
     def cast(self, expression: str, dtype: torch.dtype) -> str:
         return f"{self.dtype(dtype)}({expression})"
+
+    def coordinate_locals(self, coordinates: tuple[str, ...]) -> tuple[str, ...]:
+        """Evaluate composed scalar coordinates in their current lexical body.
+
+        Recursively expanding a reshape or physical-stride inverse duplicates
+        its incoming coordinates in every dimension. Name those pure integer
+        expressions before visiting the next fragment. Do not cast them or
+        reuse locals across reads, loops, branches, or shared-memory writes.
+        """
+        if (
+            self.expression is not None
+            and self.expression.body is self.cg.statements_stack[-1]
+        ):
+            return tuple(self.expression.coordinate(value) for value in coordinates)
+        result = []
+        for coordinate in coordinates:
+            expression = expr_from_string(coordinate)
+            if isinstance(expression, (ast.Name, ast.Constant)):
+                result.append(coordinate)
+                continue
+            result.append(self.cg.lift(expression, prefix="fragment_coordinate").id)
+        return tuple(result)
+
+    def pointwise_read(
+        self,
+        producer: object,
+        coordinates: tuple[str, ...],
+        evaluate: Callable[[], str],
+    ) -> str:
+        previous = self.expression
+        if previous is None or previous.body is not self.cg.statements_stack[-1]:
+            self.expression = FragmentExpression(self.cg)
+        try:
+            assert self.expression is not None
+            return self.expression.read(producer, coordinates, evaluate)
+        finally:
+            self.expression = previous
 
     @staticmethod
     def referenced_buffers(values: Iterable[object]) -> set[str]:
@@ -362,11 +448,22 @@ class FragmentCompiler:
         )
 
     def elements(
-        self, shape: tuple[int, ...], body: Callable[[tuple[str, ...]], None]
+        self,
+        shape: tuple[int, ...],
+        body: Callable[[tuple[str, ...]], None],
+        *,
+        threads_per_element: int = 1,
     ) -> None:
+        assert threads_per_element in (1, 32)
+        assert self.threads % threads_per_element == 0
         index = self.df.new_var("fragment_index")
+        start = (
+            self.thread
+            if threads_per_element == 1
+            else f"{self.thread} // {threads_per_element}"
+        )
         loop = statement_from_string(
-            f"for {index} in range({self.thread}, {math.prod(shape)}, {self.threads}):\n    pass"
+            f"for {index} in range({start}, {math.prod(shape)}, {self.threads // threads_per_element}):\n    pass"
         )
         assert isinstance(loop, ast.For)
         loop.body.clear()
@@ -375,21 +472,34 @@ class FragmentCompiler:
         self.cg.add_statement(loop)
         self.emit("cute.arch.sync_threads()")
 
-    def copy(self, source: Fragment, target: Fragment) -> None:
+    def copy(
+        self, source: Fragment, target: Fragment, *, threads_per_element: int = 1
+    ) -> None:
         assert source.shape == target.shape
+
+        def write(indices: tuple[str, ...]) -> None:
+            # Cooperative producers execute in every participating lane; only
+            # their leader writes the resulting shared element.
+            value = self.cast(source.read(indices), target.dtype)
+            store = f"{target.read(indices)} = {value}"
+            if threads_per_element != 1:
+                store = f"if {self.thread} % {threads_per_element} == 0:\n    {store}"
+            self.emit(store)
+
         self.elements(
             source.shape,
-            lambda indices: self.emit(
-                f"{target.read(indices)} = {self.cast(source.read(indices), target.dtype)}"
-            ),
+            write,
+            threads_per_element=threads_per_element,
         )
 
-    def materialize(self, value: Fragment, *, copy: bool = False) -> Fragment:
+    def materialize(
+        self, value: Fragment, *, copy: bool = False, threads_per_element: int = 1
+    ) -> Fragment:
         if value.resident and not copy:
             return value
         self.held.append(value)
         result = self.allocate(value)
-        self.copy(value, result)
+        self.copy(value, result, threads_per_element=threads_per_element)
         self.held.pop()
         return result
 
@@ -431,7 +541,9 @@ class FragmentCompiler:
                     for coord, index in zip(coords, indices, strict=False)
                     if index is not None
                 )
-                return tensor.read((*selected, *coords[len(indices) :]))
+                return tensor.read(
+                    self.coordinate_locals((*selected, *coords[len(indices) :]))
+                )
 
             return Fragment(
                 shape, output.dtype, view, tensor.resident, dependencies=(tensor,)
@@ -508,6 +620,9 @@ class FragmentCompiler:
                     if isinstance(value, Fragment)
                     else self.scalar(value)
                 )
+                # Round/truncate to the logical tensor dtype before CuTe
+                # converts to the pointer's storage type. In particular, an
+                # unsigned byte must retain 128..255 when its i8 pointer is signed.
                 self.emit(
                     f"if {mask}:\n    {pointer}.store({self.cast(stored, tensor.value.dtype)})"
                 )
@@ -519,10 +634,25 @@ class FragmentCompiler:
             pointer, mask = address(coords)
             name = self.df.new_var("fragment_load")
             self.emit(f"{name} = {self.cast('0', output.dtype)}")
-            self.emit(f"if {mask}:\n    {name} = {pointer}.load()")
+            # Pointer arithmetic can erase unsigned signedness (Uint8 -> Int8),
+            # and bool pointers use byte storage. Restore the logical type before
+            # a masked branch joins its typed zero or the value enters arithmetic.
+            loaded = self.cast(f"{pointer}.load()", output.dtype)
+            self.emit(f"if {mask}:\n    {name} = {loaded}")
             return name
 
         return self.materialize(Fragment(shape, output.dtype, load))
+
+    def logical_axis_extent(self, fake: torch.Tensor, dim: int, capacity: int) -> str:
+        """Use logical bounds for arithmetic over a padded local allocation."""
+        bid = self.env.resolve_block_id(fake.shape[dim])
+        extent = str(capacity)
+        if bid is not None:
+            if bid in self.offsets:
+                extent = f"min({extent}, ({self.bounds[bid]}) - ({self.offsets[bid]}))"
+            elif self.env.block_sizes[bid].reduction:
+                extent = f"min({extent}, {self.sym(self.env.block_sizes[bid].numel)})"
+        return extent
 
     def dot(self, node: Node, values: dict[Node, object]) -> Fragment:
         lhs, rhs = (values[cast("Node", x)] for x in node.args[:2])
@@ -545,6 +675,9 @@ class FragmentCompiler:
         )
         result = self.allocate(Fragment(shape, out_dtype, lambda _: "0"))
 
+        left_fake = cast("torch.Tensor", cast("Node", node.args[0]).meta["val"])
+        contraction = self.logical_axis_extent(left_fake, -1, lhs.shape[-1])
+
         def contract(coords: tuple[str, ...]) -> None:
             total = self.df.new_var("fragment_dot")
             k = self.df.new_var("fragment_k")
@@ -555,7 +688,7 @@ class FragmentCompiler:
             left = lhs.broadcast((*coords[:-2], coords[-2], k))
             right = rhs.broadcast((*coords[:-2], k, coords[-1]))
             self.emit(
-                f"for {k} in range({lhs.shape[-1]}):\n    {total} = {total} + {self.cast(left, compute_dtype)} * {self.cast(right, compute_dtype)}"
+                f"for {k} in range({contraction}):\n    {total} = {total} + {self.cast(left, compute_dtype)} * {self.cast(right, compute_dtype)}"
             )
             self.emit(f"{result.read(coords)} = {self.cast(total, out_dtype)}")
 
@@ -586,7 +719,9 @@ class FragmentCompiler:
             coords: tuple[str, ...], reduction_coords: tuple[str, ...] = ()
         ) -> str:
             if ranges != result_shape:
-                coords = self.coordinates(self.flatten(coords, result_shape), ranges)
+                coords = self.coordinate_locals(
+                    self.coordinates(self.flatten(coords, result_shape), ranges)
+                )
             prior = self.sym_indices
             self.sym_indices = {
                 sympy.Symbol(f"i{i}"): coord
@@ -617,6 +752,10 @@ class FragmentCompiler:
 
         dependencies = tuple(value for _, value in lookup.values())
         if isinstance(lowering, ReductionLowering):
+            from ..autotuner_heuristics.cute_fragment_reduction import (
+                fragment_warp_reduction_supported,
+            )
+
             assert isinstance(lowering.buffer.data, Reduction)
             reduction_shape = self.shape(lowering.buffer.data.reduction_ranges)
             indexed = lowering.reduction_type in ("argmin", "argmax")
@@ -626,6 +765,22 @@ class FragmentCompiler:
                 if value_dtype in (torch.float16, torch.bfloat16)
                 else value_dtype
             )
+            warp = self.df.config.get(
+                "cute_fragment_reduction", "serial"
+            ) == "warp" and fragment_warp_reduction_supported(node)
+
+            def combine(left: str, right: str) -> str:
+                expression = self.env.backend.reduction_combine_expr(
+                    lowering.reduction_type, left, right, compute_dtype
+                )
+                if (
+                    lowering.reduction_type in ("min", "max")
+                    and compute_dtype.is_floating_point
+                ):
+                    # A parallel fold must preserve NaNs from either operand,
+                    # including a NaN encountered in a preceding local tile.
+                    expression = f"{left} if {left} != {left} else ({expression})"
+                return expression
 
             def reduce(coords: tuple[str, ...]) -> str:
                 reduction_type = lowering.reduction_type
@@ -642,9 +797,41 @@ class FragmentCompiler:
                 selected = self.df.new_var("fragment_selected_index") if indexed else ""
                 if indexed:
                     self.emit(f"{selected} = {self.cast('0', fake.dtype)}")
+                reduction_range = str(math.prod(reduction_shape))
+                if warp:
+                    reduction_range = f"{self.thread} % 32, {reduction_range}, 32"
                 loop = statement_from_string(
-                    f"for {index} in range({math.prod(reduction_shape)}):\n    pass"
+                    f"for {index} in range({reduction_range}):\n    pass"
                 )
+                # The fragment owner retains full producer coordinates and
+                # carries this accumulator across configured reduction tiles.
+                # Generic graph rolling would instead capture a full fragment
+                # inside a tile-local graph, losing both its coordinate window
+                # and its implicit reduction carry.
+                tile = self.df.config.reduction_loops
+                block = lowering.block_index
+                tile = self.env.config_spec.reduction_loops.config_get(
+                    tile, block, None
+                )
+                tiled_loop: ast.For | None = None
+                if tile is not None:
+                    tile = self.extent(tile)
+                    tile_begin = self.df.new_var("fragment_reduce_tile")
+                    tiled_loop = cast(
+                        "ast.For",
+                        statement_from_string(
+                            f"for {tile_begin} in range(0, {math.prod(reduction_shape)}, {tile}):\n    pass"
+                        ),
+                    )
+                    assert isinstance(tiled_loop, ast.For)
+                    start = (
+                        f"{tile_begin} + ({self.thread} % 32)" if warp else tile_begin
+                    )
+                    stop = f"min({tile_begin} + {tile}, {math.prod(reduction_shape)})"
+                    reduction_range = f"{start}, {stop}" + (", 32" if warp else "")
+                    loop = statement_from_string(
+                        f"for {index} in range({reduction_range}):\n    pass"
+                    )
                 assert isinstance(loop, ast.For)
                 loop.body.clear()
                 with self.cg.set_statements(cast("list[ast.AST]", loop.body)):
@@ -663,20 +850,22 @@ class FragmentCompiler:
                             f"    {selected} = {self.cast(index, fake.dtype)}"
                         )
                     else:
-                        combined = self.env.backend.reduction_combine_expr(
-                            reduction_type, total, value, compute_dtype
+                        self.emit(f"{total} = {combine(total, value)}")
+                if tiled_loop is not None:
+                    tiled_loop.body = [loop]
+                    self.cg.add_statement(tiled_loop)
+                else:
+                    self.cg.add_statement(loop)
+                if warp:
+                    # Output coordinates are warp-uniform, including a short
+                    # final output tile. Lanes with no input use the identity;
+                    # the complete warp reconverges before each shuffle.
+                    peer = self.df.new_var("fragment_reduce_peer")
+                    for distance in (16, 8, 4, 2, 1):
+                        self.emit(
+                            f"{peer} = cute.arch.shuffle_sync_bfly({total}, offset={distance}, mask=0xffffffff, mask_and_clamp=31)"
                         )
-                        if (
-                            reduction_type in ("min", "max")
-                            and compute_dtype.is_floating_point
-                        ):
-                            # Compare/select propagates an incoming NaN, but would
-                            # overwrite a NaN already encountered in this fold.
-                            combined = (
-                                f"{total} if {total} != {total} else ({combined})"
-                            )
-                        self.emit(f"{total} = {combined}")
-                self.cg.add_statement(loop)
+                        self.emit(f"{total} = {combine(total, peer)}")
                 return selected if indexed else self.cast(total, fake.dtype)
 
             return self.materialize(
@@ -685,19 +874,23 @@ class FragmentCompiler:
                     fake.dtype,
                     reduce,
                     dependencies=dependencies,
-                )
+                ),
+                threads_per_element=32 if warp else 1,
             )
+        producer = object()
         return Fragment(
             self.shape(fake.shape),
             fake.dtype,
-            lambda coords: self.cast(element(coords), fake.dtype),
+            lambda coords: self.pointwise_read(
+                producer, coords, lambda: self.cast(element(coords), fake.dtype)
+            ),
             dependencies=dependencies,
         )
 
     def loop(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
         graph_id = node.args[0]
         assert isinstance(graph_id, int)
-        graph = self.cg.get_graph(graph_id)
+        graph = self.graphs[graph_id]
         assert isinstance(graph, ForLoopGraphInfo)
         args = [values[x] for x in cast("list[Node]", node.args[3])]
         placeholders = list(graph.graph.find_nodes(op="placeholder"))
@@ -777,7 +970,52 @@ class FragmentCompiler:
         self.held.pop()
         return carries
 
+    def serial_scan(self, node: Node, values: dict[Node, object]) -> Fragment:
+        source = values[cast("Node", node.args[1])]
+        assert isinstance(source, Fragment)
+        source = self.materialize(source)
+        self.held.append(source)
+        result = self.allocate(source)
+        dim = cast("int", node.args[2]) % len(source.shape)
+        reverse = bool(node.args[3])
+        fake = cast("torch.Tensor", node.meta["val"])
+        extent = self.logical_axis_extent(fake, dim, source.shape[dim])
+
+        def line(coords: tuple[str, ...]) -> None:
+            total = self.df.new_var("fragment_scan")
+            index = self.df.new_var("fragment_scan_index")
+            initialized = self.df.new_var("fragment_scan_initialized")
+            self.emit(f"{total} = {self.cast('0', source.dtype)}")
+            self.emit(f"{initialized} = False")
+            position = f"{source.shape[dim] - 1} - {index}" if reverse else index
+            location = (*coords[:dim], position, *coords[dim:])
+            value = source.read(location)
+            self.emit(
+                f"for {index} in range({source.shape[dim]}):\n"
+                f"    if ({position}) < ({extent}):\n"
+                f"        if {initialized}:\n"
+                f"            {total} = {self.cast(f'{total} + {value}', source.dtype)}\n"
+                f"        else:\n"
+                f"            {total} = {value}\n"
+                f"        {initialized} = True\n"
+                f"        {result.read(location)} = {total}\n"
+                f"    else:\n"
+                f"        {result.read(location)} = {self.cast('0', source.dtype)}"
+            )
+
+        self.elements((*source.shape[:dim], *source.shape[dim + 1 :]), line)
+        self.held.pop()
+        return result
+
     def scan(self, node: Node, values: dict[Node, object]) -> Fragment:
+        mode = self.df.config.get("cute_fragment_scan", "serial")
+        if mode == "serial":
+            return self.serial_scan(node, values)
+        if mode == "cooperative":
+            return self.cooperative_scan(node, values)
+        raise exc.InvalidConfig(f"unsupported computed fragment scan: {mode!r}")
+
+    def cooperative_scan(self, node: Node, values: dict[Node, object]) -> Fragment:
         source = values[cast("Node", node.args[1])]
         assert isinstance(source, Fragment)
         self.held.append(source)
@@ -788,13 +1026,7 @@ class FragmentCompiler:
         dim = cast("int", node.args[2]) % len(source.shape)
         reverse = bool(node.args[3])
         fake = cast("torch.Tensor", node.meta["val"])
-        bid = self.env.resolve_block_id(fake.shape[dim])
-        extent = str(source.shape[dim])
-        if bid is not None:
-            if bid in self.offsets:
-                extent = f"min({extent}, ({self.bounds[bid]}) - ({self.offsets[bid]}))"
-            elif self.env.block_sizes[bid].reduction:
-                extent = f"min({extent}, {self.sym(self.env.block_sizes[bid].numel)})"
+        extent = self.logical_axis_extent(fake, dim, source.shape[dim])
 
         def initialize(coords: tuple[str, ...]) -> None:
             self.emit(
@@ -844,7 +1076,7 @@ class FragmentCompiler:
         return current
 
     def conditional(self, node: Node, values: dict[Node, object]) -> list[Fragment]:
-        info = self.cg.get_graph(cast("int", node.args[1]))
+        info = self.graphs[cast("int", node.args[1])]
         assert isinstance(info, IfGraphInfo)
         assert info.branches_outputs is not None
         merged: list[Fragment] = []
@@ -858,7 +1090,7 @@ class FragmentCompiler:
             )
         branches: list[list[ast.AST]] = []
         for side in range(2):
-            branch = self.cg.get_graph(cast("int", node.args[1 + side]))
+            branch = self.graphs[cast("int", node.args[1 + side])]
             captures = [
                 values[source] for source in cast("list[Node]", node.args[3 + side])
             ]
@@ -1087,7 +1319,7 @@ class FragmentCompiler:
                         result.append(f"({position}) % {source.shape[source_dim]}")
                         source_dim += 1
                 result.extend(coords[dim:])
-                return source.read(tuple(result))
+                return source.read(self.coordinate_locals(tuple(result)))
 
             return Fragment(shape, fake.dtype, subscript, source.resident, (source,))
         if target is torch.ops.aten.permute.default:
@@ -1109,12 +1341,21 @@ class FragmentCompiler:
             torch.ops.aten.view.default,
             torch.ops.aten.reshape.default,
             torch.ops.aten._unsafe_view.default,
+            torch.ops.aten.unsqueeze.default,
+            torch.ops.aten.squeeze.default,
+            torch.ops.aten.squeeze.dim,
+            torch.ops.aten.squeeze.dims,
         ):
+            # Singleton views preserve logical element order. Read through the
+            # source recipe so permuted layouts and resident aliases retain
+            # their own physical addressing and shared-buffer lifetimes.
             return Fragment(
                 shape,
                 fake.dtype,
                 lambda coords: source.read(
-                    self.coordinates(self.flatten(coords, shape), source.shape)
+                    self.coordinate_locals(
+                        self.coordinates(self.flatten(coords, shape), source.shape)
+                    )
                 ),
                 source.resident,
                 (source,),
@@ -1132,18 +1373,24 @@ class FragmentCompiler:
         raise exc.BackendUnsupported("cute", f"computed fragment operation {target}")
 
 
-def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
-    """Own static axes and complete contractions that scalar indexing cannot express."""
-    if (
-        CompileEnvironment.current().backend_name != "cute"
-        or len(cg.host_function.device_ir.root_ids) != 1
-        or cg.device_function.config.get("cute_collective_mma", False)
-        or cg.device_function.config.get("cute_register_chain", False)
-    ):
-        return False
-    root = cg.current_root_graph_info
-    assert root is not None
-    graphs = cg.codegen_graphs
+def computed_fragment_supported(
+    env: CompileEnvironment, graphs: list[GraphInfo]
+) -> bool:
+    """Structural root ownership shared by search discovery and code generation.
+
+    Exact local sizes, strides, scalar predicates and shared capacity remain
+    configuration-dependent checks in the emitter.
+    """
+    graph_by_id = {info.graph_id: info for info in graphs}
+    independent_reductions = independent_reduction_coordinates(env, graphs)
+
+    def configured_axis(size: int | torch.SymInt) -> bool:
+        if isinstance(size, int):
+            return size > 0
+        expr = env.specialize_expr(cast("sympy.Expr", size._sympy_()))
+        if expr.is_number:
+            return int(expr) > 0
+        return all(env.get_block_id(symbol) is not None for symbol in expr.free_symbols)
 
     carried: set[Node] = set()
     captures: dict[Node, Node] = {}
@@ -1195,6 +1442,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             torch.ops.aten.view.default,
             torch.ops.aten.reshape.default,
             torch.ops.aten._unsafe_view.default,
+            torch.ops.aten.unsqueeze.default,
+            torch.ops.aten.squeeze.default,
+            torch.ops.aten.squeeze.dim,
+            torch.ops.aten.squeeze.dims,
             torch.ops.prims.convert_element_type.default,
             view_ops.subscript,
         ):
@@ -1210,6 +1461,8 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         return len(sizes) != len(set(sizes))
 
     def needs_coordinates(node: Node) -> bool:
+        if node in independent_reductions:
+            return True
         if node.target is _tracing_ops._host_tensor:
             return False
         if node.target in (
@@ -1266,10 +1519,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         lhs, rhs = node.args[:2]
         assert isinstance(lhs, Node) and isinstance(rhs, Node)
         left, right = lhs.meta["val"], rhs.meta["val"]
-        bid = CompileEnvironment.current().resolve_block_id(left.shape[-1])
+        bid = env.resolve_block_id(left.shape[-1])
         static_k = isinstance(left.shape[-1], int) and left.shape[-1] > 1
         if bid is not None:
-            static_k = CompileEnvironment.current().block_sizes[bid].reduction
+            static_k = env.block_sizes[bid].reduction
         return (
             left.dtype == right.dtype
             and left.dtype in (torch.float16, torch.bfloat16, torch.float32)
@@ -1332,6 +1585,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         torch.ops.aten.view.default,
         torch.ops.aten.reshape.default,
         torch.ops.aten._unsafe_view.default,
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.squeeze.default,
+        torch.ops.aten.squeeze.dim,
+        torch.ops.aten.squeeze.dims,
         torch.ops.aten.where.self,
         torch.ops.aten.view.dtype,
         torch.ops.aten.alias.default,
@@ -1347,7 +1604,6 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         for node in info.graph.nodes
     ):
         return False
-    compiler = FragmentCompiler(cg)
     for info in graphs:
         for node in info.graph.nodes:
             if node.target is torch.ops.aten.view.dtype:
@@ -1392,7 +1648,12 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     return False
                 if not -value.ndim <= cast("int", node.args[2]) < value.ndim:
                     return False
-                helper = cg.get_graph(cast("int", node.args[0]))
+                # Every local axis must be constant or have a configured block
+                # owner. Config-dependent values and shared capacity are checked
+                # again by the emitter, never replaced by a shape-specific mode.
+                if not all(configured_axis(size) for size in value.shape):
+                    return False
+                helper = graph_by_id[cast("int", node.args[0])]
                 assert isinstance(helper, HelperFunctionGraphInfo)
                 nodes = list(helper.graph.nodes)
                 if len(nodes) != 4:
@@ -1424,6 +1685,88 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                 not isinstance(value, torch.Tensor) for value in node.meta["val"]
             ):
                 return False
+    return True
+
+
+def computed_fragment_specialization_facts(
+    env: CompileEnvironment, ir: DeviceIR
+) -> frozenset[CompilerHeuristicSpecializationFact]:
+    """Guard shape hints used as capacities before bound-cache publication."""
+    if env.settings.static_shapes or ir.host_function is None:
+        return frozenset()
+    with ir.host_function:
+        if computed_fragment_supported(
+            env, ir.graphs
+        ) or independent_reduction_coordinates(
+            env, ir.graphs, include_rolled_outputs=True
+        ):
+            return frozenset({"input_tensor_metadata"})
+    return frozenset()
+
+
+def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
+    """Own static axes and complete contractions that scalar indexing cannot express."""
+    from ..autotuner_heuristics.cute_fragment_reduction import (
+        fragment_warp_reduction_supported,
+    )
+
+    if (
+        CompileEnvironment.current().backend_name != "cute"
+        or len(cg.host_function.device_ir.root_ids) != 1
+        or cg.device_function.config.get("cute_collective_mma", False)
+        or cg.device_function.config.get("cute_register_chain", False)
+    ):
+        return False
+    root = cg.current_root_graph_info
+    assert root is not None
+    graphs = cg.codegen_graphs
+
+    scan_required = (
+        cg.device_function.config.get("cute_fragment_scan", "serial") == "cooperative"
+        and root.graph_id
+        in CompileEnvironment.current().config_spec.cute_fragment_scan_root_ids
+    )
+    reduction_required = (
+        cg.device_function.config.get("cute_fragment_reduction", "serial") == "warp"
+        and root.graph_id
+        in CompileEnvironment.current().config_spec.cute_fragment_reduction_root_ids
+    )
+
+    def decline() -> bool:
+        if scan_required or reduction_required:
+            raise exc.InvalidConfig(
+                "cooperative scan requires a computed fragment root"
+                if scan_required
+                else "warp reduction requires a computed fragment root"
+            )
+        return False
+
+    if scan_required and not any(
+        node.target is scan_ops._associative_scan
+        for info in graphs
+        for node in info.graph.nodes
+    ):
+        return decline()
+    if reduction_required and not any(
+        fragment_warp_reduction_supported(node)
+        for info in graphs
+        for node in info.graph.nodes
+    ):
+        return decline()
+    if not computed_fragment_supported(CompileEnvironment.current(), graphs):
+        return decline()
+    # This owner implements configured reduction tiling directly. Keep the
+    # logical producer graph, including every other codegen transformation,
+    # rather than applying scalar graph rolling before fragment ownership.
+    graphs = cg.host_function.device_ir.build_codegen_graphs(
+        cg.device_function.config, roll_reductions=False
+    )
+    if not computed_fragment_supported(CompileEnvironment.current(), graphs):
+        return decline()
+    root = graphs[root.graph_id]
+    compiler = FragmentCompiler(cg, graphs)
+    for info in graphs:
+        for node in info.graph.nodes:
             if node.target is _tracing_ops._if:
                 predicate = node.args[0]
                 value = (
@@ -1433,7 +1776,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     isinstance(value, torch.Tensor)
                     and math.prod(compiler.shape(value.shape)) != 1
                 ):
-                    return False
+                    return decline()
     for info in graphs:
         for node in info.graph.nodes:
             if not isinstance(
@@ -1448,7 +1791,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                         (torch.SymInt, torch.SymFloat, torch.SymBool, int, float, bool),
                     ):
                         continue
-                    return False
+                    return decline()
                 span = 1
                 for stride, size in sorted(
                     zip(
@@ -1460,13 +1803,13 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
                     if size <= 1 or stride == 0:
                         continue
                     if stride < span:
-                        return False
+                        return decline()
                     span += (size - 1) * stride
     grid = cg.current_grid_state
     assert grid is not None
     compiler.begin()
     for bid, info in grid.block_id_to_info.items():
-        compiler.offsets[bid] = grid.strategy.offset_var(bid)
+        compiler.offsets[bid] = grid.strategy.grid_origin_var(bid)
         compiler.bounds[bid] = cast("str", info.end_var_name)
     body: list[ast.AST] = []
     with cg.set_statements(body):

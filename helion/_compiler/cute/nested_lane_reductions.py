@@ -104,6 +104,12 @@ def normalize_nested_lane_reductions(
     inner reduction, and its carry checks still apply to the complete body.
     Every other ownership mismatch is left for the strict owner validator.
     """
+    # Without a marker there is no reduction to move. Avoid building scalar
+    # dependency state for ordinary generated loops; their owner validation
+    # and subsequent lowering still run unchanged.
+    if not any(lanes._find_lane_reduce_call(statement) for statement in body):
+        return body
+
     shadowed_globals = {
         node.id
         for top in body

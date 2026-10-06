@@ -1635,8 +1635,25 @@ class GenerateAST(NodeVisitor, CodegenInterface):
                             self.statements_stack[-1]
                         )
                     root = root_graph_info.graph
+                    requested_fragment = (
+                        self.device_function.config.get("cute_fragment_scan", "serial")
+                        == "cooperative"
+                        and root_graph_info.graph_id
+                        in CompileEnvironment.current().config_spec.cute_fragment_scan_root_ids
+                    ) or (
+                        self.device_function.config.get(
+                            "cute_fragment_reduction", "serial"
+                        )
+                        == "warp"
+                        and root_graph_info.graph_id
+                        in CompileEnvironment.current().config_spec.cute_fragment_reduction_root_ids
+                    )
                     if (
-                        not self._try_codegen_block_scaled_root()
+                        not (
+                            requested_fragment
+                            and self._try_codegen_computed_fragment_root()
+                        )
+                        and not self._try_codegen_block_scaled_root()
                         and not self._try_codegen_topk_root()
                         and not self._try_codegen_chunk_prepare_root()
                         and not self._try_codegen_chunk_recurrence_root()

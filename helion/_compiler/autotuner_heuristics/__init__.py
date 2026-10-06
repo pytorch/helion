@@ -63,6 +63,10 @@ from .cute import grouped_row_union_paired_clc_carrier
 from .cute_block_scaled import CuteBlockScaledMmaHeuristic
 from .cute_bounded_loop_cache import CuteBoundedLoopCacheHeuristic
 from .cute_epilogue_fanout import register_epilogue_fanout_coverage
+from .cute_fragment_reduction import CuteFragmentReductionHeuristic
+from .cute_fragment_reduction import register_fragment_reduction_coverage
+from .cute_fragment_scan import CuteFragmentScanHeuristic
+from .cute_fragment_scan import register_fragment_scan_coverage
 from .cute_grouped_rna import CuteGroupedRnaHeuristic
 from .cute_grouped_rna import interleave_grouped_rna_seeds
 from .cute_host_paired_sum import CuteHostPairedSumHeuristic
@@ -153,6 +157,8 @@ HEURISTICS_BY_BACKEND: dict[str, tuple[AutotunerHeuristicType, ...]] = {
         CuteHostPairedSumHeuristic,
         CuteTcgen05GroupedSource64Heuristic,
         CuteSplitKClusterHeuristic,
+        CuteFragmentScanHeuristic,
+        CuteFragmentReductionHeuristic,
     ),
     "triton": (
         # The two sm90 front ends are disjoint and share the B200 decision flow,
@@ -262,6 +268,12 @@ def compiler_seed_configs(
     for heuristic in heuristics:
         registered_fact_specialization_facts.update(
             heuristic.register_facts(env, device_ir)
+        )
+    if env.backend_name == "cute":
+        from ..cute.computed_fragment import computed_fragment_specialization_facts
+
+        registered_fact_specialization_facts.update(
+            computed_fragment_specialization_facts(env, device_ir)
         )
     env.compiler_fact_specialization_facts = frozenset(
         registered_fact_specialization_facts
@@ -564,3 +576,5 @@ def register_compiler_coverage_groups(
                 )
             )
             break
+    register_fragment_scan_coverage(env, device_ir)
+    register_fragment_reduction_coverage(env, device_ir)

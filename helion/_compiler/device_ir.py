@@ -1573,7 +1573,9 @@ class DeviceIR:
             return False
         return bool(env.known_equal(block, info.size))
 
-    def build_codegen_graphs(self, config: Config) -> list[GraphInfo]:
+    def build_codegen_graphs(
+        self, config: Config, *, roll_reductions: bool = True
+    ) -> list[GraphInfo]:
         """Build and return graph copies with reduction rolling and epilogue subtiling applied.
 
         Creates a temporary DeviceIR with copied graphs, applies reduction
@@ -1583,7 +1585,8 @@ class DeviceIR:
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
-        temp._apply_rolling(config)
+        if roll_reductions:
+            temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
         temp._hoist_inband_polls()
         if CompileEnvironment.current().backend_name == "metal":
