@@ -231,6 +231,7 @@ _CALLS = _TYPES | frozenset(
         "cute.math.min",
         "cute.math.max",
         "cute.math.log2",
+        "cute.math.div",
         "operator.add",
         "operator.sub",
         "operator.mul",
@@ -276,6 +277,20 @@ def _recipe(
         return None
     if isinstance(node, ast.Call):
         func = _text(node.func)
+        # Admit only the emitter's two-operand div ABI. Its semantic flags must
+        # be literal booleans: never replay mutable settings or host IR state.
+        # Keep the exact flags (including their absence) in the recipe/cache key.
+        if func == "cute.math.div" and (
+            len(node.args) != 2
+            or len({kw.arg for kw in node.keywords}) != len(node.keywords)
+            or any(
+                kw.arg not in {"approx", "ftz"}
+                or not isinstance(kw.value, ast.Constant)
+                or type(kw.value.value) is not bool
+                for kw in node.keywords
+            )
+        ):
+            return None
         if func in _CALLS:
             receiver = None
         elif isinstance(node.func, ast.Attribute) and node.func.attr == "bitcast":
