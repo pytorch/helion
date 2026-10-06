@@ -947,6 +947,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
         "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
         "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
@@ -1069,6 +1070,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
         "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
         "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
@@ -1196,6 +1198,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_register_snapshots",
         "cute_fragment_register_producers",
         "cute_fragment_scan_exports",
+        "cute_fragment_warp_producer_regions",
         "cute_fragment_bounded_gather",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
@@ -1545,6 +1548,8 @@ class ConfigSpec:
         self.cute_fragment_register_producers_search_enabled = False
         self.cute_fragment_scan_exports_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_scan_exports_search_enabled = False
+        self.cute_fragment_warp_producer_regions_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_producer_regions_search_enabled = False
         self.cute_fragment_bounded_gather_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_bounded_gather_search_enabled = False
         self.cute_integer_loop_reduction_available = False
@@ -3621,6 +3626,41 @@ class ConfigSpec:
             return
         raise InvalidConfig(f"{key} requires a proved bounded last-axis gather")
 
+    def _normalize_cute_fragment_warp_producer_regions(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_warp_producer_regions"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_warp_producer_regions_root_ids
+            and config.get("cute_fragment_warp_scan") is True
+            and config.get("cute_fragment_reduction") == "warp"
+            and not any(
+                config.get(other)
+                for other in (
+                    "cute_collective_mma",
+                    "cute_register_chain",
+                    "cute_fragment_register_snapshots",
+                    "cute_fragment_register_loads",
+                    "cute_fragment_register_producers",
+                    "cute_fragment_warp_results",
+                    "cute_fragment_scan_exports",
+                )
+            )
+            and not config.get("reduction_loops")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key} requires a proved scalar-frontier warp producer prefix"
+        )
+
     def _normalize_cute_fragment_scan_exports(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4762,6 +4802,9 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_scan_exports(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_warp_producer_regions(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
             self._normalize_cute_materialized_operand_schedule(
                 config, fix_invalid=_fix_invalid
@@ -5950,6 +5993,7 @@ class ConfigSpec:
                 "cute_fragment_register_snapshots",
                 "cute_fragment_register_producers",
                 "cute_fragment_scan_exports",
+                "cute_fragment_warp_producer_regions",
                 "cute_fragment_bounded_gather",
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
@@ -6207,6 +6251,8 @@ class ConfigSpec:
                 fields["cute_fragment_bounded_gather"] = BooleanFragment()
             if self.cute_fragment_register_producers_search_enabled:
                 fields["cute_fragment_register_producers"] = BooleanFragment()
+            if self.cute_fragment_warp_producer_regions_search_enabled:
+                fields["cute_fragment_warp_producer_regions"] = BooleanFragment()
             if self.cute_fragment_scan_exports_search_enabled:
                 fields["cute_fragment_scan_exports"] = BooleanFragment()
             if self.cute_fragment_published_scalars_search_enabled:
