@@ -73,7 +73,12 @@ class FragmentResourceCatalog:
 
     @classmethod
     def create(
-        cls, env: CompileEnvironment, ir: DeviceIR, config: Config
+        cls,
+        env: CompileEnvironment,
+        ir: DeviceIR,
+        config: Config,
+        *,
+        root_ids: frozenset[int] | None = None,
     ) -> FragmentResourceCatalog | None:
         from ..cute.materialized_fission_codegen import _region_graph_ids
         from ..device_ir import HelperFunctionGraphInfo
@@ -82,6 +87,8 @@ class FragmentResourceCatalog:
         roots = (
             env.config_spec.cute_fragment_scan_root_ids
             | env.config_spec.cute_fragment_reduction_root_ids
+            if root_ids is None
+            else root_ids
         )
         if not roots:
             return None
@@ -150,7 +157,12 @@ class FragmentResourceCatalog:
         )
 
 
-def fragment_resource_carrier(env: CompileEnvironment, ir: DeviceIR) -> Config | None:
+def fragment_resource_carrier(
+    env: CompileEnvironment,
+    ir: DeviceIR,
+    *,
+    root_ids: frozenset[int] | None = None,
+) -> Config | None:
     """Descend only legal geometry coordinates until a storage bound fits.
 
     Strict decrease over finite block-size domains terminates without random
@@ -159,7 +171,12 @@ def fragment_resource_carrier(env: CompileEnvironment, ir: DeviceIR) -> Config |
     invoke code generation.
     """
     spec = env.config_spec
-    if not (spec.cute_fragment_scan_root_ids or spec.cute_fragment_reduction_root_ids):
+    roots = (
+        spec.cute_fragment_scan_root_ids | spec.cute_fragment_reduction_root_ids
+        if root_ids is None
+        else root_ids
+    )
+    if not roots:
         return None
     capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
     if not capacity:
@@ -170,7 +187,7 @@ def fragment_resource_carrier(env: CompileEnvironment, ir: DeviceIR) -> Config |
     with host:
         try:
             _, initial = generation.canonicalize_flat(generation.default_flat())
-            catalog = FragmentResourceCatalog.create(env, ir, initial)
+            catalog = FragmentResourceCatalog.create(env, ir, initial, root_ids=roots)
             if catalog is None:
                 return None
             current = initial

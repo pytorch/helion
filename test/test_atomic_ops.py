@@ -2011,6 +2011,34 @@ def _simulate_register_load_program(
 
         def visit_Call(self, node):
             function = ast.unparse(node.func)
+            collectives = {
+                "cute.arch.vote_ballot_sync": "ballot",
+                "cute.arch.match_sync": "match",
+                "cute.arch.warp_redux_sync": "redux",
+            }
+            if function in collectives:
+                kind = collectives[function]
+                if kind == "ballot":
+                    mask, value = ast.Constant(0xFFFFFFFF), node.args[0]
+                elif kind == "match":
+                    mask, value = node.args
+                else:
+                    assert ast.literal_eval(node.args[1]) == "add"
+                    value, mask = node.args[0], node.args[2]
+                return ast.copy_location(
+                    ast.Yield(
+                        ast.Tuple(
+                            [
+                                ast.Constant(kind),
+                                ast.Constant(node.lineno),
+                                mask,
+                                value,
+                            ],
+                            ast.Load(),
+                        )
+                    ),
+                    node,
+                )
             if function in ("cute.arch.shuffle_sync", "cute.arch.shuffle_sync_bfly"):
                 keywords = {item.arg: item.value for item in node.keywords}
                 offset = node.args[1] if len(node.args) > 1 else keywords["offset"]
@@ -2075,6 +2103,7 @@ def _simulate_register_load_program(
                 thread_idx=lambda: (state["lane"], 0, 0),
                 block_idx=lambda: (state["row"], 0, 0),
                 atomic_add=atomic_add,
+                lanemask_lt=lambda: np.uint32((1 << (state["lane"] % 32)) - 1),
                 fence_acq_rel_gpu=fence,
             ),
         ),
@@ -2122,6 +2151,50 @@ def _simulate_register_load_program(
             progressed = False
             for base in range(0, threads, 32):
                 group = reached[base : base + 32]
+                for event in group:
+                    if not isinstance(event, tuple) or event[0] not in (
+                        "ballot",
+                        "match",
+                        "redux",
+                    ):
+                        continue
+                    kind, line, mask, _value = event
+                    members = [lane for lane in range(32) if int(mask) & (1 << lane)]
+                    assert members, "empty participating mask"
+                    if not all(
+                        isinstance(group[lane], tuple) and group[lane][:3] == event[:3]
+                        for lane in members
+                    ):
+                        continue
+                    values = [group[lane][3] for lane in members]
+                    if kind == "ballot":
+                        result = np.uint32(
+                            sum(1 << lane for lane in members if group[lane][3])
+                        )
+                        returned = dict.fromkeys(members, result)
+                    elif kind == "match":
+                        returned = {
+                            lane: np.uint32(
+                                sum(
+                                    1 << other
+                                    for other in members
+                                    if group[other][3] == group[lane][3]
+                                )
+                            )
+                            for lane in members
+                        }
+                    else:
+                        result = np.add.reduce(
+                            np.array(values, dtype=np.int32), dtype=np.int32
+                        )
+                        returned = dict.fromkeys(members, result)
+                    for lane in order:
+                        if lane - base in returned:
+                            reached[lane] = advance(
+                                lane, returned[lane - base], send=True
+                            )
+                    progressed = True
+                    break
                 if not all(
                     isinstance(event, tuple) and event[0] == "shuffle"
                     for event in group
@@ -5339,6 +5412,789 @@ class TestFragmentTerminalLoopNative(TestCase):
                     )
                     _check_terminal_loop(args)
                     torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+
+def _private_loop_codegen(args, enabled, threads=128):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(_fragment_terminal_loop_finalizer, args)
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_threads=threads,
+            cute_fragment_private_scalar_loops=enabled,
+        )
+        return bound.to_code(config)
+
+
+class TestFragmentPrivateScalarLoopCPU(unittest.TestCase):
+    def test_generated_values_zero_trip_aliases_and_wide_bounds(self):
+        for dtype, width, threads in ((torch.int32, 17, 32), (torch.float32, 65, 128)):
+            sources = [
+                _private_loop_codegen(
+                    _terminal_loop_args(3, width, dtype, 0, 2, 1), enabled, threads
+                )
+                for enabled in (False, True)
+            ]
+            self.assertNotIn("fragment_private_scalar", sources[0])
+            self.assertIn("fragment_private_scalar", sources[1])
+            for begin, end in ((0, 0), (7, 4), (-3, 19), (2**31 + 4, 2**31 + 6)):
+                observed = []
+                for source in sources:
+                    args = _terminal_loop_args(3, width, dtype, begin, end, 1)
+                    _simulate_register_load_program(
+                        source,
+                        args[0],
+                        threads,
+                        host_tensors=dict(
+                            zip(
+                                ("partials", "alias", "counter", "tickets", "result"),
+                                args[1:6],
+                                strict=True,
+                            )
+                        ),
+                        scalar_args={"begin": begin, "end": end},
+                        lane_order=list(reversed(range(threads))),
+                    )
+                    _check_terminal_loop(args)
+                    observed.append(args)
+                for before, after in zip(observed[0], observed[1], strict=True):
+                    if isinstance(before, torch.Tensor):
+                        self.assertTrue(
+                            torch.equal(
+                                before.view(torch.uint8), after.view(torch.uint8)
+                            )
+                        )
+
+    def test_emitted_owner_and_scratch_initialization_fail_closed(self):
+        import ast
+        from unittest.mock import patch
+
+        from helion._compiler.cute import computed_fragment
+
+        original = computed_fragment.privatize_scalar_loop
+        for mutation in (
+            "owner",
+            "collective",
+            "slot",
+            "uninitialized",
+            "conditional_store",
+            "alias",
+        ):
+
+            def corrupt(compiler, loop, outgoing, mutation=mutation):
+                first = next(n for n in loop.body if isinstance(n, ast.For))
+                if mutation == "owner":
+                    first.iter.args[0] = ast.Constant(1)
+                elif mutation == "collective":
+                    first.body.insert(0, ast.parse("cute.arch.sync_threads()").body[0])
+                elif mutation == "slot":
+                    for node in ast.walk(loop):
+                        if isinstance(node, ast.Subscript):
+                            node.slice = ast.Constant(1)
+                            break
+                elif mutation == "conditional_store":
+                    target = min(outgoing)
+                    first.body.append(
+                        ast.parse(f"if True:\n    {target}[0] = {target}[0]").body[0]
+                    )
+                elif mutation == "alias":
+                    target = min(outgoing)
+                    first.body.insert(0, ast.parse(f"hidden = {target}").body[0])
+                else:
+                    scratch = next(
+                        name
+                        for name, _dtype, _size in compiler.buffers
+                        if name not in outgoing
+                    )
+                    first.body.insert(
+                        0, ast.parse(f"{scratch}[0] = {scratch}[0]").body[0]
+                    )
+                return original(compiler, loop, outgoing)
+
+            with (
+                self.subTest(mutation=mutation),
+                patch.object(computed_fragment, "privatize_scalar_loop", corrupt),
+                self.assertRaisesRegex(helion.exc.InvalidConfig, "thread-zero"),
+            ):
+                _private_loop_codegen(
+                    _terminal_loop_args(3, 17, torch.int32, 0, 2, 1), True
+                )
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_private_actual_sdk_preprocessor_and_legacy_scope(self):
+        import ast
+        import importlib.util
+        import inspect
+        from pathlib import Path
+        import sys
+        import tempfile
+        from unittest.mock import patch
+
+        from cutlass.base_dsl.ast_preprocessor import DSLPreprocessor
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        args = _terminal_loop_args(3, 17, torch.int32, -3, 19, 1)
+        source = _private_loop_codegen(args, True)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private_scalar_loop.py"
+            path.write_text(source)
+            spec = importlib.util.spec_from_file_location("private_scalar_sdk", path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            with (
+                patch.dict(sys.modules, {spec.name: module}),
+                patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
+            ):
+                spec.loader.exec_module(module)
+                name = next(
+                    n.name
+                    for n in ast.parse(source).body
+                    if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+                )
+                raw = inspect.unwrap(module.__dict__[name])
+                with DSLPreprocessor(["cutlass"]).get_session() as session:
+                    tree = session.transform(raw, dict(raw.__globals__))
+                    compile(tree, str(path), "exec", dont_inherit=True)
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            args = _terminal_finalizer_args(3, 17, "plain")
+            bound = _cpu_bind(_fragment_terminal_finalizer, args)
+            self.assertFalse(
+                bound.config_spec.cute_fragment_private_scalar_loop_root_ids
+            )
+            config = bound.config_spec.default_config()
+            before = bound.to_code(config)
+            config.config["cute_fragment_private_scalar_loops"] = False
+            self.assertEqual(before, bound.to_code(config))
+            config.config["cute_fragment_private_scalar_loops"] = True
+            with self.assertRaisesRegex(
+                helion.exc.InvalidConfig, "scalar finalizer loop"
+            ):
+                bound.to_code(config)
+
+    def test_default_and_population_prefix_remain_legacy(self):
+        from copy import deepcopy
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+        from test.cute_population_contracts import checked_initial_population
+
+        from helion.autotuner.pattern_search import InitialPopulationStrategy
+        from helion.autotuner.pattern_search import PatternSearch
+
+        args = _terminal_loop_args(3, 17, torch.int32, 0, 2, 1)
+        kernel = helion.kernel(
+            _fragment_terminal_loop_finalizer.fn,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="full",
+        )
+        key = "cute_fragment_private_scalar_loops"
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(kernel, args)
+            spec = bound.config_spec
+            self.assertTrue(spec.cute_fragment_private_scalar_loop_root_ids)
+            default = spec.default_config()
+            self.assertNotIn(key, default)
+            self.assertTrue(all(key not in seed for seed in spec.compiler_seed_configs))
+            off = deepcopy(default)
+            off.config[key] = False
+            self.assertEqual(bound.to_code(default), bound.to_code(off))
+            for value in (1, "private", None):
+                invalid = deepcopy(default)
+                invalid.config[key] = value
+                with self.assertRaises(helion.exc.InvalidConfig):
+                    bound.to_code(invalid)
+            group = next(g for g in spec.compiler_coverage_groups if g.key == key)
+            self.assertFalse(group.legacy)
+            self.assertEqual(group.dependencies, ())
+            with bound.env:
+                search = PatternSearch(
+                    bound,
+                    args,
+                    initial_population=4,
+                    initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
+                )
+                checked_initial_population(search)
+                outcome = next(
+                    o
+                    for o in search.compiler_coverage_outcomes
+                    if o.mechanism == group.mechanism
+                )
+                self.assertIn(outcome.outcome, ("added", "already_present"))
+                self.assertTrue(outcome.effective[key])
+
+
+@onlyBackends("cute")
+class TestFragmentPrivateScalarLoopNative(TestCase):
+    def test_scalar_carries_aliases_zero_trip_and_wide_bounds(self):
+        for dtype, width, threads in ((torch.int32, 17, 32), (torch.float32, 65, 128)):
+            for begin, end in ((0, 0), (-3, 19), (2**31 + 4, 2**31 + 6)):
+                with self.subTest(dtype=dtype, width=width, bounds=(begin, end)):
+                    args = _terminal_loop_args(
+                        3, width, dtype, begin, end, 1, device=DEVICE
+                    )
+                    before = args[0].clone()
+                    code_and_output(
+                        _fragment_terminal_loop_finalizer,
+                        args,
+                        cute_fragment_threads=threads,
+                        cute_fragment_private_scalar_loops=True,
+                    )
+                    _check_terminal_loop(args)
+                    torch.testing.assert_close(args[0], before, rtol=0, atol=0)
+
+    def test_readonly_masked_loads(self):
+        x = torch.arange(51, dtype=torch.float32, device=DEVICE).reshape(3, 17) * 0.125
+        for begin, end in ((-3, 21), (20, 25), (5, 2)):
+            with self.subTest(bounds=(begin, end)):
+                counter = torch.zeros(1, dtype=torch.int32, device=DEVICE)
+                result = torch.full((1,), float("nan"), device=DEVICE)
+                before = x.clone()
+                code_and_output(
+                    _fragment_private_masked_loop,
+                    (x, counter, result, begin, end),
+                    cute_fragment_threads=128,
+                    cute_fragment_private_scalar_loops=True,
+                )
+                expected = torch.tensor(0.0, dtype=torch.float32, device=DEVICE)
+                for column in range(begin, end):
+                    if 0 <= column < x.size(1):
+                        expected = expected + x[0, column]
+                torch.testing.assert_close(result, expected.reshape(1), rtol=0, atol=0)
+                torch.testing.assert_close(x, before, rtol=0, atol=0)
+                self.assertEqual(int(counter[0]), 3)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_private_masked_loop(x, counter, result, begin: int, end: int):
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([1], dtype=torch.int32)
+        hl.atomic_add(local, [0], row)
+        ticket = hl.atomic_add(counter, [0], 1, sem="acq_rel")
+        if ticket == x.size(0) - 1:
+            total = hl.full([], 0.0, dtype=torch.float32)
+            for column in range(begin, end):
+                value = hl.load(x, [0, column])
+                total = total + value
+            result[0] = total
+    return result
+
+
+class TestFragmentPrivateMaskedLoopCPU(unittest.TestCase):
+    def test_readonly_conditional_global_loads_keep_masks_and_order(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        x = torch.arange(51, dtype=torch.float32).reshape(3, 17) * 0.125
+        for begin, end in ((-3, 21), (20, 25), (5, 2)):
+            for enabled in (False, True):
+                with self.subTest(bounds=(begin, end), private=enabled):
+                    counter = torch.zeros(1, dtype=torch.int32)
+                    result = torch.full((1,), float("nan"))
+                    args = (x, counter, result, begin, end)
+                    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                        bound = _cpu_bind(_fragment_private_masked_loop, args)
+                        config = bound.config_spec.default_config()
+                        config.config.update(
+                            cute_fragment_threads=32,
+                            cute_fragment_private_scalar_loops=enabled,
+                        )
+                        code = bound.to_code(config)
+                    _simulate_register_load_program(
+                        code,
+                        x,
+                        32,
+                        host_tensors={"counter": counter, "result": result},
+                        scalar_args={"begin": begin, "end": end},
+                        lane_order=list(reversed(range(32))),
+                    )
+                    expected = torch.tensor(0.0, dtype=torch.float32)
+                    for column in range(begin, end):
+                        if 0 <= column < x.size(1):
+                            expected = expected + x[0, column]
+                    torch.testing.assert_close(
+                        result, expected.reshape(1), rtol=0, atol=0
+                    )
+                    self.assertEqual(int(counter[0]), 3)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_aggregated_histogram(
+    x, indices, bins: hl.constexpr, initial: hl.constexpr, repeats: hl.constexpr
+):
+    out = torch.empty((x.size(0), bins), dtype=torch.int32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        histogram = hl.full([bins], initial, dtype=torch.int32)
+        for iteration in range(repeats):
+            hl.atomic_add(histogram, [indices[row, :]], x[row, :] + iteration)
+        out[row, :] = histogram
+    return out
+
+
+def _aggregation_reference(x, indices, bins, initial, repeats):
+    expected = torch.full(
+        (x.size(0), bins), initial, dtype=torch.int32, device=x.device
+    )
+    wrapped = torch.where(indices < 0, indices + bins, indices).long()
+    for iteration in range(repeats):
+        expected.scatter_add_(
+            1, wrapped.reshape(x.size(0), -1), (x + iteration).reshape(x.size(0), -1)
+        )
+    return expected
+
+
+def _aggregation_codegen(kernel, args, enabled, threads=128):
+    from test._cute_binding import _cpu_bind
+    from test._cute_binding import _forbid_native_compile
+    from test._cute_binding import _mock_cuda_unavailable
+    from test.cute_population_contracts import _target
+
+    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        bound = _cpu_bind(kernel, args)
+        config = bound.config_spec.default_config()
+        config.config.update(
+            cute_fragment_atomic_aggregation=enabled, cute_fragment_threads=threads
+        )
+        return bound.to_code(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_aggregation_mixed(x, counter, tickets, sem: hl.constexpr):
+    out = torch.empty((x.size(0), 17), dtype=torch.int32, device=x.device)
+    floating_out = torch.empty((x.size(0), 17), dtype=torch.float32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.int32)
+        floating = hl.zeros([17], dtype=torch.float32)
+        indices = hl.arange(x.size(1)) % 17
+        hl.atomic_add(local, [indices], x[row, :])
+        hl.atomic_add(floating, [indices], x[row, :].to(torch.float32))
+        tickets[row] = hl.atomic_add(counter, [row], 0, sem=sem)
+        out[row, :] = local
+        floating_out[row, :] = floating
+    return out, floating_out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_aggregation_masked_tail(x):
+    out = torch.empty((x.size(0), 17), dtype=torch.int32, device=x.device)
+    for row in hl.grid(x.size(0)):
+        local = hl.zeros([17], dtype=torch.int32)
+        column = hl.arange(x.size(1))
+        value = torch.where(column < x.size(1), 1.0, float("nan"))
+        hl.atomic_add(local, [column % 17], value)
+        out[row, :] = local
+    return out
+
+
+class TestFragmentAtomicAggregationCPU(unittest.TestCase):
+    def test_masked_logical_tail_and_index_conversions_stay_guarded(self):
+        import warnings
+
+        for mode in ("logical_tail", "invalid_index"):
+            for enabled in (False, True):
+                with self.subTest(mode=mode, enabled=enabled):
+                    x = torch.ones((2, 17), dtype=torch.float32)
+                    inputs = {}
+                    expected = torch.ones((2, 17), dtype=torch.int32)
+                    if mode == "logical_tail":
+                        kernel, args = _fragment_aggregation_masked_tail, (x,)
+                    else:
+                        indices = torch.arange(17, dtype=torch.int32).repeat(2, 1)
+                        indices[:, 0] = 17
+                        indices[:, 1] = -18
+                        x[:, :2] = float("nan")
+                        inputs["indices"] = indices
+                        expected[:, :2] = 0
+                        kernel = _fragment_aggregated_histogram
+                        args = (x, indices, 17, 0, 1)
+                    code = _aggregation_codegen(kernel, args, enabled, 32)
+                    out = torch.full_like(expected, -99)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", RuntimeWarning)
+                        _simulate_register_load_program(
+                            code, x, 32, host_tensors={"out": out, **inputs}
+                        )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_exact_weights_tails_wrapped_keys_and_multiple_rounds(self):
+        import numpy as np
+
+        for shape, threads in (
+            ((2, 17), 32),
+            ((2, 65), 128),
+            ((2, 129), 512),
+            ((2, 3, 17), 128),
+        ):
+            width = torch.empty(shape).numel() // shape[0]
+            for mode in ("collision", "unique", "zero", "overflow"):
+                with self.subTest(shape=shape, threads=threads, mode=mode):
+                    x = (torch.arange(2 * width).reshape(shape) % 11 - 5).int()
+                    bins = 257 if mode == "unique" else 17
+                    idx = (
+                        (torch.arange(width).reshape(shape[1:]) % bins)
+                        .expand(shape)
+                        .int()
+                        .contiguous()
+                    )
+                    if mode == "collision":
+                        idx.zero_()
+                    elif mode == "zero":
+                        x.zero_()
+                    elif mode == "overflow":
+                        x.flatten()[::3] = torch.iinfo(torch.int32).max
+                        x.flatten()[1::7] = torch.iinfo(torch.int32).min
+                    idx = torch.where(
+                        torch.arange(width).reshape(shape[1:]) % 2 == 0, idx - bins, idx
+                    )
+                    args = (x, idx, bins, 2, 2)
+                    expected = _aggregation_reference(*args)
+                    for enabled in (False, True):
+                        code = _aggregation_codegen(
+                            _fragment_aggregated_histogram, args, enabled, threads
+                        )
+                        for order in (
+                            list(range(threads)),
+                            list(reversed(range(threads))),
+                        ):
+                            out = torch.full_like(expected, -999)
+                            with np.errstate(over="ignore"):
+                                _simulate_register_load_program(
+                                    code,
+                                    x,
+                                    threads,
+                                    host_tensors={"indices": idx, "out": out},
+                                    lane_order=order,
+                                )
+                            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_collisions_reduce_operations_and_preserve_barriers(self):
+        x = torch.ones((1, 65), dtype=torch.int32)
+        indices = torch.zeros_like(x)
+        expected = _aggregation_reference(x, indices, 17, 0, 1)
+        counts, barriers = [], []
+        for enabled in (False, True):
+            code = _aggregation_codegen(
+                _fragment_aggregated_histogram, (x, indices, 17, 0, 1), enabled, 32
+            )
+            out = torch.full_like(expected, -999)
+            events = []
+            _, count = _simulate_register_load_program(
+                code,
+                x,
+                32,
+                host_tensors={"indices": indices, "out": out},
+                atomic_events=events,
+            )
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            counts.append(len(events))
+            barriers.append(count)
+        self.assertEqual(counts, [65, 3])
+        self.assertEqual(barriers[0], barriers[1])
+
+    def test_zero_updates_are_private_only_and_invalid_lifetimes_still_reject(self):
+        for mode in (
+            "early_scan",
+            "later_update",
+            "loop_read",
+            "loop_allocation",
+            "conditional",
+            "alias",
+            "self_derived_update",
+        ):
+            with self.subTest(mode=mode), self.assertRaises(helion.exc.InvalidConfig):
+                _aggregation_codegen(
+                    _local_histogram_consumer_negative,
+                    (torch.ones((1, 65), dtype=torch.int32), mode),
+                    True,
+                )
+        with self.assertRaises(helion.exc.InvalidConfig):
+            _aggregation_codegen(
+                _local_histogram_consumers, (torch.ones((1, 65)), 17, "pointwise"), True
+            )
+
+    def test_broadcast_logical_domains_and_wide_contribution_casts(self):
+        x = torch.ones((2, 31), dtype=torch.int32)
+        indices = (torch.arange(17)[:, None] + torch.arange(31)) % 17
+        expected = torch.zeros((2, 17), dtype=torch.int32)
+        expected.scatter_add_(
+            1,
+            indices.flatten().expand(2, -1),
+            torch.full((2, 17 * 31), 6, dtype=torch.int32),
+        )
+        code = _aggregation_codegen(_local_atomic_broadcast_domain, (x, 17), True, 128)
+        out = torch.full_like(expected, -999)
+        _simulate_register_load_program(code, x, 128, host_tensors={"out": out})
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        x = torch.full((2, 65), 2**40 + 3, dtype=torch.int64)
+        indices = torch.zeros_like(x)
+        args = (x, indices, 17, 0, 1)
+        expected = _aggregation_reference(x.int(), indices, 17, 0, 1)
+        code = _aggregation_codegen(_fragment_aggregated_histogram, args, True, 32)
+        out = torch.full_like(expected, -999)
+        _simulate_register_load_program(
+            code, x, 32, host_tensors={"indices": indices, "out": out}
+        )
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_global_zero_ordered_returns_and_float_atomics_stay_per_element(self):
+        for sem in ("relaxed", "acquire", "release", "acq_rel"):
+            with self.subTest(sem=sem):
+                x = torch.zeros((2, 17), dtype=torch.int32)
+                counter = torch.full((2,), 9, dtype=torch.int32)
+                tickets = torch.full_like(counter, -1)
+                out = torch.full((2, 17), -1, dtype=torch.int32)
+                floating_out = torch.full((2, 17), -1.0)
+                code = _aggregation_codegen(
+                    _fragment_aggregation_mixed, (x, counter, tickets, sem), True, 32
+                )
+                events = []
+                memory = []
+                _simulate_register_load_program(
+                    code,
+                    x,
+                    32,
+                    host_tensors={
+                        "counter": counter,
+                        "tickets": tickets,
+                        "out": out,
+                        "floating_out": floating_out,
+                    },
+                    atomic_events=events,
+                    memory_events=memory,
+                )
+                self.assertEqual(sum(event[0] == "gpu" for event in events), 2)
+                self.assertEqual(sum(event[0] == "cta" for event in events), 34)
+                self.assertEqual(
+                    [
+                        event[4]
+                        for event in memory
+                        if event[0] == "atomic" and event[-1] == "gpu"
+                    ],
+                    [sem, sem],
+                )
+                self.assertTrue(torch.equal(counter, tickets))
+                self.assertTrue(torch.equal(out, torch.zeros_like(out)))
+                self.assertTrue(
+                    torch.equal(floating_out, torch.zeros_like(floating_out))
+                )
+
+    def test_model_rejects_fullmask_after_tail_and_duplicate_leaders(self):
+        import ast
+
+        x = torch.ones((1, 17), dtype=torch.int32)
+        indices = torch.zeros_like(x)
+        code = _aggregation_codegen(
+            _fragment_aggregated_histogram, (x, indices, 17, 0, 1), True, 32
+        )
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "cute.arch.match_sync"
+            ):
+                node.args[0] = ast.Constant(0xFFFFFFFF)
+        with self.assertRaisesRegex(AssertionError, "incomplete warp"):
+            _simulate_register_load_program(
+                ast.unparse(tree), x, 32, host_tensors={"indices": indices}
+            )
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If) and "lanemask_lt" in ast.unparse(node.test):
+                node.test = ast.Constant(True)
+        out = torch.full((1, 17), -1, dtype=torch.int32)
+        _simulate_register_load_program(
+            ast.unparse(tree), x, 32, host_tensors={"indices": indices, "out": out}
+        )
+        self.assertFalse(torch.equal(out, _aggregation_reference(x, indices, 17, 0, 1)))
+
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_actual_sdk_staged_match_redux_and_shared_atomic(self):
+        import ast
+        import importlib.util
+        from pathlib import Path
+        import tempfile
+
+        import cutlass
+        from cutlass._mlir import ir
+        from cutlass._mlir.dialects import func
+        import cutlass.cute as cute
+
+        x = torch.ones((1, 17), dtype=torch.int32)
+        source = _aggregation_codegen(
+            _fragment_aggregated_histogram, (x, torch.zeros_like(x), 17, 0, 1), True, 32
+        )
+        fn = next(
+            n
+            for n in ast.parse(source).body
+            if isinstance(n, ast.FunctionDef) and n.name.startswith("_helion_")
+        )
+        fn.name = "staged_histogram"
+        # The actual generated body stages through the installed CuTe frontend.
+        # Pointer arguments and scalar-thread intrinsics remain actual SDK IR.
+        fn.decorator_list = [ast.parse("cute.jit", mode="eval").body]
+        module = ast.fix_missing_locations(
+            ast.Module(
+                body=[
+                    ast.Import([ast.alias("operator")]),
+                    ast.Import([ast.alias("cutlass")]),
+                    ast.Import([ast.alias("cutlass.cute", "cute")]),
+                    *[n for n in ast.parse(source).body if isinstance(n, ast.Assign)],
+                    fn,
+                ],
+                type_ignores=[],
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sdk_histogram.py"
+            path.write_text(ast.unparse(module))
+            spec = importlib.util.spec_from_file_location("sdk_histogram", path)
+            sdk = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(sdk)
+            with ir.Context(), ir.Location.unknown():
+                emitted = ir.Module.create()
+                with ir.InsertionPoint(emitted.body):
+                    entry = func.FuncOp("entry", ([], []))
+                    block = entry.add_entry_block()
+                    with ir.InsertionPoint(block):
+                        pointers = [
+                            cute.make_ptr(
+                                cutlass.Int32,
+                                0,
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            )
+                            for _ in fn.args.args
+                        ]
+                        tensors = [
+                            cute.make_tensor(ptr, cute.make_layout((17,)))
+                            for ptr in pointers
+                        ]
+                        sdk.staged_histogram(*tensors)
+                        func.ReturnOp([])
+                self.assertTrue(emitted.operation.verify())
+                text = str(emitted)
+                self.assertIn("nvvm.match.sync", text)
+                self.assertIn("nvvm.redux.sync", text)
+                self.assertIn("nvvm.vote.sync  ballot", text)
+                self.assertIn("nvvm.atomicrmw", text)
+                self.assertIn("#nvvm.mem_scope<cta>", text)
+
+
+@onlyBackends("cute")
+class TestFragmentAtomicAggregationNative(TestCase):
+    def test_masked_logical_tail_contribution_conversion(self):
+        x = torch.ones((2, 17), dtype=torch.float32, device=DEVICE)
+        _, actual = code_and_output(
+            _fragment_aggregation_masked_tail,
+            (x,),
+            cute_fragment_atomic_aggregation=True,
+        )
+        torch.testing.assert_close(
+            actual,
+            torch.ones((2, 17), dtype=torch.int32, device=DEVICE),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_arbitrary_wrapped_histogram_keys_and_int32_boundaries(self):
+        for width, threads, bins in ((17, 32, 17), (65, 128, 17), (129, 512, 257)):
+            for mode in ("collision", "weighted", "overflow", "zero"):
+                with self.subTest(width=width, threads=threads, mode=mode):
+                    x = (
+                        torch.arange(2 * width, device=DEVICE).reshape(2, width) % 11
+                        - 5
+                    ).int()
+                    indices = (
+                        (torch.arange(width, device=DEVICE) % bins)
+                        .expand_as(x)
+                        .contiguous()
+                        .int()
+                    )
+                    if mode == "collision":
+                        indices.zero_()
+                    if mode == "overflow":
+                        x[:, ::3] = torch.iinfo(torch.int32).max
+                        x[:, 1::7] = torch.iinfo(torch.int32).min
+                    if mode == "zero":
+                        x.zero_()
+                    indices = torch.where(
+                        torch.arange(width, device=DEVICE) % 2 == 0,
+                        indices - bins,
+                        indices,
+                    )
+                    args = (x, indices, bins, 2, 2)
+                    before = (x.clone(), indices.clone())
+                    _, actual = code_and_output(
+                        _fragment_aggregated_histogram,
+                        args,
+                        cute_fragment_atomic_aggregation=True,
+                        cute_fragment_threads=threads,
+                    )
+                    torch.testing.assert_close(
+                        actual, _aggregation_reference(*args), rtol=0, atol=0
+                    )
+                    torch.testing.assert_close(x, before[0], rtol=0, atol=0)
+                    torch.testing.assert_close(indices, before[1], rtol=0, atol=0)
+
+    def test_mixed_global_zero_semantics_and_floating_updates(self):
+        for sem in ("relaxed", "acquire", "release", "acq_rel"):
+            with self.subTest(sem=sem):
+                x = torch.zeros((2, 17), dtype=torch.int32, device=DEVICE)
+                counter = torch.full((2,), 9, dtype=torch.int32, device=DEVICE)
+                tickets = torch.full_like(counter, -1)
+                _, (out, floating) = code_and_output(
+                    _fragment_aggregation_mixed,
+                    (x, counter, tickets, sem),
+                    cute_fragment_atomic_aggregation=True,
+                )
+                torch.testing.assert_close(
+                    counter, torch.full_like(counter, 9), rtol=0, atol=0
+                )
+                torch.testing.assert_close(tickets, counter, rtol=0, atol=0)
+                torch.testing.assert_close(out, torch.zeros_like(out), rtol=0, atol=0)
+                torch.testing.assert_close(
+                    floating, torch.zeros_like(floating), rtol=0, atol=0
+                )
+
+    def test_broadcast_domains_and_wide_contributions(self):
+        x = torch.ones((2, 31), dtype=torch.int32, device=DEVICE)
+        indices = (
+            torch.arange(17, device=DEVICE)[:, None] + torch.arange(31, device=DEVICE)
+        ) % 17
+        expected = torch.zeros((2, 17), dtype=torch.int32, device=DEVICE)
+        expected.scatter_add_(
+            1,
+            indices.flatten().expand(2, -1),
+            torch.full((2, 17 * 31), 6, dtype=torch.int32, device=DEVICE),
+        )
+        _, actual = code_and_output(
+            _local_atomic_broadcast_domain,
+            (x, 17),
+            cute_fragment_atomic_aggregation=True,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        x = torch.full((2, 65), 2**40 + 3, dtype=torch.int64, device=DEVICE)
+        indices = torch.zeros_like(x)
+        _, actual = code_and_output(
+            _fragment_aggregated_histogram,
+            (x, indices, 17, 0, 1),
+            cute_fragment_atomic_aggregation=True,
+        )
+        torch.testing.assert_close(
+            actual, _aggregation_reference(x.int(), indices, 17, 0, 1), rtol=0, atol=0
+        )
 
 
 if __name__ == "__main__":

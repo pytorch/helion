@@ -936,7 +936,11 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_reduction",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_atomic_aggregation",
         "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1042,7 +1046,11 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_reduction",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_atomic_aggregation",
         "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1153,7 +1161,11 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_reduction",
         "cute_fragment_threads",
         "cute_fragment_register_loads",
+        "cute_fragment_producer_cache",
+        "cute_fragment_warp_scan",
+        "cute_fragment_atomic_aggregation",
         "cute_fragment_warp_results",
+        "cute_fragment_private_scalar_loops",
         "cute_pointwise_pid_type",
         "cute_async_load_stages",
         "cute_async_load_lookahead",
@@ -1466,10 +1478,18 @@ class ConfigSpec:
         self.cute_fragment_reduction_search_enabled = False
         self.cute_fragment_thread_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_threads_search_enabled = False
+        self.cute_fragment_producer_cache_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_producer_cache_search_enabled = False
         self.cute_fragment_register_load_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_scan_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_warp_scan_search_enabled = False
+        self.cute_fragment_atomic_aggregation_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_atomic_aggregation_search_enabled = False
         self.cute_fragment_register_loads_search_enabled = False
         self.cute_fragment_warp_result_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_warp_results_search_enabled = False
+        self.cute_fragment_private_scalar_loop_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_private_scalar_loops_search_enabled = False
         self.cute_fragment_warp_result_min_threads = 32
         self.cute_materialized_operand_schedule_available: bool = False
         self.cute_materialized_operand_schedule_search_enabled: bool = False
@@ -3262,6 +3282,94 @@ class ConfigSpec:
             return
         raise InvalidConfig(f"{key}={value!r} requires a proved pointwise region")
 
+    def _normalize_cute_fragment_private_scalar_loops(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_private_scalar_loops"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_private_scalar_loop_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a proved read-only scalar finalizer loop"
+        )
+
+    def _normalize_cute_fragment_producer_cache(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_producer_cache"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_producer_cache_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires repeated pure fragment producers"
+        )
+
+    def _normalize_cute_fragment_warp_scan(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_warp_scan"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_warp_scan_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires a supported bounded warp-prefix scan"
+        )
+
+    def _normalize_cute_fragment_atomic_aggregation(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_atomic_aggregation"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_atomic_aggregation_root_ids
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires proved CTA-private Int32 relaxed unused atomic updates"
+        )
+
     def _normalize_cute_fragment_register_loads(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4024,6 +4132,17 @@ class ConfigSpec:
 
         if (
             self.backend_name == "cute"
+            and config.get("cute_fragment_producer_cache") is True
+            and (
+                config.get("cute_fragment_register_loads") is True
+                or config.get("cute_fragment_warp_results") is True
+            )
+        ):
+            raise InvalidConfig(
+                "shared producer caching cannot consume lane-private fragment storage"
+            )
+        if (
+            self.backend_name == "cute"
             and config.get("cute_fragment_warp_results") is True
             and config.get("cute_fragment_register_loads") is True
         ):
@@ -4240,10 +4359,20 @@ class ConfigSpec:
             self._normalize_cute_fragment_scan(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_reduction(config, fix_invalid=_fix_invalid)
             self._normalize_cute_fragment_threads(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_producer_cache(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_warp_scan(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_atomic_aggregation(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_fragment_register_loads(
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_warp_results(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_fragment_private_scalar_loops(
+                config, fix_invalid=_fix_invalid
+            )
             self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
             self._normalize_cute_materialized_operand_schedule(
                 config, fix_invalid=_fix_invalid
@@ -5417,9 +5546,17 @@ class ConfigSpec:
                 return True, "off"
             if key == "cute_materialized_operand_schedule":
                 return True, "off"
+            if key == "cute_fragment_private_scalar_loops":
+                return True, False
+            if key == "cute_fragment_producer_cache":
+                return True, False
             if key == "cute_fragment_warp_results":
                 return True, False
-            if key == "cute_fragment_register_loads":
+            if key in (
+                "cute_fragment_register_loads",
+                "cute_fragment_warp_scan",
+                "cute_fragment_atomic_aggregation",
+            ):
                 return True, False
             if key == "cute_fragment_threads":
                 return True, 128
@@ -5645,8 +5782,16 @@ class ConfigSpec:
                 fields["cute_materialized_operand_schedule"] = EnumFragment(
                     choices=("off", "warp_narrow4")
                 )
+            if self.cute_fragment_private_scalar_loops_search_enabled:
+                fields["cute_fragment_private_scalar_loops"] = BooleanFragment()
+            if self.cute_fragment_producer_cache_search_enabled:
+                fields["cute_fragment_producer_cache"] = BooleanFragment()
             if self.cute_fragment_warp_results_search_enabled:
                 fields["cute_fragment_warp_results"] = BooleanFragment()
+            if self.cute_fragment_atomic_aggregation_search_enabled:
+                fields["cute_fragment_atomic_aggregation"] = BooleanFragment()
+            if self.cute_fragment_warp_scan_search_enabled:
+                fields["cute_fragment_warp_scan"] = BooleanFragment()
             if self.cute_fragment_register_loads_search_enabled:
                 fields["cute_fragment_register_loads"] = BooleanFragment()
             if self.cute_fragment_threads_search_enabled:
