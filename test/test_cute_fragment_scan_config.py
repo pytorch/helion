@@ -1349,6 +1349,7 @@ def _without_later_fragment_coverage():
             "register_fragment_atomic_consumer_fusion_coverage",
             "register_integer_loop_reduction_coverage",
             "register_fragment_integer_atomic_epochs_coverage",
+            "register_fragment_packet_loads_coverage",
         ):
             stack.enter_context(
                 patch("helion._compiler.autotuner_heuristics." + registration)

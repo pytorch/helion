@@ -1548,6 +1548,14 @@ class FragmentCompiler:
                 True,
                 logical_domain=loaded_fragment.logical_domain,
             )
+        if self.df.config.get(
+            "cute_fragment_packet_loads", False
+        ) and host_load_is_readonly(node, self.env, self.graphs):
+            from .packet_loads import materialize_packet_load
+
+            packet = materialize_packet_load(self, tensor, loaded_fragment, load)
+            if packet is not None:
+                return packet
         if (
             self.df.config.get("cute_fragment_register_loads", False)
             and math.prod(shape) <= self.threads
