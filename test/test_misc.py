@@ -11,19 +11,30 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 from typing import cast
 import unittest
 from unittest.mock import patch
 
 from packaging import version
 import pytest
+import sympy
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
+from torch.utils._sympy.functions import PowByNatural
+from torch.utils._sympy.value_ranges import ValueRanges
 
+from ._cute_binding import _cpu_bind
+from ._cute_binding import _forbid_native_compile
+from ._cute_binding import _mock_cuda_unavailable
+from .cute_population_contracts import _target
 import helion
 from helion import _compat
+from helion import exc
 from helion._compat import supports_block_ptr
+from helion._compiler.cute.printer import cute_texpr
+from helion._compiler.integer_power import lower_integer_powers
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import PROJECT_ROOT
@@ -38,6 +49,7 @@ from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessTensorDescriptor
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -1430,6 +1442,233 @@ class TestTritonExactGelu(RefEagerTestBase, TestCase):
 
 
 class TestHelionCutePrinter(TestCase):
+    @skipIfRefEager("inspects generated device code")
+    def test_host_integer_power_keeps_runtime_scalar_origin(self) -> None:
+        def powers(x: torch.Tensor, bits: int) -> torch.Tensor:
+            value = 1 << bits
+            result = torch.empty_like(x)
+            for row in hl.tile(x.numel()):
+                result[row] = x[row] + value
+            return result
+
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        ):
+            for backend in ("cute", "triton"):
+                kernel = helion.kernel(
+                    powers, backend=backend, static_shapes=True, autotune_effort="none"
+                )
+                for bits in (5, 31, 62):
+                    with self.subTest(backend=backend, bits=bits):
+                        bound = _cpu_bind(
+                            kernel, (torch.ones(3, dtype=torch.int64), bits)
+                        )
+                        code = bound.to_code(bound.config_spec.default_config())
+                        tree = ast.parse(code)
+                        device = next(
+                            node
+                            for node in tree.body
+                            if isinstance(node, ast.FunctionDef)
+                            and node.name.startswith("_helion_")
+                        )
+                        self.assertIn("value", [arg.arg for arg in device.args.args])
+                        self.assertNotIn("bits", [arg.arg for arg in device.args.args])
+                        self.assertIn("value = 1 << bits", code)
+                        self.assertFalse(
+                            any(
+                                isinstance(node, ast.LShift)
+                                for node in ast.walk(device)
+                            )
+                        )
+
+    @skipUnlessBackends(["cute", "triton"])
+    def test_host_integer_power_runtime_scalar_native(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def powers(x: torch.Tensor, bits: int) -> torch.Tensor:
+            value = 1 << bits
+            result = torch.empty_like(x)
+            for row in hl.tile(x.numel()):
+                result[row] = x[row] + value
+            return result
+
+        x = torch.arange(17, device=DEVICE, dtype=torch.int64)
+        for bits in (5, 31, 62):
+            with self.subTest(bits=bits):
+                torch.testing.assert_close(
+                    powers(x, bits), x + (1 << bits), rtol=0, atol=0
+                )
+
+    def test_integer_powers_preserve_full_int64_precision(self) -> None:
+        exponent = sympy.Symbol("exponent", integer=True)
+        for base, last in ((2, 62), (4, 31), (8, 20), (16, 15)):
+            expression = cast("sympy.Expr", PowByNatural(sympy.Integer(base), exponent))
+            lowered = lower_integer_powers(
+                expression, {exponent: ValueRanges(0, last)}, backend="cute"
+            )
+            rendered = cute_texpr(lowered)
+            for value in range(last + 1):
+                with self.subTest(base=base, exponent=value):
+                    actual = eval(
+                        rendered,
+                        {"__builtins__": {}},
+                        {"exponent": value, "cutlass": SimpleNamespace(Int64=int)},
+                    )
+                    self.assertEqual(actual, base**value)
+                    self.assertIsInstance(actual, int)
+
+    def test_integer_powers_reject_unproved_or_overflowing_results(self) -> None:
+        exponent = sympy.Symbol("exponent", integer=True)
+        for base, bounds in (
+            (2, ValueRanges(0, 63)),
+            (2, ValueRanges(-1, 30)),
+            (2, ValueRanges.unknown_int()),
+            (4, ValueRanges(0, 32)),
+            (8, ValueRanges(0, 21)),
+            (3, ValueRanges(0, 10)),
+            (-2, ValueRanges(0, 10)),
+        ):
+            with self.subTest(base=base, bounds=bounds):
+                expression = cast(
+                    "sympy.Expr",
+                    sympy.Function.__new__(
+                        PowByNatural, sympy.Integer(base), exponent, evaluate=False
+                    ),
+                )
+                with self.assertRaises(exc.BackendUnsupported):
+                    lower_integer_powers(expression, {exponent: bounds}, backend="cute")
+        # Unprepared powers must not fall through to Triton's floating printer.
+        with self.assertRaises(exc.BackendUnsupported):
+            cute_texpr(cast("sympy.Expr", PowByNatural(2, exponent)))
+
+    def test_integer_powers_affine_exponents_and_identity(self) -> None:
+        index = sympy.Symbol("index", integer=True)
+        for expression, bounds in (
+            (PowByNatural(2, sympy.Add(30, sympy.Mul(-1, index))), ValueRanges(0, 30)),
+            (PowByNatural(4, sympy.Add(index, -3)), ValueRanges(3, 34)),
+            (
+                sympy.Function.__new__(
+                    PowByNatural, sympy.Integer(1), index, evaluate=False
+                ),
+                ValueRanges.unknown_int(),
+            ),
+        ):
+            expression = cast("sympy.Expr", expression)
+            rendered = cute_texpr(
+                lower_integer_powers(expression, {index: bounds}, backend="cute")
+            )
+            for value in (3, 17, 30):
+                actual = eval(
+                    rendered,
+                    {"__builtins__": {}},
+                    {"index": value, "cutlass": SimpleNamespace(Int64=int)},
+                )
+                self.assertEqual(actual, expression.subs(index, value))
+        unchanged = sympy.Add(sympy.Mul(3, index), 4)
+        self.assertIs(lower_integer_powers(unchanged, {}, backend="cute"), unchanged)
+
+    @skipIfRefEager("inspects generated device code")
+    def test_scalar_loop_integer_power_range_proof(self) -> None:
+        @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+        def powers(
+            x: torch.Tensor,
+            begin: hl.constexpr,
+            end: hl.constexpr,
+            step: hl.constexpr,
+        ) -> torch.Tensor:
+            result = torch.empty((x.numel(), 64), device=x.device, dtype=torch.int64)
+            for row in hl.tile(x.numel()):
+                for exponent in range(begin, end, step):
+                    result[row, exponent] = x[row] + (1 << exponent)
+            return result
+
+        with (
+            _mock_cuda_unavailable(),
+            _target(),
+            _forbid_native_compile(),
+            patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
+        ):
+            for begin, end, step in ((0, 63, 1), (3, 63, 2), (62, -1, -1)):
+                with self.subTest(begin=begin, end=end, step=step):
+                    bound = _cpu_bind(
+                        powers, (torch.ones(5, dtype=torch.int64), begin, end, step)
+                    )
+                    code = bound.to_code(bound.config_spec.default_config())
+                    tree = ast.parse(code)
+                    shifts = [
+                        node
+                        for node in ast.walk(tree)
+                        if isinstance(node, ast.BinOp)
+                        and isinstance(node.op, ast.LShift)
+                    ]
+                    self.assertTrue(shifts)
+                    # Execute the emitted integer expression for every actual
+                    # scalar-loop index, including nonzero and descending starts.
+                    for shift in shifts:
+                        names = {
+                            node.id
+                            for node in ast.walk(shift)
+                            if isinstance(node, ast.Name) and node.id != "cutlass"
+                        }
+                        self.assertEqual(len(names), 1)
+                        name = names.pop()
+                        compiled = compile(
+                            ast.Expression(shift), "<generated shift>", "eval"
+                        )
+                        for value in range(begin, end, step):
+                            actual = eval(
+                                compiled,
+                                {"__builtins__": {}},
+                                {
+                                    name: value,
+                                    "cutlass": SimpleNamespace(Int64=int),
+                                },
+                            )
+                            self.assertEqual(actual, 1 << value)
+            bound = _cpu_bind(powers, (torch.ones(5, dtype=torch.int64), 0, 64, 1))
+            with self.assertRaisesRegex(exc.BackendUnsupported, "proved exponent"):
+                bound.to_code(bound.config_spec.default_config())
+
+    @skipUnlessBackends(["cute"])
+    def test_scalar_loop_integer_power_int32_consumer_native(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def masks(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty((x.numel(), 31), device=x.device, dtype=torch.int32)
+            for row in hl.tile(x.numel()):
+                for bit in range(31):
+                    result[row, bit] = x[row] | (1 << (30 - bit))
+            return result
+
+        x = torch.arange(17, dtype=torch.int32, device=DEVICE)
+        expected = (
+            x[:, None]
+            | torch.tensor(
+                [1 << (30 - bit) for bit in range(31)], dtype=torch.int32, device=DEVICE
+            )[None, :]
+        )
+        torch.testing.assert_close(masks(x), expected, rtol=0, atol=0)
+
+    @skipUnlessBackends(["cute"])
+    def test_scalar_loop_integer_power_native(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def powers(x: torch.Tensor) -> torch.Tensor:
+            result = torch.empty((x.numel(), 63), device=x.device, dtype=torch.int64)
+            for row in hl.tile(x.numel()):
+                for exponent in range(63):
+                    result[row, exponent] = x[row] + (1 << exponent)
+            return result
+
+        x = torch.arange(17, dtype=torch.int64, device=DEVICE)
+        expected = (
+            x[:, None]
+            + torch.tensor(
+                [1 << index for index in range(63)], dtype=torch.int64, device=DEVICE
+            )[None, :]
+        )
+        torch.testing.assert_close(powers(x), expected, rtol=0, atol=0)
+
     def test_compound_division_operands_are_parenthesized(self) -> None:
         import sympy
         from torch.utils._sympy.functions import CeilDiv
