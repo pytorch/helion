@@ -8749,6 +8749,75 @@ class TestFragmentRegisterAtomicConsumersCPU(unittest.TestCase):
                             self.assertEqual(observed[0][1:], observed[1][1:])
                         torch.testing.assert_close(args[0], before, rtol=0, atol=0)
 
+    def test_discovery_keeps_final_bound_and_cached_alias_guards(self):
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.autotuner_heuristics.cute_fragment_common import (
+            computed_fragment_discovery_supported,
+        )
+        from helion._compiler.cute.computed_fragment import computed_fragment_supported
+
+        x = torch.ones((4, 65), dtype=torch.float32)
+        out = torch.empty_like(x, dtype=torch.int32)[:, :35]
+        kernel = _fragment_register_atomic_branches
+        key = "cute_tensor_storage_disjoint_matrix_v1"
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = kernel.bind((x, out, 17))
+            self.assertTrue(
+                bound.config_spec.cute_fragment_local_atomic_registers_root_ids
+            )
+            config = bound.config_spec.default_config()
+            config.config.update(
+                cute_fragment_threads=32, cute_fragment_local_atomic_registers=True
+            )
+            _, config = bound.config_spec.create_config_generation().strict_config_pair(
+                config
+            )
+            code = bound.to_code(config)
+            self.assertIn("fragment_local_tickets", code)
+            graphs = bound.host_function.device_ir.graphs
+            facts = bound.env.bound_runtime_input_specialization_results.pop(key)
+            try:
+                with (
+                    bound.env,
+                    bound.host_function,
+                    bound.env.use_runtime_arg_values(
+                        {"x": x, "out": out, "capacity": 17}
+                    ),
+                ):
+                    self.assertTrue(
+                        computed_fragment_discovery_supported(bound.env, graphs)
+                    )
+                    self.assertFalse(computed_fragment_supported(bound.env, graphs))
+                with self.assertRaises(helion.exc.InvalidConfig):
+                    bound.to_code(config)
+            finally:
+                bound.env.bound_runtime_input_specialization_results[key] = facts
+            for alias in (
+                x.view(torch.int32)[:, :35],
+                torch.from_dlpack(x).view(torch.int32)[:, :35],
+            ):
+                with self.subTest(dlpack=alias._base is None):
+                    self.assertEqual(alias.shape, out.shape)
+                    self.assertEqual(alias.stride(), out.stride())
+                    changed = kernel.bind((x, alias, 17))
+                    self.assertIsNot(changed, bound)
+                    with self.assertRaises(helion.exc.InvalidConfig):
+                        changed.to_code(config)
+                    with (
+                        bound.env,
+                        bound.host_function,
+                        bound.env.use_runtime_arg_values(
+                            {"x": x, "out": alias, "capacity": 17}
+                        ),
+                    ):
+                        self.assertFalse(computed_fragment_supported(bound.env, graphs))
+            replacement = torch.empty_like(x, dtype=torch.int32)[:, :35]
+            self.assertIs(kernel.bind((x, replacement, 17)), bound)
+            self.assertEqual(bound.to_code(config), code)
+
     def test_atomic_consumers_decline_changes_of_scope_dtype_or_coordinate(self):
         args = (
             torch.ones((2, 65), dtype=torch.int32),
@@ -8831,75 +8900,6 @@ class TestFragmentRegisterAtomicConsumersCPU(unittest.TestCase):
                             self.assertIn("nvvm.barrier", text)
                             self.assertEqual("nvvm.match.sync" in text, aggregate)
                             self.assertEqual("nvvm.redux.sync" in text, aggregate)
-
-    def test_discovery_keeps_final_bound_and_cached_alias_guards(self):
-        from test._cute_binding import _forbid_native_compile
-        from test._cute_binding import _mock_cuda_unavailable
-        from test.cute_population_contracts import _target
-
-        from helion._compiler.autotuner_heuristics.cute_fragment_common import (
-            computed_fragment_discovery_supported,
-        )
-        from helion._compiler.cute.computed_fragment import computed_fragment_supported
-
-        x = torch.ones((4, 65), dtype=torch.float32)
-        out = torch.empty_like(x, dtype=torch.int32)[:, :35]
-        kernel = _fragment_register_atomic_branches
-        key = "cute_tensor_storage_disjoint_matrix_v1"
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-            bound = kernel.bind((x, out, 17))
-            self.assertTrue(
-                bound.config_spec.cute_fragment_local_atomic_registers_root_ids
-            )
-            config = bound.config_spec.default_config()
-            config.config.update(
-                cute_fragment_threads=32, cute_fragment_local_atomic_registers=True
-            )
-            _, config = bound.config_spec.create_config_generation().strict_config_pair(
-                config
-            )
-            code = bound.to_code(config)
-            self.assertIn("fragment_local_tickets", code)
-            graphs = bound.host_function.device_ir.graphs
-            facts = bound.env.bound_runtime_input_specialization_results.pop(key)
-            try:
-                with (
-                    bound.env,
-                    bound.host_function,
-                    bound.env.use_runtime_arg_values(
-                        {"x": x, "out": out, "capacity": 17}
-                    ),
-                ):
-                    self.assertTrue(
-                        computed_fragment_discovery_supported(bound.env, graphs)
-                    )
-                    self.assertFalse(computed_fragment_supported(bound.env, graphs))
-                with self.assertRaises(helion.exc.InvalidConfig):
-                    bound.to_code(config)
-            finally:
-                bound.env.bound_runtime_input_specialization_results[key] = facts
-            for alias in (
-                x.view(torch.int32)[:, :35],
-                torch.from_dlpack(x).view(torch.int32)[:, :35],
-            ):
-                with self.subTest(dlpack=alias._base is None):
-                    self.assertEqual(alias.shape, out.shape)
-                    self.assertEqual(alias.stride(), out.stride())
-                    changed = kernel.bind((x, alias, 17))
-                    self.assertIsNot(changed, bound)
-                    with self.assertRaises(helion.exc.InvalidConfig):
-                        changed.to_code(config)
-                    with (
-                        bound.env,
-                        bound.host_function,
-                        bound.env.use_runtime_arg_values(
-                            {"x": x, "out": alias, "capacity": 17}
-                        ),
-                    ):
-                        self.assertFalse(computed_fragment_supported(bound.env, graphs))
-            replacement = torch.empty_like(x, dtype=torch.int32)[:, :35]
-            self.assertIs(kernel.bind((x, replacement, 17)), bound)
-            self.assertEqual(bound.to_code(config), code)
 
 
 @onlyBackends("cute")
@@ -11773,6 +11773,31 @@ class TestFragmentUniformLocalBranchesCPU(unittest.TestCase):
                     ),
                 )
 
+    def test_nested_readonly_local_capture_preserves_untaken_output(self):
+        # Nested uniform frames now admit this completed, readonly capture.
+        # An untaken inner arm must preserve the caller's output contents.
+        for dtype in (torch.int32, torch.float32):
+            with self.subTest(dtype=dtype):
+                x = (torch.arange(4 * 17).reshape(4, 17) - 30).to(dtype)
+                lengths = torch.tensor([0, 2, 3, 17], dtype=torch.int32)
+                out = torch.full_like(x, -99)
+                code = _fragment_ordered_codegen(
+                    _fragment_uniform_local_rejected, (x, lengths, out, "nested")
+                )
+                expected = torch.full_like(x, -99)
+                expected[:2] = -1
+                expected[3] = x[3].sum()
+                for order in (None, list(reversed(range(128)))):
+                    out.fill_(-99)
+                    _simulate_register_load_program(
+                        code,
+                        x,
+                        128,
+                        host_tensors={"lengths": lengths, "out": out},
+                        lane_order=order,
+                    )
+                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
     def test_predicate_host_alias_declines(self):
         from test._cute_binding import _cpu_bind
         from test._cute_binding import _forbid_native_compile
@@ -11814,31 +11839,6 @@ class TestFragmentUniformLocalBranchesCPU(unittest.TestCase):
                         bound.to_code(config)
                 else:
                     bound.to_code(config)
-
-    def test_nested_readonly_local_capture_preserves_untaken_output(self):
-        # Nested uniform frames now admit this completed, readonly capture.
-        # An untaken inner arm must preserve the caller's output contents.
-        for dtype in (torch.int32, torch.float32):
-            with self.subTest(dtype=dtype):
-                x = (torch.arange(4 * 17).reshape(4, 17) - 30).to(dtype)
-                lengths = torch.tensor([0, 2, 3, 17], dtype=torch.int32)
-                out = torch.full_like(x, -99)
-                code = _fragment_ordered_codegen(
-                    _fragment_uniform_local_rejected, (x, lengths, out, "nested")
-                )
-                expected = torch.full_like(x, -99)
-                expected[:2] = -1
-                expected[3] = x[3].sum()
-                for order in (None, list(reversed(range(128)))):
-                    out.fill_(-99)
-                    _simulate_register_load_program(
-                        code,
-                        x,
-                        128,
-                        host_tensors={"lengths": lengths, "out": out},
-                        lane_order=order,
-                    )
-                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -12601,7 +12601,9 @@ class TestUniformLocalRegionsCPU(unittest.TestCase):
             before.append(update)
         self.assertEqual(len(uniform_local_regions(graphs).frames), 9)
 
-    def test_early_indexed_local_read_and_snapshot_promotion_stay_excluded(self):
+    def test_early_indexed_local_read_and_mutable_snapshot_promotion_stay_excluded(
+        self,
+    ):
         from helion._compiler.cute.register_snapshots import snapshot_capture_slots
         from helion._compiler.cute.uniform_region_tree import uniform_local_regions
         from helion.language import memory_ops
@@ -12621,13 +12623,9 @@ class TestUniformLocalRegionsCPU(unittest.TestCase):
                 uniform_local_regions(graphs)
         finally:
             allocation.graph.erase_node(read)
-        source = next(
-            n
-            for f in tree.frames
-            if f.role == "root"
-            for n in f.graph.graph.nodes
-            if n.target is memory_ops.load and n.meta["val"].ndim == 1
-        )
+        # Immutable host captures are now eligible; a mutable local allocation
+        # is still not an initialized readonly register snapshot.
+        source = allocation
         for frame in tree.frames:
             if frame.role == "while_body":
                 self.assertEqual(snapshot_capture_slots(frame.call, graphs, source), ())
@@ -14967,6 +14965,736 @@ class TestUniformSingletonSubscriptNative(TestCase):
             )
             torch.testing.assert_close(public[0].cpu(), x, rtol=0, atol=0)
             torch.testing.assert_close(public[1].cpu(), limits, rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_frame_branch_snapshot(x, counts, flags, limits, out):
+    for row in hl.grid(x.size(0)):
+        count = torch.clamp(counts[row], min=0, max=x.size(1))
+        total = hl.full([], 7, dtype=torch.int32)
+        iteration = hl.full([], 0, dtype=torch.int32)
+        if flags[row] > 0:
+            column = hl.arange(helion.next_power_of_2(x.size(1)))
+            value = hl.load(x, [row, column], extra_mask=column < count)
+            initial = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(initial, [column % 17], value.to(torch.int32))
+            while iteration < limits[row]:
+                level = hl.zeros([17], dtype=torch.int32)
+                hl.atomic_add(level, [column % 17], value.to(torch.int32))
+                if iteration % 2 == 0:
+                    total = (
+                        total
+                        + value.to(torch.int32).sum(dtype=torch.int32)
+                        + level.sum(dtype=torch.int32)
+                    )
+                else:
+                    inner = hl.full([], 0, dtype=torch.int32)
+                    while inner < 2:
+                        last = hl.zeros([3], dtype=torch.int32)
+                        hl.atomic_add(last, [column % 3], value.to(torch.int32))
+                        total = (
+                            total
+                            + last.sum(dtype=torch.int32)
+                            + torch.where(
+                                column < count, value.to(torch.int32), 2147483647
+                            ).min()
+                        )
+                        inner += 1
+                iteration += 1
+        out[row] = total
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_frame_root_snapshot(x, counts, flags, limits, out):
+    for row in hl.grid(x.size(0)):
+        count = torch.clamp(counts[row], min=0, max=x.size(1))
+        column = hl.arange(helion.next_power_of_2(x.size(1)))
+        value = hl.load(x, [row, column], extra_mask=column < count)
+        initial = hl.zeros([17], dtype=torch.int32)
+        hl.atomic_add(initial, [column % 17], value.to(torch.int32))
+        total = hl.full([], 7, dtype=torch.int32)
+        iteration = hl.full([], 0, dtype=torch.int32)
+        if flags[row] > 0:
+            while iteration < limits[row]:
+                level = hl.zeros([17], dtype=torch.int32)
+                hl.atomic_add(level, [column % 17], value.to(torch.int32))
+                total = (
+                    total
+                    + value.to(torch.int32).sum(dtype=torch.int32)
+                    + level.sum(dtype=torch.int32)
+                )
+                iteration += 1
+        else:
+            total = total + value.to(torch.int32).sum(dtype=torch.int32)
+        out[row] = total
+    return out
+
+
+def _frame_snapshot_args(dtype, width=257):
+    x = (torch.arange(4 * width).reshape(4, width) % 13 - 6).to(dtype)
+    counts = torch.tensor([0, 31, width, width - 32], dtype=torch.int32)
+    flags = torch.tensor([0, 1, 1, 1], dtype=torch.int32)
+    limits = torch.tensor([3, 0, 1, 3], dtype=torch.int32)
+    return x, counts, flags, limits, torch.empty(4, dtype=torch.int32)
+
+
+def _frame_snapshot_expected(args, branch):
+    x, counts, flags, limits, out = args
+    expected = []
+    for row in range(4):
+        z = x[row, : int(counts[row])].to(torch.int32)
+        total = 7
+        if flags[row] > 0:
+            for iteration in range(int(limits[row])):
+                if not branch or iteration % 2 == 0:
+                    total += 2 * int(z.sum())
+                else:
+                    total += 2 * (int(z.sum()) + int(z.min()))
+        elif not branch:
+            total += int(z.sum())
+        expected.append(total)
+    return torch.tensor(expected, dtype=torch.int32)
+
+
+class TestUniformFrameSnapshotsCPU(unittest.TestCase):
+    def test_masked_multislot_captures_across_current_frames(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        for branch, kernel in (
+            (False, _fragment_frame_root_snapshot),
+            (True, _fragment_frame_branch_snapshot),
+        ):
+            for dtype in (torch.int32, torch.float32):
+                with self.subTest(branch=branch, dtype=dtype):
+                    args = _frame_snapshot_args(dtype)
+                    expected = _frame_snapshot_expected(args, branch)
+                    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                        bound = _cpu_bind(kernel, args)
+                        config = bound.config_spec.default_config()
+                        config.config.update(
+                            cute_fragment_threads=128,
+                            cute_fragment_register_snapshots=True,
+                        )
+                        code = bound.to_code(config)
+                    self.assertEqual(code.count("= cute.make_rmem_tensor"), 1)
+                    for order in (None, list(reversed(range(128)))):
+                        args[-1].fill_(-99)
+                        _simulate_register_load_program(
+                            code,
+                            args[0],
+                            128,
+                            host_tensors=dict(
+                                zip(
+                                    ("counts", "flags", "limits", "out"),
+                                    args[1:],
+                                    strict=True,
+                                )
+                            ),
+                            lane_order=order,
+                        )
+                        torch.testing.assert_close(args[-1], expected, rtol=0, atol=0)
+
+    def test_derived_and_foreign_captures_do_not_become_identities(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.register_snapshots import frame_snapshot_captures
+        from helion._compiler.cute.register_snapshots import snapshot_chains
+        from helion.language import _tracing_ops
+
+        args = _frame_snapshot_args(torch.int32)
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(_fragment_frame_branch_snapshot, args)
+            graphs = bound.host_function.device_ir.graphs
+            with bound.env, bound.host_function:
+                chains = snapshot_chains(graphs, bound.env)
+                source = next(n for n in chains if n.name == "value")
+                call = next(
+                    n
+                    for g in graphs
+                    for n in g.graph.nodes
+                    if n.target is _tracing_ops._while_loop and source in n.args[2]
+                )
+                before = frame_snapshot_captures(call, graphs, source)
+                self.assertTrue(any(before.values()))
+                slot = list(call.args[2]).index(source)
+                with source.graph.inserting_before(call):
+                    derived = source.graph.call_function(
+                        torch.ops.aten.add.Scalar, (source, 1)
+                    )
+                    derived.meta = dict(source.meta)
+                original = call.args
+                entries = list(call.args[2])
+                entries[slot] = derived
+                call.args = (*call.args[:2], entries, call.args[3])
+                try:
+                    after = frame_snapshot_captures(call, graphs, source)
+                    self.assertTrue(all(slot not in slots for slots in after.values()))
+                    self.assertIn(source, snapshot_chains(graphs, bound.env))
+                finally:
+                    call.args = original
+                    source.graph.erase_node(derived)
+                self.assertEqual(frame_snapshot_captures(call, graphs, call), {})
+                self.assertEqual(frame_snapshot_captures(source, graphs, source), {})
+                metadata = source.meta["val"]
+                source.meta["val"] = torch.empty((257,), dtype=torch.bool)
+                try:
+                    self.assertEqual(frame_snapshot_captures(call, graphs, source), {})
+                finally:
+                    source.meta["val"] = metadata
+                self.assertEqual(frame_snapshot_captures(call, graphs, source), before)
+
+    def test_cached_disjoint_binding_does_not_reuse_alias_authority(self):
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.register_snapshots import snapshot_chains
+
+        args = list(_frame_snapshot_args(torch.int32))
+        args[-1] = torch.empty_like(args[0])[:, 0]
+        kernel = _fragment_frame_root_snapshot
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = kernel.bind(tuple(args))
+            cfg = bound.config_spec.default_config()
+            cfg.config.update(
+                cute_fragment_threads=128, cute_fragment_register_snapshots=True
+            )
+            code = bound.to_code(cfg)
+            for alias in (args[0][:, 0], torch.from_dlpack(args[0])[:, 0]):
+                with self.subTest(dlpack=alias._base is None):
+                    actual = (*args[:-1], alias)
+                    other = kernel.bind(actual)
+                    self.assertIsNot(other, bound)
+                    with self.assertRaises(helion.exc.InvalidConfig):
+                        other.to_code(cfg)
+                    with (
+                        bound.env,
+                        bound.host_function,
+                        bound.env.use_runtime_arg_values(
+                            dict(
+                                zip(
+                                    ("x", "counts", "flags", "limits", "out"),
+                                    actual,
+                                    strict=True,
+                                )
+                            )
+                        ),
+                    ):
+                        self.assertFalse(
+                            snapshot_chains(
+                                bound.host_function.device_ir.graphs, bound.env
+                            )
+                        )
+            replacement = (*args[:-1], torch.empty_like(args[0])[:, 0])
+            self.assertIs(kernel.bind(replacement), bound)
+            self.assertEqual(bound.to_code(cfg), code)
+
+
+@onlyBackends("cute")
+class TestUniformFrameSnapshotsNative(TestCase):
+    def test_masked_branch_snapshot_and_nested_loops(self):
+        for dtype in (torch.int32, torch.float32):
+            args = _frame_snapshot_args(dtype)
+            public = tuple(x.to(DEVICE) for x in args)
+            _, actual = code_and_output(
+                _fragment_frame_branch_snapshot,
+                public,
+                cute_fragment_threads=128,
+                cute_fragment_register_snapshots=True,
+            )
+            self.assertIs(actual, public[-1])
+            torch.testing.assert_close(
+                actual.cpu(), _frame_snapshot_expected(args, True), rtol=0, atol=0
+            )
+            for before, after in zip(args[:-1], public[:-1], strict=True):
+                torch.testing.assert_close(before, after.cpu(), rtol=0, atol=0)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_snapshot_mixed_prerequisites(x, limits, out):
+    for row in hl.grid(x.size(0)):
+        col = hl.arange(helion.next_power_of_2(x.size(1)))
+        values = hl.load(x, [row, col], extra_mask=col < x.size(1))
+        total = hl.full([], 0, dtype=torch.int32)
+        i = hl.full([], 0, dtype=torch.int32)
+        while i < limits[row]:
+            total = total + values.sum(dtype=torch.int32)
+            i += 1
+        j = hl.full([], 0, dtype=torch.int32)
+        while j < limits[row]:
+            hist = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(hist, [col % 17], values)
+            total = total + hl.load(hist, [0])
+            j += 1
+        out[row] = total
+    return out
+
+
+class TestUniformSnapshotPrerequisitesCPU(unittest.TestCase):
+    def test_mixed_loops_retain_each_bounded_gather_prerequisite(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.computed_fragment import computed_fragment_supported
+        from helion._compiler.cute.resident_while import resident_while_plan
+        from helion.language import _tracing_ops
+
+        args = (
+            torch.ones((3, 129), dtype=torch.int32),
+            torch.tensor([0, 1, 3], dtype=torch.int32),
+            torch.empty(3, dtype=torch.int32),
+        )
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(_fragment_snapshot_mixed_prerequisites, args)
+            graphs = bound.host_function.device_ir.graphs
+            calls = [
+                n
+                for g in graphs
+                for n in g.graph.nodes
+                if n.target is _tracing_ops._while_loop
+            ]
+            plans = [resident_while_plan(n, graphs) for n in calls]
+            self.assertEqual([bool(p.local_allocations) for p in plans], [False, True])
+            with bound.env, bound.host_function:
+                self.assertFalse(
+                    computed_fragment_supported(
+                        bound.env,
+                        graphs,
+                        snapshot_owned=True,
+                        bounded_gather_owned=False,
+                    )
+                )
+            # No bounded-gather witness exists for this mixed fixture; decline
+            # snapshot discovery rather than advertising a non-emittable config.
+            self.assertFalse(
+                bound.config_spec.cute_fragment_register_snapshots_root_ids
+            )
+            config = bound.config_spec.default_config()
+            config.config.update(
+                cute_fragment_register_snapshots=True,
+                cute_fragment_bounded_gather=False,
+            )
+            with self.assertRaises(helion.exc.InvalidConfig):
+                bound.config_spec.create_config_generation().strict_config_pair(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_snapshot_unsupported_vector_carry(x, limits, out):
+    for row in hl.grid(x.size(0)):
+        values = x[row, :]
+        iteration = hl.full([], 0, dtype=torch.int32)
+        while iteration < limits[row]:
+            values = values + 1
+            iteration += 1
+        out[row, :] = values
+    return out
+
+
+class TestSnapshotDiscoveryDeclineCPU(unittest.TestCase):
+    def test_unsupported_snapshot_loop_preserves_ordinary_codegen(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            args = (
+                torch.ones((3, 17), dtype=torch.int32),
+                torch.tensor([0, 1, 3], dtype=torch.int32),
+                torch.empty((3, 17), dtype=torch.int32),
+            )
+            bound = _cpu_bind(_fragment_snapshot_unsupported_vector_carry, args)
+            self.assertFalse(
+                bound.config_spec.cute_fragment_register_snapshots_root_ids
+            )
+            config = bound.config_spec.default_config()
+            code = bound.to_code(config)
+            self.assertIn("while ", code)
+            config.config["cute_fragment_register_snapshots"] = True
+            with self.assertRaises(helion.exc.InvalidConfig):
+                bound.config_spec.create_config_generation().strict_config_pair(config)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_derived_snapshot_keys(x, counts, flags, limits, out):
+    for row in hl.grid(x.size(0)):
+        count = counts[row]
+        total = hl.full([], 7, dtype=torch.int64)
+        iteration = hl.full([], 0, dtype=torch.int32)
+        if flags[row] > 0:
+            column = hl.arange(helion.next_power_of_2(x.size(1)))
+            value = hl.load(
+                x, [row, column], extra_mask=(column < x.size(1)) & (column < count)
+            )
+            word = value.view(torch.int32).to(torch.int64) & 4294967295
+            keys = (
+                torch.where(
+                    (word & 2147483648) != 0, 4294967295 - word, word ^ 2147483648
+                )
+                + count.to(torch.int64)
+                + word.max()
+            )
+            while iteration < limits[row]:
+                histogram = hl.zeros([17], dtype=torch.int32)
+                hl.atomic_add(histogram, [column % 17], (keys & 3).to(torch.int32))
+                if iteration % 2 == 0:
+                    total = (
+                        total
+                        + keys.min()
+                        + histogram.sum(dtype=torch.int32).to(torch.int64)
+                    )
+                else:
+                    inner = hl.full([], 0, dtype=torch.int32)
+                    while inner < 2:
+                        local = hl.zeros([3], dtype=torch.int32)
+                        hl.atomic_add(local, [column % 3], (keys & 3).to(torch.int32))
+                        total = (
+                            total
+                            + keys.max()
+                            + local.sum(dtype=torch.int32).to(torch.int64)
+                        )
+                        inner += 1
+                iteration += 1
+        out[row] = total
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_mutable_snapshot_recipe(x, limits, out):
+    for row in hl.grid(x.size(0)):
+        column = hl.arange(helion.next_power_of_2(x.size(1)))
+        value = hl.load(x, [row, column], extra_mask=column < x.size(1))
+        total = hl.full([], 0, dtype=torch.int64)
+        iteration = hl.full([], 0, dtype=torch.int32)
+        while iteration < limits[row]:
+            derived = value.to(torch.int64) + iteration.to(torch.int64)
+            inner = hl.full([], 0, dtype=torch.int32)
+            while inner < 2:
+                histogram = hl.zeros([17], dtype=torch.int32)
+                hl.atomic_add(histogram, [column % 17], (derived & 3).to(torch.int32))
+                total += derived.sum(dtype=torch.int64)
+                inner += 1
+            iteration += 1
+        out[row] = total
+    return out
+
+
+def _derived_snapshot_args(dtype, width=129):
+    raw = (torch.arange(4 * width).reshape(4, width) % 19 - 9).to(torch.int32)
+    if dtype == torch.float32:
+        special = torch.tensor(
+            [0, -2147483648, 1, -1, 2139095040, -8388608, 2143289345, -4194303],
+            dtype=torch.int32,
+        )
+        raw[:, : min(width, 8)] = special[: min(width, 8)]
+        x = raw.view(torch.float32)
+    else:
+        x = raw
+    return (
+        x,
+        torch.tensor([0, 31, width, max(0, width - 32)], dtype=torch.int32),
+        torch.tensor([0, 1, 1, 1], dtype=torch.int32),
+        torch.tensor([3, 0, 1, 3], dtype=torch.int32),
+        torch.empty(4, dtype=torch.int64),
+    )
+
+
+def _derived_snapshot_expected(args):
+    x, counts, flags, limits, _out = args
+    result = []
+    for row in range(x.size(0)):
+        raw = torch.zeros(helion.next_power_of_2(x.size(1)), dtype=torch.int32)
+        count = min(int(counts[row]), x.size(1))
+        raw[:count] = x[row, :count].view(torch.int32)
+        word = raw.to(torch.int64) & 4294967295
+        keys = (
+            torch.where((word & 2147483648) != 0, 4294967295 - word, word ^ 2147483648)
+            + int(counts[row])
+            + int(word.max())
+        )
+        total = 7
+        if flags[row]:
+            for iteration in range(int(limits[row])):
+                total += int(keys.min()) if iteration % 2 == 0 else 2 * int(keys.max())
+                total += (1 if iteration % 2 == 0 else 2) * int((keys & 3).sum())
+        result.append(total)
+    return torch.tensor(result, dtype=torch.int64)
+
+
+class TestDerivedFrameSnapshotsCPU(unittest.TestCase):
+    def test_typed_multislot_keys_masks_and_nested_loops(self):
+        import ast
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        class Bitcasts(ast.NodeTransformer):
+            def visit_Attribute(self, node):
+                node = self.generic_visit(node)
+                if node.attr == "bitcast":
+                    node.attr = "view"
+                return node
+
+        for dtype in (torch.int32, torch.float32):
+            for width in (33, 129, 257):
+                with self.subTest(dtype=dtype, width=width):
+                    args = _derived_snapshot_args(dtype, width)
+                    expected = _derived_snapshot_expected(args)
+                    original = args[0].view(torch.int32).clone()
+                    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+                        bound = _cpu_bind(_fragment_derived_snapshot_keys, args)
+                        config = bound.config_spec.default_config()
+                        config.config.update(
+                            cute_fragment_threads=128,
+                            cute_fragment_register_snapshots=True,
+                        )
+                        code = bound.to_code(config)
+                    self.assertEqual(code.count("= cute.make_rmem_tensor"), 3)
+                    self.assertIn(
+                        "fragment_derived_snapshot = cute.make_rmem_tensor", code
+                    )
+                    model = ast.unparse(
+                        ast.fix_missing_locations(Bitcasts().visit(ast.parse(code)))
+                    )
+                    for order in (None, list(reversed(range(128)))):
+                        args[-1].fill_(-99)
+                        _simulate_register_load_program(
+                            model,
+                            args[0],
+                            128,
+                            host_tensors=dict(
+                                zip(
+                                    ("counts", "flags", "limits", "out"),
+                                    args[1:],
+                                    strict=True,
+                                )
+                            ),
+                            lane_order=order,
+                        )
+                        torch.testing.assert_close(args[-1], expected, rtol=0, atol=0)
+                    self.assertTrue(torch.equal(args[0].view(torch.int32), original))
+
+    def test_current_owner_recipe_rejects_mutation_and_metadata(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.register_snapshots import frame_snapshot_recipes
+        from helion.language import _tracing_ops
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(
+                _fragment_derived_snapshot_keys, _derived_snapshot_args(torch.float32)
+            )
+            graphs = bound.host_function.device_ir.graphs
+            with bound.env, bound.host_function:
+                calls = [
+                    n
+                    for g in graphs
+                    for n in g.graph.nodes
+                    if n.target is _tracing_ops._while_loop
+                ]
+                call = calls[-1]
+                before = frame_snapshot_recipes(call, graphs, bound.env)
+                self.assertTrue(any(before.values()))
+                slot = next(iter(next(v for v in before.values() if v)))
+                entry = call.args[2][slot]
+                original = entry.meta["val"]
+                for fake in (
+                    torch.empty((1,), dtype=original.dtype),
+                    torch.empty(
+                        original.shape,
+                        dtype=original.dtype,
+                        device=torch.device("meta"),
+                    ),
+                ):
+                    with self.subTest(fake=fake.shape, device=fake.device):
+                        entry.meta["val"] = fake
+                        self.assertFalse(
+                            any(
+                                frame_snapshot_recipes(call, graphs, bound.env).values()
+                            )
+                        )
+                entry.meta["val"] = original
+                target = entry.target
+                for invalid in (
+                    torch.ops.aten.add_.Tensor,
+                    torch.ops.aten.randn_like.default,
+                    torch.ops.aten.roll.default,
+                ):
+                    with self.subTest(target=invalid):
+                        entry.target = invalid
+                        self.assertFalse(
+                            any(
+                                frame_snapshot_recipes(call, graphs, bound.env).values()
+                            )
+                        )
+                entry.target = target
+                self.assertEqual(
+                    frame_snapshot_recipes(call, graphs, bound.env), before
+                )
+                self.assertEqual(frame_snapshot_recipes(entry, graphs, bound.env), {})
+            args = (
+                torch.ones((3, 129), dtype=torch.int32),
+                torch.tensor([0, 1, 3], dtype=torch.int32),
+                torch.empty(3, dtype=torch.int64),
+            )
+            mutable = _cpu_bind(_fragment_mutable_snapshot_recipe, args)
+            with mutable.env, mutable.host_function:
+                graphs = mutable.host_function.device_ir.graphs
+                inner = next(
+                    n
+                    for g in graphs
+                    for n in g.graph.nodes
+                    if n.target is _tracing_ops._while_loop
+                    and any(v.name == "derived" for v in n.args[2])
+                )
+                self.assertFalse(
+                    any(frame_snapshot_recipes(inner, graphs, mutable.env).values())
+                )
+
+    def test_derived_slots_keep_their_type_and_reject_shifted_owners(self):
+        from unittest.mock import patch
+
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.computed_fragment import FragmentCompiler
+
+        original = FragmentCompiler.derived_snapshot
+        checked = []
+
+        def remap(compiler, value, sources):
+            result = original(compiler, value, sources)
+            if result is not None:
+                self.assertIsNone(result.snapshot)
+                self.assertEqual(result.dtype, torch.int64)
+                self.assertEqual(result.dependencies, (value,))
+                checked.append(result.dtype)
+                with compiler.snapshot_scope(
+                    "derived_owner", "derived_slot", result.shape[0]
+                ):
+                    result.read(("derived_owner + 1",))
+            return result
+
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(
+                _fragment_derived_snapshot_keys, _derived_snapshot_args(torch.float32)
+            )
+            config = bound.config_spec.default_config()
+            config.config.update(
+                cute_fragment_threads=128, cute_fragment_register_snapshots=True
+            )
+            with (
+                patch.object(FragmentCompiler, "derived_snapshot", remap),
+                self.assertRaisesRegex(helion.exc.InvalidConfig, "active owner"),
+            ):
+                bound.to_code(config)
+        self.assertEqual(checked, [torch.int64])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestDerivedFrameSnapshotsNative(unittest.TestCase):
+    @skipUnlessCuteAvailable("requires CuTe DSL")
+    def test_typed_snapshot_keys_across_nested_frames(self):
+        for dtype in (torch.int32, torch.float32):
+            args = _derived_snapshot_args(dtype)
+            expected = _derived_snapshot_expected(args)
+            public = tuple(x.cuda() for x in args)
+            bound = _fragment_derived_snapshot_keys.bind(public)
+            config = bound.config_spec.default_config()
+            config.config.update(
+                cute_fragment_threads=128, cute_fragment_register_snapshots=True
+            )
+            output = bound.compile_config(config)(*public)
+            torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+            self.assertTrue(
+                torch.equal(
+                    public[0].cpu().view(torch.int32), args[0].view(torch.int32)
+                )
+            )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _fragment_two_snapshot_recipe(x, y, limits, out):
+    for row in hl.grid(x.size(0)):
+        col = hl.arange(helion.next_power_of_2(x.size(1)))
+        a = hl.load(x, [row, col], extra_mask=col < x.size(1))
+        b = hl.load(y, [row, col], extra_mask=col < y.size(1))
+        keys = a.to(torch.int64) * 3 + b.to(torch.int64)
+        total = hl.full([], 0, dtype=torch.int64)
+        iteration = hl.full([], 0, dtype=torch.int32)
+        while iteration < limits[row]:
+            hist = hl.zeros([17], dtype=torch.int32)
+            hl.atomic_add(hist, [col % 17], (keys & 7).to(torch.int32))
+            total += keys.sum(dtype=torch.int64) + hist.sum(dtype=torch.int32).to(
+                torch.int64
+            )
+            iteration += 1
+        out[row] = total
+    return out
+
+
+class TestMultipleDerivedSnapshotsCPU(unittest.TestCase):
+    def test_two_initialized_inputs_keep_distinct_register_leaves(self):
+        from test._cute_binding import _cpu_bind
+        from test._cute_binding import _forbid_native_compile
+        from test._cute_binding import _mock_cuda_unavailable
+        from test.cute_population_contracts import _target
+
+        from helion._compiler.cute.register_snapshots import frame_snapshot_recipes
+        from helion.language import _tracing_ops
+
+        x = (torch.arange(3 * 129).reshape(3, 129) % 17 - 8).to(torch.int32)
+        y = (x * -2 + 3).clone()
+        limits = torch.tensor([0, 1, 3], dtype=torch.int32)
+        out = torch.empty(3, dtype=torch.int64)
+        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+            bound = _cpu_bind(_fragment_two_snapshot_recipe, (x, y, limits, out))
+            config = bound.config_spec.default_config()
+            config.config.update(
+                cute_fragment_threads=128, cute_fragment_register_snapshots=True
+            )
+            with bound.env, bound.host_function:
+                graphs = bound.host_function.device_ir.graphs
+                call = next(
+                    n
+                    for g in graphs
+                    for n in g.graph.nodes
+                    if n.target is _tracing_ops._while_loop
+                )
+                recipes = frame_snapshot_recipes(call, graphs, bound.env)
+                self.assertEqual(
+                    {len(v) for slots in recipes.values() for v in slots.values()}, {2}
+                )
+            code = bound.to_code(config)
+        self.assertEqual(code.count("= cute.make_rmem_tensor"), 3)
+        keys = x.to(torch.int64) * 3 + y.to(torch.int64)
+        expected = (keys.sum(1) + (keys & 7).sum(1)) * limits
+        for order in (None, list(reversed(range(128)))):
+            out.fill_(-99)
+            _simulate_register_load_program(
+                code,
+                x,
+                128,
+                host_tensors={"y": y, "limits": limits, "out": out},
+                lane_order=order,
+            )
+            torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
