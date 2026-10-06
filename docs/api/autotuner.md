@@ -25,6 +25,51 @@ to benchmark in-process.
 
 ## Choosing a source-optimization handoff point
 
+Ordinary kernel calls can run the complete workflow without custom orchestration:
+
+```bash
+HELION_AUTOTUNE_HANDOFF=1 \
+HELION_AUTOTUNE_LOG=/tmp/rms/run \
+HELION_AUTOTUNE_LOG_DETAILS=1 \
+HELION_AUTOTUNE_BUDGET_SECONDS=300 \
+HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS=1500 \
+HELION_HANDOFF_AGENT=codex HELION_HANDOFF_EFFORT=ultra \
+HELION_BACKEND=cute CUDA_VISIBLE_DEVICES=0 \
+python your_kernel.py
+```
+
+This allows five minutes for configuration search and 25 minutes for native-source
+rounds, plus confirmation and export. Without a search budget, handoff uses
+automatic plateau detection. The configured autotune method and cache behavior
+remain in effect; use `HELION_SKIP_CACHE=1` for a fresh search.
+
+`HELION_HANDOFF_AGENT` selects an authenticated CLI: `codex` (default) or `claude`.
+Codex defaults to model `gpt-6-astra` and effort `ultra`; Claude defaults to `opus`
+and `max`. Override them with `HELION_HANDOFF_MODEL` and `HELION_HANDOFF_EFFORT`,
+using values supported by the selected CLI. For Claude, replace the agent line
+above with `HELION_HANDOFF_AGENT=claude HELION_HANDOFF_EFFORT=max`. Each run starts
+one continuous session with memory disabled and receives the native kernel
+contract and optimization objective. The agent edits sources and runs
+`python submit_candidate.py` whenever it has a candidate. The command returns
+correctness, latency, and acceptance feedback in the same conversation; each
+submission records a round. Native progress joins
+the existing `.trace.jsonl` when detailed logging is enabled; native scores remain separate
+from configuration timings. Bundles and agent records are saved in a unique
+directory under `<log base>.handoff/`, or `/tmp/helion-handoff/` without a log path.
+When the agent session ends, its full chat history, including tool calls and
+responses, is saved as `<log base>.handoff.<session_id>.chat.jsonl` beside the
+autotune logs. Each session has its own file; this requires `HELION_AUTOTUNE_LOG`
+and does not require `HELION_AUTOTUNE_LOG_DETAILS`.
+The agent receives the task prompt, native sources, and submission feedback.
+The full manifest and raw autotune history stay in the bundle for evaluation
+and reproducibility; they are not copied into the agent workspace.
+
+Handoff is off by default. Logging alone never launches an agent. The hook runs
+when a kernel actually autotunes; an already configured kernel or a single pinned
+config keeps its normal fast path. The Helion call still uses its selected config;
+the native winner is saved for direct use outside Helion. The explicit APIs below
+remain available for custom stopping policies and agent adapters.
+
 `find_handoff` runs an autotuner until a user-selected stopping point or an
 automatically detected plateau, then confirms a starting kernel for source
 optimization. It is opt-in; ordinary `autotune()` calls are unchanged.
@@ -76,6 +121,128 @@ The returned `HandoffPoint` includes the reason, callable, config, finalist
 samples, and trial history. `autotune_log_details` records handoff and confirmation
 events in the existing trace. This API selects the starting point; agent execution
 and source editing are separate steps.
+
+## Handing native source to an agent
+
+`build_handoff` exports a selected kernel into an editable directory and checks
+the standalone baseline before handing it to an agent. Keep the search object
+used by `find_handoff`:
+
+```python
+from helion.autotuner import build_handoff
+
+bundle = build_handoff(search, point, "handoff_workspace")
+
+def agent(workspace):
+    # Your agent reads workspace.prompt and workspace.sources, then returns
+    # {"case_0/kernel.py": "<complete replacement native source>"}.
+    return my_source_agent(workspace.prompt, workspace.sources)
+
+result = bundle.run_agent(agent)
+
+# Or optimize for a time budget, keeping only validated source improvements.
+session = bundle.run_agent_rounds(agent, budget_seconds=600)
+result = session.evaluation
+```
+
+The callback receives a workspace, with no `BoundKernel` or live autotuner.
+It proposes native CuTe, Triton, or other backend source changes. The prompt
+contains the native kernel contract and optimization objective. Measurements,
+autotune history, and configs stay in the bundle records.
+
+Each `case_N/` contains `kernel.py`, an `original.py` backup, saved inputs, and
+frozen reference outputs and post-call inputs. `manifest.json` records workload,
+hardware, dependencies, specialization metadata, tolerances, and autotune
+evidence; `prompt.md` is the agent prompt. Multi-shape searches export a separate
+module for each bound shape and retain their aggregate objective.
+
+Output references use an explicit `reference_fn`, then `autotune_baseline_fn`, or
+the confirmed original kernel. The original kernel supplies the mutation and
+alias contract. Evaluation runs in a fresh worker with a per-case timeout and
+checks outputs, aliases, and input mutations. Every timing sample uses restored
+input values, excluding restoration from timing; graph replay keeps stable
+storage addresses. Source snapshots, raw samples,
+medians, median absolute deviations, and failures are saved under `evaluations/`.
+Completed timing samples survive worker timeouts, but failed cases have no score.
+Run `python handoff_workspace/evaluate.py` to re-evaluate edits, or reopen the
+workspace with `HandoffBundle(Path("handoff_workspace"))`.
+
+Each case writes a phase journal under `evaluations/`, so failures and timeouts
+retain the last recorded phase (load, compile/launch, capture, warmup,
+measurement, or validation) alongside their source snapshot and diagnostics.
+
+New NVIDIA CUDA bundles default to `timing="cuda_graph"`, which places CUDA
+events inside graph replay and excludes host dispatch, input restoration, and
+L2 clearing. An explicit `timing` argument to `build_handoff` selects
+`"cuda_graph"`, `"cuda_event"`, or `"wall_clock"`; saved bundles retain their
+declared policy. Capture failures are reported instead of switching timers.
+Direct benchmarks of GPU callables can use the same primitive:
+
+```python
+from statistics import median
+from helion.autotuner.benchmarking import do_bench_cuda_graph
+
+bundle = build_handoff(search, point, "graph_handoff", timing="cuda_graph")
+# For a callable that does not mutate its inputs:
+reference_ms = median(
+    do_bench_cuda_graph(lambda: reference(*args), return_mode="median")
+    for _ in range(5)
+)
+```
+
+Graph timing requires capturable CUDA work. Arbitrary Python, container, CPU
+tensor, or tensor-metadata mutation is unsupported because graph replay does
+not repeat host operations. Select a legacy timing policy for such workloads;
+the evaluator never silently falls back. Mutating direct benchmarks must
+supply a capturable `reset` callback; bundle evaluation restores the saved CUDA
+input storages automatically. This timer does
+not change ordinary autotuner measurements. Remeasure searched sources under
+the same policy before comparing them with native proposals. The existing
+`autotune_benchmark_fn` setting is a batched rebenchmark callback, not this
+single-call timer.
+
+`run_agent` applies and evaluates one proposal, retaining its existing behavior.
+`run_agent_rounds` adds incumbent selection and rollback. Set `budget_seconds`;
+rounds track progress without limiting submissions. It first validates the
+starting source, then compares each proposal against a nearby incumbent
+measurement, alternating measurement order across rounds. A proposal must pass
+every case and improve the aggregate
+objective by more than both 0.1% and three times the larger noise estimate.
+The estimate is the objective score times the largest per-case MAD/median; this
+preserves the objective's units for multiple shapes and relative-latency ratios.
+This is a selection heuristic, not a confidence interval.
+Failed, noisy, and slower proposals restore the incumbent. Callback exceptions
+are recorded and optimization continues while time remains.
+
+Omitting the callback uses `CLISourceAgent`, selected by `HELION_HANDOFF_AGENT`:
+
+```python
+session = bundle.run_agent_rounds(budget_seconds=1500)
+```
+
+The time budget includes initial validation, agent work, and evaluation. The
+default agent keeps one process and workspace until it exits or reaches the budget.
+After each submission, its workspace holds the retained source, ready for further
+edits. Unsubmitted edits are never evaluated.
+
+The prompt includes an absolute `time.monotonic()` deadline. Custom synchronous
+callbacks must enforce their own timeout; the controller rejects late results
+and passes the deadline to evaluation. Provider selection
+and context management remain the callback's responsibility. The original prompt
+is restored when the controller returns.
+
+Each invocation records an immutable starting-source snapshot, per-round source
+and evaluation records, `feedback.json`, and `result.json` in a new `agent_runs/`
+directory. `HandoffAgentResult` exposes the baseline, retained evaluation, and
+`HandoffAgentRound` decisions. The original source backup remains unchanged;
+only validated improvements replace the editable source. Reopening a bundle
+does not resume an earlier agent conversation.
+
+The saved workload covers the supplied inputs, not every possible
+input value or shape. Custom accuracy/benchmark callbacks and distributed
+workloads are currently unsupported. Backend standalone-export restrictions
+also apply. The evaluation harness requires Helion; the exported native kernels
+can be imported and called directly without it.
 
 ## Configuration Classes
 

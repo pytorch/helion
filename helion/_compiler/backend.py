@@ -1371,25 +1371,25 @@ class Backend(abc.ABC):
         if bound_kernel.settings.autotune_effort == "none" and (
             force or not bound_kernel.kernel.configs
         ):
-            config = bound_kernel.config_spec.default_config()
-        elif not force and bound_kernel.kernel.configs:
+            return bound_kernel.config_spec.default_config()
+        if not force and bound_kernel.kernel.configs:
             if len(bound_kernel.kernel.configs) == 1:
                 (config,) = bound_kernel.kernel.configs
-            else:
-                # We have finite predetermined configs, no need to precompile
-                bound_kernel.settings.autotune_precompile = None
+                return config
+            # We have finite predetermined configs, no need to precompile
+            bound_kernel.settings.autotune_precompile = None
 
-                from ..autotuner import FiniteSearch
+            from ..autotuner import FiniteSearch
 
-                config = FiniteSearch(
-                    bound_kernel, args, bound_kernel.configs
-                ).autotune()
+            autotuner = FiniteSearch(bound_kernel, args, bound_kernel.configs)
         else:
             bound_kernel.settings.check_autotuning_disabled()
-            config = bound_kernel.settings.autotuner_fn(
-                bound_kernel, args, **kwargs
-            ).autotune(skip_cache=force)
-        return config
+            autotuner = bound_kernel.settings.autotuner_fn(bound_kernel, args, **kwargs)
+        if bound_kernel.settings.autotune_handoff:
+            from ..autotuner.handoff_pipeline import autotune_with_handoff
+
+            return autotune_with_handoff(autotuner, skip_cache=force)
+        return autotuner.autotune(skip_cache=force)
 
     @staticmethod
     def map_dot_precision(precision: DotPrecision) -> str:
