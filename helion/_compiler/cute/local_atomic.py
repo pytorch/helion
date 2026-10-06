@@ -45,6 +45,10 @@ def _reachable_graphs(graphs: list[GraphInfo]) -> list[GraphInfo]:
                 pending.extend(
                     by_id[cast("int", graph_id)] for graph_id in node.args[1:3]
                 )
+            elif node.target is _tracing_ops._while_loop:
+                pending.extend(
+                    by_id[cast("int", graph_id)] for graph_id in node.args[:2]
+                )
     return list(result.values())
 
 
