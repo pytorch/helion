@@ -147,6 +147,15 @@ def _static_index(
     """
     if isinstance(value, int) and not isinstance(value, bool):
         return value
+    if (
+        isinstance(value, slice)
+        and value.step in (None, 1)
+        and isinstance(value.start, int)
+        and isinstance(value.stop, int)
+        and value.start >= 0
+        and value.stop > value.start
+    ):
+        return _StaticIndexRange(value.start, value.stop - value.start)
     if not isinstance(value, torch.fx.Node):
         return None
     seen = set() if seen is None else seen
@@ -199,7 +208,11 @@ def _static_index(
     return None
 
 
-def _is_static_basic_value_subscript(node: torch.fx.Node, config: Config) -> bool:
+def _is_static_basic_value_subscript(
+    node: torch.fx.Node,
+    config: Config,
+    placeholder_to_outer: dict[torch.fx.Node, torch.fx.Node],
+) -> bool:
     """Whether static narrowing can use ordinary JAX basic indexing."""
     indices = node.args[1]
     if not isinstance(indices, (list, tuple)):
@@ -236,6 +249,9 @@ def _is_static_basic_value_subscript(node: torch.fx.Node, config: Config) -> boo
     seen: set[torch.fx.Node] = set()
     while isinstance(source, torch.fx.Node) and source not in seen:
         seen.add(source)
+        if source.op == "placeholder":
+            source = placeholder_to_outer.get(source)
+            continue
         if source.op != "call_function":
             return False
         if source.target in _RESIDENT_REF_ATEN_VIEW_TARGETS:
@@ -450,10 +466,6 @@ def _root_variants(
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} has no tensor value metadata"
         )
-    if tensor.ndim != value.ndim:
-        raise exc.BackendUnsupported(
-            "pallas", f"the source load at {location} changes the tensor rank"
-        )
     if producer.args[2] is not None:
         raise exc.BackendUnsupported(
             "pallas", f"the source load at {location} has an explicit mask"
@@ -480,13 +492,61 @@ def _root_variants(
         )
 
     selected = _narrowed_dims(indices)
+    all_selected = tuple(selected)
+    tiled_selected = [
+        candidate
+        for candidate in selected
+        if not isinstance(_node_value(indices[candidate]), int)
+    ]
+    if len(tiled_selected) == 1:
+        selected = tiled_selected
+    if len(selected) > 1:
+        from ..device_ir import ForLoopGraphInfo
+
+        env = CompileEnvironment.current()
+        current_loop_dims = [
+            candidate
+            for candidate in selected
+            if isinstance(graph_info, ForLoopGraphInfo)
+            and env.resolve_block_id(_node_value(indices[candidate]))
+            in graph_info.block_ids
+        ]
+        if len(current_loop_dims) == 1:
+            selected = current_loop_dims
     if len(selected) != 1:
         raise exc.BackendUnsupported(
             "pallas",
-            f"the source load at {location} must tile exactly one dimension, "
-            f"but it tiles {len(selected)}",
+            f"the source load at {location} must have exactly one tiled "
+            "dimension narrowed by an inner loop, "
+            f"but it has {len(selected)} candidates",
         )
     dim = selected[0]
+    rank_difference = tensor.ndim - value.ndim
+    dropped_dims: tuple[int, ...] = ()
+    if rank_difference:
+        dropped = []
+        for candidate in all_selected:
+            if candidate == dim:
+                continue
+            index_value = _node_value(indices[candidate])
+            if isinstance(index_value, (int, torch.SymInt)) or (
+                isinstance(index_value, torch.Tensor) and index_value.ndim == 0
+            ):
+                dropped.append(candidate)
+        dropped_dims = tuple(dropped)
+    if (
+        rank_difference < 0
+        or len(dropped_dims) != rank_difference
+        or any(index is None for index in indices)
+    ):
+        raise exc.BackendUnsupported(
+            "pallas",
+            f"the source load at {location} has an unsupported rank change: "
+            f"tensor_shape={tuple(tensor.shape)}, value_shape={tuple(value.shape)}, "
+            f"selected={all_selected}, resident_dim={dim}, "
+            f"dropped_dims={dropped_dims}, indices={indices}",
+        )
+    physical_dim = dim - sum(dropped < dim for dropped in dropped_dims)
     outer_block_id = CompileEnvironment.current().resolve_block_id(
         _node_value(indices[dim])
     )
@@ -498,18 +558,53 @@ def _root_variants(
     # A full source loop with evenly-sized blocks has no tail padding. Otherwise
     # the loaded Ref remains guarded until a selector proves it uses the exact live
     # extent of this source block.
+    loop_start: object = None
     full_loop = False
     from ..device_ir import device_loop_bounds
 
     bounds = device_loop_bounds(graph_info, context.parents, outer_block_id)
     if bounds is not None:
         start, end = bounds
+        loop_start = start
         env = CompileEnvironment.current()
         full_loop = (
             isinstance(start, (int, torch.SymInt))
             and isinstance(end, (int, torch.SymInt))
             and env.known_equal(start, 0)
             and env.known_equal(end, tensor.shape[dim])
+        )
+
+    def aligned_tile_begin(start: object, alignment: int) -> bool:
+        if isinstance(start, int):
+            return start % alignment == 0
+        if not isinstance(start, torch.SymInt):
+            return False
+        expression = _symint_expr(start)
+        if expression is None:
+            return False
+        if sympy.simplify(sympy.Mod(expression, alignment)) == 0:
+            return True
+        if not isinstance(expression, sympy.Symbol):
+            return False
+
+        from ..host_function import HostFunction
+        from ..variable_origin import TileBeginOrigin
+
+        origin_info = HostFunction.current().expr_to_origin.get(expression)
+        if origin_info is None or not isinstance(origin_info.origin, TileBeginOrigin):
+            return False
+        parent_id = origin_info.origin.block_id
+        parent_size = _variant_block_size(parent_id, context.config, 1)
+        parent_bounds = _enclosing_loop_bounds(
+            graph_info, context.parents, context.graph_infos, parent_id
+        )
+        if parent_size is None or parent_bounds is None:
+            return False
+        parent_start, _ = parent_bounds
+        return (
+            isinstance(parent_start, int)
+            and parent_start % alignment == 0
+            and parent_size % alignment == 0
         )
 
     # Grouping=2 emits two static branches: one base block for a short work item
@@ -525,15 +620,29 @@ def _root_variants(
                 f"the source load at {location} has no concrete physical shape "
                 "for this config",
             )
-        if _slice_addressing(value, dim, shape[-1]) is not SliceAddressing.DIRECT:
-            raise exc.BackendUnsupported(
-                "pallas",
-                f"the source load at {location} does not have direct VMEM "
-                "addressing for this config",
+        addressing = _slice_addressing(value, physical_dim, shape[-1])
+        if addressing is not SliceAddressing.DIRECT:
+            from .backend import PallasBackend
+
+            backend = CompileEnvironment.current().backend
+            assert isinstance(backend, PallasBackend)
+            alignment = backend._get_pallas_required_alignment(
+                value.ndim - physical_dim - 1,
+                value.ndim,
+                value.dtype.itemsize * 8,
             )
+            if (
+                not aligned_tile_begin(loop_start, alignment)
+                or shape[physical_dim] % alignment
+            ):
+                raise exc.BackendUnsupported(
+                    "pallas",
+                    f"the source load at {location} is not aligned for direct "
+                    "VMEM addressing in this config",
+                )
         backing = _concrete_size(tensor.shape[dim], context.config, factor)
-        full = full_loop and backing is not None and backing % shape[dim] == 0
-        validity = None if full else (dim, outer_block_id)
+        full = full_loop and backing is not None and backing % shape[physical_dim] == 0
+        validity = None if full else (physical_dim, outer_block_id)
         variants.append(_ResidentVariant(factor, shape, (), validity))
     return tuple(variants)
 
@@ -606,12 +715,14 @@ def _apply_selector_to_variants(
                 input_value.ndim,
                 bitwidth,
             )
-            if (
-                selector.kind != "static"
-                or not isinstance(selector.begin, int)
-                or selector.begin % alignment
-                or width % alignment
-            ):
+            static_aligned = (
+                selector.kind == "static"
+                and isinstance(selector.begin, int)
+                and selector.begin % alignment == 0
+                and width % alignment == 0
+            )
+            tiled_aligned = selector.kind == "tile" and width % alignment == 0
+            if not static_aligned and not tiled_aligned:
                 raise exc.BackendUnsupported(
                     "pallas",
                     f"the selector at {location} is not aligned for direct "
@@ -1255,7 +1366,9 @@ def plan_resident_ref_views(graphs: list[GraphInfo], config: Config) -> None:
             node.meta.pop(STATIC_BASIC_VALUE_SUBSCRIPT_META, None)
             if _resident_plan(node) is not None or not _narrowed_dims(node.args[1]):
                 continue
-            if _is_static_basic_value_subscript(node, config):
+            if _is_static_basic_value_subscript(
+                node, config, context.placeholder_to_outer
+            ):
                 node.meta[STATIC_BASIC_VALUE_SUBSCRIPT_META] = True
                 continue
             failure = context.failures.get(node)

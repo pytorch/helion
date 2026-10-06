@@ -770,6 +770,22 @@ def pallas_scalar_selected_panels(
 
 
 @helion.kernel(backend="pallas", static_shapes=True)
+def pallas_rank_reduced_panel_view(x: torch.Tensor) -> torch.Tensor:
+    heads, blocks, rows, _columns = x.size()
+    out = torch.empty(
+        [heads, blocks, rows, 128],
+        dtype=x.dtype,
+        device=x.device,
+    )
+    for head, block in hl.grid([heads, blocks]):
+        for tile_rows in hl.tile(rows, block_size=128):
+            panel = x[head, block, tile_rows, :]
+            selected = panel[:, 128:256]
+            out[head, block, tile_rows, :] = selected + 1.0
+    return out
+
+
+@helion.kernel(backend="pallas", static_shapes=True)
 def pallas_aligned_dynamic_window(
     table: torch.Tensor, starts: torch.Tensor
 ) -> torch.Tensor:
@@ -1125,6 +1141,16 @@ class TestPallas(TestCase):
             block_sizes=[],
         )
         torch.testing.assert_close(result.cpu(), (table[panel_ids] + 1.0).cpu())
+
+    def test_rank_reduced_panel_view(self) -> None:
+        x = torch.randn(2, 3, 256, 256, device=DEVICE, dtype=torch.float32)
+        _code, result = code_and_output(
+            pallas_rank_reduced_panel_view,
+            (x,),
+            block_sizes=[],
+        )
+        expected = x[:, :, :, 128:256] + 1.0
+        torch.testing.assert_close(result.cpu(), expected.cpu())
 
     @skipIfPallasInterpret("packed FP4 execution requires a real TPU")
     def test_fp8_fp4_matmul(self) -> None:
