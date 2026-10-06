@@ -392,6 +392,10 @@ def _pointwise_grid_thread_dims(
         or has_synthetic_free_axes
     ):
         return None
+    if any(axis < 0 or axis >= 3 for axis in final_thread_axes | live_extents.keys()):
+        raise exc.BackendUnsupported(
+            "cute", "pointwise grid requires more than three physical thread axes"
+        )
     if any(referenced_dims[axis] > live_extents[axis] for axis in final_thread_axes):
         # A larger reference is not evidence that every producer has a surplus
         # mask. Do not add duplicate/out-of-tile writers to satisfy it.
