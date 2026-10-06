@@ -81,6 +81,31 @@ def _cpu_only():
         yield
 
 
+@pytest.fixture
+def _without_later_fragment_coverage():
+    """Keep historical prefix tests in their original registration universe.
+
+    Complete staging populations, including these additions, are compared
+    separately; these tests retain their original exact extension counts.
+    """
+    from contextlib import ExitStack
+
+    with ExitStack() as stack:
+        for registration in (
+            "register_fragment_register_snapshots_coverage",
+            "register_fragment_published_scalars_coverage",
+            "register_fragment_skip_zero_atomics_coverage",
+            "register_fragment_atomic_consumer_fusion_coverage",
+            "register_integer_loop_reduction_coverage",
+            "register_fragment_integer_atomic_epochs_coverage",
+            "register_fragment_packet_loads_coverage",
+        ):
+            stack.enter_context(
+                patch("helion._compiler.autotuner_heuristics." + registration)
+            )
+        yield
+
+
 def _bind():
     return _cpu_bind(_computed_scan, (torch.ones(3, 5, 65), 2, False))
 
@@ -192,7 +217,6 @@ def test_cooperative_scan_oversized_shared_memory_rejected():
         bound.to_code(_config(bound, "cooperative"))
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -202,6 +226,7 @@ def test_cooperative_scan_oversized_shared_memory_rejected():
 )
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_scan_coverage_preserves_original_population_and_rng(strategy):
     with patch("helion._compiler.autotuner_heuristics.register_fragment_scan_coverage"):
         old_bound = _bind()
@@ -452,7 +477,6 @@ def test_fragment_reduction_explicit_phase_roots_share_capability():
     assert REDUCTION_KEY in bound.config_spec._flat_fields()
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -461,6 +485,7 @@ def test_fragment_reduction_explicit_phase_roots_share_capability():
     ],
 )
 @pytest.mark.usefixtures("_without_thread_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_reduction_coverage_preserves_original_population_and_rng(strategy):
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
@@ -686,10 +711,10 @@ def _resource_bound_and_actual(bound, config):
     return source
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize("width", [4097, 8193])
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_resource_supplements_preserve_full_cold_prefix_and_rng(width):
     inputs = (torch.ones(3, width),)
     with patch(
@@ -794,10 +819,10 @@ def test_fragment_resource_carrier_builds_catalog_only_once():
     )
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize("rows", [65536, 131072])
 @pytest.mark.usefixtures("_without_thread_coverage")
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_resource_hard_minima_preserve_prefix_and_rng(rows):
     from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -1026,7 +1051,6 @@ def test_fragment_threads_codegen_rechecks_owner_and_preserves_default():
         bound.to_code(_thread_config(bound, 512))
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -1036,6 +1060,7 @@ def test_fragment_threads_codegen_rechecks_owner_and_preserves_default():
 )
 @pytest.mark.parametrize("resource", [False, True])
 @pytest.mark.usefixtures("_without_warp_scan_coverage")
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_threads_complete_prior_population_and_rng(strategy, resource):
     kernel = _resource_fullrow_scan if resource else _scan_and_fragment_reduction
     x = torch.ones(3, 8193) if resource else torch.ones(3, 128)
@@ -1192,7 +1217,6 @@ def test_register_loads_strict_bool_roundtrip_and_neighbors():
     } == {False, True}
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -1200,6 +1224,7 @@ def test_register_loads_strict_bool_roundtrip_and_neighbors():
         InitialPopulationStrategy.FROM_BEST_AVAILABLE,
     ],
 )
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_register_loads_complete_existing_prefix_and_rng(strategy):
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_register_loads_coverage"
@@ -1332,31 +1357,6 @@ def _without_warp_scan_coverage():
         yield
 
 
-@pytest.fixture
-def _without_later_fragment_coverage():
-    """Keep historical prefix tests in their original registration universe.
-
-    Complete staging populations, including these additions, are compared
-    separately; these tests retain their original exact extension counts.
-    """
-    from contextlib import ExitStack
-
-    with ExitStack() as stack:
-        for registration in (
-            "register_fragment_register_snapshots_coverage",
-            "register_fragment_published_scalars_coverage",
-            "register_fragment_skip_zero_atomics_coverage",
-            "register_fragment_atomic_consumer_fusion_coverage",
-            "register_integer_loop_reduction_coverage",
-            "register_fragment_integer_atomic_epochs_coverage",
-            "register_fragment_packet_loads_coverage",
-        ):
-            stack.enter_context(
-                patch("helion._compiler.autotuner_heuristics." + registration)
-            )
-        yield
-
-
 def _warp_scan_config(bound, value=True):
     return helion.Config.from_dict(
         dict(bound.config_spec.default_config()) | {WARP_SCAN_KEY: value}
@@ -1395,7 +1395,6 @@ def test_warp_scan_boolean_strict_admission_and_legacy_emitters():
     } == {False, True}
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize(
     "strategy",
     [
@@ -1403,6 +1402,7 @@ def test_warp_scan_boolean_strict_admission_and_legacy_emitters():
         InitialPopulationStrategy.FROM_BEST_AVAILABLE,
     ],
 )
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_warp_scan_complete_prior_prefix_rng_seeds_and_overrides(strategy):
     with patch(
         "helion._compiler.autotuner_heuristics.register_fragment_warp_scan_coverage"
@@ -1510,7 +1510,6 @@ def test_warp_scan_zero_physical_capacity_rejects(reverse):
         bound.to_code(_warp_scan_config(bound))
 
 
-@pytest.mark.usefixtures("_without_later_fragment_coverage")
 @pytest.mark.parametrize("family", ["private", "producer", "scan"])
 @pytest.mark.parametrize(
     "strategy",
@@ -1519,6 +1518,7 @@ def test_warp_scan_zero_physical_capacity_rejects(reverse):
         InitialPopulationStrategy.FROM_BEST_AVAILABLE,
     ],
 )
+@pytest.mark.usefixtures("_without_later_fragment_coverage")
 def test_fragment_extensions_complete_legacy_prefix_rng_and_final_coverage(
     family, strategy
 ):
@@ -1668,10 +1668,13 @@ def test_atomic_aggregation_strict_scope_and_ordinary_mutation():
 def test_atomic_aggregation_complete_prior_prefix_rng_seeds_and_overrides(strategy):
     # Isolate the original aggregation extension from later deferred groups.
     # The epoch tests separately retain the whole old population as a prefix.
-    with patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
-    ), patch(
-        "helion._compiler.autotuner_heuristics.register_fragment_integer_atomic_epochs_coverage"
+    with (
+        patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_skip_zero_atomics_coverage"
+        ),
+        patch(
+            "helion._compiler.autotuner_heuristics.register_fragment_integer_atomic_epochs_coverage"
+        ),
     ):
         with patch(
             "helion._compiler.autotuner_heuristics.register_fragment_atomic_aggregation_coverage"
