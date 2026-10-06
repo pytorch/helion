@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import unittest
 
 import torch
@@ -369,6 +370,105 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
         expected = (2.0 * x_fp32 * torch.sigmoid(x_fp32 @ w_fp32)).to(dtype)
 
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
+
+    @skipIfRefEager("codegen pins")
+    @skipIfTileIR("the approximate divide is Triton-only; TileIR keeps the exact form")
+    def test_fast_math_division(self):
+        """``fast_math`` lowers plain fp32 (and upcast half-precision) divisions to
+        the approximate ``fast_dividef`` on the Triton backend; without the
+        setting, for fp64, and for the rounding-mode divisions the division stays
+        the default ``/``."""
+
+        def div_kernel(x: torch.Tensor, y: torch.Tensor, s: float) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                quot = x[tile_m, :] / (y[tile_m, :] + 2.0)
+                out[tile_m, :] = ((quot / 4.0) / s).to(x.dtype)
+            return out
+
+        def trunc_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = torch.div(
+                    x[tile_m, :], y[tile_m, :], rounding_mode="trunc"
+                )
+            return out
+
+        def int_div_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                out[tile_m, :] = x[tile_m, :] / y[tile_m, :]
+            return out
+
+        def kernel(fn, *, fast_math):
+            return helion.kernel(
+                config=helion.Config(block_sizes=[32]),
+                static_shapes=True,
+                fast_math=fast_math,
+            )(fn)
+
+        tensor_division = re.compile(r"= \w+ / \w+\b")
+        for dtype, tol in (
+            (torch.float32, 1e-5),
+            (torch.float16, 1e-2),
+            (torch.bfloat16, 1e-2),
+        ):
+            x = torch.randn(256, 64, device=DEVICE, dtype=dtype)
+            y = torch.rand(256, 64, device=DEVICE, dtype=dtype)
+            expected = (((x.float() / (y.float() + 2.0)) / 4.0) / 1.5).to(dtype)
+            code, result = code_and_output(
+                kernel(div_kernel, fast_math=True), (x, y, 1.5)
+            )
+            if _get_backend() == "triton":
+                # The two tensor-valued divisions (tensor / tensor, tensor / float
+                # argument) go through fast_dividef on fp32 operands with no cast
+                # back; the division by the constant 4.0 is already a multiply.
+                self.assertEqual(code.count("fast_dividef("), 2)
+                self.assertNotRegex(code, tensor_division)
+                self.assertNotIn("tl.cast(fast_dividef", code)
+            torch.testing.assert_close(result, expected, atol=tol, rtol=tol)
+            code, result = code_and_output(
+                kernel(div_kernel, fast_math=False), (x, y, 1.5)
+            )
+            self.assertNotIn("fast_dividef", code)
+            torch.testing.assert_close(result, expected, atol=tol, rtol=tol)
+
+        # fp64 keeps the exact division under the setting
+        x = torch.randn(256, 64, device=DEVICE, dtype=torch.float64)
+        y = torch.rand(256, 64, device=DEVICE, dtype=torch.float64)
+        code, result = code_and_output(kernel(div_kernel, fast_math=True), (x, y, 1.5))
+        self.assertNotIn("fast_dividef", code)
+        torch.testing.assert_close(result, ((x / (y + 2.0)) / 4.0) / 1.5)
+
+        # integer true division is promoted to fp32 first and takes the fast form
+        xi = torch.randint(-50, 50, (256, 64), device=DEVICE, dtype=torch.int32)
+        yi = torch.randint(1, 9, (256, 64), device=DEVICE, dtype=torch.int32)
+        code, result = code_and_output(kernel(int_div_kernel, fast_math=True), (xi, yi))
+        if _get_backend() == "triton":
+            self.assertEqual(code.count("fast_dividef("), 1)
+        torch.testing.assert_close(result, xi / yi, atol=1e-5, rtol=1e-5)
+
+        # A rounding-mode division keeps the default quotient (trunc must see
+        # the same value with or without the setting; Triton's default divide
+        # is itself 2 ulp, so the reference comparison allows one step).  The
+        # CuTe backend does not lower rounding-mode divisions at all.
+        if _get_backend() != "triton":
+            return
+        for dtype in (torch.float32, torch.bfloat16):
+            x = torch.randn(256, 64, device=DEVICE, dtype=dtype) * 8
+            y = (torch.rand(256, 64, device=DEVICE, dtype=dtype) + 0.5).to(dtype)
+            code, result = code_and_output(kernel(trunc_kernel, fast_math=True), (x, y))
+            self.assertNotIn("fast_dividef", code)
+            _, default_result = code_and_output(
+                kernel(trunc_kernel, fast_math=False), (x, y)
+            )
+            torch.testing.assert_close(result, default_result, atol=0, rtol=0)
+            torch.testing.assert_close(
+                result, torch.div(x, y, rounding_mode="trunc"), atol=1.0, rtol=0
+            )
 
 
 if __name__ == "__main__":

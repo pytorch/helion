@@ -90,7 +90,11 @@ def reference_jagged_hstu_kernel_pytorch(
 
 
 # %%
-@helion.kernel()
+# fast_math: the SiLU gate's division takes the approximate form on both
+# backends (CuTe: x * rcp.approx instead of the IEEE divide that serializes the
+# gate; Triton: fast_dividef instead of div.full) and the exp its flush-to-zero
+# form.
+@helion.kernel(fast_math=True)
 def _helion_jagged_attention_kernel(
     max_seq_len: int,
     alpha: float,
