@@ -960,6 +960,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        "cute_pdl",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1059,6 +1060,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        "cute_pdl",
         "cute_packet_prefetch",
         "cute_cluster_n",
         "cute_min_blocks_per_mp",
@@ -1164,6 +1166,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_vector_packet_unroll",
         "cute_vloop_sink",
         "cute_lane_unroll",
+        "cute_pdl",
         "cute_packet_prefetch",
         *BLOCK_SCALED_CONFIG_KEYS,
         SPLIT_K_SCHEDULE_KEY,
@@ -3535,6 +3538,18 @@ class ConfigSpec:
                 else:
                     raise InvalidConfig(f"{key} must be a boolean")
 
+    def _normalize_cute_pdl(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """``cute_pdl`` is a boolean (programmatic dependent launch)."""
+        pdl = config.get("cute_pdl", False)
+        if type(pdl) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig("cute_pdl must be a boolean")
+            pdl = False
+        if "cute_pdl" in config or pdl:
+            config["cute_pdl"] = pdl
+
     def _normalize_cute_vloop_sink(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4049,6 +4064,7 @@ class ConfigSpec:
             self._normalize_cute_rng_packet(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vector_reductions(config, fix_invalid=_fix_invalid)
             self._normalize_cute_vloop_sink(config, fix_invalid=_fix_invalid)
+            self._normalize_cute_pdl(config, fix_invalid=_fix_invalid)
             self._normalize_cute_packet_prefetch(config, fix_invalid=_fix_invalid)
             self._normalize_cute_register_chain(config, fix_invalid=_fix_invalid)
             if self.matmul_facts:
@@ -5738,6 +5754,20 @@ class ConfigSpec:
                         search_choices=_CUTE_LANE_UNROLL_CHOICES
                         if sink_seeded or unroll_seeded
                         else (1,),
+                    )
+                if self.supports_config_key("cute_pdl"):
+                    # A launch attribute plus one wait, live on every kernel
+                    # of this branch (the tcgen05 and flash families, whose
+                    # own waits and plans leave it inert, build their fields
+                    # above) and searched where ``griddepcontrol`` exists,
+                    # sm_90 and up.
+                    pdl_searched = (
+                        self.target_device_capability is not None
+                        and self.target_device_capability >= (9, 0)
+                    )
+                    fields["cute_pdl"] = EnumFragment(
+                        (False, True),
+                        search_choices=(False, True) if pdl_searched else (False,),
                     )
                 if self.cute_rng_packet_enabled:
                     fields["cute_rng_packet"] = BooleanFragment()

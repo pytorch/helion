@@ -11973,6 +11973,7 @@ class TestCuteAutotuner(TestCase):
                 "cute_vector_packet_unroll",
                 "cute_vloop_sink",
                 "cute_lane_unroll",
+                "cute_pdl",
                 "load_eviction_policies",
             },
         )
@@ -12004,6 +12005,7 @@ class TestCuteAutotuner(TestCase):
                     "cute_vector_packet_unroll",
                     "cute_vloop_sink",
                     "cute_lane_unroll",
+                    "cute_pdl",
                     "load_eviction_policies",
                 },
             )

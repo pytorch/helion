@@ -112,6 +112,58 @@ def test_pdl_source_changes_only_entry_release_and_consumer_launch(
     assert ast.dump(ast.parse(restored)) == ast.dump(ast.parse(baseline))
 
 
+@pytest.mark.parametrize(
+    "kernel,packed", [(matmul_bf16_int4, True), (_computed_rhs, False)]
+)
+def test_cute_pdl_never_reaches_the_stage_that_releases_dependents_at_entry(
+    kernel: Kernel[Any], packed: bool
+) -> None:
+    bound = _bind(kernel, _args(packed=packed))
+    serial = _serial(bound)
+    # With the protocol on, the producer stage releases its dependents at
+    # entry and the consumer's TMA role loads the ordinary operand ahead of
+    # its own wait, relying on the producer being an ordinary launch that
+    # started after everything ahead of it.  ``cute_pdl`` must not turn the
+    # producer into a programmatic dependent launch (its wait would land
+    # behind the release), and the consumer's plan already launches with one:
+    # the knob is inert on the whole bundle.
+    protocol = bound.to_code(helion.Config.from_dict(serial.config | {KEY: True}))
+    assert (
+        bound.to_code(
+            helion.Config.from_dict(serial.config | {KEY: True, "cute_pdl": True})
+        )
+        == protocol
+    )
+    producer, consumer = _stage_sources(protocol)
+    assert (
+        ast.unparse(_device(producer).body[0])
+        == "cute.arch.griddepcontrol_launch_dependents()"
+    )
+    assert WAIT not in producer and "_helion_cute_use_pdl" not in producer
+    assert "'use_pdl': True" in consumer and "_helion_cute_use_pdl" not in consumer
+    # Without the protocol the producer is an ordinary pointwise stage and
+    # takes the knob like any kernel: the wait ahead of its first access plus
+    # the launch attribute, nothing else.  The consumer keeps its role-local
+    # wait and stays inert.
+    off = _stage_sources(bound.to_code(serial))
+    on = _stage_sources(
+        bound.to_code(helion.Config.from_dict(serial.config | {"cute_pdl": True}))
+    )
+    device = _device(on[0])
+    attribute = f"{device.name}._helion_cute_use_pdl = True"
+    assert ast.unparse(device.body[0]) == WAIT
+    assert on[0].count(WAIT) == 1 and on[0].count(attribute) == 1
+    assert [
+        line
+        for line in on[0].splitlines()
+        if WAIT not in line and attribute not in line
+    ] == off[0].splitlines()
+    assert on[1] == off[1]
+    # The bundle's search space comes from the tcgen05 branch, which never
+    # offers the knob; only an explicit config reaches the producer with it.
+    assert "cute_pdl" not in bound.config_spec._flat_fields()
+
+
 def test_coverage_is_additive_serial_default_and_acc1_is_capacity_derived() -> None:
     cuda_initialized = torch.cuda.is_initialized()
     bound = _bind(matmul_bf16_int4, _args(packed=True))

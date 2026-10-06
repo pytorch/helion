@@ -3337,10 +3337,21 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
         # fragment so the seed stays reachable for very tall inputs.
         rows = min(1 << (reduced_hint - 1).bit_length(), reduced_fragment.high)
         seeds: list[Config] = []
-        # (threads along the grid axis, CTA threads): 2 x V elements per row
-        # per CTA is one 32-byte sector for a 16-byte vector.
-        for grid_threads, cta_threads in ((2, 512), (4, 512), (2, 256)):
-            columns = grid_threads * vec
+        # (threads along the grid axis, CTA threads, vector divisor): 2 x V
+        # elements per row per CTA is one 32-byte sector for a 16-byte
+        # vector.  The half-width vector (four grid threads owning 8-byte
+        # vectors, 128 row threads) keeps that sector with twice the rows in
+        # flight per CTA and was the measured best at 1024^2 and 4096^2.
+        for grid_threads, cta_threads, vec_divisor in (
+            (2, 512, 1),
+            (4, 512, 1),
+            (2, 256, 1),
+            (4, 512, 2),
+        ):
+            seed_vec = vec // vec_divisor
+            if seed_vec < 2:
+                continue
+            columns = grid_threads * seed_vec
             row_threads = cta_threads // grid_threads
             while row_threads > 32 and rows // row_threads < 4:
                 row_threads //= 2
@@ -3364,13 +3375,15 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
                             },
                         ),
                         "cute_vector_widths": _seq_config_list(
-                            spec.cute_vector_widths, {grid_block_id: vec}
+                            spec.cute_vector_widths, {grid_block_id: seed_vec}
                         ),
                         "cute_lane_layouts": _seq_config_list(
                             spec.cute_lane_layouts, {reduced_block_id: "strided"}
                         ),
                         "cute_vloop_sink": True,
                         "cute_lane_unroll": 8,
+                        # The launch overlaps the output's zero fill.
+                        "cute_pdl": True,
                     }
                 )
             )

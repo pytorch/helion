@@ -1836,6 +1836,16 @@ def _cute_cluster_shape_from_wrapper_plans(
     return (cluster_m, cluster_n, 1)
 
 
+def _cute_use_pdl(cute_kernel: object) -> bool:
+    """Whether the generated kernel asked for programmatic dependent launch.
+
+    The device function then waits (``griddepcontrol_wait``) before its first
+    global memory access, so the launch and prologue overlap the previous
+    kernel in the stream.
+    """
+    return getattr(cast("Any", cute_kernel), "_helion_cute_use_pdl", False) is True
+
+
 def _cute_cluster_shape(
     cute_kernel: object, wrapper_plans: list[dict[str, object]]
 ) -> tuple[int, int, int] | None:
@@ -2437,7 +2447,7 @@ def _create_cute_wrapper(
     # ``Tcgen05PersistenceModel.CLC_PERSISTENT`` is active. Reading
     # from the plan rather than a kernel-level side-channel attribute
     # mirrors how ``cluster_m``/``cluster_n`` flow through this layer.
-    if any(plan.get("use_pdl") for plan in wrapper_plans):
+    if any(plan.get("use_pdl") for plan in wrapper_plans) or _cute_use_pdl(cute_kernel):
         launch_suffix += ", use_pdl=True"
     # The fa4 flash topology (16-warp/512-thread) uses ``cute.arch.setmaxregister``
     # for per-warp register reallocation (softmax warps inc to 200; mma/corr/load/empty
@@ -2924,6 +2934,7 @@ def _cute_disk_cache_key(
             _cute_cache_relevant_env(),
             cutlass_version,
             num_sm,
+            _cute_use_pdl(cute_kernel),
         )
     )
     digest = hashlib.sha256(payload.encode("utf-8")).digest()

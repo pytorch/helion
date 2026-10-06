@@ -1239,6 +1239,7 @@ class CuteBackend(Backend):
             or key == "cute_packet_prefetch"
             or key == "cute_vloop_sink"
             or key == "cute_lane_unroll"
+            or key == "cute_pdl"
             or key
             in (
                 "cute_split_k_workspace",
