@@ -198,7 +198,9 @@ def _codegen_common_cute(
     )
     if tensor_index_stmt is not None:
         return tensor_index_stmt
+    from ...language.memory_ops import _cute_access_regions
     from ...language.memory_ops import _cute_index_exprs
+    from ...language.memory_ops import _cute_tag_access_regions
 
     ast_index = state.ast_args[1]
     assert isinstance(ast_index, (list, tuple))
@@ -216,6 +218,11 @@ def _codegen_common_cute(
         ptr=expr_from_string(pointer),
         sem=sem,
         **placeholders,
+    )
+    # The elements the atomic touches, for the barrier analysis
+    # (``lane_loop_distribution``), like a store's.
+    _cute_tag_access_regions(
+        atomic_expr, tensor_name, _cute_access_regions(state, index, target)
     )
     if (
         cute_func == "atomic_add"
@@ -585,6 +592,7 @@ def _cute_vector_atomic_site(
     body = stack[-1]
 
     def emit() -> ast.AST | None:
+        from ...language.memory_ops import CuteTileVecStoreSite
         from .lane_loop_distribution import _tensor_mentions
 
         # The flush runs after the whole V-loop: a later statement of the
@@ -592,25 +600,36 @@ def _cute_vector_atomic_site(
         site = next((i for i, stmt in enumerate(body) if stmt is scalar), len(body))
         if any(tensor_name in _tensor_mentions(stmt) for stmt in body[site + 1 :]):
             return None
-        # Shares the store flush numbering so flushes keep source order.
+        # Shares the store flush numbering so flushes keep source order, and
+        # the store site record so the memory-effect checks see the append as
+        # a write of the target (``_cute_statement_written_tensors``) and the
+        # flush is restored to the scalar atomic like a store's would be.
         sites = sites_by_block.setdefault(block_id, [])
         site_index = len(sites)
         list_var = state.device_function.new_var(
             f"_tile_atomic_vals_{block_id}_{site_index}", dce=False
         )
-        sites.append(list_var)
+        init_stmt = statement_from_string(f"{list_var} = []")
         lane_body.insert(
-            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body),
-            statement_from_string(f"{list_var} = []"),
+            _cute_lane_vloop_insert_pos(strategy, block_id, lane_body), init_stmt
         )
         flush = f"_cute_red_add_f32_vec({base_pointer}, {list_var})"
         if guard:
             flush = f"if {guard}:\n    {flush}"
+        flush_stmt = statement_from_string(flush)
         lane_body.insert(
             _cute_lane_vloop_insert_pos(strategy, block_id, lane_body) + 1 + site_index,
-            statement_from_string(flush),
+            flush_stmt,
         )
-        return statement_from_string(f"{list_var}.append({{value}})", value=value_expr)
+        body_stmt = statement_from_string(
+            f"{list_var}.append({{value}})", value=value_expr
+        )
+        sites.append(
+            CuteTileVecStoreSite(
+                list_var, tensor_name, body_stmt, scalar, init_stmt, flush_stmt
+            )
+        )
+        return body_stmt
 
     assert isinstance(atomic_expr, ast.expr)
     scalar: ast.stmt = ast.Expr(value=atomic_expr)

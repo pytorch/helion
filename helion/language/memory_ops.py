@@ -8,14 +8,19 @@ import operator
 import textwrap
 from typing import TYPE_CHECKING
 
+import sympy
 import torch
 from torch.fx import has_side_effect
 
 from .. import exc
 from .._compiler.ast_extension import expr_from_string
 from .._compiler.ast_extension import statement_from_string
+from .._compiler.ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from .._compiler.compile_environment import CompileEnvironment
 from .._compiler.compile_environment import _symint_expr
+from .._compiler.cute.access_regions import access_address
+from .._compiler.cute.access_regions import block_size_symbol
+from .._compiler.cute.access_regions import tile_begin_symbol
 from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_8B_HELPERS
 from .._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPERS
 from .._compiler.cute.cutedsl_compat import emit_pipeline_advance
@@ -78,6 +83,7 @@ from .._compiler.indexing_strategy import TileWithOffsetInfo
 from .._compiler.indexing_strategy import _get_tile_with_offset_info
 from .._compiler.indexing_strategy import exact_tile_block_ids
 from .._compiler.utils import compute_slice_size
+from .._compiler.variable_origin import BlockSizeOrigin
 from .._compiler.variable_origin import GridOrigin
 from .._compiler.variable_origin import TileBeginOrigin
 from .._compiler.variable_origin import TileCountOrigin
@@ -538,13 +544,22 @@ def _cute_index_exprs(
                             )
                         return f"({begin_var}) + ({block_size_var})"
                     if isinstance(origin_info.origin, TileCountOrigin):
+                        # The tiles of the whole iteration space, counted
+                        # from its first index (``tile_count``'s common
+                        # codegen), not from this program's own tile.
+                        iteration_begin = (
+                            loop_info.begin_var_name
+                            if loop_info is not None
+                            and loop_info.begin_var_name is not None
+                            else "0"
+                        )
                         end_var = (
                             loop_info.end_var_name
                             if loop_info is not None
                             and loop_info.end_var_name is not None
-                            else f"({begin_var}) + ({block_size_var})"
+                            else f"({iteration_begin}) + ({block_size_var})"
                         )
-                        extent = f"({end_var}) - ({begin_var})"
+                        extent = f"({end_var}) - ({iteration_begin})"
                         return env.backend.cdiv_expr(
                             extent, block_size_var, is_device=True
                         )
@@ -785,6 +800,197 @@ def _cute_index_exprs(
     return result
 
 
+_CuteAccessRegions = tuple[tuple[sympy.Expr, sympy.Expr] | None, ...]
+
+
+def _cute_access_regions(
+    state: CodegenState,
+    subscript: list[object] | tuple[object, ...],
+    tensor: torch.Tensor,
+) -> _CuteAccessRegions | None:
+    """The elements a subscript of ``tensor`` covers, per tensor dimension.
+
+    The ``[begin, end)`` bounds of the tile program's access along each
+    dimension, over every thread and lane: a tile's ``[begin, begin + block)``
+    (its begin one symbol per block id, which a ``tile.begin`` index reads
+    too), a slice's ``[start, start + size)``, a scalar's ``[k, k + 1)``; None
+    for a dimension indexed by a tensor or by a tile bound computed at run
+    time (``tile.end``).  The lane-loop distribution's barrier analysis
+    (``cute/lane_loop_distribution.py``) needs no barrier between accesses
+    whose regions are apart along some dimension.  None when the subscript
+    does not resolve against the tensor's dimensions.
+    """
+    env = CompileEnvironment.current()
+
+    def begin_symbol(block_id: int) -> sympy.Expr:
+        # The symbol names the loop instance iterating the block: two loops
+        # over one block id have unrelated begins (``tile_begin_symbol``).
+        block_id = _cute_remap_block_id(state, block_id)
+        loops = state.codegen.active_device_loops.get(block_id)
+        return tile_begin_symbol(block_id, loops[-1] if loops else None)
+
+    def block_size(block_id: int) -> sympy.Expr:
+        block_id = _cute_remap_block_id(state, block_id)
+        return block_size_symbol(state.device_function.block_size_var(block_id))
+
+    def substitute(expr: sympy.Expr) -> sympy.Expr | None:
+        """``expr`` over the region symbols; None when a tile bound computed at run time is left."""
+        substitutions: dict[sympy.Basic, sympy.Expr] = {}
+        for symbol in expr.free_symbols:
+            origin_info = HostFunction.current().expr_to_origin.get(symbol)
+            if origin_info is None:
+                continue
+            if isinstance(origin_info.origin, TileBeginOrigin):
+                substitutions[symbol] = begin_symbol(origin_info.origin.block_id)
+            elif isinstance(origin_info.origin, BlockSizeOrigin):
+                substitutions[symbol] = block_size(origin_info.origin.block_id)
+            elif isinstance(origin_info.origin, GridOrigin):
+                return None
+        return expr.xreplace(substitutions)
+
+    def scalar(value: object) -> sympy.Expr | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return sympy.Integer(value)
+        if isinstance(value, sympy.Expr):
+            return value
+        if not isinstance(value, torch.SymInt):
+            return None
+        expr = _symint_expr(value)
+        if expr is None:
+            return None
+        return substitute(expr)
+
+    def tile_end_interval(expr: sympy.Expr) -> tuple[sympy.Expr, sympy.Expr] | None:
+        """The bounds of a scalar index ``tile.end + k``.
+
+        A tile's end (``min(begin + block, end)``) lies in ``(begin, begin +
+        block]``, so the index lies in ``[begin + 1 + k, begin + block + k]``:
+        an interval, not a point, that the loop's later iterations leave
+        behind.  Only an index moving one for one with the end qualifies.
+        """
+        ends = [
+            (symbol, origin_info.origin.block_id)
+            for symbol in expr.free_symbols
+            if (origin_info := HostFunction.current().expr_to_origin.get(symbol))
+            is not None
+            and isinstance(origin_info.origin, TileEndOrigin)
+        ]
+        if len(ends) != 1:
+            return None
+        ((end, block_id),) = ends
+        if sympy.diff(expr, end) != 1:
+            return None
+        begin = begin_symbol(block_id)
+        low = substitute(expr.xreplace({end: sympy.Add(begin, 1)}))
+        high = substitute(expr.xreplace({end: sympy.Add(begin, block_size(block_id))}))
+        if low is None or high is None:
+            return None
+        return low, sympy.Add(high, 1)
+
+    regions: list[tuple[sympy.Expr, sympy.Expr] | None] = []
+    tensor_dim = 0
+    for pos, idx in enumerate(subscript):
+        if idx is None:
+            continue
+        if tensor_dim >= tensor.ndim:
+            return None
+        dim_size = tensor.shape[tensor_dim]
+        tensor_dim += 1
+        if env.known_equal(dim_size, 1) and not (
+            isinstance(idx, slice) and idx == slice(None)
+        ):
+            regions.append((sympy.Integer(0), sympy.Integer(1)))
+            continue
+        tile_info = _get_tile_with_offset_info(
+            idx, getattr(state, "fx_node", None), pos
+        )
+        if tile_info is not None and tile_info.block_size is not None:
+            offset = scalar(tile_info.offset)
+            size = scalar(tile_info.block_size)
+            if offset is None or size is None:
+                regions.append(None)
+            else:
+                begin = sympy.Add(begin_symbol(tile_info.block_id), offset)
+                regions.append((begin, sympy.Add(begin, size)))
+            continue
+        if isinstance(idx, torch.SymInt):
+            expr = _symint_expr(idx)
+            origin_info = (
+                None
+                if expr is None
+                else HostFunction.current().expr_to_origin.get(expr)
+            )
+            if expr is not None and (interval := tile_end_interval(expr)) is not None:
+                regions.append(interval)
+            elif (
+                origin_info is not None
+                and isinstance(origin_info.origin, GridOrigin)
+                and type(origin_info.origin) is not GridOrigin
+            ):
+                if isinstance(origin_info.origin, TileBeginOrigin):
+                    begin = begin_symbol(origin_info.origin.block_id)
+                    regions.append((begin, sympy.Add(begin, 1)))
+                else:
+                    regions.append(None)
+            elif (block_id := env.get_block_id(idx)) is not None:
+                begin = begin_symbol(block_id)
+                regions.append((begin, sympy.Add(begin, block_size(block_id))))
+            else:
+                value = scalar(idx)
+                regions.append(None if value is None else (value, sympy.Add(value, 1)))
+        elif isinstance(idx, int) and not isinstance(idx, bool):
+            regions.append((sympy.Integer(idx), sympy.Integer(idx + 1)))
+        elif isinstance(idx, slice) and (idx.step is None or idx.step == 1):
+            start = scalar(idx.start if idx.start is not None else 0)
+            size = scalar(compute_slice_size(idx, dim_size))
+            regions.append(
+                None
+                if start is None or size is None
+                else (start, sympy.Add(start, size))
+            )
+        else:
+            regions.append(None)
+    if tensor_dim != tensor.ndim:
+        return None
+    return tuple(regions)
+
+
+def _cute_tag_access_regions(
+    node: ast.AST, tensor_name: str, regions: _CuteAccessRegions | None
+) -> None:
+    """Record ``regions`` on the load and store calls of ``node`` addressing ``tensor_name``.
+
+    The address is the receiver of a ``.load()`` / ``.store()`` call or the
+    first argument of any other call, ``cute.arch.load`` included
+    (``access_address``); a call whose address only holds the tensor inside
+    a nested call (a cast around a load) is not an access.
+    """
+    if regions is None:
+        return
+    for call in ast.walk(node):
+        if not isinstance(call, ast.Call):
+            continue
+        address = access_address(call)
+        if address is None:
+            continue
+        pending: list[ast.AST] = [address]
+        while pending:
+            child = pending.pop()
+            if isinstance(child, ast.Call):
+                continue
+            if (
+                isinstance(child, ast.Attribute)
+                and child.attr == "iterator"
+                and isinstance(child.value, ast.Name)
+                and child.value.id == tensor_name
+            ):
+                setattr(call, HELION_ACCESS_REGIONS_ATTR, regions)
+                break
+            pending.extend(ast.iter_child_nodes(child))
+
+
 def _cute_index_tuple(index_exprs: list[str]) -> str:
     if len(index_exprs) == 1:
         return f"({index_exprs[0]},)"
@@ -1010,6 +1216,29 @@ def _cute_lane_vloop_insert_pos(
     return len(lane_body) - 1
 
 
+@dataclasses.dataclass(eq=False)
+class CuteTileVecStoreSite:
+    """A per-lane store collected into ``list_var`` and flushed after the V-loop.
+
+    ``body_stmt`` stands in for the store inside the constexpr V-loop body once
+    the vector protocol is in place: the list append, or the packet binding of
+    a packed signed-byte store.  ``scalar_stmt`` is the per-lane scalar store
+    it replaced (a grid keeps it in the root body until the wrap) and the one
+    to restore when the flush cannot legally run after a later access of the
+    tensor (see ``demote_reordered_tile_vec_stores`` in
+    ``_compiler/cute/memory_ops.py``).  A vector ``atomic_add`` flushed as one
+    ``red.global.add`` after the V-loop registers the same record
+    (``_compiler/cute/atomic_ops.py``).
+    """
+
+    list_var: str
+    tensor_name: str
+    body_stmt: ast.stmt
+    scalar_stmt: ast.stmt
+    init_stmt: ast.stmt | None
+    flush_stmt: ast.stmt
+
+
 def _cute_register_tile_unroll_vec_store(
     state: CodegenState,
     strategy: object,  # BlockSizeTileStrategy (PerThreadNDTileStrategy)
@@ -1020,6 +1249,7 @@ def _cute_register_tile_unroll_vec_store(
     mask_expr: str | None,
     dtype: torch.dtype = torch.float16,
     *,
+    scalar_stmt: ast.stmt,
     lane_axis_pos: int | None = None,
     packed_values: PackedStoreValue | None = None,
 ) -> ast.stmt | None:
@@ -1040,6 +1270,10 @@ def _cute_register_tile_unroll_vec_store(
     once, so the site appends nothing: it binds the packet under the flush
     operand's name, which keeps the store's place in the body for the
     lane-loop distribution (``PackedStoreValue``).
+
+    ``scalar_stmt`` is the per-lane scalar store this site replaces; the site
+    is recorded in ``strategy._cute_lane_vec_stores_by_block`` so a later
+    access of the tensor in the same lane loop can restore it.
 
     Returns the per-lane site statement (an append onto the list, or the
     packet binding), or None when the lane context isn't available.
@@ -1071,15 +1305,16 @@ def _cute_register_tile_unroll_vec_store(
         sites_by_block = {}
         # pyrefly: ignore [missing-attribute]
         strategy._cute_lane_vec_stores_by_block = sites_by_block
-    sites = sites_by_block.setdefault(block_id, [])
+    sites: list[CuteTileVecStoreSite] = sites_by_block.setdefault(block_id, [])
     site_index = len(sites)
     list_var = state.device_function.new_var(
         f"_tile_store_vals_{block_id}_{site_index}", dce=False
     )
-    sites.append(list_var)
     vloop_pos = _cute_lane_vloop_insert_pos(strategy, block_id, lane_body)
+    init_stmt: ast.stmt | None = None
     if packed_values is None:
-        lane_body.insert(vloop_pos, statement_from_string(f"{list_var} = []"))
+        init_stmt = statement_from_string(f"{list_var} = []")
+        lane_body.insert(vloop_pos, init_stmt)
     carrier = _CUTE_VECTOR_UNROLL_CARRIER[dtype]
     flush_helper = (
         "_cute_store_u32_vec" if dtype.itemsize == 4 else "_cute_store_u16_vec"
@@ -1099,10 +1334,22 @@ def _cute_register_tile_unroll_vec_store(
         flush_stmt,
     )
     if packed_values is not None:
-        return statement_from_string(f"{list_var} = {packed_values.carrier}")
-    return statement_from_string(
-        f"{list_var}.append(({value_expr}).bitcast({carrier}))"
+        body_stmt = statement_from_string(f"{list_var} = {packed_values.carrier}")
+    else:
+        body_stmt = statement_from_string(
+            f"{list_var}.append(({value_expr}).bitcast({carrier}))"
+        )
+    sites.append(
+        CuteTileVecStoreSite(
+            list_var,
+            tensor_name,
+            body_stmt,
+            scalar_stmt,
+            init_stmt,
+            flush_stmt,
+        )
     )
+    return body_stmt
 
 
 def _cute_register_reduction_unroll_vec_store(

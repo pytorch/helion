@@ -42,6 +42,8 @@ from helion import exc
 from helion._compiler.ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
 from helion._compiler.cute.lane_loop_distribution import LaneScope
 from helion._compiler.cute.lane_loop_distribution import check_full_nest
+from helion._testing import EXAMPLES_DIR
+from helion._testing import import_path
 from helion._testing import skipUnlessBackends
 import helion.language as hl
 
@@ -799,11 +801,37 @@ def test_pinned_atomic_after_a_per_lane_access_of_its_tensor_rejects_the_config(
 def test_pinned_atomic_beside_a_hoisted_access_of_its_tensor_rejects_the_config() -> (
     None
 ):
-    # The vectorized column loop hoists its loads of ``out`` above the V-loop,
-    # ahead of the pinned increment in the first row iteration.
+    # The vectorized column loop hoists its loads of ``out`` above the V-loop
+    # and flushes its stores after it, beside the pinned increment in the
+    # first row iteration.
     args = (torch.empty((4, 256)), torch.empty((4, 256)))
     with pytest.raises(exc.BackendUnsupported, match="hoisted load of it"):
-        _generate(_row_increment_then_read, args, **_NESTED)
+        _generate(_read_then_row_increment, args, **_NESTED)
+    with pytest.raises(exc.BackendUnsupported, match="hoisted store to it"):
+        _generate(_copy_then_row_increment, args, **_NESTED)
+
+
+def test_pinned_atomic_keeps_the_later_vectorized_read_of_its_tensor_scalar() -> None:
+    # The increment precedes the read of ``out`` in the program, so the
+    # memory-effect gate of the tile-vector hoist keeps the read a scalar load
+    # inside the V-loop instead of a packet hoisted above it: issued at the
+    # first row lane, the pinned increment precedes every row's read.
+    args = (torch.empty((4, 256)), torch.empty((4, 256)))
+    code = _generate(_row_increment_then_read, args, **_NESTED)
+    function = _kernel_function(code)
+    atomic = _the_atomic(function)
+    assert _lane_loops_around(function, atomic) == ["vec_lane_1", "lane_1", "lane_0"]
+    assert _first_lanes(_guard(function, atomic)) == {"lane_0"}, code
+    assert "cute.arch.load(out.iterator" not in code, code
+    (vloop,) = [
+        loop
+        for loop in ast.walk(function)
+        if isinstance(loop, ast.For) and ast.unparse(loop.target) == "vec_lane_1"
+    ]
+    source = [ast.unparse(statement) for statement in vloop.body]
+    assert [i for i, s in enumerate(source) if "atomic_add" in s] < [
+        i for i, s in enumerate(source) if "out.iterator" in s and ".load()" in s
+    ], code
 
 
 def test_fence_between_per_lane_stores_is_not_pinned() -> None:
@@ -1051,3 +1079,36 @@ def test_statement_needing_only_the_inner_loop_runs_in_the_outer_loop_too(
         and "flags.iterator" in ast.unparse(statement)
     ]
     assert flag_loads and flag_loads[0] < _first_lane_loop_index(function), code
+
+
+def test_grid_atomic_leaves_the_unindexed_block_without_an_index() -> None:
+    # ``examples/matmul_split_k.py`` under the config of the inactive-block
+    # test in ``test_dot_requirements.py``: the outer K tile reaches the
+    # kernel only as ``tile_offset_2`` (the inner loop's bounds and the
+    # ``begin == 0`` test), so the grid gives it neither a lane loop nor a
+    # thread axis, and the atomic on ``[tile_m, tile_n]`` carries no mask of
+    # its axis (``tile_offset_2 < k`` holds for every program): it is issued
+    # by the leader of the inner loop's thread axis alone.  Nothing reads
+    # the block's index, so it is not emitted; were it, it could not claim a
+    # thread axis.
+    module = import_path(EXAMPLES_DIR / "matmul_split_k.py")
+    args = (torch.empty(64, 1024), torch.empty(1024, 64))
+    code = _generate(
+        module.matmul_split_k,
+        args,
+        block_sizes=[16, 2, 16],
+        num_threads=[0, 2, 8],
+        split_k=32,
+    )
+    function = _kernel_function(code)
+    atomic = _the_atomic(function)
+    guard = _guard(function, atomic)
+    assert _leader_axes(guard) == {2} and "mask" not in (guard or ""), code
+    assert _thread_axes(function) == {0, 1, 2}, code
+    assert "tile_offset_2" in code
+    for statement in ast.walk(function):
+        if (
+            isinstance(statement, ast.Assign)
+            and ast.unparse(statement.targets[0]) == "indices_2"
+        ):
+            assert "thread_idx" not in ast.unparse(statement), code
