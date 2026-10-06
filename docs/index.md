@@ -10,6 +10,7 @@ Examples <./examples/index>
 Tutorials <helion_tutorials>
 api/index
 Deployment <deployment_autotuning>
+Pipeline Autotuning <pipeline_autotune>
 TileIR Backend <tileir_backend>
 events
 Dashboard <https://helionlang.com/dashboard/>

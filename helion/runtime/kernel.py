@@ -76,6 +76,7 @@ from .._utils import counters
 from ..autotuner.base_search import _AutotunableKernel
 from ..language.constexpr import ConstExpr
 from .config import Config
+from .pipeline import _active_pipeline
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
@@ -1950,6 +1951,8 @@ class Kernel(Generic[_R]):
         if kwargs:
             args = self.normalize_args(*args, **kwargs)
         is_compiling = torch.compiler.is_compiling()
+        if not is_compiling and (pipeline := _active_pipeline.get()) is not None:
+            return cast("_R", pipeline.call(self, args))
         if (
             not is_compiling
             and (prepared := self._prepared_call) is not None
@@ -3192,6 +3195,11 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Returns:
             _R: The result of the kernel execution.
         """
+        if (
+            not torch.compiler.is_compiling()
+            and (pipeline := _active_pipeline.get()) is not None
+        ):
+            return cast("_R", pipeline.call(self.kernel, args))
         if (
             self._cache_managed
             and self._reset_generation != self.kernel._reset_generation

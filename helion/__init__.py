@@ -10,11 +10,15 @@ from ._utils import cdiv
 from ._utils import next_power_of_2
 from .autotuner import aot_kernel
 from .autotuner import from_cache
+from .autotuner.pipeline import PipelineTuningResult
+from .autotuner.pipeline import autotune_pipeline
 from .runtime import Config
 from .runtime import Kernel
 from .runtime import OutputCodeOptions
 from .runtime import kernel
 from .runtime import kernel as jit  # alias
+from .runtime.pipeline import PipelineConfig
+from .runtime.pipeline import PipelineStage
 from .runtime.settings import RefMode
 from .runtime.settings import Settings
 
@@ -22,9 +26,13 @@ __all__ = [
     "Config",
     "Kernel",
     "OutputCodeOptions",
+    "PipelineConfig",
+    "PipelineStage",
+    "PipelineTuningResult",
     "RefMode",
     "Settings",
     "aot_kernel",
+    "autotune_pipeline",
     "cdiv",
     "exc",
     "from_cache",

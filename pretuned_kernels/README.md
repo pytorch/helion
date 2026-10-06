@@ -44,6 +44,7 @@ pretuned_kernels/
 ├── rms_norm_per_block_quant/
 ├── silu_and_mul_per_block_quant/
 ├── fused_qk_norm_rope/
+├── pipeline_topk/                   # exact variable-length top-k pipeline
 ├── causal_conv1d/                    # TPU/Pallas fixed-config decode kernel
 ├── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
 └── megakernels/
@@ -130,6 +131,12 @@ registered in the CUDA-only aggregate runner. The implementations and
 baselines follow the Apache-licensed `vllm-project/tpu-inference` state-cache
 contracts; `gdn_decode` currently targets `H=2` because larger recurrent-state
 tiles exceed Helion's current aligned indirect-DMA VMEM plan.
+
+`pipeline_topk` compares fixed tile configurations for an exact variable-length
+top-k pipeline and supports a bounded joint autotuning search. It checks values
+and original indices against PyTorch, then measures complete GPU graphs. See
+[Pipeline Autotuning](../docs/pipeline_autotune.rst) for the standalone command
+and tuning API.
 
 ## Scope
 
