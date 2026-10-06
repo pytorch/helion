@@ -9,6 +9,7 @@ its loads, contractions, and loop carries are materialized in shared memory.
 from __future__ import annotations
 
 import ast
+from contextlib import contextmanager
 from dataclasses import dataclass
 import math
 import operator
@@ -75,12 +76,16 @@ from .private_scalar_loops import private_scalar_loop_nodes
 from .private_scalar_loops import privatize_scalar_loop
 from .register_loads import host_load_is_readonly
 from .register_loads import lane_private_load
+from .register_snapshots import SnapshotOwner
+from .register_snapshots import snapshot_chains
+from .register_snapshots import snapshot_logical_shape
 from .tcgen05_config import CuteTcgen05Config
 from .warp_results import warp_result_chain
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
+    from collections.abc import Iterator
 
     from ..autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from ..device_ir import DeviceIR
@@ -247,6 +252,34 @@ class FragmentCompiler:
                         warp_result_chain(node, self.env, self.threads)
                     )
 
+        self.snapshot_owner: SnapshotOwner | None = None
+        self.snapshot_loads: set[Node] = set()
+        self.snapshot_reductions: set[Node] = set()
+        self.snapshot_shapes: set[tuple[int, ...]] = set()
+        if self.df.config.get("cute_fragment_register_snapshots", False):
+            for node, chain in snapshot_chains(self.graphs, self.env).items():
+                shape = self.shape(node.meta["val"].shape)
+                if len(shape) == 1 and 0 < shape[0] <= self.threads * MAX_SLOTS:
+                    if self.warp_result_nodes.keys() & chain:
+                        continue
+                    self.snapshot_loads.add(node)
+                    self.snapshot_shapes.add(shape)
+                    self.snapshot_shapes.add(self.shape(snapshot_logical_shape(node)))
+                    self.snapshot_reductions.update(
+                        item
+                        for item in chain
+                        if isinstance(item.meta.get("lowering"), ReductionLowering)
+                    )
+
+            if not self.snapshot_loads and any(
+                graph.graph_id
+                in self.env.config_spec.cute_fragment_register_snapshots_root_ids
+                for graph in self.graphs
+            ):
+                raise exc.InvalidConfig(
+                    "register snapshot root has no eligible immutable owner slots"
+                )
+
         self.local_register_nodes: set[Node] = set()
         self.local_register_slot: str | None = None
         if self.df.config.get("cute_fragment_local_atomic_registers", False):
@@ -259,6 +292,16 @@ class FragmentCompiler:
                 count = math.prod(self.shape(fake.shape))
                 if 0 < count <= self.threads * MAX_SLOTS:
                     self.local_register_nodes.update(chain)
+
+    @contextmanager
+    def snapshot_scope(self, index: str, slot: str, size: int) -> Iterator[None]:
+        previous = self.snapshot_owner
+        if (size,) in self.snapshot_shapes:
+            self.snapshot_owner = SnapshotOwner(index, slot, size)
+        try:
+            yield
+        finally:
+            self.snapshot_owner = previous
 
     def begin(self) -> None:
         self.allocator = self.df.new_var("fragment_smem")
@@ -416,14 +459,22 @@ class FragmentCompiler:
             self.expression is not None
             and self.expression.body is self.cg.statements_stack[-1]
         ):
-            return tuple(self.expression.coordinate(value) for value in coordinates)
+            result = tuple(self.expression.coordinate(value) for value in coordinates)
+            if self.snapshot_owner is not None:
+                for name, value in zip(result, coordinates, strict=True):
+                    if name != value:
+                        self.snapshot_owner.aliases.setdefault(name, value)
+            return result
         result = []
         for coordinate in coordinates:
             expression = expr_from_string(coordinate)
             if isinstance(expression, (ast.Name, ast.Constant)):
                 result.append(coordinate)
                 continue
-            result.append(self.cg.lift(expression, prefix="fragment_coordinate").id)
+            name = self.cg.lift(expression, prefix="fragment_coordinate").id
+            if self.snapshot_owner is not None:
+                self.snapshot_owner.aliases.setdefault(name, coordinate)
+            result.append(name)
         return tuple(result)
 
     def pointwise_read(
@@ -536,6 +587,11 @@ class FragmentCompiler:
         synchronize: bool = True,
         register_owned: bool = False,
     ) -> None:
+        register_owned = register_owned or (
+            shape in self.snapshot_shapes
+            and not warp_owned
+            and threads_per_element == 1
+        )
         if register_owned:
             assert not warp_owned and threads_per_element == 1
             slots = (math.prod(shape) + self.threads - 1) // self.threads
@@ -561,7 +617,10 @@ class FragmentCompiler:
                         ),
                     )
                     branch.body.clear()
-                    with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                    with (
+                        self.cg.set_statements(cast("list[ast.AST]", branch.body)),
+                        self.snapshot_scope(index, slot, math.prod(shape)),
+                    ):
                         body(self.coordinates(index, shape))
                     self.cg.add_statement(branch)
             finally:
@@ -649,6 +708,7 @@ class FragmentCompiler:
         No observer can read the private target until its existing epoch barrier.
         """
         assert self.threads % 32 == 0
+        register_owned = register_owned or shape in self.snapshot_shapes
         size = math.prod(shape)
         iteration = self.df.new_var("fragment_atomic_round")
         index = self.df.new_var("fragment_atomic_element")
@@ -679,7 +739,8 @@ class FragmentCompiler:
                 if register_owned:
                     self.local_register_slot = iteration
                 try:
-                    prepare(self.coordinates(index, shape))
+                    with self.snapshot_scope(index, iteration, size):
+                        prepare(self.coordinates(index, shape))
                 finally:
                     self.local_register_slot = prior
             self.cg.add_statement(valid)
@@ -1187,6 +1248,42 @@ class FragmentCompiler:
             load,
             logical_domain=logical_domain if index_domains or domain_bounds else None,
         )
+        if node in self.snapshot_loads:
+            slots = (math.prod(shape) + self.threads - 1) // self.threads
+            name = self.df.new_var("fragment_snapshot")
+            self.emit(
+                f"{name} = cute.make_rmem_tensor(({slots},), {self.dtype(output.dtype)})"
+            )
+            self.emit(f"{name}.fill({self.cast('0', output.dtype)})")
+
+            def read_snapshot(coords: tuple[str, ...]) -> str:
+                owner = self.snapshot_owner
+                if (
+                    owner is None
+                    or len(coords) != 1
+                    or owner.size
+                    not in (shape[0], self.shape(snapshot_logical_shape(node))[0])
+                ):
+                    raise exc.InvalidConfig(
+                        "register snapshot lacks its active coordinate owner"
+                    )
+                owner.prove(coords[0])
+                return f"{name}[{owner.slot}]"
+
+            def fill_snapshot(coords: tuple[str, ...]) -> None:
+                self.emit(
+                    f"{read_snapshot(coords)} = {self.cast(load(coords), output.dtype)}"
+                )
+
+            # Preserve the old materialization barrier and every guarded load.
+            self.elements(shape, fill_snapshot)
+            return Fragment(
+                shape,
+                output.dtype,
+                read_snapshot,
+                True,
+                logical_domain=loaded_fragment.logical_domain,
+            )
         if (
             self.df.config.get("cute_fragment_register_loads", False)
             and math.prod(shape) <= self.threads
@@ -1354,6 +1451,76 @@ class FragmentCompiler:
                     # including a NaN encountered in a preceding local tile.
                     expression = f"{left} if {left} != {left} else ({expression})"
                 return expression
+
+            if node in self.snapshot_reductions:
+                if (
+                    self.shape(fake.shape) != ()
+                    or len(reduction_shape) != 1
+                    or reduction_shape not in self.snapshot_shapes
+                    or compute_dtype not in (torch.int32, torch.int64)
+                    or lowering.reduction_type not in ("sum", "min", "max")
+                ):
+                    raise exc.InvalidConfig(
+                        "register snapshot requires an exact scalar integer reduction"
+                    )
+                total = self.df.new_var("fragment_snapshot_reduce")
+                identity = self.cast(
+                    self.scalar(
+                        Reduction.default_accumulator(
+                            lowering.reduction_type, compute_dtype
+                        )
+                    ),
+                    compute_dtype,
+                )
+                self.emit(f"{total} = {identity}")
+
+                def partial(coords: tuple[str, ...]) -> None:
+                    value = element((), coords)
+                    self.emit(
+                        f"{total} = {self.cast(combine(total, value), compute_dtype)}"
+                    )
+
+                self.elements(reduction_shape, partial, synchronize=False)
+                peer = self.df.new_var("fragment_snapshot_peer")
+                for distance in (16, 8, 4, 2, 1):
+                    self.emit(
+                        f"{peer} = cute.arch.shuffle_sync_bfly({total}, offset={distance}, mask=0xffffffff, mask_and_clamp=31)"
+                    )
+                    self.emit(
+                        f"{total} = {self.cast(combine(total, peer), compute_dtype)}"
+                    )
+                scratch = self.allocate(
+                    Fragment((self.threads // 32,), compute_dtype, lambda _: "0")
+                )
+                self.held.append(scratch)
+                self.emit(
+                    f"if {self.thread} % 32 == 0:\n    {scratch.read((f'{self.thread} // 32',))} = {total}"
+                )
+                self.synchronize()
+                result = self.allocate(Fragment((), fake.dtype, lambda _: "0"))
+                branch = cast(
+                    "ast.If", statement_from_string(f"if {self.thread} < 32:\n    pass")
+                )
+                branch.body.clear()
+                with self.cg.set_statements(cast("list[ast.AST]", branch.body)):
+                    self.emit(f"{total} = {identity}")
+                    self.emit(
+                        f"if {self.thread} < {self.threads // 32}:\n    {total} = {scratch.read((self.thread,))}"
+                    )
+                    for distance in (16, 8, 4, 2, 1):
+                        self.emit(
+                            f"{peer} = cute.arch.shuffle_sync_bfly({total}, offset={distance}, mask=0xffffffff, mask_and_clamp=31)"
+                        )
+                        self.emit(
+                            f"{total} = {self.cast(combine(total, peer), compute_dtype)}"
+                        )
+                    self.emit(
+                        f"if {self.thread} == 0:\n    {result.read(())} = {self.cast(total, fake.dtype)}"
+                    )
+                self.cg.add_statement(branch)
+                self.synchronize()
+                self.held.pop()
+                return result
 
             def reduce(coords: tuple[str, ...]) -> str:
                 reduction_type = lowering.reduction_type
@@ -2393,6 +2560,7 @@ def computed_fragment_supported(
     *,
     physical_axes: frozenset[int] = frozenset(),
     owned_iota_axes: frozenset[int] = frozenset(),
+    snapshot_owned: bool = False,
 ) -> bool:
     """Structural root ownership shared by search discovery and code generation.
 
@@ -2598,7 +2766,9 @@ def computed_fragment_supported(
             )
         )
 
-    if not any(needs_coordinates(node) for info in graphs for node in info.graph.nodes):
+    if not snapshot_owned and not any(
+        needs_coordinates(node) for info in graphs for node in info.graph.nodes
+    ):
         return False
     supported = {
         _tracing_ops._if,
@@ -2775,6 +2945,10 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.device_function.config.get("cute_fragment_warp_scan", False)
         and root.graph_id in env.config_spec.cute_fragment_warp_scan_root_ids
     )
+    snapshots_required = (
+        cg.device_function.config.get("cute_fragment_register_snapshots", False) is True
+        and root.graph_id in env.config_spec.cute_fragment_register_snapshots_root_ids
+    )
     register_loads_required = (
         cg.device_function.config.get("cute_fragment_register_loads", False)
         and root.graph_id in env.config_spec.cute_fragment_register_load_root_ids
@@ -2789,6 +2963,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if threads_required
         or register_loads_required
         or producer_cache_required
+        or snapshots_required
         or warp_scan_required
         or cg.device_function.config.get("cute_fragment_reduction", "serial")
         != "serial"
@@ -2804,6 +2979,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         if threads_required
         or register_loads_required
         or producer_cache_required
+        or snapshots_required
         or warp_scan_required
         or warp_results_required
         or cg.device_function.config.get("cute_fragment_scan", "serial") != "serial"
@@ -2828,6 +3004,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         or threads_required
         or register_loads_required
         or producer_cache_required
+        or snapshots_required
         or warp_scan_required
         or warp_results_required
         or (
@@ -2937,6 +3114,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or threads_required
             or register_loads_required
             or producer_cache_required
+            or snapshots_required
             or warp_scan_required
             or warp_results_required
         ):
@@ -2950,7 +3128,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
         )
-        if captured_required or local_required or free_required
+        if captured_required or local_required or free_required or snapshots_required
         else cg.codegen_graphs
     )
 
@@ -2981,6 +3159,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
             or threads_required
             or register_loads_required
             or producer_cache_required
+            or snapshots_required
             or warp_scan_required
             or warp_results_required
         ):
@@ -3012,12 +3191,18 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         graphs,
         physical_axes=physical_axes,
         owned_iota_axes=owned_iota_axes,
+        snapshot_owned=snapshots_required,
     ):
         return decline()
     # This owner implements configured reduction tiling directly. Keep the
     # logical producer graph, including every other codegen transformation,
     # rather than applying scalar graph rolling before fragment ownership.
-    if not captured_required and not local_required and not free_required:
+    if (
+        not captured_required
+        and not local_required
+        and not free_required
+        and not snapshots_required
+    ):
         graphs = cg.host_function.device_ir.build_codegen_graphs(
             cg.device_function.config, roll_reductions=False
         )
@@ -3026,6 +3211,7 @@ def codegen_computed_fragment_root(cg: GenerateAST) -> bool:
         graphs,
         physical_axes=physical_axes,
         owned_iota_axes=owned_iota_axes,
+        snapshot_owned=snapshots_required,
     ):
         return decline()
     root = graphs[root.graph_id]
