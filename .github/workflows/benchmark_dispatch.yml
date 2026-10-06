@@ -49,7 +49,7 @@ on:
         # the parent process, producing Shape Failures for every shape. Re-add
         # once #2531 (compile-phase subprocess isolation) lands or the upstream
         # Triton bug is fixed. Forward `rope` stays in the list.
-        default: "flash_attention,gdn_fwd_h,cross_entropy,grouped_gemm,gemm,welford,layer_norm-bwd,int4_gemm,softmax,layer_norm,mamba2_chunk_state,rms_norm-bwd,rope,jsd,mamba2_chunk_scan,kl_div,rms_norm"
+        default: "flash_attention,cross_entropy,grouped_gemm,gemm,welford,layer_norm-bwd,int4_gemm,softmax,layer_norm,mamba2_chunk_state,rms_norm-bwd,rope,jsd,mamba2_chunk_scan,kl_div,rms_norm"
       kernels_tpu:
         description: 'Kernels benchmarked on TPU via run_tpu.py: the kernels the tritonbench bridge cannot fully cover on TPU — bmm (no tritonbench operator), cross_entropy (Helion Mosaic-codegen holdout), and flash_attention (the bridge''s torch.compile comparator is flex_attention, which does not run on TPU, so the bridge would drop flash_attention''s torch_compile column; run_tpu.py compiles the SDPA baseline instead and keeps it). Everything else runs via the bridge (kernels_tpu_bridge). `all` runs every kernel in benchmarks/run_tpu.py::KERNEL_MAPPINGS.'
         required: false
@@ -69,7 +69,7 @@ on:
         description: 'Comma-separated list of linear-attention variants (vs FLA) from benchmarks/run_linattn.py::VARIANTS; the matrix shards these and each run emits a forward and a forward+backward ("-bwd") dashboard row, except forward-only variants which emit only the forward.'
         required: false
         type: string
-        default: "vanilla_linear_attn,simple_gla,retention,full_gla,delta_rule,gated_delta_rule,kda,kda_fused,kda_varlen"
+        default: ""
       env_vars:
         description: 'Environment variables for benchmark runner'
         required: false
