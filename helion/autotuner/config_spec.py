@@ -942,6 +942,7 @@ BACKEND_SPECIFIC_KEYS: frozenset[str] = (
         "cute_fragment_integer_atomic_epochs",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
@@ -1060,6 +1061,7 @@ VALID_KEYS: frozenset[str] = frozenset(
         "cute_fragment_integer_atomic_epochs",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
@@ -1183,6 +1185,7 @@ _CUTE_IMPLICIT_DEFAULT_KEYS: frozenset[str] = frozenset(
         "cute_fragment_integer_atomic_epochs",
         "cute_fragment_local_atomic_registers",
         "cute_fragment_register_snapshots",
+        "cute_fragment_register_producers",
         "cute_fragment_published_scalars",
         "cute_fragment_skip_zero_atomics",
         "cute_fragment_atomic_consumer_fusion",
@@ -1518,6 +1521,8 @@ class ConfigSpec:
         self.cute_fragment_local_atomic_register_min_threads = 0
         self.cute_fragment_register_snapshots_root_ids: frozenset[int] = frozenset()
         self.cute_fragment_register_snapshots_search_enabled = False
+        self.cute_fragment_register_producer_root_ids: frozenset[int] = frozenset()
+        self.cute_fragment_register_producers_search_enabled = False
         self.cute_integer_loop_reduction_available = False
         self.cute_integer_loop_reduction_search_enabled = False
         self.cute_fragment_register_snapshot_min_threads = 0
@@ -3550,6 +3555,29 @@ class ConfigSpec:
             f"{key} requires a pure single integer min/max loop recurrence"
         )
 
+    def _normalize_cute_fragment_register_producers(
+        self, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        key = "cute_fragment_register_producers"
+        value = config.get(key, False)
+        if value is False:
+            config.pop(key, None)
+            return
+        if (
+            value is True
+            and self.cute_fragment_register_producer_root_ids
+            and config.get("cute_fragment_register_snapshots") is True
+            and not config.get("cute_collective_mma")
+            and not config.get("cute_register_chain")
+        ):
+            return
+        if fix_invalid:
+            config.pop(key, None)
+            return
+        raise InvalidConfig(
+            f"{key}={value!r} requires bounded readonly snapshots and repeated pure producers"
+        )
+
     def _normalize_cute_fragment_register_snapshots(
         self, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
@@ -4619,6 +4647,9 @@ class ConfigSpec:
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_fragment_skip_zero_atomics(
+                config, fix_invalid=_fix_invalid
+            )
+            self._normalize_cute_fragment_register_producers(
                 config, fix_invalid=_fix_invalid
             )
             self._normalize_cute_materialized_schedule(config, fix_invalid=_fix_invalid)
@@ -5814,6 +5845,7 @@ class ConfigSpec:
                 "cute_fragment_integer_atomic_epochs",
                 "cute_fragment_local_atomic_registers",
                 "cute_fragment_register_snapshots",
+                "cute_fragment_register_producers",
                 "cute_fragment_published_scalars",
                 "cute_fragment_skip_zero_atomics",
                 "cute_fragment_atomic_consumer_fusion",
@@ -6065,6 +6097,8 @@ class ConfigSpec:
                 fields["cute_integer_loop_reduction"] = BooleanFragment()
             if self.cute_fragment_register_snapshots_search_enabled:
                 fields["cute_fragment_register_snapshots"] = BooleanFragment()
+            if self.cute_fragment_register_producers_search_enabled:
+                fields["cute_fragment_register_producers"] = BooleanFragment()
             if self.cute_fragment_published_scalars_search_enabled:
                 fields["cute_fragment_published_scalars"] = BooleanFragment()
             if self.cute_fragment_skip_zero_atomics_search_enabled:
