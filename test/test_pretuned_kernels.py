@@ -97,6 +97,24 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
     return sys.modules[module_name]
 
 
+def test_composite_pretuned_hardware_requires_all_stages(tmp_path: Path) -> None:
+    from pretuned_kernels import run
+
+    directory = tmp_path / "pipeline"
+    directory.mkdir()
+    for filename in (
+        "_helion_aot_produce_cuda_sm100.py",
+        "_helion_aot_produce_cuda_sm103.py",
+        f"_helion_aot_consume_cuda_sm103__policy_{'a' * 64}.py",
+    ):
+        (directory / filename).touch()
+    with patch.object(run, "PRETUNED_KERNELS_DIR", tmp_path):
+        assert run._supported_hardware("pipeline") == {"gb300"}
+        assert run._supported_hardware("missing") == set()
+        (directory / "_helion_aot_consume_cuda_sm100.py").touch()
+        assert run._supported_hardware("pipeline") == {"b200", "gb300"}
+
+
 @pytest.mark.parametrize(
     "name",
     (

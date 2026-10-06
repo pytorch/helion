@@ -26,6 +26,12 @@ pretuned_kernels/
 │   └── _helion_aot_vector_add_cuda_sm90.py    # H100 heuristic
 ├── softmax/
 ├── topk/                            # GB300 CuTe top-k + optional selected-value softmax
+├── categorical_sampling/            # GB300 CuTe categorical sampling from logits/probabilities
+├── min_p_sampling/                  # GB300 CuTe min-p filtering + sampling
+├── chain_speculative_sampling/      # GB300 CuTe draft verification + resampling
+├── varlen_topk/                     # GB300 CuTe exact selection with per-row lengths
+├── moe_softmax_routing/             # GB300 CuTe full-row softmax + expert selection
+├── top_p_renorm/                    # GB300 CuTe staged nucleus filtering + renormalization
 ├── layer_norm/
 ├── rms_norm/
 ├── cross_entropy/
@@ -61,6 +67,12 @@ At runtime Helion picks the file matching the current GPU.
 | `vector_add` | `2**i for i in range(19, 29)` | `x + y` |
 | `softmax` | Triton tutorial `M=4096, N=128*i for i in range(2, 100)` + realistic long-context shapes | `F.softmax` |
 | `topk` | BF16 `M=65536, N in {64,128,256,512,1024}, K in {8,16,32}`, plain and fused softmax (30 cases; GB300 CuTe) | `torch.topk`, optionally followed by FP32 softmax of the selected values; int32 indices |
+| `categorical_sampling` | FP32 vocabulary 128512 with batches 16/64/256 (logits) and 32/128/512 (probabilities), plus 99×32000 logits; GB300 CuTe | Torch Philox plus CDF or Gumbel sampling |
+| `min_p_sampling` | FP32 16×128512, min-p=0.05; GB300 CuTe | Torch min-p filtering, Philox and CDF sampling |
+| `chain_speculative_sampling` | FP32 batch 99, vocabulary 32000, one draft step; GB300 CuTe | Torch Philox, prefix verification and residual/bonus sampling |
+| `varlen_topk` | FP32 16×8192, K=1024, mixed valid row lengths; GB300 CuTe | Torch per-row selection and index/padding checks |
+| `moe_softmax_routing` | FP32 32768×256 experts, K=8; GB300 CuTe | Full-row `torch.softmax` followed by `torch.topk` |
+| `top_p_renorm` | FP32 16×128512, p=0.1, 32 partitions; GB300 CuTe | Torch nucleus filtering and mass normalization |
 | `layer_norm` | Triton tutorial `M=4096, N=512*i for i in range(2, 32)` + realistic hidden-size shapes | `F.layer_norm` |
 | `rms_norm` | TritonBench `(M=2048, H)` default + NPOT shapes + realistic LLM hidden-size and production-style shapes | `F.rms_norm` |
 | `cross_entropy` | TritonBench/Liger token-vocab sweep + realistic LLM vocabulary shapes | `F.cross_entropy` |
@@ -99,6 +111,23 @@ before timing, allowing different indices for tied values. Both implementations
 use the same CUDA-graph timer with cold L2; the Torch baseline includes the cast
 to int32 indices. The checked-in configs were tuned on GB300 (`sm103`) for the
 30 listed cases with contiguous BF16 inputs.
+
+The routing and sampling recipes include only measured ordinary Helion programs
+and their recorded configurations. Sampling checks
+validate the output support and the appropriate RNG/CDF contract. The Torch
+references include matched Philox generation and CDF or Gumbel arithmetic;
+CDF rounding may admit different valid token IDs near a boundary. Graph checks poison
+the captured outputs before replay and verify that kernels read the current
+device seed. `moe_softmax_routing` normalizes across all experts before selection,
+whereas `topk(softmax=True)` normalizes only the selected values.
+
+`chain_speculative_sampling` uses its faster measured fixed configuration with
+uniform producer regions. `top_p_renorm` is a fixed-configuration 14-stage,
+17-launch recipe. These two configurations are measured diagnostics, not winners
+rediscovered by a full autotuning search. The remaining new recipes use their
+recorded full-search configurations. Historical timings belong to the compiler
+snapshots used for those measurements; run the included sweeps to measure this
+checkout. A recorded configuration does not imply a win over every baseline.
 
 `grouped_gemm` compares Helion with the same pinned CUTLASS kernel. Required
 device pointer tables are initialized before graph capture, and both
@@ -178,6 +207,14 @@ To run the top-k sweep and write aggregate metrics on GB300:
 python pretuned_kernels/run.py --kernels topk --output topk-bench.json
 ```
 
+To run the measured routing and sampling recipes against Torch on GB300:
+
+```bash
+python pretuned_kernels/run.py \
+  --kernels categorical_sampling,min_p_sampling,chain_speculative_sampling,varlen_topk,moe_softmax_routing,top_p_renorm \
+  --output routing-sampling-bench.json
+```
+
 The external grouped-GEMM references need explicit pinned checkouts:
 
 ```bash
@@ -211,3 +248,6 @@ See the [Ahead-of-Time (AOT) Heuristic Tuning](../docs/deployment_autotuning.md#
 section of `docs/deployment_autotuning.md` for the end-to-end workflow,
 runner CLI, generated artifacts, and runtime fallback rules — including
 a worked "Pretuning a kernel for new hardware" walkthrough.
+
+For composite recipes without a same-name AOT kernel, the aggregate runner
+detects hardware supported by every stage's adjacent heuristic file.

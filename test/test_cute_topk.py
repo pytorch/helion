@@ -5109,6 +5109,43 @@ def test_topk_composition_integer_boolean_reductions(layout: str) -> None:
 # Pretuned top-k integration tests.
 
 
+_PRETUNED_ROUTING_SAMPLING_CASES = [
+    ("categorical_sampling", index) for index in range(7)
+] + [
+    (name, 0)
+    for name in (
+        "min_p_sampling",
+        "chain_speculative_sampling",
+        "varlen_topk",
+        "moe_softmax_routing",
+        "top_p_renorm",
+    )
+]
+
+
+@skipUnlessCuteAvailable("requires CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("name,index", _PRETUNED_ROUTING_SAMPLING_CASES)
+def test_pretuned_routing_sampling_aot_correctness(
+    name: str, index: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("routing and sampling AOT configs are pretuned for GB300")
+    from helion.autotuner.base_cache import AutotuneCacheBase
+
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    assert name in pretuned_run.KERNELS
+    assert pretuned_run._supported_hardware(name) == {"gb300"}
+    module = pretuned_run._import_kernel_module(name)
+    with patch.object(
+        AutotuneCacheBase,
+        "_run_autotune_trials",
+        side_effect=AssertionError("pretuned recipes must not launch autotuning"),
+    ):
+        module.check_case(module.SHAPES[index])
+
+
 def test_pretuned_topk_registration_and_keys() -> None:
     assert "topk" in pretuned_run.KERNELS
     assert pretuned_run._supported_hardware("topk") == {"gb300"}
