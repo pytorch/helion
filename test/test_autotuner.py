@@ -467,6 +467,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             cute_flash_search_enabled=False,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                supports_precompile=lambda: True,
                 autotune_config_is_viable=lambda _config_spec, _config: True,
                 should_deduplicate_generated_sources=lambda config_spec: False,
                 get_do_bench=lambda: None,
@@ -15007,6 +15008,7 @@ class TestAutotuneBudget(TestCase):
         # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
         # its attributes, so new __init__ fields don't need to be added here.
         config_spec = SimpleNamespace(
+            backend=SimpleNamespace(supports_precompile=lambda: True),
             default_config=lambda: helion.Config(block_sizes=[1]),
             compiler_seed_timeout_retry_repetitions=None,
             cute_flash_search_enabled=False,

@@ -53,6 +53,7 @@ from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import interleaved_bench
 from .benchmarking import mirrored_bench_generic
+from .handoff import _observe_handoff
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
@@ -162,6 +163,16 @@ class _AutotunableKernel(Protocol):
     def format_kernel_decorator(self, config: Config, settings: Settings) -> str: ...
 
     def get_cached_path(self, config: Config | None = None) -> str | None: ...
+
+    def to_code(
+        self,
+        config: Config | dict[str, object] | None = None,
+        *,
+        emit_repro_caller: bool = False,
+        output_origin_lines: bool | None = None,
+    ) -> str | None:
+        """Return source for the selected backend, or None if unavailable."""
+        ...
 
     def to_triton_code(
         self,
@@ -888,6 +899,10 @@ class BaseSearch(BaseAutotuner):
             if r.perf < self.best_perf_so_far:
                 self.best_perf_so_far = r.perf
 
+        # Check for handoff when enabled. If triggered, raise an internal stop
+        # signal that find_handoff() catches after nested searches clean up
+        # their resources.
+        _observe_handoff(self, results)
         return results
 
     def benchmark(self, config: Config) -> BenchmarkResult:
