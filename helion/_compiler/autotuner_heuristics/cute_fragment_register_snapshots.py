@@ -37,6 +37,7 @@ class CuteFragmentRegisterSnapshotsHeuristic(AutotunerHeuristic):
         from ..cute.computed_fragment import computed_fragment_supported
         from ..cute.register_snapshots import MAX_SLOTS
         from ..cute.register_snapshots import snapshot_chains
+        from ..cute.resident_while import resident_while_plan
         from ..cute.warp_results import static_shape
 
         host = device_ir.host_function
@@ -47,6 +48,8 @@ class CuteFragmentRegisterSnapshotsHeuristic(AutotunerHeuristic):
         with host:
             for root, graphs in fragment_root_regions(device_ir):
                 chains = snapshot_chains(graphs, env, allow_unbound=True)
+                if not chains:
+                    continue
                 has_while = any(
                     node.target is _tracing_ops._while_loop
                     for info in graphs
@@ -55,7 +58,18 @@ class CuteFragmentRegisterSnapshotsHeuristic(AutotunerHeuristic):
                 bounded = has_while and root in bounded_gather_roots(
                     env, device_ir, allow_unbound=True
                 )
-                if not chains or not computed_fragment_supported(
+                try:
+                    needs_bounded_gather = has_while and any(
+                        not resident_while_plan(node, graphs).local_allocations
+                        for info in graphs
+                        for node in info.graph.nodes
+                        if node.target is _tracing_ops._while_loop
+                    )
+                except InvalidConfig:
+                    continue
+                if needs_bounded_gather and not bounded:
+                    continue
+                if not computed_fragment_supported(
                     env,
                     graphs,
                     snapshot_owned=True,
@@ -73,7 +87,9 @@ class CuteFragmentRegisterSnapshotsHeuristic(AutotunerHeuristic):
                 # initialization -> updates -> final-read lifetime proof.
                 if counts:
                     roots.add(root)
-                    if has_while:
+                    # Match every actual emitter prerequisite. A composed
+                    # epoch does not cancel a pure loop's bounded-gather need.
+                    if needs_bounded_gather:
                         while_roots.add(root)
                     sizes.extend(counts)
         env.config_spec.cute_fragment_register_snapshots_root_ids = frozenset(roots)
